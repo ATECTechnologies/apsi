@@ -1,0 +1,31 @@
+# 30_gpu_training.apsi — train on the GPU with PyTorch, then use the result in plain Apsi
+#   apsi --allow-python examples\30_gpu_training.apsi      (GPU / PyTorch when installed)
+#   apsi examples\30_gpu_training.apsi                     (same program on NumPy)
+use layers
+use nn
+
+for d in devices():
+    print("device:", d.name, "·", d.detail)
+
+# data: three interleaved spirals (600 points, 2 features, 3 classes)
+let X, y = spiral_data(n_per_class=200, classes=3, noise=0.2, seed=0)
+
+# model: a deep residual MLP
+let model = resnet_mlp(2, 3, width=64, blocks=3)
+let params = model.init(seed=1)
+summary(model, params)
+
+# training: backend="auto" uses PyTorch (CUDA when there is a GPU) if it is installed and --allow-python is given,
+# otherwise NumPy. precision="bf16" is mixed precision on the GPU (ignored on NumPy).
+let t0 = clock()
+let r = fit(model, params, X, y, loss="cross_entropy", opt=adam(lr=0.01), epochs=150, batch_size=64,
+            backend="auto", precision="bf16", verbose=false)
+print(f"trained on {r.device} in {clock() - t0:.2f} · loss {r.history[0]:.3f} -> {r.history[-1]:.3f}")
+
+# the trained parameters are ordinary Apsi values: evaluate them on NumPy, save them with
+# save_params("model.npz", r.params), serve them with `use web`, or hand them to PyTorch with torch_module(model, r.params)
+print("accuracy:", accuracy(predict(model, r.params, X), y))
+
+test "the gpu-trained model works everywhere":
+    assert accuracy(predict(model, r.params, X), y) > 0.9
+    assert r.history[-1] < r.history[0]

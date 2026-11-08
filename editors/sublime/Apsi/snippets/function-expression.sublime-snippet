@@ -1,0 +1,8 @@
+<snippet>
+  <content><![CDATA[
+fn ${1:name}(${2:x}) = ${0:x}
+]]></content>
+  <tabTrigger>fn</tabTrigger>
+  <scope>source.apsi</scope>
+  <description>One-line function</description>
+</snippet>

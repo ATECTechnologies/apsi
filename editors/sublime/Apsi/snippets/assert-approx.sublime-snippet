@@ -1,0 +1,8 @@
+<snippet>
+  <content><![CDATA[
+assert ${1:a} ~= ${0:b}
+]]></content>
+  <tabTrigger>asa</tabTrigger>
+  <scope>source.apsi</scope>
+  <description>Assert approx</description>
+</snippet>

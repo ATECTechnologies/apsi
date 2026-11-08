@@ -1,0 +1,27 @@
+# 20_spectrum.apsi — signal analysis with FFT (frequencies come out in Hz)
+use sci
+
+let n = 1024
+let dt = 0.5[ms]
+let ts = arange(0, n) * dt
+
+# 50 Hz mains + a 150 Hz harmonic + noise
+let signal = (1.0 * sin(2 * pi * 50[Hz] * ts) + 0.3 * sin(2 * pi * 150[Hz] * ts)
+    + 0.05 * randn(n, seed=1)) * u.V
+
+let freqs, power = power_spectrum(signal, dt)
+let k1 = argmax(power)
+var masked = magnitude(power)
+masked[max(0, k1 - 3):k1 + 4] = 0.0
+let k2 = argmax(masked)
+
+print("main frequency:", freqs[k1])
+print("harmonic      :", freqs[k2])
+print("frequency resolution:", freqs[1])
+
+# mean power of the signal (Parseval) — in V², as physics says
+print("RMS value:", sqrt(mean(signal ** 2)))
+
+test "fft finds both tones":
+    assert abs(freqs[k1] - 50[Hz]) < 2[Hz]
+    assert abs(freqs[k2] - 150[Hz]) < 2[Hz]

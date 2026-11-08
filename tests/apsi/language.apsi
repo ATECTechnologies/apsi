@@ -1,0 +1,173 @@
+# Core language behaviour
+
+test "arithmetic and precedence":
+    assert 2 + 3 * 4 == 14
+    assert (2 + 3) * 4 == 20
+    assert 2 ** 3 ** 2 == 512
+    assert -2 ** 2 == -4
+    assert 7 // 2 == 3
+    assert 7 % 3 == 1
+    assert 7 / 2 == 3.5
+    assert 2 ^ 10 == 1024
+
+test "comparisons chain":
+    assert 1 < 2 < 3
+    assert not (1 < 3 < 2)
+    assert 3 in [1, 2, 3]
+    assert 5 not in [1, 2, 3]
+
+test "strings and f-strings":
+    let n = "Apsi"
+    assert f"hi {n}!" == "hi Apsi!"
+    assert f"{3.14159:.2f}" == "3.14"
+    assert f"{{literal}}" == "{literal}"
+    assert len("héllo wörld") == 11
+    assert "ab" + "cd" == "abcd"
+
+test "let is constant, var is mutable":
+    var x = 1
+    x += 2
+    x *= 3
+    assert x == 9
+
+test "tuples and destructuring":
+    let a, b = 1, 2
+    var p, q = b, a
+    p, q = q, p
+    assert p == 1 and q == 2
+    let t = (1, 2, 3)
+    assert t[2] == 3
+
+test "lists, slices and comprehensions":
+    var xs = [5, 3, 8, 1]
+    xs.append(9)
+    assert len(xs) == 5
+    assert xs[-1] == 9
+    assert xs[1:3] == [3, 8]
+    assert sorted(xs) == [1, 3, 5, 8, 9]
+    assert [x * 2 for x in xs if x > 4] == [10, 16, 18]
+    assert sum([1, 2, 3]) == 6
+    assert max(3, 9, 2) == 9
+
+test "dicts and dict comprehension":
+    let d = {"a": 1, "b": 2}
+    assert d["b"] == 2
+    let sq = {k: k * k for k in 0..4}
+    assert sq[3] == 9
+
+test "ranges":
+    assert list(0..4) == [0, 1, 2, 3]
+    assert list(1..=3) == [1, 2, 3]
+    assert len(range(10)) == 10
+
+test "while, break, continue":
+    var i = 0
+    var odd = 0
+    while true:
+        i += 1
+        if i > 9:
+            break
+        if i % 2 == 0:
+            continue
+        odd += 1
+    assert odd == 5
+
+test "functions, defaults, keywords, recursion":
+    fn add(a, b=10) = a + b
+    assert add(1) == 11
+    assert add(1, b=2) == 3
+    fn fact(n: Int) -> Int = 1 if n <= 1 else n * fact(n - 1)
+    assert fact(10) == 3628800
+
+test "closures capture their environment":
+    fn counter():
+        var c = 0
+        fn inc():
+            c += 1
+            return c
+        return inc
+    let next = counter()
+    next()
+    next()
+    assert next() == 3
+
+test "lambdas and pipes":
+    let inc = fn(x) => x + 1
+    assert (5 |> inc |> inc) == 7
+    assert map(fn(x) => x * 10, [1, 2]) == [10, 20]
+    assert filter(fn(x) => x > 1, [1, 2, 3]) == [2, 3]
+    assert ([3, 1, 2] |> sorted) == [1, 2, 3]
+
+test "structs, defaults and methods":
+    struct Account:
+        owner: Str
+        balance: Float = 0.0
+        fn deposit(self, amount: Float):
+            self.balance = self.balance + amount
+            return self
+    let acc = Account("nick")
+    acc.deposit(50.0).deposit(25.0)
+    assert acc.balance == 75.0
+    assert type(acc) == "Account"
+
+test "records":
+    let r = record(a=1, b=2)
+    assert r.a + r.b == 3
+
+test "ternary and logic short circuit":
+    let x = 0
+    assert (x != 0 and 10 / x > 1) == false
+    assert (true or error("never")) == true
+
+test "unicode identifiers":
+    let Δx = 5
+    assert Δx * 2 == 10
+
+test "type names":
+    assert type(1) == "Int"
+    assert type(1.0) == "Float"
+    assert type("s") == "Str"
+    assert type([1]) == "List"
+    assert type(zeros(2, 3)) == "Tensor[2x3, float64]"
+
+test "closures created in loops capture each iteration":
+    var fs = []
+    for i in 0..3:
+        let k = i * 10
+        fs.append(fn() => i + k)
+    assert [f() for f in fs] == [0, 11, 22]
+    let gs = [fn(x) => x + j for j in 0..3]
+    assert [g(1) for g in gs] == [1, 2, 3]
+
+test "shadowing in nested blocks":
+    let x = 1
+    if true:
+        let x = 2
+        assert x == 2
+    assert x == 1
+    var total = 0
+    for i in 0..3:
+        let x = i
+        total += x
+    assert total == 3 and x == 1
+
+test "builtin names can be shadowed locally":
+    fn f():
+        let before = sum([1, 2])
+        let sum = 10
+        return before + sum
+    assert f() == 13
+
+test "keyword-like and unicode names compile":
+    let lambda = 1
+    let class = 2
+    let λ = lambda + class
+    assert λ == 3
+
+test "password hashes in both formats verify":
+    use crypto
+    let s = password_hash("pw")
+    assert password_verify("pw", s)
+    assert not password_verify("pw2", s)
+    let legacy = "pbkdf2_sha256$1000$c2FsdHNhbHRzYWx0c2FsdA==$" + b64encode("x")
+    assert not password_verify("pw", legacy)

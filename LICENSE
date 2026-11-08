@@ -1,0 +1,92 @@
+# Apsi Non-Commercial License
+
+Version 1.0
+
+Copyright © ATEC. All rights reserved except as granted below.
+
+Original developer: **ATEC**
+Official source: https://github.com/OWNER/apsi (to be published)
+Official website: the official Apsi website
+
+## 1. Purpose
+
+Apsi is free, and its source code is open so that everyone can learn from it, improve it, adapt it and build on it. This License keeps it that way: anyone may use and change Apsi without paying, nobody may sell it or charge for it, and the original developer is always credited.
+
+## 2. Definitions
+
+- **“Software”** means the Apsi programming language implementation published by ATEC: its compiler, interpreter, runtime, standard library, tools, documentation, examples, website source code, and any part of them, in source or compiled form.
+- **“Derivative Work”** means any work that contains, is based on, or is adapted from the Software or any part of it, including modified versions, translations, ports, forks and works that bundle the Software.
+- **“You”** means the person or organisation exercising the rights in this License.
+- **“Commercial Use”** means any use of the Software or a Derivative Work that is intended for, or directed towards, commercial advantage or monetary compensation. It includes, in particular:
+  1. selling, renting or licensing the Software or a Derivative Work, or copies of them, for a fee;
+  2. offering the Software or a Derivative Work, or access to it, as a paid service, including hosted, cloud, subscription, “software as a service”, API or consulting offerings whose price depends on the Software;
+  3. including the Software or a Derivative Work in a product, device or service that is sold, rented or offered for a fee;
+  4. charging for distribution, downloading, installation, hosting or access, or placing the Software behind a paywall;
+  5. using the Software or a Derivative Work to provide paid support, training or certification that is presented as an offering of the Software.
+- **“Non-Commercial Purpose”** means any purpose that is not Commercial Use, including personal use, study, teaching, academic and scientific research, use by non-profit organisations, and internal evaluation.
+
+## 3. What you may do
+
+Subject to the conditions in this License, ATEC grants You a worldwide, royalty-free, non-exclusive licence, for Non-Commercial Purposes only, to:
+
+1. use and run the Software;
+2. read, study and modify the source code;
+3. create Derivative Works and improve the Software;
+4. copy and distribute the Software and Derivative Works, free of charge.
+
+## 4. Conditions
+
+### 4.1 No commercial use
+
+You may not engage in Commercial Use of the Software or of any Derivative Work. Every copy and every Derivative Work that You distribute must be made available free of charge.
+
+### 4.2 Credit is always required
+
+Every copy and every Derivative Work, in source or compiled form, must:
+
+1. keep this License and all copyright and attribution notices intact;
+2. state clearly, in its documentation and in its “about” information or README, that it is based on Apsi, originally developed by **ATEC**, with the official source address **https://github.com/OWNER/apsi (to be published)**;
+3. state that it was modified, if it was, and by whom.
+
+The credit must be easy to find for an ordinary user. It may not be hidden, removed or made misleading.
+
+### 4.3 The same license for derivative works
+
+You must distribute Derivative Works only under this License, with its non-commercial and credit conditions unchanged. You may not add terms that restrict the rights this License gives to others.
+
+### 4.4 No endorsement
+
+The names “Apsi” and “ATEC” may be used to describe the origin of a Derivative Work as required by section 4.2, but not to suggest that ATEC endorses it. A modified version must not be presented as the official Apsi.
+
+## 5. Your own programs and libraries
+
+Programs that You write in the Apsi language, libraries You publish to the registry, and the results Your programs compute belong to You. This License does not restrict them, and You choose their licence. However, distributing the Software or a Derivative Work together with them is still governed by this License: You may not sell the Software, or include it in something You sell, and You must credit it as section 4.2 requires.
+
+## 6. Contributions
+
+Unless You state otherwise in writing, any contribution You submit for inclusion in the official Software is provided under this License, and You confirm that You have the right to submit it.
+
+## 7. Termination
+
+Your rights under this License end automatically if You break its conditions. If You stop the breach and correct it within 30 days of learning about it, Your rights are restored, unless ATEC has notified You in writing that they are terminated. People who received copies from You keep their rights as long as they comply.
+
+## 8. No warranty
+
+THE SOFTWARE IS PROVIDED “AS IS”, WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE, ACCURACY AND NON-INFRINGEMENT. YOU ARE RESPONSIBLE FOR CHECKING THAT RESULTS PRODUCED WITH THE SOFTWARE ARE CORRECT FOR YOUR PURPOSE, IN PARTICULAR IN MEDICAL, SAFETY-CRITICAL, ENGINEERING AND FINANCIAL USE.
+
+## 9. Limitation of liability
+
+TO THE EXTENT PERMITTED BY LAW, IN NO EVENT SHALL ATEC OR ANY CONTRIBUTOR BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR ITS USE.
+
+## 10. Commercial licences
+
+If You want to use the Software in a way this License does not allow, contact ATEC through the official website or repository. Any other permission must be given in writing.
+
+## 11. Notice to include
+
+Put the following notice in the README or “about” information of every copy and Derivative Work:
+
+```text
+Based on Apsi, originally developed by ATEC — https://github.com/OWNER/apsi (to be published)
+Licensed under the Apsi Non-Commercial License 1.0. Not for sale or paid services.
+```

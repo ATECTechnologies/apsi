@@ -1,0 +1,24 @@
+# 17_wave.apsi — 1-D wave equation  ∂²y/∂t² = c² ∂²y/∂x²  (a string fixed at both ends)
+use physics.fields
+
+let n = 200
+let L = 1m
+let dx = L / (n - 1)
+let speed = 100[m/s]
+let xs = linspace(0m, L, n)
+
+# initial shape: the string's first mode
+var y = 1[mm] * sin(pi * xs / L)
+var vy = zeros(n) * u.m / u.s
+
+evolve y, vy over t in 0[s]..20[ms] step 2[us] using verlet:
+    y' = vy
+    vy' = speed ** 2 * laplacian(y, dx, boundary="fixed")
+
+# the period of mode 1 is 2L/c = 20 ms, so after one full period the string must be back in its shape
+let expected = 1[mm] * sin(pi * xs / L)
+let err = max(abs(y - expected))
+print("error after one period:", err as [um])
+
+test "string returns to its shape after one period":
+    assert err < 10[um]

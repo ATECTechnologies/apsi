@@ -1,0 +1,44 @@
+use nn
+
+test "lstm gradients match finite differences":
+    let p = lstm_init(2, 3, seed=1)
+    let xs = randn(2, 4, 2, seed=2)
+    fn loss(W) = sum(lstm(record(W=W, b=p.b), xs) ** 2)
+    let g = grad(loss)(p.W)
+    let n = numeric_grad(loss, p.W)
+    assert max(abs(g - n)) < 1e-6
+
+test "gru output shape":
+    let p = gru_init(3, 5, seed=1)
+    assert shape(gru(p, randn(2, 7, 3))) == (2, 7, 5)
+
+test "lstm learns to sum a sequence":
+    let p0 = record(cell=lstm_init(1, 16, seed=3), out=dense(16, 1, seed=4))
+    let xs = rand(64, 6, 1, seed=5)
+    let ys = sum(xs, axis=1)
+    fn predict(p, x) = lstm(p.cell, x)[:, -1, :] @ p.out.W + p.out.b
+    fn loss(p, x, y) = mse(predict(p, x), y)
+    let r = train(loss, p0, (xs, ys), adam(lr=0.02), epochs=150, verbose=false)
+    assert r.history[-1] < 0.05 * r.history[0]
+
+test "train helper with batches, schedule and moons":
+    let X, y = make_moons(200, noise=0.1, seed=1)
+    let Xtr, Xte, ytr, yte = train_test_split(X, y, test=0.25)
+    fn forward(p, x) = relu(x @ p[0].W + p[0].b) @ p[1].W + p[1].b
+    fn loss(p, x, labels) = cross_entropy(forward(p, x), labels)
+    let r = train(loss, mlp_init([2, 32, 2], seed=2), (Xtr, ytr), adam(lr=0.02), epochs=60,
+        batch_size=32, schedule=fn(s) => cosine_lr(s, 300, base=0.02), verbose=false)
+    assert accuracy(forward(r.params, Xte), yte) > 0.95
+
+test "batch norm normalises":
+    let x = randn(100, 4, seed=1) * 5.0 + 3.0
+    let y = batch_norm(x)
+    assert max(abs(mean(y, axis=0))) < 1e-9
+    assert approx(std(y, axis=0), ones(4), rel=1e-3)
+
+test "other optimizers reduce a quadratic":
+    for opt in [rmsprop(lr=0.05), adagrad(lr=0.5), sgd(lr=0.1, momentum=0.9)]:
+        var w = tensor([3.0, -2.0])
+        for _ in 0..200:
+            w = opt.step(w, grad(fn(v) => sum(v * v))(w))
+        assert norm(w) < 0.1

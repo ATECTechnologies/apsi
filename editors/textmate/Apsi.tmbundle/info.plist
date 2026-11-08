@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>name</key><string>Apsi</string>
+  <key>description</key><string>Apsi language: syntax, comments, indentation and snippets. Works in TextMate, JetBrains IDEs (TextMate Bundles) and Sublime Text.</string>
+  <key>contactName</key><string>Apsi</string>
+  <key>uuid</key><string>6B1E7F0A-4C1D-4F6B-9C3A-A951A0B10F01</string>
+</dict>
+</plist>

@@ -1,0 +1,18 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>content</key>
+	<string>fn ${1:name}(${2:x}: ${3:Float}) -&gt; ${4:Float}:
+	$0
+	return ${2:x}</string>
+	<key>name</key>
+	<string>Function with a body</string>
+	<key>scope</key>
+	<string>source.apsi</string>
+	<key>tabTrigger</key>
+	<string>fnb</string>
+	<key>uuid</key>
+	<string>9D05FDB9-1CFC-59B4-87BC-E9002E24FE50</string>
+</dict>
+</plist>

@@ -1,0 +1,102 @@
+# Build all installers when a version tag is pushed (git tag v1.10.0 && git push --tags)
+name: release
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.12" }
+      - uses: actions/setup-node@v4
+        with: { node-version: "22" }
+      - name: Tools
+        run: sudo apt-get update && sudo apt-get install -y nsis zip
+      - name: VS Code extension
+        run: |
+          cd editors/vscode && npm install && npx --yes @vscode/vsce@2 package --allow-missing-repository --skip-license \
+            -o ../../dist/apsi-language-$(python -c "import json;print(json.load(open('package.json'))['version'])").vsix
+      - name: Installers (wheel, .deb, Windows zip + setup.exe)
+        run: sh packaging/build_all.sh
+      - uses: actions/upload-artifact@v4
+        with: { name: apsi-release, path: dist/* }
+
+  wizard-installer:
+    # Modern Electron + React setup wizard (ApsiSetup-<v>-x64-wizard.exe / Apsi-<v>.AppImage)
+    strategy:
+      matrix:
+        include:
+          - { os: windows-2022, script: "dist:win", files: "installer/release/*.exe" }
+          - { os: ubuntu-22.04, script: "dist:linux", files: "installer/release/*.AppImage" }
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.12" }
+      - uses: actions/setup-node@v4
+        with: { node-version: "22" }
+      - name: Payload manifest
+        run: python -c "from apsi.security import write_manifest; write_manifest()"
+      - name: Installer core tests
+        if: runner.os == 'Linux'
+        run: |
+          cd installer && npm ci --no-audit --no-fund && npm run payload:linux && npm test
+      - name: Build wizard
+        shell: bash
+        run: cd installer && npm ci --no-audit --no-fund && npm run ${{ matrix.script }}
+      - uses: actions/upload-artifact@v4
+        with: { name: "apsi-wizard-${{ runner.os }}", path: "${{ matrix.files }}" }
+
+  smoke-test-wizard-windows:
+    needs: wizard-installer
+    runs-on: windows-2022
+    steps:
+      - uses: actions/download-artifact@v4
+        with: { name: apsi-wizard-Windows, path: wizard }
+      - name: Silent install with the wizard, run, uninstall
+        shell: pwsh
+        run: |
+          $exe = Get-ChildItem wizard\*.exe | Select-Object -First 1
+          Start-Process $exe.FullName -ArgumentList "--silent","--profile","strict" -Wait
+          $apsi = Join-Path $env:LOCALAPPDATA "Programs\Apsi\bin\apsi.cmd"
+          & $apsi version
+          & $apsi verify
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+          & $apsi test (Join-Path $env:LOCALAPPDATA "Programs\Apsi\examples\05_orbit.apsi")
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+          Start-Process $exe.FullName -ArgumentList "--uninstall","--silent" -Wait
+          if (Test-Path $apsi) { Write-Error "uninstall left files"; exit 1 }
+
+  smoke-test-windows:
+    needs: build
+    runs-on: windows-2022
+    steps:
+      - uses: actions/download-artifact@v4
+        with: { name: apsi-release, path: dist }
+      - name: Silent install and run
+        shell: pwsh
+        run: |
+          $exe = Get-ChildItem dist\ApsiSetup-*-x64.exe | Select-Object -First 1
+          Start-Process $exe.FullName -ArgumentList "/S" -Wait
+          $apsi = Join-Path $env:LOCALAPPDATA "Programs\Apsi\apsi.cmd"
+          & $apsi version
+          & $apsi doctor
+          & $apsi test (Join-Path $env:LOCALAPPDATA "Programs\Apsi\examples\05_orbit.apsi")
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+
+  smoke-test-linux:
+    needs: build
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/download-artifact@v4
+        with: { name: apsi-release, path: dist }
+      - name: apt install the .deb and run
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ./dist/apsi_*_all.deb
+          apsi version
+          apsi test /usr/share/apsi/examples/05_orbit.apsi

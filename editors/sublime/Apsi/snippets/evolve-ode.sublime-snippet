@@ -1,0 +1,12 @@
+<snippet>
+  <content><![CDATA[
+var ${1:x} = ${2:1m}
+var ${3:v} = ${4:0[m/s]}
+evolve ${1:x}, ${3:v} over t in 0[s]..${5:10[s]} step ${6:1[ms]} using ${7:rk4} record every ${8:10} into ${9:traj}:
+	${1:x}' = ${3:v}
+	${3:v}' = ${0:-${1:x} / 1[s^2]}
+]]></content>
+  <tabTrigger>evolve</tabTrigger>
+  <scope>source.apsi</scope>
+  <description>Differential equation solved over time</description>
+</snippet>

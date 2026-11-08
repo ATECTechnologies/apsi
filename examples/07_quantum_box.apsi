@@ -1,0 +1,30 @@
+# 07_quantum_box.apsi — particle in a box: the Schrödinger equation by finite differences
+use physics.constants
+use linalg
+
+let L = 1[nm]
+let N = 400
+let dx = L / (N + 1)
+
+# H = -(ħ²/2m) d²/dx²  as a matrix (energy unit J)
+let main = full(N, 2.0)
+let off = full(N - 1, -1.0)
+var D2 = zeros(N, N)
+for i in 0..N:
+    D2[i, i] = 2.0
+for i in 0..N - 1:
+    D2[i, i + 1] = -1.0
+    D2[i + 1, i] = -1.0
+let H = hbar ** 2 / (2 * m_e * dx ** 2) * D2
+
+let energies, states = eigh(H)
+
+fn exact(n: Int) -> Energy = n ** 2 * pi ** 2 * hbar ** 2 / (2 * m_e * L ** 2)
+
+for k in 1..=4:
+    let numeric = energies[k - 1]
+    print(f"E{k} = {numeric as [eV]:.5f}   exact = {exact(k) as [eV]:.5f}")
+
+test "ground state matches analytic result":
+    assert approx(energies[0], exact(1), rel=1e-4)
+    assert approx(energies[3], exact(4), rel=1e-3)

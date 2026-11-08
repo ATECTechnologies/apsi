@@ -1,0 +1,130 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Apsi Playground</title>
+<link rel="icon" href="favicon.ico">
+<style>
+  :root { --bg:#0f1117; --panel:#161a23; --line:#262c3a; --text:#e6e9ef; --muted:#8a93a6; --accent:#6ea8fe; --ok:#4cc38a; --err:#ff6b6b; }
+  @media (prefers-color-scheme: light) { :root { --bg:#f6f7f9; --panel:#ffffff; --line:#dde1e8; --text:#1d2330; --muted:#5d6676; --accent:#2f6fdf; --ok:#1f9d63; --err:#d63d3d; } }
+  * { box-sizing:border-box; }
+  body { margin:0; font:15px/1.5 system-ui, "Noto Sans Thai", "Segoe UI", sans-serif; background:var(--bg); color:var(--text); height:100vh; display:flex; flex-direction:column; }
+  header { display:flex; align-items:center; gap:12px; padding:10px 16px; border-bottom:1px solid var(--line); background:var(--panel); flex-wrap:wrap; }
+  header h1 { font-size:18px; margin:0; letter-spacing:.3px; }
+  header h1 span { color:var(--accent); }
+  select, button { font:inherit; border:1px solid var(--line); background:var(--bg); color:var(--text); border-radius:8px; padding:6px 10px; }
+  button.primary { background:var(--accent); color:#fff; border-color:transparent; font-weight:600; cursor:pointer; }
+  button:disabled { opacity:.5; cursor:wait; }
+  #status { color:var(--muted); font-size:13px; margin-left:auto; }
+  main { flex:1; display:grid; grid-template-columns:1fr 1fr; min-height:0; }
+  @media (max-width: 900px) { main { grid-template-columns:1fr; grid-template-rows:1fr 1fr; } }
+  .pane { display:flex; flex-direction:column; min-height:0; border-right:1px solid var(--line); }
+  .pane h2 { font-size:12px; text-transform:uppercase; letter-spacing:1px; color:var(--muted); margin:0; padding:8px 14px; border-bottom:1px solid var(--line); }
+  textarea, pre { flex:1; margin:0; padding:14px; border:0; outline:0; resize:none; background:var(--bg); color:var(--text);
+    font:14px/1.55 "JetBrains Mono", "Cascadia Code", Consolas, "Noto Sans Mono", monospace; tab-size:4; white-space:pre; overflow:auto; }
+  pre { white-space:pre-wrap; }
+  .err { color:var(--err); }
+  .ok { color:var(--ok); }
+  kbd { border:1px solid var(--line); border-radius:4px; padding:0 4px; font-size:12px; color:var(--muted); }
+</style>
+</head>
+<body>
+<header>
+  <h1><img src="apsi-logo.png" alt="Apsi" style="height:28px;vertical-align:-6px;margin-right:8px">Playground</h1>
+  <select id="examples" aria-label="Examples"><option value="">— examples —</option></select>
+  <button id="run" class="primary" disabled>▶ Run</button>
+  <kbd>Ctrl</kbd>+<kbd>Enter</kbd>
+  <span id="status">Loading the Python runtime…</span>
+</header>
+<main>
+  <section class="pane">
+    <h2>Code (.apsi)</h2>
+    <textarea id="code" spellcheck="false">use physics.constants
+
+fn kinetic(m: Mass, v: Velocity) -> Energy = 0.5 * m * v ** 2
+
+print(kinetic(2kg, 3[m/s]))
+print("electron rest energy:", m_e * c ** 2 as [MeV])
+
+# uncomment this line and press Run — the checker catches it before running
+# let wrong = 5m + 2s
+</textarea>
+  </section>
+  <section class="pane">
+    <h2>Output</h2>
+    <pre id="out"></pre>
+  </section>
+</main>
+<script src="apsi_bundle.js"></script>
+<script src="https://cdn.jsdelivr.net/pyodide/v0.27.7/full/pyodide.js"></script>
+<script>
+const $ = (id) => document.getElementById(id);
+let py = null, runner = null;
+
+function setStatus(t) { $("status").textContent = t; }
+
+function show(res) {
+  const out = $("out");
+  out.innerHTML = "";
+  const add = (text, cls) => { const s = document.createElement("span"); if (cls) s.className = cls; s.textContent = text; out.appendChild(s); };
+  if (res.output) add(res.output);
+  if (res.error) add((res.output ? "\n" : "") + res.error, "err");
+  if (res.tests) add("\n— tests —\n" + res.tests, /0 failed/.test(res.tests) ? "ok" : "err");
+  if (!res.output && !res.error && !res.tests) add("(no output)");
+}
+
+async function boot() {
+  for (const name of Object.keys(window.APSI_BUNDLE.examples)) {
+    const o = document.createElement("option"); o.value = name; o.textContent = name; $("examples").appendChild(o);
+  }
+  const t0 = performance.now();
+  py = await loadPyodide();
+  setStatus("Loading numpy…");
+  await py.loadPackage("numpy");
+  py.FS.mkdirTree("/apsi_pkg/apsi");
+  for (const [path, src] of Object.entries(window.APSI_BUNDLE.files)) py.FS.writeFile("/apsi_pkg/" + path, src);
+  py.runPython("import sys; sys.path.insert(0, '/apsi_pkg'); import apsi.playground");
+  runner = py.globals.get("apsi").playground.run;
+  setStatus(`Ready (${((performance.now() - t0) / 1000).toFixed(1)} s) · Apsi ${py.runPython("import apsi; apsi.__version__")}`);
+  $("run").disabled = false;
+}
+
+function run() {
+  if (!runner) return;
+  $("run").disabled = true;
+  setStatus("Running…");
+  setTimeout(() => {
+    const t0 = performance.now();
+    try {
+      const r = runner($("code").value);
+      const res = r.toJs({ dict_converter: Object.fromEntries });
+      r.destroy();
+      show(res);
+      setStatus(`Finished in ${((performance.now() - t0)).toFixed(0)} ms`);
+    } catch (e) {
+      show({ error: String(e) });
+      setStatus("Error");
+    }
+    $("run").disabled = false;
+  }, 10);
+}
+
+$("run").addEventListener("click", run);
+$("code").addEventListener("keydown", (e) => {
+  if ((e.ctrlKey || e.metaKey) && e.key === "Enter") { e.preventDefault(); run(); }
+  if (e.key === "Tab") {
+    e.preventDefault();
+    const t = e.target, s = t.selectionStart;
+    t.value = t.value.slice(0, s) + "    " + t.value.slice(t.selectionEnd);
+    t.selectionStart = t.selectionEnd = s + 4;
+  }
+});
+$("examples").addEventListener("change", (e) => {
+  const src = window.APSI_BUNDLE.examples[e.target.value];
+  if (src) { $("code").value = src; $("out").textContent = ""; }
+});
+boot().catch((e) => setStatus("Failed to load: " + e));
+</script>
+</body>
+</html>

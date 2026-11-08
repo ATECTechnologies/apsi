@@ -1,0 +1,39 @@
+# Uncertainty propagation and adaptive integration
+
+test "uncertainty propagates through formulas":
+    let h = 20.0m ± 0.05m
+    let g = 9.81[m/s^2] ± 0.02[m/s^2]
+    let t = sqrt(2 * h / g)
+    let expected_rel = 0.5 * sqrt((0.05 / 20.0) ** 2 + (0.02 / 9.81) ** 2)
+    assert approx(relative_uncertainty(t), expected_rel, rel=1e-9)
+    assert dim(t) == "Time"
+
+test "correlations are exact":
+    let x = 3.0 ± 0.1
+    assert sigma(x - x) == 0.0
+    assert approx(relative_uncertainty(x * x), 2 * relative_uncertainty(x))
+    let y = 5.0 +/- 0.2
+    assert approx(sigma(x + y), sqrt(0.1 ** 2 + 0.2 ** 2))
+
+test "uncertain values work in math functions":
+    let a = 0.5 ± 0.01
+    assert approx(sigma(sin(a)), cos(0.5) * 0.01)
+    assert approx(sigma(exp(a)), exp(0.5) * 0.01)
+
+test "rk45 meets its tolerance":
+    var y = 1.0
+    evolve y over t in 0[s]..5[s] step 0.5[s] using rk45 tol 1e-10:
+        y' = -y / 1[s]
+    assert abs(y - exp(-5.0)) < 1e-11
+
+test "rk45 handles a stiff-ish fast decay plus slow drift":
+    var a = 1.0
+    var b = 0.0
+    evolve a, b over t in 0[s]..2[s] step 0.1[s] using rk45 tol 1e-9:
+        a' = -50.0 * a / 1[s]
+        b' = 1.0 / 1[s]
+    assert abs(b - 2.0) < 1e-9
+    assert abs(a) < 1e-9
+
+test "parallel map":
+    assert pmap(fn(x) => x * x, [1, 2, 3, 4]) == [1, 4, 9, 16]

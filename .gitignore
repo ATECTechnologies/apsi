@@ -1,0 +1,17 @@
+__pycache__/
+*.pyc
+*.egg-info/
+.venv/
+build/
+dist/
+packaging/.cache/
+installer/node_modules/
+installer/payload/
+installer/release/
+installer/dist/
+examples/pipeline_store/
+examples/model_store/
+_tmp_models/
+*.so
+*.dll
+*.vsix

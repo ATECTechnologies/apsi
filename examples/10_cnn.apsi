@@ -1,0 +1,43 @@
+# 10_cnn.apsi — convolutional network: tell horizontal from vertical lines
+use nn
+
+fn make_images(n: Int, seed: Int):
+    var imgs = zeros(n, 1, 12, 12)
+    var labels = zeros(n, dtype=i64)
+    let pos = randint(1, 11, n, seed=seed)
+    for i in 0..n:
+        let k = pos[i]
+        if i % 2 == 0:
+            imgs[i, 0, k, :] = 1.0  # horizontal line -> class 0
+        else:
+            imgs[i, 0, :, k] = 1.0  # vertical line -> class 1
+            labels[i] = 1
+    return imgs + 0.1 * randn(n, 1, 12, 12, seed=seed + 1), labels
+
+let X, y = make_images(200, 7)
+let Xt, yt = make_images(100, 99)
+
+var params = record(c1=conv_init(1, 8, 3, seed=1), c2=conv_init(8, 16, 3, seed=2),
+    fc=dense(16 * 3 * 3, 2, seed=3))
+
+fn forward(p, x):
+    var h = relu(conv2d(x, p.c1.W, p.c1.b, padding=1))  # 8 x 12 x 12
+    h = max_pool2d(h, 2)  # 8 x 6 x 6
+    h = relu(conv2d(h, p.c2.W, p.c2.b, padding=1))  # 16 x 6 x 6
+    h = max_pool2d(h, 2)  # 16 x 3 x 3
+    return reshape(h, shape(x)[0], 144) @ p.fc.W + p.fc.b
+
+fn loss_fn(p, x, labels) = cross_entropy(forward(p, x), labels)
+
+let opt = adam(lr=0.01)
+for epoch in 0..30:
+    let loss, g = value_and_grad(loss_fn)(params, X, y)
+    params = opt.step(params, g)
+    if epoch % 10 == 0:
+        print(f"epoch {epoch:2}  loss {loss:.4f}")
+
+let test_acc = accuracy(forward(params, Xt), yt)
+print("test accuracy:", test_acc)
+
+test "cnn generalises":
+    assert test_acc > 0.9

@@ -1,0 +1,78 @@
+use web
+
+let SECRET = "test-secret-please-change"
+let app = server(name="api", log=false, max_body=1000)
+app.health()
+app.expose_metrics()
+
+@app.get("/hello/{name}")
+fn hello(req) = {"message": "hi " + req.params["name"]}
+
+@app.get("/square/{n:int}")
+fn square(req) = {"n": req.params["n"], "square": req.params["n"] ** 2}
+
+@app.post("/energy")
+fn energy(req):
+    let body = req.json()
+    let m = body["mass"]
+    let v = body["speed"]
+    return {"energy": 0.5 * m * v ** 2}
+
+@app.get("/private")
+fn private(req) = {"user": req.user["sub"]}
+
+@app.get("/boom")
+fn boom(req) = 1 / 0
+
+@app.get("/missing")
+fn missing(req) = abort(404, "nothing here")
+
+let guard = require_jwt(SECRET)
+app.before(fn(req) => guard(req) if req.path == "/private" else none)
+
+test "routing and params":
+    let r = app.handle("GET", "/hello/apsi")
+    assert r.status == 200
+    assert r.body["message"] == "hi apsi"
+    assert app.handle("GET", "/square/12").body["square"] == 144
+    assert app.handle("GET", "/square/abc").status == 404
+    assert app.handle("POST", "/hello/x").status == 405
+    assert app.handle("GET", "/nope").status == 404
+
+test "json bodies with physical units are unit-checked":
+    let r = app.handle("POST", "/energy", {"mass": {"value": 2, "unit": "kg"}, "speed": {"value": 3, "unit": "m/s"}})
+    assert r.status == 200
+    assert r.body["energy"] == 9[J]
+    let bad = app.handle("POST", "/energy", "{not json")
+    assert bad.status == 400
+
+test "errors never leak internals":
+    let r = app.handle("GET", "/boom")
+    assert r.status == 400 or r.status == 500
+    assert "Traceback" not in str(r.body)
+    assert app.handle("GET", "/missing").body["error"] == "nothing here"
+
+test "security headers are present":
+    let h = app.handle("GET", "/health").headers
+    assert h["X-Content-Type-Options"] == "nosniff"
+    assert h["X-Frame-Options"] == "DENY"
+
+test "jwt authentication":
+    assert app.handle("GET", "/private").status == 401
+    let token = jwt_sign({"sub": "nick"}, SECRET, expires_in=60)
+    let ok = app.handle("GET", "/private", headers={"Authorization": "Bearer " + token})
+    assert ok.status == 200 and ok.body["user"] == "nick"
+    let forged = jwt_sign({"sub": "admin"}, "wrong-secret")
+    assert app.handle("GET", "/private", headers={"Authorization": "Bearer " + forged}).status == 401
+    assert jwt_verify(jwt_sign({"sub": "x"}, SECRET, expires_in=-100), SECRET) == none
+
+test "rate limiting":
+    let limited = server(log=false)
+    limited.get("/x", fn(req) => "ok")
+    limited.rate_limit(5, per=1[s])
+    var codes = [limited.handle("GET", "/x").status for _ in 0..8]
+    assert codes[0] == 200 and codes[4] == 200 and codes[5] == 429
+
+test "metrics":
+    let m = app.stats()
+    assert m["requests"] > 0

@@ -1,0 +1,57 @@
+use data
+use parallel
+
+test "pipeline: shuffle, parallel map, batch, prefetch":
+    let X = arange(0, 1000) * 1.0
+    let y = arange(0, 1000) % 2
+    let ds = from_tensors(X, y) |> shuffle(256, seed=1) |> map(fn(r) => (r[0] * 2.0, r[1]), workers=4) |> batch(64) |> prefetch(3)
+    var total = 0.0
+    var count = 0
+    for xb, yb in ds:
+        total += sum(xb)
+        count += shape(xb)[0]
+    assert count == 1000
+    assert total == 2.0 * sum(X)
+    assert len(ds) == 16
+
+test "ordered parallel map matches serial":
+    let src = from_range(200)
+    let a = (src |> map(fn(i) => i * i, workers=8)).to_list()
+    assert a == [i * i for i in 0..200]
+
+test "filter, take, skip, repeat, unbatch":
+    let p = from_range(100) |> filter(fn(i) => i % 3 == 0) |> skip(2) |> take(5)
+    assert p.to_list() == [6, 9, 12, 15, 18]
+    assert len((from_range(4) |> repeat(3)).to_list()) == 12
+    assert (from_range(10) |> batch(4) |> unbatch()).to_list() == list(0..10)
+
+test "builtin map/filter still work after use data":
+    assert map(fn(x) => x + 1, [1, 2]) == [2, 3]
+    assert filter(fn(x) => x > 1, [1, 2, 3]) == [2, 3]
+
+test "tasks and channels":
+    let ch = channel(10)
+    fn producer():
+        for i in 0..50:
+            ch.send(i)
+        ch.close()
+    let t = spawn(producer)
+    var got = 0
+    for v in ch:
+        got += v
+    t.wait()
+    assert got == sum(list(0..50))
+    let tasks = [spawn(fn(k) => k * 10, k) for k in 0..8]
+    assert wait_all(tasks) == [k * 10 for k in 0..8]
+
+test "atomic counter under contention":
+    let c = atomic(0)
+    parallel_for(0..1000, fn(i) => c.add(1), workers=8)
+    assert c.get() == 1000
+
+test "parallel reduce":
+    assert parallel_reduce(0..100, fn(i) => i * i, fn(a, b) => a + b, 0) == 328350
+
+test "bench gives time quantities":
+    let r = bench(fn() => sum(randn(1000)), repeat=3)
+    assert dim(r.best) == "Time"

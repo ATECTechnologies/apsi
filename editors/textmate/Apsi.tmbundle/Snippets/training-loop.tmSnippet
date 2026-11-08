@@ -1,0 +1,21 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>content</key>
+	<string>let opt = adam(lr=${1:0.01})
+for step in 0..${2:500}:
+	let loss, g = value_and_grad(${3:loss_fn})(params, ${4:X}, ${5:y})
+	params = opt.step(params, g)
+	if step % 100 == 0:
+		print(f"step {step}: loss {loss:.4f}")$0</string>
+	<key>name</key>
+	<string>Training loop</string>
+	<key>scope</key>
+	<string>source.apsi</string>
+	<key>tabTrigger</key>
+	<string>train</string>
+	<key>uuid</key>
+	<string>4C09FD24-B36B-5002-B66A-91B4B854039D</string>
+</dict>
+</plist>

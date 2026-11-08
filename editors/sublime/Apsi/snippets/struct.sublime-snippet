@@ -1,0 +1,11 @@
+<snippet>
+  <content><![CDATA[
+struct ${1:Name}:
+	${2:field}: ${3:Float}
+	
+	fn ${4:method}(self) = ${0:self.${2:field}}
+]]></content>
+  <tabTrigger>struct</tabTrigger>
+  <scope>source.apsi</scope>
+  <description>Struct with a field and a method</description>
+</snippet>

@@ -1,0 +1,54 @@
+# Autodiff checked against finite differences
+
+use nn
+
+fn check(f, x, tol=1e-5):
+    let a = grad(f)(x)
+    let n = numeric_grad(f, x)
+    assert max(abs(a - n)) < tol, f"autodiff {a} vs numeric {n}"
+
+test "scalar functions":
+    let fs = [fn(x) => sin(x) * exp(x), fn(x) => log(1.0 + x * x), fn(x) => tanh(x) ** 3,
+        fn(x) => sqrt(x + 2.0) / (1.0 + x), fn(x) => sigmoid(3.0 * x), fn(x) => abs(x - 0.1)]
+    for f in fs:
+        check(fn(t) => sum(f(t)), tensor([0.7, -0.3, 1.5]))
+
+test "matrix ops":
+    let A = randn(4, 3, seed=1)
+    let b = randn(4, seed=2)
+    check(fn(x) => sum((A @ x - b) ** 2), randn(3, seed=3))
+    check(fn(W) => sum(relu(randn(5, 4, seed=4) @ W) ** 2), randn(4, 3, seed=5), 1e-4)
+
+test "softmax and cross entropy":
+    let labels = tensor([0, 2, 1], dtype=i64)
+    check(fn(z) => cross_entropy(z, labels), randn(3, 3, seed=6))
+    check(fn(z) => sum(softmax(z) * tensor([1.0, 2.0, 3.0])), randn(2, 3, seed=7))
+
+test "layer norm and gelu":
+    check(fn(z) => sum(layer_norm(z) * randn(2, 5, seed=8)), randn(2, 5, seed=9), 1e-4)
+    check(fn(z) => sum(gelu(z)), randn(6, seed=10))
+
+test "indexing, slicing, reshape, transpose":
+    check(fn(z) => sum(transpose(reshape(z, 2, 3))[1:, :] ** 2), randn(6, seed=11))
+    check(fn(z) => z[2] * z[0] + mean(z), randn(4, seed=12))
+
+test "conv2d":
+    let x = randn(1, 2, 5, 5, seed=13)
+    check(fn(w) => sum(conv2d(x, w, padding=1) ** 2), randn(3, 2, 3, 3, seed=14), 1e-4)
+
+test "grad through structs and records":
+    struct Lin:
+        w: Float
+        b: Float
+    fn f(p) = (p.w * 3.0 + p.b - 1.0) ** 2
+    let g = grad(f)(Lin(1.0, 0.5))
+    assert g.w ~= 15.0
+    assert g.b ~= 5.0
+    let r = grad(fn(p) => p.a * p.b)(record(a=2.0, b=5.0))
+    assert r.a ~= 5.0 and r.b ~= 2.0
+
+test "unit-aware gradients":
+    let g = grad(fn(x: Length) => 3[N] * x)(2m)
+    assert g == 3[N]
+    let k = grad(fn(v: Velocity) => 0.5 * 2kg * v ** 2)(5[m/s])
+    assert k == 10[kg*m/s]
