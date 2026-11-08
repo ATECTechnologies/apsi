@@ -1,0 +1,10 @@
+<snippet>
+  <content><![CDATA[
+@app.${1:get}("/${2:path}")
+fn ${3:handler}(req):
+	return {"${4:ok}": ${0:true}}
+]]></content>
+  <tabTrigger>route</tabTrigger>
+  <scope>source.apsi</scope>
+  <description>Web route</description>
+</snippet>

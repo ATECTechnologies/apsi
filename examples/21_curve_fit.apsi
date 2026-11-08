@@ -1,0 +1,32 @@
+# 21_curve_fit.apsi — fit experimental data and get parameters with uncertainties and correlations
+use sci
+
+# radioactive decay: N(t) = N0 · exp(-t / τ)
+let ts = linspace(0[s], 20[s], 40)
+let true_tau = 6.5[s]
+let counts = 1000.0 * exp(-ts / true_tau) + 8.0 * randn(40, seed=3)
+
+fn model(t, p) = p[0] * exp(-t / p[1])
+
+let fit = curve_fit(model, ts, counts, [900.0, 5[s]], sigma=8.0 * ones(40))
+let N0 = fit.params[0]
+let tau = fit.params[1]
+print("N0  =", N0)
+print("τ   =", tau)
+print("half-life =", tau * log(2.0))
+print(f"χ²/dof = {fit.chi2 / fit.dof:.2f}")
+
+# minimum of a function with L-BFGS (autodiff gives exact gradients)
+let best = minimize(fn(p) => (p[0] - 3.0) ** 2 + 10.0 * (p[1] + 1.0) ** 2, tensor([0.0, 0.0]))
+print("minimize ->", best.x, "in", best.steps, "steps")
+
+# root finding: the speed at which the kinetic energy is 1 kJ
+let v = find_root(fn(v) => 0.5 * 70kg * v ** 2 - 1[kJ], 1[m/s])
+print("speed =", v)
+
+# integration: work done by a k = 300 N/m spring from 0 to 20 cm
+print("work =", integrate(fn(x) => 300[N/m] * x, 0m, 20[cm]))
+
+test "fit recovers the lifetime":
+    assert abs(nominal(tau) - true_tau) < 3 * sigma(tau)
+    assert dim(tau) == "Time"

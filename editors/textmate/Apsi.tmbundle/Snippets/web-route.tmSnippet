@@ -1,0 +1,18 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>content</key>
+	<string>@app.${1:get}("/${2:path}")
+fn ${3:handler}(req):
+	return {"${4:ok}": ${0:true}}</string>
+	<key>name</key>
+	<string>Web route</string>
+	<key>scope</key>
+	<string>source.apsi</string>
+	<key>tabTrigger</key>
+	<string>route</string>
+	<key>uuid</key>
+	<string>4AB8BFC5-145B-572E-9476-7B4CDB89AB68</string>
+</dict>
+</plist>

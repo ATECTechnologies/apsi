@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>content</key>
+	<string>for ${1:i}, ${2:item} in enumerate(${3:items}):
+	$0</string>
+	<key>name</key>
+	<string>For enumerate</string>
+	<key>scope</key>
+	<string>source.apsi</string>
+	<key>tabTrigger</key>
+	<string>fore</string>
+	<key>uuid</key>
+	<string>8417CB7A-2E00-558D-8174-CE2451C93A62</string>
+</dict>
+</plist>

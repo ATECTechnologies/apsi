@@ -1,0 +1,86 @@
+{
+  "name": "apsi-setup",
+  "productName": "Apsi Setup",
+  "version": "1.10.0",
+  "description": "Installer for the Apsi programming language",
+  "author": "Apsi",
+  "private": true,
+  "main": "electron/main.cjs",
+  "scripts": {
+    "payload:win": "python ../packaging/build_payload.py --platform windows --out payload",
+    "payload:linux": "python3 ../packaging/build_payload.py --platform linux --out payload",
+    "dev": "vite build && electron .",
+    "build:ui": "vite build",
+    "test": "node --test tests/core.test.cjs",
+    "dist:win": "npm run payload:win && vite build && electron-builder --win portable",
+    "dist:linux": "npm run payload:linux && vite build && electron-builder --linux AppImage"
+  },
+  "devDependencies": {
+    "@electron/fuses": "^1.8.0",
+    "@vitejs/plugin-react": "^4.3.4",
+    "electron": "^33.2.1",
+    "electron-builder": "^25.1.8",
+    "rcedit": "^4.0.1",
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1",
+    "vite": "^5.4.11"
+  },
+  "build": {
+    "appId": "dev.apsi.setup",
+    "productName": "Apsi Setup",
+    "artifactName": "ApsiSetup-${version}-${os}-${arch}.${ext}",
+    "directories": {
+      "output": "release",
+      "buildResources": "build"
+    },
+    "files": [
+      "electron/**",
+      "dist/**",
+      "package.json"
+    ],
+    "extraResources": [
+      {
+        "from": "payload",
+        "to": "payload"
+      }
+    ],
+    "asar": true,
+    "win": {
+      "target": [
+        {
+          "target": "portable",
+          "arch": [
+            "x64"
+          ]
+        }
+      ],
+      "icon": "build/icon.ico",
+      "requestedExecutionLevel": "asInvoker",
+      "signAndEditExecutable": false
+    },
+    "portable": {
+      "artifactName": "ApsiSetup-${version}-x64.exe",
+      "requestExecutionLevel": "user",
+      "unpackDirName": true,
+      "splashImage": "build/splash.bmp"
+    },
+    "linux": {
+      "target": [
+        {
+          "target": "AppImage",
+          "arch": [
+            "x64"
+          ]
+        }
+      ],
+      "icon": "build/icons",
+      "category": "Development"
+    },
+    "afterPack": "build/after-pack.cjs",
+    "publish": [],
+    "electronLanguages": [
+      "en-US"
+    ],
+    "compression": "normal"
+  }
+}

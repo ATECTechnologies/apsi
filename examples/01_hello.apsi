@@ -1,0 +1,60 @@
+# 01_hello.apsi — Apsi basics
+# run: apsi run examples/01_hello.apsi
+
+print("Hello, Apsi!")
+
+# let = constant, var = variable that can change
+let name = "Apsi"
+var count = 0
+for i in 1..=10:
+    count += i
+print(f"{name}: sum of 1 to 10 = {count}")
+
+# expression functions (=) and block functions (:)
+fn square(x: Float) -> Float = x * x
+
+fn fib(n: Int) -> Int:
+    var a, b = 0, 1
+    for _ in 0..n:
+        a, b = b, a + b
+    return a
+
+print("square(7) =", square(7.0))
+print("fib(30) =", fib(30))
+
+# names can use any Unicode letter
+let Δv = 12[m/s]
+print("Δv =", Δv)
+
+# list comprehension, pipe |>, lambda
+let evens = [x * x for x in 0..10 if x % 2 == 0]
+print("evens² =", evens)
+let double = fn(x) => 2 * x
+print("pipe:", 21 |> double)
+print("sum via pipe:", evens |> sum)
+
+# a struct with a method
+struct Vec2D:
+    x: Float
+    y: Float
+    fn length(self) -> Float = sqrt(self.x ** 2 + self.y ** 2)
+
+let v = Vec2D(3.0, 4.0)
+print(v, "length =", v.length())
+
+# if / elif / else and the conditional expression
+let grade = 87
+if grade >= 90:
+    print("A")
+elif grade >= 80:
+    print("B")
+else:
+    print("C")
+print("pass" if grade >= 50 else "fail")
+
+test "fib is correct":
+    assert fib(10) == 55
+    assert fib(1) == 1
+
+test "vector length":
+    assert Vec2D(6.0, 8.0).length() == 10.0

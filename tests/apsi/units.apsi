@@ -1,0 +1,55 @@
+# Physical units
+
+use physics.constants
+
+test "prefixes and conversions":
+    assert 1[km] == 1000m
+    assert 1[ms] ~= 0.001[s]
+    assert 1[kWh] ~= 3.6[MJ]
+    assert 1[h] == 3600s
+    assert (36[km/h] as [m/s]).magnitude ~= 10.0
+    assert 180[deg] ~= pi
+    assert 1[atm] ~= 101.325[kPa]
+
+test "derived units":
+    assert dim(1[N]) == "Force"
+    assert dim(1[J] / 1[s]) == "Power"
+    assert dim(1[V] * 1[A]) == "Power"
+    assert 1[N*m] == 1[J]
+    assert dim(1[kg] * 1[m/s]) == "Momentum"
+
+test "dimensionless results become numbers":
+    let r = 6[km] / 2[km]
+    assert type(r) == "Float"
+    assert r == 3.0
+
+test "sqrt and powers keep units":
+    assert sqrt(9[m^2]) == 3m
+    assert dim((2m) ** 3) == "Volume"
+    assert dim(cbrt(8[m^3])) == "Length"
+
+test "constants":
+    assert approx(c, 299792458[m/s])
+    assert dim(G * M_sun / AU ** 2) == "Acceleration"
+    assert approx(h * c / (500[nm]) as [eV], 2.4797[eV], rel=1e-3)
+
+test "tensors with units":
+    let v = tensor([3.0, 4.0]) * u.m / u.s
+    assert norm(v) == 5[m/s]
+    assert dim(sum(v)) == "Velocity"
+    assert v[0] == 3[m/s]
+    assert unit(dot(v, v)) == "m^2/s^2"
+
+test "zero is compatible with any unit":
+    var total = 0
+    for d in [1m, 2m, 3m]:
+        total = total + d
+    assert total == 6m
+
+test "typed functions accept the right dimension":
+    fn power(f: Force, v: Velocity) -> Power = f * v
+    assert power(10N, 2[m/s]) == 20W
+
+test "unit type annotations":
+    fn speed(d: [m], t: [s]) -> [m/s] = d / t
+    assert speed(100m, 10s) == 10[m/s]

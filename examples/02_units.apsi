@@ -1,0 +1,51 @@
+# 02_units.apsi — physical units, checked before the program runs
+use physics.constants
+
+# two ways to attach a unit: 5kg or 9.81[m/s^2]
+let m = 70kg
+let g = 9.81[m/s^2]
+let height = 10m
+
+let weight = m * g  # -> N
+let energy = m * g * height  # -> J
+print("weight =", weight)
+print("potential energy =", energy)
+print("in kJ =", energy as [kJ])
+print("in kcal =", energy as [kcal])
+
+# declare physical quantity types
+fn free_fall_time(height: Length, accel: Acceleration) -> Time =
+    sqrt(2 * height / accel)
+
+let t = free_fall_time(100m, g0)
+print("falling 100 m takes", t)
+
+# automatic unit conversion
+let marathon = 42.195[km]
+let pace = 3[min] + 0[s]
+let speed = marathon / (pace * 42.195)
+print("running speed =", speed as [km/h])
+
+# physical constants (CODATA)
+let E_photon = h * c / 500[nm]
+print("a 500 nm photon carries", E_photon as [eV])
+let E_rest = m_e * c ** 2
+print("electron rest energy =", E_rest as [MeV])
+
+# u.<unit> to multiply tensors
+let speeds = tensor([10.0, 20.0, 30.0]) * u.km / u.h
+print("several speeds:", speeds as [m/s])
+
+# dimensionless results become plain numbers automatically
+let ratio = 3[km] / 500m
+print("ratio =", ratio, type(ratio))
+
+# uncomment the next line and the checker refuses to run the program:
+#   let wrong = 5m + 2s          # UnitError: cannot add Length and Time
+#   let bad = free_fall_time(10kg, g)   # argument 'height' must be Length
+
+test "unit algebra":
+    assert 1[km] == 1000m
+    assert (1[J] / 1[s]) ~= 1[W]
+    assert 1[eV] ~= 1.602176634e-19[J]
+    assert dim(m * g) == "Force"

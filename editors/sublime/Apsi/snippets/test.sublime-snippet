@@ -1,0 +1,9 @@
+<snippet>
+  <content><![CDATA[
+test "${1:description}":
+	assert ${0:true}
+]]></content>
+  <tabTrigger>test</tabTrigger>
+  <scope>source.apsi</scope>
+  <description>Test</description>
+</snippet>

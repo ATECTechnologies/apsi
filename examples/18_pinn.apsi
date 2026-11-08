@@ -1,0 +1,44 @@
+# 18_pinn.apsi — Physics-Informed Neural Network
+# a neural network "learns physics" straight from the equation, with no solution data at all:
+#     u''(t) + ω² u(t) = 0,   u(0) = 1,   u'(0) = 0      (exact solution: cos(ωt))
+# uses higher-order autodiff: the gradient of a loss that contains the network's second derivative
+use nn
+
+let omega = 2.0
+let ts = linspace(0.0, 2.0, 40)
+
+var params = mlp_init([1, 24, 24, 1], seed=0)
+
+fn net(p, t):
+    var h = reshape(t, -1, 1)
+    for i, layer in enumerate(p):
+        h = h @ layer.W + layer.b
+        if i < len(p) - 1:
+            h = tanh(h)
+    return reshape(h, -1)
+
+fn physics_loss(p):
+    # du/dt and d²u/dt² at every point at once (the network treats each point separately)
+    let u = fn(t) => net(p, t)
+    let du = fn(t) => grad(fn(s) => sum(u(s)))(t)
+    let d2u = grad(fn(s) => sum(du(s)))(ts)
+    let residual = d2u + omega ** 2 * u(ts)
+    let t0 = tensor([0.0])
+    let ic = (u(t0)[0] - 1.0) ** 2 + du(t0)[0] ** 2
+    return mean(residual ** 2) + 10.0 * ic
+
+let opt = adam(lr=0.01)
+let steps = 1500
+for step in 0..steps:
+    let loss, g = value_and_grad(physics_loss)(params)
+    set_lr(opt, cosine_lr(step, steps, base=0.01, warmup=50, minimum=1e-4))
+    params = opt.step(params, g)
+    if step % 300 == 0 or step == steps - 1:
+        print(f"step {step:4}  physics loss {loss:.2e}")
+
+let pred = net(params, ts)
+let err = max(abs(pred - cos(omega * ts)))
+print("largest error against cos(ωt):", err)
+
+test "network discovers cos(ωt) from the equation alone":
+    assert err < 0.05

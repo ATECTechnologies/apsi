@@ -1,0 +1,167 @@
+{
+  "Function (expression)": {
+    "prefix": "fn",
+    "body": [
+      "fn ${1:name}(${2:x}) = ${0:x}"
+    ],
+    "description": "One-line function"
+  },
+  "Function (block)": {
+    "prefix": "fnb",
+    "body": [
+      "fn ${1:name}(${2:x}: ${3:Float}) -> ${4:Float}:",
+      "\t$0",
+      "\treturn ${2:x}"
+    ],
+    "description": "Function with a body"
+  },
+  "Lambda": {
+    "prefix": "lam",
+    "body": [
+      "fn(${1:x}) => ${0:x}"
+    ],
+    "description": "Anonymous function"
+  },
+  "Struct": {
+    "prefix": "struct",
+    "body": [
+      "struct ${1:Name}:",
+      "\t${2:field}: ${3:Float}",
+      "\t",
+      "\tfn ${4:method}(self) = ${0:self.${2:field}}"
+    ],
+    "description": "Struct with a field and a method"
+  },
+  "Let": {
+    "prefix": "let",
+    "body": [
+      "let ${1:name} = ${0:value}"
+    ]
+  },
+  "Var": {
+    "prefix": "var",
+    "body": [
+      "var ${1:name} = ${0:value}"
+    ]
+  },
+  "If": {
+    "prefix": "if",
+    "body": [
+      "if ${1:cond}:",
+      "\t$0"
+    ]
+  },
+  "If / else": {
+    "prefix": "ife",
+    "body": [
+      "if ${1:cond}:",
+      "\t$2",
+      "else:",
+      "\t$0"
+    ]
+  },
+  "For range": {
+    "prefix": "for",
+    "body": [
+      "for ${1:i} in ${2:0}..${3:n}:",
+      "\t$0"
+    ]
+  },
+  "For enumerate": {
+    "prefix": "fore",
+    "body": [
+      "for ${1:i}, ${2:item} in enumerate(${3:items}):",
+      "\t$0"
+    ]
+  },
+  "While": {
+    "prefix": "while",
+    "body": [
+      "while ${1:cond}:",
+      "\t$0"
+    ]
+  },
+  "Test": {
+    "prefix": "test",
+    "body": [
+      "test \"${1:description}\":",
+      "\tassert ${0:true}"
+    ]
+  },
+  "Assert approx": {
+    "prefix": "asa",
+    "body": [
+      "assert ${1:a} ~= ${0:b}"
+    ]
+  },
+  "Use module": {
+    "prefix": "use",
+    "body": [
+      "use ${1|nn,math,physics,physics.constants,linalg,random,sci,data,web,models,parallel,precision,crypto,io,gpu|}"
+    ]
+  },
+  "Import file": {
+    "prefix": "import",
+    "body": [
+      "import \"${1:lib.apsi}\" as ${0:lib}"
+    ]
+  },
+  "Evolve (ODE)": {
+    "prefix": "evolve",
+    "body": [
+      "var ${1:x} = ${2:1m}",
+      "var ${3:v} = ${4:0[m/s]}",
+      "evolve ${1:x}, ${3:v} over t in 0[s]..${5:10[s]} step ${6:1[ms]} using ${7|rk4,rk45,verlet,symplectic,midpoint,euler|} record every ${8:10} into ${9:traj}:",
+      "\t${1:x}' = ${3:v}",
+      "\t${3:v}' = ${0:-${1:x} / 1[s^2]}"
+    ],
+    "description": "Differential equation solved over time"
+  },
+  "Gradient": {
+    "prefix": "grad",
+    "body": [
+      "let ${1:loss}, ${2:g} = value_and_grad(${3:loss_fn})(${0:params})"
+    ]
+  },
+  "Training loop": {
+    "prefix": "train",
+    "body": [
+      "let opt = adam(lr=${1:0.01})",
+      "for step in 0..${2:500}:",
+      "\tlet loss, g = value_and_grad(${3:loss_fn})(params, ${4:X}, ${5:y})",
+      "\tparams = opt.step(params, g)",
+      "\tif step % 100 == 0:",
+      "\t\tprint(f\"step {step}: loss {loss:.4f}\")$0"
+    ]
+  },
+  "Web route": {
+    "prefix": "route",
+    "body": [
+      "@app.${1|get,post,put,delete|}(\"/${2:path}\")",
+      "fn ${3:handler}(req):",
+      "\treturn {\"${4:ok}\": ${0:true}}"
+    ]
+  },
+  "Main guard": {
+    "prefix": "main",
+    "body": [
+      "fn main():",
+      "\t$0",
+      "",
+      "if not testing():",
+      "\tmain()"
+    ]
+  },
+  "Precision decorator": {
+    "prefix": "@prec",
+    "body": [
+      "@precision(${1|exact,f64,f32,f16,bf16,fp8_e4m3,int8|})"
+    ]
+  },
+  "Print f-string": {
+    "prefix": "pf",
+    "body": [
+      "print(f\"${1:x} = {${2:x}}\")$0"
+    ]
+  }
+}

@@ -1,0 +1,34 @@
+# 08_neural_net.apsi — build and train a neural network from scratch (3-class spiral)
+use nn
+
+let X, y = spiral_data(n_per_class=100, classes=3, noise=0.2, seed=0)
+print("data:", shape(X), "labels:", shape(y))
+
+# the model is plain data: a list of record(W, b)
+var params = mlp_init([2, 64, 64, 3], seed=42)
+print("parameters:", param_count(params))
+
+fn forward(params, x):
+    var h = x
+    for i, layer in enumerate(params):
+        h = h @ layer.W + layer.b
+        if i < len(params) - 1:
+            h = relu(h)
+    return h
+
+fn loss_fn(params, x, labels) = cross_entropy(forward(params, x), labels)
+
+let opt = adam(lr=0.01)
+let steps = 400
+for step in 0..steps:
+    let loss, g = value_and_grad(loss_fn)(params, X, y)
+    set_lr(opt, cosine_lr(step, steps, base=0.01, warmup=20))
+    params = opt.step(params, clip_grad_norm(g, 5.0))
+    if step % 100 == 0 or step == steps - 1:
+        print(f"step {step:4}  loss {loss:.4f}  acc {accuracy(forward(params, X), y):.3f}")
+
+let final_acc = accuracy(forward(params, X), y)
+print("final accuracy:", final_acc)
+
+test "network learns the spiral":
+    assert final_acc > 0.95

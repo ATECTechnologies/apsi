@@ -1,0 +1,28 @@
+*apsi.txt*  Apsi language support for Vim and Neovim
+
+INTRODUCTION                                                    *apsi*
+
+Files ending in .apsi (and scripts starting with #!/usr/bin/env apsi) get:
+
+- syntax colours: keywords, types, built-ins, units (5kg, 9.81[m/s^2], as [km]),
+  f-strings, decorators, derivatives in evolve blocks
+- indentation after ':' and inside brackets, 4 spaces
+- 'commentstring' "# %s"
+- :make runs `apsi check` on the file and fills the quickfix list
+- Neovim: the Apsi language server starts automatically (live errors, hover,
+  go to definition, completion, formatting with |vim.lsp.buf.format()|)
+
+MAPPINGS                                                        *apsi-mappings*
+
+<LocalLeader>r    run the file          (apsi run)
+<LocalLeader>t    test the file         (apsi test)
+<LocalLeader>c    check the file        (:make)
+<LocalLeader>f    format the file       (apsi fmt)
+<LocalLeader>i    open the Apsi REPL in a terminal
+
+OPTIONS                                                         *apsi-options*
+
+g:apsi_lsp        set to v:false to keep the language server off (Neovim)
+g:apsi_command    command list that starts Apsi, default { "apsi" }
+
+ vim:tw=78:ts=8:ft=help:norl:

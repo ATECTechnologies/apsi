@@ -1,0 +1,26 @@
+# 12_security.apsi — security: hashing, HMAC, passwords, tokens, sandbox
+use crypto
+
+let stored = password_hash("correct horse battery staple")
+print("store passwords like this:", stored[0:40], "...")
+print("right password:", password_verify("correct horse battery staple", stored))
+print("wrong password:", password_verify("hunter2", stored))
+
+let key = random_token(32)
+let msg = "transfer 100 THB to account A"
+let sig = hmac_sign(key, msg)
+print("HMAC:", sig)
+print("original message verifies:", hmac_verify(key, msg, sig))
+print("tampered message verifies:", hmac_verify(key, "transfer 9999 THB to account B", sig))
+
+print("sha3_256:", hash("apsi", "sha3_256"))
+print("permissions of this program:", permissions())
+
+# programs cannot call Python/C/the network unless whoever runs them allows it:
+#   apsi run app.apsi --allow-python --allow-ffi --allow-net
+
+test "security primitives":
+    assert password_verify("pw", password_hash("pw"))
+    assert not password_verify("other", password_hash("pw"))
+    assert secure_equal("abc", "abc")
+    assert hash("abc") == "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"

@@ -1,0 +1,29 @@
+# 06_heat_equation.apsi — 2-D heat equation  ∂T/∂t = α ∇²T
+use physics.fields
+
+let n = 64
+let dx = 1[mm]
+let alpha = 1.1e-4[m^2/s]  # thermal diffusivity of copper (approximately)
+
+# a 300 K metal plate with a 400 K hot spot in the middle
+var temp = full((n, n), 300[K])
+let hot = zeros(n, n)
+hot[28:36, 28:36] = 100.0
+temp = temp + hot * u.K
+let heat0 = sum(temp)
+
+# choose a stable dt: dt < dx² / (4α)
+let dt = 0.2 * dx ** 2 / alpha
+print("dt =", dt as [ms])
+
+evolve temp over t in 0[s]..0.5[s] step dt using euler:
+    temp' = alpha * laplacian(temp, dx)
+
+print("highest temperature after 0.5 s:", max(temp))
+print("lowest temperature:", min(temp))
+print("total heat conserved (periodic):", sum(temp) ~= heat0)
+
+test "heat spreads but total is conserved":
+    assert max(temp) < 400[K]
+    assert min(temp) >= 300[K]
+    assert sum(temp) ~= heat0

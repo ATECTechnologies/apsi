@@ -1,0 +1,8 @@
+<snippet>
+  <content><![CDATA[
+let ${1:loss}, ${2:g} = value_and_grad(${3:loss_fn})(${0:params})
+]]></content>
+  <tabTrigger>grad</tabTrigger>
+  <scope>source.apsi</scope>
+  <description>Gradient</description>
+</snippet>

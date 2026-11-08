@@ -1,0 +1,27 @@
+# 05_orbit.apsi — one year of Earth's orbit around the Sun, checking energy conservation
+use physics.constants
+
+fn accel(r) = -G * M_sun * r / norm(r) ** 3
+
+fn energy(r, v) = 0.5 * M_earth * dot(v, v) - G * M_sun * M_earth / norm(r)
+
+var r = tensor([1.0, 0.0]) * AU
+var v = tensor([0.0, 29.78]) * u.km / u.s
+let E0 = energy(r, v)
+
+# verlet is a symplectic integrator: energy does not drift even in long simulations
+evolve r, v over t in 0[day]..365.25[day] step 1[h] using verlet:
+    r' = v
+    v' = accel(r)
+
+let E1 = energy(r, v)
+print("position after 1 year:", r as [au])
+print("initial energy:", E0)
+print("final energy  :", E1)
+print("relative error:", abs((E1 - E0) / E0))
+
+test "energy is conserved":
+    assert abs((E1 - E0) / E0) < 1e-6
+
+test "earth returns near its start":
+    assert norm(r - tensor([1.0, 0.0]) * AU) < 0.01[au]

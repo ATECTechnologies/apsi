@@ -1,0 +1,8 @@
+<snippet>
+  <content><![CDATA[
+@precision(${1:exact})
+]]></content>
+  <tabTrigger>@prec</tabTrigger>
+  <scope>source.apsi</scope>
+  <description>Precision decorator</description>
+</snippet>

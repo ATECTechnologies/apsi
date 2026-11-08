@@ -1,0 +1,10 @@
+<snippet>
+  <content><![CDATA[
+fn ${1:name}(${2:x}: ${3:Float}) -> ${4:Float}:
+	$0
+	return ${2:x}
+]]></content>
+  <tabTrigger>fnb</tabTrigger>
+  <scope>source.apsi</scope>
+  <description>Function with a body</description>
+</snippet>

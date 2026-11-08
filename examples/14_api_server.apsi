@@ -1,0 +1,17 @@
+# 14_api_server.apsi — expose Apsi functions as an HTTP API for JS / Next.js / Java / Go
+# run: apsi serve examples/14_api_server.apsi --port 8787
+#
+# from Next.js / JavaScript:
+#   const r = await fetch("http://127.0.0.1:8787/call/kinetic", {
+#     method: "POST", headers: {"Content-Type": "application/json"},
+#     body: JSON.stringify({args: [{value: 2, unit: "kg"}, {value: 3, unit: "m/s"}]})
+#   });
+#   (await r.json()).result   // {value: 9, unit: "J"}
+#
+# from Java (java.net.http.HttpClient) send the same JSON to /call/<function name>
+
+fn kinetic(m: Mass, v: Velocity) -> Energy = 0.5 * m * v ** 2
+
+fn predict(xs: Tensor[N]) -> Tensor[N] = 2.0 * xs + 1.0
+
+fn greet(name: Str) -> Str = f"Hello {name}, from Apsi"

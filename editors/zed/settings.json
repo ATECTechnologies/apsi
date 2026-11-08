@@ -1,0 +1,11 @@
+// Apsi for Zed — merge into ~/.config/zed/settings.json (Windows: %AppData%\Zed\settings.json).
+// Starts the Apsi language server for .apsi files (live errors, hover, completion, formatting).
+{
+  "file_types": { "Apsi": ["apsi"] },
+  "lsp": {
+    "apsi": { "binary": { "path": "apsi", "arguments": ["lsp"] } }
+  },
+  "languages": {
+    "Apsi": { "tab_size": 4, "hard_tabs": false, "language_servers": ["apsi"] }
+  }
+}

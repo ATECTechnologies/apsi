@@ -1,0 +1,13 @@
+<snippet>
+  <content><![CDATA[
+let opt = adam(lr=${1:0.01})
+for step in 0..${2:500}:
+	let loss, g = value_and_grad(${3:loss_fn})(params, ${4:X}, ${5:y})
+	params = opt.step(params, g)
+	if step % 100 == 0:
+		print(f"step {step}: loss {loss:.4f}")$0
+]]></content>
+  <tabTrigger>train</tabTrigger>
+  <scope>source.apsi</scope>
+  <description>Training loop</description>
+</snippet>

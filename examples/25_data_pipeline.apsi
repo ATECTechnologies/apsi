@@ -1,0 +1,52 @@
+# 25_data_pipeline.apsi — streaming data pipeline: parallel + prefetch + SSD cache
+use data
+use parallel
+use nn
+
+# large data lives in a memory-mapped tensor on disk (it may be larger than RAM)
+let N = 20000
+let store = open_tensor("pipeline_store/features.npy", (N, 16), f32)
+store[0:N, :] = randn(N, 16, seed=1)
+flush(store)
+let labels = (sum(load_tensor("pipeline_store/features.npy"), axis=1) > 0) * 1
+
+fn augment(b):
+    let x, label = b
+    return (x + 0.01 * randn(shape(x)[0], 16), label)  # runs in parallel on worker threads, one batch at a time
+
+let features = load_tensor("pipeline_store/features.npy", mmap=true)
+let ds = from_tensors(features, labels, batch=512, shuffle=true, seed=2)
+    |> map(augment, workers=cpu_count())
+    |> prefetch(4)
+
+let speed = throughput(ds)
+print(f"pipeline: {speed.per_second:,.0f} batches/s ({speed.items} batches per pass)")
+
+# train while pulling data from the pipeline
+var params = mlp_init([16, 32, 2], seed=3)
+let opt = adam(lr=0.01)
+fn forward(p, x) = relu(x @ p[0].W + p[0].b) @ p[1].W + p[1].b
+for epoch in 0..3:
+    var total = 0.0
+    for xb, yb in ds:
+        let loss, g = value_and_grad(fn(p) => cross_entropy(forward(p, xb), yb))(params)
+        params = opt.step(params, g)
+        total += loss
+    print(f"epoch {epoch}  loss {total / len(ds):.4f}")
+
+# expensive work whose result never changes: store it on disk, the next call is instant
+@disk_cache("pipeline_store/cache")
+fn expensive_stats(n: Int) = (mean(randn(n, seed=9)), std(randn(n, seed=9)))
+let t0 = clock()
+expensive_stats(2000000)
+let first = clock() - t0
+let t1 = clock()
+expensive_stats(2000000)
+let second = clock() - t1
+print(f"disk_cache: first call {first as [ms]:.1f}  second call {second as [ms]:.2f}")
+
+test "the pipeline sees every row exactly once per epoch":
+    var rows = 0
+    for xb, yb in ds:
+        rows += shape(xb)[0]
+    assert rows == N

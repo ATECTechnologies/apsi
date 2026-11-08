@@ -1,0 +1,16 @@
+# Apsi for Helix — append this to ~/.config/helix/languages.toml (Windows: %AppData%\helix\languages.toml).
+# Gives the language server (live errors, hover, go to definition, completion, formatting) for .apsi files.
+
+[language-server.apsi]
+command = "apsi"
+args = ["lsp"]
+
+[[language]]
+name = "apsi"
+scope = "source.apsi"
+file-types = ["apsi"]
+roots = ["apsi.toml"]
+comment-token = "#"
+indent = { tab-width = 4, unit = "    " }
+auto-format = true
+language-servers = ["apsi"]

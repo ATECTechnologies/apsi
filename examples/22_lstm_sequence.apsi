@@ -1,0 +1,30 @@
+# 22_lstm_sequence.apsi — an LSTM predicts the next value of a wave (sequence learning)
+use nn
+
+let T = 20
+let starts = rand(256, seed=1) * 2.0 * pi
+fn wave(s) = sin(s) + 0.5 * sin(2.0 * s)
+
+# dataset: see 20 points, guess the 21st
+let steps = arange(0, T + 1) * 0.3
+let grid = reshape(starts, 256, 1) + reshape(steps, 1, T + 1)
+let series = wave(grid)
+let X = reshape(series[:, 0:T], 256, T, 1)
+let y = reshape(series[:, T], 256, 1)
+
+var params = record(cell=lstm_init(1, 32, seed=2), head=dense(32, 1, seed=3))
+fn predict(p, x) = lstm(p.cell, x)[:, -1, :] @ p.head.W + p.head.b
+fn loss(p, x, target) = mse(predict(p, x), target)
+
+let result = train(loss, params, (X, y), adam(lr=0.01), epochs=60, batch_size=64, clip=1.0)
+params = result.params
+
+let test_start = 1.234
+let window = reshape(wave(test_start + arange(0, T) * 0.3), 1, T, 1)
+let guess = predict(params, window)[0, 0]
+let truth = wave(test_start + T * 0.3)
+print(f"guess {guess:.4f}  truth {truth:.4f}")
+
+test "lstm learns the waveform":
+    assert result.history[-1] < 0.01
+    assert abs(guess - truth) < 0.1

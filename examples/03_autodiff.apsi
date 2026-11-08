@@ -1,0 +1,37 @@
+# 03_autodiff.apsi — automatic differentiation (unit-aware)
+
+# 1) derivative of an ordinary function
+fn f(x) = x ** 3 + 2 * sin(x)
+let df = grad(f)
+print("f'(1.0) =", df(1.0), " (exact:", 3 + 2 * cos(1.0), ")")
+
+# 2) physics: force = -dU/dx  ->  the unit comes out as N by itself
+let k = 200[N/m]
+fn spring_energy(x: Length) -> Energy = 0.5 * k * x ** 2
+let force = fn(x) => -grad(spring_energy)(x)
+print("spring force at x = 5 cm:", force(5[cm]))
+
+# 3) dK/dv = momentum
+fn kinetic(v: Velocity) -> Energy = 0.5 * 3kg * v ** 2
+print("dK/dv at 4 m/s =", grad(kinetic)(4[m/s]))
+
+# 4) gradients with respect to tensors: ready for AI
+let X = randn(64, 3, seed=1)
+let w_true = tensor([2.0, -1.0, 0.5])
+let y = X @ w_true
+
+fn loss(w) = mean((X @ w - y) ** 2)
+
+var w = zeros(3)
+for step in 0..200:
+    w = w - 0.1 * grad(loss)(w)
+print("learned w =", w, " (true value", w_true, ")")
+
+# 5) value_and_grad gives the value and the derivative at once
+let L, g = value_and_grad(loss)(w)
+print("loss =", L, " |grad| =", norm(g))
+
+test "gradients":
+    assert df(0.0) ~= 2.0
+    assert grad(kinetic)(4[m/s]) ~= 12[kg*m/s]
+    assert norm(w - w_true) < 1e-3

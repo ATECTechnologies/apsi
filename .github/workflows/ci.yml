@@ -1,0 +1,48 @@
+# Apsi CI: test everything on Windows and Linux, Python 3.9 – 3.13
+name: ci
+on: [push, pull_request, workflow_dispatch]
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-22.04, ubuntu-24.04, windows-2022, windows-2025]
+        python: ["3.9", "3.11", "3.13"]
+    runs-on: ${{ matrix.os }}
+    env:
+      PYTHONUTF8: "1"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - name: Install
+        run: python -m pip install -e .
+      - name: Build native example (Linux)
+        if: runner.os == 'Linux'
+        run: sh examples/native/build.sh
+      - name: Build native example (Windows)
+        if: runner.os == 'Windows'
+        shell: cmd
+        run: examples\native\build.bat
+      - name: Doctor
+        run: apsi doctor || true
+        shell: bash
+      - name: Language tests (compiler engine)
+        run: apsi test examples tests/apsi --allow-all
+      - name: Language tests (reference interpreter)
+        run: apsi test examples tests/apsi --allow-all --engine interp
+      - name: Toolchain tests
+        run: python -m unittest discover tests -v
+      - name: Formatting
+        run: apsi fmt --check examples tests/apsi
+      - name: Apsi Guard (malware scan of the repository)
+        run: apsi scan examples tests/apsi tools --fail-on high
+      - name: Launcher (Windows)
+        if: runner.os == 'Windows'
+        shell: cmd
+        run: apsi.bat run examples\01_hello.apsi
+      - name: Launcher (Linux)
+        if: runner.os == 'Linux'
+        run: ./apsi.sh run examples/01_hello.apsi

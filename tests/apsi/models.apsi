@@ -1,0 +1,20 @@
+use models
+use nn
+
+test "safetensors round trip with nested parameter trees":
+    let p = record(enc=[dense(4, 8, seed=1), dense(8, 2, seed=2)], scale=ones(2))
+    save_safetensors("_tmp_models/p.safetensors", p)
+    let back = load_safetensors("_tmp_models/p.safetensors")
+    assert approx(back.enc[1].W, p.enc[1].W)
+    assert approx(back.scale, p.scale)
+
+test "compressed loading and quantize_model reduce memory":
+    let p = record(W=randn(256, 256, seed=3), b=zeros(256))
+    save_safetensors("_tmp_models/q.safetensors", p)
+    let small = load_safetensors("_tmp_models/q.safetensors", dtype=fp4_e2m1)
+    assert model_size(small) < model_size(p) / 10
+    let q8 = quantize_model(p, int8)
+    let x = randn(4, 256, seed=4)
+    let err = norm(qlinear(x, q8.W, q8.b) - (x @ p.W + p.b)) / norm(x @ p.W)
+    assert err < 0.01
+    assert model_size(dequantize_model(q8)) > model_size(q8)

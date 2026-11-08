@@ -1,0 +1,26 @@
+# 13_interop.apsi — working with Python / PyTorch / C
+# run: apsi run examples/13_interop.apsi --allow-python --allow-ffi
+
+# --- Python: call any module
+let pymath = pyimport("math")
+print("Python math.gamma(5) =", pymath.gamma(5.0))
+let statistics = pyimport("statistics")
+print("Python median =", statistics.median([3, 1, 4, 1, 5]))
+
+# --- PyTorch (when installed)
+let have_torch = pyimport("importlib.util").find_spec("torch") != none
+if have_torch:
+    let t = to_torch(randn(3, 3, seed=0))
+    print("torch tensor:", t.shape)
+    print("back in Apsi:", from_torch(t * 2))
+else:
+    print("(PyTorch is not installed on this machine — skipped)")
+
+# --- C: call math functions from the system C library (libm on Linux, ucrtbase on Windows)
+let libm_path = "ucrtbase" if platform() == "windows" else pyimport("ctypes.util").find_library("m")
+if libm_path != none:
+    let libm = cload(libm_path)
+    let c_cos = libm.fn("cos", [f64], f64)
+    let c_hypot = libm.fn("hypot", [f64, f64], f64)
+    print("C cos(0) =", c_cos(0.0))
+    print("C hypot(3, 4) =", c_hypot(3.0, 4.0))

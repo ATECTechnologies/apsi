@@ -1,0 +1,60 @@
+use sci
+
+test "einsum matches matmul and is differentiable":
+    let A = randn(3, 4, seed=1)
+    let B = randn(4, 2, seed=2)
+    assert approx(einsum("ij,jk->ik", A, B), A @ B)
+    assert approx(einsum("ii", eye(3) * 2.0), 6.0)
+    let g = grad(fn(W) => sum(einsum("ij,jk->ik", W, B) ** 2))(A)
+    let g2 = grad(fn(W) => sum((W @ B) ** 2))(A)
+    assert approx(g, g2)
+    let gb = grad(fn(v) => einsum("i,i->", v, v))(tensor([1.0, 2.0, 3.0]))
+    assert approx(gb, tensor([2.0, 4.0, 6.0]))
+
+test "einsum multiplies units":
+    let F = tensor([1.0, 2.0]) * u.N
+    let d = tensor([3.0, 4.0]) * u.m
+    assert einsum("i,i->", F, d) == 11[J]
+
+test "fft finds the frequency of a signal":
+    let n = 256
+    let dt = 1[ms]
+    let ts = arange(0, n) * dt
+    let sig = sin(2 * pi * 50[Hz] * ts) * u.V
+    let freqs, power = power_spectrum(sig, dt)
+    let peak = freqs[argmax(power)]
+    assert abs(peak - 50[Hz]) < 4[Hz]
+    assert unit(power) == unit(1[V] * 1[V])
+
+test "integration":
+    assert approx(integrate(fn(x) => x ** 2, 0.0, 3.0), 9.0)
+    assert approx(integrate(fn(x) => sin(x), 0.0, pi), 2.0)
+    let work = integrate(fn(x) => 200[N/m] * x, 0m, 0.1m)
+    assert approx(work, 1[J])
+    let xs = linspace(0.0, 1.0, 1001)
+    assert approx(trapz(xs * xs, xs), 1.0 / 3.0, rel=1e-5)
+
+test "roots":
+    assert approx(find_root(fn(x) => x ** 2 - 2.0, 1.0), sqrt(2.0))
+    let v = find_root(fn(v) => 0.5 * 2kg * v ** 2 - 9[J], 1[m/s])
+    assert approx(v, 3[m/s])
+    assert approx(bisect(fn(x) => cos(x) - x, 0.0, 1.0), 0.739085133215, rel=1e-9)
+
+test "minimize with lbfgs (Rosenbrock)":
+    let r = minimize(fn(p) => (1.0 - p[0]) ** 2 + 100.0 * (p[1] - p[0] ** 2) ** 2, tensor([-1.2, 1.0]))
+    assert r.converged
+    assert approx(r.x, tensor([1.0, 1.0]), rel=1e-5)
+
+test "curve_fit returns correlated uncertain parameters":
+    let xs = linspace(0.0, 10.0, 50)
+    let noise = 0.1 * randn(50, seed=4)
+    let ys = (2.0 * xs + 1.0 + noise) * u.m
+    let fit = curve_fit(fn(x, p) => p[0] * x + p[1], xs, ys, [1[m], 0[m]])
+    let slope = fit.params[0]
+    let icpt = fit.params[1]
+    assert abs(nominal(slope) - 2[m]) < 3 * sigma(slope)
+    assert abs(nominal(icpt) - 1[m]) < 3 * sigma(icpt)
+    assert dim(slope) == "Length"
+
+test "interp":
+    assert approx(interp(1.5[s], tensor([1.0, 2.0]) * u.s, tensor([10.0, 20.0]) * u.m), 15m)

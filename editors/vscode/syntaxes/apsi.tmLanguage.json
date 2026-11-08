@@ -1,0 +1,844 @@
+{
+ "$schema": "https://raw.githubusercontent.com/martinring/tmlanguage/master/tmlanguage.json",
+ "name": "Apsi",
+ "scopeName": "source.apsi",
+ "fileTypes": [
+  "apsi"
+ ],
+ "patterns": [
+  {
+   "include": "#statement"
+  }
+ ],
+ "repository": {
+  "statement": {
+   "patterns": [
+    {
+     "include": "#comment"
+    },
+    {
+     "include": "#test"
+    },
+    {
+     "include": "#decorator"
+    },
+    {
+     "include": "#fn-def"
+    },
+    {
+     "include": "#lambda"
+    },
+    {
+     "include": "#struct-def"
+    },
+    {
+     "include": "#use"
+    },
+    {
+     "include": "#evolve"
+    },
+    {
+     "include": "#deriv"
+    },
+    {
+     "include": "#expression"
+    }
+   ]
+  },
+  "expression": {
+   "patterns": [
+    {
+     "include": "#comment"
+    },
+    {
+     "include": "#fstring-triple"
+    },
+    {
+     "include": "#string-triple"
+    },
+    {
+     "include": "#fstring"
+    },
+    {
+     "include": "#string"
+    },
+    {
+     "include": "#number"
+    },
+    {
+     "include": "#unit-cast"
+    },
+    {
+     "include": "#constant"
+    },
+    {
+     "include": "#self"
+    },
+    {
+     "include": "#keyword"
+    },
+    {
+     "include": "#generic-type"
+    },
+    {
+     "include": "#type"
+    },
+    {
+     "include": "#dtype"
+    },
+    {
+     "include": "#call"
+    },
+    {
+     "include": "#member"
+    },
+    {
+     "include": "#operator"
+    },
+    {
+     "include": "#punctuation"
+    },
+    {
+     "include": "#brackets"
+    }
+   ]
+  },
+  "comment": {
+   "name": "comment.line.number-sign.apsi",
+   "begin": "#",
+   "end": "$",
+   "beginCaptures": {
+    "0": {
+     "name": "punctuation.definition.comment.apsi"
+    }
+   },
+   "patterns": [
+    {
+     "name": "keyword.other.todo.apsi",
+     "match": "\\b(TODO|FIXME|NOTE|HACK|XXX)\\b"
+    }
+   ]
+  },
+  "test": {
+   "match": "^\\s*(test)\\s+(?=\")",
+   "captures": {
+    "1": {
+     "name": "keyword.control.test.apsi"
+    }
+   }
+  },
+  "decorator": {
+   "match": "^\\s*(@)\\s*([\\p{L}_][\\p{L}\\p{N}_]*(?:\\.[\\p{L}_][\\p{L}\\p{N}_]*)*)",
+   "captures": {
+    "1": {
+     "name": "punctuation.definition.decorator.apsi"
+    },
+    "2": {
+     "name": "entity.name.function.decorator.apsi"
+    }
+   }
+  },
+  "fn-def": {
+   "name": "meta.function.apsi",
+   "begin": "\\b(fn)\\s+([\\p{L}_][\\p{L}\\p{N}_]*)\\s*(?:(\\[)([^\\]]*)(\\]))?\\s*(\\()",
+   "beginCaptures": {
+    "1": {
+     "name": "storage.type.function.apsi"
+    },
+    "2": {
+     "name": "entity.name.function.apsi"
+    },
+    "3": {
+     "name": "punctuation.definition.generic.begin.apsi"
+    },
+    "4": {
+     "name": "entity.name.type.parameter.apsi"
+    },
+    "5": {
+     "name": "punctuation.definition.generic.end.apsi"
+    },
+    "6": {
+     "name": "punctuation.definition.parameters.begin.apsi"
+    }
+   },
+   "end": "(\\))\\s*(?:(->)\\s*([^=:#]+?))?\\s*(?=[=:#]|$)",
+   "endCaptures": {
+    "1": {
+     "name": "punctuation.definition.parameters.end.apsi"
+    },
+    "2": {
+     "name": "punctuation.separator.annotation.result.apsi"
+    },
+    "3": {
+     "patterns": [
+      {
+       "include": "#type-expr"
+      }
+     ]
+    }
+   },
+   "patterns": [
+    {
+     "include": "#parameter"
+    },
+    {
+     "include": "#comment"
+    }
+   ]
+  },
+  "parameter": {
+   "patterns": [
+    {
+     "match": "\\b(self)\\b",
+     "name": "variable.parameter.function.language.special.self.apsi"
+    },
+    {
+     "match": "([\\p{L}_][\\p{L}\\p{N}_]*)\\s*(:)\\s*",
+     "captures": {
+      "1": {
+       "name": "variable.parameter.function.apsi"
+      },
+      "2": {
+       "name": "punctuation.separator.annotation.apsi"
+      }
+     }
+    },
+    {
+     "include": "#type-expr"
+    },
+    {
+     "match": "([\\p{L}_][\\p{L}\\p{N}_]*)\\s*(?=[,)=])",
+     "captures": {
+      "1": {
+       "name": "variable.parameter.function.apsi"
+      }
+     }
+    },
+    {
+     "match": "=",
+     "name": "keyword.operator.assignment.apsi"
+    },
+    {
+     "match": ",",
+     "name": "punctuation.separator.parameters.apsi"
+    },
+    {
+     "include": "#type-expr"
+    },
+    {
+     "include": "#expression"
+    }
+   ]
+  },
+  "generic-type": {
+   "begin": "\\b(Tensor|Vec[234]?|Mat|Matrix|List|Tuple|Dict)(\\[)",
+   "end": "\\]",
+   "beginCaptures": {
+    "1": {
+     "name": "support.type.apsi"
+    },
+    "2": {
+     "name": "punctuation.definition.generic.begin.apsi"
+    }
+   },
+   "endCaptures": {
+    "0": {
+     "name": "punctuation.definition.generic.end.apsi"
+    }
+   },
+   "patterns": [
+    {
+     "include": "#type-expr"
+    },
+    {
+     "include": "#number"
+    },
+    {
+     "include": "#punctuation"
+    }
+   ]
+  },
+  "type-expr": {
+   "patterns": [
+    {
+     "include": "#generic-type"
+    },
+    {
+     "include": "#type"
+    },
+    {
+     "include": "#dtype"
+    },
+    {
+     "match": "\\b_\\b",
+     "name": "variable.language.wildcard.apsi"
+    },
+    {
+     "name": "meta.type.unit.apsi",
+     "begin": "\\[",
+     "end": "\\]",
+     "beginCaptures": {
+      "0": {
+       "name": "punctuation.definition.unit.begin.apsi"
+      }
+     },
+     "endCaptures": {
+      "0": {
+       "name": "punctuation.definition.unit.end.apsi"
+      }
+     },
+     "patterns": [
+      {
+       "name": "constant.numeric.exponent.apsi",
+       "match": "[-+]?\\d+(?:/\\d+)?|[²³⁻¹⁰⁴⁵⁶⁷⁸⁹]+"
+      },
+      {
+       "name": "keyword.operator.unit.apsi",
+       "match": "[*/^·]|\\*\\*"
+      },
+      {
+       "name": "support.type.unit.apsi",
+       "match": "[\\p{L}µμΩÅ]+"
+      }
+     ]
+    },
+    {
+     "match": "\\b[A-Z][\\p{L}\\p{N}_]*\\b",
+     "name": "entity.name.type.apsi"
+    }
+   ]
+  },
+  "lambda": {
+   "match": "\\b(fn)\\s*(?=\\()",
+   "captures": {
+    "1": {
+     "name": "storage.type.function.lambda.apsi"
+    }
+   }
+  },
+  "struct-def": {
+   "match": "\\b(struct)\\s+([\\p{L}_][\\p{L}\\p{N}_]*)",
+   "captures": {
+    "1": {
+     "name": "storage.type.struct.apsi"
+    },
+    "2": {
+     "name": "entity.name.type.struct.apsi"
+    }
+   }
+  },
+  "use": {
+   "patterns": [
+    {
+     "match": "^\\s*(use)\\s+([\\p{L}_][\\p{L}\\p{N}_]*(?:\\.[\\p{L}_][\\p{L}\\p{N}_]*)*)(?:\\s+(as)\\s+([\\p{L}_][\\p{L}\\p{N}_]*))?",
+     "captures": {
+      "1": {
+       "name": "keyword.control.import.apsi"
+      },
+      "2": {
+       "name": "entity.name.namespace.apsi"
+      },
+      "3": {
+       "name": "keyword.control.import.apsi"
+      },
+      "4": {
+       "name": "entity.name.namespace.apsi"
+      }
+     }
+    },
+    {
+     "match": "^\\s*(import)\\b",
+     "captures": {
+      "1": {
+       "name": "keyword.control.import.apsi"
+      }
+     }
+    }
+   ]
+  },
+  "evolve": {
+   "match": "\\b(evolve)\\b",
+   "captures": {
+    "1": {
+     "name": "keyword.control.evolve.apsi"
+    }
+   }
+  },
+  "deriv": {
+   "match": "^\\s*([\\p{L}_][\\p{L}\\p{N}_]*)(')\\s*(?==)",
+   "captures": {
+    "1": {
+     "name": "variable.other.state.apsi"
+    },
+    "2": {
+     "name": "keyword.operator.derivative.apsi"
+    }
+   }
+  },
+  "string": {
+   "name": "string.quoted.double.apsi",
+   "begin": "\"",
+   "end": "(\")|((?:[^\\\\\\n])$)",
+   "beginCaptures": {
+    "0": {
+     "name": "punctuation.definition.string.begin.apsi"
+    }
+   },
+   "endCaptures": {
+    "1": {
+     "name": "punctuation.definition.string.end.apsi"
+    },
+    "2": {
+     "name": "invalid.illegal.newline.apsi"
+    }
+   },
+   "patterns": [
+    {
+     "include": "#escape"
+    }
+   ]
+  },
+  "string-triple": {
+   "name": "string.quoted.triple.apsi",
+   "begin": "\"\"\"",
+   "end": "\"\"\"",
+   "beginCaptures": {
+    "0": {
+     "name": "punctuation.definition.string.begin.apsi"
+    }
+   },
+   "endCaptures": {
+    "0": {
+     "name": "punctuation.definition.string.end.apsi"
+    }
+   },
+   "patterns": [
+    {
+     "include": "#escape"
+    }
+   ]
+  },
+  "fstring": {
+   "name": "string.interpolated.apsi",
+   "begin": "(f)(\")",
+   "end": "\"",
+   "beginCaptures": {
+    "1": {
+     "name": "storage.type.string.apsi"
+    },
+    "2": {
+     "name": "punctuation.definition.string.begin.apsi"
+    }
+   },
+   "endCaptures": {
+    "0": {
+     "name": "punctuation.definition.string.end.apsi"
+    }
+   },
+   "patterns": [
+    {
+     "include": "#escape"
+    },
+    {
+     "include": "#interp"
+    }
+   ]
+  },
+  "fstring-triple": {
+   "name": "string.interpolated.triple.apsi",
+   "begin": "(f)(\"\"\")",
+   "end": "\"\"\"",
+   "beginCaptures": {
+    "1": {
+     "name": "storage.type.string.apsi"
+    },
+    "2": {
+     "name": "punctuation.definition.string.begin.apsi"
+    }
+   },
+   "endCaptures": {
+    "0": {
+     "name": "punctuation.definition.string.end.apsi"
+    }
+   },
+   "patterns": [
+    {
+     "include": "#escape"
+    },
+    {
+     "include": "#interp"
+    }
+   ]
+  },
+  "escape": {
+   "patterns": [
+    {
+     "name": "constant.character.escape.apsi",
+     "match": "\\\\[ntr\\\\\"0]|\\{\\{|\\}\\}"
+    },
+    {
+     "name": "invalid.illegal.escape.apsi",
+     "match": "\\\\."
+    }
+   ]
+  },
+  "interp": {
+   "name": "meta.interpolation.apsi",
+   "contentName": "source.apsi.embedded",
+   "begin": "\\{(?!\\{)",
+   "end": "(?:(:)([^}\"]*))?(\\})",
+   "beginCaptures": {
+    "0": {
+     "name": "punctuation.section.interpolation.begin.apsi"
+    }
+   },
+   "endCaptures": {
+    "1": {
+     "name": "punctuation.separator.format.apsi"
+    },
+    "2": {
+     "name": "constant.other.format-spec.apsi"
+    },
+    "3": {
+     "name": "punctuation.section.interpolation.end.apsi"
+    }
+   },
+   "patterns": [
+    {
+     "include": "#expression"
+    }
+   ]
+  },
+  "number": {
+   "patterns": [
+    {
+     "match": "(?<![\\p{L}\\p{N}_])(?:\\d[\\d_]*(?:\\.\\d[\\d_]*)?(?:[eE][+-]?\\d+)?)(?=\\[)",
+     "name": "constant.numeric.apsi"
+    },
+    {
+     "begin": "(?<=\\d)(?=\\[)",
+     "end": "(?<=\\])",
+     "patterns": [
+      {
+       "name": "meta.unit.apsi",
+       "begin": "\\[",
+       "end": "\\]",
+       "beginCaptures": {
+        "0": {
+         "name": "punctuation.definition.unit.begin.apsi"
+        }
+       },
+       "endCaptures": {
+        "0": {
+         "name": "punctuation.definition.unit.end.apsi"
+        }
+       },
+       "patterns": [
+        {
+         "name": "constant.numeric.exponent.apsi",
+         "match": "[-+]?\\d+(?:/\\d+)?|[²³⁻¹⁰⁴⁵⁶⁷⁸⁹]+"
+        },
+        {
+         "name": "keyword.operator.unit.apsi",
+         "match": "[*/^·]|\\*\\*"
+        },
+        {
+         "name": "support.type.unit.apsi",
+         "match": "[\\p{L}µμΩÅ]+"
+        }
+       ]
+      }
+     ]
+    },
+    {
+     "match": "(?<![\\p{L}\\p{N}_])((?:\\d[\\d_]*(?:\\.\\d[\\d_]*)?(?:[eE][+-]?\\d+)?))([\\p{L}µμΩÅ°][\\p{L}\\p{N}µμΩÅ]*)",
+     "captures": {
+      "1": {
+       "name": "constant.numeric.apsi"
+      },
+      "2": {
+       "name": "support.type.unit.apsi"
+      }
+     }
+    },
+    {
+     "match": "(?<![\\p{L}\\p{N}_])(?:\\d[\\d_]*(?:\\.\\d[\\d_]*)?(?:[eE][+-]?\\d+)?)",
+     "name": "constant.numeric.apsi"
+    }
+   ]
+  },
+  "unit-cast": {
+   "begin": "\\b(as)\\s*(?=\\[)",
+   "end": "(?<=\\])",
+   "beginCaptures": {
+    "1": {
+     "name": "keyword.operator.cast.apsi"
+    }
+   },
+   "patterns": [
+    {
+     "name": "meta.unit.apsi",
+     "begin": "\\[",
+     "end": "\\]",
+     "beginCaptures": {
+      "0": {
+       "name": "punctuation.definition.unit.begin.apsi"
+      }
+     },
+     "endCaptures": {
+      "0": {
+       "name": "punctuation.definition.unit.end.apsi"
+      }
+     },
+     "patterns": [
+      {
+       "name": "constant.numeric.exponent.apsi",
+       "match": "[-+]?\\d+(?:/\\d+)?|[²³⁻¹⁰⁴⁵⁶⁷⁸⁹]+"
+      },
+      {
+       "name": "keyword.operator.unit.apsi",
+       "match": "[*/^·]|\\*\\*"
+      },
+      {
+       "name": "support.type.unit.apsi",
+       "match": "[\\p{L}µμΩÅ]+"
+      }
+     ]
+    }
+   ]
+  },
+  "constant": {
+   "patterns": [
+    {
+     "match": "\\b(true|false|none)\\b",
+     "name": "constant.language.apsi"
+    },
+    {
+     "match": "\\b(pi|tau|inf|nan)\\b",
+     "name": "support.constant.math.apsi"
+    }
+   ]
+  },
+  "self": {
+   "match": "\\bself\\b",
+   "name": "variable.language.self.apsi"
+  },
+  "keyword": {
+   "patterns": [
+    {
+     "name": "keyword.control.flow.apsi",
+     "match": "\\b(if|elif|else|while|for|in|break|continue|return|pass|assert)\\b"
+    },
+    {
+     "name": "keyword.control.evolve.apsi",
+     "match": "\\b(evolve|over|step|using|tol|record(?=\\s+(?:every|into))|every|into)\\b"
+    },
+    {
+     "name": "storage.type.apsi",
+     "match": "\\b(let|var)\\b"
+    },
+    {
+     "name": "storage.type.function.apsi",
+     "match": "\\bfn\\b"
+    },
+    {
+     "name": "storage.type.struct.apsi",
+     "match": "\\bstruct\\b"
+    },
+    {
+     "name": "keyword.control.import.apsi",
+     "match": "\\b(use|import)\\b"
+    },
+    {
+     "name": "keyword.operator.logical.apsi",
+     "match": "\\b(and|or|not)\\b"
+    },
+    {
+     "name": "keyword.operator.cast.apsi",
+     "match": "\\bas\\b"
+    }
+   ]
+  },
+  "type": {
+   "name": "support.type.apsi",
+   "match": "\\b(Float|Int|Bool|Str|List|Tuple|Dict|Any|Fn|Record|Tensor|Vec|Vec2|Vec3|Vec4|Mat|Matrix|Exact|Uncertain|Quantity|Range|None|Dimensionless|Angle|Length|Mass|Time|Current|Temperature|Amount|LuminousIntensity|Area|Volume|Velocity|Speed|Acceleration|Jerk|Force|Energy|Work|Torque|Power|Pressure|Stress|Momentum|Impulse|AngularMomentum|Action|Frequency|AngularVelocity|Density|Charge|Voltage|Resistance|Capacitance|Inductance|MagneticField|MagneticFlux|ElectricField|Entropy|HeatCapacity|Viscosity|Diffusivity|KinematicViscosity|WaveNumber|Concentration|MolarMass|ThermalConductivity|SpringConstant)\\b"
+  },
+  "dtype": {
+   "name": "support.type.dtype.apsi",
+   "match": "(?<=@precision\\()\\s*(f16|f32|f64|bf16|i32|i64|int8|int4|fp8_e4m3|fp8_e5m2|fp6_e3m2|fp6_e2m3|fp4_e2m1|exact)\\b|\\b(f16|f32|f64|bf16|i32|i64)\\b"
+  },
+  "call": {
+   "patterns": [
+    {
+     "match": "\\b(any|all|divmod|pow|ord|chr|dict|set|tuple|repr|hex|bin|oct|next|iter|format|callable|getattr|hasattr|fsum|abs|acos|approx|arange|argmax|argmin|args|asin|atan|atan2|bool|cbrt|ceil|chars|clip|cload|clock|concat|cos|cosh|cross|cumsum|dequantize|derivative|dim|dot|einsum|enumerate|error|exact|exists|exit|exp|eye|filter|flatten|float|floor|format_info|from_py|from_torch|full|gelu|getenv|grad|hessian|http_get|http_post_json|input|int|jacobian|join|json_parse|json_str|keys|laplace|len|library_path|linspace|list|load_csv|load_json|log|log10|log2|log_softmax|magnitude|map|matmul|max|mean|measure|memo|meshgrid|min|nbytes|ndim|nominal|norm|ones|ones_like|outer|param_count|permissions|permutation|platform|pmap|precision|print|prod|pyimport|qmatmul|quant_error|quantize|rand|randint|randn|range|read_text|record|relative_uncertainty|relu|reshape|reversed|roll|round|round_to|save_csv|save_json|security_policy|seed|shape|sigma|sigmoid|sin|sinh|softmax|softplus|sort|sorted|sqrt|stack|std|stop_gradient|str|sum|tan|tanh|tensor|testing|timed|to_float|to_py|to_torch|transpose|tree_map|type|unique|unit|value_and_grad|var|where|write_text|zeros|zeros_like|zip)\\s*(?=\\()",
+     "captures": {
+      "1": {
+       "name": "support.function.builtin.apsi"
+      }
+     }
+    },
+    {
+     "match": "\\b([A-Z][\\p{L}\\p{N}_]*)\\s*(?=\\()",
+     "captures": {
+      "1": {
+       "name": "entity.name.type.class.apsi"
+      }
+     }
+    },
+    {
+     "match": "([\\p{L}_][\\p{L}\\p{N}_]*)\\s*(?=\\()",
+     "captures": {
+      "1": {
+       "name": "entity.name.function.call.apsi"
+      }
+     }
+    }
+   ]
+  },
+  "member": {
+   "match": "(\\.)\\s*([\\p{L}_][\\p{L}\\p{N}_]*)\\b(?!\\s*\\()",
+   "captures": {
+    "1": {
+     "name": "punctuation.accessor.apsi"
+    },
+    "2": {
+     "name": "variable.other.property.apsi"
+    }
+   }
+  },
+  "operator": {
+   "patterns": [
+    {
+     "name": "keyword.operator.pipe.apsi",
+     "match": "\\|>"
+    },
+    {
+     "name": "keyword.operator.arrow.apsi",
+     "match": "->|=>|→"
+    },
+    {
+     "name": "keyword.operator.uncertainty.apsi",
+     "match": "±|\\+/-"
+    },
+    {
+     "name": "keyword.operator.range.apsi",
+     "match": "\\.\\.=?"
+    },
+    {
+     "name": "keyword.operator.assignment.augmented.apsi",
+     "match": "\\*\\*=|//=|[+\\-*/%@]="
+    },
+    {
+     "name": "keyword.operator.comparison.apsi",
+     "match": "==|!=|<=|>=|~=|[<>≤≥≠≈]"
+    },
+    {
+     "name": "keyword.operator.assignment.apsi",
+     "match": "="
+    },
+    {
+     "name": "keyword.operator.arithmetic.apsi",
+     "match": "\\*\\*|//|[+\\-*/%^×·−]"
+    },
+    {
+     "name": "keyword.operator.matrix.apsi",
+     "match": "@"
+    },
+    {
+     "name": "keyword.operator.derivative.apsi",
+     "match": "(?<=[\\p{L}\\p{N}_])'"
+    }
+   ]
+  },
+  "punctuation": {
+   "patterns": [
+    {
+     "name": "punctuation.separator.element.apsi",
+     "match": ","
+    },
+    {
+     "name": "punctuation.separator.colon.apsi",
+     "match": ":"
+    },
+    {
+     "name": "punctuation.terminator.statement.apsi",
+     "match": ";"
+    },
+    {
+     "name": "punctuation.accessor.apsi",
+     "match": "\\."
+    }
+   ]
+  },
+  "brackets": {
+   "patterns": [
+    {
+     "begin": "\\(",
+     "end": "\\)",
+     "beginCaptures": {
+      "0": {
+       "name": "punctuation.parenthesis.begin.apsi"
+      }
+     },
+     "endCaptures": {
+      "0": {
+       "name": "punctuation.parenthesis.end.apsi"
+      }
+     },
+     "patterns": [
+      {
+       "include": "#expression"
+      },
+      {
+       "include": "#lambda"
+      }
+     ]
+    },
+    {
+     "begin": "\\[",
+     "end": "\\]",
+     "beginCaptures": {
+      "0": {
+       "name": "punctuation.definition.list.begin.apsi"
+      }
+     },
+     "endCaptures": {
+      "0": {
+       "name": "punctuation.definition.list.end.apsi"
+      }
+     },
+     "patterns": [
+      {
+       "include": "#expression"
+      },
+      {
+       "include": "#lambda"
+      }
+     ]
+    },
+    {
+     "begin": "\\{",
+     "end": "\\}",
+     "beginCaptures": {
+      "0": {
+       "name": "punctuation.definition.dict.begin.apsi"
+      }
+     },
+     "endCaptures": {
+      "0": {
+       "name": "punctuation.definition.dict.end.apsi"
+      }
+     },
+     "patterns": [
+      {
+       "include": "#expression"
+      },
+      {
+       "include": "#lambda"
+      }
+     ]
+    }
+   ]
+  }
+ }
+}

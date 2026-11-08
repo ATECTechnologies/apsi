@@ -1,0 +1,31 @@
+# 19_measurement.apsi — measurement uncertainty propagates through formulas automatically
+# use ± (or type +/-) on measured values
+
+# pendulum experiment: measure the string length and the period, then find g
+let L = 0.995m ± 0.002m
+let T = 2.003s ± 0.004s
+
+let g = 4 * pi ** 2 * L / T ** 2
+print("measured g =", g)
+print("relative uncertainty =", f"{100 * relative_uncertainty(g):.2f} %")
+
+# every error source is tracked separately: a value minus itself is exactly zero
+print("L - L =", L - L)
+
+# works with functions and constants as usual
+use physics.constants
+let accepted = g0
+let deviation = (nominal(g) - accepted) / sigma(g)
+print(f"differs from the standard value by {deviation:.2f} σ")
+
+# rk45: an integrator with adaptive steps; choose the accuracy with tol
+var theta = 0.3
+var omega = 0[1/s]
+evolve theta, omega over t in 0[s]..10[s] step 0.1[s] using rk45 tol 1e-10 record into swing:
+    theta' = omega
+    omega' = -nominal(g) / nominal(L) * sin(theta)
+print("angle after 10 s:", theta, " (used", len(swing.t), "adaptive steps)")
+
+test "g is consistent with the standard value":
+    assert abs(deviation) < 3.0
+    assert sigma(L - L) == 0m

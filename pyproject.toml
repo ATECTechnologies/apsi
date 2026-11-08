@@ -1,0 +1,24 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "apsi"
+version = "1.10.0"
+description = "Apsi: a programming language for AI, physics and servers — units, shapes, autodiff, low-precision formats, data pipelines and a hardened web server built in"
+readme = "README.md"
+requires-python = ">=3.9"
+dependencies = ["numpy>=1.22", "pyreadline3>=3.4; sys_platform == \"win32\""]
+
+[project.optional-dependencies]
+gpu = ["cupy-cuda12x"]
+torch = ["torch"]
+
+[project.scripts]
+apsi = "apsi.cli:main"
+
+[tool.setuptools]
+packages = ["apsi"]
+
+[tool.setuptools.package-data]
+apsi = ["MANIFEST.json"]

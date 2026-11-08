@@ -1,0 +1,47 @@
+# 28_any_architecture.apsi — build any network as a graph of layers: MLPs, DAGs, transformers and GNNs
+use layers
+use nn
+
+# 1) a ready-made model, trained with fit()
+let X, y = spiral_data(n_per_class=100, classes=3, noise=0.2, seed=0)
+let model = resnet_mlp(2, 3, width=32, blocks=3)
+let r = fit(model, model.init(seed=1), X, y, loss="cross_entropy", opt=adam(lr=0.01), epochs=120,
+            batch_size=64, verbose=false)
+print("resnet-mlp accuracy:", accuracy(predict(model, r.params, X), y))
+summary(model, r.params)
+
+# 2) your own architecture: any directed acyclic graph of layers
+let wide_and_deep = dag([
+    ["wide", linear(2, 3), "x"],
+    ["deep", mlp([2, 32, 32, 3]), "x"],
+    ["both", add(), ["wide", "deep"]],
+], inputs=["x"], output="both")
+let r2 = fit(wide_and_deep, wide_and_deep.init(seed=0), X, y, loss="cross_entropy", opt=adam(lr=0.01),
+             epochs=150, verbose=false)
+print("wide & deep accuracy:", accuracy(predict(wide_and_deep, r2.params, X), y))
+
+# 3) a graph neural network: two communities, labels known for half of the nodes
+seed(4)
+var edges = []
+for i in 0..30:
+    for j in 0..30:
+        if i < j and ((i < 15) == (j < 15)) and rand() < 0.3:
+            edges.append([i, j])
+edges.append([0, 20])
+let g = graph(edges=edges, n=30, undirected=true)
+let features = randn(30, 8, seed=5)
+let labels = tensor([0 if i < 15 else 1 for i in 0..30])
+let known = tensor([i % 2 == 0 for i in 0..30])
+let gnn = gat_net(8, 8, 2, heads=2, dropout=0.0)
+let r3 = fit(gnn, gnn.init(seed=0), features, labels, loss="cross_entropy", opt=adam(lr=0.02), epochs=100,
+             graph=g, mask=known, verbose=false)
+print(g, "· GAT accuracy on all nodes:", accuracy(predict(gnn, r3.params, features, graph=g), labels))
+
+# 4) a small GPT: token ids in, next-token logits out
+let lm = transformer_lm(40, d=32, heads=4, layers=2, context=16)
+print("transformer parameters:", count_params(lm.init(seed=0)))
+
+test "every architecture learns":
+    assert accuracy(predict(model, r.params, X), y) > 0.9
+    assert accuracy(predict(wide_and_deep, r2.params, X), y) > 0.9
+    assert accuracy(predict(gnn, r3.params, features, graph=g), labels) > 0.85

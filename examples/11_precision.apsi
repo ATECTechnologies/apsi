@@ -1,0 +1,35 @@
+# 11_precision.apsi — numeric precision chosen per function
+
+# exact: every number in the function is an exact fraction, no rounding at all
+@precision(exact)
+fn harmonic(n: Int):
+    var s = 0
+    for k in 1..=n:
+        s += 1 / k
+    return s
+
+print("H(10) exact =", harmonic(10))
+print("H(10) as float =", to_float(harmonic(10)))
+
+@precision(exact)
+fn tenth_sum() = 0.1 + 0.2
+print("0.1 + 0.2 (exact) =", tenth_sum(), "  (float:", 0.1 + 0.2, ")")
+
+# f32 / f16: less memory and more speed for AI
+@precision(f32)
+fn matmul32(a, b) = a @ b
+
+let a = randn(256, 256, seed=0)
+let r32 = matmul32(a, a)
+let r64 = a @ a
+print("f32 dtype:", type(r32))
+print("f32 vs f64 difference:", max(abs(r32 - r64)))
+
+# @memo: remember results automatically
+@memo
+fn slow_fib(n: Int) -> Int = n if n < 2 else slow_fib(n - 1) + slow_fib(n - 2)
+print("fib(90) =", slow_fib(90))
+
+test "exact arithmetic":
+    assert tenth_sum() == exact("3/10")
+    assert harmonic(4) == exact("25/12")

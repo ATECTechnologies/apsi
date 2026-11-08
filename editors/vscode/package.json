@@ -1,0 +1,438 @@
+{
+  "name": "apsi-language",
+  "displayName": "Apsi Language",
+  "description": "Apsi for VS Code, Cursor, Windsurf and VSCodium: syntax colours, live unit/shape diagnostics, hover, go to definition, completion, formatting, run/test/REPL commands, apsi.toml tasks and snippets",
+  "version": "1.10.0",
+  "publisher": "apsi",
+  "license": "MIT",
+  "engines": {
+    "vscode": "^1.82.0"
+  },
+  "categories": [
+    "Programming Languages",
+    "Snippets",
+    "Linters",
+    "Formatters",
+    "Themes"
+  ],
+  "keywords": [
+    "apsi",
+    "physics",
+    "units",
+    "autodiff",
+    "ai",
+    "cursor",
+    "windsurf"
+  ],
+  "main": "./extension.js",
+  "activationEvents": [
+    "onLanguage:apsi",
+    "workspaceContains:**/*.apsi",
+    "workspaceContains:apsi.toml",
+    "onCommand:apsi.convertPython"
+  ],
+  "contributes": {
+    "languages": [
+      {
+        "id": "apsi",
+        "aliases": [
+          "Apsi",
+          "apsi"
+        ],
+        "extensions": [
+          ".apsi"
+        ],
+        "configuration": "./language-configuration.json",
+        "icon": {
+          "light": "./images/file-icon.png",
+          "dark": "./images/file-icon.png"
+        }
+      },
+      {
+        "id": "toml",
+        "filenames": [
+          "apsi.toml"
+        ]
+      }
+    ],
+    "grammars": [
+      {
+        "language": "apsi",
+        "scopeName": "source.apsi",
+        "path": "./syntaxes/apsi.tmLanguage.json"
+      },
+      {
+        "scopeName": "markdown.apsi.codeblock",
+        "path": "./syntaxes/apsi.markdown.tmLanguage.json",
+        "injectTo": [
+          "text.html.markdown"
+        ],
+        "embeddedLanguages": {
+          "meta.embedded.block.apsi": "apsi"
+        }
+      }
+    ],
+    "snippets": [
+      {
+        "language": "apsi",
+        "path": "./snippets/apsi.json"
+      }
+    ],
+    "themes": [
+      {
+        "label": "Apsi Dark",
+        "uiTheme": "vs-dark",
+        "path": "./themes/apsi-dark.json"
+      },
+      {
+        "label": "Apsi Light",
+        "uiTheme": "vs",
+        "path": "./themes/apsi-light.json"
+      }
+    ],
+    "configurationDefaults": {
+      "[apsi]": {
+        "editor.tabSize": 4,
+        "editor.insertSpaces": true,
+        "editor.detectIndentation": false,
+        "editor.semanticHighlighting.enabled": true
+      }
+    },
+    "configuration": {
+      "title": "Apsi",
+      "properties": {
+        "apsi.command": {
+          "type": "array",
+          "default": [],
+          "items": {
+            "type": "string"
+          },
+          "markdownDescription": "Command that starts Apsi, e.g. `[\"apsi\"]` or `[\"py\", \"-3\", \"-m\", \"apsi\"]`. Empty = auto-detect (installed Apsi, then `apsi` on PATH, then Python)."
+        },
+        "apsi.run.arguments": {
+          "type": "array",
+          "default": [],
+          "items": {
+            "type": "string"
+          },
+          "markdownDescription": "Extra flags for **Apsi: Run** and **Apsi: Test**, e.g. `[\"--allow-net\"]`."
+        },
+        "apsi.run.saveBeforeRun": {
+          "type": "boolean",
+          "default": true,
+          "description": "Save the file before running, testing or checking it."
+        },
+        "apsi.run.clearTerminal": {
+          "type": "boolean",
+          "default": false,
+          "description": "Clear the Apsi terminal before every run."
+        },
+        "apsi.languageServer.enabled": {
+          "type": "boolean",
+          "default": true,
+          "description": "Start the Apsi language server (diagnostics, hover, go to definition, completion, formatting)."
+        },
+        "apsi.statusBar.enabled": {
+          "type": "boolean",
+          "default": true,
+          "description": "Show the Apsi version and a Run button in the status bar."
+        }
+      }
+    },
+    "commands": [
+      {
+        "command": "apsi.run",
+        "title": "Run File",
+        "category": "Apsi",
+        "icon": "$(play)"
+      },
+      {
+        "command": "apsi.runWithArgs",
+        "title": "Run File with Arguments…",
+        "category": "Apsi",
+        "icon": "$(debug-alt)"
+      },
+      {
+        "command": "apsi.runProject",
+        "title": "Run Project (apsi.toml main)",
+        "category": "Apsi"
+      },
+      {
+        "command": "apsi.test",
+        "title": "Test File",
+        "category": "Apsi",
+        "icon": "$(beaker)"
+      },
+      {
+        "command": "apsi.testAll",
+        "title": "Test Project",
+        "category": "Apsi"
+      },
+      {
+        "command": "apsi.check",
+        "title": "Check File (no run)",
+        "category": "Apsi",
+        "icon": "$(check)"
+      },
+      {
+        "command": "apsi.watch",
+        "title": "Watch File (re-run on save)",
+        "category": "Apsi",
+        "icon": "$(eye)"
+      },
+      {
+        "command": "apsi.bench",
+        "title": "Benchmark File",
+        "category": "Apsi"
+      },
+      {
+        "command": "apsi.audit",
+        "title": "Show Permissions the File Needs",
+        "category": "Apsi"
+      },
+      {
+        "command": "apsi.repl",
+        "title": "Open REPL",
+        "category": "Apsi",
+        "icon": "$(terminal)"
+      },
+      {
+        "command": "apsi.sendToRepl",
+        "title": "Run Selection / Line in REPL",
+        "category": "Apsi"
+      },
+      {
+        "command": "apsi.loadInRepl",
+        "title": "Load File into REPL",
+        "category": "Apsi"
+      },
+      {
+        "command": "apsi.task",
+        "title": "Run Project Task…",
+        "category": "Apsi",
+        "icon": "$(tasklist)"
+      },
+      {
+        "command": "apsi.newProject",
+        "title": "New Project…",
+        "category": "Apsi"
+      },
+      {
+        "command": "apsi.doc",
+        "title": "Show Documentation for Symbol",
+        "category": "Apsi"
+      },
+      {
+        "command": "apsi.custom",
+        "title": "Run Apsi Command…",
+        "category": "Apsi"
+      },
+      {
+        "command": "apsi.restartServer",
+        "title": "Restart Language Server",
+        "category": "Apsi"
+      },
+      {
+        "command": "apsi.showOutput",
+        "title": "Show Language Server Output",
+        "category": "Apsi"
+      },
+      {
+        "command": "apsi.convertPython",
+        "title": "Convert Python File to Apsi",
+        "category": "Apsi",
+        "icon": "$(arrow-swap)"
+      }
+    ],
+    "menus": {
+      "editor/title/run": [
+        {
+          "command": "apsi.run",
+          "when": "resourceLangId == apsi",
+          "group": "navigation@0"
+        },
+        {
+          "command": "apsi.runWithArgs",
+          "when": "resourceLangId == apsi",
+          "group": "navigation@1"
+        },
+        {
+          "command": "apsi.test",
+          "when": "resourceLangId == apsi",
+          "group": "navigation@2"
+        },
+        {
+          "command": "apsi.watch",
+          "when": "resourceLangId == apsi",
+          "group": "navigation@3"
+        }
+      ],
+      "editor/context": [
+        {
+          "command": "apsi.sendToRepl",
+          "when": "editorLangId == apsi",
+          "group": "apsi@1"
+        },
+        {
+          "command": "apsi.run",
+          "when": "editorLangId == apsi",
+          "group": "apsi@2"
+        },
+        {
+          "command": "apsi.test",
+          "when": "editorLangId == apsi",
+          "group": "apsi@3"
+        },
+        {
+          "command": "apsi.check",
+          "when": "editorLangId == apsi",
+          "group": "apsi@4"
+        },
+        {
+          "command": "apsi.doc",
+          "when": "editorLangId == apsi",
+          "group": "apsi@5"
+        },
+        {
+          "command": "apsi.convertPython",
+          "when": "editorLangId == python",
+          "group": "apsi@1"
+        }
+      ],
+      "explorer/context": [
+        {
+          "command": "apsi.run",
+          "when": "resourceExtname == .apsi",
+          "group": "apsi@1"
+        },
+        {
+          "command": "apsi.test",
+          "when": "resourceExtname == .apsi || explorerResourceIsFolder",
+          "group": "apsi@2"
+        },
+        {
+          "command": "apsi.check",
+          "when": "resourceExtname == .apsi || explorerResourceIsFolder",
+          "group": "apsi@3"
+        },
+        {
+          "command": "apsi.convertPython",
+          "when": "resourceExtname == .py || explorerResourceIsFolder",
+          "group": "apsi@4"
+        }
+      ],
+      "commandPalette": [
+        {
+          "command": "apsi.sendToRepl",
+          "when": "editorLangId == apsi"
+        },
+        {
+          "command": "apsi.loadInRepl",
+          "when": "editorLangId == apsi"
+        },
+        {
+          "command": "apsi.doc",
+          "when": "editorLangId == apsi"
+        }
+      ],
+      "editor/title": [
+        {
+          "command": "apsi.convertPython",
+          "when": "resourceLangId == python",
+          "group": "navigation@9"
+        }
+      ]
+    },
+    "keybindings": [
+      {
+        "command": "apsi.run",
+        "key": "ctrl+f5",
+        "mac": "cmd+f5",
+        "when": "editorLangId == apsi"
+      },
+      {
+        "command": "apsi.run",
+        "key": "ctrl+alt+n",
+        "mac": "ctrl+alt+n",
+        "when": "editorLangId == apsi"
+      },
+      {
+        "command": "apsi.test",
+        "key": "ctrl+alt+t",
+        "mac": "ctrl+alt+t",
+        "when": "editorLangId == apsi"
+      },
+      {
+        "command": "apsi.sendToRepl",
+        "key": "shift+enter",
+        "when": "editorTextFocus && editorLangId == apsi"
+      },
+      {
+        "command": "apsi.repl",
+        "key": "ctrl+alt+r",
+        "mac": "ctrl+alt+r",
+        "when": "editorLangId == apsi"
+      }
+    ],
+    "taskDefinitions": [
+      {
+        "type": "apsi",
+        "required": [
+          "command"
+        ],
+        "properties": {
+          "command": {
+            "type": "string",
+            "description": "Apsi command: run, test, check, fmt, watch, bench, audit, serve or task"
+          },
+          "file": {
+            "type": "string",
+            "description": "File or folder the command works on"
+          },
+          "task": {
+            "type": "string",
+            "description": "Name of an apsi.toml task (with command = task)"
+          },
+          "args": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Extra arguments"
+          }
+        }
+      }
+    ],
+    "problemMatchers": [
+      {
+        "name": "apsi",
+        "label": "Apsi errors",
+        "owner": "apsi",
+        "source": "apsi",
+        "fileLocation": [
+          "autoDetect",
+          "${workspaceFolder}"
+        ],
+        "pattern": {
+          "regexp": "^(?:\\u001b\\[\\d+m)?(.+?\\.apsi):(\\d+):(\\d+): (\\w+Error|PermissionError): (.*?)(?:\\u001b\\[0m)?$",
+          "file": 1,
+          "line": 2,
+          "column": 3,
+          "code": 4,
+          "message": 5
+        }
+      }
+    ]
+  },
+  "dependencies": {
+    "vscode-languageclient": "^9.0.1"
+  },
+  "icon": "images/icon.png",
+  "galleryBanner": {
+    "color": "#0B1220",
+    "theme": "dark"
+  },
+  "extensionKind": [
+    "workspace"
+  ]
+}

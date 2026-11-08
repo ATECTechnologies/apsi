@@ -1,0 +1,9 @@
+[
+  { "caption": "Apsi: Run File", "command": "build", "args": { "select": false, "variant": "" } },
+  { "caption": "Apsi: Test File", "command": "build", "args": { "variant": "Test" } },
+  { "caption": "Apsi: Check File", "command": "build", "args": { "variant": "Check" } },
+  { "caption": "Apsi: Format File", "command": "build", "args": { "variant": "Format" } },
+  { "caption": "Apsi: Benchmark File", "command": "build", "args": { "variant": "Benchmark" } },
+  { "caption": "Apsi: Run Project", "command": "build", "args": { "variant": "Run Project" } },
+  { "caption": "Apsi: Test Project", "command": "build", "args": { "variant": "Test Project" } }
+]
