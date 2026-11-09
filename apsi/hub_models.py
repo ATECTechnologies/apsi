@@ -28,6 +28,7 @@ def read_safetensors(path):
     header, start = _read_header(path)
     mm = np.memmap(path, dtype=np.uint8, mode="r")
     out = {}
+    raw = arr = None
     for name, info in header.items():
         if name == "__metadata__":
             continue
@@ -42,7 +43,15 @@ def read_safetensors(path):
             arr = raw.view(_ST_TO_NP[st]).reshape(shape)
         else:
             raise ModelError(f"safetensors: tensor '{name}' has dtype {st}, which the native runner does not read")
-        out[name] = np.asarray(arr, np.float32) if np.asarray(arr).dtype.kind == "f" else np.asarray(arr)
+        # copies: the weights are read in full by every forward pass anyway, and no open mapping is left behind
+        # (on Windows an open mapping keeps the file locked, so a cached model could not be replaced or deleted)
+        out[name] = np.array(arr, np.float32 if arr.dtype.kind == "f" else arr.dtype)
+    del raw, arr
+    try:
+        mm._mmap.close()
+    except (AttributeError, BufferError, ValueError):     # still referenced: closed when collected
+        pass
+    del mm
     return out
 
 

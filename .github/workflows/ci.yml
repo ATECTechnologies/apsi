@@ -1,6 +1,10 @@
 # Apsi CI: test everything on Windows and Linux, Python 3.12 – 3.14
 name: ci
-on: [push, pull_request, workflow_dispatch]
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
 
 jobs:
   test:
