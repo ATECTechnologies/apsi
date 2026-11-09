@@ -37,7 +37,8 @@ def _format_line(code, depth=0):
             while out and out[-1] == " ":
                 out.pop()
             if "".join(out).strip():
-                out.append("  ")
+                gap = len(code[:i]) - len(code[:i].rstrip(" "))
+                out.append(" " * max(2, gap))               # aligned comments keep their column
             out.append(text)
             break
         if c == '"' or (c == "f" and i + 1 < n and code[i + 1] == '"' and (i == 0 or not (code[i - 1].isalnum() or code[i - 1] == "_"))):
@@ -139,7 +140,10 @@ def format_source(src):
         width = len(raw) - len(raw.lstrip(" "))
         if depth > 0:
             # continuation line inside brackets: keep relative indentation, normalised
-            level_pad = cont_base + 4
+            if stripped[0] in ")]}" and width <= cont_base:
+                level_pad = cont_base                       # a closing bracket back at the statement's level
+            else:
+                level_pad = width if width > cont_base else cont_base + 4   # hand-aligned lines stay aligned
             text = " " * level_pad + _format_line(stripped, depth)
         else:
             if stripped.startswith("#"):

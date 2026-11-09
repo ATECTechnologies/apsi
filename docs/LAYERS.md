@@ -255,6 +255,7 @@ let trained = r.params
 | `graph`, `mask` | none | graph tasks (section 5) |
 | `val` | none | `[X_val, y_val]`; the validation loss is recorded every epoch |
 | `verbose` | `true` | print the loss about ten times during training |
+| `workers` | `1` | data-parallel training on several processes (Linux, macOS): every batch is split into shards, their gradients are averaged by shard size — the same step as one process — then one optimizer step is taken. `"auto"` uses every core. It pays off when the model's matrix products are too small to keep all cores busy on their own |
 | `backend` | `"numpy"` | `"numpy"`, `"torch"` or `"auto"` — see [`BACKENDS.md`](BACKENDS.md) |
 | `device`, `precision`, `compile` | `"auto"`, `"fp32"`, `false` | torch backend only |
 

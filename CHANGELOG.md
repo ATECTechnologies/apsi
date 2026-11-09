@@ -48,6 +48,12 @@
   `@memory.cached` are two-tier caches (RAM, then SSD) with signed entries; `memory.fit_batch` halves a batch on
   out-of-memory (CPU or CUDA) until it fits; `memory.status`, `memory.devices`, `memory.best_device`.
 
+### Hugging Face without Python (`use hub`)
+- Search, download (cached by commit, resumed, SHA-256 checked, offline mode) and load safetensors / GGUF weights
+  from the Hugging Face Hub; access tokens for private and gated models, sent only to the Hub itself.
+- Native `tokenizer.json` engines: WordPiece (BERT family), byte-level BPE (GPT-2, Llama 3, Qwen) and
+  SentencePiece-style BPE with byte fallback (Llama 2, Mistral).
+
 ### Fewer AI tokens (`use tokens`)
 - Exactly reversible transforms for what you send to language models: `pack`/`unpack` (lists of records as
   tables: 57–63 % fewer tokens than JSON), `dedupe`/`expand` (repeated lines once: 59 % on a log), `diff`/`patch`
@@ -56,8 +62,11 @@
 ### Data, databases, web
 - **`use dataframe`**: a columnar table engine (filter, select, group by, join, sort, windows, CSV/JSON/JSONL, a C
   CSV parser). Against pandas on 2M rows: filters 24×, group-by 4.2–4.3×, joins 3.1×, sorting 1.8× faster, 4× less memory.
-- **`use db`**: PostgreSQL (v3 protocol, SCRAM, TLS, parameters, prepared statements, LISTEN/NOTIFY, pools), Redis
-  (pipelines, pub/sub) and SQLite — no driver to install.
+- **`use db`**: PostgreSQL (v3 protocol, SCRAM, TLS, parameters, prepared statements, LISTEN/NOTIFY, pools),
+  MySQL / MariaDB (caching_sha2 and native authentication, TLS), MongoDB (OP_MSG, BSON with decimal128,
+  SCRAM-SHA-256/1, cursors), Redis (pipelines, pub/sub) and SQLite — no driver to install.
+- **Data-parallel training:** `fit(…, workers=N)` splits every batch across N processes and averages the gradients
+  (the same step as one process).
 - **WebSocket** server routes, rooms and a client (`app.websocket`, `web.websocket_connect`), RFC 6455 complete.
 - **The HTTP server is about 3× faster** (an asyncio protocol; routes that prove fast run on the event loop, measured
   by CPU time so a busy server never misleads it; slow or blocking routes stay on the workers): 20,300–20,700
@@ -66,6 +75,10 @@
   (or a `.venv` next to the program) for `pyimport`.
 
 ### Tools
+- **Apsi License 2.0** replaces the Non-Commercial License 1.0: any use is allowed, including commercial work;
+  only selling Apsi itself needs a licence. `docs/LICENSING.md` explains it with examples.
+- The formatter keeps hand-aligned continuation lines and comment columns; `@native` and `@gpu` functions run as
+  ordinary functions in the interpreter engine instead of stopping it.
 - **Debugger**: `apsi debug` in the terminal and F5 in VS Code-family editors (`apsi dap`): breakpoints with
   conditions, hit counts and log points, stepping, the call stack, variables, tensor summaries, stop on errors.
 - **Faster programs:** the main program starts with the loaded runtime frozen out of the cycle collector and a

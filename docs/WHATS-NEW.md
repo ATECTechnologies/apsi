@@ -11,8 +11,9 @@ guide.
 | Real time | 1–2 kHz control loops and video from 640×480 to 4K | [Real time](REALTIME.md) |
 | RAM, SSD, GPU | arrays that move to the SSD instead of running out of memory | [Memory](MEMORY.md) |
 | Fewer AI tokens | exactly reversible packing of what you send to language models | [Tokens](TOKENS.md) |
+| Hugging Face | models, weights and tokenizers from the Hub without Python packages | [Hub](HUB.md) |
 | Tables | a columnar engine, 3–24× faster than pandas | [Tables](DATAFRAME.md) |
-| Databases | PostgreSQL, Redis, SQLite without drivers | [Databases](DATABASES.md) |
+| Databases | PostgreSQL, MySQL / MariaDB, MongoDB, Redis, SQLite without drivers | [Databases](DATABASES.md) |
 | Web | a 3× faster HTTP server, WebSocket | [Servers](SERVER.md) |
 | Configuration | `.env` files, secrets, Python virtual environments | [Configuration](ENV.md) |
 | Debugger | breakpoints and stepping in VS Code or the terminal | [Debugging](DEBUGGING.md) |
@@ -141,8 +142,14 @@ for row in pg.query("select id, name from item where price < $1", 10):
 let r = db.redis("redis://localhost:6379/0")
 ```
 
-PostgreSQL (SCRAM, TLS, prepared statements, LISTEN/NOTIFY, pools), Redis (pipelines, pub/sub) and SQLite. Parameters
-are never pasted into SQL. MySQL and MongoDB are not built in; use their Python drivers through `pyimport`.
+PostgreSQL (SCRAM, TLS, prepared statements, LISTEN/NOTIFY, pools), MySQL / MariaDB (MySQL 8 and 5.7
+authentication, TLS), MongoDB (BSON, SCRAM-SHA-256, cursors), Redis (pipelines, pub/sub) and SQLite. Values never
+become SQL text unescaped.
+
+```apsi
+let my = db.mysql("mysql://shop:secret@localhost/shop")
+let items = db.mongo("mongodb://app:secret@localhost/shop").collection("items")
+```
 
 ## 7. Web
 
@@ -159,10 +166,27 @@ are never pasted into SQL. MySQL and MongoDB are not built in; use their Python 
 * `apsi debug app.apsi` in the terminal, or F5 in VS Code: breakpoints with conditions, hit counts and log points,
   stepping, variables, tensor summaries, stop on errors.
 
-## 9. Faster tools
+## 9. Licence
+
+The Apsi License 2.0 allows any use, including commercial work, and keeps one rule: Apsi itself may not be sold or
+offered as a paid service without a licence from ATEC. The programs, libraries and models you build are yours. See
+[Licensing](LICENSING.md) for examples.
+
+## 10. Faster tools
 
 * A cold compile of a 20,000-line program: 3.7 s → 2.5 s; unchanged programs skip the checker (signed marker).
 * `apsi convert` of 29,022 lines: 4.5 s.
+
+## 11. Hugging Face without Python
+
+`use hub` downloads models from the Hugging Face Hub (with a token for private and gated models), resumes and
+checks downloads, loads safetensors and GGUF weights into tensors, and reads `tokenizer.json` (WordPiece and BPE)
+natively. See [Hub](HUB.md).
+
+## 12. Data-parallel training
+
+`fit(model, params, X, y, …, workers=4)` trains on four processes: each batch is split into four shards, the
+gradients are averaged by shard size (the same update as one process) and one optimizer step is taken.
 
 ## Upgrading from 2.0.0
 

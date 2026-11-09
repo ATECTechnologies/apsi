@@ -74,7 +74,7 @@ def reports():
 def native(*args, **kwargs):
     """@native, @native("fast"), @native("strict"), @native(fast=true)."""
     if len(args) == 1 and not kwargs and callable(args[0]) and not isinstance(args[0], str):
-        return NativeFunction(args[0], {})
+        return _wrap(args[0], {})
     opts = {}
     for a in args:
         if not isinstance(a, str) or a not in OPTION_NAMES:
@@ -86,8 +86,24 @@ def native(*args, **kwargs):
         opts[k] = bool(v)
 
     def deco(f):
-        return NativeFunction(f, opts)
+        return _wrap(f, opts)
     return deco
+
+
+_NOTED = []
+
+
+def _wrap(f, opts):
+    """In the tree-walking interpreter (the REPL, --engine interp) a @native function simply runs as written."""
+    from ..values import Function
+    if getattr(f, "_apsi_def", None) is None and isinstance(f, Function):
+        if not _NOTED:
+            _NOTED.append(1)
+            import sys
+            print("apsi: note: @native functions run as ordinary functions in the interpreter engine; "
+                  "`apsi run` compiles them", file=sys.stderr)
+        return f
+    return NativeFunction(f, opts)
 
 
 def _plain_function(fd):

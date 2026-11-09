@@ -1265,7 +1265,7 @@ def _backend(backend):
 
 def fit(model, params, X, y=None, loss="mse", opt=None, epochs=10, batch_size=None, seed=0, verbose=True,
         clip=None, schedule=None, graph=None, mask=None, val=None, backend="numpy", device="auto",
-        precision="fp32", compile=False):
+        precision="fp32", compile=False, workers=1):
     """Train `model`. Returns record(params, history, val_history, device).
 
     loss: "mse", "cross_entropy", "mae", "bce", "vae" ("huber" on torch) or a function loss(prediction, target).
@@ -1273,6 +1273,9 @@ def fit(model, params, X, y=None, loss="mse", opt=None, epochs=10, batch_size=No
     mask is true count in the loss. val=(X_val, y_val) records a validation loss each epoch.
     backend="torch" trains with PyTorch on device ("auto", "cpu", "cuda", "cuda:1", "mps", "xpu") with
     precision "fp64", "fp32", "tf32", "bf16" or "fp16" (mixed precision) and optional torch.compile.
+    workers=N (numpy backend, mini-batches): data-parallel training on N processes — every batch is split into N
+    shards, the gradients of the shards are averaged (weighted by shard size, so the result is the gradient of the
+    whole batch) and one optimizer step is taken. "auto" uses every core.
     """
     if _backend(backend) == "torch":
         from . import torch_backend
@@ -1304,6 +1307,24 @@ def fit(model, params, X, y=None, loss="mse", opt=None, epochs=10, batch_size=No
     rng = np.random.default_rng(int(seed))
     np.random.seed(int(seed))
     history, val_hist, step = [], [], 0
+    team = _Team(vg, Xr, Yr, workers) if not full and _want_workers(workers) > 1 else None
+    if team is not None:
+        vg = team.vg
+    try:
+        return _fit_loop(locals())
+    finally:
+        if team is not None:
+            team.close()
+
+
+def _fit_loop(env):
+    (model, epochs, full, rng, n, batch_size, Xr, Yr, schedule, opt, vg, params, clip, low, history, val, lf, ctx,
+     val_hist, verbose) = (env[k] for k in ("model", "epochs", "full", "rng", "n", "batch_size", "Xr", "Yr",
+                                             "schedule", "opt", "vg", "params", "clip", "low", "history", "val",
+                                             "lf", "ctx", "val_hist", "verbose"))
+    from .stdlib import clip_grad_norm
+    _f32 = env.get("_f32")
+    step = 0
     for ep in range(int(epochs)):
         if full:
             batches = [None]
@@ -1312,11 +1333,12 @@ def fit(model, params, X, y=None, loss="mse", opt=None, epochs=10, batch_size=No
             batches = [idx[i:i + int(batch_size)] for i in range(0, n, int(batch_size))]
         total = 0.0
         for b in batches:
-            xb = Xr if b is None else _take(Xr, b)
-            yb = Yr if b is None else _take(Yr, b)
             if schedule is not None:
                 opt.lr = schedule(step)
-            l, g = vg(params, xb, yb)
+            if hasattr(vg, "shards"):
+                l, g = vg(params, b)
+            else:
+                l, g = vg(params, Xr if b is None else _take(Xr, b), Yr if b is None else _take(Yr, b))
             if clip:
                 g = clip_grad_norm(g, clip)
             params = opt.step(params, g)
@@ -1334,6 +1356,94 @@ def fit(model, params, X, y=None, loss="mse", opt=None, epochs=10, batch_size=No
         if verbose and (ep % max(1, int(epochs) // 10) == 0 or ep == int(epochs) - 1):
             print(f"epoch {ep:4}  loss {history[-1]:.5f}{extra}")
     return Record(params=params, history=history, val_history=val_hist, device="numpy")
+
+
+def _want_workers(w):
+    import os as _os
+    if w in (None, 0, 1, False):
+        return 1
+    n = (_os.cpu_count() or 1) if str(w).lower() == "auto" else int(w)
+    return max(1, min(int(n), 256))
+
+
+class _Team:
+    """Data-parallel helpers: forked processes that compute the loss and gradients of one shard of each batch."""
+
+    def __init__(self, vg, X, Y, workers):
+        import multiprocessing as mp
+        import sys as _sys
+        self.n = _want_workers(workers)
+        self.procs = []
+        if _sys.platform.startswith("win") or "fork" not in mp.get_all_start_methods():
+            print("apsi: note: fit(workers=…) needs fork (Linux, macOS); training on one process", file=_sys.stderr)
+            self.vg = vg
+            return
+        global _TEAM_STATE
+        _TEAM_STATE = (vg, X, Y)
+        ctx = mp.get_context("fork")
+        self.pipes = []
+        for _ in range(self.n - 1):                       # the parent computes one shard itself
+            a, b = ctx.Pipe()
+            p = ctx.Process(target=_team_worker, args=(b,), daemon=True)
+            p.start()
+            self.procs.append(p)
+            self.pipes.append(a)
+        self.local = vg
+        self.X, self.Y = X, Y
+
+        def parallel(params, b):
+            shards = [s for s in np.array_split(np.asarray(b), self.n) if len(s)]
+            for pipe, sh in zip(self.pipes, shards[1:]):
+                pipe.send((params, sh))
+            l0, g0 = self.local(params, _take(self.X, shards[0]), _take(self.Y, shards[0]))
+            total = len(b)
+            loss = float(ops.raw(l0)) * len(shards[0]) / total
+            grad = tree_map(lambda a: np.asarray(ops.raw(a)) * (len(shards[0]) / total), g0)
+            for pipe, sh in zip(self.pipes, shards[1:]):
+                ok, res = pipe.recv()
+                if not ok:
+                    raise RuntimeErr(f"fit(workers=…): a worker failed: {res}")
+                l, g = res
+                w = len(sh) / total
+                loss += l * w
+                grad = tree_map2(lambda a, c: a + np.asarray(c) * w, grad, g)
+            return loss, grad
+        parallel.shards = True
+        self.vg = parallel
+
+    def close(self):
+        for pipe in getattr(self, "pipes", []):
+            try:
+                pipe.send(None)
+            except (OSError, BrokenPipeError):
+                pass
+        for p in self.procs:
+            p.join(timeout=2)
+            if p.is_alive():
+                p.terminate()
+
+
+_TEAM_STATE = None
+
+
+def tree_map2(f, a, b):
+    """f over the leaves of two trees of the same shape (records, dicts, lists of arrays)."""
+    it = iter([f(x, y) for x, y in zip(tree_leaves(a), tree_leaves(b))])
+    return tree_map(lambda _: next(it), a)
+
+
+def _team_worker(pipe):
+    vg, X, Y = _TEAM_STATE
+    while True:
+        msg = pipe.recv()
+        if msg is None:
+            return
+        params, sh = msg
+        try:
+            l, g = vg(params, _take(X, sh), _take(Y, sh))
+            pipe.send((True, (float(ops.raw(l)), tree_map(lambda a: np.asarray(ops.raw(a)), g))))
+        except Exception as e:                            # noqa: BLE001 - reported to the parent
+            pipe.send((False, f"{type(e).__name__}: {e}"))
 
 
 def predict(model, params, X, backend="numpy", device="auto", precision="fp32", **ctx):

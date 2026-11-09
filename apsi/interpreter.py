@@ -272,6 +272,7 @@ class Interpreter:
         from . import hp as _hp
         self.modules["hp"] = _hp.module()
         self.modules.lazy("rt", lambda: __import__("apsi.rt", fromlist=["module"]).module(self))
+        self.modules.lazy("hub", lambda: __import__("apsi.hub", fromlist=["module"]).module(self))
         self.modules.lazy("tokens", lambda: __import__("apsi.tokens", fromlist=["module"]).module(self))
         self.modules.lazy("memory", lambda: __import__("apsi.memory", fromlist=["module"]).module(self))
         self.modules.lazy("db", lambda: __import__("apsi.db", fromlist=["module"]).module(self))

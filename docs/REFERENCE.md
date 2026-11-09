@@ -604,7 +604,7 @@ Available everywhere without `use`. Grouped by first letter; the signature shows
 | `zeros_like(x)` | zeros with the shape of another tensor |
 | `zip(*xs)` | pairs items of several lists |
 
-## Standard modules (42)
+## Standard modules (43)
 
 Load a module with `use NAME` (all its names) or `use NAME as n` (then `n.member`).
 
@@ -674,11 +674,14 @@ Load a module with `use NAME` (all its names) or `use NAME as n` (then `n.member
 | `read_json(path, interp=None)` | A JSON array of objects, or an object of columns → a DataFrame. |
 | `read_jsonl(path, interp=None)` | One JSON object per line (JSON Lines / NDJSON) → a DataFrame (missing keys become nulls). |
 
-### `use db` — 7 names
+### `use db` — 10 names
 
 | Name | What it is |
 |---|---|
 | `DatabaseError(msg, code=None, detail=None)` | An error reported by the database server (has .code: the SQLSTATE for PostgreSQL). |
+| `mariadb(url=None, **kw)` | function |
+| `mongo(url=None, **kw)` | function |
+| `mysql(url=None, **kw)` | function |
 | `pool(url, size=8, **kw)` | function |
 | `postgres(url=None, **kw)` | function |
 | `redis(url=None, **kw)` | function |
@@ -767,6 +770,26 @@ Load a module with `use NAME` (all its names) or `use NAME as n` (then `n.member
 | `sum(xs)` | The exact sum (no rounding error accumulates), rounded once to the current precision. |
 | `tan(x)` | function |
 | `tanh(x)` | function |
+
+### `use hub` — 15 names
+
+| Name | What it is |
+|---|---|
+| `cache_dir()` | function |
+| `clear_cache(repo=None)` | function |
+| `config(repo, revision='main', token=None)` | function |
+| `download(repo, filename, revision='main', token=None, kind='model', progress=True)` | One file → its local path (cached by commit; resumed; SHA-256 checked for large files). |
+| `files(repo, revision=None, token=None, kind='model')` | function |
+| `HubError(msg, line=None, col=None)` | type |
+| `info(repo, revision=None, token=None, kind='model')` | function |
+| `load(repo, filename=None, revision='main', token=None, dtype=None)` | Weights as {name: tensor}: model.safetensors (also sharded), or a named .safetensors / .gguf file. |
+| `login(token)` | function |
+| `logout()` | function |
+| `offline(on=True)` | function |
+| `search(query='', task=None, limit=20, sort='downloads')` | function |
+| `snapshot(repo, patterns=('*.json', '*.safetensors', '*.txt', '*.model'), revision='main', token=None, kind='model')` | Download the files that match the patterns; returns the folder. |
+| `tokenizer(repo, revision='main', token=None)` | function |
+| `tokenizer_from_file(path)` | function |
 
 ### `use io` — 9 names
 
@@ -996,11 +1019,11 @@ Load a module with `use NAME` (all its names) or `use NAME as n` (then `n.member
 | `best_device(need_gb=0.0)` | The GPU with the most free memory (if it has need_gb free), otherwise "cpu". |
 | `budget(gb=None)` | Set (or read) the RAM budget for array(), in GB. |
 | `cached(fn=None, name=None, ram_mb=128, disk_gb=5)` | Memoise fn in a two-tier store (RAM, then SSD). Use as @memory.cached or memory.cached(fn). |
-| `chunks(a, rows=65536)` | Row blocks of a (memory-mapped) array; the next block is read ahead on another thread. |
+| `chunks(a, rows=65536)` | function |
 | `devices()` | function |
 | `fit_batch(fn, batch, minimum=1)` | fn(batch); on out-of-memory the batch is halved (GPU cache emptied) and tried again. |
 | `free(a)` | Release an array from array() now (RAM is returned, a spill file is deleted). |
-| `map(fn, a, rows=65536, out=None, workers=None)` | out[i:j] = fn(a[i:j]) for row blocks, on all cores. out may be omitted (allocated with array()). |
+| `map(fn, a, rows=65536, out=None, workers=None)` | function |
 | `on_disk(a)` | function |
 | `spill_dir()` | function |
 | `status()` | function |
@@ -1052,7 +1075,7 @@ Load a module with `use NAME` (all its names) or `use NAME as n` (then `n.member
 | `conv2d(x, w, b=None, stride=1, padding=0)` | function |
 | `conv_init(c_in, c_out, k=3, seed=None)` | function |
 | `cosine_lr(step, total, base=0.001, warmup=0, minimum=0.0)` | function |
-| `cross_entropy(logits, labels)` | function |
+| `cross_entropy(logits, labels)` | Mean cross-entropy of integer labels; labels [B] with logits [B, C], or labels [B, T] with logits [B, T, C] (sequence models: every position counts). |
 | `dense(n_in, n_out, seed=None, scale=None)` | A dense layer's parameters: record(W, b) with He initialisation. |
 | `dropout(x, p=0.1, train=True, seed=None)` | function |
 | `embedding_init(vocab, d, seed=None)` | function |

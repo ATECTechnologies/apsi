@@ -849,9 +849,20 @@ def module(interp=None):
     def sqlite(path=":memory:"):
         return SQLite(path, interp=interp)
 
+    def mysql(url=None, **kw):
+        from .db_mysql import MySQL
+        return MySQL(url, interp=interp, **kw)
+
+    def mongo(url=None, **kw):
+        from .db_mongo import Mongo
+        return Mongo(url, interp=interp, **kw)
+
     def pool(url, size=8, **kw):
-        if str(url).startswith(("redis://", "rediss://")):
+        u = str(_plain(url))
+        if u.startswith(("redis://", "rediss://")):
             return Pool(lambda: Redis(url, interp=interp, **kw), size)
+        if u.startswith(("mysql://", "mariadb://")):
+            return Pool(lambda: mysql(url, **kw), size)
         return Pool(lambda: Postgres(url, interp=interp, **kw), size)
-    return {"postgres": postgres, "redis": redis, "sqlite": sqlite, "pool": pool, "DatabaseError": DatabaseError,
-            "RedisError": RedisError, "Result": Result}
+    return {"postgres": postgres, "redis": redis, "sqlite": sqlite, "mysql": mysql, "mariadb": mysql, "mongo": mongo,
+            "pool": pool, "DatabaseError": DatabaseError, "RedisError": RedisError, "Result": Result}

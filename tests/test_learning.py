@@ -19,6 +19,20 @@ class Learning(unittest.TestCase):
         flat = cross_entropy(logits.reshape(-1, 7), labels.reshape(-1))
         self.assertAlmostEqual(float(cross_entropy(logits, labels)), float(flat), places=12)
 
+    @unittest.skipIf(sys.platform.startswith("win"), "data-parallel fit needs fork")
+    def test_data_parallel_fit_matches_one_process(self):
+        from apsi import layers
+        from apsi.stdlib import Adam
+        rng = np.random.default_rng(1)
+        X = rng.normal(size=(600, 8))
+        y = (X[:, 0] > 0).astype(np.int64)
+        net = layers.mlp([8, 16, 2])
+        a = layers.fit(net, net.init(seed=0), X, y, loss="cross_entropy", opt=Adam(1e-2), epochs=3, batch_size=100,
+                       verbose=False, precision="fp64")
+        b = layers.fit(net, net.init(seed=0), X, y, loss="cross_entropy", opt=Adam(1e-2), epochs=3, batch_size=100,
+                       verbose=False, precision="fp64", workers=3)
+        np.testing.assert_allclose(a.history, b.history, rtol=1e-9)
+
     def test_three_models_learn(self):
         env = dict(os.environ, PYTHONPATH=ROOT)
         out = subprocess.run([sys.executable, "-m", "apsi", "run", os.path.join(ROOT, "benchmarks", "ai", "learn.apsi"),

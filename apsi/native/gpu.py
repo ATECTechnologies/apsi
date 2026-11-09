@@ -50,13 +50,21 @@ _NO_GPU_NOTED = False
 def gpu(*args, **kwargs):
     """@gpu, @gpu("fast"): run on the GPU(s) when possible, otherwise on all CPU cores."""
     if len(args) == 1 and not kwargs and callable(args[0]) and not isinstance(args[0], str):
-        return GpuFunction(args[0], {})
+        return _gwrap(args[0], {})
     opts = {a: True for a in args}
     opts.update({k: bool(v) for k, v in kwargs.items()})
     bad = set(opts) - {"fast", "quiet", "strict"}
     if bad:
         raise RuntimeErr(f"@gpu options are fast, quiet, strict; got {', '.join(sorted(bad))}")
-    return lambda f: GpuFunction(f, opts)
+    return lambda f: _gwrap(f, opts)
+
+
+def _gwrap(f, opts):
+    from . import _wrap
+    from ..values import Function
+    if getattr(f, "_apsi_def", None) is None and isinstance(f, Function):
+        return _wrap(f, opts)                    # the interpreter engine: runs as an ordinary function
+    return GpuFunction(f, opts)
 
 
 class GpuFunction:
