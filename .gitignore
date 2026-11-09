@@ -17,3 +17,4 @@ _tmp_models/
 *.vsix
 examples/out/
 experiments/
+apsi/MANIFEST.json

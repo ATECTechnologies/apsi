@@ -37,7 +37,10 @@ TTY = sys.stdout.isatty() and os.environ.get("TERM") != "dumb"
 
 
 def env_for(root):
-    return dict(os.environ, PYTHONPATH=os.pathsep.join(filter(None, [root, os.environ.get("PYTHONPATH")])))
+    # APSI_IDIOMS=0: every language runs the same loops (Apsi would otherwise run the matmul loops with BLAS;
+    # benchmarks/matmul measures that separately)
+    return dict(os.environ, APSI_IDIOMS=os.environ.get("APSI_IDIOMS", "0"),
+                PYTHONPATH=os.pathsep.join(filter(None, [root, os.environ.get("PYTHONPATH")])))
 
 
 def langs(tmp, apsi_root, apsi_src):

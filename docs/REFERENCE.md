@@ -771,7 +771,7 @@ Load a module with `use NAME` (all its names) or `use NAME as n` (then `n.member
 | `tan(x)` | function |
 | `tanh(x)` | function |
 
-### `use hub` — 15 names
+### `use hub` — 18 names
 
 | Name | What it is |
 |---|---|
@@ -785,7 +785,10 @@ Load a module with `use NAME` (all its names) or `use NAME as n` (then `n.member
 | `load(repo, filename=None, revision='main', token=None, dtype=None)` | Weights as {name: tensor}: model.safetensors (also sharded), or a named .safetensors / .gguf file. |
 | `login(token)` | function |
 | `logout()` | function |
+| `model(repo, revision='main', token=None)` | Download what a model needs and load it to run natively (see Model). |
+| `model_from_folder(folder)` | Load a model that runs natively from a local folder in Hugging Face layout. |
 | `offline(on=True)` | function |
+| `pipeline(task, repo, revision='main', token=None)` | A function for one task (sentiment-analysis, feature-extraction, ner, fill-mask, text-generation). |
 | `search(query='', task=None, limit=20, sort='downloads')` | function |
 | `snapshot(repo, patterns=('*.json', '*.safetensors', '*.txt', '*.model'), revision='main', token=None, kind='model')` | Download the files that match the patterns; returns the folder. |
 | `tokenizer(repo, revision='main', token=None)` | function |

@@ -81,8 +81,10 @@ Then read [Getting started](docs/GETTING-STARTED.md) (15 minutes) or [Write Apsi
   reports (`use rt`).
 * **Memory.** Arrays that move to the SSD instead of running out of RAM, out-of-core processing, OOM-safe batches,
   data-parallel training on several processes (`use memory`, `fit(workers=…)`).
-* **Hugging Face without Python.** Download models with an access token, load safetensors / GGUF weights and
-  tokenize with `tokenizer.json` natively (`use hub`).
+* **Hugging Face without Python.** Download models with an access token and run them natively — embeddings,
+  classification and named entities (BERT family), text generation (GPT-2, Llama, Mistral, Qwen, Gemma) (`use hub`).
+* **Matrix products from plain loops.** Three nested loops computing `c[i, j] += a[i, k] * b[k, j]` run on the tuned
+  BLAS kernel: 10× faster than the same loops in C with `-O3` at 2048×2048.
 * **Fewer AI tokens.** Exactly reversible packing of what you send to language models: 57–63 % fewer tokens for
   record lists (`use tokens`).
 * **Data.** A columnar table engine, 3–24× faster than pandas (`use dataframe`); PostgreSQL, MySQL/MariaDB, MongoDB,

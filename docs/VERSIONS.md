@@ -13,7 +13,7 @@
 | Large models | as 2.0.0 | `apsi plan`, model files (GGUF, safetensors, `.apsim`), sharding | — |
 | Libraries (`apsi install / pack / publish / yank / unpublish`) | as 2.0.0 | yes | yes |
 | Website commands (`apsi release …`) | as 2.0.0 | yes | yes |
-| Standard modules | 43 modules, 1110 members, 298 built-ins | 34 modules, 833 members, 253 built-ins | 22 modules, 360 members, 201 built-ins |
+| Standard modules | 43 modules, 1113 members, 298 built-ins | 34 modules, 833 members, 253 built-ins | 22 modules, 360 members, 201 built-ins |
 | Real time, video | `use rt`: 1–2 kHz loops, video 640×480 → 4K at any size | — | — |
 | RAM / SSD / GPU management | `use memory` | — | — |
 | Fewer AI tokens | `use tokens` (exactly reversible) | — | — |

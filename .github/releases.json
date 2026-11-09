@@ -1,23 +1,23 @@
 [
   {
     "version": "1.10.0",
-    "commit": "12e166d15e0b2d021c318698e96de42f6095c6e0",
     "notes": ".github/release-notes/notes-1.10.0.md",
     "latest": false,
-    "title": "Apsi 1.10.0"
+    "title": "Apsi 1.10.0",
+    "target": "release/1.10.0"
   },
   {
     "version": "2.0.0",
-    "commit": "5f09d327a2e75bd873e82606d1383a91e6424c1a",
     "notes": ".github/release-notes/notes-2.0.0.md",
     "latest": false,
-    "title": "Apsi 2.0.0"
+    "title": "Apsi 2.0.0",
+    "target": "release/2.0.0"
   },
   {
     "version": "2.4.4",
-    "commit": "459d5224b57cdaa8c570fea71e21650f2533d3fa",
     "notes": ".github/release-notes/notes-2.4.4.md",
     "latest": true,
-    "title": "Apsi 2.4.4"
+    "title": "Apsi 2.4.4",
+    "target": "release/2.4.4"
   }
 ]

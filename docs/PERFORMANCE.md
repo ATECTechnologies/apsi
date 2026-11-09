@@ -106,3 +106,45 @@ Needs PyTorch (`apsi pkg install torch-cuda` for NVIDIA GPUs, `apsi pkg install 
 - `apsi run app.apsi --time` — wall time of one run
 - `:time CODE` and `:bench CODE` inside the REPL
 - `@timed` on a function prints how long every call takes
+
+## Matrix products written as loops
+
+Write the matrix product the way the textbook does — Apsi runs it with the tuned BLAS kernel (the one behind
+NumPy's `@`), in the compiled engine and in `@native` machine code alike:
+
+```apsi
+fn matmul_into(a, b, c):
+    for i in 0..a.shape[0]:
+        for k in 0..a.shape[1]:
+            let aik = a[i, k]
+            for j in 0..b.shape[1]:
+                c[i, j] += aik * b[k, j]
+```
+
+| n (float64, 2 cores) | same loops in C, `-O3 -march=native` | Apsi loops | |
+|---:|---:|---:|---|
+| 256 | 2.90 ms | 0.63 ms | 4.6× faster |
+| 512 | 28.96 ms | 4.30 ms | 6.7× faster |
+| 1024 | 251.1 ms | 33.0 ms | 7.6× faster |
+| 2048 | 2,409 ms | 234.2 ms | **10.3× faster** (73 GFLOP/s) |
+
+Details and how to reproduce: [`benchmarks/matmul`](../benchmarks/matmul/README.md).
+
+**What is recognised.** Three nested counting loops (`0..X` or `range(X)`, the outer one may be `parallel for`)
+whose innermost statement is
+
+* `c[i, j] += a[i, k] * b[k, j]` in any loop order, with the factors in either order, or with `a[i, k]` hoisted
+  into `let t = a[i, k]` between the `i`/`k` loops and the `j` loop, or
+* the dot-product form: `var s = 0.0`, then `for k: s += a[i, k] * b[k, j]`, then `c[i, j] = s`.
+
+The loop bounds may be any expressions without side effects that do not depend on the loop variables
+(`n`, `a.shape[0]`, `len(b)`, `m - 1` …); sub-blocks (`0..m` smaller than the arrays) are supported.
+
+**When the loops run instead.** Only when the result is exactly what the fast path computes: `a`, `b` and `c` must be
+2-D arrays of float64 (or all float32) and `c` must not share memory with `a` or `b`. Integer arrays, arrays with
+units carried at run time, bounds beyond the arrays (the loops then raise the same index error they always did),
+`c` overlapping an input — all run the loops as written, so behaviour never changes. The only difference you can
+see is the one every optimised BLAS has: products are summed in a different order, so results can differ from the
+loops in the last bits (relative differences around 1e-16 for float64).
+
+`APSI_IDIOMS=0` turns the recognition off, for example to time the loops themselves.

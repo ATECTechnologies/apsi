@@ -276,10 +276,10 @@ class Hub:
                 idx = self.download(repo, "model.safetensors.index.json", revision, token)
                 with open(idx, encoding="utf-8") as fh:
                     shards = sorted(set(json.load(fh)["weight_map"].values()))
+                from .hub_models import read_safetensors
                 out = {}
                 for s in shards:
-                    out.update(models.load_safetensors(self.download(repo, s, revision, token), dtype=dtype,
-                                                       nested=False))
+                    out.update(read_safetensors(self.download(repo, s, revision, token)))
                 return out
             else:
                 st = [n for n in names if n.endswith(".safetensors")]
@@ -295,11 +295,208 @@ class Hub:
         if filename.endswith(".gguf"):
             return modelio.load_gguf(path, nested=False)
         if filename.endswith(".safetensors"):
-            return models.load_safetensors(path, dtype=dtype, nested=False)
+            from .hub_models import read_safetensors
+            return read_safetensors(path)
         raise HubError(f"hub.load reads .safetensors and .gguf files; use hub.download for {filename}")
 
     def tokenizer(self, repo, revision="main", token=None):
         return Tokenizer.from_file(self.download(repo, "tokenizer.json", revision, token))
+
+    def model(self, repo, revision="main", token=None):
+        """Download what a model needs and load it to run natively (see Model)."""
+        names = self.files(repo, revision, token)
+        want = {"config.json", "tokenizer.json", "modules.json", "1_Pooling/config.json", "generation_config.json",
+                "model.safetensors", "model.safetensors.index.json", "tokenizer_config.json"}
+        get = [n for n in names if n in want]
+        if "model.safetensors" not in names and "model.safetensors.index.json" in names:
+            idx = self.download(repo, "model.safetensors.index.json", revision, token)
+            with open(idx, encoding="utf-8") as fh:
+                get += sorted(set(json.load(fh)["weight_map"].values()))
+        if "model.safetensors" not in get and not any(n.endswith(".safetensors") for n in get):
+            raise HubError(f"{repo} has no safetensors weights to run natively")
+        last = None
+        for n in get:
+            last = self.download(repo, n, revision, token)
+        folder = os.path.dirname(self.download(repo, "config.json", revision, token))
+        return Model(folder, repo)
+
+    def pipeline(self, task, repo, revision="main", token=None):
+        """A function for one task (sentiment-analysis, feature-extraction, ner, fill-mask, text-generation)."""
+        return Pipeline(task, self.model(repo, revision, token))
+
+
+# ======================================================================================== running models
+class Model:
+    """A Hub model running natively: embed / classify / fill_mask / tokens / generate, depending on the model."""
+
+    def __init__(self, folder, name=None):
+        from . import hub_models
+        self.folder = folder
+        self.name = name or folder
+        self.config, weights = hub_models.load_folder(folder)
+        self.net = hub_models.build(self.config, weights)
+        tj = os.path.join(folder, "tokenizer.json")
+        self.tokenizer = Tokenizer.from_file(tj) if os.path.exists(tj) else None
+        self.kind = "encoder" if isinstance(self.net, hub_models.Encoder) else "decoder"
+        self.labels = {int(k): v for k, v in (self.config.get("id2label") or {}).items()}
+        self.pooling = "mean"
+        self.normalize = False
+        mj = os.path.join(folder, "modules.json")
+        if os.path.exists(mj):                                 # a sentence-transformers model
+            with open(mj, encoding="utf-8") as fh:
+                mods = json.load(fh)
+            self.normalize = any("Normalize" in m.get("type", "") for m in mods)
+            pj = os.path.join(folder, "1_Pooling", "config.json")
+            if os.path.exists(pj):
+                with open(pj, encoding="utf-8") as fh:
+                    pc = json.load(fh)
+                self.pooling = "cls" if pc.get("pooling_mode_cls_token") else (
+                    "max" if pc.get("pooling_mode_max_tokens") else "mean")
+        gc = os.path.join(folder, "generation_config.json")
+        self.gen = {}
+        if os.path.exists(gc):
+            with open(gc, encoding="utf-8") as fh:
+                self.gen = json.load(fh)
+
+    def _need_tok(self):
+        if self.tokenizer is None:
+            raise HubError(f"{self.name} has no tokenizer.json; pass token ids instead of text")
+        return self.tokenizer
+
+    def _batch(self, texts, max_length=None):
+        import numpy as np
+        single = isinstance(texts, str)
+        texts = [texts] if single else list(texts)
+        tok = self._need_tok()
+        encs = [tok.encode(t) for t in texts]
+        limit = max_length or self.config.get("max_position_embeddings", 512)
+        if self.config.get("model_type") in ("roberta", "xlm-roberta", "camembert"):
+            limit -= 2                                         # positions start after the padding index
+        ids = [e.ids[:limit] for e in encs]
+        T = max(len(i) for i in ids)
+        pad = self.config.get("pad_token_id") or 0
+        arr = np.full((len(ids), T), pad, np.int64)
+        mask = np.zeros((len(ids), T), np.float32)
+        for k, i in enumerate(ids):
+            arr[k, :len(i)] = i
+            mask[k, :len(i)] = 1
+        return single, arr, mask, encs
+
+    def hidden(self, texts):
+        """Last hidden states [B, T, H] (encoders)."""
+        single, ids, mask, _ = self._batch(texts)
+        h = self.net.hidden(ids, mask)
+        return h[0] if single else h
+
+    def embed(self, texts, normalize=None):
+        """Sentence embeddings: the model's own pooling (sentence-transformers) or mean pooling."""
+        import numpy as np
+        if self.kind != "encoder":
+            raise HubError("embed() needs an encoder model (BERT, RoBERTa, MiniLM, E5, BGE …)")
+        single, ids, mask, _ = self._batch(texts)
+        h = self.net.hidden(ids, mask)
+        if self.pooling == "cls":
+            v = h[:, 0]
+        elif self.pooling == "max":
+            v = np.where(mask[..., None] > 0, h, -1e9).max(1)
+        else:
+            v = (h * mask[..., None]).sum(1) / np.maximum(mask.sum(1, keepdims=True), 1e-9)
+        if self.normalize if normalize is None else normalize:
+            v = v / np.maximum(np.linalg.norm(v, axis=-1, keepdims=True), 1e-12)
+        return v[0] if single else v
+
+    def similarity(self, a, b):
+        import numpy as np
+        va, vb = self.embed([a, b], normalize=True)
+        return float(np.dot(va, vb))
+
+    def classify(self, texts, top_k=1):
+        import numpy as np
+        single, ids, mask, _ = self._batch(texts)
+        logits = self.net.classify(self.net.hidden(ids, mask))
+        multi = self.config.get("problem_type") == "multi_label_classification"
+        probs = 1 / (1 + np.exp(-logits)) if multi else np.exp(logits - logits.max(-1, keepdims=True))
+        if not multi:
+            probs = probs / probs.sum(-1, keepdims=True)
+        out = []
+        for p in probs:
+            order = np.argsort(-p)[:max(1, int(top_k))]
+            rows = [{"label": self.labels.get(int(i), f"LABEL_{int(i)}"), "score": float(p[i])} for i in order]
+            out.append(rows[0] if top_k == 1 else rows)
+        return out[0] if single else out
+
+    def tokens(self, text):
+        """Token classification (named entities …): one label per token."""
+        import numpy as np
+        _, ids, mask, encs = self._batch(text)
+        logits = self.net.token_logits(self.net.hidden(ids, mask))[0]
+        p = np.exp(logits - logits.max(-1, keepdims=True))
+        p = p / p.sum(-1, keepdims=True)
+        out = []
+        for i, tok in enumerate(encs[0].tokens[:len(p)]):
+            if tok in self.tokenizer.special:
+                continue
+            j = int(np.argmax(p[i]))
+            out.append({"token": tok, "label": self.labels.get(j, f"LABEL_{j}"), "score": float(p[i, j])})
+        return out
+
+    def fill_mask(self, text, top_k=5):
+        import numpy as np
+        tok = self._need_tok()
+        _, ids, mask, encs = self._batch(text)
+        logits = self.net.mlm_logits(self.net.hidden(ids, mask))[0]
+        mask_tokens = {t for t in tok.added if "mask" in t.lower()}
+        pos = [i for i, t in enumerate(encs[0].tokens) if t in mask_tokens]
+        if not pos:
+            raise HubError(f"the text has no mask token ({', '.join(sorted(mask_tokens)) or '[MASK]'})")
+        lg = logits[pos[0]]
+        p = np.exp(lg - lg.max())
+        p = p / p.sum()
+        top = np.argsort(-p)[:int(top_k)]
+        return [{"token": tok.decode([int(i)]).strip(), "id": int(i), "score": float(p[i])} for i in top]
+
+    def generate(self, prompt, max_new_tokens=64, temperature=0.0, top_k=0, top_p=1.0, seed=None,
+                 repetition_penalty=1.0, stream=None, add_special_tokens=True):
+        """Continue a prompt (decoders). stream=fn(text) receives each piece as it is produced."""
+        if self.kind != "decoder":
+            raise HubError("generate() needs a decoder model (GPT-2, Llama, Mistral, Qwen, Gemma)")
+        tok = self._need_tok()
+        ids = tok.encode(prompt, add_special_tokens=add_special_tokens).ids if isinstance(prompt, str) else list(prompt)
+        eos = self.gen.get("eos_token_id", self.config.get("eos_token_id"))
+        eos = eos if isinstance(eos, list) else ([eos] if eos is not None else [])
+        done = []
+
+        def emit(t):
+            if stream is not None:
+                before = tok.decode(done, skip_special_tokens=True)
+                done.append(t)
+                piece = tok.decode(done, skip_special_tokens=True)[len(before):]
+                if piece:
+                    stream(piece)
+        out = self.net.generate(ids, max_new_tokens, temperature, top_k, top_p, eos, seed, repetition_penalty,
+                                emit if stream is not None else None)
+        return tok.decode(out, skip_special_tokens=True)
+
+    def __repr__(self):
+        return f"<model {self.name}: {self.config.get('model_type')} {self.kind}>"
+
+
+class Pipeline:
+    TASKS = {"feature-extraction": "embed", "sentence-similarity": "embed", "embeddings": "embed",
+             "text-classification": "classify", "sentiment-analysis": "classify", "token-classification": "tokens",
+             "ner": "tokens", "fill-mask": "fill_mask", "text-generation": "generate"}
+
+    def __init__(self, task, model):
+        if task not in self.TASKS:
+            raise HubError(f"unknown task '{task}' (tasks: {', '.join(self.TASKS)})")
+        self.task, self.model = task, model
+        self.fn = getattr(model, self.TASKS[task])
+
+    def __call__(self, *a, **k):
+        return self.fn(*a, **k)
+
+    def __repr__(self):
+        return f"<pipeline {self.task}: {self.model.name}>"
 
 
 # ======================================================================================== tokenizers
@@ -339,9 +536,19 @@ class Tokenizer:
         self.spec = spec
         m = spec["model"]
         self.type = m.get("type") or ("WordPiece" if "continuing_subword_prefix" in m and "merges" not in m else "BPE")
-        self.vocab = m["vocab"]
+        if self.type == "Unigram":
+            self.scores = {piece: (i, float(score)) for i, (piece, score) in enumerate(m["vocab"])}
+            self.vocab = {piece: i for piece, (i, _) in self.scores.items()}
+            self.unk_id = m.get("unk_id")
+            self.byte_fallback = bool(m.get("byte_fallback"))
+            self.max_len = max((len(p) for p in self.vocab), default=1)
+            self.min_score = min((sc for _, sc in self.scores.values()), default=0.0)
+            self.unk = m["vocab"][self.unk_id][0] if self.unk_id is not None else None
+        else:
+            self.vocab = m["vocab"]
         self.inv = {i: t for t, i in self.vocab.items()}
-        self.unk = m.get("unk_token")
+        if self.type != "Unigram":
+            self.unk = m.get("unk_token")
         self.added = {a["content"]: a["id"] for a in spec.get("added_tokens", [])}
         self.inv.update({i: t for t, i in self.added.items()})
         self.special = {a["content"] for a in spec.get("added_tokens", []) if a.get("special")}
@@ -361,6 +568,8 @@ class Tokenizer:
         elif self.type == "WordPiece":
             self.prefix = m.get("continuing_subword_prefix", "##")
             self.max_chars = m.get("max_input_chars_per_word", 100)
+        elif self.type == "Unigram":
+            pass
         else:
             raise HubError(f"tokenizer model '{self.type}' is not supported natively (WordPiece and BPE are); "
                            "use hf_pipeline with --allow-python")
@@ -407,6 +616,8 @@ class Tokenizer:
                 s = re.sub(pat["Regex"], n["content"], s) if "Regex" in pat else s.replace(pat["String"], n["content"])
             elif t == "Strip":
                 s = s.strip()
+            elif t == "Precompiled":
+                s = unicodedata.normalize("NFKC", s)            # SentencePiece's nmt_nfkc, without its char map
         return s
 
     def _pretokenize(self, s):
@@ -497,6 +708,47 @@ class Tokenizer:
         self.cache[word] = out
         return out
 
+    def _unigram(self, word):
+        """SentencePiece's Viterbi: the segmentation with the highest total log-probability; characters no piece
+        covers become <unk> (consecutive ones merged), or bytes with byte fallback."""
+        n = len(word)
+        best = [(-1e300, -1, None)] * (n + 1)
+        best[0] = (0.0, -1, None)
+        unk_score = self.min_score - 10.0
+        for i in range(n):
+            if best[i][0] <= -1e299:
+                continue
+            base = best[i][0]
+            found = False
+            for j in range(i + 1, min(n, i + self.max_len) + 1):
+                hit = self.scores.get(word[i:j])
+                if hit is not None:
+                    found = found or j == i + 1
+                    sc = base + hit[1]
+                    if sc > best[j][0]:
+                        best[j] = (sc, i, word[i:j])
+            if not found:
+                sc = base + unk_score
+                if sc > best[i + 1][0]:
+                    best[i + 1] = (sc, i, None)                    # None marks an unknown character
+        pieces, j = [], n
+        while j > 0:
+            _, i, piece = best[j]
+            pieces.append((piece, word[i:j]))
+            j = i
+        pieces.reverse()
+        out = []
+        for piece, text in pieces:
+            if piece is not None:
+                out.append(piece)
+            elif self.byte_fallback:
+                out += [f"<0x{b:02X}>" for b in text.encode("utf-8")]
+            elif out and out[-1] == self.unk:
+                continue
+            else:
+                out.append(self.unk)
+        return out
+
     def _wordpiece(self, word):
         if len(word) > self.max_chars:
             return [self.unk]
@@ -527,7 +779,8 @@ class Tokenizer:
                 toks.append(chunk)
                 continue
             for w in self._pretokenize(self._normalize(chunk)):
-                toks += self._bpe(w) if self.type == "BPE" else self._wordpiece(w)
+                toks += self._bpe(w) if self.type == "BPE" else (
+                    self._unigram(w) if self.type == "Unigram" else self._wordpiece(w))
         return toks
 
     def encode(self, text, pair=None, add_special_tokens=True):
@@ -537,7 +790,8 @@ class Tokenizer:
             toks = self._post(toks, toks2)
         elif toks2:
             toks = toks + toks2
-        ids = [self.added.get(t, self.vocab.get(t, self.vocab.get(self.unk, 0))) for t in toks]
+        unk = self.vocab.get(self.unk, 0) if self.unk is not None else 0
+        ids = [self.added.get(t, self.vocab.get(t, unk)) for t in toks]
         return Encoding(ids, toks)
 
     def _post(self, a, b):
@@ -667,7 +921,14 @@ def module(interp=None):
             path = check_path(interp, path, "read", "hub.tokenizer_from_file()")
         return Tokenizer.from_file(path)
 
-    return {"info": hub.info, "files": hub.files, "search": hub.search, "download": hub.download,
+    def model_from_folder(folder):
+        """Load a model that runs natively from a local folder in Hugging Face layout."""
+        if interp is not None:
+            from .security import check_path
+            folder = check_path(interp, folder, "read", "hub.model_from_folder()")
+        return Model(folder)
+
+    return {"model": hub.model, "pipeline": hub.pipeline, "model_from_folder": model_from_folder, "info": hub.info, "files": hub.files, "search": hub.search, "download": hub.download,
             "snapshot": hub.snapshot, "load": hub.load, "config": hub.config, "tokenizer": hub.tokenizer,
             "tokenizer_from_file": tokenizer_from_file, "login": login, "logout": logout, "offline": offline,
             "cache_dir": cache_dir, "clear_cache": clear_cache, "HubError": HubError}

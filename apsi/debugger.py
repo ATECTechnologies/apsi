@@ -94,6 +94,19 @@ def _expandable(v):
                                                                and v.size > 1) or bool(_children(v))
 
 
+def _hit_ok(rule, n):
+    """Hit-count rules: "5" or ">= 5" from the 5th hit, "> 5", "== 5" only the 5th, "% 10" every 10th."""
+    rule = rule.strip()
+    try:
+        for pre, test in ((">=", lambda k: n >= k), ("==", lambda k: n == k), (">", lambda k: n > k),
+                          ("%", lambda k: k > 0 and n % k == 0)):
+            if rule.startswith(pre):
+                return test(int(rule[len(pre):]))
+        return n >= int(rule)
+    except ValueError:
+        return True
+
+
 class Debugger:
     """The engine: a sys.settrace hook that pauses the program thread and answers questions about it."""
 
@@ -194,10 +207,7 @@ class Debugger:
                 except Exception:                              # noqa: BLE001
                     ok = True
             if ok and bp.get("hit"):
-                try:
-                    ok = bp["count"] >= int(str(bp["hit"]).lstrip(">= "))
-                except ValueError:
-                    pass
+                ok = _hit_ok(str(bp["hit"]), bp["count"])
             if ok and bp.get("log"):
                 self.on_output(self._interpolate(bp["log"], frame) + "\n")
                 ok = False

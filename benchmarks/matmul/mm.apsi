@@ -1,0 +1,40 @@
+# Matrix multiplication three ways in Apsi: the loops you would write, the dot-product form, and the @ operator.
+# The loop nests are recognised as matrix products and run with BLAS (apsi/idioms.py); APSI_IDIOMS=0 runs the loops.
+# Usage: apsi run benchmarks/matmul/mm.apsi --allow-env
+
+fn loops_ikj(a, b, c):
+    let n = a.shape[0]
+    for i in 0..n:
+        for k in 0..n:
+            let aik = a[i, k]
+            for j in 0..n:
+                c[i, j] += aik * b[k, j]
+
+fn loops_dot(a, b, c):
+    let n = a.shape[0]
+    for i in 0..n:
+        for j in 0..n:
+            var s = 0.0
+            for k in 0..n:
+                s += a[i, k] * b[k, j]
+            c[i, j] = s
+
+fn best(f, reps: Int) -> Float:
+    var t_best = 1e9
+    for r in 0..reps:
+        let t = clock()
+        f()
+        t_best = min(t_best, magnitude(clock() - t))
+    return t_best
+
+for n in [256, 512, 1024, 2048]:
+    let a = randn(n, n, seed=1)
+    let b = randn(n, n, seed=2)
+    let flops = 2.0 * n * n * n
+    let c1 = zeros(n, n)
+    let c2 = zeros(n, n)
+    let t1 = best(fn() => loops_ikj(a, b, c1), 3)
+    let t2 = best(fn() => loops_dot(a, b, c2), 3)
+    let t3 = best(fn() => a @ b, 3)
+    let err = max(abs(c2 - a @ b))
+    print(f"n={n}  loops(ikj) {t1 * 1000:8.2f} ms {flops / t1 / 1e9:6.1f} GFLOP/s | loops(dot) {t2 * 1000:8.2f} ms | @ {t3 * 1000:8.2f} ms {flops / t3 / 1e9:6.1f} GFLOP/s | max error {err:.1e}")

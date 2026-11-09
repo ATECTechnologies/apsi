@@ -35,3 +35,53 @@ apsi run app.apsi                        # a .venv or venv folder next to the pr
 
 The venv's `site-packages` are put first on the import path for `pyimport`/`pyfrom` and converted programs. The
 venv's Python version must match the one Apsi runs on (Apsi says so when it does not).
+
+## Reference (`use env`)
+
+| Function | Returns | Behaviour |
+|---|---|---|
+| `env.load(path=".env", override=true, export=false)` | names defined | Reads a `.env` file. A missing file is an error. With `override=false`, names already loaded keep their value. With `export=true`, the values are also put into the process environment for child processes. Needs `--allow-read` for the file. |
+| `env.get(name, default=none)` | `Str` or default | The loaded `.env` value first, then the process environment. Without a permission to read the environment, returns `default` when one is given and raises a permission error otherwise. |
+| `env.has(name)` | `Bool` | Whether the name is set in the loaded files or the environment. |
+| `env.require(name, …)` | the values | Raises one error listing **every** missing or empty name, so a deployment shows all problems at once. |
+| `env.secret(name, default=none)` | `Secret` or `none` | The value wrapped so it never prints. `.reveal()` returns the text. |
+| `env.int(name, default=none)`, `env.float(…)` | number | Converts the value. An empty or missing value gives `default`. A value that is not a number is an error (never silently 0). |
+| `env.bool(name, default=false)` | `Bool` | `1`, `true`, `yes`, `on`, `y` (any case) are true; any other set value is false. |
+| `env.list(name, sep=",", default=none)` | `List[Str]` | Splits and trims; empty items are dropped. |
+| `env.parse(text)` | `Dict` | Parses `.env` text without touching any state — useful in tests. |
+| `env.values` | `Dict` | Everything loaded from files so far. |
+
+### File format in detail
+
+```dotenv
+# comments start with #
+PORT=8080
+export DEBUG=true                     # "export " is allowed and ignored
+NAME='single quotes: taken literally, no ${EXPANSION}'
+GREETING="double quotes: \n becomes a line break"
+KEY="-----BEGIN KEY-----
+spans several lines
+-----END KEY-----"
+DATABASE_URL=postgres://${DB_USER}:${DB_PASS}@db/app   # ${NAME} from this file or the environment
+EMPTY=
+TRAILING=value   # an unquoted value ends before " #"
+```
+
+A byte-order mark at the start of the file (common with Windows editors) is ignored.
+
+### Secrets in practice
+
+```apsi
+use env
+use db
+env.load()
+let pg = db.postgres(host=env.get("DB_HOST"), user="app", password=env.secret("DB_PASSWORD"))
+print(env.secret("DB_PASSWORD"))          # ******
+log(f"connecting with {env.secret("DB_PASSWORD")}")   # connecting with ******
+```
+
+* Keep `.env` out of version control (add it to `.gitignore`) and commit a `.env.example` with the
+  names and harmless values instead.
+* On servers, prefer real environment variables or your platform's secret store, and run with
+  `--allow-env=NAME1,NAME2` so the program can read only what it needs.
+* `Secret` values compare in constant time, so checking an API key with `==` does not leak it through timing.

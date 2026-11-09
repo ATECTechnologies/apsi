@@ -210,6 +210,10 @@ class Engine:
         mcb = ctypes.CFUNCTYPE(None, ctypes.c_int64, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p)(_matmul_cb)
         self._callbacks.append(mcb)
         llvm.add_symbol("apsi_matmul", ctypes.cast(mcb, ctypes.c_void_p).value)
+        gcb = ctypes.CFUNCTYPE(ctypes.c_int64, ctypes.c_int64, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
+                               ctypes.c_int64, ctypes.c_int64, ctypes.c_int64)(_gemm_cb)
+        self._callbacks.append(gcb)
+        llvm.add_symbol("apsi_gemm", ctypes.cast(gcb, ctypes.c_void_p).value)
         pcb = ctypes.CFUNCTYPE(None, ctypes.c_int64, ctypes.c_void_p)(_print_cb)
         self._callbacks.append(pcb)
         llvm.add_symbol("apsi_print", ctypes.cast(pcb, ctypes.c_void_p).value)
@@ -624,6 +628,19 @@ def _matmul_cb(code, da, db, dout):
         if _error is not None and _error[0] == 0:
             _error[0] = 99
         sys.stderr.write(f"apsi native: matmul failed: {e}\n")
+
+
+def _gemm_cb(code, da, db, dc, M, N, K):
+    """apsi_gemm: a loop nest recognised as a matrix product (see apsi/idioms.py). 0 = done with BLAS, 1 = the
+    compiled loops must run (nothing was written)."""
+    try:
+        import numpy as np
+        from ..idioms import gemm
+        dtype = np.dtype(np.float64 if code // 100 == 8 else np.float32)
+        a, b, c = (_as_numpy(d, 2, dtype) for d in (da, db, dc))
+        return 0 if gemm(code % 100, a, b, c, M, N, K) else 1
+    except BaseException:                                     # noqa: BLE001
+        return 1
 
 
 def _print_cb(site, slots):

@@ -465,6 +465,20 @@ class CodeGen:
         return f"({inner}{',' if len(pat) == 1 else ''})"
 
     def s_For(self, s, scope):
+        if not self.pyc:
+            from .idioms import match_gemm
+            g = match_gemm(s)
+            if g is not None:                        # a matrix product written as loops: BLAS, loops as fallback
+                args = ", ".join([str(g.mode)] + [self.load(n, scope) for n in (g.a, g.b, g.c)] +
+                                 [self.expr(e, scope) for e in (g.M, g.N, g.K)])
+                self.emit(f"if not {HELPER_PREFIX}gemm({args}):")
+                self.indent += 1
+                self._for(s, scope)
+                self.indent -= 1
+                return
+        self._for(s, scope)
+
+    def _for(self, s, scope):
         it = s.iter
         if isinstance(it, A.Range):
             src = f"{HELPER_PREFIX}irange({self.expr(it.start, scope)}, {self.expr(it.end, scope)}, {it.inclusive})"
@@ -1600,6 +1614,9 @@ def _dual(f, fe):
     return f
 
 
+from .idioms import gemm as _gemm  # noqa: E402
+
+
 def _irange(a, b, inclusive):
     if isinstance(a, (int, np.integer)) and isinstance(b, (int, np.integer)) \
             and not isinstance(a, bool) and not isinstance(b, bool):
@@ -1693,7 +1710,7 @@ class Compiled:
             f"{HELPER_PREFIX}twin": _twin, f"{HELPER_PREFIX}dual": _dual,
             f"{HELPER_PREFIX}auto_native": _auto_native, f"{HELPER_PREFIX}native_e": _native_e,
             f"{HELPER_PREFIX}truth": _truth, f"{HELPER_PREFIX}T": _truth, f"{HELPER_PREFIX}all": _all,
-            f"{HELPER_PREFIX}irange": _irange, f"{HELPER_PREFIX}iterable": _iterable,
+            f"{HELPER_PREFIX}irange": _irange, f"{HELPER_PREFIX}gemm": _gemm, f"{HELPER_PREFIX}iterable": _iterable,
             f"{HELPER_PREFIX}idx": _idx, f"{HELPER_PREFIX}unpack": _unpack,
             f"{HELPER_PREFIX}Range": RangeVal, f"{HELPER_PREFIX}as_unit": _as_unit,
             f"{HELPER_PREFIX}fmt": fmt, f"{HELPER_PREFIX}approx": ops.approx, f"{HELPER_PREFIX}pm": ops.plusminus,

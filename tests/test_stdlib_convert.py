@@ -36,7 +36,12 @@ class StdlibConvert(unittest.TestCase):
         env = dict(os.environ, PYTHONPATH=ROOT, PYTHONHASHSEED="0")
         with tempfile.TemporaryDirectory() as td:
             for m in ["_pydecimal", "_pydatetime", "argparse", "configparser", "fnmatch", "base64", "string"]:
-                shutil.copy(os.path.join(lib, m + ".py"), td)
+                src = os.path.join(lib, m + ".py")
+                if os.path.exists(src):                  # string became a package in Python 3.14
+                    shutil.copy(src, td)
+                elif os.path.isdir(os.path.join(lib, m)):
+                    shutil.copytree(os.path.join(lib, m), os.path.join(td, m),
+                                    ignore=shutil.ignore_patterns("__pycache__"))
             shutil.copytree(os.path.join(lib, "tomllib"), os.path.join(td, "tomllib"))
             shutil.copy(os.path.join(lib, "html", "parser.py"), os.path.join(td, "hparser.py"))
             shutil.copy(os.path.join(lib, "urllib", "parse.py"), os.path.join(td, "uparse.py"))

@@ -11,12 +11,13 @@ guide.
 | Real time | 1–2 kHz control loops and video from 640×480 to 4K | [Real time](REALTIME.md) |
 | RAM, SSD, GPU | arrays that move to the SSD instead of running out of memory | [Memory](MEMORY.md) |
 | Fewer AI tokens | exactly reversible packing of what you send to language models | [Tokens](TOKENS.md) |
-| Hugging Face | models, weights and tokenizers from the Hub without Python packages | [Hub](HUB.md) |
+| Hugging Face | download and run models (BERT family, GPT-2, Llama, Mistral, Qwen, Gemma) without Python packages | [Hub](HUB.md) |
 | Tables | a columnar engine, 3–24× faster than pandas | [Tables](DATAFRAME.md) |
 | Databases | PostgreSQL, MySQL / MariaDB, MongoDB, Redis, SQLite without drivers | [Databases](DATABASES.md) |
 | Web | a 3× faster HTTP server, WebSocket | [Servers](SERVER.md) |
 | Configuration | `.env` files, secrets, Python virtual environments | [Configuration](ENV.md) |
 | Debugger | breakpoints and stepping in VS Code or the terminal | [Debugging](DEBUGGING.md) |
+| Matrix products | loops written the textbook way run on BLAS: 7–10× faster than C loops | [Performance](PERFORMANCE.md#matrix-products-written-as-loops) |
 
 ## 1. Python, exactly
 
@@ -179,14 +180,39 @@ offered as a paid service without a licence from ATEC. The programs, libraries a
 
 ## 11. Hugging Face without Python
 
-`use hub` downloads models from the Hugging Face Hub (with a token for private and gated models), resumes and
-checks downloads, loads safetensors and GGUF weights into tensors, and reads `tokenizer.json` (WordPiece and BPE)
-natively. See [Hub](HUB.md).
+`use hub` downloads models from the Hugging Face Hub (with a token for private and gated models), tokenizes text
+(WordPiece, BPE, Unigram) and runs the models natively: embeddings, classification, named entities, fill-mask, and
+text generation with GPT-2, Llama, Mistral, Qwen and Gemma. See [Hub](HUB.md).
+
+```apsi
+use hub
+let sentiment = hub.pipeline("sentiment-analysis", "distilbert/distilbert-base-uncased-finetuned-sst-2-english")
+print(sentiment("Apsi is a joy to use"))
+print(hub.model("HuggingFaceTB/SmolLM2-135M").generate("The three laws of motion are", max_new_tokens=40))
+```
 
 ## 12. Data-parallel training
 
 `fit(model, params, X, y, …, workers=4)` trains on four processes: each batch is split into four shards, the
 gradients are averaged by shard size (the same update as one process) and one optimizer step is taken.
+
+## 13. Matrix products written as loops
+
+```apsi
+fn matmul_into(a, b, c):
+    for i in 0..a.shape[0]:
+        for k in 0..a.shape[1]:
+            let aik = a[i, k]
+            for j in 0..b.shape[1]:
+                c[i, j] += aik * b[k, j]
+```
+
+Loop nests like this one (any loop order, or the dot-product form with `var s = 0.0`) are recognised as a matrix
+product and run with the tuned BLAS kernel, in the compiled engine and in `@native` code. On a 2-core VM a 2048×2048
+product takes 234 ms (73 GFLOP/s) — the same loops in C with `gcc -O3 -march=native` take 2,409 ms, and in Python
+they would take minutes. When the fast path would not give the loops' exact behaviour (integer arrays, `c`
+overlapping an input, bounds beyond the arrays) the loops run as written. See
+[Performance](PERFORMANCE.md#matrix-products-written-as-loops) and `benchmarks/matmul`.
 
 ## Upgrading from 2.0.0
 

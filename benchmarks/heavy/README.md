@@ -7,7 +7,7 @@ C, C++, Rust, Go and Mojo:
 |---|---|
 | `nbody-dense 2000x10` | all-pairs gravity, 40 M interactions with square roots and divisions |
 | `jacobi-2d 1024x200` | 2-D heat-equation stencil, memory bandwidth |
-| `matmul 1024` | dense matrix product, 2.1 GFLOP |
+| `matmul 1024` | dense matrix product, 2.1 GFLOP (loops in every language; `run.py` sets `APSI_IDIOMS=0` so Apsi runs the loops too — with the default, Apsi runs them on BLAS, see [`../matmul`](../matmul/README.md)) |
 | `lu-pivot 800` | LU factorisation with partial pivoting (log-determinant) |
 | `ising 512x50` | Metropolis Monte Carlo, random numbers and unpredictable branches |
 | `levenshtein 10k` | 100 M-cell dynamic programme with a three-way minimum |

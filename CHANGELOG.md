@@ -51,8 +51,16 @@
 ### Hugging Face without Python (`use hub`)
 - Search, download (cached by commit, resumed, SHA-256 checked, offline mode) and load safetensors / GGUF weights
   from the Hugging Face Hub; access tokens for private and gated models, sent only to the Hub itself.
-- Native `tokenizer.json` engines: WordPiece (BERT family), byte-level BPE (GPT-2, Llama 3, Qwen) and
-  SentencePiece-style BPE with byte fallback (Llama 2, Mistral).
+- Native `tokenizer.json` engines: WordPiece (BERT family), byte-level BPE (GPT-2, Llama 3, Qwen),
+  SentencePiece-style BPE with byte fallback (Llama 2, Mistral) and Unigram (T5, XLM-R).
+- **Matrix products written as loops run with BLAS.** Three nested loops computing `c[i, j] += a[i, k] * b[k, j]`
+  (any loop order, a hoisted `a[i, k]`, or the dot-product form with an accumulator) are recognised in the compiled
+  engine and in `@native` code and run with the tuned BLAS kernel: 7–10× faster than the same loops in C with `-O3`,
+  about 1,000× faster than before in the compiled engine. The loops remain the fallback (integer arrays, aliasing,
+  out-of-range bounds) so behaviour never changes; `APSI_IDIOMS=0` turns it off. `benchmarks/matmul`.
+- **Models run natively** (`hub.model`, `hub.pipeline`): BERT, DistilBERT, RoBERTa, XLM-R and sentence-transformers
+  (embeddings, similarity, classification, named entities, fill-mask); GPT-2, Llama, Mistral, Qwen 2/3 and Gemma
+  (text generation with a key/value cache, greedy or sampled, streaming).
 
 ### Fewer AI tokens (`use tokens`)
 - Exactly reversible transforms for what you send to language models: `pack`/`unpack` (lists of records as

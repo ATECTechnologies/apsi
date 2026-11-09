@@ -1064,6 +1064,53 @@ class FnEmitter:
         return None
 
     def s_For(self, s):
+        if not self.dry and not self.mc.gpu:
+            from ..idioms import match_gemm
+            g = match_gemm(s)
+            done = self.gemm_call(g, s) if g is not None else None
+            if done is not None:                     # a matrix product written as loops: BLAS, loops as fallback
+                bd = self.f.b
+                slow = self.f.fn.append_basic_block("gemm.loops")
+                join = self.f.fn.append_basic_block("gemm.done")
+                bd.cbranch(done, join, slow)
+                bd.position_at_end(slow)
+                self.for_loop(s)
+                if not bd.block.is_terminated:
+                    bd.branch(join)
+                bd.position_at_end(join)
+                return
+        return self.for_loop(s)
+
+    def gemm_call(self, g, s):
+        """Emit apsi_gemm(...) for a matched loop nest; an i1 that is true when BLAS did the work, or None when the
+        operand types rule it out at compile time (then only the loops are compiled)."""
+        try:
+            arrs = [self.expr(A.Name(n, line=s.line, col=s.col)) for n in (g.a, g.b, g.c)]
+            if not all(is_arr(v.t) and v.t[2] == 2 for v in arrs):
+                return None
+            elem = arrs[0].t[1]
+            if elem not in ("f8", "f4") or any(v.t[1] != elem for v in arrs):
+                return None
+            dims = []
+            for e in (g.M, g.N, g.K):
+                v = self.expr(e)
+                if v.t not in (I64, BOOL):
+                    return None
+                dims.append(self.as_int(v).v)
+        except Exception:                                  # noqa: BLE001 - the loops alone decide
+            return None
+        bd = self.f.b
+        descs = []
+        for v in arrs:
+            p = self._entry_alloca(lltype(v.t), "gemm")
+            bd.store(v.v, p)
+            descs.append(bd.bitcast(p, i8p()))
+        code = (8 if elem == "f8" else 4) * 100 + g.mode
+        fn = self.mc.decl("apsi_gemm", i64t(), [i64t(), i8p(), i8p(), i8p(), i64t(), i64t(), i64t()])
+        r = bd.call(fn, [ir.Constant(i64t(), code)] + descs + dims)
+        return bd.icmp_signed("==", r, ir.Constant(i64t(), 0))
+
+    def for_loop(self, s):
         rng = self.range_of(s.iter, s)
         if rng is not None:
             if len(s.targets) != 1:
