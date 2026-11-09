@@ -1,0 +1,66 @@
+{
+ "machine": {
+  "cpu": "AMD EPYC 9V45 96-Core Processor",
+  "cores_used": 1,
+  "os": "Linux-7.0.0-1017-azure-x86_64-with-glibc2.39",
+  "python": "3.13.18"
+ },
+ "languages": {
+  "Apsi": {
+   "version": "Apsi 2.0.0",
+   "flags": "apsi run (@native, strict IEEE)"
+  }
+ },
+ "benchmarks": {
+  "nbody-dense 2000x10": {
+   "Apsi": {
+    "ms": 118.4,
+    "check": "0.000192436526863"
+   }
+  },
+  "jacobi-2d 1024x200": {
+   "Apsi": {
+    "ms": 94.6,
+    "check": "1193940.35882"
+   }
+  },
+  "matmul 1024": {
+   "Apsi": {
+    "ms": 98.1,
+    "check": "-12.2350796046"
+   }
+  },
+  "lu-pivot 800": {
+   "Apsi": {
+    "ms": 20.5,
+    "check": "1278.5938216"
+   }
+  },
+  "ising 512x50": {
+   "Apsi": {
+    "ms": 56.9,
+    "check": "26386"
+   }
+  },
+  "levenshtein 10k": {
+   "Apsi": {
+    "ms": 181.1,
+    "check": "5202"
+   }
+  },
+  "ode-rk4 20M": {
+   "Apsi": {
+    "ms": 377.3,
+    "check": "1.30419893119"
+   }
+  },
+  "kmeans 200k k16 x20": {
+   "Apsi": {
+    "ms": 44.4,
+    "check": "201640.557564"
+   }
+  }
+ },
+ "measured_at": "2026-11-09T22:45:22Z",
+ "all_checks_agree": true
+}

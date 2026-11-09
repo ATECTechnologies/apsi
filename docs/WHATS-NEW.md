@@ -18,6 +18,7 @@ guide.
 | Configuration | `.env` files, secrets, Python virtual environments | [Configuration](ENV.md) |
 | Debugger | breakpoints and stepping in VS Code or the terminal | [Debugging](DEBUGGING.md) |
 | Matrix products | loops written the textbook way run on BLAS: 7–10× faster than C loops | [Performance](PERFORMANCE.md#matrix-products-written-as-loops) |
+| Speed overall | 3.85–7.31× faster than 2.0.0 on the same programs (geometric mean) | [below](#how-much-faster-than-200) |
 
 ## 1. Python, exactly
 
@@ -213,6 +214,33 @@ product takes 234 ms (73 GFLOP/s) — the same loops in C with `gcc -O3 -march=n
 they would take minutes. When the fast path would not give the loops' exact behaviour (integer arrays, `c`
 overlapping an input, bounds beyond the arrays) the loops run as written. See
 [Performance](PERFORMANCE.md#matrix-products-written-as-loops) and `benchmarks/matmul`.
+
+## How much faster than 2.0.0
+
+The same programs on both versions, on the same machine, with identical results. Measured on a GitHub Actions runner
+(AMD EPYC, native compiler installed) and on a 2-core VM without the native compiler
+([`benchmarks/versions`](https://github.com/ATECTechnologies/apsi/tree/main/benchmarks/versions)):
+
+| Program | 2.0.0 | 2.4.4 | runner | 2-core VM ¹ |
+|---|---:|---:|---:|---:|
+| matmul 300, loops (compiled engine) | 20,950 ms | 3.2 ms | **6567.32×** | 6374.16× |
+| 200k objects: create and sum | 2,130 ms | 262 ms | **8.12×** | 9.26× |
+| fib(25), recursive calls | 41.0 ms | 12.2 ms | **3.37×** | 2.26× |
+| web server, 64 connections | 11,970 req/s | 39,964 req/s | **3.34×** | 3.06× |
+| web server, 256 connections | 13,144 req/s | 37,956 req/s | **2.89×** | 3.18× |
+| matmul 512, @native loops | 14.6 ms | 6.5 ms | **2.26×** | 300.48× |
+| word count, 260k words | 155 ms | 102 ms | **1.51×** | 1.41× |
+| start-up: apsi run hello.apsi | 181 ms | 134 ms | **1.35×** | 6.69× |
+| 200k f-strings and join | 116 ms | 93.8 ms | **1.24×** | 1.26× |
+| integer loop, 3M iterations | 87.2 ms | 80.9 ms | **1.08×** | 0.99× |
+| apsi check, 41 example programs (1,520 lines), empty cache | 6,759 ms | 6,499 ms | **1.04×** | 4.9× |
+| harmonic sum 50M, @native | 44.7 ms | 46.7 ms | **0.96×** | 1.03× |
+
+Geometric mean: **3.85× faster** (runner), **7.31×** (2-core VM). `@native` code was already at C
+speed in 2.0.0 and stays there. Reproduce with
+`python3 benchmarks/versions/compare.py --old ../apsi-2.0.0 --new . --web`.
+
+¹ Without the native compiler; 2.0.0 also started much more slowly there.
 
 ## Upgrading from 2.0.0
 

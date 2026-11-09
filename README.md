@@ -143,6 +143,13 @@ apsi fmt --check examples tests/apsi
 Security problems: please report them privately as described in [`docs/SECURITY.md`](docs/SECURITY.md) or at
 [apsi.dev/security](https://apsi.dev/security), not in public issues.
 
+## How Apsi was built
+
+Apsi is the work of one developer at ATEC, working together with Claude, the AI model made by Anthropic. Development
+started on 8 November 2026; everything from the first version to 2.4.4 — the language, checker and compilers, native
+and GPU code generation, the Python converter, the standard library, the tools, the documentation and the website —
+took about **19 hours of active work** in total (time actually spent working, in sessions over several days).
+
 ## License
 
 Apsi is developed by **ATEC** and published under the [Apsi License 2.0](LICENSE). In short: use it for anything,

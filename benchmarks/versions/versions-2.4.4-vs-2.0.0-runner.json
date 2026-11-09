@@ -1,0 +1,117 @@
+{
+ "old": "2.0.0",
+ "new": "2.4.4",
+ "machine": "x86_64, 4 threads, Linux, Python 3.13.18",
+ "native": true,
+ "rows": [
+  {
+   "name": "matmul 300, loops (compiled engine)",
+   "old": 20949.74,
+   "new": 3.19,
+   "unit": "ms",
+   "higher": false,
+   "speedup": 6567.32,
+   "note": ""
+  },
+  {
+   "name": "matmul 512, @native loops",
+   "old": 14.62,
+   "new": 6.46,
+   "unit": "ms",
+   "higher": false,
+   "speedup": 2.26,
+   "note": ""
+  },
+  {
+   "name": "harmonic sum 50M, @native",
+   "old": 44.73,
+   "new": 46.73,
+   "unit": "ms",
+   "higher": false,
+   "speedup": 0.96,
+   "note": ""
+  },
+  {
+   "name": "fib(25), recursive calls",
+   "old": 41.0,
+   "new": 12.18,
+   "unit": "ms",
+   "higher": false,
+   "speedup": 3.37,
+   "note": ""
+  },
+  {
+   "name": "200k objects: create and sum",
+   "old": 2129.56,
+   "new": 262.34,
+   "unit": "ms",
+   "higher": false,
+   "speedup": 8.12,
+   "note": ""
+  },
+  {
+   "name": "word count, 260k words",
+   "old": 154.62,
+   "new": 102.34,
+   "unit": "ms",
+   "higher": false,
+   "speedup": 1.51,
+   "note": ""
+  },
+  {
+   "name": "200k f-strings and join",
+   "old": 116.21,
+   "new": 93.78,
+   "unit": "ms",
+   "higher": false,
+   "speedup": 1.24,
+   "note": ""
+  },
+  {
+   "name": "integer loop, 3M iterations",
+   "old": 87.17,
+   "new": 80.87,
+   "unit": "ms",
+   "higher": false,
+   "speedup": 1.08,
+   "note": ""
+  },
+  {
+   "name": "start-up: apsi run hello.apsi",
+   "old": 181.13,
+   "new": 133.98,
+   "unit": "ms",
+   "higher": false,
+   "speedup": 1.35,
+   "note": ""
+  },
+  {
+   "name": "apsi check, 41 example programs (1,520 lines), empty cache",
+   "old": 6759.08,
+   "new": 6499.37,
+   "unit": "ms",
+   "higher": false,
+   "speedup": 1.04,
+   "note": ""
+  },
+  {
+   "name": "web server, 64 connections",
+   "old": 11970,
+   "new": 39964,
+   "unit": "req/s",
+   "higher": true,
+   "speedup": 3.34,
+   "note": ""
+  },
+  {
+   "name": "web server, 256 connections",
+   "old": 13144,
+   "new": 37956,
+   "unit": "req/s",
+   "higher": true,
+   "speedup": 2.89,
+   "note": ""
+  }
+ ],
+ "geomean": 3.85
+}
