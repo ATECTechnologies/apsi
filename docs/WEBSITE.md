@@ -29,7 +29,13 @@ reproducible.
 
 ## Apsi releases (administrators)
 
-Create a token with the `release` permission (only administrators see it), store it with `apsi lib login`, then:
+Who is an administrator is decided only on the server: signing up never makes one, not even the first account.
+The owner runs `node scripts/admin.js user promote NAME` (Windows package: `admin user promote NAME`) on the server.
+The `release` permission is offered only to administrators who have turned on two-factor sign-in, and a release
+token stops working if two-factor sign-in is turned off or the account is demoted. Tokens are stored as hashes, can
+expire, and can be revoked in *Settings → Developer*.
+
+Create a token with the `release` permission, store it with `apsi lib login`, then:
 
 ```bash
 apsi release upload ApsiSetup-2.4.4-x64.exe apsi-2.4.4-linux.zip apsi-2.4.4-source.zip --version 2.4.4
