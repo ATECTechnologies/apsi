@@ -13,7 +13,7 @@
   },
   {
     "version": "2.4.4",
-    "commit": "6e63b65ccfa9940ec051487ce541f71f6d9364bf",
+    "commit": "459d5224b57cdaa8c570fea71e21650f2533d3fa",
     "notes": ".github/release-notes/notes-2.4.4.md",
     "latest": true
   }
