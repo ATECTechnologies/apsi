@@ -1,0 +1,27 @@
+# Creates a GitHub Release (and its tag) for every version listed in .github/releases.json that does not have one
+# yet. Source code only: GitHub attaches the source archives; installers are published on apsi.dev.
+name: Releases
+on:
+  push:
+    branches: [main]
+    paths: [".github/releases.json", ".github/release-notes/**", ".github/workflows/releases.yml"]
+  workflow_dispatch:
+permissions:
+  contents: write
+jobs:
+  releases:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Create missing releases
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -e
+          jq -c '.[]' .github/releases.json | while read -r r; do
+            v=$(echo "$r" | jq -r .version); c=$(echo "$r" | jq -r .commit)
+            n=$(echo "$r" | jq -r .notes); latest=$(echo "$r" | jq -r .latest)
+            if gh release view "v$v" >/dev/null 2>&1; then echo "v$v exists"; continue; fi
+            gh release create "v$v" --target "$c" --title "Apsi $v" --notes-file "$n" --latest="$latest"
+            echo "created v$v"
+          done

@@ -1,0 +1,20 @@
+[
+  {
+    "version": "1.10.0",
+    "commit": "12e166d15e0b2d021c318698e96de42f6095c6e0",
+    "notes": ".github/release-notes/notes-1.10.0.md",
+    "latest": false
+  },
+  {
+    "version": "2.0.0",
+    "commit": "5f09d327a2e75bd873e82606d1383a91e6424c1a",
+    "notes": ".github/release-notes/notes-2.0.0.md",
+    "latest": false
+  },
+  {
+    "version": "2.4.4",
+    "commit": "6e63b65ccfa9940ec051487ce541f71f6d9364bf",
+    "notes": ".github/release-notes/notes-2.4.4.md",
+    "latest": true
+  }
+]
