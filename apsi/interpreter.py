@@ -1476,6 +1476,16 @@ class Interpreter:
             raise
 
     def get_attr(self, obj, name):
+        c = obj.__class__
+        if c is StructInstance:                                   # fast paths for the most common receivers
+            f = obj.fields
+            if name in f:
+                return f[name]
+        elif (c is list or c is dict or c is str) and name[0] != "_":
+            try:
+                return getattr(obj, name)
+            except AttributeError:
+                raise RuntimeErr(f"{type_name(obj)} has no attribute '{name}'")
         if isinstance(obj, StructInstance):
             if name in obj.fields:
                 return obj.fields[name]

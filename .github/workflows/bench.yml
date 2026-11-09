@@ -1,0 +1,40 @@
+# Benchmarks on a GitHub runner (run by hand: Actions -> bench -> Run workflow):
+# the heavy CPU programs in Apsi, C, C++, Rust and Go, the same programs on Apsi 2.0.0 (branch release/2.0.0),
+# and benchmarks/versions/compare.py between the two versions. The results are printed at the end of the log and
+# kept as an artifact.
+name: bench
+on:
+  workflow_dispatch:
+jobs:
+  bench:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    env:
+      PYTHONUTF8: "1"
+      TERM: dumb
+    steps:
+      - uses: actions/checkout@v5
+        with: { path: apsi }
+      - uses: actions/checkout@v5
+        with: { path: old, ref: release/2.0.0 }
+      - uses: actions/setup-python@v6
+        with: { python-version: "3.13" }
+      - uses: actions/setup-go@v5
+        with: { go-version: "1.23", cache: false }
+      - name: Install
+        run: python -m pip install numpy llvmlite
+      - name: Heavy benchmarks, Apsi 2.4.4 and the other languages
+        run: python apsi/benchmarks/heavy/run.py --skip Mojo --out out/new
+      - name: Heavy benchmarks, Apsi 2.0.0
+        run: python apsi/benchmarks/heavy/run.py --apsi-root old --only Apsi --label "Apsi 2.0.0" --out out/old
+      - name: Version comparison
+        run: python apsi/benchmarks/versions/compare.py --old old --new apsi --web --out out
+      - name: Results
+        if: always()
+        run: |
+          for f in out/new/results.json out/old/results.json out/versions.json; do
+            [ -f "$f" ] && { echo "=====BEGIN $f"; cat "$f"; echo; echo "=====END $f"; }
+          done
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with: { name: bench-results, path: out }

@@ -1,0 +1,101 @@
+# Programs that run unchanged on Apsi 2.0.0 and 2.4.4, used by compare.py to measure one version against another.
+# Each line of output: "name: <milliseconds> ms [check <value>]". Best of 3 runs (the first run also compiles).
+
+fn timeit(name, f):
+    var best = 1e9
+    var check = 0.0
+    for r in 0..3:
+        let t = clock()
+        check = f()
+        best = min(best, magnitude(clock() - t))
+    print(f"{name}: {best * 1000:.2f} ms [check {check}]")
+
+# --- array code written as loops (the compiled engine, no @native)
+fn matmul_loops(n: Int) -> Float:
+    let a = randn(n, n, seed=1)
+    let b = randn(n, n, seed=2)
+    let c = zeros(n, n)
+    for i in 0..n:
+        for k in 0..n:
+            let aik = a[i, k]
+            for j in 0..n:
+                c[i, j] += aik * b[k, j]
+    return round(sum(c), 6)
+
+# --- @native machine code
+@native
+fn matmul_native(n: Int) -> Float:
+    let a = zeros(n, n)
+    let b = zeros(n, n)
+    let c = zeros(n, n)
+    for i in 0..n:
+        for j in 0..n:
+            a[i, j] = ((i * 7 + j * 3) % 11) / 11.0 - 0.5
+            b[i, j] = ((i * 5 + j * 13) % 7) / 7.0 - 0.5
+    for i in 0..n:
+        for k in 0..n:
+            let aik = a[i, k]
+            for j in 0..n:
+                c[i, j] += aik * b[k, j]
+    var s = 0.0
+    for i in 0..n:
+        for j in 0..n:
+            s += c[i, j]
+    return s
+
+@native
+fn harmonic(n: Int) -> Float:
+    var s = 0.0
+    for i in 1..n:
+        s += 1.0 / i
+    return s
+
+# --- ordinary code: functions, lists, dicts, strings, structs
+fn fib(n: Int) -> Int:
+    if n < 2:
+        return n
+    return fib(n - 1) + fib(n - 2)
+
+struct P:
+    x: Float
+    y: Float
+
+fn objects() -> Float:
+    var pts = []
+    for i in 0..200000:
+        pts.append(P(i * 0.5, i * 0.25))
+    var s = 0.0
+    for p in pts:
+        s += p.x - p.y
+    return s
+
+fn words() -> Float:
+    var counts = {}
+    let text = "the quick brown fox jumps over the lazy dog and the dog sleeps "
+    for r in 0..20000:
+        for w in text.split(" "):
+            if w != "":
+                counts[w] = counts.get(w, 0) + 1
+    return float(counts["the"])
+
+fn strings() -> Float:
+    var parts = []
+    for i in 0..200000:
+        parts.append(f"item-{i}")
+    let joined = ",".join(parts)
+    return float(len(joined))
+
+fn loop_sum() -> Float:
+    var s = 0
+    for i in 0..3000000:
+        s += i % 7
+    return float(s)
+
+timeit("matmul 300, loops (compiled engine)", fn() => matmul_loops(300))
+timeit("matmul 512, @native loops", fn() => matmul_native(512))
+timeit("harmonic sum 50M, @native", fn() => harmonic(50000000))
+timeit("fib(25), recursive calls", fn() => float(fib(25)))
+timeit("200k objects: create and sum", fn() => objects())
+timeit("word count, 260k words", fn() => words())
+timeit("200k f-strings and join", fn() => strings())
+timeit("integer loop, 3M iterations", fn() => loop_sum())

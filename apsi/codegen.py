@@ -337,10 +337,17 @@ class CodeGen:
     def cond(self, c):
         return c if self.pyc else f"{HELPER_PREFIX}truth({c})"
 
+    def fast_cond(self, c, scope):
+        """A statement condition: plain bools (comparisons of numbers) skip the tensor check."""
+        if self.pyc or scope.ctx.kind != "fn":
+            return self.cond(c)
+        v = f"{HELPER_PREFIX}cnd"
+        return f"({v} if ({v} := {c}).__class__ is {HELPER_PREFIX}bool else {HELPER_PREFIX}truth({v}))"
+
     def s_If(self, s, scope):
         first = True
         for cond, body in s.branches:
-            c = self.cond(self.expr(cond, scope))
+            c = self.fast_cond(self.expr(cond, scope), scope)
             self.emit(f"{'if' if first else 'elif'} {c}:")
             first = False
             self.indent += 1
@@ -447,7 +454,7 @@ class CodeGen:
             self.indent -= 1
 
     def s_While(self, s, scope):
-        self.emit(f"while {self.cond(self.expr(s.cond, scope))}:")
+        self.emit(f"while {self.fast_cond(self.expr(s.cond, scope), scope)}:")
         self.indent += 1
         self.block(s.body, Scope(scope, scope.ctx, loop=True))
         self.indent -= 1
@@ -722,8 +729,17 @@ class CodeGen:
         val = self.expr(s.value, scope) if s.value is not None else "None"
         ret = getattr(scope.ctx, "ret_check", None)
         if ret and not scope.ctx.erased:
-            val = f"{ret}({val}, {HELPER_PREFIX}b, {'return value of ' + scope.ctx.name + '()'!r})"
+            val = self._ret(scope.ctx, val)
         self.emit(f"return {val}")
+
+    def _ret(self, ctx, val):
+        """The checked return value; Int/Float results of the expected class skip the checker call."""
+        call = f"{ctx.ret_check}({{}}, {HELPER_PREFIX}b, {'return value of ' + ctx.name + '()'!r})"
+        fast = getattr(ctx, "ret_fast", None)
+        if fast and ctx.kind == "fn":
+            r = f"{HELPER_PREFIX}ret"
+            return f"({r} if ({r} := {val}).__class__ is {fast} else {call.format(r)})"
+        return call.format(val)
 
     def s_Assert(self, s, scope):
         c = s.cond
@@ -869,14 +885,18 @@ class CodeGen:
             _collect_syms(ret, syms)
         if not ctx.erased:
             if needs_b:
-                self.emit(f"{HELPER_PREFIX}b = {{}}")
+                # shape symbols are bound across parameters through one dict; scalar-only signatures need none
+                shaped = bool(syms) or any(_has_shape(t) for t in [p.type for p in params] + [ret])
+                self.emit(f"{HELPER_PREFIX}b = {{}}" if shaped else f"{HELPER_PREFIX}b = None")
             for p, py in pnames:
                 if p.type is not None:
                     chk = self.checker(p.type)
-                    self.emit(f"{py} = {chk}({py}, {HELPER_PREFIX}b, "
-                              f"{'argument ' + repr(p.name) + ' of ' + ctx.name + '()'!r})")
+                    call = f"{chk}({py}, {HELPER_PREFIX}b, {'argument ' + repr(p.name) + ' of ' + ctx.name + '()'!r})"
+                    fast = _fast_class(p.type) if p.star is None else None
+                    self.emit(f"{py} = {py} if {py}.__class__ is {fast} else {call}" if fast else f"{py} = {call}")
             if ret is not None:
                 ctx.ret_check = self.checker(ret)
+                ctx.ret_fast = _fast_class(ret)
         elif syms:
             pairs = ", ".join(f"({py}, {self.const(p.type, 'T')})" for p, py in pnames if p.type is not None)
             self.emit(f"{HELPER_PREFIX}b = {HELPER_PREFIX}shape_bind(({pairs},))")
@@ -887,7 +907,7 @@ class CodeGen:
             self.cur_line = (body.line, body.col)
             val = self.expr(body, fscope)
             if ret is not None and not ctx.erased:
-                val = f"{ctx.ret_check}({val}, {HELPER_PREFIX}b, {'return value of ' + ctx.name + '()'!r})"
+                val = self._ret(ctx, val)
             self.emit(f"return {val}")
         else:
             self.block(body, fscope)
@@ -1309,6 +1329,28 @@ def _collect_syms(t, out):
                     out.append(a.name)
 
 
+_SHAPED = {"Tensor", "Vec", "Mat", "Matrix"}
+
+
+def _has_shape(t):
+    """Whether a type annotation mentions a tensor type (whose shape symbols bind across parameters)."""
+    if t is None:
+        return False
+    if isinstance(t, A.TName):
+        return t.name in _SHAPED or any(_has_shape(a) for a in (t.args or []))
+    return not isinstance(t, A.TUnit)
+
+
+def _fast_class(t):
+    """'int' / 'float' when values of exactly that class always pass the checker for t."""
+    if isinstance(t, A.TName) and not t.args:
+        if t.name == "Int":
+            return f"{HELPER_PREFIX}int"                # the real Python classes: Apsi's own int/float shadow them
+        if t.name in ("Float", "Number", "Real"):
+            return f"{HELPER_PREFIX}float"
+    return None
+
+
 # =========================================================================== runtime support
 class Runtime:
     """Helpers referenced by generated code (all exposed under the `_A` prefix)."""
@@ -1318,10 +1360,8 @@ class Runtime:
         self.filename = filename
         self.base_dir = base_dir
         self.structs = {}
-
-    # ---- type checks
-    def make_checker(self, t):
-        interp = self.interp
+        self._checkers = {}                 # id(type AST) -> (type AST, checker): one checker per annotation
+        self._plans = {}                    # id(struct) -> (struct, [(field, checker, message)])
         structs = self.structs
 
         class _Env:
@@ -1329,7 +1369,20 @@ class Runtime:
                 if name in structs:
                     return structs[name]
                 raise KeyError(name)
-        env = _Env()
+        self._env = _Env()
+
+    # ---- type checks
+    def make_checker(self, t):
+        hit = self._checkers.get(id(t))
+        if hit is not None and hit[0] is t:
+            return hit[1]
+        chk = self._make_checker(t)
+        self._checkers[id(t)] = (t, chk)
+        return chk
+
+    def _make_checker(self, t):
+        interp = self.interp
+        env = self._env
         if isinstance(t, A.TName):
             n = t.name
             if n == "Int":
@@ -1386,6 +1439,16 @@ class Runtime:
         return st
 
     def construct(self, st, args, kwargs):
+        if not kwargs and len(args) == len(st.fields):          # the common case: every field by position
+            plan = self._plans.get(id(st))
+            if plan is None or plan[0] is not st:
+                plan = (st, [(name, None if t is None else self.make_checker(t), f"field '{name}' of {st.name}")
+                             for name, t, _d in st.fields])
+                self._plans[id(st)] = plan
+            values, bindings = {}, {}
+            for v, (name, chk, what) in zip(args, plan[1]):
+                values[name] = v if chk is None else chk(v, bindings, what)
+            return StructInstance(st, values)
         if len(args) > len(st.fields):
             raise RuntimeErr(f"{st.name}() takes {len(st.fields)} field(s) but {len(args)} were given")
         kwargs = dict(kwargs)
@@ -1710,7 +1773,8 @@ class Compiled:
             f"{HELPER_PREFIX}twin": _twin, f"{HELPER_PREFIX}dual": _dual,
             f"{HELPER_PREFIX}auto_native": _auto_native, f"{HELPER_PREFIX}native_e": _native_e,
             f"{HELPER_PREFIX}truth": _truth, f"{HELPER_PREFIX}T": _truth, f"{HELPER_PREFIX}all": _all,
-            f"{HELPER_PREFIX}irange": _irange, f"{HELPER_PREFIX}gemm": _gemm, f"{HELPER_PREFIX}iterable": _iterable,
+            f"{HELPER_PREFIX}irange": _irange, f"{HELPER_PREFIX}gemm": _gemm,
+            f"{HELPER_PREFIX}int": int, f"{HELPER_PREFIX}float": float, f"{HELPER_PREFIX}bool": bool, f"{HELPER_PREFIX}iterable": _iterable,
             f"{HELPER_PREFIX}idx": _idx, f"{HELPER_PREFIX}unpack": _unpack,
             f"{HELPER_PREFIX}Range": RangeVal, f"{HELPER_PREFIX}as_unit": _as_unit,
             f"{HELPER_PREFIX}fmt": fmt, f"{HELPER_PREFIX}approx": ops.approx, f"{HELPER_PREFIX}pm": ops.plusminus,
