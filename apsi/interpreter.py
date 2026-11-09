@@ -96,7 +96,32 @@ DTYPE_NAMES = {"f16", "f32", "f64", "i32", "i64", "bool", "bf16", "fp8_e4m3", "f
                "fp6_e2m3", "fp4_e2m1", "int8", "int4", "fp8", "bf8", "fp4", "fp6"}
 
 
+class _GenStop(BaseException):
+    """Ends a generator's thread when its consumer stops early."""
+
+
+def is_generator(body):
+    """True when a function body contains `yield` (outside nested functions)."""
+    def walk(n):
+        if isinstance(n, A.Yield):
+            return True
+        if isinstance(n, (A.FnDef, A.Lambda, A.StructDef)):
+            return False
+        if isinstance(n, (list, tuple)):
+            return any(walk(x) for x in n)
+        if isinstance(n, A.AST):
+            return any(walk(getattr(n, f, None)) for f in n._fields)
+        return False
+    return walk(body)
+
+
 def wrap_python_error(e):
+    err = _wrap_python_error(e)
+    err.original = e                     # `except ValueError` still recognises the error after wrapping
+    return err
+
+
+def _wrap_python_error(e):
     if isinstance(e, ZeroDivisionError):
         return RuntimeErr("division by zero")
     msg = str(e)
@@ -126,6 +151,9 @@ class Interpreter:
         core = stdlib.core_builtins()
         self.globals.vars.update(core)
         self.globals.vars["testing"] = lambda: self.testing
+        from .exceptions import builtins_table
+        for _k, _v in builtins_table().items():
+            self.globals.vars.setdefault(_k, _v)
         self.modules = stdlib.modules(core)
         from . import interop, crypto, hardware, sci, precision, data, concurrency, web, models
         interop.install(self)
@@ -144,11 +172,32 @@ class Interpreter:
         self.modules["crypto"] = crypto.module()
         self.modules["sys"] = hardware.module()
         self.modules["gpu"] = self.modules["sys"]
+        from . import scale
+        self.modules["scale"] = scale.module()
+        # science, engineering and medicine (numpy only; see docs/SCIENCE.md)
+        from . import special, stats, dsp, mechanics, pde, quantum, physics, medical, lab
+        self.modules["special"] = special.module()
+        self.modules["stats"] = stats.module()
+        self.modules["signal"] = dsp.module()
+        self.modules["mechanics"] = mechanics.module()
+        self.modules["pde"] = pde.module()
+        self.modules["quantum"] = quantum.module()
+        self.modules["medical"] = dict(medical.module(), **medical.install(self))
+        self.modules["lab"] = dict(lab.module(), **lab.install(self))
+        from . import torch_compat, rl
+        self.modules["torch"] = torch_compat.module()
+        self.modules["rl"] = rl.module()
+        formulas = physics.module()
+        self.modules["physics"].update(formulas)
+        self.modules["physics.formulas"] = formulas
+        for k in ("gamma", "lgamma", "erf", "erfc", "erfinv", "factorial", "comb", "beta", "besselj", "legendre"):
+            self.modules["math"][k] = self.modules["special"][k]
         self.exact = False
         self.deriv_stack = []
         self.tests = []
         self.module_cache = {}
         self.importing = []          # files being imported right now (detects import cycles)
+        self._handling = []          # errors being handled by `except` blocks (for a bare `raise`)
         self.dir_stack = [os.getcwd()]
         self._ev = {}
         self._ex = {}
@@ -397,6 +446,42 @@ class Interpreter:
             raise RuntimeErr("a tensor with several elements cannot be used as a condition")
         return bool(v)
 
+    def ex_Try(self, s, env):
+        from . import exceptions as X
+        try:
+            try:
+                self.exec_block(s.body, Env(env))
+            except ControlSignal:
+                raise
+            except Exception as ex:                    # noqa: BLE001 - matched against the except clauses below
+                for kinds, name, body in s.handlers:
+                    if not kinds or X.matches(getattr(ex, "original", None) or ex, kinds) or X.matches(ex, kinds):
+                        henv = Env(env)
+                        if name:
+                            henv.vars[name] = X.value(getattr(ex, "original", None) or ex)
+                        self._handling.append(ex)
+                        try:
+                            self.exec_block(body, henv)
+                        finally:
+                            self._handling.pop()
+                        break
+                else:
+                    raise
+            else:
+                if s.else_body is not None:
+                    self.exec_block(s.else_body, Env(env))
+        finally:
+            if s.final_body is not None:
+                self.exec_block(s.final_body, Env(env))
+
+    def ex_Raise(self, s, env):
+        from . import exceptions as X
+        if s.value is None:
+            if not self._handling:
+                raise RuntimeErr("'raise' without a value is only allowed inside an 'except' block")
+            raise self._handling[-1]
+        raise X.to_raise(self.eval(s.value, env))
+
     def ex_While(self, s, env):
         while self.truthy(self.eval(s.cond, env)):
             try:
@@ -477,7 +562,7 @@ class Interpreter:
             for k, v in members.items():
                 env.define(k, v)
             if "." not in s.path and s.path not in members and s.path not in env.vars and s.path not in self.globals.vars:
-                env.define(s.path, Namespace(s.path, members))      # `use mylib` also allows mylib.name(...)
+                env.define(s.path, Namespace(s.path, members))      # `use rl` also allows rl.ppo(...)
 
     def ex_Import(self, s, env):
         path = s.path
@@ -793,8 +878,18 @@ class Interpreter:
 
     def ev_Call(self, n, env):
         f = self.eval(n.func, env)
-        args = [self.eval(a, env) for a in n.args]
-        kwargs = {k: self.eval(v, env) for k, v in n.kwargs}
+        args = []
+        for a in n.args:
+            if isinstance(a, A.Spread):
+                args.extend(self.eval(a.value, env))
+            else:
+                args.append(self.eval(a, env))
+        kwargs = {}
+        for k, v in n.kwargs:
+            if k is None:
+                kwargs.update(self.eval(v.value, env))
+            else:
+                kwargs[k] = self.eval(v, env)
         try:
             return self.call_value(f, args, kwargs)
         except ControlSignal:
@@ -816,13 +911,78 @@ class Interpreter:
         raise RuntimeErr(f"{type_name(f)} is not callable")
 
     def call_function(self, fn, args, kwargs):
+        if not fn.is_expr and is_generator(fn.body):
+            return self._generator(fn, args, kwargs)
+        return self._call_function(fn, args, kwargs)
+
+    def _generator(self, fn, args, kwargs):
+        """A function containing `yield`: values are produced lazily (infinite generators work)."""
+        import queue
+        import threading
+        q = queue.Queue(maxsize=1)
+        DONE = object()
+        interp = self
+        gen_self = {"stop": False}
+
+        def run():
+            interp._yield_q = getattr(interp, "_yield_q", {})
+            interp._yield_q[threading.get_ident()] = (q, gen_self)
+            try:
+                interp._call_function(fn, args, kwargs)
+                q.put((DONE, None))
+            except BaseException as e:               # noqa: BLE001 - handed to the consumer
+                q.put((DONE, e))
+
+        def gen():
+            t = threading.Thread(target=run, daemon=True)
+            t.start()
+            try:
+                while True:
+                    tag, v = q.get()
+                    if tag is DONE:
+                        if v is not None and not isinstance(v, _GenStop):
+                            raise v
+                        return
+                    yield v
+                    ack.put(True)
+            finally:
+                gen_self["stop"] = True
+                try:
+                    ack.put_nowait(False)
+                except queue.Full:
+                    pass
+        ack = queue.Queue(maxsize=1)
+        gen_self["ack"] = ack
+        return gen()
+
+    def ex_Yield(self, s, env):
+        import threading
+        slot = getattr(self, "_yield_q", {}).get(threading.get_ident())
+        if slot is None:
+            raise RuntimeErr("'yield' outside a generator")
+        q, st = slot
+        vals = self.eval(s.value, env) if s.value is not None else None
+        for v in (vals if s.from_ else [vals]):
+            q.put(("v", v))
+            if not st["ack"].get() or st["stop"]:
+                raise _GenStop()
+
+    def _call_function(self, fn, args, kwargs):
         env = Env(fn.closure)
         bindings = {}
         params = fn.params
-        if len(args) > len(params):
+        rest = kwrest = None
+        if params and params[-1].star == "**":
+            kwrest, params = params[-1], params[:-1]
+        if params and params[-1].star == "*":
+            rest, params = params[-1], params[:-1]
+        if len(args) > len(params) and rest is None:
             raise RuntimeErr(f"{fn.name}() takes {len(params)} argument(s) but {len(args)} were given")
         kwargs = dict(kwargs)
         prec = fn.precision
+        if rest is not None:
+            env.vars[rest.name] = list(args[len(params):])
+            args = args[:len(params)]
         for i, p in enumerate(params):
             if i < len(args):
                 v = args[i]
@@ -838,6 +998,9 @@ class Interpreter:
                 v = self.check_type(v, p.type, bindings, f"argument '{p.name}' of {fn.name}()", fn.closure)
             env.vars[p.name] = v
             env.consts.add(p.name)
+        if kwrest is not None:
+            env.vars[kwrest.name] = dict(kwargs)
+            kwargs = {}
         if kwargs:
             raise RuntimeErr(f"{fn.name}() got unexpected argument(s): {', '.join(kwargs)}")
         for sym, val in bindings.items():

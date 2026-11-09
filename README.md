@@ -1,10 +1,11 @@
 <p align="center"><img src="assets/brand/apsi-banner-1280x640.png" alt="Apsi" width="640"></p>
 
-# Apsi 1.10.0 (`.apsi`)
+# Apsi 2.0.0 (`.apsi`)
 
 **Apsi** is a programming language for **AI**, **physics** and **servers**. Physical units, tensor-shape
 checking, automatic differentiation, number formats from FP64 down to FP4, data pipelines and a hardened
-HTTP server are built into the language. It reads like Python, but catches mistakes before the program runs.
+HTTP server are built into the language. It reads like Python, but catches mistakes before the program runs,
+and since 2.0 it compiles to **native machine code** through LLVM, running on all CPU cores and on NVIDIA GPUs.
 
 ```apsi
 use physics.constants
@@ -15,21 +16,30 @@ print(kinetic(2kg, 3[m/s]))          # 9.0 J
 print(m_e * c ** 2 as [MeV])         # 0.510998949996 MeV
 
 let wrong = 5m + 2s                  # ✗ UnitError before running: cannot add Length and Time
+
+@native                              # machine code for this CPU, units checked then erased
+fn energy(x, v, k: Float) -> Float:
+    var e = 0.0
+    parallel for i in 0..len(x):     # every CPU core; @gpu runs the same loop on the GPU
+        e += 0.5 * v[i] * v[i] + 0.5 * k * x[i] * x[i]
+    return e
 ```
 
 ## Install
 
 | System | File in `dist/` |
 |---|---|
-| Windows 10/11 (x64) | `ApsiSetup-1.10.0-x64.exe` — setup wizard with its own Python; no administrator rights needed |
-| Any Linux (also WSL) | `sh ApsiSetup-1.10.0-linux.sh` — one-file installer, no root; commands, `.apsi` file type with icon, editor support |
-| Ubuntu / Debian | `sudo apt install ./apsi_1.10.0_all.deb` |
-| Any system with Python 3.9+ | `pip install apsi-1.10.0-py3-none-any.whl` |
+| Windows 10/11 (x64) | `ApsiSetup-2.0.0-x64.exe` — setup wizard with its own Python; no administrator rights needed |
+| Any Linux (also WSL) | `sh ApsiSetup-2.0.0-linux.sh` — one-file installer, no root; commands, `.apsi` file type with icon, editor support |
+| Ubuntu / Debian | `sudo apt install ./apsi_2.0.0_all.deb` |
+| Any system with Python 3.12+ | `pip install apsi-2.0.0-py3-none-any.whl` |
 | Code editors | the setup wizard adds Apsi to VS Code, Cursor, Windsurf, VSCodium, Sublime Text, Vim/Neovim and Notepad++ it finds (`apsi editors install` does the same later) |
 
-The installer adds `apsi` to your PATH (open a **new** terminal afterwards — already-open terminals and VS Code must
-be restarted to see it; see *Troubleshooting* in [`docs/INSTALL.md`](docs/INSTALL.md#troubleshooting)), registers `.apsi` files (icon, *Run with Apsi*, *Edit*, and
+The installer adds `apsi` to your PATH, registers `.apsi` files (icon, *Run with Apsi*, *Edit*, and
 *New → Apsi source file* in Explorer), creates Start-menu / application-menu entries and adds Apsi to your code editors. Details: [`docs/INSTALL.md`](docs/INSTALL.md) · [`docs/INSTALL-LINUX.md`](docs/INSTALL-LINUX.md)
+
+If `apsi` is not recognized right after installing, open a new terminal (quit VS Code completely); other first-run
+problems and their fixes are in [`docs/TROUBLESHOOTING.md`](docs/TROUBLESHOOTING.md).
 
 Without installing: `pip install numpy`, then use `apsi.bat …` (Windows) or `./apsi.sh …` (Linux) from this folder.
 
@@ -64,9 +74,15 @@ apsi                    # interactive REPL
 | **Autodiff** | `grad(f)`, `value_and_grad(f)` on tensors, structs and records, unit-aware (`grad(energy)` has the unit of a force); any order: `hessian`, `jacobian`, `laplace`, `grad(grad(f))` — enough for physics-informed neural networks |
 | **AI** | `use layers`: **any architecture as a graph of layers** (`sequential`, `residual`, `parallel`, `dag`), transformers, CNNs, LSTM/GRU, autoencoders/VAEs, **graph neural networks** (GCN, GraphSAGE, GAT, GIN), a model zoo and `fit()`; plus Adam/AdamW/SGD, schedules, gradient clipping, save/load — reference: [`docs/LAYERS.md`](docs/LAYERS.md) |
 | **GPU training (PyTorch)** | the same models train on PyTorch with `fit(…, backend="torch")` — NVIDIA CUDA, AMD ROCm, Apple MPS, Intel XPU or CPU; fp64/fp32/tf32, bf16/fp16 mixed precision, `torch.compile`, fused attention, cuDNN LSTMs; `torch_module()` gives a real `torch.nn.Module`; `check_torch()` verifies every layer against NumPy; `apsi pkg install torch-auto` picks the right CUDA build — [`docs/BACKENDS.md`](docs/BACKENDS.md) |
-| **From Python** | `apsi convert` translates Python files and folders — numpy, math, random, json, PyTorch tensors and `torch.nn` layers map onto Apsi; any other library keeps working through `pyimport` |
+| **From Python and PyTorch** | `apsi convert` translates Python files and folders. **PyTorch programs become native Apsi** on `use torch`, Apsi's own implementation of the PyTorch API: `nn.Module` classes, every common layer (BatchNorm, LSTM, attention, transformers), losses with all options, optimizers, learning-rate schedulers, `DataLoader`s, `state_dict`s and the training loop. Whole training runs end with the same weights as PyTorch (to 1e-9), with no Python or PyTorch at run time. numpy, math, random and json map onto Apsi too; any other library keeps working through `pyimport` — [`docs/PYTHON.md`](docs/PYTHON.md) |
+| **Reinforcement learning** | `use rl`: vectorised environments, GAE, PPO, double DQN, REINFORCE, DPO / IPO / GRPO / RLHF objectives, Monte Carlo tree search, beam search — [`docs/RL.md`](docs/RL.md) |
+| **Libraries** | `.apsil` packages: `apsi install NAME` gets the newest version with dependencies and a lock file, verifies every file's SHA-256 and scans it; `apsi pack` + `apsi publish` with an API token — [`docs/LIBRARIES.md`](docs/LIBRARIES.md) |
+| **Science and medicine** | `use special`, `stats`, `signal`, `mechanics`, `pde`, `quantum`, `medical`, `lab`: special functions, distributions and 19 hypothesis tests, regression, power analysis, zero-phase filters and spectra, Lagrangian/Hamiltonian dynamics by autodiff, N-body, orbits, beams and trusses, heat/wave/Poisson/Navier–Stokes solvers, Schrödinger equation and qubits, pharmacokinetics, survival analysis (Kaplan–Meier, log-rank, Cox), ROC/DeLong, ECG/HRV, DICOM, reproducible experiment logs. Verified against SciPy, statsmodels, lifelines, scikit-learn and pydicom — [`docs/SCIENCE.md`](docs/SCIENCE.md) |
 | **Physics** | `sci.solve_ivp` with an implicit TR-BDF2 solver for **stiff** systems and adaptive RK45; `evolve` solves differential equations with euler / midpoint / rk4 / adaptive **rk45** / symplectic / verlet; Laplacians for PDEs; linalg (eigh, solve, …); measurement uncertainty `9.81 ± 0.02` that propagates through formulas with correct correlations |
-| **Speed** | the compiler turns the whole program into bytecode; every function has an "erased twin" without unit bookkeeping for hot loops; parsed programs are kept in a signed compile cache; tensor work runs on multi-threaded BLAS, on the GPU through CuPy, and neural networks through PyTorch |
+| **Native code** | `@native` compiles a function to machine code through LLVM for the exact CPU (AVX2/AVX-512), specialised on argument types and units; on par with C, C++ and Rust and 100–3,500× faster than the 1.x bytecode engine on loops ([benchmarks](docs/NATIVE.md#performance)); overflow, index and division checks stay on by default; results identical to the bytecode engine |
+| **Large models** | `apsi plan 1T --active 32B` / `use scale`: memory per GPU, tensor × pipeline × data layout, GPU count, days and serving memory for 1B–2T-parameter models (dense or mixture-of-experts, BF16/FP8) — [`docs/SCALE.md`](docs/SCALE.md) |
+| **Parallel & GPU** | `parallel for` runs iterations on all CPU cores with deterministic reductions (bit-identical for any thread count); `@gpu` runs it on every NVIDIA GPU in the machine (GTX 1660 and newer, multi-GPU split, no CUDA toolkit) and falls back to all CPU cores — [`docs/NATIVE.md`](docs/NATIVE.md) |
+| **Speed (rest of the language)** | the compiler turns the whole program into bytecode; every function has an "erased twin" without unit bookkeeping for hot loops; parsed programs are kept in a signed compile cache; tensor work runs on multi-threaded BLAS, on the GPU through CuPy, and neural networks through PyTorch |
 | **Executables** | `apsi build app.apsi` → `app.exe` (Windows) / `app` (Linux) with the program, its imports, Apsi as bytecode and fixed permissions; `--standalone` adds its own Python runtime for PCs without Apsi |
 | **Precision** | `@precision(exact)` computes with exact fractions; `@precision(f32)` / `f16` for AI |
 | **Security** | permission system (Python, C, network are off by default), Apsi Guard pre-run scan, and a `crypto` module (scrypt, HMAC, SHA-3, tokens, constant-time compare) |
@@ -76,9 +92,9 @@ apsi                    # interactive REPL
 | **Accuracy** | exact fractions, correctly rounded sums (`fsum`), measurement uncertainty, unit checking, bit-exact low-precision formats |
 | **Concurrency** | tasks, channels, locks, atomics, `parallel_for` / `parallel_reduce`, `pmap`, BLAS thread control |
 | **Servers** | `use web`: asyncio + worker pool + multi-process, 7,700 req/s at 500 concurrent connections (2 vCPU); protection against slowloris, request smuggling, path traversal, header injection and DoS; JWT, API keys, rate limits, CORS, TLS, metrics |
-| **AI models** | `use models`: safetensors read/write, memory-mapped loading, INT8/FP8/FP4 compression (4–16× less RAM), `qlinear`; ONNX Runtime, Hugging Face and PyTorch models served as an API in a few lines |
+| **AI models** | `use models`: Apsi checkpoints (`.apsim`: units, compressed tensors, SHA-256, signatures, sharding), GGUF (bit-exact Q8_0/Q4_0), safetensors read/write, memory-mapped loading, INT8/FP8/FP4 compression (4–16× less RAM), `qlinear`; ONNX Runtime, Hugging Face and PyTorch models served as an API in a few lines |
 | **Tooling** | `run`, `check`, `test`, `fmt`, `watch`, `bench`, `build`, `compile`, `convert`, `new`, `task`, `doc`, `lsp`, `repl`, `serve`, `doctor`, `editors`, `pkg`; extensions for VS Code, Cursor, Windsurf, VSCodium, Sublime Text, Vim/Neovim and Notepad++ with live diagnostics, unit hovers, go to definition, tasks, snippets and themes; web playground (WebAssembly) |
-| **Platforms** | Windows 10/11 and Linux installers; CI on Windows Server 2022/2025 and Ubuntu 22.04/24.04; Python 3.9–3.14 |
+| **Platforms** | Windows 10/11 and Linux installers; CI on Windows Server 2022/2025 and Ubuntu 22.04/24.04; Python 3.12 and newer (3.12, 3.13, 3.14) |
 
 ## Commands
 
@@ -99,11 +115,17 @@ apsi task [NAME] / apsi NAME  run a task from apsi.toml
 apsi doc [NAME]               documentation for built-ins and modules
 apsi audit / scan / verify    permissions a program needs / malware scan / installation integrity
 apsi serve FILE               expose a program's functions as a JSON HTTP API
+apsi install NAME             install an Apsi library (.apsil) from the registry: NAME@^1.2, a file, or [dependencies]
+apsi pack / apsi publish      build dist/NAME-VERSION.apsil / upload it with an API token
+apsi search WORDS · apsi lib list | info | registry | login   the library registry
 apsi pkg install torch-auto   optional Python libraries (torch-auto, gpu, onnx, transformers, ai, …)
 apsi config --profile strict  default security profile
 apsi completion powershell    shell completion (bash, zsh, fish, powershell)
 apsi editors install          Apsi support in VS Code, Cursor, Windsurf, VSCodium, Sublime, Vim/Neovim, Notepad++
 apsi convert app.py           translate Python (and whole folders) into Apsi
+apsi native info | explain FILE  the native compiler: CPU, SIMD, GPUs; which functions run as machine code
+apsi run --native FILE        compile every function that allows it to machine code
+apsi plan 1T --active 32B     plan training of a large model: GPUs, layout, memory per GPU, days
 apsi lsp | doctor | ast | tokens | version
 ```
 
@@ -142,6 +164,16 @@ Every command and flag is described in the *Command line* chapter of [`docs/LANG
 | `27_pretrained_models` | Hugging Face / ONNX → API |
 | `28_any_architecture` | `use layers`: residual MLP, a home-made DAG, a graph attention network, a small GPT |
 | `29_stiff_chemistry` | stiff Robertson kinetics and an RC circuit with `sci.solve_ivp` |
+| `30_gpu_training` | training on the GPU through the PyTorch backend |
+| `31_native_speed` | `@native` machine code, units at zero cost, fused tensor kernels, `parallel for` on all cores |
+| `32_gpu` | `@gpu` kernels: SAXPY, a reduction and a matrix multiply on the GPU(s), or all CPU cores without one |
+| `33_model_files` | Apsi checkpoints (units, compression, SHA-256, signatures, sharding) and GGUF export |
+| `34_statistics` | a two-group study: descriptive statistics, Welch t, Mann–Whitney, power, regression, FDR, tables |
+| `35_mechanics` | a double pendulum from its Lagrangian, an exact pendulum period, a Hohmann transfer, a cantilever |
+| `36_quantum` | harmonic-oscillator states, a moving wave packet, a Bell pair and its entanglement |
+| `37_medical` | pharmacokinetics and NCA, Kaplan–Meier, log-rank, Cox regression, diagnostic accuracy, eGFR |
+| `38_reinforcement_learning` | PPO learns CartPole; Monte Carlo tree search finds the winning move |
+| `39_pytorch_converted` | a PyTorch script with BatchNorm, AdamW, cosine schedule, label smoothing and clipping after `apsi convert` |
 
 ## Tests
 
@@ -156,11 +188,17 @@ Development started on **Sunday, 8 November 2026 at about 04:00** (Bangkok time,
 
 ## Documentation
 
+- [`docs/GETTING-STARTED.md`](docs/GETTING-STARTED.md) — install, first program, first model, first library
+- [`docs/NATIVE.md`](docs/NATIVE.md) — **native code**: `@native`, `parallel for`, `@gpu`, benchmarks against C, C++, Rust, Go and Mojo
+- [`docs/LIBRARIES.md`](docs/LIBRARIES.md) — `.apsil` libraries: install, create, pack, publish, the registry API
+- [`docs/RL.md`](docs/RL.md) — reinforcement learning and learning from preferences
+- [`docs/SCALE.md`](docs/SCALE.md) — planning 21B–2T-parameter training runs (`apsi plan`, `use scale`)
+- [`docs/TROUBLESHOOTING.md`](docs/TROUBLESHOOTING.md) — `apsi` not recognized, VS Code without colours, `needs permission 'python'`
 - [`docs/LANGUAGE.md`](docs/LANGUAGE.md) — **the complete language reference**: syntax, types, units, functions, structs, modules, every built-in, the REPL and the command line
 - [`docs/AI.md`](docs/AI.md) — building AI with Apsi: any architecture, smaller RAM/VRAM, pretrained models, serving
 - [`docs/LAYERS.md`](docs/LAYERS.md) — **`use layers` reference**: every layer with shapes and parameters, `dag`, graph neural networks, the model zoo, `fit`, recipes
 - [`docs/BACKENDS.md`](docs/BACKENDS.md) — NumPy and PyTorch backends: CUDA, ROCm, Apple MPS, Intel XPU, bf16/fp16 mixed precision, `torch.compile`, `torch.nn.Module` export
-- [`docs/PYTHON.md`](docs/PYTHON.md) — converting Python programs with `apsi convert`
+- [`docs/PYTHON.md`](docs/PYTHON.md) — converting Python and PyTorch programs with `apsi convert`
 - [`docs/SERVER.md`](docs/SERVER.md) — secure, high-throughput servers
 - [`docs/PERFORMANCE.md`](docs/PERFORMANCE.md) — number formats, CPU, GPU, PyTorch, RAM, SSD
 - [`docs/INTEROP.md`](docs/INTEROP.md) — Python, PyTorch, C/C++, JS/Next.js, Java
@@ -178,7 +216,10 @@ apsi/            the language
   parser.py      tokens → syntax tree
   checker.py     names, units, argument counts and evolve rules, checked before running
   interpreter.py reference tree-walking runtime
-  codegen.py     Apsi → Python bytecode compiler (default engine) + erased twins
+  native/        the native compiler (LLVM): compiler.py (specialiser, units, fusion, parallel for → IR),
+                 engine.py (JIT, -O3 for the host CPU, signed machine-code cache, thread pool),
+                 __init__.py (@native, calling convention), gpu.py + cuda.py (@gpu: PTX, multi-GPU, CUDA driver)
+  codegen.py     Apsi → Python bytecode compiler + erased twins
   compiler.py    closure compiler for evolve in the interpreter engine
   cli.py         the apsi command
   repl.py        the interactive REPL
@@ -199,6 +240,10 @@ apsi/            the language
   concurrency.py tasks, channels, parallel loops
   web.py         HTTP server
   models.py      safetensors, model compression, ONNX / Hugging Face / PyTorch
+  modelio.py     GGUF and Apsi checkpoints (.apsim), apsi model
+  special.py stats.py dsp.py mechanics.py pde.py quantum.py physics.py medical.py lab.py
+                 science, engineering and medical modules (docs/SCIENCE.md)
+  convert_torch.py  PyTorch programs -> native Apsi (used by apsi convert)
   units.py       SI dimensions and the Quantity type
   autodiff.py    reverse-mode autodiff (incl. conv2d and attention ops)
   ops.py         math/tensor operations for numbers, tensors, quantities and autodiff nodes
@@ -209,8 +254,10 @@ apsi/            the language
   guard.py       Apsi Guard pre-run threat scan
   hardware.py    apsi doctor and the GPU backend
   server.py      apsi serve
-examples/        29 examples (+ native/: C code and build scripts for Windows/Linux)
-tests/           test suite
+examples/        39 examples (+ native/: C code and build scripts for Windows/Linux)
+tests/           test suite (tests/test_native.py: native vs bytecode differential tests)
+benchmarks/      the same benchmarks in Apsi, C, C++, Rust and Go (sh benchmarks/run_all.sh);
+                 heavy/: eight large workloads also in Mojo (python3 benchmarks/heavy/run.py)
 docs/            documentation
 editors/         editor integrations: vscode/ (VS Code, Cursor, Windsurf, VSCodium), sublime/, vim/ (Vim + Neovim),
                  notepad++/, textmate/ (JetBrains, TextMate), helix/, zed/, emacs/
@@ -227,3 +274,9 @@ Test the playground in real WebAssembly:
 ```bash
 npm install pyodide@0.27.7 && node tools/test_playground.mjs playground/apsi_bundle.js
 ```
+
+## License and credit
+
+Apsi is developed by **ATEC** and distributed under the [Apsi Non-Commercial License](LICENSE): free to use, study,
+modify and share for non-commercial purposes; no selling and no paid services; every copy and derived work must credit
+ATEC with the official source address.

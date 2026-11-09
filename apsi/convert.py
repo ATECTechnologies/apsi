@@ -7,14 +7,21 @@
 
 What is translated
   * the whole language core: variables (let/var chosen automatically, block-scoped names hoisted),
-    functions (defaults, keyword arguments, nested functions, closures, lambdas, decorators such as
-    @lru_cache → @memo), classes (fields, methods, __init__, inheritance inside the file, @dataclass,
-    @staticmethod), generators (collected into lists), if/elif/else, for/while/break/continue,
-    comprehensions, f-strings, slicing, unpacking (also nested), assert, raise, with open(...),
-    try/except (the protected code is kept), `if __name__ == "__main__":`, docstrings and comments
+    functions (defaults, keyword arguments, *args / **kwargs, nested functions, closures with nonlocal,
+    lambdas, decorators such as @lru_cache → @memo), classes (fields, methods, __init__, inheritance inside
+    the file, class attributes, @dataclass with field(default_factory=…), @staticmethod, special methods
+    __add__/__eq__/__lt__/__len__/__getitem__/__str__ … → struct methods that operators use), generators
+    (yield / yield from: lazy, endless ones work), if/elif/else, for/while with else, break/continue,
+    try/except/else/finally and raise (same error kinds, own exception classes), comprehensions (several
+    for clauses), f-strings, % and .format, slicing, unpacking (also nested and *rest), assert,
+    with open(...), `if __name__ == "__main__":`, bitwise and set operators, docstrings and comments
   * libraries, mapped onto Apsi's own built-ins and modules: numpy (arrays, maths, random, linalg, fft),
     math, random, statistics, json, time, os.path, sys.argv/exit, PyTorch tensors and torch.nn layers
     (→ `use layers`), torch.nn.functional and scipy.integrate/optimize basics
+  * pure standard modules (collections, heapq, itertools, functools, bisect, re, string, copy, datetime,
+    fractions, decimal …) are used as they are, without --allow-python
+  * whole PyTorch programs (nn.Module classes, losses, optimizers, data loaders, training loops) become native
+    Apsi that runs without Python or PyTorch — see convert_torch.py
   * every other library still works: it is loaded with pyimport() (the program then needs
     --allow-python) and the converter says so
 
@@ -106,6 +113,19 @@ PREC = {"lambda": 1, "ifexp": 2, "or": 3, "and": 4, "not": 5, "cmp": 6, "+": 8, 
         "//": 9, "%": 9, "@": 9, "unary": 10, "**": 12, "atom": 20}
 CMP = {ast.Eq: "==", ast.NotEq: "!=", ast.Lt: "<", ast.LtE: "<=", ast.Gt: ">", ast.GtE: ">=", ast.In: "in",
        ast.NotIn: "not in", ast.Is: "==", ast.IsNot: "!="}
+
+
+# Python special methods -> the Apsi struct method names that operators and built-ins use (see values.py)
+DUNDER = {"__str__": "to_str", "__repr__": "to_str", "__add__": "add", "__radd__": "radd", "__sub__": "sub",
+          "__rsub__": "rsub", "__mul__": "mul", "__rmul__": "rmul", "__truediv__": "div", "__rtruediv__": "rdiv",
+          "__floordiv__": "floordiv", "__mod__": "mod", "__pow__": "pow", "__matmul__": "matmul", "__neg__": "neg",
+          "__eq__": "eq", "__lt__": "lt", "__le__": "le", "__gt__": "gt", "__ge__": "ge", "__len__": "len",
+          "__getitem__": "get", "__setitem__": "set", "__contains__": "contains", "__iter__": "iter",
+          "__call__": "call", "__hash__": "hash", "__bool__": "bool"}
+
+
+def full_is_lib(full):
+    return bool(full) and "." in full
 
 
 class Unsupported(Exception):
@@ -260,10 +280,15 @@ class Converter:
         self.comments = self._read_comments()
         self.used_comments = set()
         self.gen_stack = []                    # generator result variables
+        self.loop_flags = []                   # per enclosing loop: the `broke` flag of a for/while … else
         self.cur_class = None
         self.pre = []                          # statements to emit before the current statement
         self.lazy_py = {}                      # python modules imported but only loaded when used
         self.in_comprehension = False
+        # PyTorch programs: models, losses, optimizers and training steps become native Apsi first
+        from .convert_torch import rewrite, APSI
+        self.torch_used, _ = rewrite(self.tree, self.warn)
+        self.alias[APSI] = APSI
 
     # ------------------------------------------------------------ comments
     def _read_comments(self):
@@ -314,9 +339,11 @@ class Converter:
         if self.warnings:
             head.append(f"# {len(self.warnings)} place(s) need a look — see the NOTE comments below.")
         for u in sorted(self.uses):
-            head.append(f"use {u} as {u}" if u in ("linalg", "sci", "layers", "parallel", "data") else f"use {u}")
+            head.append(f"use {u} as {u}" if u in ("linalg", "sci", "layers", "parallel", "data", "nn", "models", "torch")
+                        else f"use {u}")
         for alias, mod in sorted(self.pyimports.items()):
-            head.append(f'let {alias} = pyimport("{mod}")   # needs --allow-python')
+            from .interop import PURE_MODULES
+            head.append(f'let {alias} = pyimport("{mod}")' + ("" if mod in PURE_MODULES else "   # needs --allow-python"))
         if len(head) > 1 or self.uses or self.pyimports:
             head.append("")
         return "\n".join(head + body_lines).rstrip() + "\n"
@@ -380,8 +407,30 @@ class Converter:
                                             and sub.value.id == "self" and sub.attr not in [f[0] for f in fields]):
                                         fields.append((sub.attr, None, None))
                 bases = [dotted(b) for b in s.bases]
+                # class attributes written or read as ClassName.attr become a module-level variable ClassName_attr
+                assigned = {t.id: item.value for item in s.body if isinstance(item, ast.Assign)
+                            for t in item.targets if isinstance(t, ast.Name)}
+                assigned.update({item.target.id: item.value for item in s.body if isinstance(item, ast.AnnAssign)
+                                 and isinstance(item.target, ast.Name) and item.value is not None and not is_dc})
+                classvars = {}
+                for node in ast.walk(self.tree):
+                    if (isinstance(node, ast.Attribute) and isinstance(node.value, ast.Name)
+                            and node.value.id == s.name and node.attr in assigned):
+                        classvars[node.attr] = assigned[node.attr]
+                from .exceptions import KINDS
+                is_exc = any(b.split(".")[-1] in KINDS or b in ("Exception", "BaseException")
+                             or self.classes.get(b, {}).get("exception") for b in bases)
+                if is_exc and "message" not in [f[0] for f in fields]:
+                    fields.insert(0, ("message", None, ast.Constant(value="")))
                 self.classes[s.name] = dict(node=s, fields=fields, methods=methods, init=init, dataclass=is_dc,
-                                            bases=bases, statics=statics)
+                                            bases=bases, statics=statics, classvars=classvars, exception=is_exc)
+
+    def _subclasses(self, name):
+        out = []
+        for k, c in self.classes.items():
+            if name in c["bases"] and k != name:
+                out += [k] + self._subclasses(k)
+        return out
 
     def _class_fields(self, name, seen=None):
         c = self.classes[name]
@@ -496,13 +545,10 @@ class Converter:
                 self.emit(f"# {line.strip()}".rstrip(), ind)
             return
         if isinstance(v, (ast.Yield, ast.YieldFrom)):
-            if not self.gen_stack:
-                raise Unsupported("yield outside a function")
-            res = self.gen_stack[-1]
             if isinstance(v, ast.Yield):
-                self.emit(f"{res}.append({self.ex(v.value) if v.value else 'none'})", ind)
+                self.emit("yield" + (f" {self.ex(v.value, top=True)}" if v.value is not None else ""), ind)
             else:
-                self.emit(f"{res}.extend(list({self.ex(v.value)}))", ind)
+                self.emit(f"yield from {self.ex(v.value, top=True)}", ind)
             return
         if isinstance(v, ast.Call) and isinstance(v.func, ast.Attribute) and self._file_of(v.func.value) \
                 and v.func.attr in ("write", "writelines"):
@@ -528,6 +574,8 @@ class Converter:
         self.emit("pass", ind)
 
     def s_Break(self, s, ind):
+        if self.loop_flags and self.loop_flags[-1]:
+            self.emit(f"{self.loop_flags[-1]} = true", ind)
         self.emit("break", ind)
 
     def s_Continue(self, s, ind):
@@ -561,14 +609,25 @@ class Converter:
 
     def s_Raise(self, s, ind):
         if s.exc is None:
-            self.emit('error("re-raised error")', ind)
+            self.emit("raise", ind)
             return
         e = s.exc
-        if isinstance(e, ast.Call) and e.args:
-            name = dotted(e.func) or "Error"
-            self.emit(f'error({_q(name + ": ")} + str({self.ex(e.args[0])}))', ind)
-        else:
-            self.emit(f"error({_q(dotted(e.func if isinstance(e, ast.Call) else e) or 'error')})", ind)
+        name = dotted(e.func if isinstance(e, ast.Call) else e) or ""
+        short = name.split(".")[-1]
+        from .exceptions import KINDS
+        if short in KINDS or short in self.classes or short.endswith(("Error", "Exception", "Warning")):
+            if short not in KINDS and short not in self.classes:
+                # an exception class from a library: keep its name as the kind
+                arg = self.ex(e.args[0]) if isinstance(e, ast.Call) and e.args else _q(short)
+                self.emit(f"raise {arg}", ind)
+                return
+            if short in self.classes:
+                self.emit(f"raise {self.ex(e)}", ind)
+                return
+            arg = ", ".join(self.ex(x) for x in e.args) if isinstance(e, ast.Call) else ""
+            self.emit(f"raise {short}({arg})", ind)
+            return
+        self.emit(f"raise {self.ex(e)}", ind)
 
     def _decl(self, name):
         """'let ', 'var ' or '' for the first/next assignment of `name` in the current scope."""
@@ -583,7 +642,8 @@ class Converter:
 
     def _global_written(self, name):
         if len(self.scopes) != 1:
-            return False
+            # a variable of a function that an inner function rebinds with `nonlocal`
+            return any(isinstance(n, ast.Nonlocal) and name in n.names for n in ast.walk(self.tree))
         for n in ast.walk(self.tree):
             if isinstance(n, (ast.Global, ast.Nonlocal)) and name in n.names:
                 return True
@@ -689,10 +749,28 @@ class Converter:
             self.emit("else:", ind)
             self.body(orelse, ind + 1)
 
-    def s_While(self, s, ind):
+    def _loop_enter(self, s, ind):
+        flag = None
         if s.orelse:
-            self.warn(s, "while … else: the else part runs only when the loop was not broken in Python; "
-                         "here it always runs after the loop")
+            flag = self.new_tmp("broke")
+            self.emit(f"var {flag} = false", ind)
+        self.loop_flags.append(flag)
+        return flag
+
+    def _loop_exit(self, s, ind, flag):
+        self.loop_flags.pop()
+        if s.orelse:
+            self.emit(f"if not {flag}:", ind)
+            self.body(s.orelse, ind + 1)
+
+    def s_While(self, s, ind):
+        flag = self._loop_enter(s, ind)
+        try:
+            self._while(s, ind)
+        finally:
+            self._loop_exit(s, ind, flag)
+
+    def _while(self, s, ind):
         has_walrus = any(isinstance(x, ast.NamedExpr) for x in ast.walk(s.test))
         if has_walrus:
             # while (x := f()): …  →  re-evaluate the assignment at the top of every iteration
@@ -712,13 +790,15 @@ class Converter:
         else:
             self.emit(f"while {self.ex(s.test, top=True)}:", ind)
         self.body(s.body, ind + 1)
-        if s.orelse:
-            self.body(s.orelse, ind)
 
     def s_For(self, s, ind):
-        if s.orelse:
-            self.warn(s, "for … else: the else part runs only when the loop was not broken in Python; "
-                         "here it always runs after the loop")
+        flag = self._loop_enter(s, ind)
+        try:
+            self._for(s, ind)
+        finally:
+            self._loop_exit(s, ind, flag)
+
+    def _for(self, s, ind):
         it = self.iter_expr(s.iter)
         t = s.target
         unpack = []
@@ -755,8 +835,6 @@ class Converter:
         for e, tmp in unpack:
             self._unpack_into(e, tmp, ind + 1)
         self.body(s.body, ind + 1)
-        if s.orelse:
-            self.body(s.orelse, ind)
 
     def _unpack_into(self, e, value, ind):
         if isinstance(e, ast.Name):
@@ -816,18 +894,33 @@ class Converter:
         _ = handled
 
     def s_Try(self, s, ind):
-        self.warn(s, "try/except: Apsi stops with a clear error message instead of raising exceptions; "
-                     "the protected code is kept and the except blocks are left as comments")
-        self.body(s.body, ind)
+        self.emit("try:", ind)
+        self.body(s.body, ind + 1)
         for h in s.handlers:
-            self.emit(f"# except {ast.get_source_segment(self.source, h.type) if h.type else ''}:".rstrip(), ind)
-            seg = "\n".join(ast.get_source_segment(self.source, b) or "" for b in h.body)
-            for line in seg.splitlines():
-                self.emit(f"#     {line}", ind)
+            kinds = []
+            if h.type is not None:
+                elts = h.type.elts if isinstance(h.type, ast.Tuple) else [h.type]
+                for t in elts:
+                    k = dotted(t) or "Error"
+                    if k in ("Exception", "BaseException"):
+                        k = "Error"
+                    if k in self.classes:
+                        kinds += [x for x in [k] + self._subclasses(k) if x not in kinds]
+                    else:
+                        kinds.append(k.split(".")[-1] if not k.startswith("json.") else k)
+            head = "except"
+            if kinds:
+                head += " " + ", ".join(kinds)
+            if h.name:
+                head += f" as {self._safe(h.name)}"
+            self.emit(head + ":", ind)
+            self.body(h.body, ind + 1)
         if s.orelse:
-            self.body(s.orelse, ind)
+            self.emit("else:", ind)
+            self.body(s.orelse, ind + 1)
         if s.finalbody:
-            self.body(s.finalbody, ind)
+            self.emit("finally:", ind)
+            self.body(s.finalbody, ind + 1)
 
     s_TryStar = s_Try
 
@@ -843,15 +936,12 @@ class Converter:
             if skip_first and i == 0:
                 continue
             out.append(self._param(a, d))
-        if args.vararg:
-            self.warn(args.vararg, f"*{args.vararg.arg}: Apsi functions take a fixed number of arguments; "
-                                   f"pass a list instead")
-            out.append(f"{self._safe(args.vararg.arg)} = []")
         for a, d in zip(args.kwonlyargs, args.kw_defaults):
             out.append(self._param(a, d))
+        if args.vararg:
+            out.append(f"*{self._safe(args.vararg.arg)}")
         if args.kwarg:
-            self.warn(args.kwarg, f"**{args.kwarg.arg}: pass a dict instead")
-            out.append(f"{self._safe(args.kwarg.arg)} = {{}}")
+            out.append(f"**{self._safe(args.kwarg.arg)}")
         return out
 
     def _param(self, a, default):
@@ -914,17 +1004,10 @@ class Converter:
             self.pre = []
         self.emit(f"fn {name}({', '.join(params)}){ret_s}:", ind)
         prologue = []
-        if gen:
-            res = self.new_tmp("results")
-            self.gen_stack.append(res)
-            prologue.append(f"var {res} = []")
-            self.warn(s, f"generator {s.name}(): values are collected into a list")
         saved_files = dict(self.files)
         doc_skip = body
         self.block(doc_skip, ind + 1, info, prologue=prologue)
         self.files = saved_files
-        if gen:
-            self.emit(f"return {self.gen_stack.pop()}", ind + 1)
 
     s_AsyncFunctionDef = s_FunctionDef
 
@@ -941,6 +1024,8 @@ class Converter:
                 if b.endswith("Module"):
                     self.warn(s, f"class {s.name}({b}): the model is converted as a plain struct; "
                                  f"consider rewriting it with `use layers` (sequential/dag)")
+                elif b.split(".")[-1] in ("Dataset", "IterableDataset"):
+                    c["dataset"] = True
                 elif b not in ("Exception", "ValueError", "RuntimeError"):
                     self.warn(s, f"base class {b} is not defined in this file; its behaviour is not inherited")
         fields = self._class_fields(s.name)
@@ -954,6 +1039,14 @@ class Converter:
         for fname, ann, default in fields:
             t = self.typ(ann) if ann is not None else None
             t = t if t in ("Int", "Float", "Str", "Bool", "List", "Dict", "Tensor") else "Any"
+            if (isinstance(default, ast.Call) and dotted(default.func) in ("field", "dataclasses.field")):
+                kw = {k.arg: k.value for k in default.keywords}
+                if "default_factory" in kw:
+                    fac = dotted(kw["default_factory"])
+                    default = {"list": ast.List(elts=[], ctx=ast.Load()), "dict": ast.Dict(keys=[], values=[]),
+                               }.get(fac) or ast.Call(func=kw["default_factory"], args=[], keywords=[])
+                else:
+                    default = kw.get("default")
             d = self.ex(default) if default is not None else ("none" if not c["dataclass"] or ann is None else None)
             if c["dataclass"] and default is None and ann is not None:
                 self.emit(f"{fname}: {t}", ind + 1)
@@ -973,9 +1066,10 @@ class Converter:
             if mname == "__repr__" and "__str__" in methods:
                 continue
             if mname.startswith("__") and mname.endswith("__"):
-                if mname in ("__repr__", "__str__"):
-                    m = ast.FunctionDef(**{**m.__dict__, "name": "to_str"})
-                    self.warn(m, f"{mname}: available as .to_str(); print() shows the fields")
+                if c.get("dataset") and mname in ("__len__", "__getitem__"):
+                    pass                                   # used by torch.DataLoader
+                elif mname in DUNDER:
+                    m = ast.FunctionDef(**{**m.__dict__, "name": DUNDER[mname]})
                 else:
                     self.warn(m, f"special method {mname} is not used by Apsi operators (kept as a normal method)")
             info_method = m
@@ -986,6 +1080,8 @@ class Converter:
         self.cur_class = None
         if not wrote:
             self.emit("pass", ind + 1)
+        for cv, val in c.get("classvars", {}).items():
+            self.emit(f"var {s.name}_{cv} = {self.ex(val)}", ind)
         # static methods become functions Class_name
         for mname in c["statics"]:
             m = c["methods"][mname]
@@ -1052,6 +1148,12 @@ class Converter:
 
     def resolve(self, full, node):
         """Map a python dotted name (module.attr...) to Apsi."""
+        if full.startswith("__apsi__."):                   # produced by the PyTorch rewriter: already Apsi
+            target = full[len("__apsi__."):]
+            mod = target.split(".")[0] if "." in target else None
+            if mod in ("linalg", "sci", "nn", "layers", "models", "torch"):
+                self.uses.add(mod)
+            return target
         if full.startswith("@py:"):
             self._use_py(full[4:].split(".")[0])
             return full[4:]
@@ -1089,6 +1191,9 @@ class Converter:
         if key in self.lazy_py and self._safe(alias) not in self.pyimports:
             mod, node = self.lazy_py[key]
             self.pyimports[self._safe(alias)] = mod
+            from .interop import PURE_MODULES
+            if mod in PURE_MODULES:
+                return
             self.warn(node, f"'{mod}' has no Apsi equivalent: it is loaded with pyimport() — run with "
                             f"--allow-python (libraries that reach the network or the system need --allow-python=all)")
 
@@ -1102,7 +1207,8 @@ class Converter:
                     self._use_py(full[4:].split(".")[0])
                     return full[4:], PREC["atom"]
                 return self.resolve(full, n), PREC["atom"]
-            if root in self.classes and n.attr in self.classes[root]["statics"]:
+            if root in self.classes and (n.attr in self.classes[root]["statics"]
+                                         or n.attr in self.classes[root].get("classvars", {})):
                 return f"{root}_{n.attr}", PREC["atom"]
         fv = self._file_of(n.value)
         if fv:
@@ -1119,12 +1225,10 @@ class Converter:
     def e_BinOp(self, n):
         op = OPS.get(type(n.op))
         if op is None:
-            sym = {ast.BitAnd: "&", ast.BitOr: "|", ast.BitXor: "^", ast.LShift: "<<", ast.RShift: ">>"}[type(n.op)]
-            if sym in ("&", "|"):
-                # element-wise logic that works for booleans and boolean tensors alike
-                a, b = self.ex(n.left), self.ex(n.right)
-                return (f"where({a}, {b}, false)" if sym == "&" else f"where({a}, true, {b})"), PREC["atom"]
-            raise Unsupported(f"the bitwise operator {sym}")
+            fn = {ast.BitAnd: "band", ast.BitOr: "bor", ast.BitXor: "bxor", ast.LShift: "shl",
+                  ast.RShift: "shr"}[type(n.op)]
+            # ints bit by bit, sets union/intersection, dicts merged, boolean tensors element-wise — like Python
+            return f"{fn}({self.ex(n.left)}, {self.ex(n.right)})", PREC["atom"]
         if op == "%" and isinstance(n.left, ast.Constant) and isinstance(n.left.value, str):
             return f"{self.ex(n.left, PREC['%'])} % {self.ex(n.right, PREC['%'] + 1)}", PREC["%"]
         p = PREC[op]
@@ -1207,6 +1311,10 @@ class Converter:
     def e_ListComp(self, n):
         saved, self.in_comprehension = self.in_comprehension, True
         try:
+            if len(n.generators) > 1:
+                # [e for a in A for b in B if c]  →  chain_lists([[e for b in B if c] for a in A])
+                inner = ast.ListComp(elt=n.elt, generators=n.generators[1:])
+                return f"chain_lists([{self.e_ListComp(inner)[0]} {self._gens(n.generators[:1])}])", PREC["atom"]
             return f"[{self.ex(n.elt)} {self._gens(n.generators)}]", PREC["atom"]
         finally:
             self.in_comprehension = saved
@@ -1215,9 +1323,13 @@ class Converter:
         return self.e_ListComp(n)
 
     def e_SetComp(self, n):
-        return f"set([{self.ex(n.elt)} {self._gens(n.generators)}])", PREC["atom"]
+        return f"set({self.e_ListComp(ast.ListComp(elt=n.elt, generators=n.generators))[0]})", PREC["atom"]
 
     def e_DictComp(self, n):
+        if len(n.generators) > 1:
+            pairs = self.e_ListComp(ast.ListComp(elt=ast.Tuple(elts=[n.key, n.value], ctx=ast.Load()),
+                                                 generators=n.generators))[0]
+            return f"dict({pairs})", PREC["atom"]
         return f"{{{self.ex(n.key)}: {self.ex(n.value)} {self._gens(n.generators)}}}", PREC["atom"]
 
     def e_Subscript(self, n):
@@ -1238,7 +1350,7 @@ class Converter:
         return self.ex(s)
 
     def e_Starred(self, n):
-        raise Unsupported("*unpacking inside an expression")
+        return "*" + self.ex(n.value, PREC["atom"]), PREC["atom"]
 
     def e_NamedExpr(self, n):
         if self.in_comprehension:
@@ -1302,7 +1414,10 @@ class Converter:
     # ------------------------------------------------------------ calls
     def e_Call(self, n):
         if any(isinstance(a, ast.Starred) for a in n.args) or any(k.arg is None for k in n.keywords):
-            raise Unsupported("*args / **kwargs in a call — pass the values explicitly")
+            args = [self.ex(a) for a in n.args]
+            kws = [f"**{self.ex(k.value, PREC['atom'])}" if k.arg is None else f"{k.arg}={self.ex(k.value)}"
+                   for k in n.keywords]
+            return f"{self.ex(n.func, PREC['atom'])}({', '.join(args + kws)})", PREC["atom"]
         fname = dotted(n.func)
         full = None
         if fname:
@@ -1331,6 +1446,9 @@ class Converter:
                 base = next((b for b in c["bases"] if b in self.classes), None)
                 if n.func.attr == "__init__" and base:
                     return self._call(f"{base}_init", ["self"] + args, kws), PREC["atom"]
+                if n.func.attr == "__init__" and c.get("exception"):
+                    # super().__init__(message) of an exception class: keep the message
+                    return (f"self.message = str({args[0]})" if args else "self.message = \"\""), PREC["atom"]
                 raise Unsupported("super() calls other than super().__init__")
         if full and (full in SIMPLE or full.split(".")[0] in ("numpy", "math", "random", "torch", "json", "time",
                                                               "os", "sys", "statistics", "functools")):
@@ -1387,7 +1505,9 @@ class Converter:
                 if tn in ISINSTANCE:
                     tests.append(f"type({args[0]}) == {ISINSTANCE[tn]}")
                 elif tn in self.classes:
-                    tests.append(f"type({args[0]}) == {_q(tn)}")
+                    subs = [tn] + self._subclasses(tn)
+                    tests.append(f"type({args[0]}) == {_q(tn)}" if len(subs) == 1
+                                 else f"type({args[0]}) in [{', '.join(_q(x) for x in subs)}]")
                 elif tn in ("np.ndarray", "numpy.ndarray", "torch.Tensor"):
                     tests.append(f"type({args[0]}) == \"Tensor\"")
                 else:
@@ -1396,6 +1516,10 @@ class Converter:
             if fname == "isinstance" and names and any(x == "float" for x in names) and "int" not in names:
                 tests.append(f"type({args[0]}) == \"Int\"") if False else None
             return "(" + " or ".join(tests) + ")"
+        if fname == "sum" and not full_is_lib(full) and len(n.args) == 2 and not kws:
+            return f"({args[1]} + sum({args[0]}))"
+        if fname == "filter" and len(n.args) == 2 and isinstance(n.args[0], ast.Constant) and n.args[0].value is None:
+            return f"filter(bool, {args[1]})"
         if fname == "open":
             raise Unsupported("open() outside `with open(...) as f:` — use read_text()/write_text()")
         if fname == "type" and len(args) == 1:

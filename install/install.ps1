@@ -27,7 +27,7 @@ if ($Uninstall) {
 $build = [Environment]::OSVersion.Version.Build
 if ($build -lt 10240) { Write-Warning "Apsi targets Windows 10 or newer (this is build $build)." }
 
-# find Python 3.9+ : prefer the py launcher
+# find Python 3.12+ : prefer the py launcher
 $candidates = @(
     @{ Exe = "py";      Args = @("-3") },
     @{ Exe = "python";  Args = @() },
@@ -38,12 +38,12 @@ foreach ($c in $candidates) {
     if (-not (Get-Command $c.Exe -ErrorAction SilentlyContinue)) { continue }
     try {
         $a = $c.Args
-        $ok = & $c.Exe @a -c "import sys; print(1 if sys.version_info >= (3, 9) else 0)" 2>$null
+        $ok = & $c.Exe @a -c "import sys; print(1 if sys.version_info >= (3, 12) else 0)" 2>$null
         if ("$ok".Trim() -eq "1") { $PyExe = $c.Exe; $PyArgs = $c.Args; break }
     } catch { }
 }
 if (-not $PyExe) {
-    Write-Host "Python 3.9+ was not found. Install it from https://www.python.org/downloads/windows/"
+    Write-Host "Python 3.12+ was not found. Install it from https://www.python.org/downloads/windows/"
     Write-Host "(tick 'Add python.exe to PATH'), or run:  winget install Python.Python.3.12"
     exit 1
 }

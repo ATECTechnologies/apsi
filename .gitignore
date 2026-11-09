@@ -15,3 +15,5 @@ _tmp_models/
 *.so
 *.dll
 *.vsix
+examples/out/
+experiments/

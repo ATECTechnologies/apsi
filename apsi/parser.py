@@ -140,6 +140,11 @@ class Parser:
         tok = self.peek()
         if tok.type == OP and tok.value == "@":
             return self.decorated()
+        if tok.type == NAME and tok.value == "parallel" and self.at_kw("for", k=1):
+            self.next()                              # `parallel for`: a soft keyword
+            loop = self.for_stmt()
+            loop.parallel = True
+            return loop
         if tok.type == KW:
             v = tok.value
             if v in ("let", "var"):
@@ -187,6 +192,30 @@ class Parser:
                 return A.Assert(cond, msg, **self.pos(tok))
             if v == "evolve":
                 return self.evolve_stmt()
+        if tok.type == NAME and tok.value == "try" and self.at_op(":", 1):
+            return self.try_stmt()
+        if tok.type == NAME and tok.value == "raise" and not (self.at_op("=", 1) or self.at_op(".", 1)
+                                                               or self.at_op("[", 1) or self.at_op(",", 1)):
+            self.next()
+            val = None
+            if self.peek().type not in (NEWLINE, DEDENT, EOF):
+                val = self.expr()
+                if self.peek().type == NAME and self.peek().value == "from":   # `raise X from Y`: Y is dropped
+                    self.next()
+                    self.expr()
+            self.expect_eol()
+            return A.Raise(val, **self.pos(tok))
+        if tok.type == NAME and tok.value == "yield" and not (self.at_op("=", 1) or self.at_op(".", 1)
+                                                               or self.at_op("[", 1) or self.at_op("(", 1)
+                                                               and False):
+            self.next()
+            frm = False
+            if self.peek().type == NAME and self.peek().value == "from":
+                self.next()
+                frm = True
+            val = None if self.peek().type in (NEWLINE, DEDENT, EOF) else self.tuple_expr()
+            self.expect_eol()
+            return A.Yield(val, frm, **self.pos(tok))
         if tok.type == NAME and tok.value == "test" and self.at(STRING, k=1):
             self.next()
             name = self.next().value
@@ -199,6 +228,48 @@ class Parser:
             self.expect_eol()
             return A.Deriv(tok.value, e, **self.pos(tok))
         return self.simple_stmt()
+
+    def try_stmt(self):
+        tok = self.next()                              # 'try' (a soft keyword)
+        body = self.block()
+        handlers = []
+
+        def skip_nl():
+            while self.peek().type == NEWLINE:
+                self.next()
+        skip_nl()
+        while self.peek().type == NAME and self.peek().value == "except":
+            self.next()
+            kinds, name = [], None
+            if not self.at_op(":"):
+                if not self.at_kw("as"):
+                    paren = self.accept_op("(")
+                    while True:
+                        part = self.expect_name(" (an error kind such as ValueError)").value
+                        while self.accept_op("."):
+                            part += "." + self.expect_name().value
+                        kinds.append(part)
+                        if not self.accept_op(","):
+                            break
+                        if paren and self.at_op(")"):
+                            break
+                    if paren:
+                        self.expect_op(")")
+                if self.accept_kw("as"):
+                    name = self.expect_name(" after 'as'").value
+            handlers.append((kinds, name, self.block()))
+            skip_nl()
+        else_body = final_body = None
+        if handlers and self.at_kw("else"):
+            self.next()
+            else_body = self.block()
+            skip_nl()
+        if self.peek().type == NAME and self.peek().value == "finally" and self.at_op(":", 1):
+            self.next()
+            final_body = self.block()
+        if not handlers and final_body is None:
+            self.error("'try' needs at least one 'except' or a 'finally' block", tok)
+        return A.Try(body, handlers, else_body, final_body, **self.pos(tok))
 
     def simple_stmt(self):
         tok = self.peek()
@@ -256,10 +327,15 @@ class Parser:
         self.expect_op("(")
         ps = []
         while not self.at_op(")"):
+            star = None
+            if self.at_op("*") or self.at_op("**"):
+                star = self.next().value
+                if any(p.star == star or p.star == "**" for p in ps):
+                    self.error(f"only one '{star}' parameter is allowed, after the others")
             tok = self.expect_name(" for parameter")
             t = self.type_expr() if self.accept_op(":") else None
-            d = self.expr() if self.accept_op("=") else None
-            ps.append(A.Param(tok.value, t, d, **self.pos(tok)))
+            d = None if star else (self.expr() if self.accept_op("=") else None)
+            ps.append(A.Param(tok.value, t, d, star, **self.pos(tok)))
             if not self.accept_op(","):
                 break
         self.expect_op(")", " to close parameter list")
@@ -573,7 +649,11 @@ class Parser:
                 self.next()
                 args, kwargs = [], []
                 while not self.at_op(")"):
-                    if self.peek().type == NAME and self.at_op("=", 1):
+                    if self.at_op("*") or self.at_op("**"):
+                        st = self.next()
+                        sp = A.Spread(self.expr(), st.value == "**", **self.pos(st))
+                        (kwargs.append((None, sp)) if sp.double else args.append(sp))
+                    elif self.peek().type == NAME and self.at_op("=", 1):
                         k = self.next().value
                         self.next()
                         kwargs.append((k, self.expr()))

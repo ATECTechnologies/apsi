@@ -1,0 +1,258 @@
+# Apsi native benchmarks — same algorithms as bench.c / bench.cpp / bench.rs / bench.go
+
+@native
+fn fib(n: Int) -> Int:
+    if n < 2:
+        return n
+    return fib(n - 1) + fib(n - 2)
+
+@native
+fn mandel_row(y: Int, n: Int, maxit: Int) -> Int:
+    var count = 0
+    let ci = 2.0 * y / n - 1.0
+    for x in 0..n:
+        let cr = 2.0 * x / n - 1.5
+        var zr = 0.0
+        var zi = 0.0
+        var it = 0
+        while it < maxit and zr * zr + zi * zi <= 4.0:
+            let t = zr * zr - zi * zi + cr
+            zi = 2.0 * zr * zi + ci
+            zr = t
+            it += 1
+        if it == maxit:
+            count += 1
+    return count
+
+@native
+fn mandelbrot(n: Int, maxit: Int) -> Int:
+    var total = 0
+    for y in 0..n:
+        total += mandel_row(y, n, maxit)
+    return total
+
+@native
+fn mandelbrot_par(n: Int, maxit: Int) -> Int:
+    var total = 0
+    parallel for y in 0..n:
+        total += mandel_row(y, n, maxit)
+    return total
+
+@native
+fn a_ij(i: Int, j: Int) -> Float = 1.0 / ((i + j) * (i + j + 1) / 2 + i + 1)
+
+@native
+fn mul_av(v, out):
+    let n = len(v)
+    for i in 0..n:
+        var s = 0.0
+        for j in 0..n:
+            s += a_ij(i, j) * v[j]
+        out[i] = s
+
+@native
+fn mul_atv(v, out):
+    let n = len(v)
+    for i in 0..n:
+        var s = 0.0
+        for j in 0..n:
+            s += a_ij(j, i) * v[j]
+        out[i] = s
+
+@native
+fn spectral(n: Int) -> Float:
+    let u = ones(n)
+    let v = zeros(n)
+    let tmp = zeros(n)
+    for k in 0..10:
+        mul_av(u, tmp)
+        mul_atv(tmp, v)
+        mul_av(v, tmp)
+        mul_atv(tmp, u)
+    var vbv = 0.0
+    var vv = 0.0
+    for i in 0..n:
+        vbv += u[i] * v[i]
+        vv += v[i] * v[i]
+    return sqrt(vbv / vv)
+
+@native
+fn spectral_par(n: Int) -> Float:
+    let u = ones(n)
+    let v = zeros(n)
+    let tmp = zeros(n)
+    for k in 0..10:
+        mul_av_p(u, tmp)
+        mul_atv_p(tmp, v)
+        mul_av_p(v, tmp)
+        mul_atv_p(tmp, u)
+    var vbv = 0.0
+    var vv = 0.0
+    for i in 0..n:
+        vbv += u[i] * v[i]
+        vv += v[i] * v[i]
+    return sqrt(vbv / vv)
+
+@native
+fn mul_av_p(v, out):
+    let n = len(v)
+    parallel for i in 0..n:
+        var s = 0.0
+        for j in 0..n:
+            s += a_ij(i, j) * v[j]
+        out[i] = s
+
+@native
+fn mul_atv_p(v, out):
+    let n = len(v)
+    parallel for i in 0..n:
+        var s = 0.0
+        for j in 0..n:
+            s += a_ij(j, i) * v[j]
+        out[i] = s
+
+@native
+fn sieve(n: Int) -> Int:
+    let comp = zeros(n + 1, dtype=bool)
+    var count = 0
+    for i in 2..=n:
+        if not comp[i]:
+            count += 1
+            var j = i * i
+            while j <= n:
+                comp[j] = true
+                j += i
+    return count
+
+@native
+fn nbody(steps: Int) -> Float:
+    let pi4 = 4.0 * pi * pi
+    let dp = 365.24
+    let x = zeros(5)
+    let y = zeros(5)
+    let z = zeros(5)
+    let vx = zeros(5)
+    let vy = zeros(5)
+    let vz = zeros(5)
+    let m = zeros(5)
+    m[0] = pi4
+    x[1] = 4.84143144246472090e+00
+    y[1] = -1.16032004402742839e+00
+    z[1] = -1.03622044471123109e-01
+    vx[1] = 1.66007664274403694e-03 * dp
+    vy[1] = 7.69901118419740425e-03 * dp
+    vz[1] = -6.90460016972063023e-05 * dp
+    m[1] = 9.54791938424326609e-04 * pi4
+    x[2] = 8.34336671824457987e+00
+    y[2] = 4.12479856412430479e+00
+    z[2] = -4.03523417114321381e-01
+    vx[2] = -2.76742510726862411e-03 * dp
+    vy[2] = 4.99852801234917238e-03 * dp
+    vz[2] = 2.30417297573763929e-05 * dp
+    m[2] = 2.85885980666130812e-04 * pi4
+    x[3] = 1.28943695621391310e+01
+    y[3] = -1.51111514016986312e+01
+    z[3] = -2.23307578892655734e-01
+    vx[3] = 2.96460137564761618e-03 * dp
+    vy[3] = 2.37847173959480950e-03 * dp
+    vz[3] = -2.96589568540237556e-05 * dp
+    m[3] = 4.36624404335156298e-05 * pi4
+    x[4] = 1.53796971148509165e+01
+    y[4] = -2.59193146099879641e+01
+    z[4] = 1.79258772950371181e-01
+    vx[4] = 2.68067772490389322e-03 * dp
+    vy[4] = 1.62824170038242295e-03 * dp
+    vz[4] = -9.51592254519715870e-05 * dp
+    m[4] = 5.15138902046611451e-05 * pi4
+    var px = 0.0
+    var py = 0.0
+    var pz = 0.0
+    for i in 0..5:
+        px += vx[i] * m[i]
+        py += vy[i] * m[i]
+        pz += vz[i] * m[i]
+    vx[0] = -px / pi4
+    vy[0] = -py / pi4
+    vz[0] = -pz / pi4
+    let dt = 0.01
+    for s in 0..steps:
+        for i in 0..5:
+            for j in i + 1..5:
+                let dx = x[i] - x[j]
+                let dy = y[i] - y[j]
+                let dz = z[i] - z[j]
+                let d2 = dx * dx + dy * dy + dz * dz
+                let mag = dt / (d2 * sqrt(d2))
+                vx[i] -= dx * m[j] * mag
+                vy[i] -= dy * m[j] * mag
+                vz[i] -= dz * m[j] * mag
+                vx[j] += dx * m[i] * mag
+                vy[j] += dy * m[i] * mag
+                vz[j] += dz * m[i] * mag
+        for i in 0..5:
+            x[i] += dt * vx[i]
+            y[i] += dt * vy[i]
+            z[i] += dt * vz[i]
+    var e = 0.0
+    for i in 0..5:
+        e += 0.5 * m[i] * (vx[i] * vx[i] + vy[i] * vy[i] + vz[i] * vz[i])
+        for j in i + 1..5:
+            let dx = x[i] - x[j]
+            let dy = y[i] - y[j]
+            let dz = z[i] - z[j]
+            e -= m[i] * m[j] / sqrt(dx * dx + dy * dy + dz * dz)
+    return e
+
+@native
+fn matmul(a, b, c):
+    let n = a.shape[0]
+    for i in 0..n:
+        for k in 0..n:
+            let aik = a[i, k]
+            for j in 0..n:
+                c[i, j] += aik * b[k, j]
+
+@native
+fn matmul_par(a, b, c):
+    let n = a.shape[0]
+    parallel for i in 0..n:
+        for k in 0..n:
+            let aik = a[i, k]
+            for j in 0..n:
+                c[i, j] += aik * b[k, j]
+
+@native
+fn hypot_sum(a, b) -> Float = sum(sqrt(a * a + b * b))
+
+fn timeit(name, f):
+    f()
+    var best = 1e9
+    for r in 0..5:
+        let t = clock()
+        f()
+        let dt = clock() - t
+        best = min(best, magnitude(dt))
+    print(f"{name}: {best * 1000:.2f} ms")
+
+let N = 512
+let A = randn(N, N, seed=1)
+let B = randn(N, N, seed=2)
+let C = zeros(N, N)
+let H1 = randn(4000000, seed=3)
+let H2 = randn(4000000, seed=4)
+
+print("fib(32) =", fib(32))
+print("mandelbrot(1000) =", mandelbrot(1000, 50))
+print("spectral(1000) =", spectral(1000))
+print("sieve(10M) =", sieve(10000000))
+print("nbody(1M) =", nbody(1000000))
+timeit("fib(32)", fn() => fib(32))
+timeit("mandelbrot 1000x1000 x50", fn() => mandelbrot(1000, 50))
+timeit("mandelbrot parallel", fn() => mandelbrot_par(1000, 50))
+timeit("spectral-norm 1000", fn() => spectral(1000))
+timeit("spectral-norm parallel", fn() => spectral_par(1000))
+timeit("sieve 10M", fn() => sieve(10000000))
+timeit("nbody 1M steps", fn() => nbody(1000000))
+timeit("matmul 512 (naive ikj)", fn() => matmul(A, B, C))
+timeit("matmul 512 parallel", fn() => matmul_par(A, B, C))
+timeit("fused sqrt(a*a+b*b) sum 4M", fn() => hypot_sum(H1, H2))

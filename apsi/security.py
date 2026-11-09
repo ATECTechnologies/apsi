@@ -478,7 +478,12 @@ CAPABILITIES = {
     "load_json": ("read", "reads files"), "load_csv": ("read", "reads files"),
     "load_tensor": ("read", "reads files"), "from_csv": ("read", "reads files"),
     "from_npy": ("read", "reads files"), "from_files": ("read", "lists files"),
-    "load_safetensors": ("read", "reads model files"), "load_params": ("read", "reads files"),
+    "load_safetensors": ("read", "reads model files"),
+    "save_model": ("write", "writes model files"), "save_gguf": ("write", "writes model files"),
+    "load_model": ("read", "reads model files"), "load_gguf": ("read", "reads model files"),
+    "model_info": ("read", "reads model files"), "gguf_info": ("read", "reads model files"),
+    "read_dicom": ("read", "reads medical images"), "read_dicom_series": ("read", "reads medical images"),
+    "load_runs": ("read", "reads experiment logs"), "experiment": ("write", "writes experiment logs"), "load_params": ("read", "reads files"),
     "static": ("read", "serves files (app.static)"), "exists": ("read", "checks for files"),
 }
 
@@ -519,12 +524,17 @@ def package_dir():
 
 
 def compute_manifest():
+    """SHA-256 of every .py file of the runtime, subpackages included (key: path relative to the package)."""
     out = {}
     root = package_dir()
-    for name in sorted(os.listdir(root)):
-        if name.endswith(".py"):
-            with open(os.path.join(root, name), "rb") as fh:
-                out[name] = hashlib.sha256(fh.read()).hexdigest()
+    for base, dirs, files in os.walk(root):
+        dirs[:] = sorted(d for d in dirs if d != "__pycache__")
+        rel = os.path.relpath(base, root)
+        for name in sorted(files):
+            if name.endswith(".py"):
+                key = name if rel == "." else rel.replace(os.sep, "/") + "/" + name
+                with open(os.path.join(base, name), "rb") as fh:
+                    out[key] = hashlib.sha256(fh.read()).hexdigest()
     return out
 
 

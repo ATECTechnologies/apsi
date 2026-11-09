@@ -8,6 +8,8 @@
 `apsi help` / `apsi COMMAND --help` describe every command.
 """
 import argparse
+import contextlib
+import io
 import os
 import sys
 import time
@@ -147,6 +149,11 @@ def cmd_run(args):
     if not _guard(args, src, name):
         return 3
     _limits(args)
+    if getattr(args, "native", False):
+        os.environ["APSI_NATIVE"] = "auto"          # every function gets a native tier (silent fallback)
+    if getattr(args, "threads", None):
+        from . import native as _nat
+        _nat.set_threads(args.threads)
     it = _make_interp(args, args.file)
     t0 = time.perf_counter()
     try:
@@ -163,6 +170,104 @@ def cmd_run(args):
         if args.time:
             print(f"apsi: {name} ran in {time.perf_counter() - t0:.3f}s", file=sys.stderr)
     return 0
+
+
+def cmd_native(args):
+    """apsi native info | explain FILE | ir FILE FN | asm FILE FN | clear-cache"""
+    import json
+    from . import native as nat
+    action = args.action
+    if action == "info":
+        from .native.gpu import info as ginfo
+        out = nat.info()
+        out["gpu"] = ginfo()
+        if args.json:
+            print(json.dumps(out, indent=1, default=str))
+            return 0
+        if not out["available"]:
+            print(f"native compiler: unavailable ({out.get('reason')})")
+            return 1
+        print(f"native compiler : LLVM {out['llvm']}, target {out['triple']}, CPU {out['cpu']}")
+        print(f"SIMD            : {', '.join(out['simd']) or 'none'}")
+        print(f"threads         : {out['threads']} (APSI_THREADS or native_threads(n) to change)")
+        print(f"machine-code cache: {out['cache_dir']}")
+        g = out["gpu"]
+        if g["available"]:
+            for d in g["devices"]:
+                print(f"GPU {d['index']}           : {d['name']}, compute {d['compute_capability']}, "
+                      f"{d['multiprocessors']} SMs, {d['memory_gb']} GB")
+        else:
+            print(f"GPU             : none ({g['reason']}); @gpu functions run on all CPU cores")
+        return 0
+    if action == "clear-cache":
+        import shutil
+        from .security import config_dir
+        d = os.path.join(config_dir(), "cache", "native")
+        shutil.rmtree(d, ignore_errors=True)
+        print(f"removed {d}")
+        return 0
+    if not args.file:
+        print(f"apsi native {action}: give the program file", file=sys.stderr)
+        return 2
+    os.environ["APSI_NATIVE_QUIET"] = "1"
+    if args.all:
+        os.environ["APSI_NATIVE"] = "auto"
+    src = _read(args.file)
+    if not _guard(args, src, args.file):
+        return 3
+    it = _make_interp(args, args.file)
+    out = io.StringIO()
+    try:
+        with contextlib.redirect_stdout(out):
+            it.run(src, args.file)
+    except (ApsiError, CheckFailed) as e:
+        _report(e, src, args.file)
+        return 1
+    fns = [f for f in nat.REGISTRY if not f.erased]
+    if action == "explain":
+        if not fns:
+            print("no @native / @gpu functions were called (use --all to try every function)")
+            return 0
+        for f in fns:
+            done = [k for k, v in f.specs.items() if not isinstance(v, nat._Fallback)]
+            fell = [v.reason for v in f.specs.values() if isinstance(v, nat._Fallback)]
+            fell += [v.reason for v in f._apsi_e.specs.values() if isinstance(v, nat._Fallback)]
+            if done:
+                sig = "; ".join("(" + ", ".join(_tn(t, d) for t, d in k[0]) + ")" for k in done)
+                print(f"  native   {f.name}{'' if not fell else ' (partly)'}  {sig}")
+            if fell:
+                print(f"  bytecode {f.name}: {fell[0]}")
+            if not done and not fell and f.py_calls:
+                print(f"  bytecode {f.name}: called with values native code does not take (lists, records, "
+                      f"structs, autodiff values ...)")
+            elif not done and not fell:
+                print(f"  -        {f.name}: not called")
+            for name, msg in nat.reports():
+                if name == f.name and msg not in fell:
+                    print(f"           {msg}")
+        return 0
+    want = args.function
+    match = [f for f in fns if f.name == want] if want else fns[:1]
+    if not match:
+        print(f"apsi native {action}: no native function named {want!r} was called", file=sys.stderr)
+        return 1
+    f = match[0]
+    specs = [v for v in f.specs.values() if not isinstance(v, nat._Fallback)]
+    if not specs:
+        print(f"apsi native {action}: {f.name}() did not compile natively", file=sys.stderr)
+        return 1
+    text = specs[0].ir_text
+    if action == "ir":
+        print(text)
+    else:
+        print(nat._eng.engine().assembly(text)[1])
+    return 0
+
+
+def _tn(t, d):
+    from .native.compiler import tname
+    s = tname(t)
+    return s if d.dimensionless else f"{s}[{d}]"
 
 
 def cmd_check(args):
@@ -504,8 +609,20 @@ def _parser():
     p.add_argument("--no-check", action="store_true", help="skip the static checker")
     p.add_argument("--time", action="store_true", help="print how long the program ran")
     p.add_argument("-w", "--watch", action="store_true", help="run again every time the file changes")
+    p.add_argument("--native", action="store_true",
+                   help="compile every function to machine code when possible (as if each had @native)")
+    p.add_argument("--threads", type=int, metavar="N", help="CPU threads for parallel for (default: all cores)")
     perm_flags(p)
     p.set_defaults(fn=cmd_run)
+
+    p = sub.add_parser("native", help="native compiler: info, explain FILE, ir FILE [FN], asm FILE [FN], clear-cache")
+    p.add_argument("action", choices=["info", "explain", "ir", "asm", "clear-cache"])
+    p.add_argument("file", nargs="?", help="program to run (explain / ir / asm)")
+    p.add_argument("function", nargs="?", help="function name (ir / asm; default: the first one)")
+    p.add_argument("--all", action="store_true", help="try every function, as apsi run --native does")
+    p.add_argument("--json", action="store_true", help="machine-readable output (info)")
+    perm_flags(p)
+    p.set_defaults(fn=cmd_native)
 
     p = sub.add_parser("check", help="statically check files or folders without running them")
     p.add_argument("files", nargs="*", help="files or folders (default: current folder)")
@@ -569,6 +686,10 @@ def _parser():
     p.set_defaults(fn=cmd_tokens)
 
     from . import packages as _packages, editors as _editors, convert as _convert
+    from . import scale as _scale
+    _scale.add_parser(sub)
+    from . import modelio as _modelio
+    _modelio.add_parser(sub)
     _packages.add_parser(sub)
     from . import apsil as _apsil
     _apsil.add_parser(sub)

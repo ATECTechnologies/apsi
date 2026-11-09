@@ -4,11 +4,13 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "apsi"
-version = "1.10.0"
-description = "Apsi: a programming language for AI, physics and servers — units, shapes, autodiff, low-precision formats, data pipelines and a hardened web server built in"
+version = "2.0.0"
+description = "Apsi: a programming language for AI, physics and servers, compiled to native machine code — units, shapes, autodiff, low-precision formats, data pipelines and a hardened web server built in"
 readme = "README.md"
-requires-python = ">=3.9"
-dependencies = ["numpy>=1.22", "pyreadline3>=3.4; sys_platform == \"win32\""]
+requires-python = ">=3.12"
+license = {file = "LICENSE"}
+authors = [{name = "ATEC"}]
+dependencies = ["numpy>=1.26", "llvmlite>=0.43", "pyreadline3>=3.4; sys_platform == \"win32\""]
 
 [project.optional-dependencies]
 gpu = ["cupy-cuda12x"]
@@ -18,7 +20,7 @@ torch = ["torch"]
 apsi = "apsi.cli:main"
 
 [tool.setuptools]
-packages = ["apsi"]
+packages = ["apsi", "apsi.native"]
 
 [tool.setuptools.package-data]
 apsi = ["MANIFEST.json"]

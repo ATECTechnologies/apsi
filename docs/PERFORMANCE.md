@@ -31,10 +31,17 @@ computing. Results match the hardware exactly, but the speed of FP8/FP4 tensor c
 backend of a later phase (see [`ROADMAP.md`](ROADMAP.md)). Neural networks already train on GPUs in fp32, tf32,
 bf16 and fp16 through the PyTorch backend (below).
 
+## Native code (`@native`, `parallel for`, `@gpu`)
+
+The fastest way to run loops and numeric functions: machine code through LLVM for the exact CPU, all cores with
+`parallel for`, NVIDIA GPUs with `@gpu`. On par with C, C++ and Rust, and 100–3,500× faster than bytecode on loops.
+Benchmarks and the full reference: [`NATIVE.md`](NATIVE.md).
+
 ## CPU
 
+- `@native` functions run as machine code (AVX2/AVX-512 vectorised); `parallel for` uses every core — see above
 - tensor math runs on multi-threaded BLAS (the OpenBLAS/MKL that comes with numpy) on every core automatically
-- loops and ordinary functions are compiled to bytecode, 5–20× faster than the tree-walker
+- other loops and functions are compiled to bytecode, 5–20× faster than the tree-walker
 - `use parallel`
   - `spawn(f, args…)`, then `.wait()`, `wait_all`, `wait_any`
   - `channel(cap)` (send/recv/close, iterate with for), `lock()`, `atomic()`
@@ -44,6 +51,9 @@ bf16 and fp16 through the PyTorch backend (below).
 - reductions over short axes (such as xyz coordinates) use an unrolled kernel, about 1.5× faster than plain numpy in N-body work
 
 ## GPU (`use gpu`)
+
+- your own loops on the GPU: `@gpu` with a `parallel for` — no CuPy or CUDA toolkit needed, several GPUs at once
+  ([`NATIVE.md`](NATIVE.md#gpu))
 
 - `device()` returns `"cuda:0"` when an NVIDIA GPU with compute capability ≥ 7.5 (GTX 1660 or newer) and CuPy are present, otherwise `"cpu"`
 - `to_device(x)`, `to_gpu(x)`, `to_cpu(x)`, `gpu_info()` (name, memory, number of SMs)

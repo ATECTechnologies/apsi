@@ -15,10 +15,14 @@ SKIP_EXAMPLES = {"13_interop.apsi", "14_api_server.apsi", "15_native_c.apsi", "2
 def main():
     files = {}
     pkg = os.path.join(ROOT, "apsi")
-    for name in sorted(os.listdir(pkg)):
-        if name.endswith(".py"):
-            with open(os.path.join(pkg, name), encoding="utf-8") as fh:
-                files["apsi/" + name] = fh.read()
+    for root, dirs, names in os.walk(pkg):                # subpackages too (apsi/native)
+        dirs[:] = sorted(d for d in dirs if d != "__pycache__")
+        rel = os.path.relpath(root, pkg)
+        arc = "apsi" if rel == "." else "apsi/" + rel.replace(os.sep, "/")
+        for name in sorted(names):
+            if name.endswith(".py"):
+                with open(os.path.join(root, name), encoding="utf-8") as fh:
+                    files[f"{arc}/{name}"] = fh.read()
     examples = {}
     exdir = os.path.join(ROOT, "examples")
     for name in sorted(os.listdir(exdir)):

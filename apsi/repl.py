@@ -36,13 +36,15 @@ class Style:
     def _c(self, code, s):
         return f"\x1b[{code}m{s}\x1b[0m" if self.on else s
 
-    def prompt(self, s):
-        # \001/\002 tell GNU readline the escape codes take no width
+    def prompt(self, s, where=None):
+        """The prompt; `where` (the current folder) is shown before it, like a shell: C:\\work apsi> """
         if not self.on:
-            return s
+            return f"{where} {s}" if where else s
+        # \001/\002 tell GNU readline the escape codes take no width
         rl = "readline" in sys.modules and os.name != "nt"
         a, b = ("\001", "\002") if rl else ("", "")
-        return f"{a}\x1b[38;5;43m\x1b[1m{b}{s}{a}\x1b[0m{b}"
+        head = f"{a}\x1b[38;5;75m{b}{where}{a}\x1b[0m{b} " if where else ""
+        return f"{head}{a}\x1b[38;5;43m\x1b[1m{b}{s}{a}\x1b[0m{b}"
 
     def err(self, s):
         return self._c("31", s)
@@ -279,7 +281,9 @@ class Repl:
 
     def read_statement(self):
         """Read one complete input (possibly many lines). Returns None at end of input."""
-        p1, p2 = self.style.prompt("apsi> "), self.style.prompt("...   ")
+        where = _prompt_folder()
+        p1 = self.style.prompt("apsi> ", where)
+        p2 = self.style.prompt(" " * (len(where) + 1 if where else 0) + "...   ")
         lines = []
         block = False
         while True:
@@ -302,7 +306,12 @@ class Repl:
                     return line
             if lines and block and not line.strip():
                 return "\n".join(lines)
-            lines.append(line)
+            if lines and not block and _dangling(lines[-1]) and not _open_brackets("\n".join(lines)):
+                # `let x = 1 +` ⏎ `2`: the language has no line breaks after an operator outside brackets,
+                # so join the continuation onto the same logical line
+                lines[-1] = lines[-1].rstrip().rstrip("\\").rstrip() + " " + line.strip()
+            else:
+                lines.append(line)
             src = "\n".join(lines)
             if needs_more(src):
                 if src.rstrip().endswith(":"):
@@ -454,8 +463,7 @@ class Repl:
         try:
             cur = os.getcwd()
             os.chdir(target)
-            self.prev_dir = cur
-            self.print(self.style.dim(os.getcwd()))
+            self.prev_dir = cur                        # the prompt now shows the new folder, as in a shell
         except FileNotFoundError:
             self.error(f"cd: no such folder: {target}")
         except NotADirectoryError:
@@ -467,30 +475,57 @@ class Repl:
         self.print(os.getcwd())
 
     def c_ls(self, rest):
+        """A tidy listing: folders first, then files, with modification time and size, and a summary line."""
+        import time as _time
         args = [a for a in _split(rest) if not (a.startswith("-") and not os.path.exists(a))]
         target = _shell_path(args[0]) if args else "."
+        s = self.style
         if os.path.isfile(target):
-            self.print(target)
+            st = os.stat(target)
+            self.print(f"  {_time.strftime('%Y-%m-%d %H:%M', _time.localtime(st.st_mtime))}  "
+                       f"{_size(st.st_size):>9}  {target}")
             return
         try:
-            entries = sorted(os.scandir(target), key=lambda e: (not e.is_dir(), e.name.lower()))
+            entries = sorted(os.scandir(target), key=lambda e: (not _is_dir(e), e.name.lower()))
         except OSError as e:
             self.error(f"ls: {e.strerror}: {target}")
             return
-        s = self.style
-        show_all = "-a" in rest
+        show_all = "-a" in _split(rest)
+        rows = []
+        n_dirs = n_files = total = hidden = 0
         for e in entries:
             if e.name.startswith(".") and not show_all:
+                hidden += 1
                 continue
             try:
-                if e.is_dir():
-                    self.print(f"  {'<dir>':>10}  " + s.accent(e.name + os.sep))
-                else:
-                    size = e.stat().st_size
-                    name = s.ok(e.name) if e.name.endswith(".apsi") else e.name
-                    self.print(f"  {_size(size):>10}  {name}")
+                st = e.stat()
+                when = _time.strftime("%Y-%m-%d %H:%M", _time.localtime(st.st_mtime))
             except OSError:
-                self.print(f"  {'?':>10}  {e.name}")
+                st, when = None, "?"
+            if _is_dir(e):
+                n_dirs += 1
+                rows.append((when, "<dir>", s.accent(e.name + os.sep)))
+            else:
+                n_files += 1
+                size = st.st_size if st else 0
+                total += size
+                name = s.ok(e.name) if e.name.endswith(".apsi") else e.name
+                rows.append((when, _size(size), name))
+        self.print(s.dim(f"  Folder: {os.path.abspath(target)}"))
+        if not rows:
+            self.print(s.dim("  (empty)" + (f" — {hidden} hidden, ls -a shows them" if hidden else "")))
+            return
+        self.print("")
+        self.print(s.dim(f"  {'Modified':<16}  {'Size':>9}  Name"))
+        self.print(s.dim(f"  {'-' * 16}  {'-' * 9}  {'-' * 4}"))
+        for when, size, name in rows:
+            self.print(f"  {when:<16}  {size:>9}  {name}")
+        parts = [f"{n_dirs} folder{'s' if n_dirs != 1 else ''}", f"{n_files} file{'s' if n_files != 1 else ''}"]
+        summary = ", ".join(parts) + (f" ({_size(total)})" if n_files else "")
+        if hidden:
+            summary += f", {hidden} hidden (ls -a)"
+        self.print("")
+        self.print(s.dim("  " + summary))
 
     def c_run(self, rest):
         args = _split(rest)
@@ -806,9 +841,74 @@ ALIASES = {"q": "quit", "exit": "quit", "h": "help", "?": "help", "t": "type", "
            "dir": "ls", "cls": "clear", "v": "vars", "hist": "history"}
 
 
+_DANGLING = ("+", "-", "*", "/", "%", "@", "^", "=", "<", ">", "|>", "\\", "and", "or", "not", "±", "..")
+
+
+def _dangling(line):
+    """Does this line end in the middle of an expression (an operator or a backslash)?"""
+    t = line.split("#", 1)[0].rstrip() if '"' not in line and "'" not in line else line.rstrip()
+    if not t or t.endswith((":", "->")):
+        return False
+    if t.endswith(("and", "or", "not")):
+        word = t.rsplit(None, 1)[-1]
+        return word in ("and", "or", "not")
+    return t.endswith(_DANGLING)
+
+
+def _open_brackets(src):
+    depth = 0
+    quote = None
+    for ch in src:
+        if quote:
+            if ch == quote:
+                quote = None
+        elif ch in "\"'":
+            quote = ch
+        elif ch == "#":
+            continue
+        elif ch in "([{":
+            depth += 1
+        elif ch in ")]}":
+            depth -= 1
+    return depth > 0
+
+
+def _is_dir(e):
+    try:
+        return e.is_dir()
+    except OSError:
+        return False
+
+
+def _prompt_folder(limit=48):
+    """The current folder for the prompt: ~ for home on Linux/macOS, long paths shortened in the middle.
+
+    APSI_PROMPT=short shows only `apsi>`."""
+    if os.environ.get("APSI_PROMPT", "").strip().lower() in ("short", "plain", "0", "off"):
+        return ""
+    try:
+        cwd = os.getcwd()
+    except OSError:
+        return ""
+    home = os.path.expanduser("~")
+    if os.name != "nt" and (cwd == home or cwd.startswith(home + os.sep)):
+        cwd = "~" + cwd[len(home):]
+    if len(cwd) <= limit:
+        return cwd
+    sep = os.sep
+    parts = cwd.split(sep)
+    head = parts[0] + sep if parts[0] else sep
+    tail = []
+    for p in reversed(parts[1:]):
+        if len(head) + 4 + len(sep.join([p] + tail)) > limit and tail:
+            break
+        tail.insert(0, p)
+    return head + "..." + sep + sep.join(tail)
+
+
 def _size(n):
-    for unit in ("B", "KB", "MB", "GB"):
-        if n < 1024 or unit == "GB":
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if n < 1024 or unit == "TB":
             return f"{n:.0f} {unit}" if unit == "B" else f"{n:.1f} {unit}"
         n /= 1024
 

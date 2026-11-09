@@ -1,0 +1,23 @@
+# Mechanics: equations of motion from a Lagrangian (by automatic differentiation), orbits and a beam.
+use mechanics
+use special
+
+# double pendulum: write the Lagrangian, Apsi derives and integrates the equations of motion
+let g = 9.81
+fn L(q, qd) = qd[0]^2 + 0.5 * qd[1]^2 + qd[0] * qd[1] * cos(q[0] - q[1]) + 2.0 * g * cos(q[0]) + g * cos(q[1])
+let r = lagrangian_flow(L, tensor([1.5, -0.5]), tensor([0.0, 0.0]), 0.002, 1000)
+print("double pendulum: energy drift", max(r.energy) - min(r.energy))
+
+# a single pendulum's exact period from the elliptic integral, against the simulation
+let theta0 = 2.0
+let T = 4.0 * sqrt(1.0 / g) * ellipk(sin(theta0 / 2.0)^2)
+print("pendulum period (exact):", T, "s")
+
+# low Earth orbit to geostationary orbit
+let mu = 3.986004418e14
+let h = hohmann(6.778e6, 4.2164e7, mu)
+print("Hohmann transfer: Δv =", h.dv_total, "m/s, time =", h.time / 3600.0, "h")
+
+# a 3 m steel cantilever with 1 kN at the tip
+let b = beam(3.0, 200e9, 8e-6, "cantilever", [[3.0, -1000.0]])
+print("tip deflection:", b.max_deflection * 1000.0, "mm (exact: -5.625 mm)")

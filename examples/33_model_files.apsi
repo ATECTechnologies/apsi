@@ -1,0 +1,26 @@
+# Saving models: Apsi checkpoints (.apsim) and GGUF.
+# Run: apsi run examples/33_model_files.apsi --allow-read --allow-write
+use models
+use precision
+
+let params = record(layers=[record(W=randn(256, 256), b=zeros(256)),
+                            record(W=randn(256, 10), b=zeros(10))],
+                    mass=tensor([1.0, 2.0]) * 1kg)
+
+# 1. Apsi checkpoint: units, compressed tensors and the tree come back exactly; SHA-256 checked on load
+save_model("out/model.apsim", params, metadata=record(arch="mlp", step=1000), sign=true)
+let back = load_model("out/model.apsim", key=true)            # refuses changed or foreign files
+print("mass:", back.mass)
+print("largest difference:", max(abs(back.layers[0].W - params.layers[0].W)))
+
+let small = quantize_model(params, int8)                        # 4x smaller than f32
+save_model("out/model-int8.apsim", small)
+print(model_info("out/model-int8.apsim"))
+
+# 2. Large models are split into shards with an index (here: 100 KB shards to show it)
+let index = save_model("out/sharded.apsim", params, shard="100KB")
+print("shards:", model_info(index).files)
+
+# 3. GGUF for llama.cpp / Ollama / LM Studio (Q8_0 is bit-identical to ggml)
+save_gguf("out/model-q8.gguf", params, dtype="q8_0")
+print(gguf_info("out/model-q8.gguf").tensors)

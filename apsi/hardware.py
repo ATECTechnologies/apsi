@@ -194,6 +194,24 @@ def doctor(verbose=True):
     else:
         print("  - GPU      : no NVIDIA GPU detected (CPU backend will be used)")
     ready = i["cpu_meets_target"] and i["os_meets_target"]
+    try:                                              # the native tier (machine code) and @gpu kernels
+        from . import native as _nat
+        from .native.gpu import info as _ginfo
+        n = _nat.info()
+        if n["available"]:
+            print(f"  {ok(True)} Native      : LLVM {n['llvm']} for {n['cpu']} ({', '.join(n['simd'][-4:]) or 'scalar'}),"
+                  f" {n['threads']} threads for parallel for")
+        else:
+            print(f"  {ok(False)} Native      : {n.get('reason')} (functions run on the bytecode engine)")
+        g = _ginfo()
+        if g["available"]:
+            for d in g["devices"]:
+                print(f"  {ok(True)} @gpu        : GPU {d['index']} {d['name']} (sm {d['compute_capability']}, "
+                      f"{d['memory_gb']} GB) - driver PTX JIT, no toolkit needed")
+        else:
+            print(f"  - @gpu        : {g['reason']}; @gpu functions use all CPU cores")
+    except Exception as e:                            # never let diagnostics fail
+        print(f"  - Native      : could not be checked ({e})")
     print(f"\n  Status: {'ready' if ready else 'below target tier'}")
     return 0 if ready else 1
 
@@ -232,8 +250,21 @@ def to_device(x, dev=None):
 
 
 def gpu_info():
-    import cupy
+    """GPU 0: name, compute capability, memory. Works with CuPy, or with just the NVIDIA driver."""
     from .values import Record
+    try:
+        import cupy
+    except ImportError:
+        cupy = None
+    if cupy is None:
+        from .native import cuda
+        devs = cuda.devices()
+        if not devs:
+            from .errors import RuntimeErr
+            raise RuntimeErr(f"no NVIDIA GPU is available ({cuda.unavailable_reason()})")
+        d = devs[0]
+        return Record(name=d["name"], compute_capability=d["compute_capability"], memory_gb=d["memory_gb"],
+                      free_gb=None, multiprocessors=d["multiprocessors"])
     p = cupy.cuda.runtime.getDeviceProperties(0)
     free, total = cupy.cuda.runtime.memGetInfo()
     return Record(name=p["name"].decode() if isinstance(p["name"], bytes) else p["name"],

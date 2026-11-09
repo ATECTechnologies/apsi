@@ -12,13 +12,35 @@ import zipfile
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 
+def _toml_strings(chunk):
+    """Decode every TOML string literal in `chunk` ("basic" with escapes, or 'literal')."""
+    import json
+    out = []
+    for m in re.finditer(r'"((?:[^"\\\n]|\\.)*)"|\'([^\'\n]*)\'', chunk):
+        out.append(json.loads('"' + m.group(1) + '"') if m.group(1) is not None else m.group(2))
+    return out
+
+
 def _project():
-    text = open(os.path.join(ROOT, "pyproject.toml"), encoding="utf-8").read()
-    get = lambda key: re.search(rf'^{key}\s*=\s*"(.*)"', text, re.M).group(1)
-    # TOML basic strings may contain escaped quotes: "pyreadline3>=3.4; sys_platform == \"win32\""
-    block = re.search(r"^dependencies\s*=\s*\[(.*?)\]\s*$", text, re.M | re.S).group(1)
-    deps = [re.sub(r'\\(.)', r'\1', d) for d in re.findall(r'"((?:[^"\\]|\\.)*)"', block)]
+    path = os.path.join(ROOT, "pyproject.toml")
+    try:                                         # Python 3.11+: the real TOML parser
+        import tomllib
+        with open(path, "rb") as fh:
+            p = tomllib.load(fh)["project"]
+        return p["name"], p["version"], p["description"], p["requires-python"], list(p["dependencies"])
+    except ImportError:
+        pass
+    text = open(path, encoding="utf-8").read()
+    get = lambda key: _toml_strings(re.search(rf"^{key}\s*=\s*(.*)$", text, re.M).group(1))[0]
+    deps = _toml_strings(re.search(r"^dependencies\s*=\s*\[(.*?)\]", text, re.M | re.S).group(1))
     return get("name"), get("version"), get("description"), get("requires-python"), deps
+
+
+def _check_requirement(req):
+    """Refuse to write metadata pip would reject (invalid metadata once broke a Windows payload)."""
+    if "\\" in req or req.count('"') % 2 or req.count("'") % 2:
+        raise SystemExit(f"make_wheel: malformed requirement in pyproject.toml: {req!r}")
+    return req
 
 
 def _record_line(name, data):
@@ -30,17 +52,21 @@ def build(out_dir):
     name, version, summary, requires, deps = _project()
     readme = open(os.path.join(ROOT, "README.md"), encoding="utf-8").read()
     meta = [f"Metadata-Version: 2.1", f"Name: {name}", f"Version: {version}", f"Summary: {summary}",
-            f"Requires-Python: {requires}"] + [f"Requires-Dist: {d}" for d in deps] + \
+            f"Requires-Python: {requires}", "Author: ATEC", "License: Apsi Non-Commercial License 1.0"] + [f"Requires-Dist: {_check_requirement(d)}" for d in deps] + \
            ["Provides-Extra: gpu", 'Requires-Dist: cupy-cuda12x; extra == "gpu"',
             "Provides-Extra: torch", 'Requires-Dist: torch; extra == "torch"',
             "Description-Content-Type: text/markdown", "", readme]
     info = f"{name}-{version}.dist-info"
     files = {}
     pkg = os.path.join(ROOT, "apsi")
-    for f in sorted(os.listdir(pkg)):
-        if f.endswith(".py") or f == "MANIFEST.json":
-            with open(os.path.join(pkg, f), "rb") as fh:
-                files[f"apsi/{f}"] = fh.read()
+    for root, dirs, names in os.walk(pkg):                 # subpackages too (apsi/native)
+        dirs[:] = sorted(d for d in dirs if d != "__pycache__")
+        rel = os.path.relpath(root, pkg)
+        arc = "apsi" if rel == "." else "apsi/" + rel.replace(os.sep, "/")
+        for f in sorted(names):
+            if f.endswith(".py") or (f == "MANIFEST.json" and rel == "."):
+                with open(os.path.join(root, f), "rb") as fh:
+                    files[f"{arc}/{f}"] = fh.read()
     files[f"{info}/METADATA"] = "\n".join(meta).encode("utf-8")
     files[f"{info}/WHEEL"] = b"Wheel-Version: 1.0\nGenerator: apsi make_wheel\nRoot-Is-Purelib: true\nTag: py3-none-any\n"
     files[f"{info}/entry_points.txt"] = b"[console_scripts]\napsi = apsi.cli:main\n"

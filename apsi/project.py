@@ -180,7 +180,7 @@ test "greet says hello":
     },
     "lib": {
         "desc": "a reusable library that other files import",
-        "main": '''# {name} — library. Import it with:  import "src/main.apsi" as {ident}
+        "main": '''# {name} — library. Other programs use it with:  use {ident}   (after: apsi pack, apsi publish, apsi install {name})
 
 fn clamp(x, lo, hi) = min(max(x, lo), hi)
 
@@ -331,7 +331,19 @@ test = "apsi test tests"
 check = "apsi check src"
 fmt = "apsi fmt src tests"
 ci = ["apsi check src", "apsi fmt --check src tests", "apsi test tests"]
-'''
+''' + (f'''pack = "apsi pack"
+publish = ["apsi pack", "apsi publish"]
+
+[package]                       # `apsi pack` builds dist/NAME-VERSION.apsil; `apsi publish` uploads it
+entry = "{main}"                # what `use NAME` loads
+summary = ""
+license = ""
+authors = []
+keywords = []
+include = ["src/**", "README*", "LICENSE*", "examples/**"]
+
+[dependencies]                  # other libraries: name = "^1.2"
+''' if template == "lib" else "")
 
 
 def scaffold(root, name, template="app", vscode=True, force=False):

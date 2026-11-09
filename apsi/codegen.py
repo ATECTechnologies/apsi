@@ -264,6 +264,57 @@ class CodeGen:
             self.block(s.else_body, Scope(scope, scope.ctx))
             self.indent -= 1
 
+    def s_Try(self, s, scope):
+        self.emit("try:")
+        self.indent += 1
+        self.block(s.body, Scope(scope, scope.ctx))
+        self.indent -= 1
+        if s.handlers:
+            ev = self.fresh("ex")
+            self.emit(f"except {HELPER_PREFIX}Exception as {ev}:")
+            self.indent += 1
+            first, catch_all = True, False
+            for kinds, name, body in s.handlers:
+                if kinds and not catch_all:
+                    self.emit(f"{'if' if first else 'elif'} {HELPER_PREFIX}exm({ev}, {tuple(kinds)!r}):")
+                else:
+                    self.emit("if True:" if first else "else:")
+                    catch_all = True
+                first = False
+                self.indent += 1
+                hs = Scope(scope, scope.ctx)
+                if name:
+                    hb = self.declare(hs, name)
+                    self.emit(f"{hb.py} = {HELPER_PREFIX}exv({ev})")
+                self.block(body, hs)
+                self.indent -= 1
+                if catch_all:
+                    break
+            if not catch_all:
+                self.emit("else:")
+                self.emit("    raise")
+            self.indent -= 1
+        if s.else_body is not None and s.handlers:
+            self.emit("else:")
+            self.indent += 1
+            self.block(s.else_body, Scope(scope, scope.ctx))
+            self.indent -= 1
+        if s.final_body is not None:
+            self.emit("finally:")
+            self.indent += 1
+            self.block(s.final_body, Scope(scope, scope.ctx))
+            self.indent -= 1
+
+    def s_Yield(self, s, scope):
+        v = self.expr(s.value, scope) if s.value is not None else "None"
+        self.emit(f"yield from {HELPER_PREFIX}iterable({v})" if s.from_ else f"yield {v}")
+
+    def s_Raise(self, s, scope):
+        if s.value is None:
+            self.emit("raise")
+        else:
+            self.emit(f"raise {HELPER_PREFIX}raise_({self.expr(s.value, scope)})")
+
     def s_While(self, s, scope):
         self.emit(f"while {HELPER_PREFIX}truth({self.expr(s.cond, scope)}):")
         self.indent += 1
@@ -319,7 +370,7 @@ class CodeGen:
             b = self.declare(scope, name)
             self.emit(f"{b.py} = {HELPER_PREFIX}mods[{s.path!r}][{name!r}]")
         if "." not in s.path and s.path not in mods[s.path] and scope.lookup(s.path) is None and s.path not in self.rt.interp.globals.vars:
-            b = self.declare(scope, s.path)                            # `use mylib` also allows mylib.name(...)
+            b = self.declare(scope, s.path)                            # `use rl` also allows rl.ppo(...)
             self.emit(f"{b.py} = {HELPER_PREFIX}namespace({s.path!r})")
 
     def s_Import(self, s, scope):
@@ -374,10 +425,26 @@ class CodeGen:
             b.erased_py = epy
             ectx = FuncCtx(scope.ctx, "fn", erased=True, exact=exact, name=s.name)
             self._function(epy, s.params, s.body, s.is_expr, Scope(scope, ectx), ectx, s.ret, s.shape_params)
-            self.emit(f"{HELPER_PREFIX}twin({b.py}, {epy}, {s.name!r}, {self.const(s, 'D')})")
+            free = self._free_map(s, scope)
+            self.emit(f"{HELPER_PREFIX}twin({b.py}, {epy}, {s.name!r}, {self.const(s, 'D')}, {self.const(free, 'F')})")
             for d in reversed(s.decorators):
                 self.emit(f"{b.py} = {self.expr(d, scope)}({b.py})")
+            if not s.decorators:
+                self.emit(f"{b.py} = {HELPER_PREFIX}auto_native({b.py})")
+            # unit-erased callers (evolve, hot loops) go through the native version when there is one
+            self.emit(f"{epy} = {HELPER_PREFIX}native_e({b.py}, {epy})")
         self.fn_names[b.py] = s.name
+
+    def _free_map(self, s, scope):
+        """Apsi name -> (python name, mutable) for every outer name the function may read (for @native)."""
+        body = [s.body] if s.is_expr else list(s.body)
+        out = {}
+        for n in _walk_ast(body + [p.default for p in s.params if p.default is not None]):
+            if isinstance(n, A.Name) and n.id not in out:
+                b = scope.lookup(n.id)
+                if b is not None:
+                    out[n.id] = (b.py, bool(b.mutable))
+        return out
 
     def _function(self, pyname, params, body, is_expr, fscope, ctx, ret, shape_params):
         header_at = len(self.lines)
@@ -391,6 +458,8 @@ class CodeGen:
             pnames.append((p, pb.py))
         defaults = []
         for p, py in pnames:
+            if p.star == "*":
+                self.emit(f"{py} = list({py})")
             if p.default is not None:
                 self.emit(f"if {py} is {HELPER_PREFIX}NO: {py} = {self.expr(p.default, fscope.parent)}")
         needs_b = any(p.type is not None for p in params) or ret is not None
@@ -424,7 +493,8 @@ class CodeGen:
         else:
             self.block(body, fscope)
         self.indent -= 1
-        sig = ", ".join(py + (f"={HELPER_PREFIX}NO" if p.default is not None else "") for p, py in pnames)
+        sig = ", ".join(("*" if p.star == "*" else "**" if p.star == "**" else "") + py
+                        + (f"={HELPER_PREFIX}NO" if p.default is not None else "") for p, py in pnames)
         pad = "    " * self.indent
         self.lines[header_at] = (f"{pad}def {pyname}({sig}):", self.lines[header_at][1])
         decls = []
@@ -585,6 +655,9 @@ class CodeGen:
     def e_IfExpr(self, e, scope):
         return f"({self.expr(e.a, scope)} if {HELPER_PREFIX}truth({self.expr(e.cond, scope)}) else {self.expr(e.b, scope)})"
 
+    def e_Spread(self, e, scope):
+        return ("**" if e.double else "*") + self.expr(e.value, scope)
+
     def e_Call(self, e, scope):
         args = [self.expr(a, scope) for a in e.args]
         kws = [(k, self.expr(v, scope)) for k, v in e.kwargs]
@@ -601,6 +674,9 @@ class CodeGen:
             fcode = self.expr(f, scope)
         parts = list(args)
         for k, v in kws:
+            if k is None:
+                parts.append(v)
+                continue
             parts.append(f"{k}={v}" if k.isidentifier() and not keyword.iskeyword(k) else f"**{{{k!r}: {v}}}")
         return f"{fcode}({', '.join(parts)})"
 
@@ -660,7 +736,7 @@ class CodeGen:
             ps = []
             for p in e.params:
                 b = self.declare(ls, p.name, kind="param", is_param=True)
-                ps.append(b.py + (f"={self.expr(p.default, scope)}" if p.default is not None else ""))
+                ps.append((p.star or "") + b.py + (f"={self.expr(p.default, scope)}" if p.default is not None else ""))
             return f"(lambda {', '.join(ps)}: {self.expr(e.body, ls)})"
         code = build(True) if scope.ctx.erased else f"{HELPER_PREFIX}dual({build(False)}, {build(True)})"
         captured = self._loop_captures(scope)
@@ -700,6 +776,18 @@ class CodeGen:
 
     def linemap(self):
         return [line for _, line in self.lines]
+
+
+def _walk_ast(nodes):
+    stack = list(nodes)
+    while stack:
+        n = stack.pop()
+        if isinstance(n, A.AST):
+            yield n
+            for f in n._fields:
+                stack.append(getattr(n, f))
+        elif isinstance(n, (list, tuple)):
+            stack.extend(n)
 
 
 def _collect_syms(t, out):
@@ -965,12 +1053,47 @@ def _erased(f):
     return f
 
 
-def _twin(f, fe, name, node=None):
+def _twin(f, fe, name, node=None, free=None):
     f._apsi_e = fe
     f._apsi_def = node
+    f._apsi_free = free
     f.name = name
     fe.name = name
     return f
+
+
+_AUTO = None
+
+
+def _exm(ex, kinds):
+    from .exceptions import matches
+    return matches(ex, kinds)
+
+
+def _exv(ex):
+    from .exceptions import value
+    return value(ex)
+
+
+def _raise(v):
+    from .exceptions import to_raise
+    return to_raise(v)
+
+
+def _auto_native(f):
+    """`apsi run --native` (APSI_NATIVE=auto): every function gets a native tier with silent fallback."""
+    global _AUTO
+    if _AUTO is None:
+        _AUTO = os.environ.get("APSI_NATIVE", "").strip().lower() in ("1", "auto", "on", "true")
+    if not _AUTO:
+        return f
+    from .native import auto
+    return auto(f)
+
+
+def _native_e(f, fe):
+    e = getattr(f, "_apsi_native_e", None)
+    return e if e is not None else fe
 
 
 def _dual(f, fe):
@@ -1052,6 +1175,7 @@ class Compiled:
             "__name__": "__apsi__",
             f"{HELPER_PREFIX}NO": NO, f"{HELPER_PREFIX}S": _strip, f"{HELPER_PREFIX}E": _erased,
             f"{HELPER_PREFIX}twin": _twin, f"{HELPER_PREFIX}dual": _dual,
+            f"{HELPER_PREFIX}auto_native": _auto_native, f"{HELPER_PREFIX}native_e": _native_e,
             f"{HELPER_PREFIX}truth": _truth, f"{HELPER_PREFIX}T": _truth, f"{HELPER_PREFIX}all": _all,
             f"{HELPER_PREFIX}irange": _irange, f"{HELPER_PREFIX}iterable": _iterable,
             f"{HELPER_PREFIX}idx": _idx, f"{HELPER_PREFIX}unpack": _unpack,
@@ -1060,6 +1184,7 @@ class Compiled:
             f"{HELPER_PREFIX}attr": interp.get_attr, f"{HELPER_PREFIX}setattr": interp.set_attr,
             f"{HELPER_PREFIX}setidx": _setidx(interp),
             f"{HELPER_PREFIX}AssertionFailed": AssertionFailed,
+            f"{HELPER_PREFIX}exm": _exm, f"{HELPER_PREFIX}Exception": Exception, f"{HELPER_PREFIX}exv": _exv, f"{HELPER_PREFIX}raise_": _raise,
             f"{HELPER_PREFIX}mods": interp.modules,
             f"{HELPER_PREFIX}namespace": lambda p: Namespace(p, interp.modules[p]),
             f"{HELPER_PREFIX}Namespace": Namespace,

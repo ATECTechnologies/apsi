@@ -48,11 +48,120 @@ class StructType:
 
 
 class StructInstance:
+    """An instance of a struct. Methods with the names below make it work with operators and built-ins, the way
+    Python's special methods do (so converted Python classes keep their behaviour):
+
+        add sub mul div mod pow neg   →  + - * / % ** unary -        eq lt le gt ge  →  == < <= > >=
+        len get set contains iter     →  len(x) x[i] x[i]=v  in  for     to_str      →  print / str / f-strings
+        call hash bool                →  x(...)  dict keys  if x
+    """
     __slots__ = ("type", "fields")
 
     def __init__(self, type_, fields):
         self.type = type_
         self.fields = fields
+
+    def _m(self, name):
+        return self.type.methods.get(name) if hasattr(self.type, "methods") else None
+
+    def _call(self, name, *args):
+        m = self._m(name)
+        if m is None:
+            return NotImplemented
+        return m(self, *args)
+
+    def __add__(self, o): return self._call("add", o)
+    def __radd__(self, o): return self._call("radd", o) if self._m("radd") else self._call("add", o)
+    def __sub__(self, o): return self._call("sub", o)
+    def __rsub__(self, o): return self._call("rsub", o)
+    def __mul__(self, o): return self._call("mul", o)
+    def __rmul__(self, o): return self._call("rmul", o) if self._m("rmul") else self._call("mul", o)
+    def __truediv__(self, o): return self._call("div", o)
+    def __rtruediv__(self, o): return self._call("rdiv", o)
+    def __floordiv__(self, o): return self._call("floordiv", o)
+    def __mod__(self, o): return self._call("mod", o)
+    def __pow__(self, o): return self._call("pow", o)
+    def __matmul__(self, o): return self._call("matmul", o)
+    def __lt__(self, o): return self._call("lt", o)
+    def __le__(self, o): return self._call("le", o)
+    def __gt__(self, o): return self._call("gt", o)
+    def __ge__(self, o): return self._call("ge", o)
+
+    def __neg__(self):
+        r = self._call("neg")
+        if r is NotImplemented:
+            raise TypeError(f"{self.type.name} has no 'neg' method for unary -")
+        return r
+
+    def __eq__(self, o):
+        if self._m("eq") is not None:
+            return bool(self._call("eq", o))
+        if isinstance(o, StructInstance):
+            return o is self or (o.type is self.type and _fields_equal(self.fields, o.fields))
+        return False
+
+    def __ne__(self, o):
+        r = self.__eq__(o)
+        return not r
+
+    def __hash__(self):
+        if self._m("hash") is not None:
+            return hash(self._call("hash"))
+        return id(self) >> 4
+
+    def __len__(self):
+        r = self._call("len")
+        if r is NotImplemented:
+            raise TypeError(f"{self.type.name} has no 'len' method")
+        return int(r)
+
+    def __getitem__(self, k):
+        r = self._call("get", k)
+        if r is NotImplemented:
+            raise TypeError(f"{self.type.name} has no 'get' method for indexing")
+        return r
+
+    def __setitem__(self, k, v):
+        if self._call("set", k, v) is NotImplemented:
+            raise TypeError(f"{self.type.name} has no 'set' method for index assignment")
+
+    def __contains__(self, k):
+        r = self._call("contains", k)
+        if r is NotImplemented:
+            raise TypeError(f"{self.type.name} has no 'contains' method for 'in'")
+        return bool(r)
+
+    def __iter__(self):
+        r = self._call("iter")
+        if r is NotImplemented:
+            raise TypeError(f"{self.type.name} has no 'iter' method for 'for'")
+        return iter(r)
+
+    def __bool__(self):
+        if self._m("bool") is not None:
+            return bool(self._call("bool"))
+        if self._m("len") is not None:
+            return len(self) > 0
+        return True
+
+    def __call__(self, *args, **kwargs):
+        m = self._m("call")
+        if m is None:
+            raise TypeError(f"{self.type.name} is not callable (define a 'call' method)")
+        return m(self, *args, **kwargs)
+
+    def __str__(self):
+        if self._m("to_str") is not None:
+            return str(self._call("to_str"))
+        from .fmt import fmt
+        return fmt(self)
+
+
+def _fields_equal(a, b):
+    try:
+        return all(bool(np.all(a[k] == b.get(k))) for k in a) and a.keys() == b.keys()
+    except Exception:                                   # noqa: BLE001
+        return False
 
 
 class Record:

@@ -3,7 +3,7 @@
 #   ApsiSetup-<v>-linux-x86_64.AppImage   setup wizard (Express/Custom, security, Apsi Guard)
 #   apsi_<v>_all.deb                      Debian/Ubuntu package (system python3 + numpy)
 #   apsi-<v>-linux-x86_64.tar.gz          portable: own Python 3.12 + numpy, unpack and run
-#   apsi-<v>-py3-none-any.whl             pip package for any Python 3.9+
+#   apsi-<v>-py3-none-any.whl             pip package for any Python 3.12+
 #   apsi-language-<v>.vsix                VS Code extension
 #   SHA256SUMS.txt, INSTALL-LINUX.md
 # Needs: python3, node 20+, npm, dpkg-deb, zip.   Usage: bash packaging/build_linux_release.sh

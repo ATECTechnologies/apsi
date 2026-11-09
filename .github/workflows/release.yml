@@ -1,4 +1,4 @@
-# Build all installers when a version tag is pushed (git tag v1.10.0 && git push --tags)
+# Build all installers when a version tag is pushed (git tag v2.0.0 && git push --tags)
 name: release
 on:
   push:

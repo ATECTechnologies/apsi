@@ -210,9 +210,12 @@ class Checker:
 
     def _sig(self, s, sc):
         params = [(p.name, self.type_dim(p.type, sc, p) if p.type is not None else None,
-                   p.default is not None) for p in s.params]
+                   p.default is not None) for p in s.params if not p.star]
         ret = self.type_dim(s.ret, sc, s) if s.ret is not None else None
-        return Sig(s.name, params, ret)
+        sig = Sig(s.name, params, ret)
+        sig.varargs = any(p.star == "*" for p in s.params)
+        sig.varkw = any(p.star == "**" for p in s.params)
+        return sig
 
     def c_FnDef(self, s, sc, top):
         for d in s.decorators:
@@ -235,7 +238,10 @@ class Checker:
             self.shape_symbols(s.ret, syms)
         for sym in syms:
             fsc.names[sym] = Info(DIMLESS, False, kind="param")
-        for p, (_, d, _) in zip(s.params, sig.params):
+        for p in s.params:
+            if p.star:
+                self._decl(fsc, p.name, Info(None, False, kind="param"), p)
+        for p, (_, d, _) in zip([q for q in s.params if not q.star], sig.params):
             if p.default is not None:
                 pd = self.infer(p.default, sc)
                 if isD(d) and isD(pd) and pd != d:
@@ -278,6 +284,34 @@ class Checker:
         if s.else_body:
             self.block(s.else_body, Scope(sc))
 
+    def c_Try(self, s, sc, top):
+        from .exceptions import KINDS, ALIASES
+        self.block(s.body, Scope(sc))
+        for kinds, name, body in s.handlers:
+            for k in kinds:
+                base = ALIASES.get(k, k)
+                if base not in KINDS and self.lookup(base.split(".")[0], sc, None) is None:
+                    self.err(s, f"unknown error kind '{k}' (use a kind such as ValueError, KeyError, IndexError, "
+                                f"ZeroDivisionError, UnitError, OSError, or `except as e` for every error)", NameErr)
+            hs = Scope(sc)
+            if name:
+                self._decl(hs, name, Info(None, False), s)
+            self.block(body, hs)
+        if s.else_body:
+            self.block(s.else_body, Scope(sc))
+        if s.final_body:
+            self.block(s.final_body, Scope(sc))
+
+    def c_Yield(self, s, sc, top):
+        if not self.fn_stack:
+            self.err(s, "'yield' is only allowed inside a function", TypeCheckError)
+        if s.value is not None:
+            self.infer(s.value, sc)
+
+    def c_Raise(self, s, sc, top):
+        if s.value is not None:
+            self.infer(s.value, sc)
+
     def c_While(self, s, sc, top):
         self.infer(s.cond, sc)
         self.block(s.body, Scope(sc))
@@ -298,7 +332,7 @@ class Checker:
                 return
         if s.path not in self.modules:
             self.err(s, f"unknown module '{s.path}'. Available: {', '.join(sorted(self.modules))}. Install a library with: "
-                        f"apsi install {s.path}", NameErr)
+                            f"apsi install {s.path}", NameErr)
             return
         if s.alias:
             sc.names[s.alias] = Info(None, False, kind="module")
@@ -307,7 +341,7 @@ class Checker:
             for k, v in members.items():
                 sc.names[k] = Info(ops.dim_of(v) if not callable(v) else None, False, None, "builtin")
             if "." not in s.path and s.path not in members and sc.lookup(s.path) is None and s.path not in self.builtins:
-                sc.names[s.path] = Info(None, False, kind="module")      # `use mylib` also allows mylib.name(...)
+                sc.names[s.path] = Info(None, False, kind="module")      # `use rl` also allows rl.ppo(...)
 
     def c_Import(self, s, sc, top):
         path = s.path if os.path.isabs(s.path) else os.path.join(self.base_dir, s.path)
@@ -490,10 +524,23 @@ class Checker:
             self.err(e, f"both branches must have the same units: {dim_name(a)} vs {dim_name(b)}", UnitError)
         return a if isD(a) else (b if isD(b) else None)
 
+    def i_Spread(self, e, sc):
+        self.infer(e.value, sc)
+        return None
+
     def i_Call(self, e, sc):
         args = [self.infer(a, sc) for a in e.args]
-        kws = {k: self.infer(v, sc) for k, v in e.kwargs}
+        kws = {k: self.infer(v, sc) for k, v in e.kwargs if k is not None}
+        for k, v in e.kwargs:
+            if k is None:
+                self.infer(v, sc)
         f = e.func
+        if any(isinstance(a, A.Spread) for a in e.args) or any(k is None for k, _ in e.kwargs):
+            if not isinstance(f, A.Name):
+                self.infer(f, sc)
+            else:
+                self.lookup(f.id, sc, f)
+            return None
         if not isinstance(f, A.Name):
             self.infer(f, sc)
             return None
@@ -508,12 +555,12 @@ class Checker:
 
     def check_call(self, e, sig, args, kws):
         ps = sig.params
-        if len(args) > len(ps):
+        if len(args) > len(ps) and not getattr(sig, "varargs", False):
             self.err(e, f"{sig.name}() takes {len(ps)} argument(s) but {len(args)} were given")
             return sig.ret
         names = {p[0] for p in ps}
         for k in kws:
-            if k not in names:
+            if k not in names and not getattr(sig, "varkw", False):
                 self.err(e, f"{sig.name}() has no parameter '{k}'")
         for i, (pname, pd, has_def) in enumerate(ps):
             if i < len(args):

@@ -1,10 +1,10 @@
-# Building Apsi 1.10.0 from source
+# Building Apsi 2.0.0 from source
 
 ## Requirements
 
 | | Windows 10/11 | Linux |
 |---|---|---|
-| Python 3.9+ | `winget install Python.Python.3.12` | `sudo apt install python3 python3-venv` |
+| Python 3.12+ | `winget install Python.Python.3.12` | `sudo apt install python3 python3-venv` |
 | Node.js 20+ (installer only) | `winget install OpenJS.NodeJS.LTS` | `sudo apt install nodejs npm` (or nodejs.org) |
 | NSIS + zip (classic .exe/.deb/zip only) | – | `sudo apt install nsis zip` |
 
@@ -13,7 +13,7 @@
 ```powershell
 # Windows (PowerShell, in the source folder)
 powershell -ExecutionPolicy Bypass -File setup.ps1                  # .venv + Apsi + tests + malware scan of examples
-powershell -ExecutionPolicy Bypass -File setup.ps1 -Installer       # + installer\release\ApsiSetup-1.10.0-x64.exe
+powershell -ExecutionPolicy Bypass -File setup.ps1 -Installer       # + installer\release\ApsiSetup-2.0.0-x64.exe
 powershell -ExecutionPolicy Bypass -File setup.ps1 -Libs ai,gpu     # + libraries
 ```
 
@@ -28,9 +28,9 @@ powershell -ExecutionPolicy Bypass -File setup.ps1 -Libs ai,gpu     # + librarie
 Linux release files that need **no internet and no Node.js** (any Linux, also WSL):
 
 ```bash
-python3 packaging/make_linux_installer.py dist/linux   # dist/linux/ApsiSetup-1.10.0-linux.sh (self-extracting installer)
-python3 packaging/make_wheel.py dist/linux              # dist/linux/apsi-1.10.0-py3-none-any.whl (standard library only)
-SKIP_WINDOWS=1 SKIP_ELECTRON=1 sh packaging/build_all.sh   # dist/apsi_1.10.0_all.deb + wheel
+python3 packaging/make_linux_installer.py dist/linux   # dist/linux/ApsiSetup-2.0.0-linux.sh (self-extracting installer)
+python3 packaging/make_wheel.py dist/linux              # dist/linux/apsi-2.0.0-py3-none-any.whl (standard library only)
+SKIP_WINDOWS=1 SKIP_ELECTRON=1 sh packaging/build_all.sh   # dist/apsi_2.0.0_all.deb + wheel
 ```
 
 The AppImage wizard and the portable `tar.gz` with its own Python download Electron and Python, so they need
@@ -71,7 +71,7 @@ apsi test tests/apsi examples --allow-all && python -m unittest discover -s test
 cd installer
 python ../packaging/build_payload.py --platform windows --out payload   # or --platform linux
 npm ci && npm test && npm run build:ui
-npx electron-builder --win portable --x64       # Windows → release/ApsiSetup-1.10.0-x64.exe
+npx electron-builder --win portable --x64       # Windows → release/ApsiSetup-2.0.0-x64.exe
 npx electron-builder --linux AppImage           # Linux   → release/*.AppImage
 npm run dev                                     # UI preview in a browser (mock system)
 ```
@@ -90,9 +90,9 @@ npm run dist:win
 ## Unattended install (IT deployment)
 
 ```
-ApsiSetup-1.10.0-x64.exe --silent [--dir PATH] [--profile sandbox|strict|standard|developer]
+ApsiSetup-2.0.0-x64.exe --silent [--dir PATH] [--profile sandbox|strict|standard|developer]
                          [--no-examples] [--no-docs] [--no-editors] [--no-path] [--no-fileAssociation]
                          [--no-startMenu] [--desktop-shortcut] [--with-gpu] [--with-onnx] [--with-torch]
                          [--with-transformers]
-ApsiSetup-1.10.0-x64.exe --silent --uninstall
+ApsiSetup-2.0.0-x64.exe --silent --uninstall
 ```

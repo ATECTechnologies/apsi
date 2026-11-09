@@ -4,7 +4,7 @@ This guide takes you from installation to a first program, a first trained model
 
 ## 1. Install
 
-Apsi 1.10.0 runs on **Windows 10 or newer** and **Linux** (x86-64) and needs **Python 3.12 or newer** as its host runtime. The installers check for Python and offer to install it.
+Apsi 2.0.0 runs on **Windows 10 or newer** and **Linux** (x86-64) and needs **Python 3.12 or newer** as its host runtime. The installers check for Python and offer to install it.
 
 - Windows: download the installer from the download page and run it. Details: [Install on Windows](INSTALL.md).
 - Linux: unpack the Linux package and run `sh install.sh`, or install the `.deb`. Details: [Install on Linux](INSTALL-LINUX.md).
@@ -13,7 +13,7 @@ Check the installation:
 
 ```bash
 apsi version
-apsi doctor          # checks Python and your hardware
+apsi doctor          # checks Python, the native compiler and your hardware
 ```
 
 ## 2. Your first program
@@ -37,32 +37,53 @@ print(f"a stone falls {0.5 * g * t ** 2} in {t}")
 
 Physical units are part of the language. Change `t` to `2kg` and run again: the checker reports the unit error before anything runs.
 
+## 3. Make it fast
 
-## 3. Train a model
+Mark a function `@native` and it is compiled to machine code for your processor the first time it is called. The machine code is cached on disk, so later runs start immediately.
 
 ```apsi
-use nn
+@native
+fn mandel(n: Int, maxit: Int) -> Int:
+    var count = 0
+    for y in 0..n:
+        for x in 0..n:
+            let cr = 2.0 * x / n - 1.5
+            let ci = 2.0 * y / n - 1.0
+            var zr = 0.0
+            var zi = 0.0
+            var it = 0
+            while it < maxit and zr * zr + zi * zi <= 4.0:
+                let t = zr * zr - zi * zi + cr
+                zi = 2.0 * zr * zi + ci
+                zr = t
+                it += 1
+            if it == maxit:
+                count += 1
+    return count
 
-let X, y = spiral_data(n_per_class=100, classes=3, noise=0.2, seed=0)
-var params = mlp_init([2, 64, 64, 3], seed=42)
+print(mandel(1000, 50))
+```
 
-fn forward(params, x):
-    var h = x
-    for i, layer in enumerate(params):
-        h = h @ layer.W + layer.b
-        if i < len(params) - 1:
-            h = relu(h)
-    return h
+See the [native compiler guide](NATIVE.md) for what can be compiled and how to use all cores with `parallel for`.
 
-fn loss_fn(params, x, labels) = cross_entropy(forward(params, x), labels)
+## 4. Train a model
 
-let opt = adam(lr=0.01)
-for step in 0..400:
-    let loss, g = value_and_grad(loss_fn)(params, X, y)
-    params = opt.step(params, g)
+```apsi
+use torch
+
+let model = torch.Sequential(torch.Linear(2, 32), torch.ReLU(), torch.Linear(32, 1))
+var params = model.init(0)
+let opt = torch.AdamW(lr=1e-2)
+
+let x = randn(256, 2, seed=1)
+let y = sum(x * x, axis=1, keepdims=true)
+
+for step in 0..500:
+    fn loss_of(p) = torch.mse_loss(model(p, x), y)
+    let loss, grads = value_and_grad(loss_of)(params)
+    params = opt.step(params, grads)
     if step % 100 == 0:
-        print(f"step {step}: loss {loss:.4f}")
-print("accuracy:", accuracy(forward(params, X), y))
+        print(f"step {step}: loss {loss}")
 ```
 
 Already have PyTorch code? Convert it:
@@ -74,7 +95,7 @@ apsi run train.apsi
 
 See [From Python and PyTorch](PYTHON.md).
 
-## 4. Use and publish libraries
+## 5. Use and publish libraries
 
 ```bash
 apsi install physics-units        # newest version from the registry
@@ -95,9 +116,9 @@ apsi publish --token apsi_…
 
 See [Libraries](LIBRARIES.md).
 
-## 5. Where to go next
+## 6. Where to go next
 
 - [Language reference](LANGUAGE.md) — syntax, types, units, modules.
-- [AI and machine learning](AI.md) and [layers](LAYERS.md).
-- [Everything on one page](REFERENCE.md) and [maximum performance](BEST-PERFORMANCE.md).
-- [Versions](VERSIONS.md): what 2.0.0 adds.
+- [AI and machine learning](AI.md) and [Reinforcement learning](RL.md).
+- [Science, physics and medicine](SCIENCE.md).
+- [Troubleshooting](TROUBLESHOOTING.md) if something does not work.

@@ -83,7 +83,10 @@ async function boot() {
   setStatus("Loading numpy…");
   await py.loadPackage("numpy");
   py.FS.mkdirTree("/apsi_pkg/apsi");
-  for (const [path, src] of Object.entries(window.APSI_BUNDLE.files)) py.FS.writeFile("/apsi_pkg/" + path, src);
+  for (const [path, src] of Object.entries(window.APSI_BUNDLE.files)) {
+    py.FS.mkdirTree("/apsi_pkg/" + path.slice(0, path.lastIndexOf("/")));   // subpackages (apsi/native)
+    py.FS.writeFile("/apsi_pkg/" + path, src);
+  }
   py.runPython("import sys; sys.path.insert(0, '/apsi_pkg'); import apsi.playground");
   runner = py.globals.get("apsi").playground.run;
   setStatus(`Ready (${((performance.now() - t0) / 1000).toFixed(1)} s) · Apsi ${py.runPython("import apsi; apsi.__version__")}`);

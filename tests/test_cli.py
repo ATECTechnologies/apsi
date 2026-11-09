@@ -215,7 +215,7 @@ class Editors(TempDir):
         res = {x["id"]: x for x in json.loads(r.stdout)["results"]}
         for ed in ("vscode", "cursor", "sublime", "vim"):
             self.assertTrue(res[ed]["ok"], res[ed])
-        self.assertTrue(os.path.isfile(os.path.join(home, ".cursor", "extensions", "apsi.apsi-language-1.10.0", "package.json")))
+        self.assertTrue(os.path.isfile(os.path.join(home, ".cursor", "extensions", "apsi.apsi-language-2.0.0", "package.json")))
         self.assertTrue(os.path.isfile(os.path.join(home, vim, "pack", "apsi", "start", "apsi", "syntax", "apsi.vim")))
         with open(os.path.join(home, ".vscode", "extensions", "extensions.json")) as fh:
             self.assertEqual(json.load(fh)[0]["identifier"]["id"], "apsi.apsi-language")
@@ -320,7 +320,7 @@ class Convert(TempDir):
         self.assertIn("converted 2 files", out)
         with open(os.path.join(self.dir, "out", "a.apsi")) as fh:
             a = fh.read()
-        self.assertIn("layers.sequential([layers.linear(2, 3), layers.activation(\"relu\")])", a)
+        self.assertIn("torch.Sequential(torch.Linear(2, 3), torch.ReLU())", a)
         self.assertIn("json_str(", a)
         with open(os.path.join(self.dir, "out", "b.apsi")) as fh:
             self.assertIn('pyimport("requests")', fh.read())

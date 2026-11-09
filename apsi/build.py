@@ -87,18 +87,22 @@ def collect(entry):
 
 
 def _pycs(zf):
-    """Add the Apsi runtime to the archive as bytecode (no compilation at start-up)."""
+    """Add the Apsi runtime (with its subpackages) to the archive as bytecode (no compilation at start-up)."""
     pkg = os.path.dirname(os.path.abspath(__file__))
     tmp = tempfile.mkdtemp(prefix="apsi-build-")
     try:
-        for name in sorted(os.listdir(pkg)):
-            if name.endswith(".py"):
-                out = os.path.join(tmp, name + "c")
-                py_compile.compile(os.path.join(pkg, name), cfile=out, dfile=f"apsi/{name}", doraise=True,
-                                   invalidation_mode=py_compile.PycInvalidationMode.UNCHECKED_HASH)
-                zf.write(out, f"apsi/{name}c")
-            elif name == "MANIFEST.json":
-                zf.write(os.path.join(pkg, name), f"apsi/{name}")
+        for root, dirs, files in os.walk(pkg):
+            dirs[:] = sorted(d for d in dirs if d != "__pycache__")
+            rel = os.path.relpath(root, pkg)
+            arc = "apsi" if rel == "." else "apsi/" + rel.replace(os.sep, "/")
+            for name in sorted(files):
+                if name.endswith(".py"):
+                    out = os.path.join(tmp, (arc + "/" + name).replace("/", "_") + "c")
+                    py_compile.compile(os.path.join(root, name), cfile=out, dfile=f"{arc}/{name}", doraise=True,
+                                       invalidation_mode=py_compile.PycInvalidationMode.UNCHECKED_HASH)
+                    zf.write(out, f"{arc}/{name}c")
+                elif name == "MANIFEST.json" and rel == ".":
+                    zf.write(os.path.join(root, name), f"apsi/{name}")
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
 
@@ -152,6 +156,12 @@ def _needed_python_packages(sources, include):
     names |= set(re.findall(r'pyimport\(\s*"([A-Za-z0-9_\.]+)"', text))
     if re.search(r'backend\s*=\s*"(torch|auto)"|torch_module\(|check_torch\(|to_torch\(', text):
         names.add("torch")
+    if re.search(r'@native\b|@gpu\b|^\s*parallel\s+for\b', text, re.M):   # the native compiler
+        try:
+            import llvmlite  # noqa: F401
+            names.add("llvmlite")
+        except ImportError:
+            pass
     return {n.split(".")[0] for n in names}
 
 

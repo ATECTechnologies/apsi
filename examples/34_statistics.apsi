@@ -1,0 +1,27 @@
+# Statistics for research: a two-group study from data to the numbers a paper reports.
+use stats
+use lab
+
+set_seed(7)
+let control = randn(48) * 12.0 + 120.0
+let treated = randn(45) * 12.0 + 112.0
+
+let d = describe(treated)
+print("treated:", format_measurement(d.mean, d.sem, "mmHg"), " n =", d.n)
+
+let t = ttest_ind(treated, control)
+print("Welch t =", sigfig(t.statistic, 4), " df =", sigfig(t.df, 4), " p =", sigfig(t.p, 3))
+print("difference 95% CI:", t.ci, " Cohen's d =", sigfig(t.cohen_d, 3))
+print("Mann-Whitney p =", sigfig(mannwhitneyu(treated, control).p, 3))
+print("n per group for 80% power at d = 0.5:", sample_size_ttest(0.5).n)
+
+# regression with confidence intervals
+let age = rand(93) * 40.0 + 30.0
+let group = concat([ones(45), zeros(48)])
+let bp = concat([treated, control]) + 0.3 * (age - 50.0)
+let fit = ols(stack([group, age], axis=1), bp, names=["treated", "age"])
+print("effect of treatment:", sigfig(fit.coef.treated, 4), " p =", sigfig(fit.p[1], 3), " R² =", sigfig(fit.r2, 3))
+
+# several outcomes: control the false discovery rate
+print("BH-adjusted:", adjust_pvalues([0.001, 0.02, 0.04, 0.3, 0.012], "bh"))
+print(table_markdown([record(test="Welch t", p=sigfig(t.p, 3)), record(test="OLS treated", p=sigfig(fit.p[1], 3))]))

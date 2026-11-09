@@ -65,8 +65,7 @@ def build_wheel():
     sys.path.insert(0, ROOT)
     from apsi.security import write_manifest
     write_manifest()
-    import tempfile
-    out = os.path.join(tempfile.gettempdir(), "apsi-payload-wheel")      # outside the source folder
+    out = os.path.join(ROOT, "build", "wheel")
     shutil.rmtree(out, ignore_errors=True)
     # standard library only: no setuptools, no network, and no build/ or *.egg-info left in the source folder
     sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -130,11 +129,11 @@ def main():
             if f.startswith("libpython3"):
                 os.remove(os.path.join(rt, "python", "lib", f))
         strip_binaries(rt)
-    log("installing numpy + apsi into the runtime")
+    log("installing numpy + llvmlite (native compiler) + apsi into the runtime")
     subprocess.check_call([sys.executable, "-m", "pip", "install", "--quiet", "--no-compile", "--upgrade",
                            "--target", os.path.join(rt, site), "--platform", pip_platform,
                            "--python-version", "3.12", "--implementation", "cp", "--only-binary=:all:",
-                           "numpy>=1.26", whl] + (["pyreadline3>=3.4"] if a.platform == "windows" else []))
+                           "numpy>=1.26", "llvmlite>=0.44", whl] + (["pyreadline3>=3.4"] if a.platform == "windows" else []))
 
     for d in ("examples", "docs"):
         shutil.copytree(os.path.join(ROOT, d), os.path.join(out, d),

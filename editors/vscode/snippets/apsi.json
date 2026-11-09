@@ -163,5 +163,32 @@
     "body": [
       "print(f\"${1:x} = {${2:x}}\")$0"
     ]
+  },
+  "Native function": {
+    "prefix": "native",
+    "body": [
+      "@native",
+      "fn ${1:name}(${2:x}: ${3:Float}) -> ${4:Float}:",
+      "\t$0"
+    ],
+    "description": "A function compiled to machine code (LLVM); falls back to the bytecode engine if needed"
+  },
+  "Parallel for": {
+    "prefix": "pfor",
+    "body": [
+      "parallel for ${1:i} in ${2:0}..${3:n}:",
+      "\t$0"
+    ],
+    "description": "Run the iterations on all CPU cores (inside @native) or GPU threads (inside @gpu)"
+  },
+  "GPU function": {
+    "prefix": "gpu",
+    "body": [
+      "@gpu",
+      "fn ${1:kernel}(${2:x}, ${3:y}):",
+      "\tparallel for i in 0..len(${2:x}):",
+      "\t\t${3:y}[i] = $0"
+    ],
+    "description": "Run a parallel for on the NVIDIA GPU(s); all CPU cores when there is none"
   }
 }

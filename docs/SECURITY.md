@@ -121,6 +121,11 @@ not count.
 - `cload` refuses libraries in world-writable folders, in the temporary folder, and (unless
   pinned) in Downloads. Pins come from `--allow-ffi=name@sha256` or from `ffi_pins` in the
   config. A pinned library with a different hash is refused.
+- **`@native` and `@gpu` code needs no permission and gains none.** The native compiler only accepts computation:
+  numbers, tensors passed in, other Apsi functions and `print`. It cannot open files, use the network, run
+  programs or call Python or C libraries, so machine code produced from a program can do nothing the program could
+  not already do. Index, overflow and division checks are on by default (`@native("fast")` removes them for code
+  you trust; out-of-range accesses are then undefined, as in C).
 
 ## 7. Packages
 
@@ -162,6 +167,10 @@ versions with SHA-256 hashes, and `apsi pkg install -r apsi.lock` then requires 
   per-user key `~/.apsi/cache.key` (HMAC-SHA256) and verified before it is read; an entry that was modified or copied
   from another computer is deleted without being unpickled. `APSI_NO_CACHE=1` turns the cache off,
   `apsi compile --clear` empties it.
+- **The machine-code cache** (`~/.apsi/cache/native`) holds object code produced by the native compiler. Every entry is
+  signed with the same per-user key and verified before it is loaded; a modified or foreign entry is deleted and the
+  code is compiled again. The key includes the IR, the CPU model and features, and the LLVM and Apsi versions.
+  `APSI_NO_CACHE=1` turns it off; `apsi native clear-cache` empties it.
 - **The PyTorch backend** (`fit(…, backend="torch")`, `torch_module`, `check_torch`) runs PyTorch, which is Python
   code outside Apsi's sandbox, so it needs the `python` permission like `pyimport`; `backend="auto"` stays on NumPy
   without it.
@@ -169,4 +178,4 @@ versions with SHA-256 hashes, and `apsi pkg install -r apsi.lock` then requires 
 ## Reporting a vulnerability
 
 Do not open a public issue. Send the details and a proof of concept to the maintainers'
-security address on the official site. Fixes are released as `1.10.x` patch versions.
+security address on the official site. Fixes are released as `2.0.x` patch versions.

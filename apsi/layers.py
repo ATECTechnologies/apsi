@@ -34,7 +34,7 @@ from . import ops
 from . import autodiff as ad
 from .autodiff import Node
 from .errors import RuntimeErr, ShapeError
-from .values import Record, tree_leaves
+from .values import Record, tree_leaves, tree_map
 
 
 # =============================================================== graph ops (differentiable)
@@ -504,7 +504,7 @@ def _elu(x):
 
 
 ACTIVATIONS = {
-    "relu": ops.relu, "gelu": ops.gelu, "tanh": ops.tanh, "sigmoid": ops.sigmoid,
+    "relu": ops.relu, "gelu": ops.gelu, "gelu_exact": ops.gelu_exact, "tanh": ops.tanh, "sigmoid": ops.sigmoid,
     "softplus": lambda x: ops.log(1 + ops.exp(x)), "silu": lambda x: x * ops.sigmoid(x),
     "swish": lambda x: x * ops.sigmoid(x), "leaky_relu": _leaky, "elu": _elu,
     "mish": lambda x: x * ops.tanh(ops.log(1 + ops.exp(x))), "linear": lambda x: x, "identity": lambda x: x,
@@ -903,6 +903,153 @@ def activation(fn):
     return Activation(fn)
 
 
+class CustomLayer(Layer):
+    """A layer defined by two Apsi functions: init(seed) -> parameters and forward(p, x..., train) -> output.
+    `parts` names the sub-layers (a record of layers or lists of layers) so summaries and weight import can see
+    inside. Models converted from PyTorch (`apsi convert`) are custom layers."""
+    kind = "custom"
+
+    def __init__(self, init_fn, forward_fn, name="model", parts=None):
+        self.init_fn, self.forward_fn, self.name = init_fn, forward_fn, str(name)
+        self.parts = parts
+        self.training = True                  # like a PyTorch module: train() / eval() switch the mode
+
+    def init(self, seed=0):
+        return self.init_fn(seed=0 if seed is None else int(seed))
+
+    def __call__(self, params, *xs, train=None, **kw):
+        return self.forward_fn(params, *xs, train=self.training if train is None else bool(train), **kw)
+
+    def train(self, mode=True):
+        self.training = bool(mode)
+        for c in self.children():
+            if hasattr(c, "train") and callable(c.train):
+                c.train(mode)
+        return self
+
+    def eval(self):
+        return self.train(False)
+
+    def apply(self, params, x, train=False, **ctx):
+        return self.forward_fn(params, x, train=train)
+
+    def children(self):
+        if self.parts is None:
+            return []
+        out = []
+        for v in (self.parts.fields.values() if isinstance(self.parts, Record) else self.parts):
+            out.extend(v if isinstance(v, list) else [v])
+        return [c for c in out if hasattr(c, "init") and callable(getattr(c, "init"))]
+
+    def describe(self):
+        return self.name
+
+
+class Checkpoint(Layer):
+    """Wraps a layer so that its activations are recomputed in the backward pass instead of stored."""
+    kind = "checkpoint"
+
+    def __init__(self, inner):
+        self.inner = _as_layer(inner)
+
+    def init(self, seed=0):
+        return self.inner.init(seed)
+
+    def apply(self, params, x, train=False, **ctx):
+        from .torch_compat import checkpoint_layer
+        return checkpoint_layer(self.inner, params, x, train=train, **ctx)
+
+    def children(self):
+        return [self.inner]
+
+    def describe(self):
+        return f"checkpoint({self.inner.describe()})"
+
+
+def checkpoint(layer):
+    """Gradient checkpointing: checkpoint(layer) gives the same results with much less activation memory."""
+    return Checkpoint(layer)
+
+
+def custom_layer(init, forward, name="model", parts=None):
+    """A layer from your own functions: init(seed) returns the parameter tree, forward(p, x, train) the output."""
+    return CustomLayer(init, forward, name, parts)
+
+
+def _np_of(t):
+    if hasattr(t, "detach"):
+        t = t.detach().cpu().numpy()
+    return np.asarray(ops.raw(t), dtype=np.float64)
+
+
+def load_torch_weights(model, params, state, prefix=""):
+    """Copy a PyTorch state_dict (or a flat record/dict of arrays with the same names, e.g. from
+    load_safetensors(path, nested=false)) into an Apsi parameter tree of the same architecture.
+    Linear weights are transposed, LSTM/GRU gate weights fused, embeddings and norms renamed. Returns the new
+    parameter tree; raises a clear error naming any missing or mis-shaped tensor."""
+    st = dict(state.fields) if isinstance(state, Record) else dict(state)
+    st = {k.replace("__", "."): v for k, v in st.items()} if not any("." in k for k in st) else st
+    used = set()
+
+    def get(name, shape=None):
+        if name not in st:
+            raise RuntimeErr(f"load_torch_weights: '{name}' is not in the state_dict "
+                             f"(it has {', '.join(sorted(st)[:8])}{' …' if len(st) > 8 else ''})")
+        used.add(name)
+        a = _np_of(st[name])
+        if shape is not None and tuple(a.shape) != tuple(shape):
+            raise ShapeError(f"load_torch_weights: '{name}' has shape {tuple(a.shape)}, the Apsi layer expects "
+                             f"{tuple(shape)}")
+        return a
+
+    def leaf(layer, p, pre):
+        k = layer.kind
+        if isinstance(layer, CustomLayer):
+            out = {}
+            for name, sub in (layer.parts.fields.items() if isinstance(layer.parts, Record) else []):
+                if isinstance(sub, list):
+                    out[name] = [leaf(l, pp, f"{pre}{name}.{i}.") if isinstance(l, Layer) else pp
+                                 for i, (l, pp) in enumerate(zip(sub, p[name]))]
+                elif isinstance(sub, Layer):
+                    out[name] = leaf(sub, p[name], f"{pre}{name}.")
+            for name in p.fields:                              # nn.Parameter / buffers of this module
+                if name not in out:
+                    full = f"{pre}{name}"
+                    out[name] = get(full, np.shape(ops.raw(p[name]))) if full in st else p[name]
+            return Record(**out)
+        if isinstance(layer, Sequential):
+            return [leaf(l, pp, f"{pre}{i}.") for i, (l, pp) in enumerate(zip(layer.layers, p))]
+        if k == "linear":
+            W = get(pre + "weight", (layer.n_out, layer.n_in)).T
+            return Record(W=W, b=get(pre + "bias", (layer.n_out,))) if layer.bias else Record(W=W)
+        if k == "conv2d":
+            W = get(pre + "weight", (layer.c_out, layer.c_in, layer.k, layer.k))
+            return Record(W=W, b=get(pre + "bias", (layer.c_out,))) if "b" in p.fields else Record(W=W)
+        if k == "embedding":
+            return Record(E=get(pre + "weight", (layer.vocab, layer.d)))
+        if k in ("layer_norm", "batch_norm"):
+            return Record(gamma=get(pre + "weight", (layer.d,)), beta=get(pre + "bias", (layer.d,)))
+        if k == "rms_norm":
+            return Record(gamma=get(pre + "weight", (layer.d,)))
+        if k in ("lstm", "gru"):
+            H = layer.n_hidden
+            g = 4 if k == "lstm" else 3
+            wi = get(pre + "weight_ih_l0", (g * H, layer.n_in))
+            wh = get(pre + "weight_hh_l0", (g * H, H))
+            bi = get(pre + "bias_ih_l0", (g * H,))
+            bh = get(pre + "bias_hh_l0", (g * H,))
+            if k == "gru":
+                raise RuntimeErr("load_torch_weights: GRU weights use a different gate layout; train the GRU in "
+                                 "Apsi or keep it in PyTorch")
+            return Record(W=np.concatenate([wi.T, wh.T], axis=0), b=bi + bh)
+        if count_params(p) == 0:
+            return p
+        raise RuntimeErr(f"load_torch_weights: layer kind '{k}' at '{pre or 'model'}' has no PyTorch mapping yet")
+
+    out = leaf(model, params, str(prefix))
+    return out
+
+
 def sequential(layers):
     return Sequential(layers)
 
@@ -1145,6 +1292,13 @@ def fit(model, params, X, y=None, loss="mse", opt=None, epochs=10, batch_size=No
         return lf(out, yb)
     vg = value_and_grad(objective)
     Xr, Yr = X, target
+    low = str(precision).lower() in ("fp32", "float32", "f32", "tf32")
+    if low:                                   # half the memory of float64 for weights, data and activations
+        def _f32(t):
+            return tree_map(lambda a: a.astype(np.float32) if isinstance(a, np.ndarray) and a.dtype.kind == "f"
+                            else a, t)
+        params, Xr = _f32(params), _f32(Xr)
+        Yr = _f32(Yr) if np.asarray(ops.raw(Yr)).dtype.kind == "f" else Yr
     n = _rows(Xr)
     full = graph is not None or not batch_size
     rng = np.random.default_rng(int(seed))
@@ -1166,6 +1320,8 @@ def fit(model, params, X, y=None, loss="mse", opt=None, epochs=10, batch_size=No
             if clip:
                 g = clip_grad_norm(g, clip)
             params = opt.step(params, g)
+            if low:
+                params = _f32(params)
             total += float(ops.raw(l)) * (1 if b is None else len(b))
             step += 1
         history.append(total / (1 if full else n))
@@ -1303,7 +1459,7 @@ def module(interp=None):
         gcn=GCN, sage=SAGE, gat=GAT, gin=GIN, graph_pool=GraphPool,
         # composition
         sequential=sequential, residual=residual, parallel=parallel, dag=dag, add=add, multiply=multiply,
-        concatenate=concatenate,
+        concatenate=concatenate, custom_layer=custom_layer, checkpoint=checkpoint, load_torch_weights=load_torch_weights,
         # model zoo
         mlp=mlp, resnet_mlp=resnet_mlp, cnn=cnn, lstm_classifier=lstm_classifier, transformer_lm=transformer_lm,
         transformer_classifier=transformer_classifier, autoencoder=autoencoder, vae=vae, vae_loss=vae_loss,

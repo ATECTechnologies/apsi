@@ -31,7 +31,7 @@ def _wrap_leaf(x):
     if isinstance(x, (int, float, Fraction, np.floating, np.integer)):
         return Node(float(x))
     if isinstance(x, np.ndarray) and x.dtype.kind in "fiu":
-        return Node(x.astype(float))
+        return Node(x if x.dtype.kind == "f" else x.astype(float))    # float32 stays float32 (half the memory)
     return x
 
 
@@ -473,6 +473,65 @@ def cross_entropy(logits, labels):
     return -ops.mean(picked)
 
 
+def l1_loss(pred, target):
+    """Mean absolute error."""
+    return ops.mean(ops.abs_(pred - target))
+
+
+def bce_with_logits(logits, target):
+    """Binary cross-entropy on logits (numerically stable): mean(softplus(z) − y·z)."""
+    return ops.mean(ops.softplus(logits) - target * logits)
+
+
+def bce(prob, target):
+    """Binary cross-entropy on probabilities (clamped like PyTorch: log ≥ −100)."""
+    with np.errstate(divide="ignore"):
+        lp = ops.log(prob)
+        lq = ops.log(1.0 - prob)
+    lp = ops.where(np.asarray(ops.raw(lp)) > -100.0, lp, -100.0)
+    lq = ops.where(np.asarray(ops.raw(lq)) > -100.0, lq, -100.0)
+    return -ops.mean(target * lp + (1.0 - target) * lq)
+
+
+def nll_loss(log_probs, labels):
+    """Negative log-likelihood of integer labels given log-probabilities [N, C]."""
+    labels = np.asarray(ops.raw(labels)).astype(int)
+    n = labels.shape[0]
+    return -ops.mean(log_probs[(np.arange(n), labels)])
+
+
+def huber_loss(pred, target, delta=1.0):
+    """Huber / smooth-L1 loss (mean), quadratic below delta and linear above."""
+    d = pred - target
+    a = np.abs(np.asarray(ops.raw(d)))
+    quad = 0.5 * d * d
+    lin = delta * (ops.abs_(d) - 0.5 * delta)
+    return ops.mean(ops.where(a <= delta, quad, lin))
+
+
+class Loader:
+    """Mini-batches of (X, y), reshuffled every time it is iterated (one pass = one epoch)."""
+
+    def __init__(self, X, y, batch_size, shuffle=False, seed=None):
+        self.X, self.y, self.size, self.shuffle = X, y, int(batch_size), bool(shuffle)
+        self.n = np.shape(ops.raw(X))[0]
+        self.rng = ops._rng(seed)
+
+    def __iter__(self):
+        idx = self.rng.permutation(self.n) if self.shuffle else np.arange(self.n)
+        for i in range(0, self.n, self.size):
+            j = idx[i:i + self.size]
+            yield (self.X[j], self.y[j])
+
+    def __len__(self):
+        return -(-self.n // self.size)
+
+
+def loader(X, y, batch_size=32, shuffle=False, seed=None):
+    """Iterable mini-batches (like a PyTorch DataLoader over a TensorDataset); reshuffled every epoch."""
+    return Loader(X, y, batch_size, shuffle, seed)
+
+
 def accuracy(logits, labels):
     pred = np.argmax(np.asarray(ops.raw(logits)), axis=-1)
     return float(np.mean(pred == np.asarray(ops.raw(labels))))
@@ -498,6 +557,12 @@ class SGD:
         return tree_map(lambda p, g: p - self.lr * g, params, grads)
 
 
+def _float_arr(g):
+    """Gradient as a float array, keeping float32 when training in float32 (half the optimizer memory)."""
+    a = np.asarray(ops.raw(g))
+    return a if a.dtype.kind == "f" else a.astype(float)
+
+
 class Adam:
     def __init__(self, lr=1e-3, b1=0.9, b2=0.999, eps=1e-8):
         self.lr, self.b1, self.b2, self.eps = lr, b1, b2, eps
@@ -505,7 +570,7 @@ class Adam:
         self.t = 0
 
     def step(self, params, grads):
-        g_raw = tree_map(lambda g: np.asarray(ops.raw(g), dtype=float), grads)
+        g_raw = tree_map(_float_arr, grads)
         if self.m is None:
             self.m = tree_map(np.zeros_like, g_raw)
             self.v = tree_map(np.zeros_like, g_raw)
@@ -922,12 +987,79 @@ CONSTANTS = {
 }
 
 
+# =============================================================== native tier
+def _native(*args, **kwargs):
+    """@native / @native("fast") / @native("strict"): compile a function to machine code."""
+    from .native import native
+    return native(*args, **kwargs)
+
+
+def _native_threads(n=None):
+    """Number of CPU threads `parallel for` and large tensor kernels use (set it with an argument)."""
+    from . import native as nat
+    return nat.threads() if n is None else nat.set_threads(int(n))
+
+
+def _gpu(*args, **kwargs):
+    """@gpu: run a function's parallel for on the NVIDIA GPU(s); all CPU cores when there is none."""
+    from .native.gpu import gpu
+    return gpu(*args, **kwargs)
+
+
+def _gpu_info():
+    """The GPUs Apsi can use (needs the NVIDIA driver; no CUDA toolkit)."""
+    from .native.gpu import info
+    from .values import Record
+    i = info()
+    i["devices"] = [Record(**d) for d in i["devices"]]
+    i.pop("skipped", None)
+    return Record(**i)
+
+
+def _native_info():
+    """What the native compiler sees on this machine (CPU, SIMD, threads, cache)."""
+    from . import native as nat
+    from .values import Record
+    return Record(**nat.info())
+
+
 # =============================================================== registry
+def _bitop(op):
+    import operator as _o
+    f = {"or": _o.or_, "and": _o.and_, "xor": _o.xor, "shl": _o.lshift, "shr": _o.rshift}[op]
+    lf = {"or": np.logical_or, "and": np.logical_and, "xor": np.logical_xor}.get(op)
+
+    def g(a, b):
+        """Bitwise / set operator: ints bit by bit, sets union (or) / intersection (and) / symmetric difference
+        (xor), dicts merged (or), booleans and boolean tensors element by element."""
+        if isinstance(a, np.ndarray) or isinstance(b, np.ndarray):
+            if lf is not None and (getattr(a, "dtype", None) == bool or getattr(b, "dtype", None) == bool):
+                return lf(a, b)
+            return f(np.asarray(a), np.asarray(b))
+        if isinstance(a, (set, frozenset)) and isinstance(b, (list, tuple)):
+            b = set(b)
+        return f(a, b)
+    g.__name__ = "b" + op
+    return g
+
+
+def _bnot(a):
+    """Bitwise not of an integer (~a), or element-wise not of a boolean tensor."""
+    if isinstance(a, np.ndarray) and a.dtype == bool:
+        return np.logical_not(a)
+    return ~a
+
+
 def core_builtins():
     return {
+        "chain_lists": lambda xss: [x for xs in xss for x in xs],
+        "bor": _bitop("or"), "band": _bitop("and"), "bxor": _bitop("xor"), "shl": _bitop("shl"),
+        "shr": _bitop("shr"), "bnot": _bnot, "set": set, "frozenset": frozenset,
         # io & conversion
         "print": _print, "str": _str, "int": _int, "float": _float, "bool": bool,
         "len": _len, "range": _range, "type": type_name, "error": _error,
+        "native": _native, "native_threads": _native_threads, "native_info": _native_info,
+        "gpu": _gpu, "gpu_info": _gpu_info,
         "list": _list, "pmap": _pmap, "unique": _unique, "chars": _chars, "join": _join, "map": _map, "filter": _filter, "enumerate": _enumerate, "zip": _zip,
         "sorted": _sorted, "reversed": _reversed, "keys": _keys, "record": _record,
         **_python_compat(),
@@ -943,6 +1075,8 @@ def core_builtins():
         "asin": ops.asin, "acos": ops.acos, "atan": ops.atan, "atan2": ops.atan2,
         "sinh": ops.sinh, "cosh": ops.cosh, "tanh": ops.tanh, "floor": ops.floor,
         "ceil": ops.ceil, "round": ops.round_, "min": ops.min_, "max": ops.max_,
+        "swapaxes": ops.swapaxes, "permute": ops.permute, "unsqueeze": ops.unsqueeze, "squeeze": ops.squeeze,
+        "erf": ops.erf,
         "sum": ops.sum_, "mean": ops.mean, "std": ops.std, "var": ops.var, "prod": ops.prod,
         "cumsum": ops.cumsum, "argmax": ops.argmax, "argmin": ops.argmin, "approx": ops.approx,
         "pi": math.pi, "tau": math.tau, "e": math.e, "inf": math.inf, "nan": math.nan,
@@ -976,7 +1110,8 @@ def modules(core):
     fields = {"laplacian": ops.laplacian, "gradient": ops.gradient, "meshgrid": ops.meshgrid}
     nn = {"dense": dense, "mlp_init": mlp_init, "mse": mse, "cross_entropy": cross_entropy,
           "accuracy": accuracy, "one_hot": one_hot, "sgd": sgd, "adam": adam,
-          "spiral_data": spiral_data, "batches": batches,
+          "spiral_data": spiral_data, "batches": batches, "loader": loader, "l1_loss": l1_loss,
+          "bce_with_logits": bce_with_logits, "bce": bce, "nll_loss": nll_loss, "huber_loss": huber_loss,
           "conv2d": conv2d, "max_pool2d": max_pool2d, "conv_init": conv_init,
           "layer_norm": layer_norm, "norm_init": norm_init, "dropout": dropout,
           "embedding_init": embedding_init, "causal_mask": causal_mask, "attention": attention,

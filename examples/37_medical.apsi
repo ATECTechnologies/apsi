@@ -1,0 +1,26 @@
+# Medical research computing (for research and education; not a medical device).
+use medical
+
+# pharmacokinetics: an oral dose every 12 h, then non-compartmental analysis of one profile
+let t = tensor([0.0, 0.5, 1.0, 2.0, 3.0, 4.0, 6.0, 8.0, 12.0, 16.0, 24.0])
+let c = pk_one_compartment(500, 40, t, CL=5.0, route="oral", ka=1.1)
+let r = nca(t, c, dose=500)
+print("Cmax", r.cmax, "mg/L at", r.tmax, "h;  t½", r.t_half, "h;  AUCinf", r.auc_inf, ";  CL/F", r.cl, "L/h")
+
+# survival: Kaplan-Meier, log-rank and Cox regression
+let time = tensor([5.0, 8.0, 12.0, 12.0, 15.0, 20.0, 26.0, 33.0, 9.0, 14.0, 22.0, 25.0, 30.0, 31.0, 35.0, 40.0])
+let event = tensor([1, 0, 1, 1, 1, 0, 1, 1, 0, 1, 1, 1, 0, 1, 1, 0])
+let arm = tensor([0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 1, 1])
+print("median survival:", kaplan_meier(time, event).median)
+print("log-rank p:", logrank(time, event, arm).p)
+let cox = cox_ph(time, event, arm, names=["treatment"])
+print("hazard ratio:", cox.hazard_ratio, " 95% CI:", cox.hr_ci)
+
+# a diagnostic test against the reference standard
+let dx = diagnostic_metrics(90, 20, 10, 180)
+print("sensitivity", dx.sensitivity, dx.sensitivity_ci, " specificity", dx.specificity, " LR+", dx.lr_positive)
+print("AUC:", roc(tensor([0.1, 0.4, 0.35, 0.8, 0.7, 0.2, 0.9, 0.3]), tensor([0, 0, 1, 1, 1, 0, 1, 0])).auc)
+
+# clinical formulas
+print("eGFR (CKD-EPI 2021):", egfr_ckd_epi_2021(1.1, 55, "male"), " BSA:", bsa(72kg, 178cm), "m²")
+print(DISCLAIMER)

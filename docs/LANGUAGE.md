@@ -1,6 +1,6 @@
 # The Apsi Language Reference
 
-Version 1.10 · source files use the extension `.apsi` and the UTF-8 encoding.
+Version 2.0 · source files use the extension `.apsi` and the UTF-8 encoding.
 
 This document is the complete reference for Apsi: how programs are written, what every construct means, every
 built-in function and module, the interactive REPL and the `apsi` command line. Read it from the top to learn the
@@ -131,8 +131,9 @@ let var fn return if elif else while for in break continue struct
 true false none and or not use import assert evolve as pass
 ```
 
-Contextual (special only in one place, ordinary names elsewhere): `test` (starts a test block),
-`over step using tol record every into` (inside `evolve`).
+Contextual (special only in one place, ordinary names elsewhere): `try`, `except`, `finally`, `raise`, `yield`
+(statements, section 7.2–7.3), `test` (starts a test block),
+`parallel` (only directly before `for`), `over step using tol record every into` (inside `evolve`).
 
 ### 3.5 Numbers
 
@@ -351,6 +352,100 @@ assert total > 0, "total must be positive"
 - `return` leaves a function (chapter 8). `return` outside a function is an error.
 - `error("message")` raises a `RuntimeError` with your message; `exit(code)` stops the program.
 
+### 7.2 Errors: `try` / `except` / `else` / `finally` and `raise`
+
+```apsi
+fn parse_speed(text):
+    try:
+        return float(text) * 1[m/s]
+    except ValueError as e:               # e.kind, e.message, e.line; str(e) is the message
+        print(f"not a number: {e.message}")
+        return none
+
+try:
+    let cfg = load_json("config.json")
+except FileNotFoundError, PermissionError:   # several kinds; (A, B) works too
+    print("using defaults")
+except as e:                                 # every other error (also: except Error as e)
+    print("unexpected:", e.kind)
+    raise                                    # hand the same error on
+else:
+    print("config loaded")                   # only when nothing failed
+finally:
+    print("always runs")
+
+raise ValueError("speed must be positive")   # the familiar Python kinds are built in
+raise "something went wrong"                 # a RuntimeError with this message
+```
+
+Kinds use Python's names, so converted code keeps its exact behaviour: `ValueError`, `TypeError`, `KeyError`,
+`IndexError`, `ZeroDivisionError`, `ArithmeticError`, `LookupError`, `AttributeError`, `NameError`,
+`RuntimeError`, `NotImplementedError`, `AssertionError`, `StopIteration`, `OSError`, `FileNotFoundError`,
+`PermissionError`, `TimeoutError`, `UnicodeError`, `RecursionError`, `OverflowError`, plus Apsi's `UnitError` and
+`ShapeError`. Errors Apsi raises itself are matched the same way: dividing by zero is a `ZeroDivisionError`, a
+missing dictionary key a `KeyError`, an index outside a list an `IndexError`, a unit mismatch at run time a
+`UnitError` (which is also a `ValueError`). Parent kinds match their children (`except LookupError` catches
+`KeyError` and `IndexError`).
+
+Your own error types are structs: `struct OutOfFuel: message: Str = ""` and `raise OutOfFuel("tank empty")` —
+`except OutOfFuel as e` then reads `e.message` and every other field of the struct.
+
+### 7.3 Generators: `yield`
+
+A function that contains `yield` produces its values one at a time, only when they are asked for — so a sequence
+may be endless:
+
+```apsi
+fn naturals():
+    var n = 0
+    while true:
+        yield n
+        n += 1
+
+fn evens(xs):
+    for x in xs:
+        if x % 2 == 0:
+            yield x
+    yield from [100, 200]                  # hand on every value of another sequence
+
+for n in naturals():
+    if n > 4:
+        break
+    print(n)
+print(list(evens([1, 2, 3, 4])))           # [2, 4, 100, 200]
+```
+
+### 7.4 `for … else` / `while … else` in converted code
+
+Apsi has no loop `else`; `apsi convert` rewrites Python's `for … else` with a flag so the `else` part still runs
+only when the loop finished without `break`.
+
+### 7.1 `parallel for`
+
+```apsi
+@native
+fn total_energy(m, v) -> Float:
+    var e = 0.0
+    parallel for i in 0..len(m):           # iterations run on all CPU cores
+        e += 0.5 * m[i] * v[i] * v[i]
+    return e
+```
+
+`parallel for` promises that the iterations are independent, so they may run at the same time and in any order.
+In a `@native` function the iterations are spread over all CPU cores; in a `@gpu` function each iteration is one
+GPU thread. Everywhere else (the bytecode engine, the REPL) it runs like an ordinary `for`, so the same program
+works on every engine.
+
+- Variables declared inside the loop are private to each iteration.
+- An outer number may only be updated as a **reduction**: `x += …`, `x -= …`, `x *= …`, `x = min(x, …)` or
+  `x = max(x, …)`. Each thread works on its own copy, and the copies are combined in a fixed order, so the result is
+  identical on every machine and for every thread count.
+- Writing to tensor elements is allowed; two iterations must not write the same element.
+- `return`, `break` and `print` are not allowed inside (the native compiler runs such a loop sequentially and says why).
+- The loop must count over a range: `parallel for i in a..b`, `a..=b` or `range(…)`.
+
+`parallel` is a soft keyword: a variable called `parallel` keeps working.
+
 ---
 
 ## 8. Functions
@@ -406,6 +501,25 @@ Shape symbols (`B`, `T`, `D`) are bound to the real sizes at the call. Every arg
 `ShapeError` names the dimension that differs. Inside the function the symbols are ordinary numbers (`sqrt(D)`).
 Writing `[B, T, D]` after the name is optional — symbols used in `Tensor[...]` are declared automatically.
 
+### 8.3b Any number of arguments: `*args` and `**kwargs`
+
+```apsi
+fn total(*xs, **opts):                     # xs is a List, opts a Dict
+    var t = 0
+    for x in xs:
+        t += x
+    return t * opts.get("scale", 1)
+
+print(total(1, 2, 3))                      # 6
+print(total(1, 2, scale=10))               # 30
+let nums = [4, 5]
+let o = {"scale": 2}
+print(total(*nums, **o))                   # spread a list and a dict into a call: 18
+```
+
+`*name` collects the remaining positional arguments, `**name` the remaining keyword arguments; both come after
+the ordinary parameters. Functions with them run on the bytecode engine (`@native` refuses them).
+
 ### 8.4 Decorators
 
 A decorator is any function that takes a function and returns a function; `@name` above `fn` applies it.
@@ -419,6 +533,8 @@ A decorator is any function that takes a function and returns a function; `@name
 | `@timed` | print how long each call takes |
 | `@app.get("/path")` etc. | register a web route (chapter 22, `web`) |
 | `@disk_cache("dir")` | remember results on disk across runs (`use data`) |
+| `@native` | compile the function to machine code (see [`NATIVE.md`](NATIVE.md)); `@native("fast")` drops the safety checks and allows fast-math, `@native("strict")` makes "cannot compile" an error |
+| `@gpu` | run the function's `parallel for` on the NVIDIA GPU(s), or on all CPU cores when there is none ([`NATIVE.md`](NATIVE.md#gpu)) |
 
 ```apsi
 @memo
@@ -451,6 +567,30 @@ print(p)                                         # Particle(pos=…, vel=…, ma
 - Construct with positional or named arguments: `Particle(pos, vel, mass=3kg)`. Field types are checked.
 - Methods are `fn` definitions inside the struct; the first parameter is `self`.
 - Struct names can be used as types in annotations.
+
+### 9.1b Operators on your own structs
+
+Methods with these names make a struct work with operators and built-ins — the same idea as Python's special
+methods (`apsi convert` renames `__add__` → `add`, `__str__` → `to_str`, and so on):
+
+| Method | Used by | | Method | Used by |
+|---|---|---|---|---|
+| `add sub mul div` | `+ - * /` | | `eq lt le gt ge` | `== < <= > >=` (and `sorted`) |
+| `floordiv mod pow matmul` | `// % ** @` | | `neg` | unary `-` |
+| `radd rmul rsub rdiv` | `3 + v` … | | `len get set contains` | `len(v)` `v[i]` `v[i] = x` `x in v` |
+| `iter` | `for x in v` | | `to_str` | `print`, `str()`, f-strings |
+| `call` | `v(...)` | | `hash bool` | dictionary keys, `if v:` |
+
+```apsi
+struct Vec:
+    x: Float
+    y: Float
+    fn add(self, o) = Vec(self.x + o.x, self.y + o.y)
+    fn mul(self, k) = Vec(self.x * k, self.y * k)
+    fn to_str(self) = f"Vec({self.x}, {self.y})"
+
+print(Vec(1.0, 2.0) + Vec(3.0, 4.0) * 2.0)   # Vec(7.0, 10.0)
+```
 
 ### 9.2 Records
 
@@ -662,20 +802,26 @@ let l, gs = value_and_grad(loss, wrt=[0, 1])(w, b)    # gs[0] = ∂l/∂w, gs[1]
 ## 16. Modules and imports
 
 ```apsi
-use nn                       # bring every name of a standard module into scope
-use linalg as la             # or keep them under a short name: la.eigh(H)
+use nn                       # bring every name of a module into scope, and also nn.name
+use linalg as la             # or keep them under a short name only: la.eigh(H)
 use physics.constants        # dotted module names
+use geom_tools               # an installed library (apsi install geom-tools)
 import "mylib.apsi"          # the public names (not starting with _) of another file
 import "lib/geometry.apsi" as geo
 ```
 
-- `use` is for the standard modules listed in chapter 22.
+- `use NAME` brings every public name of the module into scope and, unless that name is already taken, also makes
+  the module itself available as `NAME`, so both `ppo(…)` and `rl.ppo(…)` work after `use rl`.
+- `use` finds the standard modules listed in chapter 22 and installed libraries (`.apsil`, see
+  [Libraries](LIBRARIES.md)). Dashes in a library name become underscores: `geom-tools` → `use geom_tools`.
 - `import` runs another `.apsi` file once (cached) and brings in its public top-level names. The path is relative to
   the importing file. Its `test` blocks do not run on import.
 - Circular imports are reported as errors.
 
-Standard modules: `math`, `physics`, `physics.units`, `physics.constants`, `physics.fields`, `nn`, `layers`, `linalg`,
-`random`, `sci`, `precision`, `data`, `parallel`, `web`, `models`, `gpu`, `sys`, `crypto`, `io`, `ffi`, `python`, `net`.
+Standard modules: `math`, `physics`, `physics.units`, `physics.constants`, `physics.fields`, `physics.formulas`, `nn`,
+`layers`, `torch`, `rl`, `linalg`, `random`, `sci`, `special`, `stats`, `signal`, `mechanics`, `pde`, `quantum`,
+`medical`, `lab`, `precision`, `data`, `parallel`, `scale`, `web`, `models`, `gpu`, `sys`, `crypto`, `io`, `ffi`,
+`python`, `net`.
 
 ---
 
@@ -754,16 +900,23 @@ Full details: [`SECURITY.md`](SECURITY.md).
 
 | Engine | How it works | Use it for |
 |---|---|---|
-| `compile` (default) | the checked program is compiled to Python bytecode: scopes resolved at compile time, specialized type checks, and an **erased twin** of every function used in hot loops | everything — 5–20× faster than the tree-walker |
+| **native** (`@native`, `@gpu`, `apsi run --native`) | each function is specialised on its argument types and units, compiled through LLVM to machine code for the exact CPU (AVX2/AVX-512), cached on disk; `parallel for` uses all cores, `@gpu` the GPUs | numeric code: loops, tensors, physics, simulation — typically 100–3,500× faster than bytecode, on par with C/C++/Rust ([`NATIVE.md`](NATIVE.md)) |
+| `compile` (default for everything else) | the checked program is compiled to Python bytecode: scopes resolved at compile time, specialized type checks, and an **erased twin** of every function used in hot loops | everything; code the native compiler does not handle (strings, lists, records, I/O) |
 | `interp` | the tree-walking reference interpreter that defines the language's meaning | cross-checking the engines; the REPL |
 
-Select with `--engine interp`. Both engines pass the same test suite. Closures created in loops capture each
-iteration's value. Run-time errors always point back to the line and column in the `.apsi` file.
+The engines work together in one program: native functions and bytecode functions call each other freely, and
+`evolve` calls native right-hand sides from its integration loop. A `@native` function that uses something the
+native compiler does not support says why (once) and runs on the bytecode engine, so adding `@native` never breaks
+a program. `apsi native explain app.apsi` lists which functions run as machine code.
 
-Parsed programs are kept in a signed compile cache, so an unchanged file is not parsed again on the next run;
-`apsi build` turns a program into an executable (`.exe`). Both are described under *Executables and the compile
-cache* in chapter 24. Neural networks built with `use layers` can also run on PyTorch (CPU or GPU) — see
-[`BACKENDS.md`](BACKENDS.md).
+Select the reference interpreter with `--engine interp`. The engines pass the same test suite; native results are
+bit-identical to the bytecode engine for scalar arithmetic. Closures created in loops capture each iteration's
+value. Run-time errors always point back to the line and column in the `.apsi` file.
+
+Parsed programs are kept in a signed compile cache, and native machine code in a signed machine-code cache, so an
+unchanged program starts without recompiling; `apsi build` turns a program into an executable (`.exe`). Both are
+described under *Executables and the compile cache* in chapter 24. Neural networks built with `use layers` can also
+run on PyTorch (CPU or GPU) — see [`BACKENDS.md`](BACKENDS.md).
 
 ---
 
@@ -842,6 +995,8 @@ are being differentiated alike. `apsi doc NAME` (or `:doc NAME` in the REPL) pri
 | `arange(start, stop, step=1)` · `linspace(start, stop, n=50)` · `meshgrid(x, y)` | ranges (with units too) |
 | `randn(*shape, seed)` · `rand(*shape, seed)` · `randint(lo, hi, *shape, seed)` · `permutation(n, seed)` · `seed(n)` | random numbers (default seed 0, so runs are reproducible) |
 | `shape(x)` · `ndim(x)` · `reshape(x, *shape)` · `flatten(x)` · `transpose(x, axes)` | shape handling |
+| `swapaxes(x, a, b)` · `permute(x, *axes)` · `unsqueeze(x, axis)` · `squeeze(x, axis)` | axis handling with PyTorch's meaning (negative axes count from the end; all differentiable) |
+| `erf(x)` · `gelu(x, approximate="tanh"\|"none")` | error function (differentiable); GELU with the tanh approximation or exact (PyTorch's default) |
 | `stack(items, axis=0)` · `concat(items, axis=0)` · `roll(x, shift, axis)` · `where(cond, a, b)` · `clip(x, lo, hi)` · `sort(x)` | data manipulation |
 | `dot(a, b)` · `matmul(a, b)` · `outer(a, b)` · `cross(a, b)` · `norm(x, axis)` · `einsum(spec, *xs)` | linear algebra (einsum multiplies units and is differentiable) |
 | `f16 f32 f64 i32 i64` (+ `bf16 fp8 … int4`) | dtypes for `dtype=` and `@precision` |
@@ -885,11 +1040,36 @@ Use with `use NAME` (all names) or `use NAME as short` (`short.name`).
 
 ### `math`
 `abs sqrt cbrt exp log log10 log2 sin cos tan asin acos atan atan2 sinh cosh tanh floor ceil round pi tau e inf nan`
+and from `special`: `gamma lgamma erf erfc erfinv factorial comb beta besselj legendre`
+
+### Science, engineering and medicine
+`special` (special functions), `stats` (distributions, tests, regression, power), `signal` (filters, spectra,
+peaks), `mechanics` (integrators, Lagrangian/Hamiltonian dynamics, N-body, orbits, rigid bodies, beams, trusses),
+`pde` (heat, wave, advection, Poisson, Navier–Stokes, CG, BiCGSTAB), `quantum` (Schrödinger equation, operators,
+qubits), `medical` (pharmacokinetics, epidemiology, diagnostic accuracy, survival analysis, clinical formulas,
+ECG/HRV, DICOM) and `lab` (seeds, provenance, experiment logs, tables). Complete reference:
+[`SCIENCE.md`](SCIENCE.md). `physics` also contains radiation, relativity, optics, electromagnetism,
+thermodynamics and decay formulas with units (listed there).
 
 ### `physics`, `physics.constants`, `physics.fields`, `physics.units`
 - constants (CODATA, with units): `c G h hbar k_B N_A R_gas q_e m_e m_p m_n epsilon_0 mu_0 g0 sigma_SB a_0 alpha_fs M_sun M_earth R_earth AU`
 - fields: `laplacian(u, dx, boundary="periodic"|"fixed")` (∇² in any number of dimensions) · `gradient(u, dx, axis=0)` · `meshgrid(x, y)`
 - `physics` contains both; `physics.units` exists for clarity (units are always available)
+
+### `torch` — the PyTorch API, natively
+Layers (`Linear`, `Conv1d/2d`, pooling, `BatchNorm1d/2d`, `LayerNorm`, `RMSNorm`, `GroupNorm`, `Embedding`, `LSTM`,
+`GRU`, `RNN`, `MultiheadAttention`, `Transformer…`, `Sequential`, activations), the `F.` functions, losses with all
+their options, optimizers (`SGD`, `Adam`, `AdamW`, `Adamax`, `RMSprop`, `Adagrad`, `NAdam`, `RAdam`), every common
+learning-rate scheduler, `DataLoader` / `TensorDataset`, `state_dict` / `load_state_dict`, `value_and_grad_aux`,
+`clip_grad_norm`, `checkpoint` / `checkpoint_layer` and `Module(init, forward)`. Layers use PyTorch's parameter names
+and give the same results as PyTorch. Each layer has `init(seed)` → parameters and is called as
+`layer(params, x)`. Reference: [From Python and PyTorch](PYTHON.md).
+
+### `rl` — reinforcement learning
+Environments (`cartpole`, `gridworld`, `bandit`), `gae`, `discounted_returns`, `ppo`, `dqn`, `reinforce`, `evaluate`,
+preference learning (`dpo_loss`, `ipo_loss`, `preference_loss`, `grpo_advantages`, `kl_penalized_rewards`,
+`ppo_clip_loss`, `sequence_log_prob`) and search (`mcts`, `beam_search`, `best_of_n`). Reference:
+[Reinforcement learning](RL.md).
 
 ### `nn` — neural networks
 
@@ -905,6 +1085,8 @@ Use with `use NAME` (all names) or `use NAME as short` (`short.name`).
 | `lstm_init(n_in, n_hidden)` · `lstm_cell(p, x, h, c)` · `lstm(p, xs)` | LSTM (xs: B×T×F → B×T×H) |
 | `gru_init(n_in, n_hidden)` · `gru_cell(p, x, h)` · `gru(p, xs)` | GRU |
 | `mse(pred, target)` · `cross_entropy(logits, labels)` · `accuracy(logits, labels)` · `one_hot(labels, k)` | losses and metrics |
+| `l1_loss` · `bce_with_logits(logits, y)` · `bce(prob, y)` · `nll_loss(log_probs, labels)` · `huber_loss(pred, target, delta)` | more losses (mean reduction, the same values as PyTorch) |
+| `loader(X, y, batch_size, shuffle, seed)` | mini-batches that are reshuffled every time the loader is iterated (one pass = one epoch) |
 | `sgd(lr, momentum)` · `adam(lr, b1, b2, eps)` · `adamw(…, weight_decay)` · `rmsprop(lr, decay, eps)` · `adagrad(lr, eps)` | optimizers: `params = opt.step(params, grads)` |
 | `set_lr(opt, lr)` · `cosine_lr(step, total, base, warmup, minimum)` · `step_lr(step, base, every, factor)` · `linear_warmup(step, base, warmup)` | learning-rate schedules |
 | `clip_grad_norm(grads, max_norm=1)` · `global_norm(grads)` | gradient clipping |
@@ -920,7 +1102,9 @@ Use with `use NAME` (all names) or `use NAME as short` (`short.name`).
 Layers, composition (`sequential`, `residual`, `parallel`, `dag`), graph neural networks (`graph`, `gcn`, `sage`,
 `gat`, `gin`, `graph_pool`, `segment_sum/mean/max/softmax`), transformers, a model zoo (`mlp`, `resnet_mlp`, `cnn`,
 `lstm_classifier`, `transformer_lm`, `transformer_classifier`, `autoencoder`, `vae`, `gcn_net`, `gat_net`, `gin_net`,
-`siamese`) and training helpers (`fit`, `predict`, `summary`, `count_params`). Every layer has `init(seed)` and is
+`siamese`) and training helpers (`fit`, `predict`, `summary`, `count_params`). `custom_layer(init, forward, name,
+parts)` turns two functions into a layer (models converted from PyTorch use it), and
+`load_torch_weights(model, params, state_dict)` copies PyTorch weights into an Apsi parameter tree. Every layer has `init(seed)` and is
 applied as `layer(params, x, train=false, graph=…)`. More layers: `mean_pool(axis)`, `bilinear`, `scale`, `select`.
 
 Backends: `fit(…, backend="numpy"|"torch"|"auto", device="auto"|"cpu"|"cuda"|"mps"|"xpu",
@@ -985,10 +1169,13 @@ Full guide: [`SERVER.md`](SERVER.md).
 
 ### `models` — model files
 
-`load_safetensors(path, dtype, names, nested)` · `save_safetensors(path, params, metadata)` · `safetensors_info(path)` ·
+`save_model(path, params, metadata, shard, sign)` · `load_model(path, verify, key)` · `model_info(path)` (Apsi
+checkpoints) · `save_gguf(path, params, metadata, dtype, name, architecture)` · `load_gguf(path, nested)` ·
+`gguf_info(path)` · `load_safetensors(path, dtype, names, nested)` · `save_safetensors(path, params, metadata)` ·
+`safetensors_info(path)` ·
 `quantize_model(params, dtype, min_size)` · `dequantize_model(params)` · `model_size(params)` · `qlinear(x, W, b)` ·
 `onnx_model(path, providers)` · `hf_pipeline(task, model, device)` · `torch_load(path)` (the last three need
-`--allow-python`). Guide: [`AI.md`](AI.md).
+`--allow-python`). Guides: [`AI.md`](AI.md), [`MODEL-FILES.md`](MODEL-FILES.md).
 
 ### `gpu` and `sys`
 `device()` · `to_device(x, dev)` · `to_gpu(x)` · `to_cpu(x)` · `gpu_available()` · `gpu_info()` · `hardware()` (CPU,
@@ -1016,23 +1203,33 @@ Group the built-ins of 21.8 and 21.9 so they can be used under a name: `use io a
 Start it with `apsi` (or `apsi repl`). Type Apsi code; the value of an expression is printed, and `_` holds the last value.
 
 ```text
-apsi> let g = 9.81[m/s^2]
-apsi> 0.5 * g * (2s) ** 2
+C:\Users\me apsi> let g = 9.81[m/s^2]
+C:\Users\me apsi> 0.5 * g * (2s) ** 2
 19.62 m
-apsi> fn sq(x) =
-...       x * x
-apsi> cd C:\Users\me\project
-C:\Users\me\project
-apsi> run src\main.apsi
-apsi> :load src\main.apsi
+C:\Users\me apsi> cd C:\Users\me\project
+C:\Users\me\project apsi> ls
+  Folder: C:\Users\me\project
+
+  Modified               Size  Name
+  ----------------  ---------  ----
+  2026-11-08 13:40      <dir>  src\
+  2026-11-08 13:41      412 B  apsi.toml
+
+  1 folder, 1 file (412 B)
+C:\Users\me\project apsi> run src\main.apsi
 ```
+
+The prompt shows the current folder, as a shell does (`~` stands for your home folder on Linux and macOS; long
+paths are shortened in the middle). `APSI_PROMPT=short` shows only `apsi>`.
 
 **Multi-line input** continues automatically after a line ending in `:` (a block — finish it with an empty line),
 inside open brackets or a triple-quoted string, and after a trailing `\`, `=`, `,`, `|>` or operator. `:paste`
 accepts any block until a line containing `:end`.
 
 **Shell words** behave like a terminal when they are not names you defined: `cd PATH` (Windows paths, quotes,
-`~`, `%VAR%`/`$VAR` and `cd -` work), `pwd`, `ls`/`dir [PATH]`, `clear`/`cls`, `run FILE`, `help`, `exit`/`quit`.
+`~`, `%VAR%`/`$VAR` and `cd -` work; the prompt shows the new folder), `pwd`, `ls`/`dir [PATH]` (folders first,
+then files, with modification time, size and a summary; `ls -a` includes hidden files), `clear`/`cls`, `run FILE`,
+`help`, `exit`/`quit`.
 `!COMMAND` runs any operating-system command (`!git status`).
 
 **Commands** (`:help` lists them; most have short aliases):
@@ -1088,7 +1285,7 @@ A mistyped command prints suggestions ("did you mean: test").
 
 | Command | Description |
 |---|---|
-| `apsi run [FILE] [ARGS…]` | check, then run. Without FILE: the project's `main`. `-` reads the program from stdin. Options: `--no-check`, `--time`, `-w/--watch`, `--engine compile\|interp`, security flags |
+| `apsi run [FILE] [ARGS…]` | check, then run. Without FILE: the project's `main`. `-` reads the program from stdin. Options: `--no-check`, `--time`, `-w/--watch`, `--native` (machine code for every function that allows it), `--threads N`, `--engine compile\|interp`, security flags |
 | `apsi eval CODE…` | evaluate code; the value of a final expression is printed. `;` or `\n` separate statements |
 | `apsi repl` | interactive REPL (chapter 23) |
 | `apsi watch [PATHS…] [--do run\|test\|check] [--ext .apsi,.csv] [--interval S] [--no-clear] [-- FLAGS]` | re-run whenever a watched file changes |
@@ -1172,6 +1369,9 @@ fish `apsi completion fish > ~/.config/fish/completions/apsi.fish`; PowerShell
 | `apsi config [--profile sandbox\|strict\|standard\|developer]` | show or set the default profile |
 | `apsi pkg list \| install NAMES \| remove NAMES \| lock \| audit` | optional Python libraries (`gpu onnx torch transformers sci data plot crypto audit`, groups `ai ai-gpu science all`) |
 | `apsi doctor [--json]` | check this machine against Apsi's hardware targets |
+| `apsi plan PARAMS [--active N] [--gpu G] [--gpus N\|--days D]` | plan a large-model training run: layout, memory per GPU, GPU count, days ([`SCALE.md`](SCALE.md)) |
+| `apsi model info\|verify\|convert FILE [OUT] [--dtype T] [--shard S] [--key K]` | inspect, verify and convert model files: GGUF, `.apsim`, safetensors ([`MODEL-FILES.md`](MODEL-FILES.md)) |
+| `apsi native info\|explain\|ir\|asm\|clear-cache` | the native compiler: this machine's CPU/SIMD/threads/GPUs; which functions of a program run as machine code and why not; the LLVM IR or assembly of a function; empty the machine-code cache |
 | `apsi lsp` | language server over stdio (for editors) |
 | `apsi version` | version |
 

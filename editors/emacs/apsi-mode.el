@@ -9,7 +9,7 @@
 
 (defconst apsi--keywords
   '("let" "var" "fn" "return" "if" "elif" "else" "while" "for" "in" "break" "continue" "struct"
-    "and" "or" "not" "use" "import" "assert" "evolve" "as" "pass" "test"
+    "and" "or" "not" "use" "import" "assert" "evolve" "as" "pass" "test" "parallel"
     "over" "step" "using" "tol" "record" "every" "into"))
 
 (defconst apsi--types

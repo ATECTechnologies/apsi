@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>content</key>
+	<string>parallel for ${1:i} in ${2:0}..${3:n}:
+	$0</string>
+	<key>name</key>
+	<string>Run the iterations on all CPU cores (inside @native) or GPU threads (inside @gpu)</string>
+	<key>scope</key>
+	<string>source.apsi</string>
+	<key>tabTrigger</key>
+	<string>pfor</string>
+	<key>uuid</key>
+	<string>830CD3F7-6765-57D1-B6D0-4C28C20B6AA1</string>
+</dict>
+</plist>
