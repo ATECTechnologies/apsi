@@ -131,7 +131,10 @@ let weights = torch_load("checkpoint.pt")                   # pip install torch 
 let hf_weights = load_safetensors("model.safetensors", dtype=int8)   # no extra library needed
 ```
 
-Existing PyTorch/numpy code can be translated with `apsi convert model.py` (see [`PYTHON.md`](PYTHON.md)).
+Existing PyTorch/numpy code can be translated with `apsi convert model.py`: `nn.Module` models, losses,
+optimizers, data loaders and training loops become native Apsi that runs without Python or PyTorch, with the same
+outputs and gradients as PyTorch for the same weights. `load_torch_weights(model, params, state_dict)` imports
+pretrained weights (see [`PYTHON.md`](PYTHON.md#pytorch-programs--native-apsi)).
 Any other Python library: `pyimport("module")`, then `to_torch` / `from_torch` to move tensors back and forth
 (after `use layers`, `torch_module(model, params)` turns a whole Apsi model into a `torch.nn.Module`).
 `apsi pkg install ai` installs ONNX Runtime, PyTorch and Transformers into Apsi's own runtime.
@@ -149,8 +152,25 @@ app.run(port=8080)
 Complete examples: `examples/23_web_api.apsi`, `26_model_serving.apsi` and `27_pretrained_models.apsi`.
 Server security is covered in [`SERVER.md`](SERVER.md).
 
+## 6. Save and share models
+
+`save_model` writes an Apsi checkpoint (`.apsim`): a standard safetensors file that also keeps units, compressed
+tensors and the parameter tree, checks a SHA-256 when loading, can be signed, and splits huge models into shards.
+`save_gguf` writes GGUF for llama.cpp, Ollama and LM Studio, with Q8_0 and Q4_0 bit-identical to ggml.
+`apsi model convert` converts between safetensors, GGUF and `.apsim`. Full reference:
+[`MODEL-FILES.md`](MODEL-FILES.md).
+
+```apsi
+use models
+save_model("ckpt/model.apsim", params, metadata=record(step=step), sign=true)
+let params = load_model("ckpt/model.apsim", key=true)
+save_gguf("model-q8.gguf", params, dtype="q8_0")
+```
+
 ## Model file safety
 
 - `load_safetensors` never runs code from the file (unlike pickle) and checks that every offset stays inside the file
+- `load_model` and `load_gguf` check every header size and offset against the file before mapping it, and
+  `load_model` checks the SHA-256 (and the signature when you give a key)
 - `torch_load` uses `weights_only=True`, so code embedded in a `.pt` file is not executed
 - the on-disk cache is signed with HMAC

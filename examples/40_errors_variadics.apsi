@@ -1,0 +1,56 @@
+# Errors (try / except / else / finally, raise) and functions with *args / **kwargs
+fn safe_div(a, b):
+    try:
+        return a / b
+    except ZeroDivisionError:
+        return none
+    finally:
+        print("finally runs")
+
+fn parse(s):
+    try:
+        return int(s)
+    except ValueError as e:
+        print(f"bad: {e.kind}")
+        return -1
+
+fn total(*xs, **opts):
+    var t = 0
+    for x in xs:
+        t += x
+    return t * opts.get("scale", 1)
+
+fn check(v):
+    if v < 0:
+        raise ValueError("negative value")
+    return v
+
+print(safe_div(1, 2), safe_div(1, 0))
+print(parse("12"), parse("x"))
+print(total(1, 2, 3), total(1, 2, scale=10))
+let nums = [4, 5]
+print(total(*nums), total(*nums, **{"scale": 2}))
+try:
+    check(-1)
+except ValueError, KeyError as e:
+    print("caught", e.message)
+else:
+    print("no")
+try:
+    let d = {"a": 1}
+    print(d["b"])
+except KeyError:
+    print("key error caught")
+try:
+    try:
+        raise "inner"
+    except as e:
+        print("inner", e)
+        raise
+except RuntimeError as e:
+    print("outer got", e.kind, e.message)
+let xs = [1, 2]
+try:
+    print(xs[5])
+except IndexError as e:
+    print("index", e.kind)

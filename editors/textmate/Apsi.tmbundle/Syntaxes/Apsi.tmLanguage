@@ -964,7 +964,7 @@
 					<key>name</key>
 					<string>keyword.control.flow.apsi</string>
 					<key>match</key>
-					<string>\b(if|elif|else|while|for|in|break|continue|return|pass|assert)\b</string>
+					<string>\b(if|elif|else|while|parallel(?=\s+for\b)|for|in|break|continue|return|pass|assert)\b</string>
 				</dict>
 				<dict>
 					<key>name</key>
@@ -1030,7 +1030,7 @@
 			<array>
 				<dict>
 					<key>match</key>
-					<string>\b(any|all|divmod|pow|ord|chr|dict|set|tuple|repr|hex|bin|oct|next|iter|format|callable|getattr|hasattr|fsum|abs|acos|approx|arange|argmax|argmin|args|asin|atan|atan2|bool|cbrt|ceil|chars|clip|cload|clock|concat|cos|cosh|cross|cumsum|dequantize|derivative|dim|dot|einsum|enumerate|error|exact|exists|exit|exp|eye|filter|flatten|float|floor|format_info|from_py|from_torch|full|gelu|getenv|grad|hessian|http_get|http_post_json|input|int|jacobian|join|json_parse|json_str|keys|laplace|len|library_path|linspace|list|load_csv|load_json|log|log10|log2|log_softmax|magnitude|map|matmul|max|mean|measure|memo|meshgrid|min|nbytes|ndim|nominal|norm|ones|ones_like|outer|param_count|permissions|permutation|platform|pmap|precision|print|prod|pyimport|qmatmul|quant_error|quantize|rand|randint|randn|range|read_text|record|relative_uncertainty|relu|reshape|reversed|roll|round|round_to|save_csv|save_json|security_policy|seed|shape|sigma|sigmoid|sin|sinh|softmax|softplus|sort|sorted|sqrt|stack|std|stop_gradient|str|sum|tan|tanh|tensor|testing|timed|to_float|to_py|to_torch|transpose|tree_map|type|unique|unit|value_and_grad|var|where|write_text|zeros|zeros_like|zip)\s*(?=\()</string>
+					<string>\b(native|native_threads|native_info|gpu|gpu_info|any|all|divmod|pow|ord|chr|dict|set|tuple|repr|hex|bin|oct|next|iter|format|callable|getattr|hasattr|fsum|abs|acos|approx|arange|argmax|argmin|args|asin|atan|atan2|bool|cbrt|ceil|chars|clip|cload|clock|concat|cos|cosh|cross|cumsum|dequantize|derivative|dim|dot|einsum|enumerate|error|exact|exists|exit|exp|eye|filter|flatten|float|floor|format_info|from_py|from_torch|full|gelu|getenv|grad|hessian|http_get|http_post_json|input|int|jacobian|join|json_parse|json_str|keys|laplace|len|library_path|linspace|list|load_csv|load_json|log|log10|log2|log_softmax|magnitude|map|matmul|max|mean|measure|memo|meshgrid|min|nbytes|ndim|nominal|norm|ones|ones_like|outer|param_count|permissions|permutation|platform|pmap|precision|print|prod|pyimport|qmatmul|quant_error|quantize|rand|randint|randn|range|read_text|record|relative_uncertainty|relu|reshape|reversed|roll|round|round_to|save_csv|save_json|security_policy|seed|shape|sigma|sigmoid|sin|sinh|softmax|softplus|sort|sorted|sqrt|stack|std|stop_gradient|str|sum|tan|tanh|tensor|testing|timed|to_float|to_py|to_torch|transpose|tree_map|type|unique|unit|value_and_grad|var|where|write_text|zeros|zeros_like|zip)\s*(?=\()</string>
 					<key>captures</key>
 					<dict>
 						<key>1</key>

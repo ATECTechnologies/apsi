@@ -55,7 +55,7 @@ let model = tk.gpt(layers=12, width=768)
 1. The SHA-256 of the downloaded file must match the registry’s record.
 2. The archive must contain exactly the files listed in its manifest, with the listed sizes; paths may not leave the package folder; encrypted entries are refused.
 3. Every file’s SHA-256 must match the manifest.
-4. The library must accept your Apsi version (`apsi = ">=1.10.0"` in its manifest).
+4. The library must accept your Apsi version (`apsi = ">=2.0.0"` in its manifest).
 5. **Apsi Guard** scans the code. Critical findings remove the library again; high findings are shown.
 
 ## Creating a library
@@ -80,7 +80,7 @@ authors = ["Your Name"]
 keywords = ["physics", "orbits"]
 homepage = "https://example.org"
 repository = "https://github.com/you/my-physics"
-apsi = ">=1.10.0"                 # Apsi versions the library works with
+apsi = ">=2.0.0"                 # Apsi versions the library works with
 include = ["src/**", "README*", "LICENSE*", "examples/**", "data/**"]
 exclude = ["data/raw/**"]
 

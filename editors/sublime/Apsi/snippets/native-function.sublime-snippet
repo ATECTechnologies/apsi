@@ -1,0 +1,10 @@
+<snippet>
+  <content><![CDATA[
+@native
+fn ${1:name}(${2:x}: ${3:Float}) -> ${4:Float}:
+	$0
+]]></content>
+  <tabTrigger>native</tabTrigger>
+  <scope>source.apsi</scope>
+  <description>A function compiled to machine code (LLVM); falls back to the bytecode engine if needed</description>
+</snippet>

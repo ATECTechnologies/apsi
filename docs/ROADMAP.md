@@ -20,7 +20,7 @@
 ## ✅ v0.3 — real use on Windows/Linux and complete tooling
 - Windows 10/11 (PowerShell) and Linux installers, BOM/CRLF support, automatic `.dll`/`.so` selection
 - `apsi doctor` checks the Windows build / Linux kernel / CPU / GPU
-- CI on Windows Server 2022/2025 and Ubuntu 22.04/24.04 with Python 3.9–3.13
+- CI on Windows Server 2022/2025 and Ubuntu 22.04/24.04 with Python 3.12–3.14
 - language server + VS Code extension (.vsix), `apsi fmt`
 - web playground (WebAssembly), every example tested in it
 - `use sci` (einsum, FFT, integrate, find_root, minimize, curve_fit)
@@ -44,13 +44,25 @@
 - `sci.solve_ivp`: implicit TR-BDF2 for stiff systems and adaptive RK45
 - `apsi build` → executables (`.exe`, `--standalone` with its own Python); signed compile cache, `apsi compile`
 
+## ✅ 2.0.0 — native code
+- native compiler: checked AST → specialised, typed, unit-erased LLVM IR → machine code for the host CPU
+  (x86-64 AVX2/AVX-512, ARMv8 NEON), signed machine-code cache
+- units erased across native code (checked once, at compile time); bounds checks hoisted; kernel fusion of
+  element-wise tensor expressions and reductions
+- `parallel for` on all cores with deterministic reductions; `@gpu` kernels through NVPTX → PTX and the CUDA driver,
+  multi-GPU row splitting
+- `apsi native info/explain/ir/asm`, `apsi run --native`
+
 ## Phase 2 (continued) — IR compiler and speed
-- **Apsi IR**: lower the checked AST to an SSA IR carrying types, shapes and units
+- **Apsi IR**: lower the checked AST to an SSA IR carrying types, shapes and units (2.0 specialises straight to LLVM IR)
 - erase units across the whole program (not just in `evolve`): check once, run on plain numbers
-- kernel fusion: merge chains of element-wise ops into one loop to cut memory traffic
+- ~~kernel fusion: merge chains of element-wise ops into one loop~~ — done in native code in 2.0; extend to the bytecode engine
 - IR-level (source-to-source) autodiff, so no tape is built at run time
 
-## Phase 3 — native backends (per the hardware targets)
+## Phase 3 — native backends (per the hardware targets) — CPU and first GPU path done in 2.0
+- next: transcendental functions (`exp`, `log`, `sin`, …) in GPU kernels (libdevice-equivalent), device-resident
+  tensors to avoid copies between calls, AMD GPUs through the AMDGPU backend, native `@` matmul with blocking,
+  structs/records and strings in native code, ahead-of-time native code in `apsi build`
 - CPU through LLVM: **x86-64-v3** (AVX2 + FMA, Intel Core i5-7500 / Ryzen and newer) and ARMv8.2 NEON
 - GPU through MLIR → PTX: **sm_75 and newer** (Turing GTX 1660 / RTX 20xx → Ada/Blackwell), Tensor Cores for
   f16/bf16, and native FP8/FP4 on sm_89/sm_90/sm_100 (the formats are already bit-exact but computed through FP32)

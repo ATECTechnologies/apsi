@@ -10,7 +10,7 @@ syn keyword apsiStatement   let var nextgroup=apsiVarName skipwhite
 syn keyword apsiFunction    fn nextgroup=apsiFuncName skipwhite
 syn keyword apsiStructKw    struct nextgroup=apsiStructName skipwhite
 syn keyword apsiConditional if elif else
-syn keyword apsiRepeat      while for in break continue
+syn keyword apsiRepeat      while for in break continue parallel
 syn keyword apsiStatement   return pass assert
 syn keyword apsiInclude     use import as
 syn keyword apsiOperatorKw  and or not

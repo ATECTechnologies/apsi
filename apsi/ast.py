@@ -8,6 +8,8 @@ class AST:
     def __init__(self, *args, line=0, col=0):
         for f, a in zip(self._fields, args):
             setattr(self, f, a)
+        for f in self._fields[len(args):]:          # optional trailing fields default to None
+            setattr(self, f, None)
         self.line, self.col = line, col
 
     def __repr__(self):
@@ -51,7 +53,8 @@ As = _node("As", "expr", "unit")                     # unit: (text, scale, dim)
 # types
 TName = _node("TName", "name", "args")
 TUnit = _node("TUnit", "text", "scale", "dim")
-Param = _node("Param", "name", "type", "default")
+Param = _node("Param", "name", "type", "default", "star")     # star: None | "*" | "**"
+Spread = _node("Spread", "value", "double")       # *xs / **d in a call
 
 # statements
 Let = _node("Let", "targets", "type", "value", "mutable")
@@ -62,7 +65,7 @@ FnDef = _node("FnDef", "name", "shape_params", "params", "ret", "body", "is_expr
 StructDef = _node("StructDef", "name", "fields", "methods")
 If = _node("If", "branches", "else_body")
 While = _node("While", "cond", "body")
-For = _node("For", "targets", "iter", "body")
+For = _node("For", "targets", "iter", "body", "parallel")   # parallel: True for `parallel for`
 Return = _node("Return", "value")
 Break = _node("Break")
 Continue = _node("Continue")
@@ -73,6 +76,9 @@ Test = _node("Test", "name", "body")
 Assert = _node("Assert", "cond", "msg")
 Evolve = _node("Evolve", "states", "tvar", "range", "step", "method", "every", "into", "body", "tol")
 Deriv = _node("Deriv", "name", "expr")
+Try = _node("Try", "body", "handlers", "else_body", "final_body")   # handlers: [(kinds, name, body)]
+Raise = _node("Raise", "value")
+Yield = _node("Yield", "value", "from_")          # `yield x` / `yield from xs`: the function becomes a generator
 Program = _node("Program", "body")
 
 

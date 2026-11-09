@@ -1,0 +1,19 @@
+# Generators: `yield` produces values lazily, so even endless sequences work
+fn naturals():
+    var n = 0
+    while true:
+        yield n
+        n += 1
+
+fn evens(xs):
+    for x in xs:
+        if x % 2 == 0:
+            yield x
+    yield from [100, 200]
+
+var out = []
+for v in naturals():
+    if v > 4:
+        break
+    out.append(v)
+print(out, list(evens([1, 2, 3, 4])))

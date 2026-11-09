@@ -170,11 +170,47 @@ def resolve_library(path, base_dir, must_exist=True):
     return sysname or cands[0]
 
 
+# ------------------------------------------------------------------ pure Python standard modules
+# These modules only compute: they cannot read files, open connections or start programs, so programs may use
+# them without --allow-python. Only their public functions, classes and constants are exposed (no submodules), so
+# nothing reaches os/sys through them. `apsi convert` relies on this to keep collections, heapq, itertools, re …
+PURE_MODULES = {"collections", "heapq", "bisect", "itertools", "functools", "copy", "string", "re", "textwrap",
+                "fractions", "decimal", "datetime", "calendar", "enum", "statistics", "cmath", "math", "random",
+                "json", "typing", "dataclasses", "array", "numbers", "difflib", "unicodedata", "hashlib", "hmac",
+                "base64", "binascii", "zlib", "struct", "secrets", "graphlib", "colorsys", "uuid", "keyword",
+                "html", "abc", "contextlib", "pprint"}
+_PURE_DROP = {"functools": {"_lru_cache_wrapper"}, "json": {"load", "dump"}, "pprint": {"PrettyPrinter"},
+              "contextlib": {"redirect_stdout", "redirect_stderr", "chdir"}, "random": {"SystemRandom"},
+              "uuid": {"getnode", "uuid1"}}
+_pure_cache = {}
+
+
+def pure_module(name):
+    if name not in _pure_cache:
+        import importlib
+        import types
+        from .values import Namespace
+        mod = importlib.import_module(name)
+        drop = _PURE_DROP.get(name, set())
+        members = {}
+        for k in dir(mod):
+            if k.startswith("_") or k in drop:
+                continue
+            v = getattr(mod, k)
+            if isinstance(v, types.ModuleType):
+                continue
+            members[k] = v
+        _pure_cache[name] = Namespace(name, members)
+    return _pure_cache[name]
+
+
 # ------------------------------------------------------------------ install
 def install(interp):
     g = interp.globals.vars
 
     def pyimport(name):
+        if str(name) in PURE_MODULES:
+            return pure_module(str(name))
         _need(interp, "python", f"pyimport(\"{name}\")")
         from .guard import check_pyimport
         check_pyimport(interp.policy, str(name))
@@ -300,8 +336,9 @@ def install(interp):
     def json_parse(text):
         return from_py(json.loads(text))
 
-    def json_str(value):
-        return json.dumps(to_py(value), ensure_ascii=False)
+    def json_str(value, indent=None, sort_keys=False, ensure_ascii=False, separators=None, default=None):
+        return json.dumps(to_py(value), ensure_ascii=ensure_ascii, indent=indent, sort_keys=sort_keys,
+                          separators=separators, default=default)
 
     def permissions():
         return sorted(interp.permissions)

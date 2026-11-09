@@ -1,8 +1,8 @@
 // Fake system API so the UI can be previewed in a browser without Electron.
 export function mockSetup() {
   const sys = {
-    platform: "win32", arch: "x64", version: "1.10.0",
-    payload: { version: "1.10.0", components: { runtime: 97e6, examples: 120e3, docs: 160e3, editors: 520e3 } },
+    platform: "win32", arch: "x64", version: "2.0.0",
+    payload: { version: "2.0.0", components: { runtime: 97e6, examples: 120e3, docs: 160e3, editors: 520e3 } },
     osName: "Windows 11 (build 22631)", osOk: true, cpu: "Intel(R) Core(TM) i7-12700H", cpuOk: true,
     threads: 20, ramGB: 32, gpus: [{ name: "NVIDIA GeForce RTX 3060 Laptop GPU", compute_capability: 8.6, meets_target: true }],
     gpuOk: true, admin: false, editors: [{ id: "vscode", name: "Visual Studio Code", kind: "extension", found: true }, { id: "cursor", name: "Cursor", kind: "extension", found: true }, { id: "sublime", name: "Sublime Text", kind: "package", found: false }],

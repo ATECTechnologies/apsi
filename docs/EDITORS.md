@@ -96,7 +96,7 @@ Apsi has a standard LSP language server built in, so it works with almost every 
 
 Everything in this section applies to all editors of the VS Code family — they share one extension.
 The setup wizard installs it automatically into every one it finds. To install it by hand:
-Extensions → `…` → **Install from VSIX…** → `dist/apsi-language-1.10.0.vsix`.
+Extensions → `…` → **Install from VSIX…** → `dist/apsi-language-2.0.0.vsix`.
 
 The extension finds Apsi by itself, in this order: `apsi.command` from Settings, the wizard's install
 (`%LOCALAPPDATA%\Programs\Apsi` / `~/.local/share/apsi`), the script install (`%LOCALAPPDATA%\Apsi` / `~/.apsi`),

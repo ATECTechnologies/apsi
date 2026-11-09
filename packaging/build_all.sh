@@ -30,6 +30,11 @@ echo "built dist/apsi-$V-py3-none-any.whl"
 P="$BUILD/deb/apsi_${V}_all"
 mkdir -p "$P/DEBIAN" "$P/usr/bin" "$P/usr/lib/python3/dist-packages/apsi" "$P/usr/share/doc/apsi" "$P/usr/share/apsi"
 cp apsi/*.py apsi/MANIFEST.json "$P/usr/lib/python3/dist-packages/apsi/"
+for sub in apsi/*/; do                                   # subpackages (apsi/native), without caches
+  case "$sub" in *__pycache__*) continue ;; esac
+  mkdir -p "$P/usr/lib/python3/dist-packages/$sub"
+  cp "$sub"*.py "$P/usr/lib/python3/dist-packages/$sub"
+done
 cp README.md CHANGELOG.md "$P/usr/share/doc/apsi/"
 cp -r examples docs "$P/usr/share/apsi/"          # /usr/share/doc may be stripped on minimal systems
 rm -f "$P"/usr/share/apsi/examples/native/*.so
@@ -47,13 +52,14 @@ Version: $V
 Section: devel
 Priority: optional
 Architecture: all
-Depends: python3 (>= 3.9), python3-numpy (>= 1:1.21)
+Depends: python3 (>= 3.12), python3-numpy (>= 1:1.26)
+Recommends: python3-llvmlite
 Suggests: code
 Installed-Size: $SIZE
 Maintainer: Apsi maintainers <apsi@localhost>
 Homepage: https://example.invalid/apsi
 Description: Apsi programming language for AI, physics and servers
- Apsi is a compiled-to-bytecode language with physical units, tensor shape
+ Apsi is a natively compiled (LLVM) language with physical units, tensor shape
  checking, automatic differentiation (any order), FP64-FP4 numeric formats,
  streaming data pipelines and a hardened high-concurrency web server.
 CTL

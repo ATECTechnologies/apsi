@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
-# Apsi 1.10.0 — one-shot setup for Linux (run from the source folder).
+# Apsi 2.0.0 — one-shot setup for Linux (run from the source folder).
 #
 #   ./setup.sh                      install Apsi for development + run tests
 #   ./setup.sh --installer          also build the setup wizard (AppImage) and the Windows payload
 #   ./setup.sh --release            build every release file (wheel, .deb, Windows zip, NSIS exe, wizard)
 #   ./setup.sh --libs ai            also install libraries: gpu onnx torch transformers sci data | ai ai-gpu science all
 #
-# Needs: python3 (3.9+) with venv.  --installer/--release: Node.js 20+;  --release: nsis, zip, dpkg-deb.
+# Needs: python3 (3.12+) with venv.  --installer/--release: Node.js 20+;  --release: nsis, zip, dpkg-deb.
 #   Ubuntu/Debian: sudo apt install python3 python3-venv nodejs npm nsis zip
 set -euo pipefail
 cd "$(dirname "$0")"
@@ -29,7 +29,7 @@ need() { command -v "$1" >/dev/null 2>&1 || { echo "Missing: $1. $2"; exit 1; };
 
 step "Checking Python"
 need python3 "sudo apt install python3 python3-venv"
-python3 -c 'import sys; assert sys.version_info >= (3, 9), "Python 3.9+ required"'
+python3 -c 'import sys; assert sys.version_info >= (3, 12), "Python 3.12+ required"'
 
 step "Creating a private environment (.venv)"
 [ -d .venv ] || python3 -m venv .venv

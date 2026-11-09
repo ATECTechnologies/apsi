@@ -62,7 +62,7 @@ class Permissions(unittest.TestCase):
     def test_config_is_never_writable(self):
         target = os.path.join(os.environ["APSI_HOME"], "config.json").replace("\\", "/")
         with self.assertRaises(PermissionErr):
-            run(f'write_text("{target}", "{{}}")', Policy.profile("developer"), self.tmp)
+            run(f'write_text("{str(target).replace(chr(92), "/")}", "{{}}")', Policy.profile("developer"), self.tmp)
 
     def test_credentials_need_explicit_grant(self):
         ssh = os.path.join(os.path.expanduser("~"), ".ssh", "id_rsa").replace("\\", "/")

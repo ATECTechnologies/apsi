@@ -19,7 +19,7 @@ export const PROFILES = [
 
 export const COMPONENTS = [
   { id: "runtime", title: "Apsi runtime", text: "Compiler, standard library, Python 3.12 and numpy (required).", size: "runtime", required: true },
-  { id: "examples", title: "Example programs", text: "30 examples: physics, AI on CPU and GPU, data pipelines, web servers.", size: "examples" },
+  { id: "examples", title: "Example programs", text: "27 examples: physics, AI, data pipelines, web servers.", size: "examples" },
   { id: "docs", title: "Documentation", text: "Language reference, standard library, guides.", size: "docs" },
   { id: "editors", title: "Code editor support", size: "editors", needsEditor: true,
     text: "Apsi colours, live unit/shape errors, run buttons and snippets in VS Code, Cursor, Windsurf, VSCodium, Sublime Text, Vim/Neovim and Notepad++." },

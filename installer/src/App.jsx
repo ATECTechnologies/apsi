@@ -404,13 +404,14 @@ export default function App() {
         <h1>{ok ? "Apsi is ready" : "Installation failed"}</h1>
         {ok ? (
           <>
-            <p className="lead">Open a <b>new</b> terminal and try — windows that were already open (PowerShell, Command
-              Prompt, VS Code and its terminals) do not see the new <code>apsi</code> command until you close and reopen them:</p>
+            <p className="lead">Open a new terminal and try the commands below. Terminals and VS Code windows that were
+              already open still use the old PATH, so close them first (quit VS Code completely). Still not recognized?
+              See docs/TROUBLESHOOTING.md.</p>
             <pre className="code">apsi version{"\n"}apsi run {isWin ? "examples\\01_hello.apsi" : "examples/01_hello.apsi"}{"\n"}apsi doctor</pre>
             <div className="group-title">When I select Finish</div>
             <OptionRow title="Open the Apsi REPL" text="An interactive prompt for trying Apsi." checked={finishActions.repl}
               onChange={(v) => setFinishActions({ ...finishActions, repl: v })} />
-            {opts.components.examples && <OptionRow title="Open the examples folder" text="30 example programs." checked={finishActions.examples}
+            {opts.components.examples && <OptionRow title="Open the examples folder" text="The example programs." checked={finishActions.examples}
               onChange={(v) => setFinishActions({ ...finishActions, examples: v })} />}
             {opts.components.docs && <OptionRow title="Open the documentation" text="Language guide and reference." checked={finishActions.docs}
               onChange={(v) => setFinishActions({ ...finishActions, docs: v })} />}

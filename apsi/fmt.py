@@ -95,12 +95,16 @@ def fmt(v, top=True, spec=None):
         return fmt_array(v, spec)
     if isinstance(v, list):
         return "[" + ", ".join(fmt(x, False) for x in v) + "]"
+    if isinstance(v, tuple) and hasattr(v, "_fields"):           # a named tuple
+        return f"{type(v).__name__}(" + ", ".join(f"{k}={fmt(x, False)}" for k, x in zip(v._fields, v)) + ")"
     if isinstance(v, tuple):
         inner = ", ".join(fmt(x, False) for x in v)
         return f"({inner},)" if len(v) == 1 else f"({inner})"
     if isinstance(v, dict):
         return "{" + ", ".join(f"{fmt(k, False)}: {fmt(x, False)}" for k, x in v.items()) + "}"
     if isinstance(v, StructInstance):
+        if v._m("to_str") is not None:
+            return str(v._call("to_str"))
         inner = ", ".join(f"{k}={fmt(x, False)}" for k, x in v.fields.items())
         return f"{v.type.name}({inner})"
     if isinstance(v, Record):

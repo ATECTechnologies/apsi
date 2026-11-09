@@ -1,0 +1,87 @@
+# 31_native_speed.apsi — machine code with @native, all cores with parallel for
+#
+# @native compiles a function to machine code for this exact CPU (LLVM, AVX2/AVX-512 when present).
+# Units are checked once at compile time and then cost nothing; integer overflow, bad indices and
+# division by zero are still caught with the line number. Results are identical to the bytecode engine.
+
+use physics.constants
+
+# --- a plain loop: the bytecode engine and the native compiler side by side
+fn harmonic_bytecode(n: Int) -> Float:
+    var s = 0.0
+    for k in 1..=n:
+        s += 1.0 / k
+    return s
+
+@native
+fn harmonic(n: Int) -> Float:
+    var s = 0.0
+    for k in 1..=n:
+        s += 1.0 / k
+    return s
+
+# --- units cost nothing in native code, but are still checked
+@native
+fn orbit_speed(m: Mass, r: Length) -> Velocity = sqrt(G * m / r)
+
+# --- tensors: element loops and fused whole-array expressions (one pass, no temporaries)
+@native
+fn laplacian(u):
+    let n = len(u)
+    let out = zeros(n)
+    for i in 1..n - 1:
+        out[i] = u[i - 1] - 2.0 * u[i] + u[i + 1]
+    return out
+
+@native
+fn rms(a, b) -> Float = sqrt(mean((a - b) * (a - b)))
+
+# --- parallel for: iterations spread over every CPU core; s += ... is a deterministic reduction
+@native
+fn mandelbrot_area(n: Int, maxit: Int) -> Float:
+    var inside = 0
+    parallel for y in 0..n:
+        let ci = 3.0 * y / n - 1.5
+        for x in 0..n:
+            let cr = 3.0 * x / n - 2.0
+            var zr = 0.0
+            var zi = 0.0
+            var it = 0
+            while it < maxit and zr * zr + zi * zi <= 4.0:
+                let t = zr * zr - zi * zi + cr
+                zi = 2.0 * zr * zi + ci
+                zr = t
+                it += 1
+            if it == maxit:
+                inside += 1
+    return 9.0 * inside / (n * n)
+
+let n = 2000000
+var t = clock()
+let h1 = harmonic_bytecode(n)
+let t_bytecode = clock() - t
+harmonic(10)                         # the first call compiles (and caches the machine code on disk)
+t = clock()
+let h2 = harmonic(n)
+let t_native = clock() - t
+print(f"harmonic({n}): bytecode {t_bytecode}, native {t_native} -> {t_bytecode / t_native:.0f}x faster")
+print("same result, bit for bit:", h1 == h2)
+
+print("orbital speed of the Moon:", orbit_speed(5.972e24kg, 384400[km]) as [km/s])
+
+let x = linspace(0, 1, 101)
+let lap = laplacian(x * x)
+print("discrete laplacian of x^2 (expect 2/100^2):", lap[50])
+print("rms:", rms(sin(x), x))
+
+t = clock()
+let area = mandelbrot_area(600, 200)
+print(f"Mandelbrot set area ~ {area:.4f} on {native_threads()} threads in {clock() - t}")
+
+test "native results match the bytecode engine":
+    assert h1 == h2
+    assert lap[50] ~= 2.0e-4
+    assert area > 1.4 and area < 1.6
+
+test "units are still checked":
+    assert orbit_speed(5.972e24kg, 384400[km]) ~= 1018.28904573[m/s]

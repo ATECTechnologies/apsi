@@ -1,0 +1,18 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>content</key>
+	<string>@native
+fn ${1:name}(${2:x}: ${3:Float}) -&gt; ${4:Float}:
+	$0</string>
+	<key>name</key>
+	<string>A function compiled to machine code (LLVM); falls back to the bytecode engine if needed</string>
+	<key>scope</key>
+	<string>source.apsi</string>
+	<key>tabTrigger</key>
+	<string>native</string>
+	<key>uuid</key>
+	<string>63B671C9-3679-53AE-BEF4-83A26D084C62</string>
+</dict>
+</plist>

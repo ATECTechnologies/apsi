@@ -1,0 +1,36 @@
+# A PyTorch training script after `apsi convert` (the Python original is in docs/PYTHON.md).
+# It runs natively — no Python, no PyTorch — and computes exactly what PyTorch computes.
+use torch as torch
+
+var _aux3 = none
+var _grads2 = none
+var _loss_of1 = none
+var loss = none
+
+fn MLP(d_in, hidden, d_out):
+    let fc1 = torch.Linear(d_in, hidden)
+    let bn = torch.BatchNorm1d(hidden)
+    let out = torch.Linear(hidden, d_out)
+    let drop = torch.Dropout(0.1)
+    fn init_(seed = 0) = record(fc1=fc1.init(seed=seed * 1009 + 1), bn=bn.init(seed=seed * 1009 + 2), out=out.init(seed=seed * 1009 + 3), drop=drop.init(seed=seed * 1009 + 4))
+    fn forward_(p, x, train = false) = out(p.out, drop(p.drop, torch.relu(bn(p.bn, fc1(p.fc1, x, train=train), train=train)), train=train), train=train)
+    return torch.Module(init_, forward_, "MLP", record(fc1=fc1, bn=bn, out=out, drop=drop))
+let X = randn(256, 4, seed=0)
+let y = tensor(X[:, 0] > 0, dtype=i64)
+let model = MLP(4, 32, 2)
+var model_params = model.init(seed=0)
+let opt = torch.AdamW(lr=0.01)
+let sched = torch.CosineAnnealingLR(opt, T_max=200)
+let loss_fn = torch.CrossEntropyLoss(label_smoothing=0.1)
+for epoch in 0..200:
+    fn _loss_of1(_p):
+        let logits = model(_p, X)
+        let loss = loss_fn(logits, y)
+        return loss
+    loss, _aux3, _grads2 = torch.value_and_grad_aux(_loss_of1)(model_params)
+    _grads2 = torch.clip_grad_norm(_grads2, 1.0)
+    model_params = opt.step(model_params, _grads2)
+    sched.step()
+model.eval()
+print(loss)
+print(keys(torch.state_dict(model, model_params)))   # PyTorch names: fc1.weight, bn.running_mean, …

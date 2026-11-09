@@ -1,0 +1,281 @@
+# Apsi heavy CPU benchmarks — the same algorithms, sizes and random numbers as heavy.c / .cpp / .rs / .go / .mojo
+# Every workload prints a checksum so the six languages can be checked against each other.
+
+@native
+fn rng_next(s: Int) -> Int = (s * 16807) % 2147483647
+
+# 1. Dense gravitational N-body: 2000 bodies, all pairs, 10 leapfrog steps (40 M interactions)
+@native
+fn nbody_dense(n: Int, steps: Int) -> Float:
+    let x = zeros(n)
+    let y = zeros(n)
+    let z = zeros(n)
+    let vx = zeros(n)
+    let vy = zeros(n)
+    let vz = zeros(n)
+    let ax = zeros(n)
+    let ay = zeros(n)
+    let az = zeros(n)
+    let m = zeros(n)
+    var s = 42
+    for i in 0..n:
+        s = rng_next(s)
+        x[i] = s / 2147483647.0 - 0.5
+        s = rng_next(s)
+        y[i] = s / 2147483647.0 - 0.5
+        s = rng_next(s)
+        z[i] = s / 2147483647.0 - 0.5
+        s = rng_next(s)
+        m[i] = 1.0 / n * (0.5 + s / 2147483647.0)
+    let dt = 0.001
+    let eps2 = 0.0001
+    for st in 0..steps:
+        for i in 0..n:
+            var fx = 0.0
+            var fy = 0.0
+            var fz = 0.0
+            let xi = x[i]
+            let yi = y[i]
+            let zi = z[i]
+            for j in 0..n:
+                let dx = x[j] - xi
+                let dy = y[j] - yi
+                let dz = z[j] - zi
+                let d2 = dx * dx + dy * dy + dz * dz + eps2
+                let inv = m[j] / (d2 * sqrt(d2))
+                fx += dx * inv
+                fy += dy * inv
+                fz += dz * inv
+            ax[i] = fx
+            ay[i] = fy
+            az[i] = fz
+        for i in 0..n:
+            vx[i] += dt * ax[i]
+            vy[i] += dt * ay[i]
+            vz[i] += dt * az[i]
+            x[i] += dt * vx[i]
+            y[i] += dt * vy[i]
+            z[i] += dt * vz[i]
+    var e = 0.0
+    for i in 0..n:
+        e += 0.5 * m[i] * (vx[i] * vx[i] + vy[i] * vy[i] + vz[i] * vz[i])
+    return e
+
+# 2. 2-D heat equation, Jacobi 5-point stencil: 1024 x 1024 grid, 200 sweeps
+@native
+fn jacobi(n: Int, iters: Int) -> Float:
+    let a = zeros(n, n)
+    let b = zeros(n, n)
+    for j in 0..n:
+        a[0, j] = 100.0
+        b[0, j] = 100.0
+    for it in 0..iters:
+        for i in 1..n - 1:
+            for j in 1..n - 1:
+                b[i, j] = 0.25 * (a[i - 1, j] + a[i + 1, j] + a[i, j - 1] + a[i, j + 1])
+        for i in 1..n - 1:
+            for j in 1..n - 1:
+                a[i, j] = 0.25 * (b[i - 1, j] + b[i + 1, j] + b[i, j - 1] + b[i, j + 1])
+    var s = 0.0
+    for i in 0..n:
+        for j in 0..n:
+            s += a[i, j]
+    return s
+
+# 3. Dense matrix multiply 1024 x 1024 (ikj loop order, 2.1 GFLOP)
+@native
+fn matmul(n: Int) -> Float:
+    let a = zeros(n, n)
+    let b = zeros(n, n)
+    let c = zeros(n, n)
+    var s = 7
+    for i in 0..n:
+        for j in 0..n:
+            s = rng_next(s)
+            a[i, j] = s / 2147483647.0 - 0.5
+            s = rng_next(s)
+            b[i, j] = s / 2147483647.0 - 0.5
+    for i in 0..n:
+        for k in 0..n:
+            let aik = a[i, k]
+            for j in 0..n:
+                c[i, j] += aik * b[k, j]
+    var t = 0.0
+    for i in 0..n:
+        t += c[i, (i * 7) % n]
+    return t
+
+# 4. LU factorisation with partial pivoting, 800 x 800; returns log|det|
+@native
+fn lu_logdet(n: Int) -> Float:
+    let a = zeros(n, n)
+    var s = 11
+    for i in 0..n:
+        for j in 0..n:
+            s = rng_next(s)
+            a[i, j] = s / 2147483647.0 - 0.5
+    var logdet = 0.0
+    for k in 0..n:
+        var p = k
+        var best = abs(a[k, k])
+        for i in k + 1..n:
+            let v = abs(a[i, k])
+            if v > best:
+                best = v
+                p = i
+        if p != k:
+            for j in 0..n:
+                let t = a[k, j]
+                a[k, j] = a[p, j]
+                a[p, j] = t
+        let piv = a[k, k]
+        logdet += log(abs(piv))
+        for i in k + 1..n:
+            let f = a[i, k] / piv
+            a[i, k] = f
+            for j in k + 1..n:
+                a[i, j] -= f * a[k, j]
+    return logdet
+
+# 5. 2-D Ising model, Metropolis Monte Carlo: 512 x 512 spins, 50 sweeps (13 M updates, branchy + random)
+@native
+fn ising(n: Int, sweeps: Int, beta: Float) -> Int:
+    let sp = zeros(n, n)
+    var s = 5
+    for i in 0..n:
+        for j in 0..n:
+            s = rng_next(s)
+            sp[i, j] = 1.0 if s < 1073741824 else -1.0
+    let w4 = exp(-2.0 * beta * 4.0)
+    let w8 = exp(-2.0 * beta * 8.0)
+    for sw in 0..sweeps:
+        for i in 0..n:
+            for j in 0..n:
+                let nb = sp[(i + 1) % n, j] + sp[(i + n - 1) % n, j] + sp[i, (j + 1) % n] + sp[i, (j + n - 1) % n]
+                let de = 2.0 * sp[i, j] * nb
+                s = rng_next(s)
+                let r = s / 2147483647.0
+                if de <= 0.0 or (de == 4.0 and r < w4) or (de == 8.0 and r < w8):
+                    sp[i, j] = -sp[i, j]
+    var mag = 0
+    for i in 0..n:
+        for j in 0..n:
+            mag += int(sp[i, j])
+    return mag
+
+# 6. Edit distance (Levenshtein) of two 10 000-symbol sequences: 100 M dynamic-programming cells
+@native
+fn levenshtein(n: Int) -> Int:
+    let a = zeros(n)
+    let b = zeros(n)
+    var s = 3
+    for i in 0..n:
+        s = rng_next(s)
+        a[i] = float(s % 4)
+        s = rng_next(s)
+        b[i] = float(s % 4)
+    let prev = zeros(n + 1)
+    let cur = zeros(n + 1)
+    for j in 0..=n:
+        prev[j] = float(j)
+    for i in 1..=n:
+        cur[0] = float(i)
+        let ai = a[i - 1]
+        for j in 1..=n:
+            let cost = 0.0 if ai == b[j - 1] else 1.0
+            cur[j] = min(min(prev[j] + 1.0, cur[j - 1] + 1.0), prev[j - 1] + cost)
+        for j in 0..=n:
+            prev[j] = cur[j]
+    return int(prev[n])
+
+# 7. Van der Pol oscillator (mu = 2), classic RK4, 20 M steps (latency-bound scalar ODE)
+@native
+fn vdp_rk4(steps: Int) -> Float:
+    var x = 2.0
+    var v = 0.0
+    let h = 0.0001
+    let mu = 2.0
+    for i in 0..steps:
+        let k1x = v
+        let k1v = mu * (1.0 - x * x) * v - x
+        let x2 = x + 0.5 * h * k1x
+        let v2 = v + 0.5 * h * k1v
+        let k2x = v2
+        let k2v = mu * (1.0 - x2 * x2) * v2 - x2
+        let x3 = x + 0.5 * h * k2x
+        let v3 = v + 0.5 * h * k2v
+        let k3x = v3
+        let k3v = mu * (1.0 - x3 * x3) * v3 - x3
+        let x4 = x + h * k3x
+        let v4 = v + h * k3v
+        let k4x = v4
+        let k4v = mu * (1.0 - x4 * x4) * v4 - x4
+        x += h / 6.0 * (k1x + 2.0 * k2x + 2.0 * k3x + k4x)
+        v += h / 6.0 * (k1v + 2.0 * k2v + 2.0 * k3v + k4v)
+    return x + v
+
+# 8. k-means clustering: 200 000 points in 2-D, 16 clusters, 20 Lloyd iterations
+@native
+fn kmeans(n: Int, k: Int, iters: Int) -> Float:
+    let px = zeros(n)
+    let py = zeros(n)
+    let cx = zeros(k)
+    let cy = zeros(k)
+    let sx = zeros(k)
+    let sy = zeros(k)
+    let cnt = zeros(k)
+    var s = 9
+    for i in 0..n:
+        s = rng_next(s)
+        let c = s % k
+        s = rng_next(s)
+        px[i] = float(c % 4) * 3.0 + s / 2147483647.0
+        s = rng_next(s)
+        py[i] = float((c - c % 4) / 4) * 3.0 + s / 2147483647.0
+    for c in 0..k:
+        cx[c] = px[c]
+        cy[c] = py[c]
+    var inertia = 0.0
+    for it in 0..iters:
+        for c in 0..k:
+            sx[c] = 0.0
+            sy[c] = 0.0
+            cnt[c] = 0.0
+        inertia = 0.0
+        for i in 0..n:
+            var bc = 0
+            var bd = 1e300
+            for c in 0..k:
+                let dx = px[i] - cx[c]
+                let dy = py[i] - cy[c]
+                let d = dx * dx + dy * dy
+                if d < bd:
+                    bd = d
+                    bc = c
+            sx[bc] += px[i]
+            sy[bc] += py[i]
+            cnt[bc] += 1.0
+            inertia += bd
+        for c in 0..k:
+            if cnt[c] > 0.0:
+                cx[c] = sx[c] / cnt[c]
+                cy[c] = sy[c] / cnt[c]
+    return inertia
+
+fn timeit(name, f):
+    let r = f()
+    var best = 1e9
+    for rep in 0..3:
+        let t = clock()
+        f()
+        best = min(best, magnitude(clock() - t))
+    print(f"{name}: {best * 1000:.1f} ms  [check {r}]")
+
+timeit("nbody-dense 2000x10", fn() => nbody_dense(2000, 10))
+timeit("jacobi-2d 1024x200", fn() => jacobi(1024, 200))
+timeit("matmul 1024", fn() => matmul(1024))
+timeit("lu-pivot 800", fn() => lu_logdet(800))
+timeit("ising 512x50", fn() => ising(512, 50, 0.44))
+timeit("levenshtein 10k", fn() => levenshtein(10000))
+timeit("ode-rk4 20M", fn() => vdp_rk4(20000000))
+timeit("kmeans 200k k16 x20", fn() => kmeans(200000, 16, 20))

@@ -1,0 +1,27 @@
+# Reinforcement learning: PPO learns to balance CartPole, then Monte Carlo tree search plays a simple game.
+use torch
+use rl
+
+let l1 = torch.Linear(4, 64)
+let l2 = torch.Linear(64, 64)
+let pi = torch.Linear(64, 2)
+let vf = torch.Linear(64, 1)
+let params = record(l1=l1.init(1), l2=l2.init(2), pi=pi.init(3), vf=vf.init(4))
+
+# the policy network returns [action logits, state value]
+fn policy(p, obs):
+    let h = tanh(l2(p.l2, tanh(l1(p.l1, obs))))
+    return [pi(p.pi, h), vf(p.vf, h)]
+
+# 200 000 steps reach the maximum return of 500; 40 000 already learn to balance
+let result = rl.ppo(rl.cartpole(8, seed=0), policy, params, total_steps=40000, epochs=10, lr=1e-3)
+let score = rl.evaluate(rl.cartpole(1, seed=5), fn(obs) => argmax(policy(result.params, obs)[0], axis=1), episodes=5)
+print(f"PPO on CartPole: mean return {score.mean} (random play: about 20)")
+
+# Monte Carlo tree search on a counting game: add 1 or 2, whoever reaches 10 wins
+fn legal(s) = [1, 2] if s[0] < 10 else []
+fn apply(s, a) = [min(s[0] + a, 10), -s[1]]
+fn done(s) = s[0] >= 10
+fn reward(s) = 1.0
+let best = rl.mcts([0, 1], legal, apply, done, reward, simulations=2000, two_player=true, seed=0)
+print(f"MCTS: from 0 the winning first move is +{best.action}")

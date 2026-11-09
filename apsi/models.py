@@ -6,6 +6,9 @@ Native (no extra libraries):
   * load straight into a compact format: load_safetensors(path, dtype=int8 / fp8 / int4 / bf16)
     stores weights as QTensors (2–16× smaller than f32) and qlinear() runs them.
   * quantize_model / model_size / dequantize_model for any parameter tree.
+  * Apsi checkpoints (.apsim: units, compressed tensors, SHA-256, signatures, sharding) and GGUF
+    (llama.cpp / Ollama, bit-exact Q8_0 / Q4_0): save_model / load_model / model_info,
+    save_gguf / load_gguf / gguf_info (see modelio.py and docs/MODEL-FILES.md).
 
 Ecosystem bridges (need --allow-python; install the library with pip as usual):
   * onnx_model(path)                     -> onnxruntime (CPU / CUDA / DirectML / TensorRT)
@@ -17,6 +20,8 @@ import os
 import struct
 
 import numpy as np
+
+from . import modelio
 
 from . import ops
 from .errors import RuntimeErr
@@ -261,6 +266,16 @@ def install(interp):
         "quantize_model": quantize_model, "dequantize_model": dequantize_model,
         "model_size": model_size, "qlinear": qlinear,
         "onnx_model": onnx_model, "hf_pipeline": hf_pipeline, "torch_load": torch_load,
+        # GGUF (llama.cpp / Ollama / LM Studio) and Apsi checkpoints (.apsim) - every file goes through the
+        # permission checks, shards and index files included
+        "save_gguf": lambda path, params, metadata=None, dtype="f16", name=None, architecture="apsi":
+            modelio.save_gguf(_wpath(path), params, metadata, dtype, name, architecture),
+        "load_gguf": lambda path, nested=True: modelio.load_gguf(_path(path), nested),
+        "gguf_info": lambda path: modelio.gguf_info(_path(path)),
+        "save_model": lambda path, params, metadata=None, shard="4GB", sign=False:
+            modelio.save_model(path, params, metadata, shard, sign, check=_wpath),
+        "load_model": lambda path, verify=True, key=None: modelio.load_model(path, verify, key, check=_path),
+        "model_info": lambda path: modelio.model_info(_path(path)),
     }
 
 

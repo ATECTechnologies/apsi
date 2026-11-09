@@ -92,8 +92,11 @@ SYSTEM_LIBS = re.compile(r"(kernel32|ntdll|advapi32|user32|ws2_32|wininet|urlmon
                          r"psapi|dbghelp|libc\.so|libc$|^c$|libdl|libpthread|msvcrt)", re.I)
 CRYPTO_FNS = {"encrypt", "aes_encrypt", "aes_gcm_encrypt", "xor", "chacha", "fernet", "rc4", "seal"}
 WALK_FNS = {"from_files", "list_dir", "walk", "glob", "listdir"}
-READ_FNS = {"read_text", "load_json", "load_csv", "load_tensor", "from_csv", "from_npy", "read_bytes"}
-WRITE_FNS = {"write_text", "save_json", "save_csv", "save_tensor", "write_bytes", "save_safetensors"}
+READ_FNS = {"read_text", "load_json", "load_csv", "load_tensor", "from_csv", "from_npy", "read_bytes",
+            "load_safetensors", "load_model", "load_gguf", "model_info", "gguf_info",
+            "read_dicom", "read_dicom_series", "load_runs"}
+WRITE_FNS = {"write_text", "save_json", "save_csv", "save_tensor", "write_bytes", "save_safetensors",
+             "save_model", "save_gguf", "experiment"}
 NET_FNS = {"http_get", "http_post_json", "fetch", "websocket"}
 B64 = re.compile(r"^[A-Za-z0-9+/=_-]{160,}$")
 HEX = re.compile(r"^(?:[0-9a-fA-F]{2}){100,}$")

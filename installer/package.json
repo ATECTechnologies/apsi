@@ -1,7 +1,7 @@
 {
   "name": "apsi-setup",
   "productName": "Apsi Setup",
-  "version": "1.10.0",
+  "version": "2.0.0",
   "description": "Installer for the Apsi programming language",
   "author": "Apsi",
   "private": true,

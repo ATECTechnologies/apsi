@@ -95,13 +95,30 @@ sigmoid = _dimless_unary("sigmoid", _np_sigmoid, ad.sigmoid)
 softplus = _dimless_unary("softplus", lambda x: np.logaddexp(0, x), ad.softplus)
 
 
+def _erf_np(x):
+    from .special import _erf
+    r = _erf(np.asarray(x, dtype=float))
+    return float(r) if np.ndim(r) == 0 else r
+
+
+erf = _dimless_unary("erf", _erf_np, ad.erf)
+
+
 def log2(x):
     return log(x) / math.log(2.0)
 
 
-def gelu(x):
+def gelu(x, approximate="tanh"):
+    """GELU. approximate="tanh" (default, fast) or "none" (exact: x·Φ(x), as PyTorch's default)."""
     x = _arr(x)
+    if approximate in ("none", "exact", False, None):
+        return 0.5 * x * (1 + erf(x * 0.7071067811865476))
     return 0.5 * x * (1 + tanh(0.7978845608028654 * (x + 0.044715 * x * x * x)))
+
+
+def gelu_exact(x):
+    """Exact GELU x·Φ(x) (PyTorch's nn.GELU() default)."""
+    return gelu(x, "none")
 
 
 def sqrt(x):
@@ -504,6 +521,50 @@ def flatten(x):
     return reshape(x, -1)
 
 
+def _nd(x):
+    v = x.v if isinstance(x, Quantity) else x
+    return np.ndim(v.value if isinstance(v, Node) else v)
+
+
+def swapaxes(x, a, b):
+    """Exchange two axes (PyTorch's x.transpose(a, b))."""
+    n = _nd(x)
+    axes = list(range(n))
+    a, b = int(a) % n, int(b) % n
+    axes[a], axes[b] = axes[b], axes[a]
+    return transpose(x, tuple(axes))
+
+
+def permute(x, *dims):
+    """Reorder the axes (PyTorch's x.permute(...))."""
+    if len(dims) == 1 and isinstance(dims[0], (list, tuple)):
+        dims = tuple(dims[0])
+    n = _nd(x)
+    return transpose(x, tuple(int(d) % n for d in dims))
+
+
+def unsqueeze(x, axis):
+    """Insert an axis of length 1 (negative axes count from the end, as in PyTorch)."""
+    v = x.v if isinstance(x, Quantity) else x
+    shp = list(np.shape(v.value if isinstance(v, Node) else v))
+    a = int(axis)
+    a = a % (len(shp) + 1)
+    shp.insert(a, 1)
+    return reshape(x, *shp)
+
+
+def squeeze(x, axis=None):
+    """Remove axes of length 1 (only `axis` when given, and only if it has length 1, as in PyTorch)."""
+    v = x.v if isinstance(x, Quantity) else x
+    shp = list(np.shape(v.value if isinstance(v, Node) else v))
+    if axis is None:
+        new = [d for d in shp if d != 1]
+    else:
+        a = int(axis) % max(len(shp), 1)
+        new = shp[:a] + shp[a + 1:] if shp and shp[a] == 1 else shp
+    return reshape(x, *new) if new else reshape(x, 1)[0]
+
+
 def transpose(x, axes=None):
     x = _arr(x)
     if isinstance(x, Quantity):
@@ -534,7 +595,12 @@ def where(cond, a, b):
 
 def clip(x, lo, hi):
     if isinstance(x, Quantity):
-        return Quantity(np.clip(raw(x.v), raw(lo), raw(hi)), x.dim)
+        return Quantity(clip(x.v, raw(lo), raw(hi)), x.dim)
+    if isinstance(x, Node):                        # differentiable: gradient 1 inside the range, 0 outside
+        r = np.asarray(x.value)
+        lo_, hi_ = (-np.inf if lo is None else raw(lo)), (np.inf if hi is None else raw(hi))
+        inside = ((r >= lo_) & (r <= hi_)).astype(float)
+        return x * inside + ad.const(np.clip(r, lo_, hi_)) * (1.0 - inside)
     return py(np.clip(raw(x), lo, hi))
 
 

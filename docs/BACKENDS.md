@@ -22,6 +22,10 @@ evaluated on NumPy, saved with `save_params`, served by `use web`, or handed to 
 
 ---
 
+> **Your own loops on the GPU:** this page is about training `use layers` models on PyTorch. To run your own
+> numeric loops as GPU kernels (one thread per iteration, several GPUs, no CUDA toolkit), use `@gpu` with a
+> `parallel for` — see [`NATIVE.md`](NATIVE.md#gpu).
+
 ## 1. Setup
 
 1. Install **one** PyTorch build into the Python that runs Apsi. A CUDA build also runs on the CPU, so with an

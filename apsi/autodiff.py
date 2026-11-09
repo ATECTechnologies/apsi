@@ -7,6 +7,7 @@ gradient is itself differentiable — this gives Hessians, Laplacians of network
 (physics-informed nets), and grad(grad(f)) to any order.
 """
 import builtins
+import copy
 from fractions import Fraction
 
 import numpy as np
@@ -249,6 +250,15 @@ sigmoid = _un(lambda a: 1.0 / (1.0 + np.exp(-a)), lambda g, out, a: mul(g, mul(o
 softplus = _un(lambda a: np.logaddexp(0, a), lambda g, out, a: mul(g, sigmoid(a)))
 
 
+def _erf_np(a):
+    from .special import _erf
+    r = _erf(np.asarray(a, dtype=float))
+    return float(r) if np.ndim(r) == 0 else r
+
+
+erf = _un(_erf_np, lambda g, out, a: mul(g, mul(1.1283791670955126, exp(neg(mul(a, a))))))
+
+
 # ------------------------------------------------------------- reductions
 def _norm_axes(axis, nd):
     if axis is None:
@@ -442,6 +452,37 @@ def max_pool2d(x, k=2):
     return _op(lambda a: out0, vjp, [x], raw_only=True)
 
 
+# ------------------------------------------------------------- gradient checkpointing
+def checkpoint(f, *inputs):
+    """f(*inputs) without keeping its intermediate values: they are recomputed during the backward pass.
+    Activation memory of the wrapped part drops to its inputs and output; random numbers (dropout) are replayed
+    exactly in the recomputation."""
+    if not builtins.any(isinstance(i, Node) for i in inputs):
+        return f(*inputs)
+    from . import ops as _ops
+    gen = _ops._RNG[0]
+    state = copy.deepcopy(gen.bit_generator.state)
+    out = f(*[_v(i) for i in inputs])
+    out_v = _v(out)
+
+    def vjp(g, outv, need, *raw_inputs):
+        now = copy.deepcopy(gen.bit_generator.state)
+        gen.bit_generator.state = state
+        try:
+            leaves = [Node(np.asarray(v)) if isinstance(v, np.ndarray) or np.ndim(v) == 0 and need[k]
+                      else v for k, v in enumerate(raw_inputs)]
+            y = f(*leaves)
+        finally:
+            gen.bit_generator.state = now
+        if not isinstance(y, Node):
+            return tuple(None for _ in raw_inputs)
+        s = sum(mul(y, np.asarray(_v(g))))
+        grads = gradients(s)
+        return tuple(grads.get(id(l)) if isinstance(l, Node) and need[k] else None
+                     for k, l in enumerate(leaves))
+    return Node(out_v, tuple(inputs), vjp, raw_only=True)
+
+
 # ------------------------------------------------------------- backward
 def _topo(root):
     order, seen, stack_ = [], set(), [(root, False)]
@@ -463,7 +504,9 @@ def _topo(root):
 def gradients(root, create_graph=False):
     """Return {id(node): d root / d node} for every node in root's graph."""
     order = _topo(root)
-    seed = np.ones_like(root.value, dtype=float) if np.ndim(root.value) else 1.0
+    rv = np.asarray(root.value)
+    seed = np.ones_like(rv, dtype=rv.dtype if rv.dtype.kind == "f" else float) if np.ndim(root.value) else \
+        (rv.dtype.type(1.0) if rv.dtype.kind == "f" else 1.0)
     grads = {id(root): seed}
     for node in reversed(order):
         g = grads.get(id(node))
@@ -478,6 +521,10 @@ def gradients(root, create_graph=False):
             gs = node.vjp(_v(g), node.value, need, *[_v(i) for i in node.inputs])
         for inp, gi in zip(node.inputs, gs):
             if gi is not None and isinstance(inp, Node):
+                if type(gi) is np.ndarray and gi.dtype == np.float64:          # keep float32 graphs in float32
+                    iv = inp.value
+                    if type(iv) is np.ndarray and iv.dtype == np.float32:
+                        gi = gi.astype(np.float32)
                 k = id(inp)
                 grads[k] = gi if k not in grads else add(grads[k], gi)
     return grads

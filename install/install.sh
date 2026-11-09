@@ -16,15 +16,15 @@ if [ "$1" = "--uninstall" ]; then
 fi
 
 PY=""
-for c in python3.14 python3.13 python3.12 python3.11 python3.10 python3.9 python3 python; do
+for c in python3.15 python3.14 python3.13 python3.12 python3 python; do
   if command -v "$c" >/dev/null 2>&1; then
-    if "$c" -c 'import sys; sys.exit(0 if sys.version_info >= (3, 9) else 1)' 2>/dev/null; then
+    if "$c" -c 'import sys; sys.exit(0 if sys.version_info >= (3, 12) else 1)' 2>/dev/null; then
       PY="$c"; break
     fi
   fi
 done
 if [ -z "$PY" ]; then
-  echo "Python 3.9 or newer is required  (Ubuntu/Debian: sudo apt install python3 python3-venv)"
+  echo "Python 3.12 or newer is required  (Ubuntu 24.04+/Debian 13+: sudo apt install python3 python3-venv; older systems: uv python install 3.12)"
   exit 1
 fi
 echo "using $($PY --version)"

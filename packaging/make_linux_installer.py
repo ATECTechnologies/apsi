@@ -5,7 +5,7 @@
 The installer is a POSIX shell script followed by a tar.gz archive. It installs for the current user (no sudo):
 Apsi into ~/.local/share/apsi, the commands apsi / apsi-repl / apsi-run into ~/.local/bin, the .apsi file type with
 its icon, "Run with Apsi", a ~/Templates entry, and Apsi support in the code editors it finds. It uses the
-system's python3 (3.9+) and numpy; when numpy is missing it creates a private environment and installs it with pip.
+system's python3 (3.12+) and numpy; when numpy is missing it creates a private environment and installs it with pip.
 `sh ApsiSetup-<v>-linux.sh --help` lists the options; `~/.local/share/apsi/uninstall.sh` removes everything again.
 """
 import io
@@ -41,13 +41,13 @@ say() { printf '\033[36m==>\033[0m %s\n' "$*"; }
 
 say "Apsi $V installer"
 PY=""
-for c in python3.14 python3.13 python3.12 python3.11 python3.10 python3.9 python3; do
-  if command -v "$c" >/dev/null 2>&1 && "$c" -c 'import sys; sys.exit(0 if sys.version_info >= (3, 9) else 1)' 2>/dev/null; then
+for c in python3.15 python3.14 python3.13 python3.12 python3; do
+  if command -v "$c" >/dev/null 2>&1 && "$c" -c 'import sys; sys.exit(0 if sys.version_info >= (3, 12) else 1)' 2>/dev/null; then
     PY="$(command -v "$c")"; break
   fi
 done
 if [ -z "$PY" ]; then
-  echo "Python 3.9 or newer is required."
+  echo "Python 3.12 or newer is required (Ubuntu 24.04+, Debian 13+, Fedora 39+, or: uv python install 3.12)."
   echo "  Ubuntu/Debian: sudo apt install python3 python3-numpy    Fedora: sudo dnf install python3 python3-numpy"
   echo "  Arch: sudo pacman -S python python-numpy                  openSUSE: sudo zypper install python3 python3-numpy"
   exit 1
@@ -67,9 +67,23 @@ mkdir -p "$PREFIX" "$BIN"
 cp -R "$TMP/apsi/." "$PREFIX/"
 
 RUNPY="$PY"
+if "$PY" -c 'import numpy' 2>/dev/null && ! "$PY" -c 'import llvmlite' 2>/dev/null; then
+  # numpy is there but the native compiler's llvmlite is not: a private environment that still sees the system's
+  # packages, plus llvmlite (a prebuilt wheel). Without it Apsi still works, on the bytecode engine only.
+  say "installing llvmlite (Apsi's native compiler) into a private Python environment"
+  if "$PY" -m venv --system-site-packages "$PREFIX/venv" 2>/dev/null && \
+     "$PREFIX/venv/bin/python" -m pip install --quiet "llvmlite>=0.42" 2>/dev/null; then
+    RUNPY="$PREFIX/venv/bin/python"
+  else
+    rm -rf "$PREFIX/venv"
+    say "could not install llvmlite: @native functions will run on the bytecode engine"
+    say "  (later: $PY -m pip install --user llvmlite)"
+  fi
+fi
 if ! "$PY" -c 'import numpy' 2>/dev/null; then
   say "numpy is missing: creating a private Python environment and installing numpy"
-  if "$PY" -m venv "$PREFIX/venv" 2>/dev/null && "$PREFIX/venv/bin/python" -m pip install --quiet "numpy>=1.22"; then
+  if "$PY" -m venv "$PREFIX/venv" 2>/dev/null && "$PREFIX/venv/bin/python" -m pip install --quiet "numpy>=1.22" && \
+     { "$PREFIX/venv/bin/python" -m pip install --quiet "llvmlite>=0.42" || say "llvmlite not installed: no native compiler"; }; then
     RUNPY="$PREFIX/venv/bin/python"
   else
     rm -rf "$PREFIX/venv"
@@ -161,9 +175,12 @@ chmod 755 "$PREFIX/uninstall.sh"
 echo ""
 "$BIN/apsi" version || true
 case ":$PATH:" in
-  *":$BIN:"*) say "ready — try: apsi   (REPL)   or   apsi run $PREFIX/examples/01_hello.apsi" ;;
-  *) say "add $BIN to your PATH (then open a new terminal):"
-     echo "    echo 'export PATH=\"$BIN:\$PATH\"' >> ~/.bashrc" ;;
+  *":$BIN:"*) say "ready — try: apsi   (REPL)   or   apsi run $PREFIX/examples/01_hello.apsi"
+              say "terminals and editors that were already open keep the old PATH: open a new one" ;;
+  *) say "$BIN is not on your PATH yet. Make it permanent (then open a new terminal):"
+     echo "    echo 'export PATH=\"$BIN:\$PATH\"' >> ~/.bashrc"
+     echo "  or use Apsi in this terminal right away:"
+     echo "    export PATH=\"$BIN:\$PATH\"; hash -r" ;;
 esac
 echo "Uninstall: $PREFIX/uninstall.sh"
 exit 0
