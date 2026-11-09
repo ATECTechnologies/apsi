@@ -395,6 +395,29 @@ function updateStatus() {
 function activate(context) {
   const reg = (id, fn) => context.subscriptions.push(vscode.commands.registerCommand(id, fn));
 
+  // F5: the Apsi debugger speaks the Debug Adapter Protocol (`apsi dap`)
+  context.subscriptions.push(vscode.debug.registerDebugAdapterDescriptorFactory("apsi", {
+    createDebugAdapterDescriptor() {
+      const apsi = requireApsi();
+      if (!apsi) return undefined;
+      return new vscode.DebugAdapterExecutable(apsi.command, [...apsi.args, "dap"]);
+    },
+  }));
+  context.subscriptions.push(vscode.debug.registerDebugConfigurationProvider("apsi", {
+    resolveDebugConfiguration(folder, config) {
+      if (!config.type && !config.request && !config.name) {
+        const ed = vscode.window.activeTextEditor;
+        if (ed && ed.document.languageId === "apsi") {
+          config.type = "apsi"; config.name = "Debug Apsi file"; config.request = "launch"; config.program = "${file}";
+        }
+      }
+      if (!config.program) {
+        return vscode.window.showInformationMessage("Open an .apsi file to debug it.").then(() => undefined);
+      }
+      return config;
+    },
+  }));
+
   reg("apsi.run", async (uri) => {
     const f = await activeFile(uri);
     if (f) runInTerminal(["run", f, ...extraArgs()], { cwd: folderOf(f) });

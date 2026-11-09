@@ -40,13 +40,66 @@ class ContinueSignal(ControlSignal):
     pass
 
 
+class LazyModules(dict):
+    """The module table; heavy modules (web, db, dataframe, rt …) are imported the first time a program uses them."""
+
+    def __init__(self, *a):
+        super().__init__(*a)
+        self._lazy = {}
+
+    def lazy(self, name, factory):
+        self._lazy[name] = factory
+
+    def _load(self, name):
+        f = self._lazy.pop(name, None)
+        if f is not None:
+            v = f()
+            if not dict.__contains__(self, name):
+                dict.__setitem__(self, name, v)
+
+    def __getitem__(self, k):
+        if k in self._lazy:
+            self._load(k)
+        return dict.__getitem__(self, k)
+
+    def get(self, k, default=None):
+        if k in self._lazy:
+            self._load(k)
+        return dict.get(self, k, default)
+
+    def __contains__(self, k):
+        return k in self._lazy or dict.__contains__(self, k)
+
+    def _all(self):
+        for k in list(self._lazy):
+            self._load(k)
+
+    def keys(self):
+        return list(dict.keys(self)) + list(self._lazy)
+
+    def __iter__(self):
+        return iter(self.keys())
+
+    def items(self):
+        self._all()
+        return dict.items(self)
+
+    def values(self):
+        self._all()
+        return dict.values(self)
+
+    def __len__(self):
+        return dict.__len__(self) + len(self._lazy)
+
+
 class Env:
-    __slots__ = ("vars", "consts", "parent")
+    __slots__ = ("vars", "consts", "parent", "module")
 
     def __init__(self, parent=None):
         self.vars = {}
         self.consts = set()
         self.parent = parent
+        self.module = None
 
     def lookup(self, name):
         e = self
@@ -89,11 +142,49 @@ BINOPS = {
     ">=": operator.ge, "~=": lambda a, b: ops.approx(a, b),
     "in": lambda a, b: a in b, "not in": lambda a, b: a not in b,
     "±": lambda a, b: ops.plusminus(a, b),
+    "is": operator.is_, "is not": operator.is_not, "|": operator.or_, "&": operator.and_,
+    "<<": operator.lshift, ">>": operator.rshift, "^": operator.xor,
 }
+IOPS = {"+": operator.iadd, "-": operator.isub, "*": operator.imul, "/": operator.itruediv,
+        "//": operator.ifloordiv, "%": operator.imod, "@": operator.imatmul, "**": operator.ipow,
+        "|": operator.ior, "&": operator.iand, "<<": operator.ilshift, ">>": operator.irshift, "^": operator.ixor}
+
+
+def bind_pattern(pat, value, define):
+    """Assign a value to a target pattern (see ast.For): names, nested tuples and one *name."""
+    if isinstance(pat, str):
+        define(pat, value)
+        return
+    if isinstance(pat, tuple):
+        define(pat[1], list(value))
+        return
+    vals = list(value)
+    star = next((i for i, p in enumerate(pat) if isinstance(p, tuple)), None)
+    if star is None:
+        if len(vals) != len(pat):
+            raise ValueError(f"expected {len(pat)} values to unpack, got {len(vals)}")
+        for p, v in zip(pat, vals):
+            bind_pattern(p, v, define)
+        return
+    after = len(pat) - star - 1
+    if len(vals) < len(pat) - 1:
+        raise ValueError(f"expected at least {len(pat) - 1} values to unpack, got {len(vals)}")
+    for p, v in zip(pat[:star], vals[:star]):
+        bind_pattern(p, v, define)
+    define(pat[star][1], vals[star:len(vals) - after])
+    for p, v in zip(pat[star + 1:], vals[len(vals) - after:]):
+        bind_pattern(p, v, define)
 
 TENSOR_TYPES = {"Tensor", "Vec", "Mat", "Matrix", "Vec2", "Vec3", "Vec4"}
 DTYPE_NAMES = {"f16", "f32", "f64", "i32", "i64", "bool", "bf16", "fp8_e4m3", "fp8_e5m2", "fp6_e3m2",
                "fp6_e2m3", "fp4_e2m1", "int8", "int4", "fp8", "bf8", "fp4", "fp6"}
+
+
+_FRAME_ATTRS = {"gi_frame", "gi_code", "f_globals", "f_builtins", "f_locals", "f_back", "f_code", "tb_frame",
+                "tb_next", "cr_frame", "cr_code", "ag_frame", "ag_code", "co_code", "func_globals", "mro"}
+_PUBLIC_UNDERSCORE = {"_replace", "_asdict", "_fields", "_make", "_field_defaults", "_value_", "_name_",
+                      "_missing_", "_member_names_", "_member_map_", "_value2member_map_", "_ignore_", "_order_",
+                      "_generate_next_value_"}
 
 
 class _GenStop(BaseException):
@@ -151,14 +242,22 @@ class Interpreter:
         core = stdlib.core_builtins()
         self.globals.vars.update(core)
         self.globals.vars["testing"] = lambda: self.testing
+        from .helpers import builtins as _helper_builtins
+        for _k, _v in _helper_builtins().items():
+            self.globals.vars.setdefault(_k, _v)
         from .exceptions import builtins_table
         for _k, _v in builtins_table().items():
             self.globals.vars.setdefault(_k, _v)
-        self.modules = stdlib.modules(core)
-        from . import interop, crypto, hardware, sci, precision, data, concurrency, web, models
+        self.modules = LazyModules(stdlib.modules(core))
+        from . import interop, crypto, hardware, sci, precision, data, concurrency, models
         interop.install(self)
         models.install(self)
-        web.install(self)
+
+        def _web():
+            from . import web as _w
+            _w.install(self)                               # sets modules["web"] (asyncio loads only when used)
+            return dict.__getitem__(self.modules, "web")
+        self.modules.lazy("web", _web)
         data.install(self)
         concurrency.install(self)
         self.modules["sci"] = sci.module()
@@ -170,6 +269,17 @@ class Interpreter:
                 self.globals.vars.setdefault(k, v)
         self.globals.vars["einsum"] = sci.einsum
         self.modules["crypto"] = crypto.module()
+        from . import hp as _hp
+        self.modules["hp"] = _hp.module()
+        self.modules.lazy("rt", lambda: __import__("apsi.rt", fromlist=["module"]).module(self))
+        self.modules.lazy("tokens", lambda: __import__("apsi.tokens", fromlist=["module"]).module(self))
+        self.modules.lazy("memory", lambda: __import__("apsi.memory", fromlist=["module"]).module(self))
+        self.modules.lazy("db", lambda: __import__("apsi.db", fromlist=["module"]).module(self))
+        self.modules.lazy("env", lambda: __import__("apsi.envfile", fromlist=["module"]).module(self))
+        self.modules.lazy("dataframe", lambda: __import__("apsi.dataframe", fromlist=["module"]).module(self))
+        from . import pycompat as _pyc
+        self.modules["pycompat"] = _pyc.module(self)
+        self.globals.vars.setdefault("open", self.modules["pycompat"]["open"])   # checked by --allow-read/write
         self.modules["sys"] = hardware.module()
         self.modules["gpu"] = self.modules["sys"]
         from . import scale
@@ -218,8 +328,16 @@ class Interpreter:
 
     def run(self, source, filename="<main>", check=True, env=None, engine=None):
         prog = parse(source, cache=not filename.startswith("<"))
+        if getattr(self, "_main_dir", None) is None:
+            self._main_dir = os.path.dirname(os.path.abspath(filename)) if not filename.startswith("<") else \
+                os.getcwd()
         engine = engine or self.engine
+        from .checker import is_python_mode
+        if is_python_mode(prog) and not filename.startswith("<repl"):
+            env = None                                     # Python-exact files always compile
+            engine = "compile"
         if env is None and engine == "compile":
+            self._src_for_check = source
             return self._run_compiled(prog, filename, check)
         if check:
             from .checker import Checker
@@ -242,10 +360,17 @@ class Interpreter:
 
     def _check(self, prog, filename):
         from .checker import Checker
+        from . import check_cache
         base = os.path.dirname(os.path.abspath(filename)) if not filename.startswith("<") else os.getcwd()
-        errs = Checker(self, base).check(prog)
+        src, self._src_for_check = getattr(self, "_src_for_check", None), None
+        if src is not None and check_cache.known_clean(src, base, self):
+            return base
+        ch = Checker(self, base)
+        errs = ch.check(prog)
         if errs:
             raise CheckFailed(errs)
+        if src is not None:
+            check_cache.remember(src, base, self, ch.deps)
         return base
 
     def _run_compiled(self, prog, filename, check):
@@ -261,6 +386,7 @@ class Interpreter:
             self.dir_stack.pop()
         env = Env(self.globals)
         env.vars.update(comp.exports())
+        env.module = comp.module
         return env
 
     def _enter_import(self, path):
@@ -270,9 +396,65 @@ class Interpreter:
                           + "; move the shared code into a third file that both import")
         self.importing.append(path)
 
+    def import_module(self, path):
+        """`import "x.apsi" as m` in a Python-exact file: the module object itself (m._private works, objects
+        pickle by reference, the module is in sys.modules under its file name)."""
+        self.import_compiled(path)
+        env = self.module_cache[os.path.normpath(path)]
+        mod = getattr(env, "module", None)
+        if mod is None:
+            from .values import Namespace
+            return Namespace(os.path.basename(path), dict(env.vars))
+        return mod
+
+    def _shadow_name(self, dotted, path):
+        """A module whose Python name is already taken (a local json/ next to the program, say) lives under a
+        private top-level package, so `pkg.sub` attributes and pickling still work."""
+        import sys as _sys
+        import types as _types
+        if not all(p.isidentifier() for p in dotted.split(".")):
+            return f"apsi_{abs(hash(path)):x}"
+        root = f"apsi_{abs(hash(getattr(self, '_main_dir', '') or '')):x}"
+        if root not in _sys.modules:
+            pkg = _types.ModuleType(root)
+            pkg.__path__ = []
+            _sys.modules[root] = pkg
+        parts = dotted.split(".")
+        for i in range(1, len(parts)):                    # parents that are not modules of their own yet
+            pname = root + "." + ".".join(parts[:i])
+            if pname not in _sys.modules:
+                m = _types.ModuleType(pname)
+                m.__path__ = []
+                _sys.modules[pname] = m
+        return root + "." + dotted
+
+    def _dotted_name(self, path):
+        """Python's module name for a file: `pkg/sub.apsi` is `pkg.sub` when pkg is a package (has __init__),
+        `pkg/__init__.apsi` is `pkg`; the main program's own folder is never part of the name."""
+        path = os.path.abspath(path)
+        stem = os.path.splitext(os.path.basename(path))[0]
+        top = getattr(self, "_main_dir", None)
+        d = os.path.dirname(path)
+        parts = [] if stem == "__init__" else [stem]
+        while d != top and any(os.path.exists(os.path.join(d, f"__init__.{e}")) for e in ("apsi", "py")):
+            parts.insert(0, os.path.basename(d))
+            nd = os.path.dirname(d)
+            if nd == d:
+                break
+            d = nd
+        return ".".join(parts) or stem
+
     def import_compiled(self, path):
         path = os.path.normpath(path)
         if path not in self.module_cache:
+            import sys as _sys
+            stem = os.path.splitext(os.path.basename(path))[0]
+            dotted = self._dotted_name(path)
+            taken = _sys.modules.get(dotted)
+            name = dotted if all(p.isidentifier() for p in dotted.split(".")) and (
+                taken is None or os.path.normpath(getattr(taken, "__file__", "") or "") == os.path.abspath(path)) \
+                else self._shadow_name(dotted, path)
+            self._next_module_name = name
             if not os.path.exists(path):
                 raise NameErr(f"cannot find file '{path}'")
             with open(path, encoding="utf-8-sig") as fh:
@@ -290,6 +472,12 @@ class Interpreter:
                 self.tests = saved
                 self.importing.pop()
             self.module_cache[path] = menv
+            mod = getattr(menv, "module", None)
+            if mod is not None:
+                _sys.modules.setdefault(mod.__name__, mod)
+                parent, _, leaf = mod.__name__.rpartition(".")
+                if parent and parent in _sys.modules:
+                    setattr(_sys.modules[parent], leaf, mod)   # importing pkg.sub makes it pkg's attribute
         return {k: v for k, v in self.module_cache[path].vars.items() if not k.startswith("_")}
 
     def run_tests(self, report=print):
@@ -347,11 +535,15 @@ class Interpreter:
             env.define("_", v)
 
     def ex_Let(self, s, env):
+        if s.value is None:
+            return None
         v = self.eval(s.value, env)
         if len(s.targets) == 1:
             if s.type is not None:
                 v = self.check_type(v, s.type, {}, f"'{s.targets[0]}'", env)
             env.define(s.targets[0], v, const=not s.mutable)
+        elif any(isinstance(n, tuple) for n in s.targets):
+            bind_pattern(list(s.targets), v, lambda n, x: env.define(n, x, const=not s.mutable))
         else:
             vals = self._unpack(v, len(s.targets))
             for n, x in zip(s.targets, vals):
@@ -367,12 +559,26 @@ class Interpreter:
         return vals
 
     def ex_Assign(self, s, env):
-        self.assign(s.target, self.eval(s.value, env), env)
+        v = self.eval(s.value, env)
+        self.assign(s.target, v, env)
+        for t in s.more or ():
+            self.assign(t, v, env)
 
     def assign(self, t, v, env):
         if isinstance(t, A.Name):
             env.assign(t.id, v)
-        elif isinstance(t, A.TupleLit):
+        elif isinstance(t, (A.TupleLit, A.ListLit)) and any(isinstance(x, A.Spread) for x in t.items):
+            vals = list(v)
+            star = next(i for i, x in enumerate(t.items) if isinstance(x, A.Spread))
+            after = len(t.items) - star - 1
+            if len(vals) < len(t.items) - 1:
+                raise RuntimeErr(f"expected at least {len(t.items) - 1} values to unpack, got {len(vals)}")
+            for sub, x in zip(t.items[:star], vals[:star]):
+                self.assign(sub, x, env)
+            self.assign(t.items[star].value, vals[star:len(vals) - after], env)
+            for sub, x in zip(t.items[star + 1:], vals[len(vals) - after:]):
+                self.assign(sub, x, env)
+        elif isinstance(t, (A.TupleLit, A.ListLit)):
             vals = self._unpack(v, len(t.items))
             for sub, x in zip(t.items, vals):
                 self.assign(sub, x, env)
@@ -393,7 +599,32 @@ class Interpreter:
             v = float(v)
         obj[idx] = v
 
+    @staticmethod
+    def _own_object(obj, name=None):
+        """An instance (or class) defined by an Apsi program: its _private attributes are its own business. Also the
+        public underscore APIs of the standard library (namedtuple._replace, Enum._value_ …)."""
+        if name is not None and (name in _PUBLIC_UNDERSCORE or (len(name) > 2 and name.endswith("_")
+                                                                 and not name.startswith("__"))):
+            return True
+        from .codegen import is_own
+        return is_own(obj)
+
+    def del_attr(self, obj, name):
+        from .pycompat import check_attr, trusted
+        if name.startswith("_") and not (name.startswith("__") or trusted(self) or self._own_object(obj, name)):
+            raise RuntimeErr(f"cannot delete the private attribute '{name}'")
+        check_attr(self, name)
+        delattr(obj, name)
+
     def set_attr(self, obj, name, v):
+        if name.startswith("_") and not isinstance(obj, (StructInstance, Record)):
+            from .pycompat import check_attr, trusted
+            check_attr(self, name)
+            if trusted(self) or self._own_object(obj, name):
+                if name in ("__class__", "__code__", "__globals__") and not trusted(self):
+                    raise RuntimeErr(f"setting '{name}' needs --allow-python=all")
+                setattr(obj, name, v)
+                return
         if isinstance(obj, StructInstance):
             if name not in obj.fields:
                 raise RuntimeErr(f"{obj.type.name} has no field '{name}'")
@@ -401,10 +632,11 @@ class Interpreter:
         elif isinstance(obj, Record):
             obj.fields[name] = v
         else:
-            raise RuntimeErr(f"cannot set attribute '{name}' on {type_name(obj)}")
+            from .stdlib import _safe_setattr
+            _safe_setattr(obj, name, v)
 
     def ex_AugAssign(self, s, env):
-        fn = BINOPS[s.op]
+        fn = IOPS[s.op] if s.op in ("|", "&", "<<", ">>", "^") else BINOPS[s.op]
         t = s.target
         rhs = self.eval(s.value, env)
         if isinstance(t, A.Name):
@@ -455,7 +687,23 @@ class Interpreter:
                 raise
             except Exception as ex:                    # noqa: BLE001 - matched against the except clauses below
                 for kinds, name, body in s.handlers:
-                    if not kinds or X.matches(getattr(ex, "original", None) or ex, kinds) or X.matches(ex, kinds):
+                    classes = ()
+                    if kinds:
+                        cl = []
+                        for k in kinds:
+                            if X.ALIASES.get(k, k).split(".")[-1] in X.KINDS:
+                                continue
+                            try:
+                                v = self.lookup(k.split(".")[0], env, s)
+                                for part in k.split(".")[1:]:
+                                    v = getattr(v, part)
+                                if isinstance(v, type) and issubclass(v, BaseException):
+                                    cl.append(v)
+                            except Exception:          # noqa: BLE001 - not a class: matched by name
+                                pass
+                        classes = tuple(cl)
+                    if not kinds or X.matches(getattr(ex, "original", None) or ex, kinds, classes) \
+                            or X.matches(ex, kinds, classes):
                         henv = Env(env)
                         if name:
                             henv.vars[name] = X.value(getattr(ex, "original", None) or ex)
@@ -480,7 +728,10 @@ class Interpreter:
             if not self._handling:
                 raise RuntimeErr("'raise' without a value is only allowed inside an 'except' block")
             raise self._handling[-1]
-        raise X.to_raise(self.eval(s.value, env))
+        ex = X.to_raise(self.eval(s.value, env))
+        if s.cause is not None:
+            raise ex from X.to_raise(self.eval(s.cause, env))
+        raise ex
 
     def ex_While(self, s, env):
         while self.truthy(self.eval(s.cond, env)):
@@ -490,6 +741,83 @@ class Interpreter:
                 break
             except ContinueSignal:
                 continue
+        else:
+            if s.else_body:
+                self.exec_block(s.else_body, Env(env))
+
+    def ex_With(self, s, env):
+        from contextlib import ExitStack
+        from .codegen import _ctx
+        wenv = Env(env)
+        with ExitStack() as stack:
+            for e, target in s.items:
+                v = stack.enter_context(_ctx(self.eval(e, env)))
+                if target is not None:
+                    bind_pattern(target, v, lambda n, x: wenv.define(n, x))
+            self.exec_block(s.body, wenv)
+
+    def ex_Del(self, s, env):
+        for t in s.targets:
+            if isinstance(t, A.Name):
+                e = env
+                while e is not None and t.id not in e.vars:
+                    e = e.parent
+                if e is None:
+                    raise NameErr(f"'{t.id}' is not defined", t.line, t.col)
+                del e.vars[t.id]
+            elif isinstance(t, A.Attr):
+                self.del_attr(self.eval(t.obj, env), t.name)
+            elif isinstance(t, A.Index):
+                del self.eval(t.obj, env)[self.eval_index(t.index, env)]
+
+    def ex_Global(self, s, env):
+        pass
+
+    def ex_ClassDef(self, s, env):
+        """A real Python class whose methods are Apsi functions."""
+        bases = tuple(self.eval(b, env) for b in s.bases)
+        kw = {k: self.eval(v, env) for k, v in s.kwargs if k is not None}
+        ns = {"__module__": "__apsi__", "__qualname__": s.name}
+        cenv = Env(env)
+        menv_all = []
+        annotations = {}
+        interp = self
+        for item in s.body:
+            if isinstance(item, A.FnDef):
+                menv = Env(env)                            # holds __class__ for zero-argument super()
+                if item.params and item.params[0].name:
+                    menv.vars["__selfname__"] = item.params[0].name
+                menv_all.append(menv)
+                f = Function(self, item.name, item.params, item.ret, item.body, item.is_expr, menv, item.shape_params)
+
+                def method(*a, _f=f, **k):
+                    return interp.call_value(_f, list(a), k)
+                method.__name__ = method.__qualname__ = item.name
+                m = method
+                for d in reversed(item.decorators):
+                    m = self.call_value(self.eval(d, cenv), [m], {})
+                ns[item.name] = m
+                cenv.vars[item.name] = m
+            elif isinstance(item, A.FieldDef):
+                annotations[item.name] = item.annotation[1]
+                if item.value is not None:
+                    ns[item.name] = cenv.vars[item.name] = self.eval(item.value, cenv)
+            elif isinstance(item, A.ExprStmt) and isinstance(item.expr, A.Str) and "__doc__" not in ns:
+                ns["__doc__"] = item.expr.value
+            else:
+                self.exec_stmt(item, cenv) if hasattr(self, "exec_stmt") else self.exec_block([item], cenv)
+                ns.update({k: v for k, v in cenv.vars.items() if k not in ns})
+        if annotations:
+            ns["__annotations__"] = annotations
+        meta = kw.pop("metaclass", type(bases[0]) if bases else type)
+        cls = meta(s.name, bases or (object,), ns, **kw)
+        for menv in menv_all:
+            menv.vars["__class__"] = cls
+        for d in reversed(s.decorators):
+            cls = self.call_value(self.eval(d, env), [cls], {})
+        from .codegen import own_class
+        own_class(cls)
+        env.define(s.name, cls)
 
     def ex_For(self, s, env):
         it = self.eval(s.iter, env)
@@ -497,20 +825,19 @@ class Interpreter:
             raise RuntimeErr("cannot iterate over a number; use 0..n or range(n)")
         if isinstance(it, Record):
             it = list(it.fields.items())
-        n = len(s.targets)
+        pat = s.targets[0] if len(s.targets) == 1 else list(s.targets)
         for item in it:
             loop_env = Env(env)
-            if n == 1:
-                loop_env.define(s.targets[0], item, const=True)
-            else:
-                for name, x in zip(s.targets, self._unpack(item, n)):
-                    loop_env.define(name, x, const=True)
+            bind_pattern(pat, item, lambda n, x: loop_env.define(n, x, const=True))
             try:
                 self.exec_block(s.body, loop_env)
             except BreakSignal:
                 break
             except ContinueSignal:
                 continue
+        else:
+            if s.else_body:
+                self.exec_block(s.else_body, Env(env))
 
     def ex_Return(self, s, env):
         raise ReturnSignal(self.eval(s.value, env) if s.value is not None else None)
@@ -808,14 +1135,55 @@ class Interpreter:
         return n.value
 
     def ev_FStr(self, n, env):
+        from .codegen import _conv
         out = []
         for p in n.parts:
             if isinstance(p, str):
                 out.append(p)
             else:
-                e, spec = p
-                out.append(fmt(self.eval(e, env), True, spec))
+                e, spec = p[0], p[1]
+                v = self.eval(e, env)
+                if len(p) > 2:
+                    v = _conv(v, p[2])
+                if isinstance(spec, A.FStr):
+                    spec = self.ev_FStr(spec, env)
+                out.append(fmt(v, True, spec))
         return "".join(out)
+
+    def ev_Bytes(self, n, env):
+        return n.value
+
+    def ev_SetLit(self, n, env):
+        out = set()
+        for x in n.items:
+            if isinstance(x, A.Spread):
+                out.update(self.eval(x.value, env))
+            else:
+                out.add(self.eval(x, env))
+        return out
+
+    def ev_SetComp(self, n, env):
+        return {self.eval(n.elem, e) for e in self._comp_envs(n, env)}
+
+    def ev_GenExp(self, n, env):
+        return (self.eval(n.elem, e) for e in self._comp_envs(n, env))
+
+    def ev_Chain(self, n, env):
+        a = self.eval(n.operands[0], env)
+        for op, x in zip(n.ops, n.operands[1:]):
+            b = self.eval(x, env)
+            if not self.truthy(BINOPS[op](a, b)):
+                return False
+            a = b
+        return True
+
+    def ev_NamedExpr(self, n, env):
+        v = self.eval(n.value, env)
+        try:
+            env.assign(n.name, v)
+        except Exception:                                  # noqa: BLE001 - first use: a new variable
+            env.define(n.name, v)
+        return v
 
     def ev_Bool(self, n, env):
         return n.value
@@ -845,6 +1213,8 @@ class Interpreter:
             return -v
         if n.op == "+":
             return +v
+        if n.op == "~":
+            return ~v
         return not self.truthy(v)
 
     def ev_Binary(self, n, env):
@@ -877,6 +1247,17 @@ class Interpreter:
         return self.eval(n.a, env) if self.truthy(self.eval(n.cond, env)) else self.eval(n.b, env)
 
     def ev_Call(self, n, env):
+        if isinstance(n.func, A.Name) and n.func.id == "super" and not n.args and not n.kwargs:
+            e = env                                        # zero-argument super() inside a method
+            while e is not None and "__class__" not in e.vars:
+                e = e.parent
+            if e is not None:
+                first = e.vars.get("__selfname__")
+                se = env
+                while se is not None and first not in se.vars:
+                    se = se.parent
+                if se is not None:
+                    return super(e.vars["__class__"], se.vars[first])
         f = self.eval(n.func, env)
         args = []
         for a in n.args:
@@ -1112,50 +1493,75 @@ class Interpreter:
         if isinstance(obj, UnitNamespace):
             return obj.get(name)
         if name.startswith("_"):
-            raise RuntimeErr(f"cannot access private attribute '{name}'")
+            from .pycompat import check_attr, trusted
+            if name.startswith("__") and name.endswith("__"):
+                check_attr(self, name, obj)                # dunders: allowed except interpreter internals
+            elif not (trusted(self) or self._own_object(obj, name)):
+                raise RuntimeErr(f"cannot access private attribute '{name}'")
+            try:
+                return getattr(obj, name)
+            except AttributeError:
+                raise RuntimeErr(f"{type_name(obj)} has no attribute '{name}'")
         if isinstance(obj, np.ndarray) and name == "shape":
             return tuple(obj.shape)
+        if name in _FRAME_ATTRS:
+            from .pycompat import check_attr
+            check_attr(self, name, obj)
+        if name in ("tofile", "dump") and isinstance(obj, np.ndarray):
+            from .pycompat import trusted
+            if not trusted(self):
+                raise RuntimeErr(f"array.{name}() writes a file without Apsi's permission checks; use "
+                                 f"numpy.save() (checked by --allow-write) or run with --allow-python=all")
         try:
             return getattr(obj, name)
         except AttributeError:
             raise RuntimeErr(f"{type_name(obj)} has no attribute '{name}'")
 
     def ev_ListLit(self, n, env):
-        return [self.eval(x, env) for x in n.items]
+        out = []
+        for x in n.items:
+            if isinstance(x, A.Spread):
+                out.extend(self.eval(x.value, env))
+            else:
+                out.append(self.eval(x, env))
+        return out
 
     def ev_TupleLit(self, n, env):
         return tuple(self.eval(x, env) for x in n.items)
 
     def ev_DictLit(self, n, env):
-        return {self.eval(k, env): self.eval(v, env) for k, v in n.pairs}
+        out = {}
+        for k, v in n.pairs:
+            if k is None:
+                out.update(self.eval(v.value, env))
+            else:
+                out[self.eval(k, env)] = self.eval(v, env)
+        return out
+
+    def _comp_envs(self, n, env):
+        """Every environment of a comprehension's for-clauses, in Python's order."""
+        clauses = [(n.targets, n.iter, n.cond)] + list(n.more or [])
+
+        def walk(i, env):
+            if i == len(clauses):
+                yield env
+                return
+            targets, itx, cond = clauses[i]
+            pat = targets[0] if len(targets) == 1 else list(targets)
+            for item in self.eval(itx, env):
+                e = Env(env)
+                bind_pattern(pat, item, e.vars.__setitem__)
+                if cond is None or self.truthy(self.eval(cond, e)):
+                    yield from walk(i + 1, e)
+        return walk(0, env)
 
     def ev_ListComp(self, n, env):
-        out = []
-        it = self.eval(n.iter, env)
-        k = len(n.targets)
-        for item in it:
-            e = Env(env)
-            if k == 1:
-                e.vars[n.targets[0]] = item
-            else:
-                for name, x in zip(n.targets, self._unpack(item, k)):
-                    e.vars[name] = x
-            if n.cond is None or self.truthy(self.eval(n.cond, e)):
-                out.append(self.eval(n.elem, e))
-        return out
+        return [self.eval(n.elem, e) for e in self._comp_envs(n, env)]
 
     def ev_DictComp(self, n, env):
         out = {}
-        k = len(n.targets)
-        for item in self.eval(n.iter, env):
-            e = Env(env)
-            if k == 1:
-                e.vars[n.targets[0]] = item
-            else:
-                for name, x in zip(n.targets, self._unpack(item, k)):
-                    e.vars[name] = x
-            if n.cond is None or self.truthy(self.eval(n.cond, e)):
-                out[self.eval(n.key, e)] = self.eval(n.value, e)
+        for e in self._comp_envs(n, env):
+            out[self.eval(n.key, e)] = self.eval(n.value, e)
         return out
 
     def ev_Lambda(self, n, env):

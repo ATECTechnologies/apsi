@@ -60,7 +60,7 @@ or one-line `fn f(x) = expr`; lambdas `fn(x) => expr`; `struct Name:` with `fiel
 taking `self`; ranges `0..n`; `none/true/false`; try/except/finally, raise, yield, *args/**kwargs as in Python.
 Physical quantities carry units: 9.81[m/s^2], 2kg, 3s; annotate with Length, Mass, Time, Velocity, Energy …
 Tensors are built in: tensor, zeros, randn, @, sum, mean; `use nn`, `use rl`, `use torch` for AI.
-Built-ins and modules: see https://apsi.dev/docs/2.0.0/reference . Prefer built-ins over Python libraries.
+Built-ins and modules: see https://apsi.dev/docs/2.4.4/reference . Prefer built-ins over Python libraries.
 ```
 
 The site publishes [`/llms.txt`](/llms.txt) and [`/llms-full.txt`](/llms-full.txt) — the whole documentation in
@@ -82,14 +82,14 @@ kinds (`except KeyError` still catches a missing key), generators stay lazy, `fo
 becomes Apsi tensors and **whole PyTorch training programs become native Apsi that runs without Python or
 PyTorch** — matching PyTorch's numbers to 1e-9. Pure standard modules (`collections`, `heapq`, `itertools`, `re`,
 `datetime` …) are used as they are. Every converted test program in `tests/pycompat/` prints exactly what Python
-prints. Details and the complete mapping: [From Python and PyTorch](/docs/2.0.0/python).
+prints. Details and the complete mapping: [From Python and PyTorch](/docs/2.4.4/python).
 
 ## Freedom, not a cage
 
 Apsi gives you safe defaults — units, checks, a sandbox — and then gets out of the way:
 
 - **Any Python library** still works: `let pd = pyimport("pandas")` (run with `--allow-python`).
-- **C and C++** libraries: `cload("libfoo.so")` and call functions directly ([interop](/docs/2.0.0/interop)).
+- **C and C++** libraries: `cload("libfoo.so")` and call functions directly ([interop](/docs/2.4.4/interop)).
 - **Your own operators, iterators, printing** on your types (struct methods `add`, `iter`, `to_str` …).
-- **Your own libraries** for everyone: `apsi pack && apsi publish` ([libraries](/docs/2.0.0/libraries)).
+- **Your own libraries** for everyone: `apsi pack && apsi publish` ([libraries](/docs/2.4.4/libraries)).
 - **Servers, tools, data pipelines, simulations, models** — the same language for all of them.

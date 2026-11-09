@@ -178,11 +178,17 @@ PURE_MODULES = {"collections", "heapq", "bisect", "itertools", "functools", "cop
                 "fractions", "decimal", "datetime", "calendar", "enum", "statistics", "cmath", "math", "random",
                 "json", "typing", "dataclasses", "array", "numbers", "difflib", "unicodedata", "hashlib", "hmac",
                 "base64", "binascii", "zlib", "struct", "secrets", "graphlib", "colorsys", "uuid", "keyword",
-                "html", "abc", "contextlib", "pprint"}
-_PURE_DROP = {"functools": {"_lru_cache_wrapper"}, "json": {"load", "dump"}, "pprint": {"PrettyPrinter"},
+                "html", "abc", "contextlib", "pprint", "time", "argparse", "warnings", "operator", "queue",
+                "threading", "ipaddress", "shlex", "weakref", "numbers", "zoneinfo", "textwrap"}
+_PURE_DROP = {"functools": {"_lru_cache_wrapper"}, "pprint": {"PrettyPrinter"}, "operator": {"attrgetter",
+                                                                                              "methodcaller"},
               "contextlib": {"redirect_stdout", "redirect_stderr", "chdir"}, "random": {"SystemRandom"},
               "uuid": {"getnode", "uuid1"}}
 _pure_cache = {}
+
+
+class PyModuleMissing(RuntimeErr, ModuleNotFoundError):
+    """A missing Python module: an Apsi error that `except ImportError` in converted code also catches."""
 
 
 def pure_module(name):
@@ -224,7 +230,9 @@ def install(interp):
         try:
             return importlib.import_module(name)
         except ImportError as e:
-            raise RuntimeErr(f"Python module '{name}' is not installed ({e})")
+            err = PyModuleMissing(f"Python module '{name}' is not installed ({e})")
+            err.name = name
+            raise err from None
         finally:
             if added and cwd in _sys.path:
                 _sys.path.remove(cwd)

@@ -1,9 +1,9 @@
-# Apsi 2.0.0 — everything on one page
+# Apsi 2.4.4 — everything on one page
 
 This page is the whole language in one place: every piece of syntax with a short example, then **every built-in
-function, every standard module and every member, and every command** of Apsi 2.0.0, generated from the runtime
+function, every standard module and every member, and every command** of Apsi 2.4.4, generated from the runtime
 itself so nothing is missing. Read it top to bottom once, then use it with your browser's search (Ctrl+F).
-The long-form explanations live in the [language reference](/docs/2.0.0/language).
+The long-form explanations live in the [language reference](/docs/2.4.4/language).
 
 ## How a program looks
 
@@ -182,7 +182,7 @@ Programs run sandboxed. Files, network, environment variables and Python need ex
 or `--allow-all`. `apsi audit app.apsi` prints exactly the flags a program needs. Pure standard modules (`pyimport("collections")`, heapq, itertools, re, datetime …) need no flag.
 
 
-## Built-in functions and values (253)
+## Built-in functions and values (298)
 
 Available everywhere without `use`. Grouped by first letter; the signature shows parameters (`=…` means optional).
 
@@ -199,7 +199,9 @@ Available everywhere without `use`. Grouped by first letter; the signature shows
 | `argmax(x, axis=None)` | index of the largest value (along an axis) |
 | `argmin(x, axis=None)` | index of the smallest value (along an axis) |
 | `args()` | Command-line arguments after the program name: `apsi run app.apsi a b` -> ["a", "b"]. |
+| `argsort(xs, reverse=False)` | function |
 | `ArithmeticError(/, *args, **kwargs)` | Base class for arithmetic errors. |
+| `ascii(obj, /)` | Return an ASCII-only representation of an object. |
 | `asin(x)` | inverse sine, radians |
 | `AssertionError(/, *args, **kwargs)` | Assertion failed. |
 | `atan(x)` | inverse tangent, radians |
@@ -218,6 +220,8 @@ Available everywhere without `use`. Grouped by first letter; the signature shows
 | `bool(/, *args, **kwargs)` | true/false of a value |
 | `bor(a, b)` | `a | b` of Python: bits, set union, dict merge, element-wise or |
 | `bxor(a, b)` | `a ^ b` of Python |
+| `bytearray(/, *args, **kwargs)` | bytearray(iterable_of_ints) -> bytearray bytearray(string, encoding[, errors]) -> bytearray bytearray(bytes_or_buffer) -> mutable copy of bytes_or_buffer bytearray(int) -> bytes array of size given by the parameter initi |
+| `bytes(/, *args, **kwargs)` | bytes(iterable_of_ints) -> bytes bytes(string, encoding[, errors]) -> bytes bytes(bytes_or_buffer) -> immutable copy of bytes_or_buffer bytes(int) -> bytes object of size given by the parameter initialized with null byte |
 
 ### C
 
@@ -229,13 +233,19 @@ Available everywhere without `use`. Grouped by first letter; the signature shows
 | `chain_lists(xss)` | join a list of lists into one list |
 | `chars(s)` | the characters of a string as a list |
 | `chr(i, /)` | Return a Unicode string of one character with ordinal i; 0 <= i <= 0x10ffff. |
+| `chunks(xs, n)` | function |
+| `clamp(x, lo, hi)` | function |
+| `classmethod(/, *args, **kwargs)` | Convert a function to be a class method. |
 | `clip(x, lo, hi)` | limit values to [lo, hi] |
 | `cload(path)` | load a C library (needs --allow-ffi) |
 | `clock()` | time since the program started, in seconds (a Quantity) |
+| `combinations(xs, k)` | function |
+| `complex(/, *args, **kwargs)` | Create a complex number from a string or numbers. |
 | `concat(items, axis=0)` | join tensors along an axis |
 | `ConnectionError(/, *args, **kwargs)` | Connection error. |
 | `cos(x)` | cosine (radians or an angle quantity) |
 | `cosh(x)` | hyperbolic cosine |
+| `count_by(xs, key=None)` | function |
 | `cross(a, b)` | cross product of 3-vectors |
 | `cstr` | value |
 | `cumsum(x, axis=None)` | running sum |
@@ -248,6 +258,7 @@ Available everywhere without `use`. Grouped by first letter; the signature shows
 | `derivative(f, x)` | numerical derivative of a function at a point |
 | `dict(/, *args, **kwargs)` | make a dictionary |
 | `dim(x)` | the physical dimension of a value (length, time …) |
+| `dir(obj=None)` | function |
 | `divmod(x, y, /)` | Return the tuple (x//y, x%y). Invariant: div*y + mod == x. |
 | `dot(a, b)` | dot product |
 
@@ -270,6 +281,7 @@ Available everywhere without `use`. Grouped by first letter; the signature shows
 | `exists(path)` | true when a file exists (needs read permission) |
 | `exit(code=0)` | Stop the program with an exit status (0 = success). |
 | `exp(x)` | e to the power x |
+| `expm1(x)` | function |
 | `eye(n)` | identity matrix |
 
 ### F
@@ -286,6 +298,7 @@ Available everywhere without `use`. Grouped by first letter; the signature shows
 | `float(x)` | convert to a floating-point number |
 | `FloatingPointError(/, *args, **kwargs)` | Floating-point operation failed. |
 | `floor(x)` | round down to an integer |
+| `flush_out()` | function |
 | `format(value, format_spec='', /)` | Return type(value).__format__(value, format_spec) |
 | `format_info(fmt)` | details of a number format (f16, bf16, f32 …) |
 | `fp16` | value |
@@ -315,16 +328,19 @@ Available everywhere without `use`. Grouped by first letter; the signature shows
 | `gpu(*args, **kwargs)` | run work on the GPU when one is available |
 | `gpu_info()` | The GPUs Apsi can use (needs the NVIDIA driver; no CUDA toolkit). |
 | `grad(f, wrt=0)` | gradient of a function (automatic differentiation) |
+| `group_by(xs, key)` | function |
 
 ### H
 
 | Name | What it is |
 |---|---|
 | `hasattr(obj, name)` | true when a value has a field or method |
+| `hash(x)` | A stable hash for numbers, strings, tuples and struct instances; tensors hash their bytes. |
 | `hessian(f)` | hessian(f)(x) -> matrix of second derivatives of a scalar f. |
 | `hex(number, /)` | Return the hexadecimal representation of an integer. |
 | `http_get(url, timeout=30)` | download a URL (needs --allow-net) |
 | `http_post_json(url, data, timeout=30)` | POST JSON to a URL (needs --allow-net) |
+| `hypot(*xs)` | √(Σ x²) without overflow/underflow; works with quantities of the same unit and with tensors. |
 
 ### I
 
@@ -332,15 +348,20 @@ Available everywhere without `use`. Grouped by first letter; the signature shows
 |---|---|
 | `i32` | value |
 | `i64` | value |
+| `id(obj, /)` | Return the identity of an object. |
 | `ImportError(/, *args, **kwargs)` | Import can't find module, or can't find name in module. |
 | `IndexError(/, *args, **kwargs)` | Sequence index out of range. |
 | `inf` | constant |
 | `input(prompt='')` | Read one line from standard input (without the newline); returns none at end of input. |
-| `int(x)` | convert to an integer |
+| `int(x, base=None)` | convert to an integer |
 | `int4` | value |
 | `int8` | value |
 | `IOError(/, *args, **kwargs)` | Base class for I/O related errors. |
 | `IsADirectoryError(/, *args, **kwargs)` | Operation doesn't work on directories. |
+| `isfinite(x)` | function |
+| `isinstance(x, t)` | type test |
+| `isnan(x)` | function |
+| `issubclass(cls, class_or_tuple, /)` | Return whether 'cls' is derived from another class or is the same class. |
 | `iter(…)` | iter(iterable) -> iterator iter(callable, sentinel) -> iterator |
 
 ### J
@@ -365,6 +386,7 @@ Available everywhere without `use`. Grouped by first letter; the signature shows
 |---|---|
 | `laplace(f)` | laplace(f)(x) -> Σ ∂²f/∂x_i² (trace of the Hessian), e.g. for PDE residuals. |
 | `len(x)` | number of items |
+| `lerp(a, b, t)` | function |
 | `library_path(path)` | The actual file cload() would load (e.g. vecmath -> vecmath.dll on Windows). |
 | `linspace(start, stop, n=50)` | n evenly spaced values from start to stop |
 | `list(x=())` | make a list from any sequence |
@@ -372,8 +394,10 @@ Available everywhere without `use`. Grouped by first letter; the signature shows
 | `load_json(path)` | read a JSON file |
 | `log(x)` | natural logarithm |
 | `log10(x)` | base-10 logarithm |
+| `log1p(x)` | function |
 | `log2(x)` | base-2 logarithm |
 | `log_softmax(x, axis=-1)` | log of softmax, numerically stable |
+| `logsumexp(xs, axis=None)` | function |
 | `LookupError(/, *args, **kwargs)` | Base class for lookup errors. |
 
 ### M
@@ -383,13 +407,15 @@ Available everywhere without `use`. Grouped by first letter; the signature shows
 | `magnitude(x)` | the number without its unit (in SI base units) |
 | `map(f, xs)` | apply a function to every item |
 | `matmul(a, b)` | matrix product (also `a @ b`) |
-| `max(*args, axis=None, keepdims=False)` | largest value (of a list/tensor, or of the arguments) |
-| `mean(x, axis=None, keepdims=False)` | average |
+| `max(*args, axis=None, keepdims=False, key=None, default=…)` | largest value (of a list/tensor, or of the arguments) |
+| `mean(x, axis=None, keepdims=False, start=None)` | average |
 | `measure(value, sigma)` | value ± sigma -> an independent measurement with standard uncertainty sigma. |
+| `median(xs)` | function |
 | `memo(fn)` | cache a function's results (@memo) |
 | `MemoryError(/, *args, **kwargs)` | Out of memory. |
 | `meshgrid(x, y)` | coordinate grids from 1-D axes |
-| `min(*args, axis=None, keepdims=False)` | smallest value |
+| `min(*args, axis=None, keepdims=False, key=None, default=…)` | smallest value |
+| `mode(xs)` | function |
 | `ModuleNotFoundError(/, *args, **kwargs)` | Module not found. |
 
 ### N
@@ -398,6 +424,7 @@ Available everywhere without `use`. Grouped by first letter; the signature shows
 |---|---|
 | `NameError(/, *args, **kwargs)` | Name not found globally. |
 | `nan` | constant |
+| `nan_to_num(x, nan=0.0, posinf=None, neginf=None)` | function |
 | `native(*args, **kwargs)` | compile a function to machine code (@native) |
 | `native_info()` | What the native compiler sees on this machine (CPU, SIMD, threads, cache). |
 | `native_threads(n=None)` | Number of CPU threads `parallel for` and large tensor kernels use (set it with an argument). |
@@ -412,9 +439,11 @@ Available everywhere without `use`. Grouped by first letter; the signature shows
 
 | Name | What it is |
 |---|---|
+| `object(/, *args, **kwargs)` | The base class of the class hierarchy. |
 | `oct(number, /)` | Return the octal representation of an integer. |
 | `ones(*shape, dtype=None)` | tensor of ones |
 | `ones_like(x)` | ones with the shape of another tensor |
+| `open(file, mode='r', *args, **kwargs)` | function |
 | `ord(character, /)` | Return the ordinal value of a character. |
 | `OSError(/, *args, **kwargs)` | Base class for I/O related errors. |
 | `outer(a, b)` | outer product |
@@ -424,22 +453,27 @@ Available everywhere without `use`. Grouped by first letter; the signature shows
 
 | Name | What it is |
 |---|---|
+| `pairwise(xs)` | function |
 | `param_count(tree)` | number of trainable numbers in a model |
 | `PermissionError(/, *args, **kwargs)` | Not enough permissions. |
 | `permissions()` | the permissions the program runs with |
 | `permutation(n, seed=None)` | random permutation of 0..n |
+| `permutations(xs, k=None)` | function |
 | `permute(x, *dims)` | Reorder the axes (PyTorch's x.permute(...)). |
 | `pi` | constant |
 | `platform()` | "windows", "linux" or "macos". |
 | `pmap(f, xs, workers=None)` | Parallel map on a thread pool (numpy/BLAS work releases the GIL). |
 | `pow(base, exp, mod=None)` | Equivalent to base**exp with 2 arguments or base**exp % mod with 3 arguments |
 | `precision(dtype)` | @precision(f32) / @precision(exact): numeric precision of a function. |
-| `print(*args, sep=' ', end='\n')` | write values to the output, separated by spaces |
+| `print(*args, sep=' ', end='\n', flush=False, file=None)` | write values to the output, separated by spaces |
 | `prod(x, axis=None)` | product of all values |
+| `product(*lists, repeat=1)` | function |
+| `property(/, *args, **kwargs)` | Property attribute. |
 | `ptr_f32` | value |
 | `ptr_f64` | value |
 | `ptr_i32` | value |
 | `ptr_i64` | value |
+| `py_type_name(x)` | The name Python would give the type of x (int, float, str, list, dict, or the struct's name). |
 | `pyimport(name)` | use a Python module (pure ones like collections need no permission) |
 
 ### Q
@@ -475,11 +509,14 @@ Available everywhere without `use`. Grouped by first letter; the signature shows
 
 | Name | What it is |
 |---|---|
+| `safe_div(a, b, default=0.0)` | function |
 | `save_csv(path, data, header='')` | write rows to a CSV file |
 | `save_json(path, value)` | write a value as a JSON file |
 | `security_policy()` | the active security profile |
 | `seed(n)` | make random numbers reproducible |
 | `set(/, *args, **kwargs)` | a set: unique items, fast `in` |
+| `set_recursion_limit(n)` | Allow deeper recursion (Python's sys.setrecursionlimit), capped at 1 000 000; the stack grows with it. |
+| `setattr(obj, name, value)` | function |
 | `shape(x)` | shape of a tensor |
 | `shl(a, b)` | `a << b` |
 | `shr(a, b)` | `a >> b` |
@@ -487,6 +524,7 @@ Available everywhere without `use`. Grouped by first letter; the signature shows
 | `sigmoid(x)` | 1 / (1 + e^-x) |
 | `sin(x)` | sine (radians or an angle quantity) |
 | `sinh(x)` | hyperbolic sine |
+| `slice(/, *args, **kwargs)` | slice(stop) slice(start, stop[, step]) |
 | `softmax(x, axis=-1)` | normalised exponentials (probabilities) |
 | `softplus(x)` | log(1 + e^x) |
 | `sort(x)` | sorted copy of a tensor |
@@ -494,11 +532,13 @@ Available everywhere without `use`. Grouped by first letter; the signature shows
 | `sqrt(x)` | square root (units become their square root) |
 | `squeeze(x, axis=None)` | Remove axes of length 1 (only `axis` when given, and only if it has length 1, as in PyTorch). |
 | `stack(items, axis=0)` | stack tensors along a new axis |
+| `staticmethod(/, *args, **kwargs)` | Convert a function to be a static method. |
 | `std(x, axis=None)` | standard deviation |
 | `stop_gradient(x)` | use a value without differentiating through it |
 | `StopIteration(/, *args, **kwargs)` | Signal the end from iterator.__next__(). |
 | `str(x)` | text form of a value |
-| `sum(x, axis=None, keepdims=False)` | sum of all values (or along an axis) |
+| `sum(x, axis=None, keepdims=False, start=None)` | sum of all values (or along an axis) |
+| `super(/, *args, **kwargs)` | super() -> same as super(__class__, <first argument>) super(type) -> unbound super object super(type, obj) -> bound super object; requires isinstance(obj, type) super(type, type2) -> bound super object; requires issubcla |
 | `swapaxes(x, a, b)` | Exchange two axes (PyTorch's x.transpose(a, b)). |
 
 ### T
@@ -511,6 +551,7 @@ Available everywhere without `use`. Grouped by first letter; the signature shows
 | `tensor(x, dtype=None)` | make a tensor from numbers or nested lists (dtype=…) |
 | `testing()` | true while `apsi test` runs |
 | `timed(fn)` | @timed: print how long each call takes. |
+| `timeit(f, repeat=5, warmup=1)` | Run f() repeat times after warm-up runs; seconds as a record(best, median, mean, runs). |
 | `TimeoutError(/, *args, **kwargs)` | Timeout expired. |
 | `to_float(x)` | plain float from a quantity or 1-element tensor |
 | `to_py(x)` | Apsi value -> plain Python/JSON-friendly value (units become {value, unit}). |
@@ -541,6 +582,7 @@ Available everywhere without `use`. Grouped by first letter; the signature shows
 | `value_and_grad(f, wrt=0)` | value and gradient of a function (automatic differentiation) |
 | `ValueError(/, *args, **kwargs)` | Inappropriate argument value (of correct type). |
 | `var(x, axis=None)` | variance |
+| `vars(obj)` | The fields of a struct or record as a dict. |
 | `void` | value |
 
 ### W
@@ -548,6 +590,9 @@ Available everywhere without `use`. Grouped by first letter; the signature shows
 | Name | What it is |
 |---|---|
 | `where(cond, a, b)` | choose element-wise: where(cond, a, b) |
+| `windows(xs, n)` | function |
+| `write_err(text)` | function |
+| `write_out(text)` | Write text without a line break (Python's sys.stdout.write). |
 | `write_text(path, text)` | write a text file (needs write permission) |
 
 ### Z
@@ -559,7 +604,7 @@ Available everywhere without `use`. Grouped by first letter; the signature shows
 | `zeros_like(x)` | zeros with the shape of another tensor |
 | `zip(*xs)` | pairs items of several lists |
 
-## Standard modules (34)
+## Standard modules (42)
 
 Load a module with `use NAME` (all its names) or `use NAME as n` (then `n.member`).
 
@@ -612,6 +657,52 @@ Load a module with `use NAME` (all its names) or `use NAME as n` (then `n.member
 | `unbatch(p)` | function |
 | `window(p, size, shift=1, drop_last=True)` | Sliding windows over a stream: each item is a tensor of `size` consecutive items (time series). |
 
+### `use dataframe` — 12 names
+
+| Name | What it is |
+|---|---|
+| `col(name)` | function |
+| `concat(frames)` | function |
+| `count()` | function |
+| `DataFrame(data=None, columns=None)` | type |
+| `Expr(fn, name, agg=None)` | A column expression, evaluated against a DataFrame: col("a") * 2 > col("b"). |
+| `frame(data=None, columns=None)` | type |
+| `from_csv_text(text, sep=',', columns=None)` | function |
+| `from_records(rows, columns=None)` | function |
+| `lit(v)` | function |
+| `read_csv(path, sep=',', columns=None, interp=None)` | function |
+| `read_json(path, interp=None)` | A JSON array of objects, or an object of columns → a DataFrame. |
+| `read_jsonl(path, interp=None)` | One JSON object per line (JSON Lines / NDJSON) → a DataFrame (missing keys become nulls). |
+
+### `use db` — 7 names
+
+| Name | What it is |
+|---|---|
+| `DatabaseError(msg, code=None, detail=None)` | An error reported by the database server (has .code: the SQLSTATE for PostgreSQL). |
+| `pool(url, size=8, **kw)` | function |
+| `postgres(url=None, **kw)` | function |
+| `redis(url=None, **kw)` | function |
+| `RedisError(msg, code=None, detail=None)` | type |
+| `Result(rows=(), columns=(), status='', rowcount=0)` | Rows of a query (a list), with .columns, .rowcount (rows affected) and .status ("INSERT 0 3" …). |
+| `sqlite(path=':memory:')` | function |
+
+### `use env` — 12 names
+
+| Name | What it is |
+|---|---|
+| `bool(name, default=False)` | function |
+| `float(name, default=None)` | function |
+| `get(name, default=None)` | function |
+| `has(name)` | function |
+| `int(name, default=None)` | function |
+| `list(name, sep=',', default=None)` | function |
+| `load(path='.env', override=True, export=False)` | Read a .env file (needs --allow-read for it). Returns the names it defined. |
+| `parse(text)` | Parse .env text into a dict (the same rules as python-dotenv / docker compose). |
+| `require(*names)` | function |
+| `secret(name, default=None)` | function |
+| `Secret(value, name='')` | A value that does not show itself: print, str, f-strings and logs give ******. |
+| `values` | value |
+
 ### `use ffi` — 6 names
 
 | Name | What it is |
@@ -635,6 +726,47 @@ Load a module with `use NAME` (all its names) or `use NAME as n` (then `n.member
 | `to_cpu(x)` | function |
 | `to_device(x, dev=None)` | function |
 | `to_gpu(x)` | function |
+
+### `use hp` — 36 names
+
+| Name | What it is |
+|---|---|
+| `acos(x)` | function |
+| `asin(x)` | function |
+| `atan(x)` | function |
+| `atan2(y, x)` | function |
+| `cbrt(x)` | function |
+| `cos(x)` | function |
+| `cosh(x)` | function |
+| `det(a)` | function |
+| `digits(n=None)` | Set (or read) the number of significant digits of hp results (default 50, at most 100 000). |
+| `dot(a, b)` | function |
+| `e()` | function |
+| `equal(a, b, digits_=None)` | True when a and b agree to `digits` significant digits (default: the current precision minus 2). |
+| `exp(x)` | function |
+| `factorial(n)` | function |
+| `float(x)` | function |
+| `gamma(x)` | Γ(x) for positive integers and half-integers (exact formulas). |
+| `inv(a)` | function |
+| `ln(x)` | function |
+| `log(x)` | function |
+| `log10(x)` | function |
+| `log2(x)` | function |
+| `matmul(a, b)` | function |
+| `mean(xs)` | function |
+| `num(x)` | An hp number. Strings keep every digit you write ("0.1" is exactly one tenth); floats keep their exact binary value (0.1 becomes 0.1000000000000000055511…), integers and fractions are exact. |
+| `pi()` | π to the current number of digits (Chudnovsky-free: Machin's formula with binary splitting of atan). |
+| `pow(x, y)` | function |
+| `prod(xs)` | function |
+| `root(x, n)` | The real n-th root (negative x allowed for odd n). |
+| `sin(x)` | function |
+| `sinh(x)` | function |
+| `solve(a, b)` | x with a·x = b, by LU factorisation with partial pivoting at the current precision (+ guard digits). |
+| `sqrt(x)` | function |
+| `str(x, n=None)` | x as text with exactly n significant digits (default: the current precision). |
+| `sum(xs)` | The exact sum (no rounding error accumulates), rounded once to the current precision. |
+| `tan(x)` | function |
+| `tanh(x)` | function |
 
 ### `use io` — 9 names
 
@@ -855,6 +987,24 @@ Load a module with `use NAME` (all its names) or `use NAME as n` (then `n.member
 | `seir(beta, sigma, gamma, S0, E0, I0, R0=0.0, days=200, dt=0.1)` | SEIR model with incubation rate sigma (1/latent period). Returns record(t, S, E, I, R, peak_day, R0). |
 | `sir(beta, gamma, S0, I0, R0=0.0, days=160, dt=0.1)` | SIR epidemic model (counts or fractions). Returns record(t, S, I, R, peak_day, peak_infected, R0, attack_rate). |
 | `window_level(image, center, width)` | Map intensities (e.g. Hounsfield units) to [0, 1] for display with a window centre and width (e.g. soft tissue 40/400, lung −600/1500, bone 400/1800, brain 40/80). |
+
+### `use memory` — 13 names
+
+| Name | What it is |
+|---|---|
+| `array(shape, dtype='float32', fill=None, ram=None)` | An array that lives in RAM while it fits the budget, else in a memory-mapped file on the SSD. ram=true/false forces the choice. |
+| `best_device(need_gb=0.0)` | The GPU with the most free memory (if it has need_gb free), otherwise "cpu". |
+| `budget(gb=None)` | Set (or read) the RAM budget for array(), in GB. |
+| `cached(fn=None, name=None, ram_mb=128, disk_gb=5)` | Memoise fn in a two-tier store (RAM, then SSD). Use as @memory.cached or memory.cached(fn). |
+| `chunks(a, rows=65536)` | Row blocks of a (memory-mapped) array; the next block is read ahead on another thread. |
+| `devices()` | function |
+| `fit_batch(fn, batch, minimum=1)` | fn(batch); on out-of-memory the batch is halved (GPU cache emptied) and tried again. |
+| `free(a)` | Release an array from array() now (RAM is returned, a spill file is deleted). |
+| `map(fn, a, rows=65536, out=None, workers=None)` | out[i:j] = fn(a[i:j]) for row blocks, on all cores. out may be omitted (allocated with array()). |
+| `on_disk(a)` | function |
+| `spill_dir()` | function |
+| `status()` | function |
+| `store(name='default', ram_mb=256, disk_gb=10)` | function |
 
 ### `use models` — 16 names
 
@@ -1156,6 +1306,157 @@ Load a module with `use NAME` (all its names) or `use NAME as n` (then `n.member
 | `round_to(x, fmt, scale='auto', axis=None)` | Round x to what the format can represent and return it as a normal tensor ("fake quantisation"). Gradients pass straight through, so this works inside training. |
 | `uint8` | value |
 
+### `use pycompat` — 146 names
+
+| Name | What it is |
+|---|---|
+| `abs(x, /)` | Return the absolute value of the argument. |
+| `aiter(async_iterable, /)` | Return an AsyncIterator for an AsyncIterable object. |
+| `all(iterable, /)` | Return True if bool(x) is True for all values x in the iterable. |
+| `anext(…)` | Return the next item from the async iterator. |
+| `any(iterable, /)` | Return True if bool(x) is True for any x in the iterable. |
+| `ArithmeticError(/, *args, **kwargs)` | Base class for arithmetic errors. |
+| `ascii(obj, /)` | Return an ASCII-only representation of an object. |
+| `AssertionError(/, *args, **kwargs)` | Assertion failed. |
+| `AttributeError(/, *args, **kwargs)` | Attribute not found. |
+| `BaseException(/, *args, **kwargs)` | Common base class for all exceptions |
+| `BaseExceptionGroup(/, *args, **kwargs)` | A combination of multiple unrelated exceptions. |
+| `bin(number, /)` | Return the binary representation of an integer. |
+| `BlockingIOError(/, *args, **kwargs)` | I/O operation would block. |
+| `bool(/, *args, **kwargs)` | Returns True when the argument is true, False otherwise. The builtins True and False are the only two instances of the class bool. The class bool is a subclass of the class int, and cannot be subclassed. |
+| `breakpoint(*a, **k)` | function |
+| `BrokenPipeError(/, *args, **kwargs)` | Broken pipe. |
+| `BufferError(/, *args, **kwargs)` | Buffer error. |
+| `bytearray(/, *args, **kwargs)` | bytearray(iterable_of_ints) -> bytearray bytearray(string, encoding[, errors]) -> bytearray bytearray(bytes_or_buffer) -> mutable copy of bytes_or_buffer bytearray(int) -> bytes array of size given by the parameter initi |
+| `bytes(/, *args, **kwargs)` | bytes(iterable_of_ints) -> bytes bytes(string, encoding[, errors]) -> bytes bytes(bytes_or_buffer) -> immutable copy of bytes_or_buffer bytes(int) -> bytes object of size given by the parameter initialized with null byte |
+| `BytesWarning(/, *args, **kwargs)` | Base class for warnings about bytes and buffer related problems, mostly related to conversion from str or comparing to str. |
+| `callable(obj, /)` | Return whether the object is callable (i.e., some kind of function). |
+| `ChildProcessError(/, *args, **kwargs)` | Child process error. |
+| `chr(i, /)` | Return a Unicode string of one character with ordinal i; 0 <= i <= 0x10ffff. |
+| `classmethod(/, *args, **kwargs)` | Convert a function to be a class method. |
+| `compile(*a, **k)` | function |
+| `complex(/, *args, **kwargs)` | Create a complex number from a string or numbers. |
+| `ConnectionAbortedError(/, *args, **kwargs)` | Connection aborted. |
+| `ConnectionError(/, *args, **kwargs)` | Connection error. |
+| `ConnectionRefusedError(/, *args, **kwargs)` | Connection refused. |
+| `ConnectionResetError(/, *args, **kwargs)` | Connection reset. |
+| `delattr(obj, name)` | function |
+| `DeprecationWarning(/, *args, **kwargs)` | Base class for warnings about deprecated features. |
+| `dict(/, *args, **kwargs)` | dict() -> new empty dictionary dict(mapping) -> new dictionary initialized from a mapping object's (key, value) pairs dict(iterable) -> new dictionary initialized as if via: d = {} for k, v in iterable: d[k] = v dict(**k |
+| `dir(*obj)` | function |
+| `divmod(x, y, /)` | Return the tuple (x//y, x%y). Invariant: div*y + mod == x. |
+| `Ellipsis` | value |
+| `EncodingWarning(/, *args, **kwargs)` | Base class for warnings about encodings. |
+| `enumerate(/, *args, **kwargs)` | Return an enumerate object. |
+| `EnvironmentError(/, *args, **kwargs)` | Base class for I/O related errors. |
+| `EOFError(/, *args, **kwargs)` | Read beyond end of file. |
+| `eval(*a, **k)` | function |
+| `Exception(/, *args, **kwargs)` | Common base class for all non-exit exceptions. |
+| `ExceptionGroup(/, *args, **kwargs)` | type |
+| `exec(*a, **k)` | function |
+| `exit(code=None)` | function |
+| `FileExistsError(/, *args, **kwargs)` | File already exists. |
+| `FileNotFoundError(/, *args, **kwargs)` | File not found. |
+| `filter(/, *args, **kwargs)` | Return an iterator yielding those items of iterable for which function(item) is true. If function is None, return the items that are true. |
+| `float(/, *args, **kwargs)` | Convert a string or number to a floating-point number, if possible. |
+| `FloatingPointError(/, *args, **kwargs)` | Floating-point operation failed. |
+| `format(value, format_spec='', /)` | Return type(value).__format__(value, format_spec) |
+| `frozenset(/, *args, **kwargs)` | Build an immutable unordered collection of unique elements. |
+| `FutureWarning(/, *args, **kwargs)` | Base class for warnings about constructs that will change semantically in the future. |
+| `GeneratorExit(/, *args, **kwargs)` | Request that a generator exit. |
+| `getattr(obj, name, *default)` | function |
+| `globals(*a, **k)` | function |
+| `hasattr(obj, name)` | function |
+| `hash(obj, /)` | Return the hash value for the given object. |
+| `hex(number, /)` | Return the hexadecimal representation of an integer. |
+| `id(obj, /)` | Return the identity of an object. |
+| `ImportError(/, *args, **kwargs)` | Import can't find module, or can't find name in module. |
+| `ImportWarning(/, *args, **kwargs)` | Base class for warnings about probable mistakes in module imports |
+| `IndentationError(/, *args, **kwargs)` | Improper indentation. |
+| `IndexError(/, *args, **kwargs)` | Sequence index out of range. |
+| `input(prompt='')` | function |
+| `int(/, *args, **kwargs)` | int([x]) -> integer int(x, base=10) -> integer |
+| `InterruptedError(/, *args, **kwargs)` | Interrupted by signal. |
+| `IOError(/, *args, **kwargs)` | Base class for I/O related errors. |
+| `IsADirectoryError(/, *args, **kwargs)` | Operation doesn't work on directories. |
+| `isinstance(obj, class_or_tuple, /)` | Return whether an object is an instance of a class or of a subclass thereof. |
+| `issubclass(cls, class_or_tuple, /)` | Return whether 'cls' is derived from another class or is the same class. |
+| `iter(…)` | iter(iterable) -> iterator iter(callable, sentinel) -> iterator |
+| `KeyboardInterrupt(/, *args, **kwargs)` | Program interrupted by user. |
+| `KeyError(/, *args, **kwargs)` | Mapping key not found. |
+| `len(obj, /)` | Return the number of items in a container. |
+| `list(/, *args, **kwargs)` | Built-in mutable sequence. |
+| `locals(*a, **k)` | function |
+| `LookupError(/, *args, **kwargs)` | Base class for lookup errors. |
+| `map(/, *args, **kwargs)` | Make an iterator that computes the function using arguments from each of the iterables. Stops when the shortest iterable is exhausted. |
+| `max(…)` | max(iterable, *[, default=obj, key=func]) -> value max(arg1, arg2, *args, *[, key=func]) -> value |
+| `MemoryError(/, *args, **kwargs)` | Out of memory. |
+| `memoryview(/, *args, **kwargs)` | Create a new memoryview object which references the given object. |
+| `min(…)` | min(iterable, *[, default=obj, key=func]) -> value min(arg1, arg2, *args, *[, key=func]) -> value |
+| `ModuleNotFoundError(/, *args, **kwargs)` | Module not found. |
+| `NameError(/, *args, **kwargs)` | Name not found globally. |
+| `next(…)` | next(iterator[, default]) |
+| `NotADirectoryError(/, *args, **kwargs)` | Operation only works on directories. |
+| `NotImplemented` | value |
+| `NotImplementedError(/, *args, **kwargs)` | Method or function hasn't been implemented yet. |
+| `object(/, *args, **kwargs)` | The base class of the class hierarchy. |
+| `oct(number, /)` | Return the octal representation of an integer. |
+| `open(file, mode='r', *args, **kwargs)` | function |
+| `ord(character, /)` | Return the ordinal value of a character. |
+| `OSError(/, *args, **kwargs)` | Base class for I/O related errors. |
+| `OverflowError(/, *args, **kwargs)` | Result too large to be represented. |
+| `PendingDeprecationWarning(/, *args, **kwargs)` | Base class for warnings about features which will be deprecated in the future. |
+| `PermissionError(/, *args, **kwargs)` | Not enough permissions. |
+| `pow(base, exp, mod=None)` | Equivalent to base**exp with 2 arguments or base**exp % mod with 3 arguments |
+| `print(*args, sep=' ', end='\n', file=None, flush=False)` | Prints the values to a stream, or to sys.stdout by default. |
+| `ProcessLookupError(/, *args, **kwargs)` | Process not found. |
+| `property(/, *args, **kwargs)` | Property attribute. |
+| `pyfrom(module, name)` | `from module import name`: an attribute of the module, or its submodule. |
+| `pyimport(name)` | pyimport() for Python-exact files: pure standard modules (and their submodules) need no permission; with --allow-python=all every module is the real module object. |
+| `pystar(module, *names)` | `from module import *`: the public names, in one go. |
+| `PythonFinalizationError(/, *args, **kwargs)` | Operation blocked during Python finalization. |
+| `quit(code=None)` | function |
+| `range(/, *args, **kwargs)` | range(stop) -> range object range(start, stop[, step]) -> range object |
+| `RecursionError(/, *args, **kwargs)` | Recursion limit exceeded. |
+| `ReferenceError(/, *args, **kwargs)` | Weak ref proxy used after referent went away. |
+| `repr(obj, /)` | Return the canonical string representation of the object. |
+| `ResourceWarning(/, *args, **kwargs)` | Base class for warnings about resource usage. |
+| `reversed(/, *args, **kwargs)` | Return a reverse iterator over the values of the given sequence. |
+| `round(number, ndigits=None)` | Round a number to a given precision in decimal digits. |
+| `RuntimeError(/, *args, **kwargs)` | Unspecified run-time error. |
+| `RuntimeWarning(/, *args, **kwargs)` | Base class for warnings about dubious runtime behavior. |
+| `set(/, *args, **kwargs)` | Build an unordered collection of unique elements. |
+| `setattr(obj, name, value)` | function |
+| `slice(/, *args, **kwargs)` | slice(stop) slice(start, stop[, step]) |
+| `sorted(iterable, /, *, key=None, reverse=False)` | Return a new list containing all items from the iterable in ascending order. |
+| `staticmethod(/, *args, **kwargs)` | Convert a function to be a static method. |
+| `StopAsyncIteration(/, *args, **kwargs)` | Signal the end from iterator.__anext__(). |
+| `StopIteration(/, *args, **kwargs)` | Signal the end from iterator.__next__(). |
+| `str(/, *args, **kwargs)` | str(object='') -> str str(bytes_or_buffer[, encoding[, errors]]) -> str |
+| `sum(iterable, /, start=0)` | Return the sum of a 'start' value (default: 0) plus an iterable of numbers |
+| `super(/, *args, **kwargs)` | super() -> same as super(__class__, <first argument>) super(type) -> unbound super object super(type, obj) -> bound super object; requires isinstance(obj, type) super(type, type2) -> bound super object; requires issubcla |
+| `SyntaxError(/, *args, **kwargs)` | Invalid syntax. |
+| `SyntaxWarning(/, *args, **kwargs)` | Base class for warnings about dubious syntax. |
+| `SystemError(/, *args, **kwargs)` | Internal error in the Python interpreter. |
+| `SystemExit(/, *args, **kwargs)` | Request to exit from the interpreter. |
+| `TabError(/, *args, **kwargs)` | Improper mixture of spaces and tabs. |
+| `TimeoutError(/, *args, **kwargs)` | Timeout expired. |
+| `tuple(/, *args, **kwargs)` | Built-in immutable sequence. |
+| `type(/, *args, **kwargs)` | type |
+| `TypeError(/, *args, **kwargs)` | Inappropriate argument type. |
+| `UnboundLocalError(/, *args, **kwargs)` | Local name referenced but not bound to a value. |
+| `UnicodeDecodeError(/, *args, **kwargs)` | Unicode decoding error. |
+| `UnicodeEncodeError(/, *args, **kwargs)` | Unicode encoding error. |
+| `UnicodeError(/, *args, **kwargs)` | Unicode related error. |
+| `UnicodeTranslateError(/, *args, **kwargs)` | Unicode translation error. |
+| `UnicodeWarning(/, *args, **kwargs)` | Base class for warnings about Unicode related problems, mostly related to conversion problems. |
+| `UserWarning(/, *args, **kwargs)` | Base class for warnings generated by user code. |
+| `ValueError(/, *args, **kwargs)` | Inappropriate argument value (of correct type). |
+| `vars(*obj)` | function |
+| `Warning(/, *args, **kwargs)` | Base class for warning categories. |
+| `ZeroDivisionError(/, *args, **kwargs)` | Second argument to a division or modulo operation was zero. |
+| `zip(/, *args, **kwargs)` | The zip object yields n-length tuples, where n is the number of iterables passed as positional arguments to zip(). The i-th element in every tuple comes from the i-th iterable argument to zip(). This continues until the  |
+
 ### `use python` — 5 names
 
 | Name | What it is |
@@ -1248,6 +1549,31 @@ Load a module with `use NAME` (all its names) or `use NAME as n` (then `n.member
 | `reinforce(env, model, params, episodes=500, lr=0.01, gamma=0.99, seed=0, max_steps=1000)` | REINFORCE with a running-mean baseline on a single environment (n=1). model(params, obs) -> logits. |
 | `sample_token(logits, temperature=1.0, top_k=None, top_p=None, seed=None)` | Sample from logits [..., V] with temperature, top-k and nucleus (top-p) filtering; temperature 0 = greedy. |
 | `sequence_log_prob(logits, tokens, mask=None)` | Σ_t log softmax(logits[b, t])[tokens[b, t]] for each sequence (logits [B, T, V], tokens [B, T]). |
+
+### `use rt` — 20 names
+
+| Name | What it is |
+|---|---|
+| `backend(name=None)` | rt.backend() → the current frame backend; rt.backend("cpu" \| "gpu" \| "auto"). "auto" picks the GPU only for frames large enough to beat the copy to the card (≥ 1600×900); "gpu" without a usable card stays on the CPU and  |
+| `box_blur(img, r=1)` | Mean filter of radius r (cost independent of r). |
+| `camera(index=0, width=None, height=None, fps=None, fourcc=None)` | A camera through OpenCV (pip install opencv-python); needs --allow-python. `width` may be a size name or "WxH" ("fhd", "1600x900"). |
+| `diff(a, b, threshold=0.0)` | \|a - b\| per pixel (largest channel for colour); with a threshold, a boolean mask of pixels that changed more than it. |
+| `downsample(img, k=2)` | Average k×k blocks (fast, no aliasing from skipping pixels). |
+| `edges(img, low=50, high=150)` | Edge map (Canny with OpenCV; gradient magnitude above `high` otherwise), uint8 0/255. |
+| `ema(prev, new, alpha=0.2)` | Exponential moving average (smooths noise while staying responsive). |
+| `fps_meter()` | function |
+| `gray(rgb)` | Luminance of an RGB(A) image (BT.601). uint8 in → uint8 out (fast path); other types → float32. |
+| `has_opencv` | OpenCV, imported on first use (it takes ~20 ms to load); falsy when it is not installed. |
+| `loop(hz, step, seconds=None, steps=None, catch_up=False, on_error='raise')` | Call step(tick, t) `hz` times per second for `seconds` (or `steps` ticks). A tick that cannot start on time is counted as missed and skipped (catch_up=true runs it late instead), so the rhythm never drifts. on_error="ski |
+| `motion(prev, cur, threshold=25.0, step=None)` | Did something move? record(moved, fraction, cx, cy, box): changed share of pixels, the centre of the change and its bounding box [x0, y0, x1, y1] in full-frame pixels. Works on gray or colour frames of any size; above 64 |
+| `resize(img, width, height=None)` | Resize to width×height (area averaging when shrinking — no aliasing; smooth when enlarging). resize(img, 0.5) scales by a factor. |
+| `scheduler()` | function |
+| `size(width, height=None)` | (width, height) from 1600, 900 / "1600x900" / "fhd" / "1080p" / (w, h). |
+| `sizes` | value |
+| `synthetic(width=640, height=None, fps=120.0, noise=False)` | function |
+| `threshold(img, t, high=255)` | Pixels above t become `high`, the rest 0 (uint8). |
+| `ticks(hz, seconds=None, steps=None)` | A for-loop that runs at `hz`: `for tick in rt.ticks(1000, seconds=2):`. Yields the tick number. |
+| `video(source, process, fps=None, seconds=None, frames=None, adapt=False, min_scale=0.25, on_error='skip', gray…)` | Run `process(frame, info)` on the newest frame from `source` until `seconds` or `frames` is reached. |
 
 ### `use scale` — 4 names
 
@@ -1410,6 +1736,23 @@ Load a module with `use NAME` (all its names) or `use NAME as n` (then `n.member
 | `to_device(x, dev=None)` | function |
 | `to_gpu(x)` | function |
 
+### `use tokens` — 12 names
+
+| Name | What it is |
+|---|---|
+| `best(value, model='gpt-4o')` | Try the transforms that apply and return (text, method) with the fewest tokens; unpack with restore(). |
+| `count(text, model='gpt-4o')` | Tokens in text: exact with tiktoken installed (o200k / cl100k), otherwise an estimate (±10–15 %). |
+| `dedupe(text, min_chars=24, min_count=2)` | Lines that repeat are written once in a header and referenced as §N where they occur. |
+| `diff(old, new)` | Only what changed, as line operations: `=N` keep N lines, `-N` drop N lines, `+text` add a line. |
+| `exact()` | True when count() is exact (tiktoken installed). |
+| `expand(text)` | function |
+| `pack(value)` | Compact, exactly reversible text for a JSON value. A list of records with the same keys becomes a table: `@table ["id","name"]` then one line per record (`1,"ann"`). Anything else is minified JSON. |
+| `pack_jsonl(text)` | JSON Lines → pack() of the records (exact for the parsed values). |
+| `patch(old, delta)` | function |
+| `restore(text, method)` | function |
+| `savings(before, after, model='gpt-4o')` | function |
+| `unpack(text)` | function |
+
 ### `use torch` — 138 names
 
 | Name | What it is |
@@ -1553,7 +1896,7 @@ Load a module with `use NAME` (all its names) or `use NAME as n` (then `n.member
 | `Unflatten(dim, unflattened_size)` | type |
 | `value_and_grad_aux(fn)` | value_and_grad for a function returning [loss, aux]: returns (loss, aux, grads). aux values (e.g. the logits used to compute the loss) are returned without their gradient graph, so nothing is computed twice. |
 
-### `use web` — 9 names
+### `use web` — 10 names
 
 | Name | What it is |
 |---|---|
@@ -1566,14 +1909,17 @@ Load a module with `use NAME` (all its names) or `use NAME as n` (then `n.member
 | `require_jwt(secret, exempt=())` | A before-hook: rejects requests without a valid Bearer JWT; sets req.user to its claims. |
 | `response(body='', status=200, headers=None, type=None)` | Build a response explicitly: response("created", status=201, headers={"X-A": "1"}). |
 | `server(name='apsi', max_body=1048576, workers=None, max_connections=10000, log=True, handler_timeout=60.0, head…)` | function |
+| `websocket_connect(url, headers=None, timeout=10.0, subprotocols=None)` | function |
 
-## Command line (41 commands)
+## Command line (43 commands)
 
 Every command takes `--help` (`apsi help run` works too).
 
 | Command | What it does |
 |---|---|
 | `apsi run` | run a .apsi program (default: the project's main file) |
+| `apsi debug` | debug a program in the terminal (breakpoints, stepping, variables) |
+| `apsi dap` | the Debug Adapter Protocol server (VS Code starts it for F5) |
 | `apsi native` | native compiler: info, explain FILE, ir FILE [FN], asm FILE [FN], clear-cache |
 | `apsi check` | statically check files or folders without running them |
 | `apsi test` | run test blocks in files or folders |

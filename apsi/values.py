@@ -212,8 +212,23 @@ class RangeVal:
 
 class Namespace:
     def __init__(self, name, members):
-        self.name = name
         self.members = dict(members)
+        # members as instance attributes: `math.sqrt` is a plain dict lookup, not a __getattr__ call per access
+        self.__dict__.update((k, v) for k, v in self.members.items()
+                             if isinstance(k, str) and k != "members" and not k.startswith("__"))
+        self.name = name
+
+    def __getattr__(self, k):            # direct attribute access (Python-exact files, library code)
+        members = self.__dict__.get("members")
+        if members is not None and k in members:
+            return members[k]
+        raise AttributeError(f"module '{self.__dict__.get('name')}' has no attribute '{k}'")
+
+    def __dir__(self):
+        return list(self.members)
+
+    def __repr__(self):
+        return f"<module '{self.name}'>"
 
 
 class Dtype:

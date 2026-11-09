@@ -64,7 +64,7 @@ def build(out_dir):
         rel = os.path.relpath(root, pkg)
         arc = "apsi" if rel == "." else "apsi/" + rel.replace(os.sep, "/")
         for f in sorted(names):
-            if f.endswith(".py") or (f == "MANIFEST.json" and rel == "."):
+            if f.endswith((".py", ".c", ".h")) or (f == "MANIFEST.json" and rel == "."):
                 with open(os.path.join(root, f), "rb") as fh:
                     files[f"{arc}/{f}"] = fh.read()
     files[f"{info}/METADATA"] = "\n".join(meta).encode("utf-8")

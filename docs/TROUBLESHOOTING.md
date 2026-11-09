@@ -6,7 +6,7 @@ This page covers the problems people most often hit right after installing Apsi,
 - [VS Code shows no syntax colours, or Ctrl+F5 does nothing](#vs-code-shows-no-syntax-colours-or-ctrlf5-does-nothing)
 - [`needs permission 'python'`](#needs-permission-python)
 - [A function prints "runs on the bytecode engine"](#a-function-prints-runs-on-the-bytecode-engine)
-- [`Apsi 2.0.0 needs Python 3.12 or newer`](#apsi-200-needs-python-312-or-newer)
+- [`Apsi 2.4.4 needs Python 3.12 or newer`](#apsi-244-needs-python-312-or-newer)
 - [A converted PyTorch program reports notes](#a-converted-pytorch-program-reports-notes)
 
 ---
@@ -179,28 +179,28 @@ the bytecode engine instead of as machine code. Rewrite that line using the cons
 [`NATIVE.md`](NATIVE.md) to get machine-code speed, use `@native("strict")` to turn the note into an error, or
 `@native("quiet")` (or `APSI_NATIVE_QUIET=1`) to hide it. `apsi native explain app.apsi` lists every such function.
 
-## `Apsi 2.0.0 needs Python 3.12 or newer`
+## `Apsi 2.4.4 needs Python 3.12 or newer`
 
 Apsi runs on Python 3.12 and every newer release. This message means the `apsi` command, `pip` or your editor
 started an older Python.
 
-- **Windows:** the installer (`ApsiSetup-2.0.0-x64.exe`) brings its own Python 3.12, so nothing else is needed.
+- **Windows:** the installer (`ApsiSetup-2.4.4-x64.exe`) brings its own Python 3.12, so nothing else is needed.
   To use `pip install` instead, install a current Python first:
 
   ```powershell
   winget install Python.Python.3.13
-  py -3.13 -m pip install apsi-2.0.0-py3-none-any.whl
+  py -3.13 -m pip install apsi-2.4.4-py3-none-any.whl
   ```
 
 - **Linux:** Ubuntu 24.04+, Debian 13+, Fedora 39+, Arch and openSUSE Tumbleweed ship Python 3.12 or newer. On
-  older systems, use the portable build (`apsi-2.0.0-linux-x86_64.tar.gz`, which brings its own Python), or install
+  older systems, use the portable build (`apsi-2.4.4-linux-x86_64.tar.gz`, which brings its own Python), or install
   a newer Python next to the system one:
 
   ```bash
   curl -LsSf https://astral.sh/uv/install.sh | sh
   uv python install 3.12
   uv venv --python 3.12 ~/.apsi-venv
-  ~/.apsi-venv/bin/pip install apsi-2.0.0-py3-none-any.whl
+  ~/.apsi-venv/bin/pip install apsi-2.4.4-py3-none-any.whl
   ```
 
 - **Check which Python is used:**

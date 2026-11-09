@@ -88,6 +88,8 @@ ESCAPE_MODULES = {"subprocess", "os", "sys", "ctypes", "cffi", "socket", "shutil
                   "webbrowser", "http", "urllib", "requests", "ftplib", "smtplib", "telnetlib", "paramiko",
                   "pexpect", "asyncio", "threading", "_thread", "gc", "inspect", "types", "io", "mmap",
                   "zipimport", "pkgutil", "site", "sysconfig", "platform"}
+PYCOMPAT_STANDINS = {"sys", "os", "os.path", "pathlib", "threading", "time", "urllib.parse", "html.parser", "numpy",
+                     "numpy.linalg", "numpy.fft", "numpy.random", "numpy.polynomial", "numpy.ma"}
 SYSTEM_LIBS = re.compile(r"(kernel32|ntdll|advapi32|user32|ws2_32|wininet|urlmon|shell32|crypt32|"
                          r"psapi|dbghelp|libc\.so|libc$|^c$|libdl|libpthread|msvcrt)", re.I)
 CRYPTO_FNS = {"encrypt", "aes_encrypt", "aes_gcm_encrypt", "xor", "chacha", "fernet", "rc4", "seal"}
@@ -139,7 +141,9 @@ def _script(ch):
 def scan_text(src, file=None):
     """Checks that do not need a parse: Trojan Source, invisible and confusable characters."""
     out = []
-    for i, line in enumerate(src.splitlines(), 1):
+    special = "".join(BIDI) + "".join(INVISIBLE)
+    lines = src.splitlines() if any(ch in src for ch in special) else []
+    for i, line in enumerate(lines, 1):
         bad = [c for c in line if c in BIDI]
         if bad:
             out.append(Finding("critical", "trojan-source", i,
@@ -149,16 +153,37 @@ def scan_text(src, file=None):
         if inv:
             out.append(Finding("high", "invisible-char", i,
                                "invisible character U+%04X inside the source (hidden identifiers)" % ord(inv[0]), file))
-        for word in re.findall(r"[^\W\d_][\w]*", line):
-            scripts = {_script(c) for c in word if c.isalpha()}
-            # Greek letters are normal in physics (ω, π, θ); only letters that look like Latin count
-            spoof = any(c in CONFUSABLE for c in word)
-            if "LATIN" in scripts and spoof:
-                out.append(Finding("high", "homoglyph", i,
-                                   f"identifier '{word}' mixes {', '.join(sorted(scripts))} letters "
-                                   f"(look-alike characters)", file))
-                break
+    # homoglyphs matter in identifiers only (text inside strings and comments is data)
+    try:
+        from .lexer import tokenize, NAME
+        words = [] if src.isascii() else [(t.line, t.value) for t in tokenize(src)
+                                           if t.type == NAME and not t.value.isascii()]
+    except Exception:                                      # noqa: BLE001 - unparsable: scan the raw text
+        words = [(i, w) for i, line in enumerate(src.splitlines(), 1) for w in re.findall(r"[^\W\d_][\w]*", line)]
+    seen = set()
+    for i, word in words:
+        if word in seen or word.isascii():
+            continue
+        seen.add(word)
+        scripts = {_script(c) for c in word if c.isalpha()}
+        # Greek letters are normal in physics (ω, π, θ); only letters that look like Latin count
+        spoof = any(c in CONFUSABLE for c in word)
+        if "LATIN" in scripts and spoof:
+            out.append(Finding("high", "homoglyph", i,
+                               f"identifier '{word}' mixes {', '.join(sorted(scripts))} letters "
+                               f"(look-alike characters)", file))
     return out
+
+
+_ANY_HINT = None
+
+
+def _any_hint():
+    global _ANY_HINT
+    if _ANY_HINT is None:
+        pats = list(SECRET_HINTS) + list(PERSISTENCE_HINTS) + [p for p, _, _ in NET_BAD] + [SHELL_HINTS]
+        _ANY_HINT = re.compile("|".join(f"(?:{p})" for p in pats), re.I)
+    return _ANY_HINT
 
 
 def scan_program(prog, src="", file=None):
@@ -208,7 +233,7 @@ def scan_program(prog, src="", file=None):
                 calls.setdefault(nm, line)
                 first = n.args[0] if n.args else None
                 lit = first.value if isinstance(first, A.Str) else None
-                if nm == "pyimport":
+                if nm in ("pyimport", "pyfrom"):
                     pyimports.append((line, lit))
                 elif nm == "cload":
                     cloads.append((line, lit))
@@ -226,9 +251,12 @@ def scan_program(prog, src="", file=None):
     walk(prog.body)
 
     reads_secret = []
+    any_hint = _any_hint()
     for line, s in strings:
         if not isinstance(s, str):
             continue
+        if len(s) < 160 and not any_hint.search(s) and "EICAR" not in s:
+            continue                       # one combined search rules out almost every string
         for pat in SECRET_HINTS:
             if re.search(pat, s, re.I):
                 reads_secret.append(line)
@@ -255,7 +283,11 @@ def scan_program(prog, src="", file=None):
         if EICAR.decode() in s:
             out.append(Finding("critical", "eicar", line, "EICAR antivirus test signature", file))
 
+    from .checker import is_python_mode
+    pyc = is_python_mode(prog)
     for line, mod in pyimports:
+        if pyc and mod in PYCOMPAT_STANDINS:
+            continue                       # `use pycompat` gives permission-checked stand-ins (pysafe.py)
         if mod is None:
             out.append(Finding("high", "dynamic-import", line,
                                "pyimport() with a computed module name hides what is loaded", file))
@@ -427,14 +459,18 @@ def worst(findings):
 
 
 # ------------------------------------------------------------------ pre-run gate
-def gate_program(prog, src, path, policy_name, trust=False, stream=sys.stderr):
+def gate_program(prog, src, path, policy_name, trust=False, stream=sys.stderr, python_all=False):
     """Called by `apsi run` before execution. Critical findings stop the run unless --trust;
     high findings stop it under the sandbox/strict profiles and warn otherwise."""
     mode = os.environ.get("APSI_SCAN") or _cfg().get("scan_on_run", "on")
     if mode == "off" or trust:
         return True
-    found = [f for f in scan_program(prog, src, path) if SEVERITY[f.severity] >= SEVERITY["high"]]
+    if _known_clean(src):
+        return True
+    found = [f for f in scan_program(prog, src, path) if SEVERITY[f.severity] >= SEVERITY["high"]
+             and not (python_all and f.rule == "sandbox-escape")]   # granted explicitly with --allow-python=all
     if not found:
+        _remember_clean(src)
         return True
     w = worst(found)
     block = w >= SEVERITY["critical"] or (policy_name in ("sandbox", "strict") and w >= SEVERITY["high"])
@@ -446,6 +482,49 @@ def gate_program(prog, src, path, policy_name, trust=False, stream=sys.stderr):
         print("  Review the code. If you trust it, run again with --trust "
               "(or 'apsi scan' for a full report).", file=stream)
     return not block
+
+
+def _clean_path(src):
+    """A signed marker per (Guard rules, source): a program that scanned clean is not scanned again (a 20 000-line
+    program saves about half a second per run). Any change to the program or to these rules gives a new key."""
+    import hashlib
+    import hmac
+    from .compile_cache import cache_dir, _secret
+    with open(__file__, "rb") as fh:
+        rules = hashlib.sha256(fh.read()).hexdigest()
+    key = hashlib.sha256((rules + "\0" + src).encode("utf-8")).hexdigest()
+    sig = hmac.new(_secret(), key.encode(), hashlib.sha256).hexdigest()
+    return os.path.join(cache_dir(), "guard", key[:2], key + ".ok"), sig
+
+
+def _known_clean(src):
+    if len(src) < 20000:
+        return False
+    try:
+        from .compile_cache import enabled
+        if not enabled():
+            return False
+        path, sig = _clean_path(src)
+        with open(path, encoding="ascii") as fh:
+            import hmac
+            return hmac.compare_digest(fh.read().strip(), sig)
+    except Exception:                     # noqa: BLE001 - no marker: scan normally
+        return False
+
+
+def _remember_clean(src):
+    if len(src) < 20000:
+        return
+    try:
+        from .compile_cache import enabled
+        if not enabled():
+            return
+        path, sig = _clean_path(src)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w", encoding="ascii") as fh:
+            fh.write(sig)
+    except Exception:                     # noqa: BLE001
+        pass
 
 
 def _cfg():

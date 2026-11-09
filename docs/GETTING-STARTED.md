@@ -4,7 +4,7 @@ This guide takes you from installation to a first program, a first trained model
 
 ## 1. Install
 
-Apsi 2.0.0 runs on **Windows 10 or newer** and **Linux** (x86-64) and needs **Python 3.12 or newer** as its host runtime. The installers check for Python and offer to install it.
+Apsi 2.4.4 runs on **Windows 10 or newer** and **Linux** (x86-64) and needs **Python 3.12 or newer** as its host runtime. The installers check for Python and offer to install it.
 
 - Windows: download the installer from the download page and run it. Details: [Install on Windows](INSTALL.md).
 - Linux: unpack the Linux package and run `sh install.sh`, or install the `.deb`. Details: [Install on Linux](INSTALL-LINUX.md).
@@ -118,6 +118,8 @@ See [Libraries](LIBRARIES.md).
 
 ## 6. Where to go next
 
+- [What's new in 2.4.4](WHATS-NEW.md) — exact Python conversion, real time, memory, tokens, tables, databases.
+- [From Python](PYTHON.md) — `apsi convert` an existing program and run it unchanged.
 - [Language reference](LANGUAGE.md) — syntax, types, units, modules.
 - [AI and machine learning](AI.md) and [Reinforcement learning](RL.md).
 - [Science, physics and medicine](SCIENCE.md).

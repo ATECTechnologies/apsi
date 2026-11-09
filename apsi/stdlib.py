@@ -228,15 +228,56 @@ def timed(fn):
 
 
 # =============================================================== misc builtins
-def _print(*args, sep=" ", end="\n"):
-    sys.stdout.write(sep.join(fmt(a) for a in args) + end)
+def _print(*args, sep=" ", end="\n", flush=False, file=None):
+    out = sys.stderr if file in ("stderr", sys.stderr) else sys.stdout
+    out.write(str(sep).join(fmt(a) for a in args) + str(end))
+    if flush:
+        out.flush()
+
+
+def _write_out(text):
+    """Write text without a line break (Python's sys.stdout.write)."""
+    sys.stdout.write(str(text))
+    return len(str(text))
+
+
+def _write_err(text):
+    sys.stderr.write(str(text))
+    return len(str(text))
+
+
+def _flush_out():
+    sys.stdout.flush()
+
+
+def _set_recursion_limit(n):
+    """Allow deeper recursion (Python's sys.setrecursionlimit), capped at 1 000 000; the stack grows with it."""
+    import threading
+    n = max(1000, min(int(n), 1_000_000))
+    sys.setrecursionlimit(n)
+    try:
+        threading.stack_size(min(512 * 1024 * 1024, max(threading.stack_size(), n * 1024)))
+    except (ValueError, RuntimeError):
+        pass
+    return n
+
+
+def _platform():
+    import platform
+    return {"win32": "windows", "linux": "linux", "darwin": "macos"}.get(sys.platform, sys.platform) + "-" + platform.machine().lower()
 
 
 def _str(x):
     return fmt(x)
 
 
-def _int(x):
+def _int(x, base=None):
+    if base is not None:
+        return int(str(x), int(base))
+    return _int1(x)
+
+
+def _int1(x):
     if isinstance(x, Quantity):
         raise UnitError(f"cannot convert {dim_name(x.dim)} to Int")
     if isinstance(x, str):
@@ -300,19 +341,151 @@ def _exit(code=0):
 
 def _getattr(obj, name, *default):
     """getattr(obj, "field"[, default]); names starting with _ are never reachable."""
+    from .values import StructInstance, Record, Namespace, BoundMethod
     name = str(name)
     if name.startswith("_"):
         raise RuntimeErr(f"getattr(): attribute '{name}' is private")
+    if isinstance(obj, (StructInstance, Record)):
+        if name in obj.fields:
+            return obj.fields[name]
+        m = obj.type.methods.get(name) if isinstance(obj, StructInstance) else None
+        if m is not None:
+            return BoundMethod(m, obj)
+        if default:
+            return default[0]
+        raise RuntimeErr(f"no field or method '{name}'")
+    if isinstance(obj, Namespace):
+        if name in obj.members:
+            return obj.members[name]
+        if default:
+            return default[0]
+        raise RuntimeErr(f"module '{obj.name}' has no member '{name}'")
     return getattr(obj, name, *default)
 
 
 def _hasattr(obj, name):
+    try:
+        _getattr(obj, name)
+        return True
+    except Exception:                      # noqa: BLE001
+        return False
+
+
+_TYPE_OF_CONVERTER = {}
+
+
+def _isinstance(x, t):
+    """isinstance(x, T): T is a type name ("Int", "Tensor", "Length"…), int/float/str/bool/list/dict/tuple/set,
+    a struct, an error kind (ValueError…), or a tuple/list of those."""
+    import builtins as b
+    from .values import StructInstance, StructType
+    if isinstance(t, (tuple, list)):
+        return any(_isinstance(x, u) for u in t)
+    if isinstance(t, str):
+        return type_name(x) == t or (t == "Float" and type_name(x) == "Int") or (
+            t in ("Number", "Any")) and isinstance(x, (int, float, complex)) or t == "Any"
+    py = _TYPE_OF_CONVERTER.get(id(t))
+    if py is not None:
+        if py is int:
+            return isinstance(x, (int, np.integer))           # like Python: true and false are Ints too
+        if py is float:
+            return isinstance(x, (float, np.floating))
+        return isinstance(x, py)
+    if isinstance(t, StructType):
+        if not isinstance(x, StructInstance):
+            return False
+        st = x.type
+        while st is not None:
+            if st is t or st.name == t.name:
+                return True
+            st = getattr(st, "base", None)
+        return False
+    if isinstance(t, type):
+        return b.isinstance(x, t)
+    raise RuntimeErr(f"isinstance(): {type_name(t)} is not a type")
+
+
+def _setattr(obj, name, value):
+    from .values import StructInstance, Record
     name = str(name)
-    return not name.startswith("_") and hasattr(obj, name)
+    if name.startswith("_"):
+        raise RuntimeErr(f"setattr(): attribute '{name}' is private")
+    if isinstance(obj, StructInstance):
+        if name not in obj.fields:
+            raise RuntimeErr(f"{obj.type.name} has no field '{name}'")
+        obj.fields[name] = value
+    elif isinstance(obj, Record):
+        obj.fields[name] = value
+    else:
+        _safe_setattr(obj, name, value)
+
+
+def _safe_setattr(obj, name, value):
+    """Setting a public attribute of an ordinary object (decimal's context.prec = 50, a dataclass field…).
+    Modules, classes, functions and built-in objects stay read-only, so the sandbox cannot be bent."""
+    import types
+    if name.startswith("_"):
+        raise RuntimeErr(f"cannot set the private attribute '{name}'")
+    if isinstance(obj, (types.ModuleType, type, types.FunctionType, types.BuiltinFunctionType, types.MethodType,
+                        int, float, str, bytes, tuple, frozenset, bool, type(None))):
+        raise RuntimeErr(f"cannot set attribute '{name}' on {type_name(obj)}")
+    try:
+        setattr(obj, name, value)
+    except (AttributeError, TypeError) as e:
+        raise RuntimeErr(f"cannot set attribute '{name}' on {type_name(obj)}: {e}")
+
+
+def _py_type_name(x):
+    """The name Python would give the type of x (int, float, str, list, dict, or the struct's name)."""
+    from .values import StructInstance
+    if isinstance(x, StructInstance):
+        return x.type.name
+    if isinstance(x, bool):
+        return "bool"
+    if isinstance(x, (int, np.integer)):
+        return "int"
+    if isinstance(x, (float, np.floating)):
+        return "float"
+    if isinstance(x, np.ndarray):
+        return "ndarray"
+    if x is None:
+        return "NoneType"
+    return type(x).__name__
+
+
+def _vars(obj):
+    """The fields of a struct or record as a dict."""
+    from .values import StructInstance, Record
+    if isinstance(obj, (StructInstance, Record)):
+        return dict(obj.fields)
+    return {k: v for k, v in getattr(obj, "__dict__", {}).items() if not k.startswith("_")}
+
+
+def _dir(obj=None):
+    from .values import StructInstance, Record, Namespace
+    if isinstance(obj, StructInstance):
+        return sorted(list(obj.fields) + list(obj.type.methods))
+    if isinstance(obj, Record):
+        return sorted(obj.fields)
+    if isinstance(obj, Namespace):
+        return sorted(obj.members)
+    return sorted(n for n in dir(obj) if not n.startswith("_"))
+
+
+def _hash(x):
+    """A stable hash for numbers, strings, tuples and struct instances; tensors hash their bytes."""
+    if isinstance(x, np.ndarray):
+        import hashlib
+        return int.from_bytes(hashlib.blake2b(x.tobytes() + str(x.shape).encode(), digest_size=8).digest(), "big", signed=True)
+    if isinstance(x, list):
+        return hash(tuple(_hash(v) for v in x))
+    if isinstance(x, dict):
+        return hash(tuple(sorted((_hash(k), _hash(v)) for k, v in x.items())))
+    return hash(x)
 
 
 def _repr(x):
-    return fmt(x)
+    return fmt(x, False)
 
 
 def _python_compat():
@@ -321,7 +494,12 @@ def _python_compat():
     return {"any": b.any, "all": b.all, "divmod": b.divmod, "pow": b.pow, "ord": b.ord, "chr": b.chr,
             "dict": b.dict, "set": b.set, "tuple": b.tuple, "repr": _repr, "hex": b.hex, "bin": b.bin,
             "oct": b.oct, "next": b.next, "iter": b.iter, "format": b.format, "callable": b.callable,
-            "getattr": _getattr, "hasattr": _hasattr, "fsum": _fsum}
+            "getattr": _getattr, "hasattr": _hasattr, "fsum": _fsum, "setattr": _setattr, "isinstance": _isinstance,
+            "super": super, "property": property, "staticmethod": staticmethod, "classmethod": classmethod,
+            "object": object,
+            "hash": _hash, "id": b.id, "ascii": b.ascii, "bytes": b.bytes, "bytearray": b.bytearray,
+            "complex": b.complex, "slice": b.slice, "vars": _vars, "dir": _dir, "issubclass": b.issubclass,
+            "frozenset": b.frozenset, "py_type_name": _py_type_name}
 
 
 def _fsum(x):
@@ -466,7 +644,13 @@ def mse(pred, target):
 
 
 def cross_entropy(logits, labels):
+    """Mean cross-entropy of integer labels; labels [B] with logits [B, C], or labels [B, T] with logits
+    [B, T, C] (sequence models: every position counts)."""
     labels = np.asarray(ops.raw(labels)).astype(int)
+    if labels.ndim > 1:
+        c = ops.shape(logits)[-1]
+        logits = ops.reshape(logits, -1, c)
+        labels = labels.reshape(-1)
     lp = ops.log_softmax(logits, axis=-1)
     n = labels.shape[0]
     picked = lp[(np.arange(n), labels)]
@@ -1051,8 +1235,14 @@ def _bnot(a):
 
 
 def core_builtins():
+    import builtins as _b
+    for conv, py in ((_int, int), (_float, float), (_str, str), (_list, list), (_b.dict, dict), (_b.tuple, tuple),
+                     (_b.set, set), (bool, bool), (_b.frozenset, frozenset), (_b.bytes, bytes), (_b.complex, complex)):
+        _TYPE_OF_CONVERTER[id(conv)] = py
     return {
         "chain_lists": lambda xss: [x for xs in xss for x in xs],
+        "write_out": _write_out, "write_err": _write_err, "flush_out": _flush_out,
+        "set_recursion_limit": _set_recursion_limit, "platform": _platform,
         "bor": _bitop("or"), "band": _bitop("and"), "bxor": _bitop("xor"), "shl": _bitop("shl"),
         "shr": _bitop("shr"), "bnot": _bnot, "set": set, "frozenset": frozenset,
         # io & conversion

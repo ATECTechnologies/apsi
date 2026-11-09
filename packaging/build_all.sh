@@ -33,7 +33,7 @@ cp apsi/*.py apsi/MANIFEST.json "$P/usr/lib/python3/dist-packages/apsi/"
 for sub in apsi/*/; do                                   # subpackages (apsi/native), without caches
   case "$sub" in *__pycache__*) continue ;; esac
   mkdir -p "$P/usr/lib/python3/dist-packages/$sub"
-  cp "$sub"*.py "$P/usr/lib/python3/dist-packages/$sub"
+  find "$sub" -maxdepth 1 -type f \( -name '*.py' -o -name '*.c' -o -name '*.h' -o -name '*.json' \) -exec cp {} "$P/usr/lib/python3/dist-packages/$sub" \;
 done
 cp README.md CHANGELOG.md "$P/usr/share/doc/apsi/"
 cp -r examples docs "$P/usr/share/apsi/"          # /usr/share/doc may be stripped on minimal systems

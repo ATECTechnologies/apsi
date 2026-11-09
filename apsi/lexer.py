@@ -1,22 +1,26 @@
 """Tokenizer for Apsi: indentation-sensitive, Unicode identifiers, unit literals."""
+import re
 from .errors import LexError, UnitError
 from .units import parse_unit
 
-NUMBER, STRING, FSTRING, NAME, KW, OP, UNIT, NEWLINE, INDENT, DEDENT, EOF = (
-    "NUMBER", "STRING", "FSTRING", "NAME", "KW", "OP", "UNIT", "NEWLINE", "INDENT", "DEDENT", "EOF")
+NUMBER, STRING, FSTRING, NAME, KW, OP, UNIT, NEWLINE, INDENT, DEDENT, EOF, BYTES = (
+    "NUMBER", "STRING", "FSTRING", "NAME", "KW", "OP", "UNIT", "NEWLINE", "INDENT", "DEDENT", "EOF", "BYTES")
 
 KEYWORDS = {"let", "var", "fn", "return", "if", "elif", "else", "while", "for", "in", "break",
             "continue", "struct", "true", "false", "none", "and", "or", "not", "use", "import",
             "assert", "evolve", "as", "pass"}
 
-OPS3 = ["..=", "**=", "//="]
+OPS3 = ["..=", "**=", "//=", "<<=", ">>="]
 OPS2 = ["..", "**", "//", "==", "!=", "<=", ">=", "->", "=>", "|>", "+=", "-=", "*=", "/=",
-        "~=", "%=", "@="]
-OPS1 = set("+-*/%@^<>=()[]{},.:'")
+        "~=", "%=", "@=", "<<", ">>", "|=", "&=", ":=", "^="]
+_OPS3, _OPS2 = frozenset(OPS3), frozenset(OPS2)
+OPS1 = set("+-*/%@^<>=()[]{},.:'|&~")
 UNICODE_OPS = {"±": "±", "×": "*", "·": "*", "≤": "<=", "≥": ">=", "≠": "!=", "≈": "~=", "→": "->",
                "−": "-"}
 UNIT_CHARS = "µμΩÅ"
-ESCAPES = {"n": "\n", "t": "\t", "r": "\r", "\\": "\\", '"': '"', "0": "\0"}
+ESCAPES = {"n": "\n", "t": "\t", "r": "\r", "\\": "\\", '"': '"', "0": "\0", "'": "'", "a": "\a", "b": "\b",
+           "f": "\f", "v": "\v"}
+_HEX_ESC = {"x": 2, "u": 4, "U": 8}
 
 
 class Token:
@@ -30,11 +34,32 @@ class Token:
         return f"{self.type}({self.value!r}{u})@{self.line}:{self.col}"
 
 
+_ASCII_START = frozenset("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ_")
+_ASCII_WORD = re.compile(r"[A-Za-z0-9_]*")
+
+
 def _ident_char(ch):
     return ("a" + ch).isidentifier()
 
 
+_TOK_MEMO = {}
+
+
 def tokenize(src):
+    """Tokens of a source text. The last few results are remembered (the Guard scan and the parser read the
+    same file); the caller gets its own list."""
+    if len(src) < 2000:
+        return _tokenize(src)
+    toks = _TOK_MEMO.get(src)
+    if toks is None:
+        toks = _tokenize(src)
+        if len(_TOK_MEMO) >= 4:
+            _TOK_MEMO.pop(next(iter(_TOK_MEMO)))
+        _TOK_MEMO[src] = toks
+    return list(toks)
+
+
+def _tokenize(src):
     if src.startswith("\ufeff"):
         src = src[1:]                       # UTF-8 BOM written by Windows Notepad
     src = src.replace("\r\n", "\n").replace("\r", "\n")
@@ -102,8 +127,9 @@ def tokenize(src):
             line_start = i
             continue
         if c == "#":
-            while i < n and src[i] != "\n":
-                i += 1
+            i = src.find("\n", i)
+            if i < 0:
+                i = n
             continue
         if c == ";":
             if depth == 0 and toks and toks[-1].type != NEWLINE:
@@ -151,9 +177,10 @@ def tokenize(src):
             add(NUMBER, text, unit, start_col)
             continue
         # strings -------------------------------------------------------
-        if c == '"' or (c == "f" and i + 1 < n and src[i + 1] == '"'):
+        if c == '"' or (c in "fb" and i + 1 < n and src[i + 1] == '"'):
             is_f = c == "f"
-            if is_f:
+            is_b = c == "b"
+            if is_f or is_b:
                 i += 1
             triple = src.startswith('"""', i)
             q = '"""' if triple else '"'
@@ -173,19 +200,38 @@ def tokenize(src):
                     line_start = i + 1
                 if ch == "\\" and i + 1 < n:
                     e = src[i + 1]
-                    if e in ESCAPES:
+                    if e in ESCAPES and not (is_f and e in "{}"):
                         buf.append(ESCAPES[e])
+                        i += 2
+                        continue
+                    if e in _HEX_ESC and not (is_b and e != "x"):
+                        k = _HEX_ESC[e]
+                        digits = src[i + 2:i + 2 + k]
+                        if len(digits) == k and all(d in "0123456789abcdefABCDEF" for d in digits):
+                            buf.append(chr(int(digits, 16)))
+                            i += 2 + k
+                            continue
+                    if e == "\n":                      # backslash-newline: line continuation inside a string
+                        line += 1
+                        line_start = i + 2
                         i += 2
                         continue
                 buf.append(ch)
                 i += 1
+            if is_b:
+                try:
+                    add(BYTES, "".join(buf).encode("latin-1"), c=start_col)
+                except UnicodeEncodeError:
+                    raise LexError("bytes literals hold only characters up to \\xff", line, start_col)
+                continue
             add(FSTRING if is_f else STRING, "".join(buf), c=start_col)
             continue
         # identifiers ---------------------------------------------------
-        if _ident_char(c) and not c.isdigit():
+        if (c in _ASCII_START or not c.isascii() and _ident_char(c)) and not c.isdigit():
             s = i
-            while i < n and _ident_char(src[i]):
-                i += 1
+            i = _ASCII_WORD.match(src, i).end()          # fast path for the ASCII part of a name
+            while i < n and not src[i].isascii() and _ident_char(src[i]):
+                i = _ASCII_WORD.match(src, i + 1).end()
             word = src[s:i]
             if word in KEYWORDS:
                 add(KW, word, c=start_col)
@@ -207,6 +253,15 @@ def tokenize(src):
             else:
                 add(NAME, word, c=start_col)
             continue
+        # `name`: any identifier, also one that is an Apsi keyword (converted Python: `var`, `fn` …)
+        if c == "`":
+            j = src.find("`", i + 1)
+            word = src[i + 1:j] if j > 0 else ""
+            if j < 0 or not word.isidentifier():
+                raise LexError("expected an identifier between backticks, e.g. `var`", line, col())
+            add(NAME, word, c=col())
+            i = j + 1
+            continue
         # operators -----------------------------------------------------
         if c in UNICODE_OPS:
             add(OP, UNICODE_OPS[c], c=start_col)
@@ -216,12 +271,14 @@ def tokenize(src):
             add(OP, "±", c=start_col)
             i += 3
             continue
-        for group in (OPS3, OPS2):
-            m = next((o for o in group if src.startswith(o, i)), None)
-            if m:
-                add(OP, m, c=start_col)
-                i += len(m)
-                break
+        m = src[i:i + 3]
+        if m not in _OPS3:
+            m = m[:2]
+            if m not in _OPS2:
+                m = None
+        if m:
+            add(OP, m, c=start_col)
+            i += len(m)
         else:
             if c in OPS1:
                 if c in "([{":

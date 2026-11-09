@@ -32,7 +32,7 @@ reproducible.
 Create a token with the `release` permission (only administrators see it), store it with `apsi lib login`, then:
 
 ```bash
-apsi release upload ApsiSetup-2.0.0-x64.exe apsi-2.0.0-linux.zip apsi-2.0.0-source.zip --version 2.0.0
+apsi release upload ApsiSetup-2.4.4-x64.exe apsi-2.4.4-linux.zip apsi-2.4.4-source.zip --version 2.4.4
 apsi release upload apsi-1.10.0-linux.zip --version 1.10.0 --date 2026-11-08T09:00:00Z   # an older version
 apsi release list               # ids, sizes, downloads
 apsi release hide 7             # / unhide 7
@@ -46,7 +46,7 @@ stable version is what `/download` shows; every version stays on `/download/all`
 On the server itself the same works without a token:
 
 ```bash
-node scripts/admin.js release add FILE... --version 2.0.0
+node scripts/admin.js release add FILE... --version 2.4.4
 node scripts/admin.js release list
 node scripts/admin.js release delete 7 8 9
 node scripts/admin.js release delete-version 1.10.0       # every file of a version
@@ -55,10 +55,10 @@ node scripts/admin.js release delete-version 1.10.0       # every file of a vers
 ## Benchmarks (administrators)
 
 ```bash
-python3 benchmarks/heavy/run.py --publish 2.0.0                       # numbers appear on /benchmarks live
+python3 benchmarks/heavy/run.py --publish 2.4.4                       # numbers appear on /benchmarks live
 python3 benchmarks/heavy/run.py --apsi-root ../apsi-1.10.0 --only Apsi --label "Apsi 1.10.0" \
         --merge benchmarks/heavy/results.json --publish 1.10.0        # measure an older version
-apsi release bench results.json --version 2.0.0                       # publish an existing results file
+apsi release bench results.json --version 2.4.4                       # publish an existing results file
 apsi release bench --delete 1.10.0                                    # remove a version's results
 ```
 

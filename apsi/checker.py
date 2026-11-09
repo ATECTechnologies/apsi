@@ -69,6 +69,7 @@ class Checker:
         self.struct_names = set()
         self.refs = []           # (line, col, name, Info) for every resolved name — used by the LSP
         self.decls = []          # (line, col, name, Info) for declarations
+        self.deps = []           # files read while checking (imports): a cached "checked clean" depends on them
 
     # ------------------------------------------------------------- utils
     def err(self, node, msg, cls=TypeCheckError):
@@ -78,10 +79,13 @@ class Checker:
         info = sc.lookup(name)
         if info is not None:
             return info
+        if name in ("__name__", "__file__", "__doc__"):
+            return Info(None, False, None, "builtin")
         if name in self.builtins:
             v = self.builtins[name]
             return Info(ops.dim_of(v) if not callable(v) else None, False, None, "builtin")
-        if node is not None:
+        if node is not None and not self.pyc:
+            # Python-mode programs keep Python's rule: an unknown name is a NameError when (and if) it runs
             self.err(node, f"'{name}' is not defined", NameErr)
         return None
 
@@ -131,8 +135,9 @@ class Checker:
 
     # ------------------------------------------------------------- program
     def check(self, prog):
+        self.pyc = is_python_mode(prog)
         for s in prog.body:
-            if isinstance(s, A.StructDef):
+            if isinstance(s, (A.StructDef, A.ClassDef)):
                 self.struct_names.add(s.name)
         top = Scope()
         self.block(prog.body, top, top_level=True)
@@ -152,7 +157,7 @@ class Checker:
         self.infer(s.expr, sc)
 
     def c_Let(self, s, sc, top):
-        d = self.infer(s.value, sc)
+        d = self.infer(s.value, sc) if s.value is not None else None
         if len(s.targets) == 1:
             declared = self.type_dim(s.type, sc, s) if s.type is not None else None
             if isD(declared) and isD(d) and d != declared:
@@ -161,7 +166,7 @@ class Checker:
             dim = declared if declared is not None else (None if d == ZERO else d)
             self._decl(sc, s.targets[0], Info(dim, s.mutable), s)
         else:
-            for n in s.targets:
+            for n in pattern_names(s.targets):
                 self._decl(sc, n, Info(None, s.mutable), s)
 
     def _assign_name(self, node, name, d, sc):
@@ -169,7 +174,7 @@ class Checker:
         if info is None:
             self.err(node, f"'{name}' is not defined; declare it first with let or var", NameErr)
             return None
-        if not info.mutable:
+        if not info.mutable and not self.pyc:
             what = "a parameter" if info.kind == "param" else (
                 "a function" if info.kind in ("fn", "builtin") else "declared with let")
             self.err(node, f"cannot assign to '{name}': it is {what} (use var for mutable variables)")
@@ -179,15 +184,19 @@ class Checker:
     def c_Assign(self, s, sc, top):
         d = self.infer(s.value, sc)
         self._target(s.target, d, sc, s)
+        for t in s.more or ():
+            self._target(t, d, sc, s)
 
     def _target(self, t, d, sc, s):
         if isinstance(t, A.Name):
             info = self._assign_name(t, t.id, d, sc)
             if info and isD(info.dim) and isD(d) and info.dim != d:
                 self.err(t, f"'{t.id}' holds {dim_name(info.dim)}; cannot assign {dim_name(d)}", UnitError)
-        elif isinstance(t, A.TupleLit):
+        elif isinstance(t, (A.TupleLit, A.ListLit)):
             for x in t.items:
                 self._target(x, None, sc, s)
+        elif isinstance(t, A.Spread):
+            self._target(t.value, None, sc, s)
         elif isinstance(t, A.Attr):
             self.infer(t.obj, sc)
         elif isinstance(t, A.Index):
@@ -211,6 +220,10 @@ class Checker:
     def _sig(self, s, sc):
         params = [(p.name, self.type_dim(p.type, sc, p) if p.type is not None else None,
                    p.default is not None) for p in s.params if not p.star]
+        if any(p.star in ("*", "/") and p.name is None for p in s.params):
+            sig = Sig(s.name, params, None)                    # keyword-only / positional-only markers:
+            sig.varargs = sig.varkw = True                     # arity is checked when the call runs
+            return sig
         ret = self.type_dim(s.ret, sc, s) if s.ret is not None else None
         sig = Sig(s.name, params, ret)
         sig.varargs = any(p.star == "*" for p in s.params)
@@ -221,14 +234,19 @@ class Checker:
         for d in s.decorators:
             self.infer(d, sc)
         sig = self._sig(s, sc)
-        self._decl(sc, s.name, Info(None, False, sig, "fn"), s)
-        if top:
+        if s.decorators and self.pyc:
+            sig = None                                         # a decorator may change the signature
+        self._decl(sc, s.name, Info(None, self.pyc, sig, "fn"), s)
+        if sig is None:
+            sig = self._sig(s, sc)
+        if top or self.pyc:
             self.deferred.append(lambda: self.fn_body(s, sc, sig))
         else:
             self.fn_body(s, sc, sig)
 
     def fn_body(self, s, sc, sig, extra=None):
         fsc = Scope(sc)
+        fsc.fn_root = True
         for k, v in (extra or {}).items():
             fsc.names[k] = v
         syms = set(s.shape_params)
@@ -239,20 +257,24 @@ class Checker:
         for sym in syms:
             fsc.names[sym] = Info(DIMLESS, False, kind="param")
         for p in s.params:
-            if p.star:
-                self._decl(fsc, p.name, Info(None, False, kind="param"), p)
-        for p, (_, d, _) in zip([q for q in s.params if not q.star], sig.params):
+            if p.star and p.name is not None:
+                self._decl(fsc, p.name, Info(None, self.pyc, kind="param"), p)
+        for p, (_, d, _) in zip([q for q in s.params if not q.star], self._sig_plain(s, sc)):
             if p.default is not None:
                 pd = self.infer(p.default, sc)
                 if isD(d) and isD(pd) and pd != d:
                     self.err(p, f"default value of '{p.name}' is {dim_name(pd)}, expected {dim_name(d)}", UnitError)
-            self._decl(fsc, p.name, Info(d, False, kind="param"), p)
+            self._decl(fsc, p.name, Info(d, self.pyc, kind="param"), p)
         self.fn_stack.append(sig)
         if s.is_expr:
             self.check_ret(s.body, self.infer(s.body, fsc), sig)
         else:
             self.block(s.body, fsc)
         self.fn_stack.pop()
+
+    def _sig_plain(self, s, sc):
+        return [(p.name, self.type_dim(p.type, sc, p) if p.type is not None else None, p.default is not None)
+                for p in s.params if not p.star]
 
     def check_ret(self, node, d, sig):
         if isD(sig.ret) and isD(d) and d != sig.ret:
@@ -262,6 +284,10 @@ class Checker:
     def c_Return(self, s, sc, top):
         if not self.fn_stack:
             self.err(s, "'return' outside of a function")
+            return
+        if self.fn_stack[-1] is None:
+            if s.value is not None:
+                self.infer(s.value, sc)
             return
         d = self.infer(s.value, sc) if s.value is not None else None
         self.check_ret(s, d, self.fn_stack[-1])
@@ -277,6 +303,105 @@ class Checker:
             extra = {}
             self.deferred.append(lambda m=m, sig=sig: self.fn_body(m, sc, sig))
 
+    # ---- the Python object model: classes, with, del, global
+    def c_ClassDef(self, s, sc, top):
+        for d in s.decorators:
+            self.infer(d, sc)
+        for b in s.bases:
+            self.infer(b, sc)
+        for _k, v in s.kwargs:
+            self.infer(v, sc)
+        self._decl(sc, s.name, Info(None, self.pyc, None, "struct"), s)
+        csc = Scope(sc)
+        csc.is_class = True
+        for item in s.body:
+            if isinstance(item, A.FieldDef):
+                if item.value is not None:
+                    self.infer(item.value, csc)
+                self._decl(csc, item.name, Info(None, True), item)
+            elif isinstance(item, A.FnDef):
+                for d in item.decorators:
+                    self.infer(d, csc)
+                sig = self._sig(item, sc)
+                csc.names[item.name] = Info(None, True, None, "fn")
+                # methods see the enclosing scope, not the class body (Python's rule)
+                self.deferred.append(lambda m=item, sig=sig: self.fn_body(m, sc, sig))
+            else:
+                m = getattr(self, "c_" + type(item).__name__, None)
+                if m:
+                    m(item, csc, False)
+
+    def c_FieldDef(self, s, sc, top):
+        if s.value is not None:
+            self.infer(s.value, sc)
+        self._decl(sc, s.name, Info(None, True), s)
+
+    def c_With(self, s, sc, top):
+        ws = Scope(sc) if not self.pyc else sc
+        for e, target in s.items:
+            self.infer(e, sc)
+            if target is not None:
+                for n in pattern_names(target):
+                    if self.pyc and _local_lookup(sc, n) is not None:
+                        continue
+                    self._decl(ws, n, Info(None, True), s)
+        self.block(s.body, ws if not self.pyc else Scope(sc))
+
+    def c_Match(self, s, sc, top):
+        self.infer(s.subject, sc)
+        for pat, guard, body in s.cases:
+            inner = Scope(sc)
+            self._pattern(pat, sc, inner, s)
+            if guard is not None:
+                self.infer(guard, inner)
+            self.block(body, inner)
+
+    def _pattern(self, p, sc, inner, node):
+        k = p[0]
+        if k in ("capture",):
+            self._decl(inner, p[1], Info(None, True), node)
+        elif k == "star" and p[1]:
+            self._decl(inner, p[1], Info(None, True), node)
+        elif k == "as":
+            self._pattern(p[1], sc, inner, node)
+            self._decl(inner, p[2], Info(None, True), node)
+        elif k in ("or", "seq"):
+            for x in p[1]:
+                self._pattern(x, sc, inner, node)
+        elif k == "map":
+            for key, v in p[1]:
+                if not isinstance(key, tuple):
+                    self.infer(key, sc)
+                self._pattern(v, sc, inner, node)
+            if p[2]:
+                self._decl(inner, p[2], Info(None, True), node)
+        elif k == "class":
+            self.lookup(p[1].split(".")[0], sc, node)
+            for x in p[2]:
+                self._pattern(x, sc, inner, node)
+            for _n, x in p[3]:
+                self._pattern(x, sc, inner, node)
+        elif k == "value":
+            self.lookup(p[1].split(".")[0], sc, node)
+        elif k == "lit" and not isinstance(p[1], tuple):
+            self.infer(p[1], sc)
+
+    def i_AsyncIter(self, e, sc):
+        self.infer(e.value, sc)
+        return None
+
+    def c_Del(self, s, sc, top):
+        for t in s.targets:
+            if isinstance(t, A.Name):
+                self.lookup(t.id, sc, t)
+            else:
+                self.infer(t, sc)
+
+    def c_Global(self, s, sc, top):
+        for n in s.names:
+            if self.lookup(n, sc, None) is None:
+                self.err(s, f"'{n}' is not defined in an enclosing scope (declare it there with var)", NameErr)
+
     def c_If(self, s, sc, top):
         for cond, body in s.branches:
             self.infer(cond, sc)
@@ -290,7 +415,8 @@ class Checker:
         for kinds, name, body in s.handlers:
             for k in kinds:
                 base = ALIASES.get(k, k)
-                if base not in KINDS and self.lookup(base.split(".")[0], sc, None) is None:
+                if base not in KINDS and self.lookup(base.split(".")[0], sc, None) is None \
+                        and not (self.pyc and base in _PY_EXC):
                     self.err(s, f"unknown error kind '{k}' (use a kind such as ValueError, KeyError, IndexError, "
                                 f"ZeroDivisionError, UnitError, OSError, or `except as e` for every error)", NameErr)
             hs = Scope(sc)
@@ -311,17 +437,25 @@ class Checker:
     def c_Raise(self, s, sc, top):
         if s.value is not None:
             self.infer(s.value, sc)
+        if s.cause is not None:
+            self.infer(s.cause, sc)
 
     def c_While(self, s, sc, top):
         self.infer(s.cond, sc)
         self.block(s.body, Scope(sc))
+        if s.else_body:
+            self.block(s.else_body, Scope(sc))
 
     def c_For(self, s, sc, top):
         self.infer(s.iter, sc)
         fs = Scope(sc)
-        for n in s.targets:
-            self._decl(fs, n, Info(None, False), s)
+        for n in pattern_names(s.targets):
+            if self.pyc and _local_lookup(sc, n) is not None:
+                continue                                       # Python: the loop assigns the existing variable
+            self._decl(fs, n, Info(None, self.pyc), s)
         self.block(s.body, fs)
+        if s.else_body:
+            self.block(s.else_body, Scope(sc))
 
     def c_Use(self, s, sc, top):
         if s.path not in self.modules:
@@ -349,9 +483,10 @@ class Checker:
             self.err(s, f"cannot find file '{s.path}'", NameErr)
             return
         if s.alias:
-            sc.names[s.alias] = Info(None, False, kind="module")
+            self._decl(sc, s.alias, Info(None, False, kind="module"), s)
             return
         try:
+            self.deps.append(path)
             with open(path, encoding="utf-8-sig") as fh:
                 prog = parse(fh.read(), cache=True)
         except (ParseError, LexError) as e:
@@ -464,6 +599,12 @@ class Checker:
 
     def _decl(self, sc, name, info, node):
         info.decl = (node.line, node.col)
+        if self.pyc:
+            # Python: blocks are not scopes — a name belongs to the whole function (or class / module)
+            while sc.parent is not None and not (getattr(sc, "fn_root", False) or getattr(sc, "is_class", False)
+                                                 or getattr(sc, "is_comp", False)):
+                sc = sc.parent
+            info.mutable = True
         sc.names[name] = info
         self.decls.append((node.line, node.col, name, info))
         return info
@@ -632,27 +773,66 @@ class Checker:
 
     def i_DictLit(self, e, sc):
         for k, v in e.pairs:
-            self.infer(k, sc)
+            if k is not None:
+                self.infer(k, sc)
             self.infer(v, sc)
         return None
 
+    def _comp_scope(self, e, sc):
+        cs = sc
+        for targets, itx, cond in [(e.targets, e.iter, e.cond)] + list(e.more or []):
+            self.infer(itx, cs)
+            cs = Scope(cs)
+            cs.is_comp = True
+            for n in pattern_names(targets):
+                cs.names[n] = Info(None, False)
+            if cond is not None:
+                self.infer(cond, cs)
+        return cs
+
     def i_ListComp(self, e, sc):
-        self.infer(e.iter, sc)
-        cs = Scope(sc)
-        for n in e.targets:
-            cs.names[n] = Info(None, False)
-        if e.cond is not None:
-            self.infer(e.cond, cs)
+        cs = self._comp_scope(e, sc)
         self.infer(e.elem, cs)
         return None
 
+    i_SetComp = i_GenExp = i_ListComp
+
+    def i_SetLit(self, e, sc):
+        for x in e.items:
+            self.infer(x, sc)
+        return None
+
+    def i_Bytes(self, e, sc):
+        return None
+
+    def i_Chain(self, e, sc):
+        ds = [self.infer(x, sc) for x in e.operands]
+        for op, a, b, node in zip(e.ops, ds, ds[1:], e.operands[1:]):
+            if op in ("<", "<=", ">", ">=", "==", "!=") and isD(a) and isD(b) and a != b:
+                self.err(node, f"cannot compare {dim_name(a)} and {dim_name(b)}", UnitError)
+        return None
+
+    def i_NamedExpr(self, e, sc):
+        self.infer(e.value, sc)
+        if sc.lookup(e.name) is None:
+            # Python binds the name in the enclosing function (not in a comprehension's own scope)
+            target = sc
+            while getattr(target, "is_comp", False) and target.parent is not None:
+                target = target.parent
+            target.names[e.name] = Info(None, True)
+        return None
+
+    def i_Await(self, e, sc):
+        self.infer(e.value, sc)
+        return None
+
+    def i_YieldExpr(self, e, sc):
+        if e.value is not None:
+            self.infer(e.value, sc)
+        return None
+
     def i_DictComp(self, e, sc):
-        self.infer(e.iter, sc)
-        cs = Scope(sc)
-        for n in e.targets:
-            cs.names[n] = Info(None, False)
-        if e.cond is not None:
-            self.infer(e.cond, cs)
+        cs = self._comp_scope(e, sc)
         self.infer(e.key, cs)
         self.infer(e.value, cs)
         return None
@@ -660,7 +840,10 @@ class Checker:
     def i_Lambda(self, e, sc):
         ls = Scope(sc)
         for p in e.params:
-            ls.names[p.name] = Info(self.type_dim(p.type, sc, p) if p.type else None, False, kind="param")
+            if p.default is not None:
+                self.infer(p.default, sc)
+            if p.name is not None:
+                ls.names[p.name] = Info(self.type_dim(p.type, sc, p) if p.type else None, False, kind="param")
         self.fn_stack.append(Sig("<lambda>", [], None))
         self.infer(e.body, ls)
         self.fn_stack.pop()
@@ -683,4 +866,42 @@ class Checker:
         for p in e.parts:
             if not isinstance(p, str):
                 self.infer(p[0], sc)
+                if isinstance(p[1], A.FStr):
+                    self.infer(p[1], sc)
         return None
+
+
+def pattern_names(pats):
+    """Every name a target pattern binds (see ast.For)."""
+    if isinstance(pats, str):
+        return [pats]
+    if isinstance(pats, tuple):                    # ("*", name) or ("expr", attribute/index target)
+        return [] if pats[0] == "expr" else [pats[1]]
+    out = []
+    for p in pats:
+        out += pattern_names(p)
+    return out
+
+
+def _local_lookup(sc, name):
+    """A binding of `name` in the same function (Python scoping: one namespace per function)."""
+    s = sc
+    while s is not None:
+        if name in s.names:
+            return s.names[name]
+        if getattr(s, "fn_root", False) or getattr(s, "is_class", False):
+            return None
+        s = s.parent
+    return None
+
+
+def is_python_mode(prog):
+    """`use pycompat` at the top of a file: Python's exact semantics (converted programs)."""
+    for s in prog.body[:40]:
+        if isinstance(s, A.Use) and s.path == "pycompat" and s.alias is None:
+            return True
+    return False
+
+
+import builtins as _bi  # noqa: E402
+_PY_EXC = {k for k, v in vars(_bi).items() if isinstance(v, type) and issubclass(v, BaseException)}

@@ -132,7 +132,8 @@ true false none and or not use import assert evolve as pass
 ```
 
 Contextual (special only in one place, ordinary names elsewhere): `try`, `except`, `finally`, `raise`, `yield`
-(statements, section 7.2–7.3), `test` (starts a test block),
+(statements, section 7.2–7.3), `class`, `with`, `del`, `global`, `nonlocal`, `async`, `await` (section 9.4 and
+7.5–7.7), `is` (after an expression), `test` (starts a test block),
 `parallel` (only directly before `for`), `over step using tol record every into` (inside `evolve`).
 
 ### 3.5 Numbers
@@ -274,12 +275,17 @@ p.mass = 2kg                # field assignment (structs, records)
 | lambda | `fn(x) => expr` | |
 | pipe | `x \|> f` | `x \|> f` is `f(x)`; `x \|> f(a)` is `f(x, a)` |
 | conditional | `a if cond else b` | |
-| logical | `or`, `and`, `not` | short-circuit |
-| comparison | `== != < <= > >= ~= in not in` | chain: `0 < x < 1` |
+| walrus | `(n := expr)` | assigns and gives the value |
+| logical | `or`, `and`, `not` | short-circuit; `a or b` gives `a` or `b` itself |
+| comparison | `== != < <= > >= ~= in not in is is not` | chain: `0 < f(x) < 1` evaluates `f(x)` once |
+| bitwise or | `\|` | integers bit by bit, set union, dict merge, boolean tensors |
+| bitwise xor | `^` (only after `use pycompat`; elsewhere `^` is a power) | |
+| bitwise and | `&` | |
+| shifts | `<< >>` | |
 | range / conversion | `a..b`, `a..=b`, `x as [unit]` | |
 | additive | `+ -` | |
 | multiplicative | `* / // % @` | `@` is matrix multiplication |
-| unary | `-x`, `+x` | |
+| unary | `-x`, `+x`, `~x` | `~` is bitwise not (logical not for boolean tensors) |
 | uncertainty | `x ± σ`, `x +/- σ` | binds tighter than `*` |
 | power | `**` or `^` | right-associative: `2**3**2 == 512`, `-2**2 == -4` |
 | postfix | `f(a, k=v)`, `x[i, j]`, `x[1:5:2]`, `x.field` | |
@@ -415,10 +421,46 @@ for n in naturals():
 print(list(evens([1, 2, 3, 4])))           # [2, 4, 100, 200]
 ```
 
-### 7.4 `for … else` / `while … else` in converted code
+### 7.4 `for … else` / `while … else`
 
-Apsi has no loop `else`; `apsi convert` rewrites Python's `for … else` with a flag so the `else` part still runs
-only when the loop finished without `break`.
+The `else` part runs when the loop finished without `break`:
+
+```apsi
+for d in divisors:
+    if n % d == 0:
+        break
+else:
+    print(f"{n} is prime")
+```
+
+Loop targets may be nested and starred: `for i, (a, b) in enumerate(pairs):`, `for first, *rest in rows:`.
+
+### 7.5 `with`
+
+`with` enters a context and always leaves it, also when the block fails. Anything with `__enter__`/`__exit__` works
+(open files, locks, `torch.no_grad()`, your own classes); a struct with `enter`/`exit` methods works too.
+
+```apsi
+with open("log.txt", "w") as f, lock:
+    f.write("ok")
+```
+
+### 7.6 `del`, assignment forms, `global` / `nonlocal`
+
+```apsi
+del cache[key], obj.tmp, name
+a = b = 0                       # several targets
+first, *rest = items            # also: let first, *rest = items
+x |= flags                      # |= &= <<= >>= update in place where the value supports it
+```
+
+`global name` / `nonlocal name` say that a function assigns a variable of the module / of the enclosing function.
+In Apsi files they are optional (an outer `var` is assigned without them); converted Python keeps them.
+
+### 7.7 Generators are lazy
+
+`(f(x) for x in xs)` is a generator: values are made one at a time, so `any(slow(x) for x in xs)` stops at the
+first true value and endless sources work. `[…]` is a list, `{…}` a set (`{x % 3 for x in xs}`) or a dict.
 
 ### 7.1 `parallel for`
 
@@ -613,6 +655,51 @@ print(param_count(model))                        # 65
 ```
 
 ---
+
+### 9.4 Classes — Python's object model
+
+`class` defines a real class with the same rules as Python: inheritance from your classes *and from library
+classes* (`torch.nn.Module`, `threading.Thread`, `Exception`, `enum.Enum` …), `super()`, properties, static and class
+methods, special methods (`__add__`, `__eq__`, `__len__`, `__getitem__`, `__call__`, `__enter__` …), decorators on
+the class, metaclasses and keyword arguments in the header.
+
+```apsi
+class Account:
+    rate: Float = 0.02                 # a field: class attribute + annotation (dataclasses use it)
+    let opened = [0]                   # a class attribute
+    fn __init__(self, owner, balance=0.0):
+        self.owner = owner
+        self._balance = balance        # _private attributes are reachable inside your own classes
+        Account.opened[0] += 1
+    @property
+    fn balance(self):
+        return self._balance
+    fn __repr__(self):
+        return f"Account({self.owner}, {self._balance})"
+
+class Savings(Account):
+    fn __init__(self, owner):
+        super().__init__(owner, 10.0)
+
+let dataclasses = pyimport("dataclasses")       # a pure standard module: no permission needed
+
+@dataclasses.dataclass(frozen=true)
+class Point:
+    x: Float
+    y: Float = 0.0
+```
+
+Methods see the scope around the class, not the class body (as in Python). Instances print with `__repr__` /
+`__str__`. A `struct` (9.1) is still the light, typed record for numeric code; a `class` is for objects with
+behaviour and for anything that has to fit into a Python library.
+
+### 9.5 `use pycompat` — Python's exact semantics for a file
+
+A file that starts with `use pycompat` keeps Apsi's syntax but behaves exactly like Python: Python's `print`/`str`/
+`repr` text (`True`, `None`, `'quotes'`), Python's built-ins (`range`, `map`, `zip`, `open` …), one namespace per
+function (a loop variable lives after the loop), default values evaluated once, `*args` as a tuple, `+=` in place,
+direct attribute access, `^` as exclusive or. `apsi convert` writes it at the top of every converted file; see
+[From Python to Apsi](PYTHON.md). Apsi's permissions still apply inside such a file.
 
 ## 10. Physical units
 

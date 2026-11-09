@@ -1,5 +1,5 @@
-"""Python programs converted with `apsi convert` must print what Python prints (Apsi spells true/false/none
-in lower case and quotes strings with "…", which is normalised before comparing)."""
+"""Python programs converted with `apsi convert` must print exactly what Python prints, byte for byte (the
+converted files start with `use pycompat`, which gives them Python's semantics)."""
 import glob
 import os
 import re
@@ -31,9 +31,12 @@ def _make(path):
             out = os.path.join(td, "prog.apsi")
             subprocess.run([sys.executable, "-m", "apsi", "convert", path, "-o", out], capture_output=True,
                            text=True, env=env, timeout=120, check=True)
-            got = subprocess.run([sys.executable, "-m", "apsi", "run", out], capture_output=True, text=True,
+            with open(path, encoding="utf-8") as f:
+                head = f.readline()
+            flags = head.split(":", 1)[1].split() if head.startswith("# apsi-flags:") else []
+            got = subprocess.run([sys.executable, "-m", "apsi", "run", out, *flags], capture_output=True, text=True,
                                  env=env, timeout=120)
-        self.assertEqual(_norm(want), _norm(got.stdout), got.stderr)
+        self.assertEqual(want, got.stdout, got.stderr)
     return test
 
 

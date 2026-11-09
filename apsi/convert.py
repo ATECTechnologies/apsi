@@ -85,6 +85,12 @@ SIMPLE.update({
     "random.random": "rand", "random.seed": "seed",
     "json.loads": "json_parse", "json.dumps": "json_str",
     "time.time": "clock", "time.perf_counter": "clock", "time.monotonic": "clock", "time.process_time": "clock",
+    "sys.maxsize": "9223372036854775807", "sys.float_info.epsilon": "2.220446049250313e-16",
+    "sys.float_info.max": "1.7976931348623157e308", "sys.float_info.min": "2.2250738585072014e-308",
+    "sys.float_info.dig": "15", "sys.setrecursionlimit": "set_recursion_limit", "sys.getrecursionlimit": "fn() => 1000",
+    "sys.stdout.write": "write_out", "sys.stderr.write": "write_err", "sys.stdout.flush": "flush_out",
+    "sys.stderr.flush": "flush_out", "sys.platform": "platform()", "sys.stdout": '"stdout"', "sys.stderr": '"stderr"',
+    "sys.version": '"Apsi"', "sys.byteorder": '"little"',
     "os.path.exists": "exists", "os.path.isfile": "exists", "sys.exit": "exit", "exit": "exit", "quit": "exit",
     "statistics.mean": "mean", "statistics.fmean": "mean", "statistics.pstdev": "std",
     "functools.reduce": None,
@@ -371,7 +377,7 @@ class Converter:
                         self.lazy_py[mod_alias] = (s.module, s)
 
     def _native(self, mod):
-        return mod in NATIVE_MODULES or mod.split(".")[0] in ("numpy", "math", "random", "json", "time",
+        return mod in NATIVE_MODULES or mod.split(".")[0] in ("numpy", "math", "random", "json", "time", "sys",
                                                               "typing", "dataclasses", "functools", "__future__")
 
     def _safe(self, name):
@@ -1213,6 +1219,18 @@ class Converter:
         fv = self._file_of(n.value)
         if fv:
             raise Unsupported(f"file method .{n.attr} outside a call")
+        if n.attr == "__name__":
+            if isinstance(n.value, ast.Call) and isinstance(n.value.func, ast.Name) and n.value.func.id == "type" \
+                    and len(n.value.args) == 1:
+                return f"py_type_name({self.ex(n.value.args[0])})", PREC["atom"]
+            if isinstance(n.value, ast.Name):
+                return _q(n.value.id), PREC["atom"]
+        if n.attr == "__class__":
+            return f"type({self.ex(n.value)})", PREC["atom"]
+        if n.attr == "__dict__":
+            return f"vars({self.ex(n.value)})", PREC["atom"]
+        if n.attr == "__doc__":
+            return '""', PREC["atom"]
         if n.attr.startswith("__"):
             raise Unsupported(f"special attribute {n.attr}")
         return f"{self.ex(n.value, PREC['atom'])}.{n.attr}", PREC["atom"]
@@ -1281,12 +1299,23 @@ class Converter:
         return "set([" + ", ".join(self.ex(e) for e in n.elts) + "])", PREC["atom"]
 
     def e_Dict(self, n):
-        items = []
+        items, parts = [], []
         for k, v in zip(n.keys, n.values):
-            if k is None:
-                raise Unsupported("**dict unpacking")
-            items.append(f"{self.ex(k)}: {self.ex(v)}")
-        return "{" + ", ".join(items) + "}", PREC["atom"]
+            if k is None:                          # {**a, "k": 1, **b}  →  bor(bor(bor({}, a), {"k": 1}), b)
+                if items:
+                    parts.append("{" + ", ".join(items) + "}")
+                    items = []
+                parts.append(self.ex(v))
+            else:
+                items.append(f"{self.ex(k)}: {self.ex(v)}")
+        if not parts:
+            return "{" + ", ".join(items) + "}", PREC["atom"]
+        if items:
+            parts.append("{" + ", ".join(items) + "}")
+        out = "dict()"
+        for p in parts:
+            out = f"bor({out}, {p})"
+        return out, PREC["atom"]
 
     def _gens(self, gens):
         out = []
@@ -1311,10 +1340,6 @@ class Converter:
     def e_ListComp(self, n):
         saved, self.in_comprehension = self.in_comprehension, True
         try:
-            if len(n.generators) > 1:
-                # [e for a in A for b in B if c]  →  chain_lists([[e for b in B if c] for a in A])
-                inner = ast.ListComp(elt=n.elt, generators=n.generators[1:])
-                return f"chain_lists([{self.e_ListComp(inner)[0]} {self._gens(n.generators[:1])}])", PREC["atom"]
             return f"[{self.ex(n.elt)} {self._gens(n.generators)}]", PREC["atom"]
         finally:
             self.in_comprehension = saved
@@ -1326,10 +1351,6 @@ class Converter:
         return f"set({self.e_ListComp(ast.ListComp(elt=n.elt, generators=n.generators))[0]})", PREC["atom"]
 
     def e_DictComp(self, n):
-        if len(n.generators) > 1:
-            pairs = self.e_ListComp(ast.ListComp(elt=ast.Tuple(elts=[n.key, n.value], ctx=ast.Load()),
-                                                 generators=n.generators))[0]
-            return f"dict({pairs})", PREC["atom"]
         return f"{{{self.ex(n.key)}: {self.ex(n.value)} {self._gens(n.generators)}}}", PREC["atom"]
 
     def e_Subscript(self, n):
@@ -1502,8 +1523,8 @@ class Converter:
             names = [dotted(e) for e in t.elts] if isinstance(t, ast.Tuple) else [dotted(t)]
             tests = []
             for tn in names:
-                if tn in ISINSTANCE:
-                    tests.append(f"type({args[0]}) == {ISINSTANCE[tn]}")
+                if tn in ISINSTANCE or tn in ("set", "frozenset", "bytes", "complex"):
+                    tests.append(f"isinstance({args[0]}, {tn})")       # Python's rules (bool is an int, …)
                 elif tn in self.classes:
                     subs = [tn] + self._subclasses(tn)
                     tests.append(f"type({args[0]}) == {_q(tn)}" if len(subs) == 1
@@ -1641,6 +1662,36 @@ def _check(text, path):
         return [e.format(text, path)]
 
 
+def _permissions_needed(text):
+    """The --allow-python level a converted file needs (pure standard modules and pycompat stand-ins need none)."""
+    from .interop import PURE_MODULES
+    from .guard import ESCAPE_MODULES, SAFE_SUBMODULES, PYCOMPAT_STANDINS
+    mods = re.findall(r'py(?:import|from)\("([^"]+)"', text)
+    pyc = "use pycompat" in text
+    level = ""
+    for m in mods:
+        root = m.split(".")[0]
+        if root in PURE_MODULES or (pyc and (m in PYCOMPAT_STANDINS or root == "numpy")) or \
+                m in ("urllib.parse", "html.parser"):
+            continue
+        if root in ESCAPE_MODULES and m not in SAFE_SUBMODULES:
+            return "--allow-python=all (it uses " + m + ")"
+        level = "--allow-python"
+    return level
+
+
+def _up_to_date(apsi_path, py_path):
+    """A converted module can be reused only if it is newer than its source and was written by this version."""
+    from . import __version__
+    try:
+        if os.path.getmtime(apsi_path) < os.path.getmtime(py_path):
+            return False
+        with open(apsi_path, encoding="utf-8") as fh:
+            return f"`apsi convert` {__version__} " in fh.readline()
+    except OSError:
+        return False
+
+
 def cmd_convert(args):
     import argparse  # noqa: F401
     paths = args.paths
@@ -1666,21 +1717,42 @@ def cmd_convert(args):
     if not jobs:
         print("apsi convert: no .py files found", file=sys.stderr)
         return 2
+    idiomatic = getattr(args, "idiomatic", False)
     status = 0
     total_warn = 0
-    for src, dst in jobs:
+    done = set()
+    written = []
+    queue = list(jobs)
+    while queue:
+        src, dst = queue.pop(0)
+        key = os.path.abspath(src)
+        if key in done:
+            continue
+        done.add(key)
         try:
             with open(src, encoding="utf-8-sig") as fh:
                 code = fh.read()
-            text, warns = convert_source(code, src)
+            if idiomatic:
+                text, warns = convert_source(code, src)
+                deps = set()
+            else:
+                from .pyconvert import convert_source as faithful
+                text, warns, deps = faithful(code, src)
         except SyntaxError as e:
             print(f"✗ {src}:{e.lineno}: Python syntax error: {e.msg}", file=sys.stderr)
             status = 1
             continue
+        # modules next to the program are converted with it (unless written already and newer)
+        if not args.stdout:
+            out_dir = os.path.dirname(os.path.abspath(dst))
+            for dep in sorted(deps):
+                rel = os.path.relpath(dep, os.path.dirname(os.path.abspath(src)))
+                ddst = os.path.splitext(os.path.join(out_dir, rel))[0] + ".apsi"
+                if os.path.abspath(dep) not in done and not (
+                        _up_to_date(ddst, dep)
+                        and not any(os.path.abspath(j[0]) == os.path.abspath(dep) for j in jobs)):
+                    queue.append((dep, ddst))
         total_warn += len(warns)
-        notes = {}
-        for line, msg in warns:
-            notes.setdefault(line, []).append(msg)
         if args.stdout:
             sys.stdout.write(text)
         else:
@@ -1693,26 +1765,36 @@ def cmd_convert(args):
             os.makedirs(os.path.dirname(os.path.abspath(dst)), exist_ok=True)
             with open(dst, "w", encoding="utf-8", newline="\n") as fh:
                 fh.write(text)
+        written.append((src, dst, text, warns))
+    out = sys.stderr if args.stdout else sys.stdout
+    for src, dst, text, warns in written:
         problems = [] if args.no_check else _check(text, dst)
         mark = "✓" if not problems else "!"
-        if not args.stdout or len(jobs) > 1:
+        notes = {}
+        for line, msg in warns:
+            notes.setdefault(line, []).append(msg)
+        if not args.stdout or len(written) > 1:
             print(f"{mark} {src} → {dst if not args.stdout else '(stdout)'}  "
                   f"({len(warns)} note{'s' if len(warns) != 1 else ''}"
                   f"{', ' + str(len(problems)) + ' check error' + ('s' if len(problems) != 1 else '') if problems else ''})",
-                  file=sys.stderr if args.stdout else sys.stdout)
+                  file=out)
         for line, msgs in sorted(notes.items()):
             for m in msgs:
-                print(f"    line {line}: {m}", file=sys.stderr if args.stdout else sys.stdout)
+                print(f"    line {line}: {m}", file=out)
         for p in problems[:20]:
-            print("    " + p.replace("\n", "\n    "), file=sys.stderr if args.stdout else sys.stdout)
+            print("    " + p.replace("\n", "\n    "), file=out)
         if problems:
             status = 1
-        if args.run and not problems and len(jobs) == 1:
-            from .cli import main as apsi_main
-            run_args = ["run", dst] + (["--allow-python"] if "pyimport(" in text else [])
-            return apsi_main(run_args)
-    if len(jobs) > 1:
-        print(f"\nconverted {len(jobs)} files, {total_warn} notes")
+        need = _permissions_needed(text)
+        if need:
+            print(f"    run with {need}", file=out)
+    if args.run and status == 0 and len(jobs) == 1 and written:
+        from .cli import main as apsi_main
+        text = written[0][2]
+        perms = ["--allow-python=all"] if "pyimport(" in text or "pyfrom(" in text else []
+        return apsi_main(["run", written[0][1]] + perms)
+    if len(written) > 1:
+        print(f"\nconverted {len(written)} files, {total_warn} notes", file=out)
     return status
 
 
@@ -1724,4 +1806,7 @@ def add_parser(sub):
     p.add_argument("--run", action="store_true", help="run the result (single file) when it checks cleanly")
     p.add_argument("--no-check", action="store_true", help="do not run the Apsi checker on the result")
     p.add_argument("--force", action="store_true", help="overwrite .apsi files that were not made by apsi convert")
+    p.add_argument("--idiomatic", action="store_true",
+                   help="map numpy/math/torch onto Apsi's own built-ins and structs (small numeric scripts); the "
+                        "default keeps Python's exact semantics with `use pycompat`")
     p.set_defaults(fn=cmd_convert)

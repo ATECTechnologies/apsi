@@ -22,6 +22,7 @@ import numpy as np
 
 from .. import ast as A
 from ..errors import RuntimeErr, AssertionFailed, ApsiError
+from ..fmt import type_name
 from ..units import Quantity, DIMLESS, DIM_NAMES
 from . import engine as _eng
 from .types import type_of_value as _type_of_value
@@ -132,9 +133,10 @@ class NativeFunction:
         if erased:
             self.options["erased"] = True
         self.erased = erased
-        self.fndef = fn._apsi_def
+        from .lower import lower
+        self.fndef = lower(fn._apsi_def)          # list-style code → tensors (only in the compiled copy)
         self.name = getattr(fn, "name", self.fndef.name)
-        self._apsi_def = self.fndef
+        self._apsi_def = fn._apsi_def
         self._apsi_free = getattr(fn, "_apsi_free", None)
         self.specs = {}
         self.warned = False
@@ -172,15 +174,34 @@ class NativeFunction:
             args = bound
         key = []
         mask = 0
+        orig = args
+        lists = None
+        for j, a in enumerate(args):
+            if type(a) is list:                     # numbers in (nested) lists → a tensor for native code
+                from .lower import as_array
+                arr = as_array(a)
+                if arr is not None:
+                    if lists is None:
+                        lists, args = [], list(args)
+                    lists.append((a, arr))
+                    args[j] = arr
         for j, a in enumerate(args):
             if isinstance(a.v if isinstance(a, Quantity) else a, np.generic):
                 mask |= 1 << j                      # a NumPy scalar: NumPy's arithmetic rules apply
             tv = _key_of(a)
             if tv is None:
                 self.py_calls += 1
+                why = (f"argument {j + 1} ('{fd.params[j].name}') is a {type_name(a)}; native code takes numbers, "
+                       "tensors and lists of numbers")
+                if self.options.get("strict"):
+                    raise RuntimeErr(f"@native(strict): {self.name}() cannot run natively: {why}")
+                if not self.warned and not self.options.get("quiet") and not self.auto and \
+                        os.environ.get("APSI_NATIVE_QUIET", "") not in ("1", "true"):
+                    sys.stderr.write(f"apsi: note: {self.name}() runs on the bytecode engine: {why}\n")
+                    self.warned = True
                 if self.auto and self.py_calls >= 8:
-                    self.retired = True             # called with records/lists/...: stay on the bytecode path
-                return self._py_fallback(*args)
+                    self.retired = True             # called with records/strings/...: stay on the bytecode path
+                return self._py_fallback(*orig)
             key.append(tv)
         key = (tuple(key), mask)
         for _ in range(3):
@@ -190,17 +211,22 @@ class NativeFunction:
             if isinstance(spec, _Fallback):
                 if self.auto and spec.permanent:
                     self.retired = True
-                return self._py_fallback(*args)
+                return self._py_fallback(*orig)
             STATS["calls"] += 1
             if spec.fast_call is not None and not kwargs and len(args) == len(fd.params):
                 sig = tuple(_fast_sig(a) for a in args)
                 if None not in sig:
                     self.fast[sig] = spec.fast_call
             try:
-                return spec.call(args)
+                result = spec.call(args)
             except _Retry:                         # a global tensor changed type: specialise again
                 continue
-        return self._py_fallback(*args)
+            if lists:
+                from .lower import write_back
+                for lst, arr in lists:              # the caller's lists see every change, as before
+                    write_back(lst, arr)
+            return result
+        return self._py_fallback(*orig)
 
     def _bind(self, args, kwargs):
         """Positional arguments in parameter order, filling simple defaults; None -> use the bytecode engine."""

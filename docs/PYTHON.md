@@ -1,82 +1,149 @@
 # From Python to Apsi (`apsi convert`)
 
-`apsi convert` translates Python files — or whole folders — into Apsi, maps the libraries you use onto Apsi's own
-built-ins, checks the result and tells you exactly which lines need a human look.
+`apsi convert` translates Python files — or whole projects — into Apsi **with Python's exact semantics**: the converted
+program prints the same text, raises the same errors, trains to the same losses and writes the same files as the
+Python program, byte for byte. Large real programs convert in seconds and run immediately.
 
 ```bash
-apsi convert script.py                 # writes script.apsi next to it, then checks it
+apsi convert script.py                 # writes script.apsi (and .apsi files for the modules it imports), checks them
 apsi convert script.py --run           # convert, check and run
 apsi convert src/ -o apsi_src/         # a whole project, keeping the folder layout
 apsi convert script.py --stdout        # print the Apsi code
+apsi convert script.py --idiomatic     # map numpy/math/torch onto Apsi's own built-ins (small numeric scripts)
 ```
 
 In VS Code, Cursor and the other VS Code-family editors: right-click a `.py` file (or a folder) →
-**Apsi: Convert Python File to Apsi** — the result opens beside the Python file.
+**Apsi: Convert Python File to Apsi**.
 
 Typical output:
 
 ```text
-✓ demo.py → demo.apsi  (2 notes)
-    line 48: generator squares(): values are collected into a list
-    line 92: try/except: Apsi stops with a clear error message instead of raising exceptions; …
+✓ build_graph_cache.py → build_graph_cache.apsi  (0 notes)
+✓ GLA.py → GLA.apsi  (0 notes)
+    run with --allow-python=all (it uses subprocess)
+✓ gla_brain_dual.py → gla_brain_dual.apsi  (0 notes)
+
+converted 5 files, 0 notes
 ```
 
-## What is translated
+Modules that sit next to the program (`import GLA`, `from gla_brain_dual import X`, packages with `__init__.py`,
+`from . import x`) are converted with it and imported as Apsi files; everything else is loaded from Python.
 
-| Python | Apsi |
-|---|---|
-| `x = 1` (assigned once) / assigned again or `+=` | `let x = 1` / `var x = 1` — chosen automatically |
-| a name first assigned inside `if`/`for`/`with`/`try` and used after it | declared before the block (`var x = none`), because Apsi blocks have their own scope |
-| a parameter that is reassigned | `var p = p` at the start of the function (Apsi parameters are constants) |
-| `def f(a, b=2, *, c=3)` | `fn f(a, b = 2, c = 3)` — one-line bodies become `fn f(a) = expr` |
-| `def f(*args, **kwargs)`, `f(*xs, **d)` | the same: `fn f(*args, **kwargs)`, `f(*xs, **d)` |
-| `lambda x: x * 2` | `fn(x) => x * 2` |
-| `@functools.lru_cache` / `@cache` | `@memo` |
-| generators (`yield`, `yield from`) | Apsi generators: values are produced lazily, endless generators work |
-| `class` with `__init__` | `struct` with the fields found in `__init__`, methods, plus `Name_init` / `Name_new` (calls `Name(...)` become `Name_new(...)`) |
-| `@dataclass` | a `struct` with typed fields and defaults (constructed directly) |
-| inheritance from a class in the same file | fields and methods are merged; `super().__init__(...)` calls the base's `_init` |
-| `@staticmethod` | a function `Class_method` |
-| `if`/`elif`/`else`, `while`, `for`, `break`, `continue`, `pass`, `assert` | the same |
-| `for i in range(n)` / `range(a, b)` | `for i in 0..n` / `a..b` |
-| nested unpacking `for k, (a, b) in …`, `first, *rest = xs` | temporary variable + element access |
-| list / dict / set comprehensions, generator expressions | comprehensions (`set([...])` for sets) |
-| f-strings (also with format specs) | f-strings; when an expression contains quotes, string concatenation with `format()` |
-| `with open(p) as f: f.read()` / `f.write()` / `print(..., file=f)` / `json.load(f)` / `json.dump(x, f)` / `for line in f` | `read_text`, `write_text`, `load_json`, `save_json`, `read_text(p).splitlines()` |
-| `try` / `except A, B as e` / `else` / `finally` | the same statements; kinds keep their Python names, and errors Apsi raises itself (division by zero, missing key …) match them |
-| `raise ValueError("msg")`, bare `raise`, own exception classes | `raise ValueError("msg")`, `raise`, an error struct with a `message` field |
-| `for … else`, `while … else` | a `broke` flag, so `else` runs exactly when Python runs it |
-| `__add__`, `__eq__`, `__lt__`, `__len__`, `__getitem__`, `__str__` … | struct methods `add`, `eq`, `lt`, `len`, `get`, `to_str` … that operators and built-ins call |
-| class attributes (`Counter.count += 1`) | a module variable `Counter_count` |
-| `collections`, `heapq`, `itertools`, `functools`, `bisect`, `re`, `string`, `copy`, `datetime`, `fractions`, `decimal` … | `pyimport("…")` of the pure standard module — **no `--allow-python` needed** (they cannot touch files, network or processes) |
-| `@dataclass` with `field(default_factory=list)` | a fresh `[]` default for every instance |
-| `[x for a in A for b in B]`, `{k: v for … for …}` | `chain_lists([...])` / `dict(...)` with the same order |
-| `isinstance(x, int)` / `(int, float)` / own classes | `type(x) == "Int"` / `… or …` / `type(x) == "ClassName"` |
-| `max(xs, key=f)` / `min(…)` | `sorted(xs, key=f)[-1]` / `[0]` |
-| `a & b`, `a \| b`, `a ^ b`, `<<`, `>>` | `band`, `bor`, `bxor`, `shl`, `shr`: integers bit by bit, sets, dict merge, boolean tensors — exactly like Python |
-| `is None` / `is not None` | `== none` / `!= none` |
-| `if __name__ == "__main__":` | the body runs at the end of the file |
-| docstrings and comments | comments, in the same places |
-| names that are Apsi keywords (`var`, `let`, `fn`, `struct`, `test`, `step`, …) | renamed with a trailing `_` |
+## How exact is exact?
 
-## Libraries
+The converted file starts with `use pycompat`. That line gives the file Python's object model and built-ins while the
+text stays Apsi (`fn`, `let`/`var`, `none`/`true`/`false`, `import "x.apsi"`). Concretely:
 
-| Python | Apsi |
-|---|---|
-| **numpy**: `array`, `zeros`, `ones`, `full`, `eye`, `arange`, `linspace`, `sum`, `mean`, `std`, `var`, `max`, `min`, `argmax`, `cumsum`, `sqrt`, `exp`, `log`, trig and hyperbolic functions, `clip`, `where`, `dot`, `matmul`, `outer`, `cross`, `transpose`, `reshape`, `concatenate`, `stack`, `vstack`, `hstack`, `meshgrid`, `sort`, `roll`, `einsum`, `maximum`, `minimum`, `square`, `sign`, `median` | built-ins of the same meaning (`concatenate` → `concat`, `arcsin` → `asin`, …) |
-| `np.random.seed/randn/rand/randint/normal/uniform/random/permutation/choice` | `seed`, `randn`, `rand`, `randint`, … (Apsi's random generator is a different stream: random numbers differ, statistics do not) |
-| `np.linalg.inv/det/solve/eig/eigh/svd/norm`, `np.fft.*`, `np.trapz`, `np.interp` | `use linalg`, `use sci` |
-| `dtype=np.float32` / `torch.float16` … | `dtype=f32` / `f16` … |
-| **math**: `sqrt`, `exp`, `log` (also with a base), trig, `hypot`, `radians`, `degrees`, `factorial`, `isnan`, `isinf`, `fsum`, `pi`, `e`, `tau`, `inf` | built-ins |
-| **random**: `random`, `seed`, `randint` (inclusive), `randrange`, `uniform`, `gauss`, `choice` | `rand`, `seed`, `randint(a, b + 1)`, … |
-| **json** `loads`/`dumps`/`load`/`dump`, **time** `time`/`perf_counter`/`sleep`, **os.path** `exists`/`join`, **sys** `argv`/`exit`, **statistics** `mean`/`median`/`pstdev` | `json_parse`, `json_str`, `load_json`, `save_json`, `clock()`, `parallel.sleep`, `exists`, `args()`, `exit` |
-| **PyTorch** tensors: `torch.tensor/zeros/ones/randn/arange/linspace/matmul/…`, `dim=`, `keepdim=` | the numpy equivalents, `axis=`, `keepdims=` |
-| `torch.nn.Linear/Conv2d/LSTM/GRU/Embedding/LayerNorm/BatchNorm/Dropout/MultiheadAttention/Flatten/Sequential` and activations | `use layers`: `linear`, `conv2d_layer`, `lstm_layer`, … `sequential([...])`, `activation("relu")` — with PyTorch's defaults (for example `Conv2d` padding 0, exact `GELU`) |
-| whole PyTorch programs (models, training loops, data loaders) | native Apsi — see the next section |
-| `torch.nn.functional.relu/gelu/softmax/log_softmax/mse_loss/cross_entropy/dropout` | built-ins and `use nn` |
-| **any other library** (pandas, scipy.special, requests, matplotlib, …) | loaded with `pyimport("name")`; the program then needs `--allow-python` (`=all` for libraries that reach the network or the operating system). The note tells you which. |
+| Python | Apsi (with `use pycompat`) | behaves |
+|---|---|---|
+| `class Net(nn.Module):` with `__init__`, `super().__init__()`, `forward`, `@property`, `@staticmethod`, `@classmethod`, `__slots__`, dunder methods, metaclasses, class decorators, `__init_subclass__` | `class Net(nn.Module):` with `fn __init__(self, …):` … | a real class: inherits from any library class, attribute hooks (`__setattr__`, `__getattr__`) run, pickling works |
+| `@dataclass(frozen=True, order=True)` with `x: int = 0`, `field(default_factory=list)` | the same decorator and `x: int = 0` fields | Python's dataclass (`asdict`, `fields`, `replace`, frozen errors …) |
+| `with open(p) as f, lock:` / `async with` | `with open(p) as f, lock:` | `__enter__`/`__exit__`, exceptions suppressed when `__exit__` returns true |
+| `try / except (A, B) as e / else / finally`, `raise X from Y`, own exception classes | the same | the real exception object is bound (`e.args`, `e.__cause__`, `isinstance`) |
+| generators, `x = yield v`, `yield from`, generator expressions | the same | lazy, `send()` / `throw()` / return values |
+| `global`, `nonlocal`, closures, default values evaluated once, `*args` (a tuple), keyword-only and positional-only parameters | the same | Python's scoping: one namespace per function, loop variables live after the loop |
+| `a, *rest = xs`, `for i, (a, b) in …`, `a = b = 0`, `x += [1]` (in place) | the same | |
+| `{1, 2}`, set/dict comprehensions, `{**a, **b}`, `[*xs, y]` | the same | |
+| `is`, `is not`, `a < b < c` (b evaluated once), `| & ^ << >> ~`, `:=` | the same | |
+| `for … else`, `while … else`, `del`, `assert`, `pass` | the same | |
+| f-strings with `!r`, `{x=}`, nested specs `{v:{w}.{p}f}` | f-strings, or `format()` calls when an expression contains quotes | Python's `format()` |
+| `print`, `str`, `repr`, `len`, `range`, `map`, `zip`, `sorted`, `int`, `isinstance`, `super`, … | Python's own built-ins | `print([None, True])` prints `[None, True]` |
+| `import x.y as z`, `from x import y` | `let z = pyimport("x.y")`, `let y = pyfrom("x", "y")` | submodules found as Python does |
+| `if __name__ == "__main__":` | the same | `__name__` is `"__main__"` only for the program you run; imported files get their module name |
+| docstrings | kept (they are docstrings again: `help()` and `__doc__` work) | |
+| comments, blank lines, statement order | kept | |
+| `match` / `case` with literal, capture, sequence (`[x, *rest]`), mapping (`{"k": v, **rest}`), class (`Point(x=0, y=y)`), or (`1 \| 2`), `as` and guard patterns | the same | Python's matching rules, including `__match_args__` |
+| `except*` and exception groups | the same | |
+| `except KINDS as e:` where `KINDS` is a variable or call | an `isinstance` test on the caught error | the same handler runs |
+| `async def`, `await`, `async for`, `async with`, async comprehensions | the same | runs on asyncio |
+| `[b.v for b.v in xs]`, `for st.line, x in …` (attribute and index targets) | the same | |
+| `type Pair = tuple[int, int]`, `def first[T](xs: list[T]) -> T`, `class Box[T]:` | `TypeAliasType`, `TypeVar` and `Generic[T]` objects | |
+| `self.__secret` inside `class Vault` | the same | stored as `_Vault__secret` (Python's name mangling) |
+| `from math import *`, `from helper import *` | the module's public names (its `__all__` when it has one) | |
+| `a[1:2, ...]`, `a[*idx]`, `a[1,]` | the same | |
+| reading a name before it is bound | the same | `UnboundLocalError` / `NameError`, as in Python |
+| names that are Apsi keywords (`let`, `var`, `fn`, `struct`, `use`, `none`, `true`, `false`, `match`, `type` …) | written in backticks: `` `let` ``, `` `fn` `` | the same name — `getattr`, keyword arguments and pickling see `let`, not a renamed copy |
 
-## PyTorch programs → native Apsi
+Converted programs run at the speed of the Python program — attribute access, calls and loops compile to the same
+Python bytecode — and keep every Apsi feature: `use rt`, `use hp`, `@native` functions, units, the checker.
+Measured on 2 cores (`benchmarks/python/cmp.sh`, best of five, interleaved):
+
+| program | CPython 3.13 | converted, `apsi run` |
+|---|---|---|
+| objects: trees, dataclasses, dicts, `Counter` | 0.295 s | **0.271 s** (8 % faster) |
+| strings: regex, `split`, JSON, sets | 0.271 s | 0.273 s |
+| n-body, 200,000 steps (floats, lists) | 0.928 s | 0.941 s |
+
+Programs that create many objects are faster because Apsi freezes everything loaded before the program starts (the
+cycle collector never scans it again) and collects the youngest generation every 50,000 allocations instead of
+2,000; reference counting is untouched, so objects are still freed the moment they are no longer used
+(`APSI_GC=default` restores Python's settings). Pure arithmetic in Python loops runs on the same bytecode
+interpreter as CPython, so it runs at the same speed; to go far beyond it, put `@native` on the hot function
+(machine code through LLVM, see [native code](NATIVE.md)).
+
+Conversion itself: the 23,769-line program and three of its modules (29,022 lines) convert and check in 4.5 s.
+
+## Permissions — what a converted program may touch
+
+Apsi's sandbox stays on. Without any flag a converted program can use:
+
+* every **pure** standard module (`collections`, `itertools`, `functools`, `re`, `json`, `dataclasses`, `enum`,
+  `typing`, `math`, `random`, `decimal`, `time`, `argparse`, `threading`, `queue`, `datetime`, `hashlib` …)
+* **`sys`, `os`, `os.path`, `pathlib` and `numpy` as permission-checked stand-ins**: the same names and behaviour,
+  but file access asks `--allow-read`/`--allow-write`, environment variables ask `--allow-env`, and the parts that
+  would escape the sandbox (`os.system`, `subprocess`, `sys.modules`, `numpy.ctypeslib`, `np.load(allow_pickle=True)`,
+  `array.tofile`) are not there
+* `open()` checked against `--allow-read` / `--allow-write`
+
+Other libraries need `--allow-python` (for example `torch`, `scipy`, `pandas`), and libraries that reach the operating
+system or the network (`subprocess`, `socket`, `http`, `ctypes`, `multiprocessing`, `shutil` …) need
+`--allow-python=all`; with `=all` every module is the real one and nothing is filtered. `apsi convert` prints the flag
+a file needs, and `apsi run` says so when one is missing:
+
+```bash
+apsi run train.apsi --allow-python                     # torch, numpy, scipy …
+apsi run GLA.apsi --allow-python=all -- train --epochs 3   # arguments after -- go to the program (sys.argv)
+```
+
+Introspection that leads to interpreter internals (`__globals__`, `__subclasses__`, `__builtins__`, frame objects,
+`object.__getattribute__`, `__dict__` of library classes, `operator.attrgetter("__…")`, `eval`/`exec`/`__import__`)
+is refused unless the program was started with `--allow-python=all`.
+
+## Checked with real programs
+
+* **The Python standard library itself.** `tests/test_stdlib_convert.py` copies 34 pure-Python standard modules next to
+  a driver program — `_pydecimal` (6,357 lines of arbitrary-precision decimal arithmetic), `_pydatetime`, `argparse`,
+  `configparser`, `tomllib`, `json` (a package with relative imports), `pickle`, `dataclasses`, `enum`, `random`,
+  `statistics`, `fractions`, `difflib`, `ipaddress`, `textwrap`, `pprint`, `calendar`, `shlex`, `graphlib`, `heapq`,
+  `bisect`, `html.parser`, `urllib.parse`, `base64`, `fnmatch`, `string`, `copy`, `contextlib`, `operator`, `reprlib`,
+  `numbers`, `_py_abc`, `colorsys`, `keyword` — converts all of them with the program, runs it, and requires **byte-identical output** to
+  CPython running the original files. About 38,000 lines of metaclasses, descriptors, generators, `__slots__`, name
+  mangling, `__class_getitem__`, exception chaining and 50-digit arithmetic.
+* `tests/pycompat/` — programs with classes, inheritance from library classes, dataclasses, enums, abstract base
+  classes, context managers, generators with `send`, closures, threads, `collections`, `heapq`, `functools`, `re`,
+  `json`, numpy and every operator. `tests/test_python_compat.py` converts each one and requires **byte-identical
+  output**.
+* A 23,769-line AI training program with its four companion modules (graph building for 30 languages, web search,
+  safety filter, a dual-brain model) converts in about 3 seconds and checks cleanly; its command-line tools, its
+  multi-process graph-cache builder (results pickled across worker processes, resumable output) and its safety filter
+  produce byte-identical files and output to Python.
+* A PyTorch-style training program (an `nn.Module` hierarchy that registers parameters through `__setattr__`,
+  autograd, Adam with weight decay, cosine schedule, early stopping, checkpoint) trains to bit-identical losses.
+
+## Coverage
+
+Every statement and expression of Python 3.13 converts: there is no "kept as a comment" list any more. Two things
+differ by design and are not part of a program's behaviour:
+
+* **Tracebacks** of an uncaught error name the `.apsi` file and line (`train.apsi:212:1: TypeError: …`) instead of
+  the `.py` file; the error type and message are Python's. Programs that catch errors see the real exception objects.
+* **The sandbox.** Without `--allow-python=all`, introspection that leads to interpreter internals is refused (see
+  above). With it, `eval`, `exec`, `globals()`, frames and every module behave exactly as in Python.
+
+A converted module is reused while it is newer than its `.py` file and was written by the same Apsi version; a new
+Apsi version converts it again.
+
+## `--idiomatic`: PyTorch programs → native Apsi (no Python, no PyTorch)
 
 A PyTorch training script becomes an Apsi program that runs **without Python and without PyTorch**. The converter
 targets `use torch`, Apsi's own implementation of the PyTorch API: the same layer names, constructor arguments,
@@ -119,7 +186,7 @@ print(loss.item())
 torch.save(model.state_dict(), "mlp.safetensors")
 ```
 
-`apsi convert mlp.py` writes:
+`apsi convert mlp.py --idiomatic` writes:
 
 ```apsi
 # Converted from mlp.py by `apsi convert`.
@@ -199,24 +266,6 @@ than in PyTorch. To reproduce a PyTorch run exactly, load its initial `state_dic
 - Create parameters with `dtype=f32` (or `fit(…, precision="fp32")`); gradients and Adam state then stay float32.
 - `DataLoader` builds one batch at a time, so datasets larger than memory can be streamed from a `Dataset` class.
 
-## Checked with real programs
 
-`tests/pycompat/` holds Python programs that use classes with inheritance and operator methods, dataclasses,
-custom exceptions, `try/except/else/finally`, generators (also endless ones), closures with `nonlocal`,
-`*args/**kwargs`, `collections`, `heapq`, `itertools`, `re`, `json`, string formatting (`%`, `.format`, f-strings),
-comprehensions with several `for`, sets, slicing, sorting with keys and numpy. `tests/test_python_compat.py`
-converts each one and checks that the Apsi program prints exactly what Python prints. All of them pass.
-
-## What needs a human look
-
-The converter never silently drops behaviour. These general Python constructs have no direct Apsi equivalent and
-are reported with their line number so that you can check the result:
-
-- `match` statements (rewrite as `if`/`elif`), `async`/`await`
-- `random.shuffle` and other in-place random operations
-- `super().method()` other than `super().__init__()`, metaclasses, `__getattr__`
-- base classes from other modules (classes derived from `torch.nn.Module` and `Dataset` are converted, see above)
-- decorators that have no Apsi equivalent
-
-After converting, run `apsi check file.apsi` (done automatically) — and consider adding units to the physics
-parts: `let g = 9.81` → `let g = 9.81[m/s^2]` turns every later formula into a checked one.
+After converting with `--idiomatic`, run `apsi check file.apsi` (done automatically) — and consider adding units to
+the physics parts: `let g = 9.81` → `let g = 9.81[m/s^2]` turns every later formula into a checked one.

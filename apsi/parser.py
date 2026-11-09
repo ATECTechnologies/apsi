@@ -4,11 +4,14 @@ from fractions import Fraction
 from . import ast as A
 from .errors import ParseError, UnitError
 from .lexer import (tokenize, NUMBER, STRING, FSTRING, NAME, KW, OP, UNIT, NEWLINE, INDENT,
-                    DEDENT, EOF)
+                    DEDENT, EOF, BYTES)
 from .units import parse_unit
 
 COMPARE_OPS = {"==", "!=", "<", "<=", ">", ">=", "~="}
-AUG_OPS = {"+=", "-=", "*=", "/=", "//=", "%=", "**=", "@="}
+AUG_OPS = {"+=", "-=", "*=", "/=", "//=", "%=", "**=", "@=", "|=", "&=", "<<=", ">>=", "^="}
+# a soft keyword starts a statement only when the next token cannot continue an expression that uses it as a name
+_NOT_STMT_AFTER = {"=", ".", "[", ",", ")", "(", ":", "+=", "-=", "*=", "/=", "//=", "%=", "**=", "@=", "|=", "&=",
+                   "<<=", ">>=", "==", "!=", "<", ">", "<=", ">=", "+", "-", "*", "/", "//", "%", "|>", ":="}
 EVOLVE_METHODS = {"euler", "midpoint", "rk4", "rk45", "symplectic", "verlet"}
 
 
@@ -22,36 +25,44 @@ def _unit_info(text, line, col):
 
 class Parser:
     def __init__(self, tokens):
-        self.t = tokens
+        self.last = len(tokens) - 1
+        self.t = tokens + [tokens[-1]] * 8 if tokens else tokens   # EOF padding: peek(k) needs no bounds check
         self.i = 0
+        self.pyc = False             # after `use pycompat`: `^` is Python's exclusive or
 
     # -- token helpers ---------------------------------------------------
     def peek(self, k=0):
-        j = min(self.i + k, len(self.t) - 1)
-        return self.t[j]
+        j = self.i + k
+        return self.t[j] if j <= self.last + 8 else self.t[-1]
 
     def next(self):
         tok = self.t[self.i]
-        if self.i < len(self.t) - 1:
+        if self.i < self.last:
             self.i += 1
         return tok
 
     def at(self, type_, value=None, k=0):
-        tok = self.peek(k)
+        tok = self.t[self.i + k] if k < 8 else self.peek(k)
         return tok.type == type_ and (value is None or tok.value == value)
 
     def at_op(self, v, k=0):
-        return self.at(OP, v, k)
+        tok = self.t[self.i + k] if k < 8 else self.peek(k)
+        return tok.value == v and tok.type == OP
 
     def at_kw(self, v, k=0):
-        return self.at(KW, v, k)
+        tok = self.t[self.i + k] if k < 8 else self.peek(k)
+        return tok.value == v and tok.type == KW
 
     def at_word(self, v, k=0):
-        return self.at(NAME, v, k)
+        tok = self.t[self.i + k] if k < 8 else self.peek(k)
+        return tok.value == v and tok.type == NAME
 
     def accept_op(self, v):
-        if self.at_op(v):
-            return self.next()
+        tok = self.t[self.i]
+        if tok.value == v and tok.type == OP:
+            if self.i < self.last:
+                self.i += 1
+            return tok
         return None
 
     def accept_kw(self, v):
@@ -136,10 +147,49 @@ class Parser:
         return [self.statement()]
 
     # -- statements ------------------------------------------------------
+    def _soft(self, word):
+        """A soft keyword (class, with, del, global, …) at the start of a statement."""
+        tok = self.peek()
+        if tok.type != NAME or tok.value != word:
+            return False
+        nxt = self.peek(1)
+        if nxt.type == OP and nxt.value in _NOT_STMT_AFTER:
+            return False
+        return nxt.type not in (NEWLINE, EOF, DEDENT) or word in ("pass",)
+
     def statement(self):
         tok = self.peek()
         if tok.type == OP and tok.value == "@":
             return self.decorated()
+        if tok.type == NAME and tok.value == "async" and (self.at_kw("fn", 1) or self.at_word("with", 1)
+                                                          or self.at_kw("for", 1)):
+            self.next()
+            st = self.statement()
+            st.is_async = True
+            return st
+        if self._soft("class") and self.at(NAME, k=1):
+            return self.class_def([])
+        if self._soft("with"):
+            return self.with_stmt()
+        if tok.type == NAME and tok.value == "match" and not (self.peek(1).type == OP and self.peek(1).value in
+                                                               _NOT_STMT_AFTER - {"(", "["}):
+            m = self.try_match()
+            if m is not None:
+                return m
+        if self._soft("del"):
+            self.next()
+            targets = [self.postfix_target()]
+            while self.accept_op(","):
+                targets.append(self.postfix_target())
+            self.expect_eol()
+            return A.Del(targets, **self.pos(tok))
+        if (self._soft("global") or self._soft("nonlocal")) and self.at(NAME, k=1):
+            word = self.next().value
+            names = [self.expect_name().value]
+            while self.accept_op(","):
+                names.append(self.expect_name().value)
+            self.expect_eol()
+            return A.Global(names, word == "nonlocal", **self.pos(tok))
         if tok.type == NAME and tok.value == "parallel" and self.at_kw("for", k=1):
             self.next()                              # `parallel for`: a soft keyword
             loop = self.for_stmt()
@@ -158,7 +208,8 @@ class Parser:
             if v == "while":
                 self.next()
                 cond = self.expr()
-                return A.While(cond, self.block(), **self.pos(tok))
+                body = self.block()
+                return A.While(cond, body, self.loop_else(), **self.pos(tok))
             if v == "for":
                 return self.for_stmt()
             if v == "return":
@@ -197,14 +248,14 @@ class Parser:
         if tok.type == NAME and tok.value == "raise" and not (self.at_op("=", 1) or self.at_op(".", 1)
                                                                or self.at_op("[", 1) or self.at_op(",", 1)):
             self.next()
-            val = None
+            val = cause = None
             if self.peek().type not in (NEWLINE, DEDENT, EOF):
                 val = self.expr()
-                if self.peek().type == NAME and self.peek().value == "from":   # `raise X from Y`: Y is dropped
+                if self.peek().type == NAME and self.peek().value == "from":   # `raise X from Y`
                     self.next()
-                    self.expr()
+                    cause = self.expr()
             self.expect_eol()
-            return A.Raise(val, **self.pos(tok))
+            return A.Raise(val, cause, **self.pos(tok))
         if tok.type == NAME and tok.value == "yield" and not (self.at_op("=", 1) or self.at_op(".", 1)
                                                                or self.at_op("[", 1) or self.at_op("(", 1)
                                                                and False):
@@ -238,8 +289,11 @@ class Parser:
             while self.peek().type == NEWLINE:
                 self.next()
         skip_nl()
+        star = False
         while self.peek().type == NAME and self.peek().value == "except":
             self.next()
+            if self.accept_op("*"):                             # except* (exception groups)
+                star = True
             kinds, name = [], None
             if not self.at_op(":"):
                 if not self.at_kw("as"):
@@ -269,47 +323,309 @@ class Parser:
             final_body = self.block()
         if not handlers and final_body is None:
             self.error("'try' needs at least one 'except' or a 'finally' block", tok)
-        return A.Try(body, handlers, else_body, final_body, **self.pos(tok))
+        return A.Try(body, handlers, else_body, final_body, star or None, **self.pos(tok))
+
+    def rhs(self):
+        """The right side of an assignment: a tuple expression, or `yield …` used as a value."""
+        if self.at_word("yield") and not self.at_op("=", 1):
+            tok = self.next()
+            frm = False
+            if self.at_word("from"):
+                self.next()
+                frm = True
+            val = None if self.peek().type in (NEWLINE, DEDENT, EOF) else self.tuple_expr()
+            return A.YieldExpr(val, frm, **self.pos(tok))
+        return self.tuple_expr()
 
     def simple_stmt(self):
         tok = self.peek()
         lhs = self.tuple_expr()
         if self.at_op("="):
             self.next()
-            self._check_target(lhs)
-            val = self.tuple_expr()
+            targets = [self._target(lhs)]
+            val = self.rhs()
+            while self.accept_op("="):                          # a = b = value
+                targets.append(self._target(val))
+                val = self.rhs()
             self.expect_eol()
-            return A.Assign(lhs, val, **self.pos(tok))
+            return A.Assign(targets[0], val, targets[1:] or None, **self.pos(tok))
         if self.peek().type == OP and self.peek().value in AUG_OPS:
             op = self.next().value[:-1]
+            if op == "^" and not self.pyc:
+                self.error("'^=' is only available after `use pycompat` (in Apsi '^' is a power)", tok)
             if not isinstance(lhs, (A.Name, A.Attr, A.Index)):
                 self.error("invalid target for augmented assignment", tok)
-            val = self.expr()
+            val = self.rhs()
             self.expect_eol()
             return A.AugAssign(lhs, op, val, **self.pos(tok))
         self.expect_eol()
         return A.ExprStmt(lhs, **self.pos(tok))
 
-    def _check_target(self, t):
-        if isinstance(t, A.TupleLit):
+    def _target(self, t):
+        if isinstance(t, A.ListLit):                           # [a, b] = … is the same as a, b = …
+            t = A.TupleLit(t.items, line=t.line, col=t.col)
+        self._check_target(t)
+        return t
+
+    def _check_target(self, t, star_ok=False):
+        if isinstance(t, (A.TupleLit, A.ListLit)):
+            stars = sum(isinstance(x, A.Spread) for x in t.items)
+            if stars > 1:
+                raise ParseError("only one starred name is allowed in an assignment", t.line, t.col)
             for x in t.items:
-                self._check_target(x)
+                self._check_target(x, True)
+        elif isinstance(t, A.Spread) and star_ok and not t.double:
+            self._check_target(t.value)
         elif not isinstance(t, (A.Name, A.Attr, A.Index)):
             raise ParseError("cannot assign to this expression", t.line, t.col)
+
+    def postfix_target(self):
+        t = self.postfix()
+        if not isinstance(t, (A.Name, A.Attr, A.Index)):
+            if isinstance(t, A.TupleLit):
+                return t
+            raise ParseError("cannot delete this expression", t.line, t.col)
+        return t
+
+    # ------------------------------------------------------------------ match / case (Python's structural patterns)
+    def try_match(self):
+        save = self.i
+        tok = self.next()
+        try:
+            subject = self.tuple_expr()
+            if not self.at_op(":"):
+                raise ParseError("not a match", tok.line, tok.col)
+            self.next()
+            if self.peek().type != NEWLINE:
+                raise ParseError("not a match", tok.line, tok.col)
+            self.next()
+            while self.peek().type == NEWLINE:
+                self.next()
+            if self.peek().type != INDENT or not (self.peek(1).type == NAME and self.peek(1).value == "case"):
+                raise ParseError("not a match", tok.line, tok.col)
+        except ParseError:
+            self.i = save
+            return None
+        self.next()                                              # INDENT
+        cases = []
+        while self.peek().type == NAME and self.peek().value == "case":
+            self.next()
+            pat = self.pattern_top()
+            guard = None
+            if self.accept_kw("if"):
+                guard = self.expr()
+            cases.append((pat, guard, self.block()))
+            while self.peek().type == NEWLINE:
+                self.next()
+        if self.peek().type == DEDENT:
+            self.next()
+        return A.Match(subject, cases, **self.pos(tok))
+
+    def pattern_top(self):
+        p = self.pattern_as()
+        if self.at_op(","):                                      # case a, b: an open sequence
+            items = [p]
+            while self.accept_op(","):
+                if self.at_op(":") or self.at_kw("if"):
+                    break
+                items.append(self.pattern_as())
+            return ("seq", items)
+        return p
+
+    def pattern_as(self):
+        p = self.pattern_or()
+        if self.accept_kw("as"):
+            return ("as", p, self.expect_name(" after 'as'").value)
+        return p
+
+    def pattern_or(self):
+        alts = [self.pattern_one()]
+        while self.accept_op("|"):
+            alts.append(self.pattern_one())
+        return alts[0] if len(alts) == 1 else ("or", alts)
+
+    def pattern_one(self):
+        tok = self.peek()
+        if tok.type == OP and tok.value == "*":
+            self.next()
+            n = self.expect_name(" after '*'").value
+            return ("star", None if n == "_" else n)
+        if tok.type == OP and tok.value in ("(", "["):
+            close = ")" if self.next().value == "(" else "]"
+            items, trailing = [], False
+            while not self.at_op(close):
+                items.append(self.pattern_as())
+                trailing = self.accept_op(",")
+                if not trailing:
+                    break
+            self.expect_op(close)
+            if close == ")" and len(items) == 1 and not trailing:
+                return items[0]                                  # a group
+            return ("seq", items)
+        if tok.type == OP and tok.value == "{":
+            self.next()
+            pairs, rest = [], None
+            while not self.at_op("}"):
+                if self.accept_op("**"):
+                    rest = self.expect_name().value
+                else:
+                    key = self.pattern_literal_or_value()
+                    self.expect_op(":")
+                    pairs.append((key, self.pattern_as()))
+                if not self.accept_op(","):
+                    break
+            self.expect_op("}")
+            return ("map", pairs, rest)
+        if tok.type == NAME:
+            name = self.next().value
+            dotted = name
+            while self.at_op(".") and self.peek(1).type in (NAME, KW):
+                self.next()
+                dotted += "." + self.next().value
+            if self.at_op("("):                                  # a class pattern
+                self.next()
+                pos, kws = [], []
+                while not self.at_op(")"):
+                    if self.peek().type == NAME and self.at_op("=", 1):
+                        k = self.next().value
+                        self.next()
+                        kws.append((k, self.pattern_as()))
+                    else:
+                        pos.append(self.pattern_as())
+                    if not self.accept_op(","):
+                        break
+                self.expect_op(")")
+                return ("class", dotted, pos, kws)
+            if "." in dotted:
+                return ("value", dotted)
+            return ("wild",) if name == "_" else ("capture", name)
+        return ("lit", self.pattern_literal_or_value())
+
+    def pattern_literal_or_value(self):
+        tok = self.peek()
+        if tok.type == NAME:
+            dotted = self.next().value
+            while self.accept_op("."):
+                dotted += "." + self.next().value
+            return A.Name(dotted, **self.pos(tok)) if "." not in dotted else ("value", dotted)
+        return self.unary()
+
+    def loop_else(self):
+        """The `else:` of a for/while loop (runs when the loop ended without break)."""
+        save = self.i
+        while self.peek().type == NEWLINE:
+            self.next()
+        if self.at_kw("else"):
+            self.next()
+            return self.block()
+        self.i = save
+        return None
+
+    def with_stmt(self):
+        tok = self.next()
+        items = []
+        while True:
+            e = self.expr()
+            target = None
+            if self.accept_kw("as"):
+                target = self.target_pattern()
+            items.append((e, target))
+            if not self.accept_op(","):
+                break
+        return A.With(items, self.block(), None, **self.pos(tok))
+
+    def target_pattern(self):
+        """A name, `*name`, or a (possibly nested) tuple of them — the targets of for/with/comprehensions."""
+        if self.at_op("*"):
+            self.next()
+            return ("*", self.expect_name(" after '*'").value)
+        if self.at_op("(") or self.at_op("["):
+            close = ")" if self.next().value == "(" else "]"
+            items = [self.target_pattern()]
+            while self.accept_op(","):
+                if self.at_op(close):
+                    break
+                items.append(self.target_pattern())
+            self.expect_op(close)
+            return items
+        if self.peek().type == NAME and (self.at_op(".", 1) or self.at_op("[", 1)):
+            t = self.postfix()                                   # for self.x in …, for a[i] in …
+            if not isinstance(t, (A.Attr, A.Index)):
+                self.error("expected a name, an attribute or an index as a target")
+            return ("expr", t)
+        return self.expect_name(" as a target").value
+
+    def class_def(self, decos):
+        tok = self.next()                                       # 'class'
+        name = self.expect_name(" after 'class'").value
+        bases, kwargs = [], []
+        if self.accept_op("("):
+            while not self.at_op(")"):
+                if self.at_op("*") or self.at_op("**"):
+                    st = self.next()
+                    sp = A.Spread(self.expr(), st.value == "**", **self.pos(st))
+                    (kwargs.append((None, sp)) if sp.double else bases.append(sp))
+                elif self.peek().type in (NAME, KW) and self.at_op("=", 1):
+                    k = self.next().value
+                    self.next()
+                    kwargs.append((k, self.expr()))
+                else:
+                    bases.append(self.expr())
+                if not self.accept_op(","):
+                    break
+            self.expect_op(")", " to close the base classes")
+        self.expect_op(":", " after the class header")
+        body = []
+        if self.peek().type == NEWLINE:
+            self.next()
+            if self.peek().type != INDENT:
+                self.error("expected an indented class body")
+            self.next()
+            while self.peek().type not in (DEDENT, EOF):
+                if self.peek().type == NEWLINE:
+                    self.next()
+                    continue
+                body.append(self.class_item())
+            if self.peek().type == DEDENT:
+                self.next()
+        else:
+            body.append(self.class_item())
+        return A.ClassDef(name, bases, kwargs, body, decos, **self.pos(tok))
+
+    def class_item(self):
+        tok = self.peek()
+        if tok.type == NAME and self.at_op(":", 1) and tok.value not in ("try", "finally", "except", "with"):
+            self.next()
+            self.next()
+            start = self.i
+            ann = self.expr()
+            text = _tokens_text(self.t[start:self.i])
+            val = self.rhs() if self.accept_op("=") else None
+            self.expect_eol()
+            return A.FieldDef(tok.value, (ann, text), val, **self.pos(tok))
+        return self.statement()
 
     def let_stmt(self):
         tok = self.next()
         mutable = tok.value == "var"
-        names = [self.expect_name(f" after '{tok.value}'").value]
+
+        def one():
+            if self.accept_op("*"):
+                return ("*", self.expect_name(" after '*'").value)
+            return self.expect_name(f" after '{tok.value}'").value
+        names = [one()]
         while self.accept_op(","):
-            names.append(self.expect_name().value)
+            names.append(one())
         type_ = None
         if self.accept_op(":"):
             if len(names) > 1:
                 self.error("a type annotation needs a single variable")
             type_ = self.type_expr()
+        if self.pyc and mutable and type_ is None and self.at(NEWLINE) or self.pyc and mutable and self.at(EOF):
+            self.expect_eol()                    # `var x`: declared, not yet bound (reads raise like Python)
+            return A.Let(names, None, None, True, **self.pos(tok))
         self.expect_op("=", f" in '{tok.value}' declaration")
-        val = self.tuple_expr()
+        val = self.rhs()
         self.expect_eol()
         return A.Let(names, type_, val, mutable, **self.pos(tok))
 
@@ -319,18 +635,40 @@ class Parser:
             self.next()
             decos.append(self.expr())
             self.expect_eol()
+            while self.peek().type == NEWLINE:
+                self.next()
+        if self._soft("class") and self.at(NAME, k=1):
+            return self.class_def(decos)
+        is_async = False
+        if self.at_word("async") and self.at_kw("fn", 1):
+            self.next()
+            is_async = True
         if not self.at_kw("fn"):
-            self.error("decorators must be followed by a function definition")
-        return self.fn_def(decos)
+            self.error("decorators must be followed by a function or class definition")
+        f = self.fn_def(decos)
+        f.is_async = is_async
+        return f
 
     def params(self):
         self.expect_op("(")
         ps = []
         while not self.at_op(")"):
             star = None
+            if self.at_op("/") and (self.at_op(",", 1) or self.at_op(")", 1)):
+                tok = self.next()                               # positional-only marker
+                ps.append(A.Param(None, None, None, "/", **self.pos(tok)))
+                if not self.accept_op(","):
+                    break
+                continue
+            if self.at_op("*") and (self.at_op(",", 1) or self.at_op(")", 1)):
+                tok = self.next()                               # keyword-only marker
+                ps.append(A.Param(None, None, None, "*", **self.pos(tok)))
+                if not self.accept_op(","):
+                    break
+                continue
             if self.at_op("*") or self.at_op("**"):
                 star = self.next().value
-                if any(p.star == star or p.star == "**" for p in ps):
+                if any(p.star == star or p.star == "**" for p in ps if p.name is not None):
                     self.error(f"only one '{star}' parameter is allowed, after the others")
             tok = self.expect_name(" for parameter")
             t = self.type_expr() if self.accept_op(":") else None
@@ -417,20 +755,28 @@ class Parser:
         return A.If(branches, else_body, **self.pos(tok))
 
     def targets(self):
-        paren = self.accept_op("(")
-        names = [self.expect_name(" as loop variable").value]
+        """Loop / comprehension targets: a list of patterns (see ast.For)."""
+        if self.at_op("(") or self.at_op("["):
+            p = self.target_pattern()
+            if not self.at_op(","):
+                # (a, b) alone is the same as a, b; a single parenthesised name is just that name
+                return p if isinstance(p, list) else [p]
+            pats = [p]
+        else:
+            pats = [self.target_pattern()]
         while self.accept_op(","):
-            names.append(self.expect_name().value)
-        if paren:
-            self.expect_op(")")
-        return names
+            if self.at_kw("in"):
+                break
+            pats.append(self.target_pattern())
+        return pats
 
     def for_stmt(self):
         tok = self.next()
         names = self.targets()
         self.expect_kw("in", " in for loop")
-        it = self.expr()
-        return A.For(names, it, self.block(), **self.pos(tok))
+        it = self.tuple_expr()
+        body = self.block()
+        return A.For(names, it, body, None, self.loop_else(), **self.pos(tok))
 
     def use_stmt(self):
         tok = self.next()
@@ -441,6 +787,8 @@ class Parser:
         if self.accept_kw("as"):
             alias = self.expect_name(" after 'as'").value
         self.expect_eol()
+        if parts == ["pycompat"] and alias is None:
+            self.pyc = True
         return A.Use(".".join(parts), alias, **self.pos(tok))
 
     def evolve_stmt(self):
@@ -509,13 +857,14 @@ class Parser:
     # -- expressions -----------------------------------------------------
     def tuple_expr(self):
         tok = self.peek()
-        e = self.expr()
-        if self.at_op(","):
+        e = self.list_item()
+        if self.at_op(",") or isinstance(e, A.Spread):
             items = [e]
             while self.accept_op(","):
-                if self.peek().type in (NEWLINE, EOF, DEDENT) or self.at_op("="):
+                if self.peek().type in (NEWLINE, EOF, DEDENT) or self.at_op("=") or self.at_op(":") \
+                        or (self.peek().type == OP and self.peek().value in AUG_OPS):
                     break
-                items.append(self.expr())
+                items.append(self.list_item())
             return A.TupleLit(items, **self.pos(tok))
         return e
 
@@ -525,6 +874,10 @@ class Parser:
             ps = self.params()
             self.expect_op("=>", " in lambda (fn(x) => expr)")
             return A.Lambda(ps, self.expr(), **self.pos(tok))
+        if self.peek().type == NAME and self.at_op(":=", 1):     # (name := value)
+            tok = self.next()
+            self.next()
+            return A.NamedExpr(tok.value, self.expr(), **self.pos(tok))
         return self.pipe()
 
     def pipe(self):
@@ -569,8 +922,9 @@ class Parser:
         return self.comparison()
 
     def comparison(self):
-        e = self.range_expr()
-        parts = []
+        first = e = self.bit_or()
+        ops, operands = [], [e]
+        tok0 = self.peek()
         while True:
             tok = self.peek()
             if tok.type == OP and tok.value in COMPARE_OPS:
@@ -582,27 +936,54 @@ class Parser:
                 self.next()
                 self.next()
                 op = "not in"
+            elif self.at_word("is"):
+                self.next()
+                op = "is not" if self.accept_kw("not") else "is"
             else:
                 break
-            right = self.range_expr()
-            parts.append(A.Binary(op, e if not parts else parts[-1].right, right, **self.pos(tok)))
-            e = right
-        if not parts:
-            return e
-        out = parts[0]
-        for p in parts[1:]:
-            out = A.Logic("and", out, p, line=p.line, col=p.col)
-        return out
+            ops.append(op)
+            operands.append(self.bit_or())
+        if not ops:
+            return first
+        if len(ops) == 1:
+            return A.Binary(ops[0], operands[0], operands[1], **self.pos(tok0))
+        return A.Chain(ops, operands, **self.pos(tok0))       # a < b < c: b is evaluated once
+
+    def bit_or(self):
+        e = self.bit_xor()
+        while self.at_op("|"):
+            tok = self.next()
+            e = A.Binary("|", e, self.bit_xor(), **self.pos(tok))
+        return e
+
+    def bit_xor(self):
+        e = self.bit_and()
+        while self.pyc and self.at_op("^"):
+            tok = self.next()
+            e = A.Binary("^", e, self.bit_and(), **self.pos(tok))
+        return e
+
+    def bit_and(self):
+        e = self.shift()
+        while self.at_op("&"):
+            tok = self.next()
+            e = A.Binary("&", e, self.shift(), **self.pos(tok))
+        return e
+
+    def shift(self):
+        e = self.range_expr()
+        while self.at_op("<<") or self.at_op(">>"):
+            tok = self.next()
+            e = A.Binary(tok.value, e, self.range_expr(), **self.pos(tok))
+        return e
 
     def range_expr(self):
         e = self.additive()
         if self.at_op("..") or self.at_op("..="):
             tok = self.next()
             e = A.Range(e, self.additive(), tok.value == "..=", **self.pos(tok))
-        while self.at_kw("as"):
+        while self.at_kw("as") and self.peek(1).type == UNIT:
             tok = self.next()
-            if self.peek().type != UNIT:
-                self.error("expected a unit in brackets after 'as', e.g. x as [km]")
             ut = self.next()
             e = A.As(e, _unit_info(ut.value, ut.line, ut.col), **self.pos(tok))
         return e
@@ -622,9 +1003,13 @@ class Parser:
         return e
 
     def unary(self):
-        if self.peek().type == OP and self.peek().value in ("-", "+"):
+        if self.peek().type == OP and self.peek().value in ("-", "+", "~"):
             tok = self.next()
             return A.Unary(tok.value, self.unary(), **self.pos(tok))
+        if self.at_word("await") and self.peek(1).type in (NAME, NUMBER, STRING, FSTRING, KW) \
+                or self.at_word("await") and self.at_op("(", 1):
+            tok = self.next()
+            return A.Await(self.unary(), **self.pos(tok))
         return self.plusminus()
 
     def plusminus(self):
@@ -636,7 +1021,7 @@ class Parser:
 
     def power(self):
         e = self.postfix()
-        if self.peek().type == OP and self.peek().value in ("**", "^"):
+        if self.peek().type == OP and (self.peek().value == "**" or self.peek().value == "^" and not self.pyc):
             tok = self.next()
             return A.Binary("**", e, self.unary(), **self.pos(tok))
         return e
@@ -653,14 +1038,19 @@ class Parser:
                         st = self.next()
                         sp = A.Spread(self.expr(), st.value == "**", **self.pos(st))
                         (kwargs.append((None, sp)) if sp.double else args.append(sp))
-                    elif self.peek().type == NAME and self.at_op("=", 1):
+                    elif self.peek().type in (NAME, KW) and self.at_op("=", 1):
                         k = self.next().value
                         self.next()
                         kwargs.append((k, self.expr()))
                     else:
-                        if kwargs:
+                        if kwargs and any(k is not None for k, _ in kwargs):
                             self.error("positional argument after keyword argument")
-                        args.append(self.expr())
+                        a = self.expr()
+                        if self._comp_for() and not args:
+                            cl = self.comp_clauses("generator expression")
+                            (names, it, cond), more = cl[0], cl[1:]
+                            a = A.GenExp(a, names, it, cond, more or None, line=a.line, col=a.col)
+                        args.append(a)
                     if not self.accept_op(","):
                         break
                 self.expect_op(")", " to close call")
@@ -668,12 +1058,15 @@ class Parser:
             elif self.at_op("["):
                 self.next()
                 idx = [self.subscript()]
+                comma = False
                 while self.accept_op(","):
+                    comma = True
                     if self.at_op("]"):
                         break
                     idx.append(self.subscript())
                 self.expect_op("]", " to close index")
-                index = idx[0] if len(idx) == 1 else A.TupleLit(idx, **self.pos(tok))
+                index = idx[0] if len(idx) == 1 and not (comma and self.pyc) and not isinstance(idx[0], A.Spread) \
+                    else A.TupleLit(idx, **self.pos(tok))
                 e = A.Index(e, index, **self.pos(tok))
             elif self.at_op("."):
                 self.next()
@@ -685,8 +1078,42 @@ class Parser:
             else:
                 return e
 
+    def list_item(self):
+        """An element of a list literal: an expression or `*xs` (all items of xs spread in place)."""
+        if self.at_op("*"):
+            tok = self.next()
+            return A.Spread(self.expr(), False, **self.pos(tok))
+        return self.expr()
+
+    def _comp_for(self):
+        return self.at_kw("for") or (self.at_word("async") and self.at_kw("for", 1))
+
+    def comp_clauses(self, what):
+        """`for a in A [if c]... [for b in B [if d]...]...` — Python's comprehension clauses, in order."""
+        out = []
+        while self.at_kw("for") or (self.at_word("async") and self.at_kw("for", 1)):
+            is_async = self.at_word("async")
+            if is_async:
+                self.next()
+            self.next()
+            names = self.targets()
+            self.expect_kw("in", f" in {what}")
+            it = self.or_expr()
+            if is_async:
+                it = A.AsyncIter(it, line=it.line, col=it.col)
+            cond = None
+            while self.at_kw("if"):
+                tok = self.next()
+                c = self.or_expr()
+                cond = c if cond is None else A.Logic("and", cond, c, **self.pos(tok))
+            out.append((names, it, cond))
+        return out
+
     def subscript(self):
         tok = self.peek()
+        if self.pyc and self.at_op("*"):
+            self.next()
+            return A.Spread(self.or_expr(), False, **self.pos(tok))
         lo = hi = step = None
         if not self.at_op(":"):
             lo = self.expr()
@@ -713,6 +1140,9 @@ class Parser:
         if tok.type == STRING:
             self.next()
             return A.Str(tok.value, **p)
+        if tok.type == BYTES:
+            self.next()
+            return A.Bytes(tok.value, **p)
         if tok.type == FSTRING:
             self.next()
             return A.FStr(parse_fstring(tok.value, tok.line, tok.col), **p)
@@ -733,13 +1163,22 @@ class Parser:
                 self.next()
                 if self.accept_op(")"):
                     return A.TupleLit([], **p)
-                e = self.expr()
-                if self.at_op(","):
+                if self.at_word("yield"):
+                    e = self.rhs()
+                    self.expect_op(")", " to close parenthesis")
+                    return e
+                e = self.list_item()
+                if self._comp_for():                      # (x for x in xs): a lazy generator expression
+                    cl = self.comp_clauses("generator expression")
+                    self.expect_op(")", " to close the generator expression")
+                    (names, it, cond), more = cl[0], cl[1:]
+                    return A.GenExp(e, names, it, cond, more or None, **p)
+                if self.at_op(",") or isinstance(e, A.Spread):
                     items = [e]
                     while self.accept_op(","):
                         if self.at_op(")"):
                             break
-                        items.append(self.expr())
+                        items.append(self.list_item())
                     self.expect_op(")")
                     return A.TupleLit(items, **p)
                 self.expect_op(")", " to close parenthesis")
@@ -748,41 +1187,54 @@ class Parser:
                 self.next()
                 if self.accept_op("]"):
                     return A.ListLit([], **p)
-                first = self.expr()
-                if self.at_kw("for"):
-                    self.next()
-                    names = self.targets()
-                    self.expect_kw("in", " in list comprehension")
-                    it = self.or_expr()
-                    cond = self.or_expr() if self.accept_kw("if") else None
+                first = self.list_item()
+                if self._comp_for():
+                    clauses = self.comp_clauses("list comprehension")
                     self.expect_op("]")
-                    return A.ListComp(first, names, it, cond, **p)
+                    (names, it, cond), more = clauses[0], clauses[1:]
+                    return A.ListComp(first, names, it, cond, more or None, **p)
                 items = [first]
                 while self.accept_op(","):
                     if self.at_op("]"):
                         break
-                    items.append(self.expr())
+                    items.append(self.list_item())
                 self.expect_op("]", " to close list")
                 return A.ListLit(items, **p)
             if tok.value == "{":
                 self.next()
                 pairs = []
+                items = None                                    # a set literal {a, b} once known
                 while not self.at_op("}"):
-                    k = self.expr()
-                    self.expect_op(":", " in dict literal")
-                    val = self.expr()
-                    if not pairs and self.at_kw("for"):
-                        self.next()
-                        names = self.targets()
-                        self.expect_kw("in", " in dict comprehension")
-                        it = self.or_expr()
-                        cond = self.or_expr() if self.accept_kw("if") else None
-                        self.expect_op("}", " to close dict comprehension")
-                        return A.DictComp(k, val, names, it, cond, **p)
-                    pairs.append((k, val))
+                    if self.at_op("**"):
+                        st = self.next()
+                        pairs.append((None, A.Spread(self.bit_or(), True, **self.pos(st))))
+                    elif self.at_op("*"):
+                        items = (items or []) + [self.list_item()]
+                    else:
+                        k = self.expr()
+                        if items is not None or not self.at_op(":"):
+                            if pairs:
+                                self.error("expected ':' in dict literal")
+                            if items is None and self._comp_for():
+                                clauses = self.comp_clauses("set comprehension")
+                                self.expect_op("}", " to close set comprehension")
+                                (names, it, cond), more = clauses[0], clauses[1:]
+                                return A.SetComp(k, names, it, cond, more or None, **p)
+                            items = (items or []) + [k]
+                        else:
+                            self.expect_op(":", " in dict literal")
+                            val = self.expr()
+                            if not pairs and self._comp_for():
+                                clauses = self.comp_clauses("dict comprehension")
+                                self.expect_op("}", " to close dict comprehension")
+                                (names, it, cond), more = clauses[0], clauses[1:]
+                                return A.DictComp(k, val, names, it, cond, more or None, **p)
+                            pairs.append((k, val))
                     if not self.accept_op(","):
                         break
                 self.expect_op("}", " to close dict")
+                if items is not None:
+                    return A.SetLit(items, **p)
                 return A.DictLit(pairs, **p)
         self.error(f"unexpected {self._desc(tok)}")
 
@@ -814,6 +1266,19 @@ def parse_fstring(raw, line, col):
                 raise ParseError("unclosed '{' in f-string", line, col)
             expr_text = raw[i + 1:(colon if colon is not None else j)]
             spec = raw[colon + 1:j] if colon is not None else None
+            conv = None
+            if len(expr_text) >= 2 and expr_text[-2] == "!" and expr_text[-1] in "rsa" \
+                    and not expr_text.endswith("!=!r"):
+                conv = expr_text[-1]
+                expr_text = expr_text[:-2]
+            debug = expr_text.rstrip().endswith("=") and not expr_text.rstrip().endswith(("==", "!=", "<=", ">="))
+            if debug:                                     # f"{x=}" prints "x=" and the value's repr
+                buf.append(expr_text)
+                expr_text = expr_text.rstrip()[:-1]
+                if conv is None and spec is None:
+                    conv = "r"
+            if spec is not None and "{" in spec:          # a nested format spec: f"{x:{width}.{prec}f}"
+                spec = A.FStr(parse_fstring(spec, line, col), line=line, col=col)
             try:
                 sub = Parser(tokenize(expr_text))
                 e = sub.expr()
@@ -822,7 +1287,7 @@ def parse_fstring(raw, line, col):
             if buf:
                 parts.append("".join(buf))
                 buf = []
-            parts.append((e, spec))
+            parts.append((e, spec) if conv is None else (e, spec, conv))
             i = j + 1
         elif ch == "}" and raw[i + 1:i + 2] == "}":
             buf.append("}")
@@ -833,6 +1298,21 @@ def parse_fstring(raw, line, col):
     if buf:
         parts.append("".join(buf))
     return parts
+
+
+def _tokens_text(toks):
+    """Source-like text of a token run (annotations are kept as text, as `from __future__ import annotations`
+    does)."""
+    out = []
+    for t in toks:
+        if t.type in (NEWLINE, INDENT, DEDENT, EOF):
+            continue
+        v = repr(t.value) if t.type == STRING else {"none": "None", "true": "True", "false": "False"}.get(
+            str(t.value), str(t.value)) if t.type == KW else str(t.value)
+        if out and v not in ".,[]()" and out[-1] not in ".[(":
+            out.append(" ")
+        out.append(v)
+    return "".join(out).replace(",", ", ")
 
 
 def parse(source, cache=False):

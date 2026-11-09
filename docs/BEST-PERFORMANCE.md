@@ -73,7 +73,7 @@ SI numbers. You keep the safety and pay nothing in the inner loop.
 **Why:** half the bytes per number means half the memory traffic; most AI workloads are memory-bound.
 
 **Difference:** up to 2× for memory-bound work, and models that fit in memory at all. See
-[number formats](/docs/2.0.0/performance).
+[number formats](/docs/2.4.4/performance).
 
 ## 7. Measure instead of guessing
 

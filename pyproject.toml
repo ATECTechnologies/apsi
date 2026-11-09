@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "apsi"
-version = "2.0.0"
+version = "2.4.4"
 description = "Apsi: a programming language for AI, physics and servers, compiled to native machine code — units, shapes, autodiff, low-precision formats, data pipelines and a hardened web server built in"
 readme = "README.md"
 requires-python = ">=3.12"

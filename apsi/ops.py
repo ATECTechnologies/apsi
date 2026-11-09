@@ -207,7 +207,12 @@ def ceil(x):
 def round_(x, digits=0):
     if isinstance(x, Quantity):
         return Quantity(round_(x.v, digits), x.dim)
-    r = py(np.round(raw(x), digits))
+    v = raw(x)
+    if isinstance(v, (int, float, np.integer, np.floating)) and not isinstance(v, bool):
+        # Python's correctly rounded round(): round(2.675, 2) == 2.67, round(2.5) == 2 (ties to even)
+        r = round(float(v), int(digits)) if digits else round(float(v))
+        return r
+    r = py(np.round(v, digits))
     if digits == 0 and isinstance(r, float) and r.is_integer():
         return int(r)
     return r
@@ -223,16 +228,27 @@ def atan2(y, x):
 
 # ------------------------------------------------------------- reductions
 def _reduce(name, npf, adf):
-    def f(x, axis=None, keepdims=False):
+    def f(x, axis=None, keepdims=False, start=None):
+        if start is not None:                              # sum(xs, start) as in Python
+            return builtins.sum(x, start)
+        if not isinstance(x, (list, tuple, np.ndarray, Quantity, Node)) and hasattr(x, "__iter__") \
+                and not isinstance(x, (str, bytes, dict, set, frozenset)) and axis is None:
+            x = list(x)                                     # generators, ranges, map/zip objects
         if isinstance(x, (list, tuple)) and axis is None and not keepdims:
             items = list(x)
+            plain = all(type(it) in (int, float) for it in items)
             if name == "sum":
+                if plain:
+                    return builtins.sum(items)      # compensated summation (no drift): sum([0.1] * 10) == 1.0
                 total = 0
                 for it in items:
                     total = total + it
                 return total
             if not items:
                 raise RuntimeErr("mean() of an empty list")
+            if plain:
+                import math as _m
+                return _m.fsum(items) / len(items)
             total = 0
             for it in items:
                 total = total + it
@@ -275,12 +291,22 @@ mean = _reduce("mean", np.mean, ad.mean)
 
 
 def _extreme(name, npf, adf, pyf):
-    def f(*args, axis=None, keepdims=False):
+    _NO = object()
+
+    def f(*args, axis=None, keepdims=False, key=None, default=_NO):
+        extra = {} if key is None else {"key": key}
         if len(args) > 1:
-            return pyf(args)
+            return pyf(args, **extra)
         if not args:
             raise RuntimeErr(f"{name}() needs at least one argument")
         x = args[0]
+        if isinstance(x, (dict, set, frozenset, str)) or (hasattr(x, "__next__") and not isinstance(x, np.ndarray)):
+            x = list(x)
+        if key is not None or default is not _NO:
+            items = list(x) if not isinstance(x, np.ndarray) else list(x.ravel())
+            if default is not _NO:
+                extra["default"] = default
+            return pyf(items, **extra)
         if isinstance(x, (list, tuple, RangeVal)):
             items = list(x)
             if any(isinstance(i, (np.ndarray, Node)) for i in items):
@@ -406,16 +432,77 @@ def _shape_args(shape):
     return tuple(int(s) for s in shape)
 
 
+_MEM = [0.0, None]
+
+
+def available_memory():
+    """Bytes of RAM that can still be allocated (cached for one second), or None when unknown."""
+    import time as _t
+    if _t.monotonic() - _MEM[0] < 1.0:
+        return _MEM[1]
+    avail = None
+    try:
+        import sys as _s
+        if _s.platform.startswith("linux"):
+            with open("/proc/meminfo") as fh:
+                for line in fh:
+                    if line.startswith("MemAvailable:"):
+                        avail = int(line.split()[1]) * 1024
+                        break
+        elif _s.platform.startswith("win"):
+            import ctypes
+
+            class MS(ctypes.Structure):
+                _fields_ = [("dwLength", ctypes.c_ulong), ("dwMemoryLoad", ctypes.c_ulong)] + \
+                    [(n, ctypes.c_ulonglong) for n in ("total", "avail", "tpf", "apf", "tv", "av", "aev")]
+            m = MS()
+            m.dwLength = ctypes.sizeof(MS)
+            if ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(m)):
+                avail = int(m.avail)
+    except Exception:                          # noqa: BLE001
+        avail = None
+    _MEM[0], _MEM[1] = _t.monotonic(), avail
+    return avail
+
+
+def _itemsize(dtype):
+    try:
+        return np.dtype(_np_dtype(dtype) or float).itemsize
+    except Exception:                          # noqa: BLE001 - custom formats: assume the worst case
+        return 8
+
+
+def check_alloc(shape, itemsize=8, what="tensor"):
+    """Refuse an allocation that cannot fit in free RAM with a clear error, instead of letting the computer
+    swap to a standstill or the program be killed (out of memory)."""
+    n = 1
+    for s in shape:
+        n *= int(s)
+    need = n * itemsize
+    if need < (256 << 20):
+        return
+    avail = available_memory()
+    if avail is not None and need > avail * 0.9:
+        def gb(b):
+            return f"{b / 1e9:.2f} GB"
+        raise MemoryError(f"a {what} of shape {tuple(int(s) for s in shape)} needs {gb(need)} but only {gb(avail)} of "
+                          "RAM is free. Use a smaller size, f32/bf16 (half the memory), data streaming "
+                          "(use data), or close other programs.")
+
+
 def zeros(*shape, dtype=None):
+    check_alloc(_shape_args(shape), _itemsize(dtype))
     return np.zeros(_shape_args(shape), dtype=_np_dtype(dtype) or float)
 
 
 def ones(*shape, dtype=None):
+    check_alloc(_shape_args(shape), _itemsize(dtype))
     return np.ones(_shape_args(shape), dtype=_np_dtype(dtype) or float)
 
 
 def full(shape, value):
     shape = _shape_args(shape if isinstance(shape, (list, tuple)) else (shape,))
+    check_alloc(shape)
     if isinstance(value, Quantity):
         return Quantity(np.full(shape, value.v, dtype=float), value.dim)
     return np.full(shape, value, dtype=float)
@@ -481,10 +568,14 @@ def _rng(s):
 
 
 def randn(*shape, seed=None):
+    if shape:
+        check_alloc(_shape_args(shape))
     return _rng(seed).standard_normal(_shape_args(shape)) if shape else py(_rng(seed).standard_normal())
 
 
 def rand(*shape, seed=None):
+    if shape:
+        check_alloc(_shape_args(shape))
     return _rng(seed).random(_shape_args(shape)) if shape else py(_rng(seed).random())
 
 

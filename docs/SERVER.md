@@ -20,12 +20,21 @@ app.run(host="0.0.0.0", port=8080)            # run with --allow-net
 | Part | How it works |
 |---|---|
 | Accepting connections | one asyncio event loop holds tens of thousands of keep-alive clients with little memory |
-| Processing | handlers run on a worker thread pool (`workers=`), so numpy/AI work runs truly in parallel and never blocks accepting requests |
+| Processing | handlers run on a worker thread pool (`workers=`), so numpy/AI work runs truly in parallel and never blocks accepting requests. A route that proves fast (under 0.5 ms, measured by CPU time so a busy server does not mislead it) runs directly on the event loop, without a thread hand-off; a route that is slow or blocks on I/O stays on the workers |
 | Several cores | on Linux, `app.run(processes=N)` forks N processes on the same port (SO_REUSEPORT) and the kernel spreads connections between them |
 | Shutdown | on SIGINT/SIGTERM the server stops accepting new connections and lets running requests finish (graceful shutdown) |
 
-**Measured** (2 vCPU machine, load generator on the same machine): **7,700 requests/s** at 500 concurrent
-connections, p99 82 ms, 0 errors out of 20,000 requests.
+**Measured** (2 vCPU machine, a Go load generator on the same machine, a JSON route, keep-alive):
+
+| concurrent connections | requests/s | p50 | p99 | errors |
+|---|---|---|---|---|
+| 50 | 20,300 | 2.5 ms | 3.7 ms | 0 |
+| 256 | 20,700 | 12.4 ms | 19.3 ms | 0 |
+| 1,000 | 20,400 | 48 ms | 72 ms | 0 |
+
+The same machine and load generator measure Node.js 22's `http` module at 54,000–57,000 requests/s. While 64
+connections keep a blocking 10 ms route busy, a fast route on the same server still answers 15,000 requests/s with a
+p99 of 1.0 ms.
 
 ```bash
 python tools/loadtest.py http://127.0.0.1:8080/health --requests 20000 --concurrency 500
@@ -81,6 +90,48 @@ app.run_background(port=0)                         # run on a separate thread; r
 `response(body, status, headers, type)`; `redirect(url)`; `abort(status, message)` to stop with an error; `none` → 204
 
 **Errors:** a UnitError/ShapeError/TypeError caused by the client's data → 400; any other error → 500
+
+## WebSocket
+
+```apsi
+use web
+let app = web.server()
+
+@app.websocket("/echo")
+fn echo(ws, msg):                      # message mode: called once per message; no thread waits per connection,
+    ws.send(msg)                       # so tens of thousands of idle connections cost almost nothing
+
+@app.websocket("/chat", origins=["https://example.com"], max_message=1_000_000, ping=20)
+fn chat(ws):                           # session mode: one conversation per connection
+    ws.join("lobby")
+    for msg in ws:                     # ends when the client closes
+        app.room("lobby").send({"from": ws.id, "text": msg})    # dicts and lists are sent as JSON
+
+app.run(port=8080)
+```
+
+* `app.websocket(path, handler, origins=, max_message=, ping=, on_open=, on_close=, subprotocols=)` — the handler
+  takes `(ws, msg)` for message mode or `(ws)` for session mode.
+* `ws.send(text | bytes | dict | list)`, `ws.receive(timeout=)`, `ws.close(code, reason)`, `ws.join(room)`,
+  `ws.leave(room)`, `ws.receive_json()`, `ws.id`, `ws.request` (the upgrade request: path, headers, query).
+* `app.room(name).send(msg, exclude=ws)` broadcasts to every member; `len(app.room(name))` counts them.
+* Messages of one connection are handled in order; slow receivers get back-pressure instead of unbounded buffers.
+* RFC 6455 in full: text and binary, fragmentation, ping/pong keep-alive (dead peers are dropped), the closing
+  handshake, UTF-8 checking of text, client masking enforced, a size limit per message (16 MB by default) and Origin
+  checking.
+
+Client (needs `--allow-net` for the host):
+
+```apsi
+let c = web.websocket_connect("ws://localhost:8080/echo")
+c.send("hi")
+print(c.receive())
+c.close()
+```
+
+Measured on a 2-core VM with a Node.js 22 client: a round trip takes 206 µs; a burst of 20,000 messages is echoed
+at 36,800 messages per second, in order; 1,000 concurrent connections all answered. Reproduce with
+`benchmarks/websocket/`.
 
 ## Talking to Next.js / JavaScript / Java
 

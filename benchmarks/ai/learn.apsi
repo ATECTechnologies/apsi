@@ -1,0 +1,50 @@
+# Does it really learn? Three small models trained from scratch on the CPU, with held-out accuracy / loss.
+use layers
+use nn
+let np = pyimport("numpy")
+let time = pyimport("time")
+
+# 1) a 3-class spiral: not separable by a line; an MLP must learn curved boundaries
+let rng = np.random.default_rng(0)
+let n = 600
+var xs = []
+var ys = []
+for k in range(3):
+    let r = np.linspace(0.05, 1.0, n)
+    let t = np.linspace(k * 4.0, (k + 1) * 4.0, n) + rng.normal(0, 0.2, n)
+    xs.append(np.stack([r * np.sin(t), r * np.cos(t)], axis=1))
+    ys.append(np.full(n, k))
+let X = np.concatenate(xs).astype("float32")
+let Y = np.concatenate(ys)
+let idx = rng.permutation(len(Y))
+let tr = idx[0:1440]
+let te = idx[1440:]
+let net = mlp([2, 64, 64, 3])
+let p0 = net.init(seed=0)
+fn acc(p, a, b) = float(np.mean(np.argmax(np.asarray(net(p, a)), axis=1) == b))
+let t0 = time.perf_counter()
+let r = fit(net, p0, X[tr], Y[tr], loss="cross_entropy", opt=adam(lr=1e-2), epochs=60, batch_size=64, verbose=false)
+print(f"spiral MLP     test accuracy {acc(p0, X[te], Y[te]):.3f} -> {acc(r.params, X[te], Y[te]):.3f}   loss {r.history[0]:.3f} -> {r.history[-1]:.3f}   {time.perf_counter() - t0:.1f}s")
+
+# 2) sequence memory: an LSTM must remember the first value of a sequence of 20
+let S = rng.integers(0, 2, [2000, 20]).astype("float32")
+let SX = S.reshape([2000, 20, 1]) * 2.0 - 1.0
+let SY = S[:, 0:1]
+let seq = sequential([lstm_layer(1, 32, return_sequences=false), linear(32, 1)])
+let q0 = seq.init(seed=0)
+fn sacc(p, a, b) = float(np.mean((np.asarray(seq(p, a)) > 0) == (b > 0.5)))
+let t1 = time.perf_counter()
+let r2 = fit(seq, q0, SX[0:1600], SY[0:1600], loss="bce", opt=adam(lr=3e-3), epochs=30, batch_size=32, clip=1.0, verbose=false)
+print(f"LSTM memory    test accuracy {sacc(q0, SX[1600:], SY[1600:]):.3f} -> {sacc(r2.params, SX[1600:], SY[1600:]):.3f}   loss {r2.history[0]:.3f} -> {r2.history[-1]:.3f}   {time.perf_counter() - t1:.1f}s")
+
+# 3) a character-level transformer learns a repeating text
+let text = "the quick brown fox jumps over the lazy dog. " * 40
+let chars = sorted(set(text))
+let ids = np.array([chars.index(c) for c in text])
+let ctx = 32
+let starts = np.arange(0, len(ids) - ctx - 1, 3)
+let T = np.stack([ids[s:s + ctx + 1] for s in starts])
+let lm = transformer_lm(len(chars), d=64, heads=4, layers=2, context=ctx)
+let t2 = time.perf_counter()
+let r3 = fit(lm, lm.init(seed=0), T[:, 0:-1], T[:, 1:], loss="cross_entropy", opt=adam(lr=3e-3), epochs=8, batch_size=32, verbose=false)
+print(f"char GPT       loss {r3.history[0]:.3f} -> {r3.history[-1]:.3f}  (uniform guess {np.log(len(chars)):.3f})   {time.perf_counter() - t2:.1f}s")

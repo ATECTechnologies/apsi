@@ -1,6 +1,6 @@
 <p align="center"><img src="assets/brand/apsi-banner-1280x640.png" alt="Apsi" width="640"></p>
 
-# Apsi 2.0.0 (`.apsi`)
+# Apsi 2.4.4 (`.apsi`)
 
 **Apsi** is a programming language for **AI**, **physics** and **servers**. Physical units, tensor-shape
 checking, automatic differentiation, number formats from FP64 down to FP4, data pipelines and a hardened
@@ -29,10 +29,10 @@ fn energy(x, v, k: Float) -> Float:
 
 | System | File in `dist/` |
 |---|---|
-| Windows 10/11 (x64) | `ApsiSetup-2.0.0-x64.exe` — setup wizard with its own Python; no administrator rights needed |
-| Any Linux (also WSL) | `sh ApsiSetup-2.0.0-linux.sh` — one-file installer, no root; commands, `.apsi` file type with icon, editor support |
-| Ubuntu / Debian | `sudo apt install ./apsi_2.0.0_all.deb` |
-| Any system with Python 3.12+ | `pip install apsi-2.0.0-py3-none-any.whl` |
+| Windows 10/11 (x64) | `ApsiSetup-2.4.4-x64.exe` — setup wizard with its own Python; no administrator rights needed |
+| Any Linux (also WSL) | `sh ApsiSetup-2.4.4-linux.sh` — one-file installer, no root; commands, `.apsi` file type with icon, editor support |
+| Ubuntu / Debian | `sudo apt install ./apsi_2.4.4_all.deb` |
+| Any system with Python 3.12+ | `pip install apsi-2.4.4-py3-none-any.whl` |
 | Code editors | the setup wizard adds Apsi to VS Code, Cursor, Windsurf, VSCodium, Sublime Text, Vim/Neovim and Notepad++ it finds (`apsi editors install` does the same later) |
 
 The installer adds `apsi` to your PATH, registers `.apsi` files (icon, *Run with Apsi*, *Edit*, and
@@ -74,7 +74,14 @@ apsi                    # interactive REPL
 | **Autodiff** | `grad(f)`, `value_and_grad(f)` on tensors, structs and records, unit-aware (`grad(energy)` has the unit of a force); any order: `hessian`, `jacobian`, `laplace`, `grad(grad(f))` — enough for physics-informed neural networks |
 | **AI** | `use layers`: **any architecture as a graph of layers** (`sequential`, `residual`, `parallel`, `dag`), transformers, CNNs, LSTM/GRU, autoencoders/VAEs, **graph neural networks** (GCN, GraphSAGE, GAT, GIN), a model zoo and `fit()`; plus Adam/AdamW/SGD, schedules, gradient clipping, save/load — reference: [`docs/LAYERS.md`](docs/LAYERS.md) |
 | **GPU training (PyTorch)** | the same models train on PyTorch with `fit(…, backend="torch")` — NVIDIA CUDA, AMD ROCm, Apple MPS, Intel XPU or CPU; fp64/fp32/tf32, bf16/fp16 mixed precision, `torch.compile`, fused attention, cuDNN LSTMs; `torch_module()` gives a real `torch.nn.Module`; `check_torch()` verifies every layer against NumPy; `apsi pkg install torch-auto` picks the right CUDA build — [`docs/BACKENDS.md`](docs/BACKENDS.md) |
-| **From Python and PyTorch** | `apsi convert` translates Python files and folders. **PyTorch programs become native Apsi** on `use torch`, Apsi's own implementation of the PyTorch API: `nn.Module` classes, every common layer (BatchNorm, LSTM, attention, transformers), losses with all options, optimizers, learning-rate schedulers, `DataLoader`s, `state_dict`s and the training loop. Whole training runs end with the same weights as PyTorch (to 1e-9), with no Python or PyTorch at run time. numpy, math, random and json map onto Apsi too; any other library keeps working through `pyimport` — [`docs/PYTHON.md`](docs/PYTHON.md) |
+| **Python, exactly** | `apsi convert` turns any Python 3.13 program into Apsi that behaves **byte for byte** like the original: classes, metaclasses, dataclasses, `match`, `async`, `except*`, generics, star imports. Verified on 34 standard-library modules (≈38,000 lines) and a 23,769-line AI training program — identical output, files and training losses — [`docs/PYTHON.md`](docs/PYTHON.md) |
+| **Real time** | `use rt`: control loops at 1–2 kHz with microsecond lateness; video pipelines at any size from 640×480 to 3840×2160 (named sizes `vga` … `4k`) with newest-frame hand-off, adaptive resolution and per-frame latency reports; CPU or GPU — [`docs/REALTIME.md`](docs/REALTIME.md) |
+| **RAM, SSD, GPU** | `use memory`: arrays that move to the SSD instead of running out of RAM, out-of-core `chunks`/`map` on all cores, two-tier RAM/SSD caches, batches that shrink on out-of-memory, the GPU with the most free memory — [`docs/MEMORY.md`](docs/MEMORY.md) |
+| **Fewer AI tokens** | `use tokens`: exactly reversible packing for prompts — record lists as tables (−57 to −63 %), repeated lines once (−59 % on logs), only the changed lines of an edited document (−99 %) — [`docs/TOKENS.md`](docs/TOKENS.md) |
+| **Tables** | `use dataframe`: a columnar engine — filters 24×, group-by 4×, joins 3× faster than pandas, 4× less memory — [`docs/DATAFRAME.md`](docs/DATAFRAME.md) |
+| **Databases** | `use db`: PostgreSQL, Redis and SQLite with no driver to install — [`docs/DATABASES.md`](docs/DATABASES.md) |
+| **Debugger** | breakpoints, stepping, variables and tensors in VS Code (F5) or `apsi debug` — [`docs/DEBUGGING.md`](docs/DEBUGGING.md) |
+| **From PyTorch to native** | `apsi convert --idiomatic`: **PyTorch programs become native Apsi** on `use torch`, Apsi's own implementation of the PyTorch API: `nn.Module` classes, every common layer (BatchNorm, LSTM, attention, transformers), losses with all options, optimizers, learning-rate schedulers, `DataLoader`s, `state_dict`s and the training loop. Whole training runs end with the same weights as PyTorch (to 1e-9), with no Python or PyTorch at run time. numpy, math, random and json map onto Apsi too; any other library keeps working through `pyimport` — [`docs/PYTHON.md`](docs/PYTHON.md) |
 | **Reinforcement learning** | `use rl`: vectorised environments, GAE, PPO, double DQN, REINFORCE, DPO / IPO / GRPO / RLHF objectives, Monte Carlo tree search, beam search — [`docs/RL.md`](docs/RL.md) |
 | **Libraries** | `.apsil` packages: `apsi install NAME` gets the newest version with dependencies and a lock file, verifies every file's SHA-256 and scans it; `apsi pack` + `apsi publish` with an API token — [`docs/LIBRARIES.md`](docs/LIBRARIES.md) |
 | **Science and medicine** | `use special`, `stats`, `signal`, `mechanics`, `pde`, `quantum`, `medical`, `lab`: special functions, distributions and 19 hypothesis tests, regression, power analysis, zero-phase filters and spectra, Lagrangian/Hamiltonian dynamics by autodiff, N-body, orbits, beams and trusses, heat/wave/Poisson/Navier–Stokes solvers, Schrödinger equation and qubits, pharmacokinetics, survival analysis (Kaplan–Meier, log-rank, Cox), ROC/DeLong, ECG/HRV, DICOM, reproducible experiment logs. Verified against SciPy, statsmodels, lifelines, scikit-learn and pydicom — [`docs/SCIENCE.md`](docs/SCIENCE.md) |
@@ -91,7 +98,7 @@ apsi                    # interactive REPL
 | **Data** | streaming pipelines: parallel map, prefetch, shuffle, vectorized batching (~2 M rows/s), sliding windows, sharding, interleaving; CSV, JSON Lines, Parquet, `.npy`; memory-mapped tensors on SSD, signed on-disk cache |
 | **Accuracy** | exact fractions, correctly rounded sums (`fsum`), measurement uncertainty, unit checking, bit-exact low-precision formats |
 | **Concurrency** | tasks, channels, locks, atomics, `parallel_for` / `parallel_reduce`, `pmap`, BLAS thread control |
-| **Servers** | `use web`: asyncio + worker pool + multi-process, 7,700 req/s at 500 concurrent connections (2 vCPU); protection against slowloris, request smuggling, path traversal, header injection and DoS; JWT, API keys, rate limits, CORS, TLS, metrics |
+| **Servers** | `use web`: asyncio protocol + worker pool + multi-process, 20,000+ req/s on 2 vCPU at 50–1,000 connections; WebSocket routes, rooms and client; `.env` files and secrets (`use env`); protection against slowloris, request smuggling, path traversal, header injection and DoS; JWT, API keys, rate limits, CORS, TLS, metrics |
 | **AI models** | `use models`: Apsi checkpoints (`.apsim`: units, compressed tensors, SHA-256, signatures, sharding), GGUF (bit-exact Q8_0/Q4_0), safetensors read/write, memory-mapped loading, INT8/FP8/FP4 compression (4–16× less RAM), `qlinear`; ONNX Runtime, Hugging Face and PyTorch models served as an API in a few lines |
 | **Tooling** | `run`, `check`, `test`, `fmt`, `watch`, `bench`, `build`, `compile`, `convert`, `new`, `task`, `doc`, `lsp`, `repl`, `serve`, `doctor`, `editors`, `pkg`; extensions for VS Code, Cursor, Windsurf, VSCodium, Sublime Text, Vim/Neovim and Notepad++ with live diagnostics, unit hovers, go to definition, tasks, snippets and themes; web playground (WebAssembly) |
 | **Platforms** | Windows 10/11 and Linux installers; CI on Windows Server 2022/2025 and Ubuntu 22.04/24.04; Python 3.12 and newer (3.12, 3.13, 3.14) |
@@ -188,6 +195,7 @@ Development started on **Sunday, 8 November 2026 at about 04:00** (Bangkok time,
 
 ## Documentation
 
+- [`docs/WHATS-NEW.md`](docs/WHATS-NEW.md) — **everything new in 2.4.4**, with examples, measurements and limits
 - [`docs/GETTING-STARTED.md`](docs/GETTING-STARTED.md) — install, first program, first model, first library
 - [`docs/NATIVE.md`](docs/NATIVE.md) — **native code**: `@native`, `parallel for`, `@gpu`, benchmarks against C, C++, Rust, Go and Mojo
 - [`docs/LIBRARIES.md`](docs/LIBRARIES.md) — `.apsil` libraries: install, create, pack, publish, the registry API
@@ -199,6 +207,13 @@ Development started on **Sunday, 8 November 2026 at about 04:00** (Bangkok time,
 - [`docs/LAYERS.md`](docs/LAYERS.md) — **`use layers` reference**: every layer with shapes and parameters, `dag`, graph neural networks, the model zoo, `fit`, recipes
 - [`docs/BACKENDS.md`](docs/BACKENDS.md) — NumPy and PyTorch backends: CUDA, ROCm, Apple MPS, Intel XPU, bf16/fp16 mixed precision, `torch.compile`, `torch.nn.Module` export
 - [`docs/PYTHON.md`](docs/PYTHON.md) — converting Python and PyTorch programs with `apsi convert`
+- [`docs/REALTIME.md`](docs/REALTIME.md) — 1–2 kHz loops and video from 640×480 to 4K (`use rt`)
+- [`docs/MEMORY.md`](docs/MEMORY.md) — RAM budgets, SSD spill, out-of-core data, OOM-safe batches (`use memory`)
+- [`docs/DATAFRAME.md`](docs/DATAFRAME.md) — tables (`use dataframe`)
+- [`docs/DATABASES.md`](docs/DATABASES.md) — PostgreSQL, Redis, SQLite (`use db`)
+- [`docs/DEBUGGING.md`](docs/DEBUGGING.md) — the debugger
+- [`docs/ENV.md`](docs/ENV.md) — `.env` files, secrets, Python virtual environments
+- [`docs/TOKENS.md`](docs/TOKENS.md) — fewer LLM tokens with exactly reversible transforms (`use tokens`)
 - [`docs/SERVER.md`](docs/SERVER.md) — secure, high-throughput servers
 - [`docs/PERFORMANCE.md`](docs/PERFORMANCE.md) — number formats, CPU, GPU, PyTorch, RAM, SSD
 - [`docs/INTEROP.md`](docs/INTEROP.md) — Python, PyTorch, C/C++, JS/Next.js, Java
