@@ -1,4 +1,5 @@
 """Recursive-descent parser for Apsi."""
+import itertools
 from fractions import Fraction
 
 from . import ast as A
@@ -21,6 +22,9 @@ def _unit_info(text, line, col):
     except UnitError as e:
         raise ParseError(e.msg, line, col)
     return (text, scale, dim)
+
+
+_QIDS = itertools.count(1)          # hidden names for `??` and `?.` (each value is computed once)
 
 
 class Parser:
@@ -892,14 +896,38 @@ class Parser:
         return e
 
     def ternary(self):
-        e = self.or_expr()
+        e = self.coalesce()
         if self.at_kw("if"):
             tok = self.next()
-            cond = self.or_expr()
+            cond = self.coalesce()
             self.expect_kw("else", " in conditional expression (a if cond else b)")
             b = self.ternary()
             return A.IfExpr(cond, e, b, **self.pos(tok))
         return e
+
+    def coalesce(self):
+        """a ?? b: a unless it is none, then b (b is evaluated only when needed; a only once)."""
+        e = self.or_expr()
+        while self.at_op("??"):
+            tok = self.next()
+            b = self.or_expr()
+            if isinstance(e, A.NoneLit):
+                e = b
+                continue
+            if isinstance(e, (A.Num, A.Str, A.FStr, A.Bool)):     # a literal is never none
+                continue
+            ref, test = self._once(e)
+            e = A.IfExpr(A.Binary("is", test, A.NoneLit(**self.pos(tok)), **self.pos(tok)), b, ref,
+                         **self.pos(tok))
+        return e
+
+    def _once(self, e):
+        """(an expression that reads e's value again, the expression that computes it): plain names are read
+        twice, anything else is computed once into a hidden variable."""
+        if isinstance(e, A.Name):
+            return e, e
+        tmp = f"__q{next(_QIDS)}"
+        return A.Name(tmp, line=e.line, col=e.col), A.NamedExpr(tmp, e, line=e.line, col=e.col)
 
     def or_expr(self):
         e = self.and_expr()
@@ -1027,9 +1055,34 @@ class Parser:
         return e
 
     def postfix(self):
-        e = self.primary()
+        return self.postfix_rest(self.primary())
+
+    def postfix_rest(self, e):
         while True:
             tok = self.peek()
+            if self.at_op("?.") or self.at_op("?["):
+                # a?.b, a?[i], a?.f(x): none when a is none, and the rest of the chain is skipped too
+                if isinstance(e, (A.Num, A.Str, A.FStr, A.Bool)):  # a literal is never none: a plain . or [
+                    self.next()
+                    if tok.value == "?.":
+                        nt = self.next()
+                        e = A.Attr(e, nt.value, **self.pos(tok))
+                    else:
+                        e = self._index_after_bracket(e, tok)
+                    continue
+                ref, test = self._once(e)
+                self.next()
+                if tok.value == "?.":
+                    nt = self.peek()
+                    if nt.type not in (NAME, KW):
+                        self.error("expected attribute name after '?.'")
+                    self.next()
+                    inner = A.Attr(ref, nt.value, **self.pos(tok))
+                else:
+                    inner = self._index_after_bracket(ref, tok)
+                rest = self.postfix_rest(inner)
+                return A.IfExpr(A.Binary("is", test, A.NoneLit(**self.pos(tok)), **self.pos(tok)),
+                                A.NoneLit(**self.pos(tok)), rest, **self.pos(tok))
             if self.at_op("("):
                 self.next()
                 args, kwargs = [], []
@@ -1057,17 +1110,7 @@ class Parser:
                 e = A.Call(e, args, kwargs, **self.pos(tok))
             elif self.at_op("["):
                 self.next()
-                idx = [self.subscript()]
-                comma = False
-                while self.accept_op(","):
-                    comma = True
-                    if self.at_op("]"):
-                        break
-                    idx.append(self.subscript())
-                self.expect_op("]", " to close index")
-                index = idx[0] if len(idx) == 1 and not (comma and self.pyc) and not isinstance(idx[0], A.Spread) \
-                    else A.TupleLit(idx, **self.pos(tok))
-                e = A.Index(e, index, **self.pos(tok))
+                e = self._index_after_bracket(e, tok)
             elif self.at_op("."):
                 self.next()
                 nt = self.peek()
@@ -1077,6 +1120,19 @@ class Parser:
                 e = A.Attr(e, nt.value, **self.pos(tok))
             else:
                 return e
+
+    def _index_after_bracket(self, e, tok):
+        idx = [self.subscript()]
+        comma = False
+        while self.accept_op(","):
+            comma = True
+            if self.at_op("]"):
+                break
+            idx.append(self.subscript())
+        self.expect_op("]", " to close index")
+        index = idx[0] if len(idx) == 1 and not (comma and self.pyc) and not isinstance(idx[0], A.Spread) \
+            else A.TupleLit(idx, **self.pos(tok))
+        return A.Index(e, index, **self.pos(tok))
 
     def list_item(self):
         """An element of a list literal: an expression or `*xs` (all items of xs spread in place)."""

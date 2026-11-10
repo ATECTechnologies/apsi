@@ -8,7 +8,7 @@ from .errors import ApsiError
 from .parser import parse
 
 SPACED = ["**=", "//=", "<<=", ">>=", "==", "!=", "<=", ">=", "+=", "-=", "*=", "/=", "%=", "@=", "|=", "&=",
-          "^=", ":=", "->", "=>", "|>", "~=", "+/-", "±", "="]
+          "^=", ":=", "->", "=>", "|>", "~=", "+/-", "±", "??", "="]
 
 
 def _tree(src):
@@ -91,6 +91,16 @@ def _format_line(code, depth=0):
             while i < n and code[i] == " ":
                 i += 1
             continue
+        if code.startswith("?.", i) or code.startswith("?[", i):          # a?.b, a?[i]: no spaces around
+            while out and out[-1] == " ":
+                out.pop()
+            out.append(code[i:i + 2])
+            i += 2
+            if code[i - 1] == "[":
+                depth += 1
+            while i < n and code[i] == " ":
+                i += 1
+            continue
         if code.startswith("..=", i) or code.startswith("..", i):
             k = 3 if code.startswith("..=", i) else 2
             out.append(code[i:i + k])
@@ -98,7 +108,7 @@ def _format_line(code, depth=0):
             continue
         op = next((o for o in SPACED if code.startswith(o, i)), None)
         if op and not (op == "=" and depth > 0):
-            if op in ("=", "->", "=>", ":=") or depth == 0 or op in ("|>", "~=", "±", "+/-"):
+            if op in ("=", "->", "=>", ":=") or depth == 0 or op in ("|>", "~=", "±", "+/-", "??"):
                 while out and out[-1] == " ":
                     out.pop()
                 if out and not "".join(out).endswith(" "):

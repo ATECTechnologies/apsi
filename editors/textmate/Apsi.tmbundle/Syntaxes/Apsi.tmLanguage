@@ -1096,6 +1096,12 @@
 				</dict>
 				<dict>
 					<key>name</key>
+					<string>keyword.operator.null-safe.apsi</string>
+					<key>match</key>
+					<string>\?\?|\?\.|\?(?=\[)</string>
+				</dict>
+				<dict>
+					<key>name</key>
 					<string>keyword.operator.arrow.apsi</string>
 					<key>match</key>
 					<string>-&gt;|=&gt;|→</string>

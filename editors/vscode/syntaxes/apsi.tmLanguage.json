@@ -713,6 +713,10 @@
      "match": "\\|>"
     },
     {
+     "name": "keyword.operator.null-safe.apsi",
+     "match": "\\?\\?|\\?\\.|\\?(?=\\[)"
+    },
+    {
      "name": "keyword.operator.arrow.apsi",
      "match": "->|=>|→"
     },

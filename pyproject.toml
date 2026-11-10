@@ -16,6 +16,7 @@ dependencies = ["numpy>=1.26", "llvmlite>=0.43; sys_platform != \"darwin\" or pl
 [project.optional-dependencies]
 gpu = ["cupy-cuda12x"]
 torch = ["torch"]
+web = ["uvloop; sys_platform != \"win32\""]
 
 [project.scripts]
 apsi = "apsi.cli:main"

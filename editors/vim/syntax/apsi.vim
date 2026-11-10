@@ -58,7 +58,7 @@ syn region  apsiUnitBracket matchgroup=apsiUnitDelim start="\[" end="\]" contain
 syn match   apsiUnitOp   "[*/^·]\|\*\*\|-\=\d\+" contained
 syn region  apsiUnitCast matchgroup=apsiOperatorKw start="\<as\s*\[" matchgroup=apsiUnitDelim end="\]" oneline contains=apsiUnitOp
 
-syn match   apsiOperator "|>\|->\|=>\|±\|+/-\|\.\.=\=\|\~=\|==\|!=\|<=\|>=\|\*\*\|//\|[-+*/%@^<>=]"
+syn match   apsiOperator "??\|?\.\|?\[\@=\||>\|->\|=>\|±\|+/-\|\.\.=\=\|\~=\|==\|!=\|<=\|>=\|\*\*\|//\|[-+*/%@^<>=]"
 
 syn match   apsiEscape   "\\[ntr\\\"0]" contained
 syn match   apsiEscape   "{{\|}}" contained

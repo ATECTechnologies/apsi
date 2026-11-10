@@ -275,6 +275,7 @@ p.mass = 2kg                # field assignment (structs, records)
 | lambda | `fn(x) => expr` | |
 | pipe | `x \|> f` | `x \|> f` is `f(x)`; `x \|> f(a)` is `f(x, a)` |
 | conditional | `a if cond else b` | |
+| none-coalescing | `a ?? b` | `a` unless it is `none`, then `b`; `b` runs only when needed |
 | walrus | `(n := expr)` | assigns and gives the value |
 | logical | `or`, `and`, `not` | short-circuit; `a or b` gives `a` or `b` itself |
 | comparison | `== != < <= > >= ~= in not in is is not` | chain: `0 < f(x) < 1` evaluates `f(x)` once |
@@ -288,7 +289,7 @@ p.mass = 2kg                # field assignment (structs, records)
 | unary | `-x`, `+x`, `~x` | `~` is bitwise not (logical not for boolean tensors) |
 | uncertainty | `x ± σ`, `x +/- σ` | binds tighter than `*` |
 | power | `**` or `^` | right-associative: `2**3**2 == 512`, `-2**2 == -4` |
-| postfix | `f(a, k=v)`, `x[i, j]`, `x[1:5:2]`, `x.field` | |
+| postfix | `f(a, k=v)`, `x[i, j]`, `x[1:5:2]`, `x.field`, `x?.field`, `x?[i]` | `?.` / `?[`: `none` when `x` is `none` |
 
 ### 6.2 Arithmetic
 
@@ -302,6 +303,22 @@ element-wise with NumPy broadcasting.
 data |> normalize |> train(model)          # train(normalize(data), model)
 [1, 2, 3] |> sum                           # 6
 ```
+
+### 6.3b Values that may be `none`: `??`, `?.`, `?[`
+
+```apsi
+let port = config.get("port") ?? 8080               # 8080 when the key is missing (get gives none)
+let city = user?.address?.city ?? "unknown"          # none anywhere on the way: "unknown"
+let top = results?[0]                                # none when results is none
+let name = find_user(id)?.name?.upper()             # the whole chain stops at the first none
+```
+
+`a ?? b` is `a` unless `a` is `none` — only `none`: `0 ?? 1` is `0` and `"" ?? "x"` is `""` (use `or` for "empty
+or false"). `b` is evaluated only when it is needed and `a` exactly once, so `next_item() ?? default` calls
+`next_item` once. `x?.name`, `x?.f(args)` and `x?[i]` give `none` when `x` is `none` and otherwise act like `.`
+and `[ ]`; everything after them in the same chain is skipped as well, as in JavaScript, C# and Kotlin. Both work in
+the compiled engine, the tree-walking interpreter and the checker, and `apsi fmt` writes them as `a ?? b`,
+`a?.b`, `a?[i]`.
 
 ### 6.4 Indexing and slicing
 
@@ -908,7 +925,7 @@ import "lib/geometry.apsi" as geo
 Standard modules: `math`, `physics`, `physics.units`, `physics.constants`, `physics.fields`, `physics.formulas`, `nn`,
 `layers`, `torch`, `rl`, `linalg`, `random`, `sci`, `special`, `stats`, `signal`, `mechanics`, `pde`, `quantum`,
 `medical`, `lab`, `precision`, `data`, `parallel`, `scale`, `web`, `models`, `gpu`, `sys`, `crypto`, `io`, `ffi`,
-`python`, `net`.
+`python`, `net`, `collections`, `memory`, `db`, `rt`, `hub`, `tokens`, `dataframe`, `env`.
 
 ---
 
@@ -1128,6 +1145,35 @@ Use with `use NAME` (all names) or `use NAME as short` (`short.name`).
 ### `math`
 `abs sqrt cbrt exp log log10 log2 sin cos tan asin acos atan atan2 sinh cosh tanh floor ceil round pi tau e inf nan`
 and from `special`: `gamma lgamma erf erfc erfinv factorial comb beta besselj legendre`
+
+### `collections` — data structures and functional helpers
+
+```apsi
+use collections
+let words = Counter(text.split())
+print(words.most_common(3))                    # [("the", 120), ("a", 87), ("of", 60)]
+let by_city = DefaultDict(fn() => [])
+by_city[p.city].append(p)
+let todo = Heap(key=fn(t) => t.priority)       # smallest priority first; max_heap=true for largest
+let recent = Deque(max=100)                    # keeps the newest 100
+let cache = LRUCache(1000)
+```
+
+| Class | What it is |
+|---|---|
+| `Counter(xs)` | counts: `add(x, n)`, `c[x]` (0 when absent), `most_common(k)`, `total()`, `c + d`, `c - d`, `items()`, `to_dict()` |
+| `DefaultDict(make)` | a dict whose missing keys are created by `make()` |
+| `Deque(xs, max)` | double-ended queue: `push`, `push_left`, `pop`, `pop_left`, `peek`, `peek_left`, `rotate(n)`; with `max`, a ring buffer |
+| `Heap(xs, key, max_heap)` | priority queue: `push`, `pop`, `peek`, `push_pop`; equal priorities leave in arrival order |
+| `LRUCache(capacity)` | `get(k, default)`, `set(k, v)`, `has`, `delete`, `stats()` (hits, misses, hit rate); thread-safe |
+| `OrderedSet(xs)` | a set that keeps insertion order: `add`, `discard`, `has`, `\|`, `&`, `-` |
+| `BiMap(pairs)` | a one-to-one map: `get(k)`, `key_of(v)`, `set`, `delete` |
+
+These functions are built in (no `use` needed): `first(xs, pred, default)`, `last(xs, pred, default)`,
+`partition(xs, pred)` → (matching, rest), `take_while(xs, pred)`, `drop_while(xs, pred)`, `scan(xs, f, init)` (running
+results), `fold(xs, f, init)`, `flat_map(xs, f)`, `zip_longest(a, b, …, fill=none)`, `interleave(a, b, …)`,
+`distinct_by(xs, key)`, `min_by(xs, key)`, `max_by(xs, key)`, `sum_by(xs, key)`, `frequencies(xs)` (most common
+first), `compose(f, g, …)` (`compose(f, g)(x)` is `f(g(x))`), `partial(f, args…)`.
 
 ### Science, engineering and medicine
 `special` (special functions), `stats` (distributions, tests, regression, power), `signal` (filters, spectra,
@@ -1571,7 +1617,8 @@ augop       = "+=" | "-=" | "*=" | "/=" | "//=" | "%=" | "**=" | "@=" ;
 
 expr        = "fn" "(" params ")" "=>" expr | pipe ;
 pipe        = ternary { "|>" ternary } ;
-ternary     = or [ "if" or "else" ternary ] ;
+ternary     = coalesce [ "if" coalesce "else" ternary ] ;
+coalesce    = or { "??" or } ;
 or          = and { "or" and } ;
 and         = not { "and" not } ;
 not         = "not" not | comparison ;
@@ -1583,7 +1630,7 @@ term        = unary { ( "*" | "/" | "//" | "%" | "@" ) unary } ;
 unary       = ( "-" | "+" ) unary | plusminus ;
 plusminus   = power [ ( "±" | "+/-" ) power ] ;
 power       = postfix [ ( "**" | "^" ) unary ] ;
-postfix     = primary { "(" args ")" | "[" subscripts "]" | "." NAME } ;
+postfix     = primary { "(" args ")" | "[" subscripts "]" | "." NAME | "?." NAME | "?[" subscripts "]" } ;
 primary     = NUMBER [ unit ] | STRING | FSTRING | NAME | "true" | "false" | "none"
             | "(" [ expr_list ] ")" | "[" list_or_comp "]" | "{" dict_or_comp "}" ;
 args        = [ arg { "," arg } ] ;

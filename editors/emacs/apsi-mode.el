@@ -27,7 +27,7 @@
     ("^\\s-*@\\(?:\\sw\\|\\s_\\|\\.\\)+" . font-lock-preprocessor-face)
     ("\\_<[0-9][0-9_]*\\(?:\\.[0-9_]+\\)?\\(?:[eE][-+]?[0-9]+\\)?\\(\\[[^]\n]*\\]\\|[[:alpha:]µΩÅ]+\\)" 1 font-lock-builtin-face)
     ("\\_<as\\s-*\\(\\[[^]\n]*\\]\\)" 1 font-lock-builtin-face)
-    ("±\\|+/-\\||>" . font-lock-warning-face)))
+    ("±\\|+/-\\||>\\|??\\|\\?\\." . font-lock-warning-face)))
 
 ;;;###autoload
 (define-derived-mode apsi-mode python-mode "Apsi"

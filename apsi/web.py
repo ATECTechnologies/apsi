@@ -22,6 +22,8 @@ import asyncio
 import base64
 import hashlib
 import hmac
+import collections
+import itertools
 import json
 import mimetypes
 import os
@@ -63,6 +65,15 @@ SECURITY_HEADERS = {
 
 
 # =========================================================================== request / response
+_ID_PREFIX = os.urandom(5).hex()
+_ID_COUNT = itertools.count(1)
+
+
+def _next_id():
+    """A request id unique in this process (random per process, then a counter): no system call per request."""
+    return f"{_ID_PREFIX}{next(_ID_COUNT):06x}"
+
+
 class Request:
     __slots__ = ("method", "path", "query", "headers", "body", "params", "client", "id", "started", "user")
 
@@ -70,7 +81,7 @@ class Request:
         self.method, self.path, self.query, self.headers = method, path, query, headers
         self.body, self.client = body, client
         self.params = {}
-        self.id = os.urandom(8).hex()
+        self.id = _next_id()
         self.started = time.perf_counter()
         self.user = None
 
@@ -237,7 +248,7 @@ class Metrics:
         self.requests = 0
         self.errors = 0
         self.by_status = {}
-        self.latencies = []
+        self.latencies = collections.deque(maxlen=10000)
         self.started = time.time()
         self.active = 0
 
@@ -248,8 +259,6 @@ class Metrics:
                 self.errors += 1
             self.by_status[status] = self.by_status.get(status, 0) + 1
             self.latencies.append(seconds)
-            if len(self.latencies) > 10000:
-                self.latencies = self.latencies[-5000:]
 
     def snapshot(self):
         with self.lock:
@@ -299,6 +308,8 @@ class App:
         self._probe = {}                 # route index -> run the next request on the loop to measure it exactly
         self._strikes = {}               # route index -> slow runs on the loop in a row
         self._route_cache = {}
+        self._sec_headers = None
+        self._literal = None             # literal path -> routes without parameters (no regex needed)
         self.rooms = {}
         self._rooms_lock = threading.Lock()
 
@@ -407,6 +418,17 @@ class App:
                 if r is not None:
                     return self._finish(req, _to_response(r))
             allowed = []
+            lit = self._literal
+            if lit is None or lit[0] != len(self.routes):
+                table = {}
+                for route in self.routes:
+                    if not route.converters:
+                        table.setdefault(route.pattern, []).append(route)
+                lit = self._literal = (len(self.routes), table)
+            for route in lit[1].get(req.path, ()):
+                if route.method == req.method or (route.method == "GET" and req.method == "HEAD"):
+                    req.params = {}
+                    return self._finish(req, _to_response(route.handler(req)))
             for route in self.routes:
                 params = route.match(req.path)
                 if params is None:
@@ -484,11 +506,19 @@ class App:
             resp.headers.setdefault("Access-Control-Allow-Methods", "GET, POST, PUT, PATCH, DELETE, OPTIONS")
             resp.headers.setdefault("Access-Control-Allow-Headers", "Content-Type, Authorization")
         if self.security_headers:
-            for k, v in SECURITY_HEADERS.items():
-                resp.headers.setdefault(k, v)
-            if self.tls:
-                resp.headers.setdefault("Strict-Transport-Security", "max-age=63072000; includeSubDomains")
-        resp.headers.setdefault("X-Request-Id", req.id)
+            sec = self._sec_headers
+            if sec is None:
+                sec = dict(SECURITY_HEADERS)
+                if self.tls:
+                    sec["Strict-Transport-Security"] = "max-age=63072000; includeSubDomains"
+                self._sec_headers = sec
+            h = resp.headers
+            merged = sec.copy()                         # defaults first, the handler's own headers win
+            if h:
+                merged.update(h)
+            resp.headers = merged
+        if "X-Request-Id" not in resp.headers:
+            resp.headers["X-Request-Id"] = req.id
         for hook in self.after_hooks:
             try:
                 hook(req, resp)
@@ -524,7 +554,9 @@ class App:
 
     # ------------------------------------------------------------- network server
     def run(self, host="127.0.0.1", port=8080, tls_cert=None, tls_key=None, processes=1, workers=None):
-        """Start serving (blocks). processes > 1 forks workers sharing the port (Linux)."""
+        """Start serving (blocks). processes > 1 forks workers sharing the port (Linux, macOS); processes="auto"
+        uses one per CPU this process may run on. Each process has its own memory: share state through a
+        database, memory.store() or rooms only within one process."""
         if self.interp is not None:
             from .security import check_net
             check_net(self.interp, host, int(port), "app.run() (listening)")
@@ -538,11 +570,19 @@ class App:
             ssl_ctx.load_cert_chain(tls_cert, tls_key)
             ssl_ctx.set_alpn_protocols(["http/1.1"])
             self.tls = True
+        if str(processes).lower() == "auto":
+            try:
+                processes = len(os.sched_getaffinity(0))
+            except (AttributeError, OSError):
+                processes = os.cpu_count() or 1
+            if not hasattr(os, "fork"):
+                processes = 1
         processes = int(processes or 1)
         sock = _bind(host, int(port), reuse_port=processes > 1)
         scheme = "https" if ssl_ctx else "http"
         print(f"{self.name} listening on {scheme}://{host}:{sock.getsockname()[1]}  "
-              f"({processes} process{'es' if processes > 1 else ''} × {self.workers} worker threads)")
+              f"({processes} process{'es' if processes > 1 else ''} × {self.workers} worker threads, "
+              f"{event_loop_name()} event loop)")
         if processes > 1 and hasattr(os, "fork"):
             children = []
             for _ in range(processes - 1):
@@ -583,16 +623,25 @@ class App:
     def stop(self):
         self._stopping = True
         if self._loop is not None and self._server is not None:
-            self._loop.call_soon_threadsafe(self._server.close)
+            def close():
+                self._server.close()
+                task = getattr(self, "_main_task", None)
+                if task is not None and not task.done():
+                    task.cancel()                  # serve_forever ends (uvloop does not end it on close alone)
+            try:
+                self._loop.call_soon_threadsafe(close)
+            except RuntimeError:                   # the loop has already finished
+                pass
 
     def _serve(self, sock, ssl_ctx, ready=None):
-        loop = asyncio.new_event_loop()
+        loop = _new_loop()
         self._loop = loop
         self._executor = ThreadPoolExecutor(max_workers=self.workers, thread_name_prefix=f"{self.name}-w")
         loop.set_default_executor(self._executor)
 
         async def main():
             app = self
+            self._main_task = asyncio.current_task()
             self._server = await loop.create_server(lambda: _HTTPProtocol(app), sock=sock, ssl=ssl_ctx,
                                                     backlog=4096)
             if threading.current_thread().name == "apsi-program":
@@ -733,7 +782,7 @@ class _HTTPProtocol(asyncio.Protocol):
     Fast handlers run inline on the loop — no thread hop — and the app measures every route: a route whose calls
     take more than 2 ms (or that blocks once for longer than 20 ms) moves to the worker threads for good. Pipelined
     requests are answered in order; reading pauses while a request is being handled on a worker."""
-    __slots__ = ("app", "t", "buf", "busy", "client", "timer", "closed", "first", "loop", "requests")
+    __slots__ = ("app", "t", "buf", "busy", "client", "timer", "closed", "first", "loop", "requests", "deadline")
 
     def __init__(self, app):
         self.app = app
@@ -742,6 +791,7 @@ class _HTTPProtocol(asyncio.Protocol):
         self.closed = False
         self.first = True
         self.timer = None
+        self.deadline = 0.0
         self.requests = 0
 
     def connection_made(self, transport):
@@ -764,11 +814,19 @@ class _HTTPProtocol(asyncio.Protocol):
         self._arm(app.header_timeout)
 
     def _arm(self, seconds):
-        if self.timer is not None:
-            self.timer.cancel()
-        self.timer = self.loop.call_later(seconds, self._timeout)
+        """Move the connection's deadline. One timer per connection: it is re-armed only when it fires early,
+        not on every request (scheduling and cancelling a timer per request costs more than the rest)."""
+        self.deadline = self.loop.time() + seconds
+        if self.timer is None:
+            self.timer = self.loop.call_at(self.deadline, self._timeout)
 
     def _timeout(self):
+        self.timer = None
+        if self.closed:
+            return
+        if self.loop.time() < self.deadline - 0.001:
+            self.timer = self.loop.call_at(self.deadline, self._timeout)
+            return
         if not self.closed:
             if self.first or self.buf:
                 self._write(_json_response({"error": "request timeout"}, 408), False)
@@ -841,11 +899,29 @@ class _HTTPProtocol(asyncio.Protocol):
                 self._upgrade(method, path, qs, headers)
                 return
             keep = version == "HTTP/1.1" and headers.get("connection", "").lower() != "close"
-            req = Request(method, unquote(path) if "%2f" not in path.lower() else path, _query(qs), headers, body,
-                          self.client)
+            if "%" in path and "%2f" not in path.lower():
+                path = unquote(path)
+            req = Request(method, path, _query(qs), headers, body, self.client)
             route_key = _route_key(app, req)
             score = app._fast.get(route_key, 0) if route_key is not None else -1
-            if score >= _INLINE_AFTER or (score >= 0 and app._probe.pop(route_key, False)):
+            if score >= _INLINE_AFTER:                         # proven fast: run it here, watch the wall time only
+                t0 = req.started
+                resp = app.dispatch(req)
+                dt = time.perf_counter() - t0
+                if dt > 0.002:                                 # slow this time: three strikes and it moves
+                    strikes = app._strikes.get(route_key, 0) + 1
+                    app._strikes[route_key] = strikes
+                    if strikes >= 3:
+                        app._fast[route_key] = -1_000_000
+                elif dt < 0.0005 and route_key in app._strikes:
+                    app._strikes.pop(route_key, None)
+                self._write(resp, keep, method == "HEAD")
+                if not keep:
+                    self._close()
+                    return
+                self._arm(app.keepalive_timeout)
+                continue
+            if score >= 0 and app._probe.pop(route_key, False):
                 t0, c0 = time.perf_counter(), time.thread_time()
                 resp = app.dispatch(req)
                 dt, cpu = time.perf_counter() - t0, time.thread_time() - c0
@@ -911,17 +987,14 @@ class _HTTPProtocol(asyncio.Protocol):
     def _write(self, resp, keep, head_only=False):
         h = resp.headers
         status = resp.status
-        parts = [f"HTTP/1.1 {status} {STATUS.get(status, 'Status')}\r\nContent-Length: {len(resp.body)}\r\n"
-                 f"Connection: {'keep-alive' if keep else 'close'}\r\n"]
-        if "Server" not in h:
-            parts.append("Server: apsi\r\n")
-        for k, v in h.items():
-            v = str(v)
-            if "\r" in v or "\n" in v:                       # header injection guard
-                continue
-            parts.append(f"{k}: {v}\r\n")
-        parts.append("\r\n")
-        data = "".join(parts).encode("latin-1", "replace")
+        head = f"HTTP/1.1 {status} {STATUS.get(status, 'Status')}\r\nContent-Length: {len(resp.body)}\r\n" \
+               f"{'Connection: keep-alive' if keep else 'Connection: close'}\r\n" \
+               f"{'' if 'Server' in h else 'Server: apsi' + chr(13) + chr(10)}"
+        lines = "".join([f"{k}: {v}\r\n" for k, v in h.items()])
+        if "\n" in lines.replace("\r\n", "") or lines.count("\r") != lines.count("\n"):
+            lines = "".join(f"{k}: {v}\r\n" for k, v in h.items()              # header injection guard
+                            if "\r" not in str(v) and "\n" not in str(v))
+        data = (head + lines + "\r\n").encode("latin-1", "replace")
         self.t.write(data if head_only else data + resp.body)
 
     def _upgrade(self, method, path, qs, headers):
@@ -956,6 +1029,26 @@ class _HTTPProtocol(asyncio.Protocol):
             return
         self._write(_json_response({"error": "not found"}, 404), False)
         self._close()
+
+
+def _new_loop():
+    """uvloop (libuv; about twice the requests per second) when it is installed and APSI_UVLOOP is not 0,
+    otherwise asyncio's own loop."""
+    if os.environ.get("APSI_UVLOOP", "1") != "0" and sys.platform != "win32":
+        try:
+            import uvloop
+            return uvloop.new_event_loop()
+        except ImportError:
+            pass
+    return asyncio.new_event_loop()
+
+
+def event_loop_name():
+    loop = _new_loop()
+    try:
+        return type(loop).__module__.split(".")[0]
+    finally:
+        loop.close()
 
 
 _INLINE_AFTER = 32          # a route runs on the event loop after this many calls that each took < 0.5 ms
@@ -1015,32 +1108,36 @@ def _bind(host, port, reuse_port=False):
 _TOKEN = re.compile(r"^[!#$%&'*+\-.^_`|~0-9A-Za-z]+$")
 
 
+_HDR_BLOCK = re.compile(r"(?:[!#$%&'*+\-.^_`|~0-9A-Za-z]+:[^\r\n]*\r\n)*")
+_HDR_LINE = re.compile(r"([!#$%&'*+\-.^_`|~0-9A-Za-z]+):[ \t]*([^\r\n]*?)[ \t]*\r\n")
+_GUARDED = ("content-length", "host", "transfer-encoding")
+
+
 def _parse_head(head, limit):
+    """Request line and headers. The whole header block is validated by one regular expression (token names,
+    no folded or bare-CR lines) before it is split, which is both strict and fast."""
     if len(head) > limit:
         raise HTTPError(431, "headers too large")
-    try:
-        text = head.decode("latin-1")
-    except UnicodeDecodeError:
-        raise HTTPError(400, "bad header encoding")
-    lines = text.split("\r\n")
-    parts = lines[0].split(" ")
+    text = head.decode("latin-1")
+    i = text.find("\r\n")
+    parts = text[:i].split(" ")
     if len(parts) != 3 or not parts[2].startswith("HTTP/1.") or not _TOKEN.match(parts[0]):
         raise HTTPError(400, "bad request line")
     method, target, version = parts
-    headers = {}
-    for line in lines[1:]:
-        if not line:
-            continue
-        if line[0] in " \t":
+    end = len(text) - 2                                  # the block ends with the empty line
+    if not _HDR_BLOCK.fullmatch(text, i + 2, end):
+        if any(line[:1] in (" ", "\t") for line in text[i + 2:end].split("\r\n")):
             raise HTTPError(400, "obsolete header folding is not allowed")
-        k, sep, v = line.partition(":")
-        if not sep or not _TOKEN.match(k):
-            raise HTTPError(400, "bad header")
-        k = k.lower()
-        if k in headers and k in ("content-length", "host", "transfer-encoding"):
+        raise HTTPError(400, "bad header")
+    headers = {}
+    n = 0
+    for m in _HDR_LINE.finditer(text, i + 2, end):
+        k = m.group(1).lower()
+        if k in headers and k in _GUARDED:
             raise HTTPError(400, f"duplicate {k} header")     # request-smuggling guard
-        headers[k] = v.strip()
-    if len(headers) > 100:
+        headers[k] = m.group(2)
+        n += 1
+    if n > 100:
         raise HTTPError(431, "too many headers")
     return method.upper(), target, version, headers
 
