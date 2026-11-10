@@ -1,4 +1,4 @@
-"""16-bit floats (float16 and bfloat16) in @native and @gpu code: stored in 16 bits, computed in 32 bits.
+"""Small floats in @native and @gpu code: float16, bfloat16 and FP8 (e4m3fn, e5m2), stored small, computed in 32 bits.
 
 Conversions must agree bit for bit with NumPy (float16) and ml_dtypes (bfloat16): every one of the 65,536 16-bit
 patterns is widened, and special values, subnormals, overflow and ties are narrowed.
@@ -150,6 +150,28 @@ class Native16(unittest.TestCase):
         z = self.nat("make_bf16")(8)
         self.assertEqual(z.dtype, BF16)
         self.assertTrue((z.astype(np.float32) == np.arange(8) * 0.25).all())
+
+    @unittest.skipUnless(BF16 is not None, "ml_dtypes is not installed")
+    def test_fp8(self):
+        rng = np.random.default_rng(5)
+        for name in ("float8_e4m3fn", "float8_e5m2"):
+            dt = np.dtype(getattr(ml_dtypes, name))
+            codes = np.arange(256, dtype=np.uint16).astype(np.uint8)
+            x = codes.view(dt)
+            y = np.zeros(256, np.float32)
+            self.nat("copy")(x, y)
+            want = x.astype(np.float32)
+            self.assertTrue(((y == want) | (np.isnan(y) & np.isnan(want))).all(), name)
+            f = np.concatenate([SPECIAL, want[~np.isnan(want)]] +
+                               [rng.standard_normal(40000).astype(np.float32) * s for s in (1e-6, 1e-2, 1, 100, 1e4, 1e6)])
+            mids = (want[~np.isnan(want)][:-1] + want[~np.isnan(want)][1:]) / 2
+            f = np.concatenate([f, mids.astype(np.float32), -f])
+            q = np.zeros(len(f), dt)
+            self.nat("copy")(f, q)
+            ref = f.astype(dt)
+            nan = np.isnan(ref.astype(np.float32))
+            self.assertTrue((q.view(np.uint8)[~nan] == ref.view(np.uint8)[~nan]).all(), name)
+            self.assertTrue(np.isnan(q[nan].astype(np.float32)).all(), name)
 
     def test_gpu_kernels_are_generated(self):
         x = np.zeros(8, np.float16)

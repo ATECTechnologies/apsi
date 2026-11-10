@@ -41,26 +41,34 @@ def dim_of(x):
     return None
 
 
+_ML = {"bf16": "bfloat16", "bfloat16": "bfloat16", "fp8_e4m3": "float8_e4m3fn", "fp8": "float8_e4m3fn",
+       "e4m3": "float8_e4m3fn", "fp8_e5m2": "float8_e5m2", "bf8": "float8_e5m2", "e5m2": "float8_e5m2"}
+
+
 def _np_dtype(dtype):
     if dtype is None:
         return None
     if isinstance(dtype, Dtype):
-        if dtype.np is None and dtype.name in ("bf16", "bfloat16"):
-            return bfloat16()
+        if dtype.np is None and dtype.name in _ML:
+            return ml_dtype(dtype.name)
         return dtype.np
-    if isinstance(dtype, str) and dtype in ("bf16", "bfloat16"):
-        return bfloat16()
+    if isinstance(dtype, str) and dtype in _ML:
+        return ml_dtype(dtype)
     return np.dtype(dtype)
 
 
-def bfloat16():
-    """NumPy's bfloat16 dtype (from the ml_dtypes package, which Apsi installs with its requirements)."""
+def ml_dtype(name):
+    """NumPy dtypes for bfloat16 and the FP8 formats (from ml_dtypes, installed with Apsi's requirements)."""
     try:
         import ml_dtypes
     except ImportError:
-        raise RuntimeErr("bf16 tensors need the ml_dtypes package: pip install ml_dtypes "
-                         "(or use @precision(bf16) / round_to(x, bf16), which work without it)") from None
-    return np.dtype(ml_dtypes.bfloat16)
+        raise RuntimeErr(f"{name} tensors need the ml_dtypes package: pip install ml_dtypes "
+                         f"(or use @precision({name}) / round_to(x, {name}), which work without it)") from None
+    return np.dtype(getattr(ml_dtypes, _ML[name]))
+
+
+def bfloat16():
+    return ml_dtype("bf16")
 
 
 def _arr(x):
