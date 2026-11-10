@@ -148,3 +148,26 @@ see is the one every optimised BLAS has: products are summed in a different orde
 loops in the last bits (relative differences around 1e-16 for float64).
 
 `APSI_IDIOMS=0` turns the recognition off, for example to time the loops themselves.
+
+## Outer loops four at a time (exact SIMD for reductions)
+
+```apsi
+for i in 0..n:
+    var fx = 0.0
+    for j in 0..n:
+        fx += (x[j] - x[i]) * m[j] / d(i, j)
+    ax[i] = fx
+```
+
+The inner loop adds into `fx` one term after another. Vectorising it along `j` would change the order of the
+additions — and so the result — which strict IEEE arithmetic forbids. The outer iterations are independent,
+though, so `@native` code runs **four values of `i` at once**: four accumulators, each receiving exactly the same
+additions in exactly the same order as before. The four lanes are identical instruction streams on different data,
+which LLVM packs into SIMD registers. Results are bit-for-bit identical to the plain loop (the test suite checks
+this); only the speed changes. C compilers call this outer-loop vectorisation.
+
+It applies when the outer loop counts by one, its body is straight-line code around one inner counting loop that
+accumulates into variables declared in the outer body, tensors written in the nest are written only at the outer
+index (`ax[i]`) — or only after the inner loop, like `sums[cluster] += x[i]`, which keeps its original order — and
+only built-in math functions are called. Examples: n-body forces, k-means assignment, matrix-vector products,
+distance matrices. `APSI_JAM=0` turns it off.

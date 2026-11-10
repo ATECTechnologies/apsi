@@ -272,18 +272,34 @@ A `@gpu` function runs its `parallel for` with one GPU thread per iteration.
   and creating tensors are not available inside GPU kernels yet.
 - **Always runs:** without a usable GPU, or for a function outside these rules, the same function runs as native
   code on all CPU cores, with the same results; one note says why.
+- **One thread per element:** when the body of the `parallel for` over rows is a single inner loop whose
+  iterations are independent (`c[i, j] = …`), the two loops become one loop over rows × columns, so a 2048 × 2048
+  result gets 4 million GPU threads instead of 2,048. Nothing to write differently.
+- **CPU or GPU, chosen per call size:** a launch of fewer than 4,096 iterations runs on the CPU (the GPU's fixed
+  costs would dominate). For larger sizes, the first call of each size class (powers of two) is timed on the GPU,
+  the next on the CPU, and later calls use the faster one. Each call runs exactly once, so side effects never
+  repeat. `@gpu("strict")` or `APSI_GPU_AUTO=0` always uses the GPU; `APSI_GPU_MIN=n` changes the threshold.
+- **Matrix products and Tensor Cores:** a `@gpu` function whose loop nest is a matrix product runs as one cuBLAS
+  GEMM when cuBLAS is installed (`pip install nvidia-cublas-cu12`): Tensor Cores with f32 accumulation for f16 and
+  bf16 tensors, SGEMM / DGEMM for f32 / f64. See [Number formats](NUMBERS.md).
+- **Number formats:** f64, f32, f16, bf16, FP8 (E4M3, E5M2) and int8 tensors; 16- and 8-bit values are computed
+  in f32 and rounded once when stored ([Number formats](NUMBERS.md)). `var acc: f32 = 0.0` keeps an accumulator in
+  f32, which consumer GPUs run up to 64× faster than f64.
 - **Data movement:** tensor arguments are copied to GPU memory for each call and written tensors are copied back.
-  This suits work that is large compared with the data (many operations per element). Consumer GPUs compute f32
-  far faster than f64: pass f32 tensors for speed.
-- **Precision:** IEEE f64/f32 arithmetic; `sqrt` is correctly rounded, as on the CPU.
+  This suits work that is large compared with the data (many operations per element).
+- **Precision:** IEEE arithmetic; `sqrt` is correctly rounded, as on the CPU.
 - **Status:** PTX generation, the kernel rules and the CPU path are covered by the test suite. The launch path
   uses the CUDA driver API (`nvcuda.dll` / `libcuda.so.1`) and needs a GPU to run, so it is not exercised by
   continuous integration on GPU-less machines. `apsi native info` and `gpu_info()` show the GPUs Apsi can use;
   `apsi doctor` reports them too.
 
 For training neural networks on the GPU, the PyTorch backend (`fit(…, backend="torch")`, see
-[`BACKENDS.md`](BACKENDS.md)) remains the right tool: it brings cuDNN, tensor cores and mixed precision. `@gpu` is
-for your own loops and kernels.
+[`BACKENDS.md`](BACKENDS.md)) remains the right tool: it brings cuDNN and fused training kernels. `@gpu` is for your
+own loops and kernels, including matrix products on Tensor Cores.
+
+**Other GPU APIs.** `@gpu` targets NVIDIA GPUs through CUDA. Vulkan, DirectX 12 and Metal compute backends (which
+would add AMD, Intel and Apple GPUs) are planned; until then those GPUs are used through the PyTorch backend
+(ROCm, XPU, MPS).
 
 ## Tools and settings
 

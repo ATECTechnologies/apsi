@@ -131,6 +131,10 @@ class Engine:
         self.llvm = llvm
         llvm.initialize_native_target()
         llvm.initialize_native_asmprinter()
+        try:
+            llvm.initialize_native_asmparser()      # inline assembly (the ARM64 spin-wait hint) needs the parser
+        except Exception:                           # noqa: BLE001 - older llvmlite: x86 needs no parser
+            pass
         self.llvm_version = ".".join(map(str, llvm.llvm_version_info))
         self.llvmlite_version = llvmlite.__version__
         self.triple = llvm.get_process_triple()
@@ -223,7 +227,7 @@ class Engine:
         if self.triple.startswith(("x86_64", "i686", "i386")):
             pause_decl, pause = "declare void @llvm.x86.sse2.pause()", "call void @llvm.x86.sse2.pause()"
         elif self.triple.startswith(("aarch64", "arm64")):
-            pause_decl, pause = "", 'call void asm sideeffect "yield", ""()'
+            pause_decl, pause = "declare void @llvm.aarch64.hint(i32)", "call void @llvm.aarch64.hint(i32 1)"
         else:
             pause_decl, pause = "", ""
         ir_text = r"""

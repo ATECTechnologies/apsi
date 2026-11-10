@@ -1,3 +1,3 @@
 numpy>=1.26
-llvmlite>=0.43
+llvmlite>=0.43; sys_platform != "darwin" or platform_machine != "x86_64"
 ml_dtypes>=0.5
