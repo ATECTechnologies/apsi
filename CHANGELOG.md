@@ -63,7 +63,7 @@
   nearest, ties to even) when stored; the conversions are bit-identical to NumPy and ml_dtypes for every 16-bit
   and 8-bit pattern and work the same on every CPU and GPU. `var acc: f32 = 0.0` types a scalar's precision;
   `zeros(n, dtype=bf16)` and `dtype=fp8_e4m3` create real tensors (ml_dtypes). `docs/NUMBERS.md`.
-- **GPU.** One thread per element for row loops with an independent inner loop (collapse); fewer than 4,096
+- **GPU.** `to_gpu(x)` keeps tensors in GPU memory between calls (no copy per call; `to_host` brings them back). One thread per element for row loops with an independent inner loop (collapse); fewer than 4,096
   iterations run on the CPU and larger sizes are timed once on each and then use the faster; matrix-product loop
   nests run as one cuBLAS GEMM when cuBLAS is installed (Tensor Cores with f32 accumulation for f16/bf16).
 - **Exact outer-loop vectorisation.** Independent outer iterations with a reduction along the inner loop run four

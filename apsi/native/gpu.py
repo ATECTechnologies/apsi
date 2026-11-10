@@ -68,6 +68,92 @@ def _gwrap(f, opts):
     return GpuFunction(f, opts)
 
 
+class GpuArray:
+    """A tensor that stays in GPU memory between @gpu calls: to_gpu(x). Kernels read and write it in place, with no
+    copy over PCIe per call; to_host(g) (or g.numpy()) copies it back when you need the values. If a call runs on
+    the CPU instead (no GPU, small launch), the data moves once and the copy that is out of date is refreshed lazily.
+    """
+
+    def __init__(self, host, device=None):
+        from . import cuda
+        self.ptr = 0
+        drv = cuda.driver()
+        if drv is None:
+            raise RuntimeErr(f"to_gpu(): {cuda.unavailable_reason()}")
+        arr = np.ascontiguousarray(_raw(host))
+        if _key_of(arr) is None:
+            raise RuntimeErr(f"to_gpu(): a {arr.dtype} tensor cannot be used in GPU kernels")
+        self.host = arr.copy() if arr is _raw(host) else arr
+        self.dev = drv.devices[int(device or 0)]
+        self.dev.activate()
+        self.ptr = self.dev.alloc(self.host.nbytes)
+        self.dev.to_device(self.ptr, self.host.ctypes.data, self.host.nbytes)
+        self.host_ok, self.dev_ok = True, True
+
+    shape = property(lambda self: self.host.shape)
+    dtype = property(lambda self: self.host.dtype)
+    nbytes = property(lambda self: self.host.nbytes)
+
+    def device_ptr(self):
+        if not self.dev_ok:
+            self.dev.activate()
+            self.dev.to_device(self.ptr, self.host.ctypes.data, self.host.nbytes)
+            self.dev_ok = True
+        return self.ptr
+
+    def numpy(self):
+        """The values on the host (copied from the GPU when the GPU has newer ones)."""
+        if not self.host_ok:
+            self.dev.activate()
+            self.dev.sync()
+            self.dev.to_host(self.host.ctypes.data, self.ptr, self.host.nbytes)
+            self.host_ok = True
+        return self.host
+
+    def written_on_gpu(self):
+        self.host_ok = False
+
+    def written_on_host(self):
+        self.dev_ok = False
+
+    def free(self):
+        if getattr(self, "ptr", 0):
+            try:
+                self.dev.activate()
+                self.dev.free(self.ptr)
+            except Exception:                              # noqa: BLE001 - driver already gone at exit
+                pass
+            self.ptr = 0
+
+    __del__ = free
+
+    def __repr__(self):
+        return f"<gpu tensor {self.shape} {self.dtype} on {self.dev.name}>"
+
+
+def to_gpu(x, device=0):
+    """Keep a tensor in GPU memory between @gpu calls (see GpuArray). Without a GPU the tensor itself is returned,
+    so the same program runs everywhere."""
+    if isinstance(x, GpuArray):
+        return x
+    from . import cuda
+    try:
+        if cuda.driver() is None:
+            return x
+    except Exception:                                      # noqa: BLE001
+        return x
+    return GpuArray(x, device)
+
+
+def to_host(x):
+    """The values of a GPU tensor as an ordinary tensor (a copy); other values unchanged."""
+    return x.numpy().copy() if isinstance(x, GpuArray) else x
+
+
+def _host_args(args):
+    return tuple(a.numpy() if isinstance(a, GpuArray) else a for a in args)
+
+
 # Automatic CPU/GPU choice for small launches (off with APSI_GPU_AUTO=0; @gpu("strict") always uses the GPU).
 AUTO = os.environ.get("APSI_GPU_AUTO", "1") != "0"
 MIN_TRIPS = int(os.environ.get("APSI_GPU_MIN", "4096"))     # fewer iterations than this: the CPU, without trying
@@ -102,11 +188,12 @@ class GpuFunction:
             if bound is None:
                 return self.cpu(*args, **kwargs)
             args = bound
+        on_gpu = [a for a in args if isinstance(a, GpuArray)]
         key = []
         for a in args:
-            tv = _key_of(a)
+            tv = _key_of(a.host if isinstance(a, GpuArray) else a)
             if tv is None:
-                return self.cpu(*args)
+                return self._on_cpu(args, on_gpu)
             key.append(tv)
         key = tuple(key)
         plan = self.plans.get(key)
@@ -114,18 +201,20 @@ class GpuFunction:
             plan = self._plan(key)
         if isinstance(plan, _Fallback):
             STATS["cpu_calls"] += 1
-            return self.cpu(*args)
-        r = plan.ranger(*args)
+            return self._on_cpu(args, on_gpu)
+        r = plan.ranger(*plan.range_args(args))
         if not self.options.get("strict") and AUTO:
             # Small launches: the GPU's fixed costs (launch, copies) can exceed the work. Per size class (powers of
             # two of the iteration count) the first call runs on the GPU and the next on the CPU, both timed; later
             # calls of that size use whichever was faster. Each call runs once, so side effects never repeat.
             trips = plan.trips(r)
-            if trips < MIN_TRIPS:
+            if trips < MIN_TRIPS and not on_gpu:
                 STATS["cpu_calls"] += 1
                 return self.cpu(*args)
             bucket = trips.bit_length()
             seen = plan.timing.setdefault(bucket, [None, None])      # [gpu seconds, cpu seconds]
+            if on_gpu:
+                seen = [None, None]           # data already on the GPU: moving it to the CPU is never cheaper
             if seen[0] is not None and seen[1] is None:
                 t = time.perf_counter()
                 out = self.cpu(*args)
@@ -143,6 +232,12 @@ class GpuFunction:
             return out
         STATS["gpu_calls"] += 1
         return plan.run(args, r)
+
+    def _on_cpu(self, args, on_gpu):
+        out = self.cpu(*_host_args(args))
+        for a in on_gpu:                       # the CPU may have changed them: refresh the GPU copy when next needed
+            a.written_on_host()
+        return out
 
     def _plan(self, key):
         from . import cuda
@@ -474,6 +569,40 @@ class GpuPlan:
         except Exception:                                  # noqa: BLE001 - no cuBLAS path; the kernel runs
             return None
 
+    def _run_blas_resident(self, a, b, c, g, elem, M, N, K):
+        """cuBLAS with some operands already on the GPU: only host operands are copied."""
+        from . import cublas
+        d = self.devices[0]
+        d.activate()
+        tmp, ptrs = [], []
+        try:
+            for x in (a, b, c):
+                if isinstance(x, GpuArray):
+                    ptrs.append((x.device_ptr(), x.host.shape[1]))
+                else:
+                    dense = np.ascontiguousarray(x)
+                    p = d.alloc(dense.nbytes)
+                    tmp.append((p, dense, x))
+                    d.to_device(p, dense.ctypes.data, dense.nbytes)
+                    ptrs.append((p, dense.shape[1]))
+            if isinstance(c, GpuArray) and (c.ptr in (ptrs[0][0], ptrs[1][0])):
+                return False
+            cublas.gemm(d, elem, g.mode == 0, M, N, K, ptrs[0][0], ptrs[0][1], ptrs[1][0], ptrs[1][1],
+                        ptrs[2][0], ptrs[2][1])
+            if isinstance(c, GpuArray):
+                c.written_on_gpu()
+            else:
+                d.sync()
+                p, dense, orig = tmp[-1]
+                d.to_host(dense.ctypes.data, p, dense.nbytes)
+                if dense is not orig:
+                    orig[...] = dense
+        finally:
+            for p, _, _ in tmp:
+                d.free(p)
+        STATS["blas_calls"] = STATS.get("blas_calls", 0) + 1
+        return True
+
     def _run_blas(self, args):
         """c (+)= a @ b with cuBLAS; False when this call cannot use it (nothing changed)."""
         from . import cublas
@@ -481,9 +610,18 @@ class GpuPlan:
         if cublas.library() is None:
             return False
         a, b, c = (_raw(args[k]) for k in pos)
-        if not all(isinstance(x, np.ndarray) for x in (a, b, c)):
+        if not all(isinstance(x, (np.ndarray, GpuArray)) for x in (a, b, c)):
             return False
-        M, N, K = (int(v) for v in dims(*args))
+        res = [x for x in (a, b, c) if isinstance(x, GpuArray)]
+        if res and any(x.dev is not self.devices[0] for x in res):
+            return False
+        M, N, K = (int(v) for v in dims(*self.range_args(args)))
+        shp = [x.shape for x in (a, b, c)]
+        if min(M, N, K) <= 0 or M > shp[0][0] or K > shp[0][1] or K > shp[1][0] or N > shp[1][1] \
+                or M > shp[2][0] or N > shp[2][1]:
+            return False
+        if res:
+            return self._run_blas_resident(a, b, c, g, elem, M, N, K)
         if min(M, N, K) <= 0 or M > a.shape[0] or K > a.shape[1] or K > b.shape[0] or N > b.shape[1] \
                 or M > c.shape[0] or N > c.shape[1] or np.may_share_memory(c, a) or np.may_share_memory(c, b):
             return False
@@ -518,6 +656,22 @@ class GpuPlan:
                 return n.targets[key[2]]
         return None
 
+    def range_args(self, args):
+        """Arguments for the host-side helpers (loop bounds, matrix sizes): GPU tensors by their host copy, which
+        has the right shape; refreshed from the GPU only if the bounds read tensor values."""
+        if not any(isinstance(a, GpuArray) for a in args):
+            return args
+        reads = getattr(self, "_reads", None)
+        if reads is None:
+            prelude, loop, _ = kernel_shape(self.gf.gpu_fndef)
+            reads = set()
+            for n in _walk(list(prelude) + [loop.iter]):
+                if isinstance(n, A.Index) and isinstance(n.obj, A.Name):
+                    reads.add(n.obj.id)
+            self._reads = reads
+        return tuple((a.numpy() if p in reads else a.host) if isinstance(a, GpuArray) else a
+                     for a, p in zip(args, self.params))
+
     def trips(self, r):
         start, stop, step = (int(x) for x in r[:3])
         if step == 0:
@@ -534,7 +688,7 @@ class GpuPlan:
                 _REPORTS.append((self.gf.name, "cuBLAS: " + str(e)))
                 self.blas = None
         if r is None:
-            r = self.ranger(*args)
+            r = self.ranger(*self.range_args(args))
         start, stop, step = (int(x) for x in r[:3])
         init = r[3 + self.n_extra] if self.ret_name else None
         unit = 1                                      # iterations per row of the written tensors
@@ -550,7 +704,10 @@ class GpuPlan:
         split = len(devs) > 1 and start == 0 and step == 1 and unit > 0 and all(
             self.written.get(n, True) for n, a in zip(self.params, args) if isinstance(_raw(a), np.ndarray)
             and n in self.written)
-        if not split or trips < 2 * BLOCK * len(devs):
+        resident = [_raw(a) for a in args if isinstance(_raw(a), GpuArray)]
+        if resident:                                   # tensors kept on a GPU: run there
+            devs = [resident[0].dev]
+        elif not split or trips < 2 * BLOCK * len(devs):
             devs = devs[:1]
         parts = []
         rows = trips // unit if unit > 0 else trips
@@ -564,7 +721,13 @@ class GpuPlan:
         hosts = []
         for a in args:
             raw = _raw(a)
-            if isinstance(raw, np.ndarray):
+            if isinstance(raw, GpuArray):
+                if raw.dev is not devs[0]:
+                    raw = raw.numpy()                  # on another GPU: through the host this once
+                    hosts.append((raw, np.ascontiguousarray(raw)))
+                else:
+                    hosts.append((raw, "gpu"))
+            elif isinstance(raw, np.ndarray):
                 dense = np.ascontiguousarray(raw)
                 hosts.append((raw, dense))
             else:
@@ -583,6 +746,10 @@ class GpuPlan:
                             slots.append(ctypes.c_int64.from_buffer(ctypes.c_double(float(raw))).value)
                         else:
                             slots.append(int(raw))
+                        continue
+                    if isinstance(dense, str):                     # already in this GPU's memory
+                        h = raw.host
+                        slots += [raw.device_ptr(), 0] + list(h.shape) + [s // h.itemsize for s in h.strides]
                         continue
                     dp = d.alloc(dense.nbytes)
                     bufs.append(dp)
@@ -626,6 +793,10 @@ class GpuPlan:
                 for (t, _), (raw, dense), name in zip(self.key, hosts, self.params):
                     if dense is None:
                         continue
+                    if isinstance(dense, str):
+                        if name in self.written:
+                            raw.written_on_gpu()               # the values stay on the GPU
+                        continue
                     dp = bufs[bi]
                     bi += 1
                     if name not in self.written:
@@ -642,7 +813,7 @@ class GpuPlan:
                 for p in bufs:
                     d.free(p)
         for (raw, dense), name in zip(hosts, self.params):
-            if dense is not None and dense is not raw and name in self.written:
+            if dense is not None and not isinstance(dense, str) and dense is not raw and name in self.written:
                 raw[...] = dense
         if self.ret_name is None:
             return None

@@ -1190,6 +1190,18 @@ def _gpu(*args, **kwargs):
     return gpu(*args, **kwargs)
 
 
+def _to_gpu(x, device=0):
+    """Keep a tensor in GPU memory between @gpu calls: no copy per call. to_host(g) brings the values back."""
+    from .native.gpu import to_gpu
+    return to_gpu(x, device)
+
+
+def _to_host(x):
+    """The values of a GPU tensor (to_gpu) as an ordinary tensor."""
+    from .native.gpu import to_host
+    return to_host(x)
+
+
 def _gpu_info():
     """The GPUs Apsi can use (needs the NVIDIA driver; no CUDA toolkit)."""
     from .native.gpu import info
@@ -1249,7 +1261,7 @@ def core_builtins():
         "print": _print, "str": _str, "int": _int, "float": _float, "bool": bool,
         "len": _len, "range": _range, "type": type_name, "error": _error,
         "native": _native, "native_threads": _native_threads, "native_info": _native_info,
-        "gpu": _gpu, "gpu_info": _gpu_info,
+        "gpu": _gpu, "gpu_info": _gpu_info, "to_gpu": _to_gpu, "to_host": _to_host,
         "list": _list, "pmap": _pmap, "unique": _unique, "chars": _chars, "join": _join, "map": _map, "filter": _filter, "enumerate": _enumerate, "zip": _zip,
         "sorted": _sorted, "reversed": _reversed, "keys": _keys, "record": _record,
         **_python_compat(),

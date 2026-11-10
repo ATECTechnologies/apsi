@@ -285,8 +285,10 @@ A `@gpu` function runs its `parallel for` with one GPU thread per iteration.
 - **Number formats:** f64, f32, f16, bf16, FP8 (E4M3, E5M2) and int8 tensors; 16- and 8-bit values are computed
   in f32 and rounded once when stored ([Number formats](NUMBERS.md)). `var acc: f32 = 0.0` keeps an accumulator in
   f32, which consumer GPUs run up to 64× faster than f64.
-- **Data movement:** tensor arguments are copied to GPU memory for each call and written tensors are copied back.
-  This suits work that is large compared with the data (many operations per element).
+- **Data movement:** ordinary tensor arguments are copied to GPU memory for each call and written tensors are
+  copied back. `to_gpu(x)` keeps a tensor in GPU memory instead: kernels read and write it in place, with no copy
+  per call, and `to_host(g)` brings the values back when you need them. Without a GPU, `to_gpu` returns the tensor
+  itself, so the program runs everywhere.
 - **Precision:** IEEE arithmetic; `sqrt` is correctly rounded, as on the CPU.
 - **Status:** PTX generation, the kernel rules and the CPU path are covered by the test suite. The launch path
   uses the CUDA driver API (`nvcuda.dll` / `libcuda.so.1`) and needs a GPU to run, so it is not exercised by

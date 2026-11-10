@@ -213,6 +213,29 @@ class RealGpu(unittest.TestCase):
             self.g("saxpy")(2.0, x, y)
             self.assertTrue(np.allclose(y.astype(np.float32), 2 * x.astype(np.float32) + 1, rtol=tol))
 
+    def test_tensors_kept_on_the_gpu(self):
+        """to_gpu(): no copy per call; the values come back with to_host() / .numpy()."""
+        from apsi.native.gpu import to_gpu, to_host
+        n = 20_000_000
+        x = np.linspace(0, 1, n).astype(np.float32)
+        f = self.g("saxpy")
+        gx, gy = to_gpu(x), to_gpu(np.zeros(n, np.float32))
+        f(1.0, gx, gy)                                          # compile and warm up
+        t = time.perf_counter()
+        for _ in range(20):
+            f(1.0, gx, gy)
+        resident = time.perf_counter() - t
+        y = to_host(gy)
+        self.assertTrue(np.allclose(y, 21 * x, rtol=1e-5))
+        hy = np.zeros(n, np.float32)
+        t = time.perf_counter()
+        for _ in range(20):
+            f(1.0, x, hy)
+        copied = time.perf_counter() - t
+        print(f"  20 x saxpy of {n:,}: kept on the GPU {resident * 1000:.0f} ms, copied every call "
+              f"{copied * 1000:.0f} ms", file=sys.stderr)
+        self.assertLess(resident, copied)
+
     def test_cublas_tensor_cores(self):
         """Matrix-product loop nests run as one cuBLAS GEMM when cuBLAS is installed (Tensor Cores for f16/bf16)."""
         from apsi.native import cublas

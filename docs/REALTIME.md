@@ -125,3 +125,21 @@ rt.backend("auto")   # GPU only for frames large enough to beat the copy to the 
 
 Frame helpers: `gray`, `resize`, `downsample`, `diff`, `motion`, `ema`, `box_blur`, `threshold`, `edges`,
 `fps_meter`.
+
+### Your own per-pixel kernels
+
+Anything the helpers do not cover, write as a `@gpu` function: one GPU thread per pixel, and on a machine without
+an NVIDIA GPU the same function runs as native code on all CPU cores. Keep output buffers in GPU memory with
+`to_gpu` so frames do not travel back and forth (`examples/43_gpu_video.apsi`):
+
+```apsi
+@gpu
+fn brightness_mask(frame, out, level: Float):
+    parallel for y in 0..frame.shape[0]:            # rows x columns: one thread per pixel
+        for x in 0..frame.shape[1]:
+            let v = 0.299 * frame[y, x, 0] + 0.587 * frame[y, x, 1] + 0.114 * frame[y, x, 2]
+            out[y, x] = 1.0 if v > level else 0.0
+
+let out = to_gpu(zeros(1080, 1920, dtype=f32))
+rt.video(rt.camera(0, "fhd"), fn(frame, info) => brightness_mask(frame, out, 128.0), fps=60)
+```
