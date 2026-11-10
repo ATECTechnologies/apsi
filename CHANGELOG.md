@@ -119,11 +119,6 @@
   lexer and parser, the Guard scan 3× faster, a signed "checked clean" marker so unchanged programs are not checked
   again).
 
-## 2.0.0 — native machine code, all CPU cores and NVIDIA GPUs
-
-Apsi 2.0 replaces "everything runs on the Python VM" with a native compiler. Python stays where it helps (the
-tooling, libraries, the rest of the language), while numeric code runs as machine code built through LLVM.
-
 ### Faster web server
 - Less work per request (request ids without a system call, merged security headers, literal routes without a
   regular expression, one timer per connection, one-regex header validation, fast routes timed by the wall clock
@@ -161,6 +156,11 @@ tooling, libraries, the rest of the language), while numeric code runs as machin
   rounds; the native cache now also depends on `APSI_SLP`. From the start of this work to the release, on one
   EPYC 7763: n-body 4.0×, ODE 1.5×, k-means 1.27×, compiling 1.21× faster, nothing slower
   (`benchmarks/commits/results-2.4.4.md`).
+
+## 2.0.0 — native machine code, all CPU cores and NVIDIA GPUs
+
+Apsi 2.0 replaces "everything runs on the Python VM" with a native compiler. Python stays where it helps (the
+tooling, libraries, the rest of the language), while numeric code runs as machine code built through LLVM.
 
 ### Python compatibility — write Apsi the way you write Python
 - **Exceptions:** `try / except Kind, Other as e / else / finally` and `raise` (with Python's kind names; errors Apsi

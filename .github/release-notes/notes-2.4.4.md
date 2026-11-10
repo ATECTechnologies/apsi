@@ -117,3 +117,41 @@
   lexer and parser, the Guard scan 3× faster, a signed "checked clean" marker so unchanged programs are not checked
   again).
 
+### Faster web server
+- Less work per request (request ids without a system call, merged security headers, literal routes without a
+  regular expression, one timer per connection, one-regex header validation, fast routes timed by the wall clock
+  only): 19,200 → 22,400 requests/s per process on a 2-vCPU VM.
+- uvloop when installed (`pip install "apsi[web]"`); `app.run(processes="auto")`; `stop()` also ends uvloop's
+  `serve_forever`. Synthetic test on a 4-vCPU EPYC 7763: 1 process 14,600–15,700 req/s, `processes="auto"`
+  38,800–41,500, Node.js 22 (bare `http`, one process) 23,400–24,100.
+
+### Syntax and library
+- `a ?? b`, `a?.b`, `a?.f(x)`, `a?[i]` in both engines, the checker, the formatter and the editor grammars.
+- `use collections`: `Counter`, `DefaultDict`, `Deque`, `Heap`, `LRUCache`, `OrderedSet`, `BiMap`; built-in
+  `first`, `last`, `partition`, `take_while`, `drop_while`, `scan`, `fold`, `flat_map`, `zip_longest`, `interleave`,
+  `distinct_by`, `min_by`, `max_by`, `sum_by`, `frequencies`, `compose`, `partial` (`tests/test_new_syntax.py`).
+
+### Smarter memory (`use memory`)
+- Container-aware: the memory cgroup's limit (v1 and v2) is used when it is smaller than the machine's, for the
+  budget, `array()`, `status()` and the new `limits()`.
+- `pressure()` (ok / moderate / high / critical, from free memory and Linux PSI); under high pressure big arrays go
+  to the SSD and stores and pools give RAM back by themselves; `relieve()`; `on_pressure(fn)` watcher.
+- `pool()`: reusable buffers for big temporaries (`take` / `give`), 1.36× faster for 256 MB temporaries.
+- `chunks()` and `map()` stream memory-mapped files with flat memory (3 GB file: peak RSS 3,103 → 97 MB, same speed),
+  with kernel read-ahead; `chunks()` of arrays in RAM returns views.
+- Stores keep a running SSD total: `set` no longer lists the folder (8.6 → 0.07 ms per `set` at 8,000 entries).
+- `report()`: every array from `array()`, its size and whether it is in RAM or on the SSD.
+
+### Speed on every processor
+- The jammed lanes of an outer loop (n-body forces, matrix-vector products, distances) are emitted as SIMD vector
+  instructions by Apsi itself instead of relying on LLVM's SLP vectoriser, which with LLVM 22 failed on AVX2
+  processors: n-body 127.5 → 46.0 ms on an EPYC 7763 (gcc -O3: 44.2 ms); results bit-for-bit unchanged (`tests/test_jam.py`).
+- `@native("fma")`: checks on, `a * b + c` may fuse into one instruction (gcc's default for C); ODE benchmark
+  440 → 288 ms (gcc -O3: 387 ms).
+- `@gpu` CPU/GPU choice: the first GPU launch (kernel loading) is no longer counted, and the losing side is timed
+  again every 64 calls (`tests/test_gpu_choice.py`).
+- `benchmarks/commits/measure.py` and the `commits` workflow measure several commits on one machine, in rotating
+  rounds; the native cache now also depends on `APSI_SLP`. From the start of this work to the release, on one
+  EPYC 7763: n-body 4.0×, ODE 1.5×, k-means 1.27×, compiling 1.21× faster, nothing slower
+  (`benchmarks/commits/results-2.4.4.md`).
+
