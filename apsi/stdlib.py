@@ -268,6 +268,11 @@ def _platform():
 
 
 def _str(x):
+    t = type(x)
+    if t is int:
+        return str(x)
+    if t is str:
+        return x
     return fmt(x)
 
 

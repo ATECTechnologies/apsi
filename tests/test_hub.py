@@ -5,6 +5,8 @@ import hashlib
 import http.server
 import json
 import os
+import pathlib
+import sys
 import tempfile
 import threading
 import unittest
@@ -75,6 +77,7 @@ class Tokenizers(unittest.TestCase):
 class FakeHub(http.server.BaseHTTPRequestHandler):
     files = {}
     seen_auth = []
+    ranges = []
 
     def log_message(self, *a):
         pass
@@ -105,9 +108,11 @@ class FakeHub(http.server.BaseHTTPRequestHandler):
             data = self.files[self.path[len("/storage/"):]]
             rng = self.headers.get("Range")
             if rng:
-                start = int(rng.split("=")[1].split("-")[0])
-                return self.reply(206, data[start:], {"Content-Range": f"bytes {start}-{len(data) - 1}/{len(data)}"},
-                                  head)
+                lo, _, hi = rng.split("=")[1].partition("-")
+                start, end = int(lo), (int(hi) if hi else len(data) - 1)
+                FakeHub.ranges.append((start, end))
+                return self.reply(206, data[start:end + 1],
+                                  {"Content-Range": f"bytes {start}-{end}/{len(data)}"}, head)
             return self.reply(200, data, {}, head)
         self.reply(404, b"", {}, head)
 
@@ -160,6 +165,103 @@ class Downloads(unittest.TestCase):
         finally:
             m["offline"](False)
             m["logout"]()
+
+    def test_model_starts_from_cache_without_network(self):
+        import importlib
+        sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+        tiny_llama = importlib.import_module("test_hub_models").tiny_llama
+        saved = dict(FakeHub.files)
+        with tempfile.TemporaryDirectory() as src, tempfile.TemporaryDirectory() as cache:
+            tiny_llama(src, "qwen2")
+            FakeHub.files = {n: pathlib.Path(src, n).read_bytes() for n in os.listdir(src)}
+            old_cache = os.environ.get("APSI_HUB_CACHE")
+            os.environ["APSI_HUB_CACHE"] = cache
+            try:
+                m = H.module()
+                n0 = len(FakeHub.seen_auth)
+                a = m["model"]("me/tiny", device="cpu")
+                self.assertGreater(len(FakeHub.seen_auth), n0)          # the first start downloads
+                n1 = len(FakeHub.seen_auth)
+                b = m["model"]("me/tiny", device="cpu")
+                self.assertEqual(len(FakeHub.seen_auth), n1)            # the second start asks nothing
+                self.assertEqual(a.folder, b.folder)
+                H.ENDPOINT = "http://127.0.0.1:9"                       # no connection, even when asked to update
+                c = m["model"]("me/tiny", device="cpu", update=True)
+                self.assertEqual(c.folder, a.folder)
+                self.assertEqual(c.generate("hello", max_new_tokens=3), a.generate("hello", max_new_tokens=3))
+            finally:
+                H.ENDPOINT = f"http://127.0.0.1:{self.srv.server_address[1]}"
+                FakeHub.files = saved
+                if old_cache is None:
+                    os.environ.pop("APSI_HUB_CACHE", None)
+                else:
+                    os.environ["APSI_HUB_CACHE"] = old_cache
+
+    def test_large_file_over_several_connections_and_resume(self):
+        old = (H.PARALLEL_MIN, H.CHUNK)
+        H.PARALLEL_MIN, H.CHUNK = 100_000, 40_000
+        data = os.urandom(450_000)
+        FakeHub.files["big.bin"] = data
+        try:
+            name = os.path.join(self.td.name, "models", "me--tiny", "abc123", "big.bin")
+            os.makedirs(os.path.dirname(name), exist_ok=True)
+            with open(name + ".part", "wb") as fh:          # an earlier one-connection download got 100 kB
+                fh.write(data[:100_000])
+            FakeHub.ranges.clear()
+            p = H.module()["download"]("me/tiny", "big.bin", progress=False)
+            with open(p, "rb") as fh:
+                self.assertEqual(fh.read(), data)
+            self.assertGreater(len(FakeHub.ranges), 5)              # many pieces ...
+            self.assertTrue(all(a >= 80_000 for a, _ in FakeHub.ranges))   # ... none of the 2 already there
+            self.assertFalse(os.path.exists(name + ".part.ranges"))
+            # a corrupted piece: the whole file is refused
+            os.remove(p)
+            orig = FakeHub.route
+
+            def tamper(self, head):
+                if self.path == "/storage/big.bin" and not head and "bytes=40000" in str(self.headers.get("Range")):
+                    return self.reply(206, b"x" * 40_000, {}, head)
+                return orig(self, head)
+            FakeHub.route = tamper
+            try:
+                with self.assertRaises(H.HubError):
+                    H.module()["download"]("me/tiny", "big.bin", progress=False)
+            finally:
+                FakeHub.route = orig
+        finally:
+            H.PARALLEL_MIN, H.CHUNK = old
+            FakeHub.files.pop("big.bin", None)
+
+    def test_broken_connection_is_resumed(self):
+        data = os.urandom(200_000)
+        FakeHub.files["cut.bin"] = data
+        orig = FakeHub.route
+        cuts = [0]
+
+        def cut(self, head):
+            if self.path == "/storage/cut.bin" and not head and cuts[0] < 2:
+                cuts[0] += 1                                # the server hangs up part way, twice
+                start = int((self.headers.get("Range") or "bytes=0-").split("=")[1].split("-")[0])
+                self.send_response(206 if start else 200)
+                self.send_header("Content-Length", str(len(data) - start))
+                self.end_headers()
+                self.wfile.write(data[start:start + 50_000])
+                self.wfile.flush()
+                self.close_connection = True
+                return
+            return orig(self, head)
+        FakeHub.route = cut
+        old = H.time.sleep
+        H.time.sleep = lambda s: None
+        try:
+            p = H.module()["download"]("me/tiny", "cut.bin", progress=False)
+            with open(p, "rb") as fh:
+                self.assertEqual(fh.read(), data)
+            self.assertEqual(cuts[0], 2)
+        finally:
+            FakeHub.route = orig
+            H.time.sleep = old
+            FakeHub.files.pop("cut.bin", None)
 
     def test_corrupt_download_is_rejected(self):
         good = FakeHub.files["weights.bin"]

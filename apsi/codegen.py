@@ -289,7 +289,11 @@ class CodeGen:
             self.emit(" = ".join(self.pytarget(x, scope) for x in targets) + f" = {val}")
             return
         if isinstance(t, A.Attr):
-            self.emit(f"{HELPER_PREFIX}setattr({self.expr(t.obj, scope)}, {t.name!r}, {val})")
+            direct = self._self_attr(t, scope)
+            if direct:
+                self.emit(f"{direct} = {val}")
+            else:
+                self.emit(f"{HELPER_PREFIX}setattr({self.expr(t.obj, scope)}, {t.name!r}, {val})")
         elif isinstance(t, A.Index):
             self.emit(f"{HELPER_PREFIX}setidx({self.expr(t.obj, scope)}, {self.index(t.index, scope)}, {val})")
         elif isinstance(t, A.TupleLit) and any(not isinstance(x, A.Name) for x in t.items):
@@ -668,6 +672,8 @@ class CodeGen:
         b = self.declare(cscope, f.name, kind="fn", exact=True)
         ctx = FuncCtx(cscope.ctx.parent, "fn", erased=False, exact=cscope.ctx.exact, name=f.name)
         ctx.mangle_as = cscope.ctx.name
+        if not f.decorators and f.params and f.params[0].name and f.params[0].star is None:
+            ctx.self_param = f.params[0].name          # self.x in this method: a plain attribute of an instance
         # the body sees the scope around the class, not the class body (Python's rule)
         outer = cscope.parent
         self._pyfunction(b.py, f, Scope(outer, ctx), ctx)
@@ -1172,8 +1178,25 @@ class CodeGen:
             if obj[:1].isdigit():
                 obj = f"({obj})"                                 # 1024.to_bytes would lex as a float
             return f"{obj}.{_pyattr(name)}"
+        direct = self._self_attr(e, scope)
+        if direct:
+            return direct
         code = f"{HELPER_PREFIX}attr({self.expr(e.obj, scope)}, {e.name!r})"
         return f"{HELPER_PREFIX}S({code})" if scope.ctx.erased else code
+
+    def _self_attr(self, e, scope):
+        """`self.name` inside a method of an Apsi class: Python's own attribute access (the instance is an
+        ordinary object, the name public), with no helper call in between."""
+        name = e.name
+        if scope.ctx.erased or not isinstance(e.obj, A.Name) or getattr(scope.ctx, "self_param", None) != e.obj.id:
+            return None
+        if name.startswith("_") or name in _RISKY_ATTRS or name in ("shape", "tofile", "dump") or \
+                keyword.iskeyword(name) or not name.isidentifier():
+            return None
+        b = scope.lookup(e.obj.id)
+        if b is None or b.kind != "param" or b.ctx is not scope.ctx or b.mutable:
+            return None
+        return f"{b.py}.{name}"
 
     def index(self, n, scope):
         if self.pyc:
@@ -1597,7 +1620,12 @@ class Runtime:
 
 
 # =========================================================================== helper namespace
+_PLAIN_TRUTH = frozenset((bool, int, float, str, type(None), list, dict, tuple))
+
+
 def _truth(v):
+    if v.__class__ in _PLAIN_TRUTH:                  # conditions are nearly always plain values
+        return v
     if isinstance(v, (np.ndarray, Node)) and np.size(ops.raw(v)) != 1:
         raise RuntimeErr("a tensor with several elements cannot be used as a condition")
     return v
@@ -1688,6 +1716,9 @@ def _irange(a, b, inclusive):
 
 
 def _idx(v):
+    t = type(v)
+    if t is int or t is str:
+        return v
     if isinstance(v, list) and v and all(isinstance(x, (int, np.integer)) for x in v):
         return np.asarray(v)
     if isinstance(v, float) and v.is_integer():
@@ -1750,7 +1781,12 @@ class Compiled:
                       module_ctx.used)
         self.code = _cc.load_code(self.source, f"<apsi:{filename}>")
         if self.code is None:
-            self.code = compile(self.source, f"<apsi:{filename}>", "exec")
+            try:
+                self.code = compile(self.source, f"<apsi:{filename}>", "exec")
+            except SyntaxError as e:                     # never a Python traceback: an Apsi error at the Apsi line
+                ln = e.lineno or 0
+                line, col = self.linemap[ln - 1] if 0 < ln <= len(self.linemap) else (None, None)
+                raise RuntimeErr(f"this cannot run: {e.msg}", line, col) from None
             _cc.store_code(self.source, f"<apsi:{filename}>", self.code)
         import types as _types
         modname = getattr(interp, "_next_module_name", None) or (
@@ -1958,6 +1994,12 @@ def _attr_slot(interp):
 
 
 def _setidx(interp):
+    set_index = interp.set_index
+
     def setidx(obj, idx, v):
-        interp.set_index(obj, idx, v)
+        t = type(obj)
+        if t is dict or t is list:                   # the common case without another call
+            obj[idx] = v
+        else:
+            set_index(obj, idx, v)
     return setidx

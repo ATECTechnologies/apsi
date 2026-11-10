@@ -15,10 +15,12 @@ after an interruption, and checked against the Hub's SHA-256; with hub.offline(t
 cache is used.
 """
 import hashlib
+import http.client
 import json
 import os
 import re
 import shutil
+import sys
 import threading
 import time
 import unicodedata
@@ -29,6 +31,11 @@ import urllib.request
 from .errors import RuntimeErr
 
 ENDPOINT = os.environ.get("HF_ENDPOINT", "https://huggingface.co").rstrip("/")
+PARALLEL_MIN = 64 << 20          # files at least this large download over several connections
+CHUNK = 16 << 20                 # bytes per piece
+CONNECTIONS = max(1, int(os.environ.get("APSI_HUB_CONNECTIONS", "8") or 8))   # at most; added while they help
+CONN_BEST = [1]
+CHECK_HOURS = float(os.environ.get("APSI_HUB_CHECK_HOURS", "24") or 24)
 _STATE = {"token": None, "offline": os.environ.get("APSI_HUB_OFFLINE", "") in ("1", "true", "yes")}
 _LOCK = threading.Lock()
 _STORAGE_HOSTS = ("huggingface.co", "hf.co", "cdn-lfs.huggingface.co", "cdn-lfs-us-1.huggingface.co",
@@ -164,7 +171,23 @@ class Hub:
         return out
 
     def download(self, repo, filename, revision="main", token=None, kind="model", progress=True):
-        """One file → its local path (cached by commit; resumed; SHA-256 checked for large files)."""
+        """One file → its local path (cached by commit; resumed; SHA-256 checked for large files). A connection
+        that breaks part way is resumed by itself, several times, before giving up."""
+        for attempt in range(8):
+            try:
+                return self._download_once(repo, filename, revision, token, kind, progress)
+            except (HubError, OSError, http.client.HTTPException) as e:
+                text = str(e)
+                broken = isinstance(e, (OSError, http.client.HTTPException)) or "download ended at" in text or "cannot reach" in text \
+                    or "ended early" in text or "timed out" in text.lower()
+                if not broken or attempt == 7 or _STATE["offline"]:
+                    raise
+                if progress:
+                    print(f"  (the connection broke; continuing where it stopped, try {attempt + 2} of 8)",
+                          flush=True)
+                time.sleep(min(30, 2 + 4 * attempt))
+
+    def _download_once(self, repo, filename, revision="main", token=None, kind="model", progress=True):
         _repo_ok(repo)
         name = _file_ok(filename)
         rev = revision or "main"
@@ -194,6 +217,13 @@ class Hub:
             return path
         os.makedirs(os.path.dirname(path), exist_ok=True)
         part = path + ".part"
+        if size >= PARALLEL_MIN and target and CONNECTIONS > 1:
+            with _LOCK:
+                self._download_parallel(urllib.parse.urljoin(url, target), url, token, part, size, etag, name,
+                                        progress)
+                os.replace(part, path)
+            self._remember_ref(refs, rev, commit)
+            return path
         with _LOCK:
             have = os.path.getsize(part) if os.path.exists(part) else 0
             src = urllib.parse.urljoin(url, target) if target else url
@@ -206,6 +236,7 @@ class Hub:
                     for chunk in iter(lambda: fh.read(1 << 20), b""):
                         h.update(chunk)
             t0, done, shown = time.time(), have, 0.0
+            tty = getattr(sys.stdout, "isatty", lambda: False)()
             with open(part, "ab" if have else "wb") as out:
                 while True:
                     chunk = r.read(1 << 20)
@@ -214,13 +245,13 @@ class Hub:
                     out.write(chunk)
                     h.update(chunk)
                     done += len(chunk)
-                    if progress and size > (32 << 20) and time.time() - shown > 1:
+                    if progress and size > (32 << 20) and time.time() - shown > (1 if tty else 30):
                         shown = time.time()
                         rate = (done - have) / max(1e-6, shown - t0)
-                        print(f"\r  {name}: {done / 2**20:,.0f} / {size / 2**20:,.0f} MB  {rate / 2**20:,.1f} MB/s",
-                              end="", flush=True)
+                        print(("\r" if tty else "") + f"  {name}: {done / 2**20:,.0f} / {size / 2**20:,.0f} MB  "
+                              f"{rate / 2**20:,.1f} MB/s", end="" if tty else "\n", flush=True)
             r.close()
-            if progress and size > (32 << 20):
+            if progress and size > (32 << 20) and tty:
                 print()
             if size and os.path.getsize(part) != size:
                 raise HubError(f"{name}: download ended at {os.path.getsize(part):,} of {size:,} bytes; "
@@ -232,6 +263,158 @@ class Hub:
         self._remember_ref(refs, rev, commit)
         return path
 
+    def _download_parallel(self, src, url, token, part, size, etag, name, progress):
+        """A large file over several connections at once (each a byte range of the file), resumable: finished
+        pieces are listed next to the .part file. The SHA-256 of the whole file is checked at the end."""
+        import concurrent.futures as cf
+        ranges = part + ".ranges"
+        n = (size + CHUNK - 1) // CHUNK
+        done = set()
+        try:
+            with open(ranges, encoding="utf-8") as fh:
+                d = json.load(fh)
+            if d.get("size") == size and d.get("chunk") == CHUNK:
+                done = {int(i) for i in d.get("done", []) if 0 <= int(i) < n}
+        except (OSError, ValueError, TypeError):
+            if os.path.exists(part):                   # an earlier one-connection download: its prefix is good
+                have = os.path.getsize(part)
+                done = {i for i in range(n) if min(size, (i + 1) * CHUNK) <= have}
+        mode = "r+b" if os.path.exists(part) else "w+b"
+        with open(part, mode) as fh:
+            fh.truncate(size)
+        lock = threading.Lock()
+        state = {"src": src, "got": sum(min(CHUNK, size - i * CHUNK) for i in done)}
+        start_got, t0 = state["got"], time.time()
+
+        def save():
+            tmp = ranges + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as fh:
+                json.dump({"size": size, "chunk": CHUNK, "done": sorted(done)}, fh)
+            os.replace(tmp, ranges)
+
+        def fetch(i):
+            a, b = i * CHUNK, min(size, (i + 1) * CHUNK) - 1
+            for attempt in range(6):
+                pos = a
+                try:
+                    r = self._open(state["src"], token, headers={"Range": f"bytes={a}-{b}"})
+                    if r.status != 206:
+                        r.close()
+                        raise HubError(f"the server ignored the byte range (status {r.status})")
+                    with open(part, "r+b") as out:
+                        out.seek(a)
+                        while True:
+                            chunk = r.read(1 << 20)
+                            if not chunk:
+                                break
+                            out.write(chunk)
+                            pos += len(chunk)
+                            with lock:
+                                state["got"] += len(chunk)
+                    r.close()
+                    if pos != b + 1:
+                        raise HubError(f"piece {i} ended early")
+                    with lock:
+                        done.add(i)
+                        save()
+                    return
+                except (HubError, OSError, http.client.HTTPException) as e:
+                    with lock:
+                        state["got"] -= pos - a                 # this piece starts again
+                    if attempt == 5:
+                        raise
+                    if "403" in str(e) or "410" in str(e):  # the signed storage link expired: ask the Hub again
+                        try:
+                            h = self._open(url, token, method="HEAD", follow=False)
+                            loc = h.headers.get("Location")
+                            h.close()
+                            if loc:
+                                state["src"] = urllib.parse.urljoin(url, loc)
+                        except (HubError, OSError):
+                            pass
+                    time.sleep(min(8, 1 + attempt * 2))
+
+        todo = [i for i in range(n) if i not in done]
+        # Connections are added while they help: 1, then 2, 4, 8 … as long as each step raises the speed by a
+        # fifth; a network (or server) that does not gain from more goes back to the best number.
+        queue = list(reversed(todo))
+        cond = threading.Condition()
+        ctl = {"limit": 1, "active": 0, "error": None}
+
+        def worker():
+            while True:
+                with cond:
+                    while ctl["active"] >= ctl["limit"] and queue and ctl["error"] is None:
+                        cond.wait(0.5)
+                    if not queue or ctl["error"] is not None:
+                        return
+                    i = queue.pop()
+                    ctl["active"] += 1
+                try:
+                    fetch(i)
+                except BaseException as e:             # the finished pieces stay; the next run resumes
+                    with cond:
+                        ctl["error"] = e
+                        queue.append(i)
+                finally:
+                    with cond:
+                        ctl["active"] -= 1
+                        cond.notify_all()
+
+        threads = [threading.Thread(target=worker, daemon=True) for _ in range(min(CONNECTIONS, max(1, len(todo))))]
+        for t in threads:
+            t.start()
+        tty = progress and size > (32 << 20) and getattr(sys.stdout, "isatty", lambda: False)()
+        shown, step_t, step_got, best, last_pct = 0.0, time.time(), state["got"], (0.0, 1), -1
+        while any(t.is_alive() for t in threads):
+            time.sleep(0.5)
+            now = time.time()
+            if now - step_t >= 8 and ctl["limit"] < CONNECTIONS:      # try more connections
+                rate = (state["got"] - step_got) / (now - step_t)
+                with cond:
+                    if rate > best[0] * 1.2:
+                        best = (rate, ctl["limit"])
+                        ctl["limit"] = min(CONNECTIONS, ctl["limit"] * 2)
+                    else:
+                        ctl["limit"] = best[1]
+                        CONN_BEST[0] = best[1]
+                        step_t = float("inf")              # settled
+                    cond.notify_all()
+                if step_t != float("inf"):
+                    step_t, step_got = now, state["got"]
+            if progress and size > (32 << 20):
+                rate = (state["got"] - start_got) / max(1e-6, now - t0)
+                line = (f"  {name}: {state['got'] / 2**20:,.0f} / {size / 2**20:,.0f} MB  {rate / 2**20:,.1f} MB/s"
+                        f"  ({ctl['limit']} connection{'s' if ctl['limit'] > 1 else ''})")
+                if tty and now - shown >= 1:
+                    shown = now
+                    print("\r" + line + "   ", end="", flush=True)
+                elif not tty and int(100 * state["got"] / size) // 10 != last_pct:
+                    last_pct = int(100 * state["got"] / size) // 10   # into a file: one line per 10 %
+                    print(line, flush=True)
+        if ctl["error"] is not None:
+            if tty:
+                print()
+            raise ctl["error"]
+        if progress and size > (32 << 20) and getattr(sys.stdout, "isatty", lambda: False)():
+            print()
+        if re.fullmatch(r"[0-9a-f]{64}", etag):
+            h = hashlib.sha256()
+            with open(part, "rb") as fh:
+                for chunk in iter(lambda: fh.read(1 << 22), b""):
+                    h.update(chunk)
+            if h.hexdigest() != etag:
+                os.remove(part)
+                try:
+                    os.remove(ranges)
+                except OSError:
+                    pass
+                raise HubError(f"{name}: the downloaded file does not match the Hub's SHA-256; it was deleted")
+        try:
+            os.remove(ranges)
+        except OSError:
+            pass
+
     @staticmethod
     def _remember_ref(refs, rev, commit):
         try:
@@ -239,10 +422,14 @@ class Hub:
             if os.path.exists(refs):
                 with open(refs, encoding="utf-8") as fh:
                     d = json.load(fh)
-            if d.get(rev) != commit:
-                d[rev] = commit
-                with open(refs, "w", encoding="utf-8") as fh:
-                    json.dump(d, fh)
+            d[rev] = commit
+            checked = d.get("_checked") if isinstance(d.get("_checked"), dict) else {}
+            checked[rev] = time.time()                 # when the Hub was last asked (see Hub.model)
+            d["_checked"] = checked
+            tmp = f"{refs}.{os.getpid()}.tmp"
+            with open(tmp, "w", encoding="utf-8") as fh:
+                json.dump(d, fh)
+            os.replace(tmp, refs)
         except (OSError, ValueError):
             pass
 
@@ -302,8 +489,45 @@ class Hub:
     def tokenizer(self, repo, revision="main", token=None):
         return Tokenizer.from_file(self.download(repo, "tokenizer.json", revision, token))
 
-    def model(self, repo, revision="main", token=None):
-        """Download what a model needs and load it to run natively (see Model)."""
+    def model(self, repo, revision="main", token=None, device="auto", update=False, gpu_layers=None, memory="auto"):
+        """Download what a model needs and load it to run natively (see Model).
+        device: "auto" (an NVIDIA GPU when there is one, else the processor), "cpu", "cuda" or "cuda:N".
+
+        A model downloaded completely before starts from the cache with no network request; the Hub is asked for a
+        newer version at most once a day (APSI_HUB_CHECK_HOURS), or now with update=true. Without a connection, the
+        cached copy is used."""
+        _repo_ok(repo)
+        rev = revision or "main"
+        folder = None if update else self._ready(repo, rev, None if _STATE["offline"] else CHECK_HOURS * 3600)
+        if folder is None:
+            try:
+                folder = self._fetch_model(repo, rev, token)
+            except (HubError, OSError):
+                folder = self._ready(repo, rev, None)
+                if folder is None:
+                    raise
+        return Model(folder, repo, device, gpu_layers=gpu_layers, memory=memory)
+
+    def _ready(self, repo, rev, max_age):
+        """The folder of a complete cached copy of the model, checked against the Hub within max_age seconds."""
+        try:
+            with open(os.path.join(cache_dir(), "models", repo.replace("/", "--"), "refs.json"), encoding="utf-8") as fh:
+                refs = json.load(fh)
+            commit = refs.get(rev) if re.fullmatch(r"[0-9a-f]{40}", rev) is None else rev
+            if not isinstance(commit, str) or not commit:
+                return None
+            if max_age is not None and time.time() - float((refs.get("_checked") or {}).get(rev, 0)) > max_age:
+                return None
+            folder = os.path.dirname(self._local(repo, "model", commit, "config.json"))
+            with open(os.path.join(folder, ".apsi-complete"), encoding="utf-8") as fh:
+                names = json.load(fh)
+            if all(os.path.isfile(os.path.join(folder, *n.split("/"))) for n in names):
+                return folder
+        except (OSError, ValueError, TypeError, AttributeError):
+            pass
+        return None
+
+    def _fetch_model(self, repo, revision, token):
         names = self.files(repo, revision, token)
         want = {"config.json", "tokenizer.json", "modules.json", "1_Pooling/config.json", "generation_config.json",
                 "model.safetensors", "model.safetensors.index.json", "tokenizer_config.json"}
@@ -314,11 +538,15 @@ class Hub:
                 get += sorted(set(json.load(fh)["weight_map"].values()))
         if "model.safetensors" not in get and not any(n.endswith(".safetensors") for n in get):
             raise HubError(f"{repo} has no safetensors weights to run natively")
-        last = None
         for n in get:
-            last = self.download(repo, n, revision, token)
+            self.download(repo, n, revision, token)
         folder = os.path.dirname(self.download(repo, "config.json", revision, token))
-        return Model(folder, repo)
+        try:                                           # mark the copy complete: the next start needs no network
+            with open(os.path.join(folder, ".apsi-complete"), "w", encoding="utf-8") as fh:
+                json.dump(sorted(set(get) | {"config.json"}), fh)
+        except OSError:
+            pass
+        return folder
 
     def pipeline(self, task, repo, revision="main", token=None):
         """A function for one task (sentiment-analysis, feature-extraction, ner, fill-mask, text-generation)."""
@@ -329,15 +557,32 @@ class Hub:
 class Model:
     """A Hub model running natively: embed / classify / fill_mask / tokens / generate, depending on the model."""
 
-    def __init__(self, folder, name=None):
-        from . import hub_models
+    def __init__(self, folder, name=None, device="auto", gpu_layers=None, memory="auto"):
+        """memory: "ram" reads the weights into memory, "disk" maps them from the file (SSD) and decodes them as they
+        are used, "auto" maps them only when the model is larger than half the free memory."""
+        from . import hub_models, hub_gpu
         self.folder = folder
         self.name = name or folder
-        self.config, weights = hub_models.load_folder(folder)
+        pending = None
+        try:
+            with open(os.path.join(folder, "config.json"), encoding="utf-8") as fh:
+                kind = json.load(fh).get("model_type", "")
+        except (OSError, ValueError):
+            kind = ""
+        if kind in hub_models.DECODERS and str(device or "auto").lower() != "cpu":
+            pending = hub_gpu.prepare(device)              # the GPU starts up while the weights are read
+        self.config, weights = hub_models.load_folder(folder, mmap=_use_mmap(folder, memory))
         self.net = hub_models.build(self.config, weights)
         tj = os.path.join(folder, "tokenizer.json")
         self.tokenizer = Tokenizer.from_file(tj) if os.path.exists(tj) else None
         self.kind = "encoder" if isinstance(self.net, hub_models.Encoder) else "decoder"
+        self.device, self.device_note = "cpu", ""
+        self.last_tokens = 0
+        if self.kind == "decoder":
+            self.device, self.device_note = self.net.to_device(device, pending, gpu_layers)
+        if self.device == "cpu" and isinstance(weights, hub_models.Weights) and not weights.mapped:
+            if not (self.kind == "decoder" and self.net._prepare_cpu()):
+                weights.decode_all(drop_raw=True)      # the processor works in float32: decode once, keep one copy
         self.labels = {int(k): v for k, v in (self.config.get("id2label") or {}).items()}
         self.pooling = "mean"
         self.normalize = False
@@ -462,23 +707,235 @@ class Model:
             raise HubError("generate() needs a decoder model (GPT-2, Llama, Mistral, Qwen, Gemma)")
         tok = self._need_tok()
         ids = tok.encode(prompt, add_special_tokens=add_special_tokens).ids if isinstance(prompt, str) else list(prompt)
+        return self._run(ids, max_new_tokens, temperature, top_k, top_p, seed, repetition_penalty, stream)
+
+    def _run(self, ids, max_new_tokens, temperature, top_k, top_p, seed, repetition_penalty, stream, extra_stops=()):
+        tok = self._need_tok()
         eos = self.gen.get("eos_token_id", self.config.get("eos_token_id"))
         eos = eos if isinstance(eos, list) else ([eos] if eos is not None else [])
+        eos = list(eos) + [t for t in extra_stops if t not in eos]
         done = []
+        at = [0, 0]                                    # decode only the last few tokens: [context start, shown up to]
 
         def emit(t):
             if stream is not None:
-                before = tok.decode(done, skip_special_tokens=True)
                 done.append(t)
-                piece = tok.decode(done, skip_special_tokens=True)[len(before):]
-                if piece:
-                    stream(piece)
+                before = tok.decode(done[at[0]:at[1]], skip_special_tokens=True)
+                text = tok.decode(done[at[0]:], skip_special_tokens=True)
+                if len(text) > len(before) and not text.endswith("\ufffd"):   # not half of a character
+                    at[0], at[1] = at[1], len(done)
+                    stream(text[len(before):])
         out = self.net.generate(ids, max_new_tokens, temperature, top_k, top_p, eos, seed, repetition_penalty,
                                 emit if stream is not None else None)
+        self.last_tokens = len(out)                    # how many tokens the last generate() produced
         return tok.decode(out, skip_special_tokens=True)
 
+    # ---------------------------------------------------------------- chat
+    def chat_format(self):
+        """The prompt format of a chat model, from its own chat template: chatml (Qwen, SmolLM, …), llama3, gemma,
+        mistral ([INST]) or none (not a chat model)."""
+        if getattr(self, "_fmt", None) is None:
+            t = ""
+            try:
+                with open(os.path.join(self.folder, "tokenizer_config.json"), encoding="utf-8") as fh:
+                    t = json.load(fh).get("chat_template") or ""
+                if isinstance(t, list):                    # several named templates
+                    t = " ".join(str(x.get("template", "")) for x in t if isinstance(x, dict))
+            except (OSError, ValueError, AttributeError):
+                t = ""
+            added = getattr(self.tokenizer, "added", {}) or {}
+            if "<|start_header_id|>" in t or ("<|start_header_id|>" in added and not t):
+                f = "llama3"
+            elif "<start_of_turn>" in t or ("<start_of_turn>" in added and not t):
+                f = "gemma"
+            elif "<|im_start|>" in t or ("<|im_start|>" in added and not t):
+                f = "chatml"
+            elif "[INST]" in t:
+                f = "mistral"
+            else:
+                f = "none"
+            self._fmt = f
+        return self._fmt
+
+    def chat_prompt(self, messages, system=None):
+        """The text the model sees for a conversation: messages is a text (one user message) or a list of
+        {"role": "user" | "assistant" | "system", "content": text}."""
+        msgs = _messages(messages, system)
+        f = self.chat_format()
+        if f == "llama3":
+            s = "<|begin_of_text|>"
+            for m in msgs:
+                s += f"<|start_header_id|>{m['role']}<|end_header_id|>\n\n{m['content']}<|eot_id|>"
+            return s + "<|start_header_id|>assistant<|end_header_id|>\n\n"
+        if f == "gemma":                               # no system role: it goes in front of the first user turn
+            s, pre = "<bos>", ""
+            for m in msgs:
+                if m["role"] == "system":
+                    pre += m["content"] + "\n\n"
+                    continue
+                role = "model" if m["role"] == "assistant" else "user"
+                s += f"<start_of_turn>{role}\n{(pre if role == 'user' else '') + m['content']}<end_of_turn>\n"
+                if role == "user":
+                    pre = ""
+            return s + "<start_of_turn>model\n"
+        if f == "mistral":
+            s, pre = "<s>", ""
+            for m in msgs:
+                if m["role"] == "system":
+                    pre += m["content"] + "\n\n"
+                elif m["role"] == "user":
+                    s += f"[INST] {pre}{m['content']} [/INST]"
+                    pre = ""
+                else:
+                    s += f" {m['content']}</s>"
+            return s
+        if f == "chatml":
+            s = ""
+            for m in msgs:
+                s += f"<|im_start|>{m['role']}\n{m['content']}<|im_end|>\n"
+            return s + "<|im_start|>assistant\n"
+        s = ""                                         # a plain language model: a readable transcript
+        for m in msgs:
+            s += {"system": "", "user": "User: ", "assistant": "Assistant: "}[m["role"]] + m["content"] + "\n"
+        return s + "Assistant:"
+
+    def _stops(self):
+        """End-of-turn tokens of the chat formats (besides the model's own end-of-sequence)."""
+        added = getattr(self.tokenizer, "added", {}) or {}
+        return [added[t] for t in ("<|im_end|>", "<|eot_id|>", "<end_of_turn>", "<|endoftext|>", "</s>",
+                                   "<|end_of_text|>") if t in added]
+
+    def chat(self, messages, system=None, max_new_tokens=512, temperature=0.7, top_p=0.9, top_k=0,
+             repetition_penalty=1.1, seed=None, stream=None):
+        """The model's reply in a conversation (see chat_prompt): the right prompt format, stops at the end of the
+        turn, and the oldest turns are left out when the conversation no longer fits the model's window."""
+        if self.kind != "decoder":
+            raise HubError("chat() needs a decoder model (Llama, Mistral, Qwen, Gemma, …)")
+        tok = self._need_tok()
+        msgs = _messages(messages, system)
+        window = int(self.config.get("max_position_embeddings") or self.config.get("n_positions") or 4096)
+        budget = max(64, min(window, 32768) - int(max_new_tokens) - 8)
+        sys_msgs = [m for m in msgs if m["role"] == "system"]
+        rest = [m for m in msgs if m["role"] != "system"]
+        ids = tok.encode(self.chat_prompt(sys_msgs + rest), add_special_tokens=False).ids
+        while len(ids) > budget and len(rest) > 1:     # drop the oldest exchange, keep the newest message
+            rest = rest[2:] if len(rest) > 2 else rest[1:]
+            ids = tok.encode(self.chat_prompt(sys_msgs + rest), add_special_tokens=False).ids
+        if len(ids) > budget:
+            ids = ids[-budget:]
+        return self._run(ids, max_new_tokens, temperature, top_k, top_p, seed, repetition_penalty, stream,
+                         extra_stops=self._stops()).strip()
+
+    def conversation(self, system=None, **options):
+        """A conversation that remembers its turns: c.say(text, stream=fn) -> reply; c.reset(); c.history."""
+        return Conversation(self, system, options)
+
+    def to(self, device):
+        """Move a decoder to "cpu", "cuda", "cuda:N" or "auto"; returns the device it runs on."""
+        if self.kind == "decoder":
+            self.device, self.device_note = self.net.to_device(device)
+        return self.device
+
     def __repr__(self):
-        return f"<model {self.name}: {self.config.get('model_type')} {self.kind}>"
+        return f"<model {self.name}: {self.config.get('model_type')} {self.kind} on {self.device}>"
+
+
+def _available_ram():
+    """Bytes of memory free for new allocations, or None when unknown."""
+    try:
+        if os.name == "nt":
+            import ctypes
+
+            class MS(ctypes.Structure):
+                _fields_ = [("dwLength", ctypes.c_ulong), ("dwMemoryLoad", ctypes.c_ulong),
+                            ("ullTotalPhys", ctypes.c_ulonglong), ("ullAvailPhys", ctypes.c_ulonglong),
+                            ("ullTotalPageFile", ctypes.c_ulonglong), ("ullAvailPageFile", ctypes.c_ulonglong),
+                            ("ullTotalVirtual", ctypes.c_ulonglong), ("ullAvailVirtual", ctypes.c_ulonglong),
+                            ("ullAvailExtendedVirtual", ctypes.c_ulonglong)]
+            m = MS()
+            m.dwLength = ctypes.sizeof(MS)
+            if ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(m)):
+                return int(m.ullAvailPhys)
+            return None
+        with open("/proc/meminfo", encoding="ascii") as fh:
+            for line in fh:
+                if line.startswith("MemAvailable:"):
+                    return int(line.split()[1]) * 1024
+    except (OSError, ValueError, AttributeError):
+        pass
+    return None
+
+
+def _use_mmap(folder, memory):
+    memory = str(memory or "auto").lower()
+    if memory in ("disk", "ssd", "mmap"):
+        return True
+    if memory in ("ram", "memory"):
+        return False
+    if memory != "auto":
+        raise HubError(f"memory must be \"auto\", \"ram\" or \"disk\", not \"{memory}\"")
+    size = sum(os.path.getsize(os.path.join(folder, f)) for f in os.listdir(folder) if f.endswith(".safetensors"))
+    free = _available_ram()
+    return free is not None and size > free / 2
+
+
+def _messages(messages, system=None):
+    """Normalise a conversation to [{"role", "content"}], with an optional system message first."""
+    if isinstance(messages, str):
+        messages = [{"role": "user", "content": messages}]
+    out = []
+    for m in messages or []:
+        if isinstance(m, str):
+            m = {"role": "user", "content": m}
+        try:
+            role = str(m.get("role", "user")).lower()
+            content = m.get("content", m.get("text", ""))
+        except AttributeError:
+            raise HubError("a chat message is a text or {\"role\": ..., \"content\": ...}") from None
+        if role in ("bot", "model", "ai"):
+            role = "assistant"
+        if role not in ("system", "user", "assistant"):
+            raise HubError(f"unknown chat role '{role}' (use system, user or assistant)")
+        out.append({"role": role, "content": str(content)})
+    if system is not None:
+        out = [{"role": "system", "content": str(system)}] + [m for m in out if m["role"] != "system"]
+    if not out or out[-1]["role"] == "assistant":
+        if not out:
+            raise HubError("chat() needs at least one message")
+    return out
+
+
+class Conversation:
+    """Turns remembered between calls: say() adds the user's text and the model's reply."""
+
+    def __init__(self, model, system=None, options=None):
+        self.model = model
+        self.system = system
+        self.options = dict(options or {})
+        self.history = []
+
+    def say(self, text, stream=None, **options):
+        o = dict(self.options)
+        o.update(options)
+        self.history.append({"role": "user", "content": str(text)})
+        try:
+            reply = self.model.chat(self.history, system=self.system, stream=stream, **o)
+        except BaseException:
+            self.history.pop()                         # a failed or interrupted turn leaves no half entry
+            raise
+        self.history.append({"role": "assistant", "content": reply})
+        return reply
+
+    def reset(self, system=None):
+        self.history = []
+        if system is not None:
+            self.system = system
+
+    def transcript(self):
+        return "\n\n".join(("You" if m["role"] == "user" else "Assistant") + ": " + m["content"] for m in self.history)
+
+    def __repr__(self):
+        return f"<conversation with {self.model.name}: {len(self.history)} messages>"
 
 
 class Pipeline:
@@ -921,14 +1378,19 @@ def module(interp=None):
             path = check_path(interp, path, "read", "hub.tokenizer_from_file()")
         return Tokenizer.from_file(path)
 
-    def model_from_folder(folder):
+    def model_from_folder(folder, device="auto", gpu_layers=None, memory="auto"):
         """Load a model that runs natively from a local folder in Hugging Face layout."""
         if interp is not None:
             from .security import check_path
             folder = check_path(interp, folder, "read", "hub.model_from_folder()")
-        return Model(folder)
+        return Model(folder, device=device, gpu_layers=gpu_layers, memory=memory)
 
-    return {"model": hub.model, "pipeline": hub.pipeline, "model_from_folder": model_from_folder, "info": hub.info, "files": hub.files, "search": hub.search, "download": hub.download,
+    def devices():
+        """The NVIDIA GPUs the hub can use: [{"index", "name", "memory_gb", "compute_capability", ...}] (or [])."""
+        from .native import cuda
+        return cuda.devices()
+
+    return {"devices": devices, "model": hub.model, "pipeline": hub.pipeline, "model_from_folder": model_from_folder, "info": hub.info, "files": hub.files, "search": hub.search, "download": hub.download,
             "snapshot": hub.snapshot, "load": hub.load, "config": hub.config, "tokenizer": hub.tokenizer,
             "tokenizer_from_file": tokenizer_from_file, "login": login, "logout": logout, "offline": offline,
             "cache_dir": cache_dir, "clear_cache": clear_cache, "HubError": HubError}

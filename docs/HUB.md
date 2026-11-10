@@ -50,7 +50,8 @@ its storage hosts; the permission for `huggingface.co` covers them.
 | `hub.config(repo)` | `config.json` as a dict |
 | `hub.load(repo)` / `hub.load(repo, "file.gguf")` | weights as `{name: tensor}`: `model.safetensors`, sharded safetensors (`model.safetensors.index.json`), or a GGUF file |
 | `hub.tokenizer(repo)` / `hub.tokenizer_from_file(path)` | a tokenizer from `tokenizer.json` |
-| `hub.model(repo)` / `hub.model_from_folder(path)` | a model that runs natively (below) |
+| `hub.model(repo, device="auto", gpu_layers=, memory="auto", update=false)` / `hub.model_from_folder(path, device=, gpu_layers=, memory=)` | a model that runs natively (below); decoders use an NVIDIA GPU when there is one. A model downloaded before starts from the cache with no network request (the Hub is asked for a newer version at most once a day, or now with `update=true`) |
+| `hub.devices()` | the NVIDIA GPUs the hub can use: `[{"index", "name", "memory_gb", "compute_capability", "multiprocessors"}]`, or `[]` |
 | `hub.pipeline(task, repo)` | a function for one task: `"sentiment-analysis"` / `"text-classification"`, `"feature-extraction"` / `"sentence-similarity"`, `"ner"` / `"token-classification"`, `"fill-mask"`, `"text-generation"` |
 | `hub.login(token)` / `hub.logout()` | a Hub access token for private and gated models |
 | `hub.offline(true)` | use only the local cache |
@@ -116,12 +117,34 @@ and, for sentence-transformers models, their pooling settings, then runs the net
   — text generation with a key/value cache. `temperature=0` is greedy. It stops at the model's end-of-sequence token
   (from `generation_config.json` or `config.json`). `stream` receives each new piece of text as it appears.
 * **`hidden(texts)`** — the last hidden states, for your own heads.
+* **`chat(messages, system=, max_new_tokens=512, temperature=0.7, top_p=0.9, repetition_penalty=1.1, stream=)`** —
+  the model's reply in a conversation. `messages` is a text (one user message) or a list of
+  `{"role": "user" | "assistant" | "system", "content": text}`. The prompt is written in the model's own chat format,
+  read from its chat template (ChatML for Qwen and SmolLM, Llama 3, Gemma, Mistral `[INST]`); generation stops at
+  the end of the turn; when the conversation no longer fits the model's window the oldest turns are left out.
+  `chat_format()` names the format, `chat_prompt(messages, system=)` shows the exact text the model sees.
+* **`conversation(system=, **options)`** — a conversation that remembers its turns: `c.say(text, stream=fn)` returns
+  the reply, `c.reset(system=)` starts over, `c.history` is the list of messages, `c.transcript()` is readable text.
+  A failed or interrupted turn leaves no half entry behind.
+* `m.last_tokens` — the number of tokens the last `generate()` / `chat()` produced; `m.device` — where it runs.
 
 How it is checked: tiny checkpoints written in the exact Hugging Face file layout are run in the test suite. The
 encoder is compared with an independent per-head reference implementation, padding is checked not to change results,
 and cached generation is compared with recomputing the whole sequence at every step. On a machine with
 `transformers` and `torch`, `APSI_HF_COMPARE=1 python -m unittest tests.test_hub_models` also compares against the
 reference library.
+
+A chat assistant in a few lines:
+
+```
+use hub
+let lm = hub.model("Qwen/Qwen2.5-1.5B-Instruct")
+let c = lm.conversation(system="You are a concise assistant.")
+fn show(piece):
+    print(piece, end="")
+c.say("What is a prime number?", stream=show)
+c.say("Give three examples.", stream=show)       # remembers the question before
+```
 
 ### Methods and what they return
 
@@ -221,16 +244,65 @@ let m = hub.model_from_folder("models/my-classifier")   # config.json, model.saf
 
 ### Speed and size
 
-Everything runs on the CPU in float32 with NumPy's multi-threaded BLAS. Encoders such as MiniLM and BERT-base
-handle sentences in milliseconds; decoders up to about 1–2 billion parameters generate at interactive speed on a
-modern CPU (a 1.1B model needs about 4.4 GB of RAM in float32). For bigger models, use GGUF with llama.cpp, or
-PyTorch through `hf_pipeline`.
+Encoders run on the CPU in float32 with NumPy's multi-threaded BLAS and handle sentences in milliseconds.
+
+Decoders (`generate`, `chat`) run on an **NVIDIA graphics card by themselves** when one is present, with nothing
+to install but the display driver: no CUDA Toolkit, CuPy or PyTorch. The whole network runs on the card: the weights,
+the key/value cache, norms, rotary embeddings, attention and the MLP, in kernels that Apsi generates (as PTX, like
+`@gpu`) and the driver compiles for the card in use. Per new token only its embedding goes to the card and the
+next-token scores come back. Any GPU from the GTX 1660 / RTX 20xx on (compute capability 7.5) works.
+
+* **Precision.** Weights are kept as bfloat16, the format Qwen, Llama, Gemma and Mistral are published in, so for
+  them the copy on the card is exact; sums and activations are float32. A 0.5B model needs about 1 GB, 1.5B about
+  3 GB, 3B about 6 GB, 7B about 15 GB.
+* **Start-up.** A bfloat16 checkpoint goes from the file to the card as it is (no float32 copy is ever made); the
+  driver starts and the kernels load while the file is read; the kernels are compiled once and kept in Apsi's cache
+  folder; a model downloaded before needs no network request.
+* **Measured** on an RTX 3060 with Qwen2.5-0.5B: 193 tokens/s greedy, 190 sampled, 211 through `chat`; a prompt
+  of 512 tokens in 118 ms; a token after 2,000 tokens of context in 5.5 ms; ready 0.86 s after `hub.model(...)`.
+* **Prompts** are processed in passes of up to 512 positions with a tiled matrix product; single tokens with a product
+  that normalises its input on the fly, so a token is about 170 kernel launches with no work on the processor
+  between them.
+* **Larger than the card.** With `device="auto"` the first layers that fit in the card's free memory run on the
+  GPU and the rest on the processor; `lm.device` says how many (`cuda:0 (...) + cpu (20 of 28 layers on the GPU)`).
+  `gpu_layers=N` sets the number. `memory="disk"` maps the weights from the file (an SSD) instead of reading them
+  into RAM, for models larger than the memory; `"auto"` does that by itself when the model is larger than half of
+  the free memory.
+* **Choosing the next token on the card.** With a temperature, the repetition penalty, the temperature and the
+  softmax denominator are computed on the GPU, and only the tokens that top-k / top-p can pick come back (a few
+  dozen numbers instead of the 150,000 scores of a Qwen vocabulary); a very flat distribution falls back to the
+  processor. The choice rule is the same as on the processor.
+* **Conversations.** A prompt that starts with the tokens of the previous generation (a conversation re-sends its
+  earlier turns) reuses that generation's key/value cache: only the new part is computed. On the GPU and on the
+  processor alike.
+* **Failures.** Running out of GPU memory frees the scratch space and goes on in smaller passes; any other driver
+  error moves the model to the processor, which carries on from the tokens already produced (a streamed answer sees
+  every token once). It is reported once per kind of failure; `APSI_QUIET=1` silences it. One model can serve
+  several threads; they take turns.
+
+```
+let lm = hub.model("Qwen/Qwen2.5-3B-Instruct")                 # device="auto": the GPU when there is one
+print(lm.device)                                               # cuda:0 (NVIDIA GeForce RTX ...) or cpu
+let cpu = hub.model("Qwen/Qwen2.5-0.5B-Instruct", device="cpu")
+let big = hub.model("Qwen/Qwen2.5-7B-Instruct", gpu_layers=20, memory="disk")
+lm.to("cpu")                                                   # move it later; returns the device
+```
+
+`device=` is `"auto"` (default), `"cpu"`, `"cuda"` or `"cuda:N"`. With `"auto"`, a machine without a usable card
+stays on the CPU and `lm.device_note` says why; `"cuda"` raises an error instead, also when the model does not fit
+the card. `APSI_NO_GPU=1` keeps everything on the CPU.
+
+On the processor, a bfloat16 checkpoint runs on all cores with a matrix product that reads bfloat16 directly
+(compiled by Apsi's native compiler): half the memory of float32 and about half the time per token (a 0.5B model
+needs about 1 GB of RAM, a 1.5B model 3 GB). Prompts of 24 tokens or more use NumPy's BLAS. Other checkpoints run in
+float32 with NumPy. `APSI_HUB_NATIVE=0` turns the native product off. For bigger models, use GGUF with llama.cpp, or PyTorch through `hf_pipeline`.
 
 ### Not native yet
 
 * Gemma 2 and 3 (extra norms and soft-capping), Phi, Falcon, MPT and mixture-of-experts models, T5 and BART
   (encoder–decoder), vision and audio models.
-* Chat templates (Jinja in `tokenizer_config.json`): write the prompt in the model's format yourself.
+* Chat templates other than ChatML, Llama 3, Gemma and Mistral (the Jinja in `tokenizer_config.json` is not run):
+  `chat()` falls back to a plain "User: / Assistant:" transcript; write the prompt yourself with `generate()`.
 * Quantised GGUF formats other than Q8_0 and Q4_0 for `hub.load`.
 
 For those, `hf_pipeline(task, model)` in `use models` runs Python's `transformers` (needs `--allow-python`).

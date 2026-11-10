@@ -2,6 +2,51 @@
 
 ## 2.4.4 — Python, exactly; real time; data, databases and the web
 
+### Language models on the GPU (`use hub`)
+- **Decoders run on an NVIDIA graphics card by themselves, with nothing to install but the display driver.** The
+  whole network runs on the card (weights as bfloat16, key/value cache, norms, rotary embeddings, attention, MLP) in
+  kernels Apsi generates as PTX and the driver compiles: no CUDA Toolkit, CuPy or PyTorch. Measured on an RTX 3060
+  with Qwen2.5-0.5B: 193 tokens/s greedy, 190 sampled, 211 through `lm.chat` (7.7 on the processor before this
+  release); a prompt of 512 tokens in 118 ms, of 2,048 in 0.81 s; a token after 2,000 tokens of context in 5.5 ms;
+  the model ready in 0.86 s.
+- **Starts in a fraction of the time:** bfloat16 checkpoints go from the file to the card as they are (no float32
+  copy); the driver starts while the file is read; kernels are compiled once and cached; a model downloaded before
+  starts with no network request (the Hub is asked for a newer version at most once a day; without a connection the
+  cached copy is used).
+- **Prompts in passes of up to 512 positions** with a tiled matrix product; single tokens with a product that normalises
+  its input on the fly; attention with a warp per key.
+- **Models larger than the card:** the first layers that fit run on the GPU, the rest on the processor, from RAM or
+  memory-mapped from the SSD (`gpu_layers=`, `memory="disk"`); `device="cuda"` insists on the card alone.
+- **Steady under failure:** out of GPU memory frees scratch space and continues in smaller passes; any other driver
+  error moves the model to the processor, which carries on from the tokens already produced, reported once.
+  One model serves several threads.
+- **`lm.chat(messages)` and `lm.conversation()`:** the model's own chat format (ChatML, Llama 3, Gemma, Mistral),
+  stops at the end of the turn, oldest turns left out when the window is full; `hub.devices()` lists the GPUs.
+- **The next token is chosen on the card:** penalty, temperature and softmax there; only the candidates come back.
+- **Conversations reuse their cache:** a prompt that starts like the previous generation computes only the new part.
+- **On the processor, bfloat16 products on all cores** (native code from Apsi's compiler): half the memory of
+  float32 NumPy and faster per token (124 → 91 ms on the same machine).
+- Faster sampling (top-p sorts only the likely tokens), streamed text that never splits a character, the output head
+  computed for the last position only (long prompts on the processor were paying for every position), no forward
+  pass after the last token, weights read from the file only when needed (a GPU model never holds a copy in RAM).
+
+### Faster everyday code, clearer errors
+- **Objects 4–6× faster:** `self.x` inside a method of an Apsi class compiles to Python's own attribute access;
+  other attribute reads and writes on ordinary objects, text, lists and dicts skip straight to it after the first
+  check. Creating objects and calling methods: 0.646 s → 0.102 s for 300,000 (CPython: 0.041 s).
+- **`str()` / f-strings / `print` of numbers and text, conditions, dict and list stores** take their common case
+  first: f-string building 1.8×, dict updates 1.7×, float loops 1.5× faster.
+- **Every error says how to fix it, and the caret points at what failed** (not the start of the line):
+  `'ad' is not defined (did you mean 'add'?)`, `Str has no attribute 'uper' (did you mean 'upper'?)`,
+  `cannot join Str and Int with '+'; … write str(x)`, `'[' is not closed: expected ']' … at the end of line 1`,
+  `'abc' is not a whole number`, `key not found: 'b' (use d.get(key, default) …)`, index, tuple, `len()`,
+  unpacking (`for k, v in d.items()`) and classes without `__init__`.
+- **Habits from other languages are translated:** `def` → `fn`, `else if` → `elif`, `print "x"` → `print(x)`,
+  `x++` → `x += 1`, `&&` / `||` / `!` → `and` / `or` / `not`, `if x = 5` → `==`, `True` / `null` → `true` / `none`,
+  `import os` → `use os`, `3[m] + 1` → give the number a unit.
+- A parameter without a default after one with a default is reported at the parameter (it used to stop with a
+  Python traceback); no program can show a Python traceback for a compile problem any more.
+
 ### Python conversion: exact, complete
 - **`apsi convert` keeps Python's semantics byte for byte.** Converted files start with `use pycompat`, which gives
   them Python's object model, scoping and built-ins. Real classes (inheritance from any library class, metaclasses,

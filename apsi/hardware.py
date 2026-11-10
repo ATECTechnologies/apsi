@@ -190,7 +190,7 @@ def doctor(verbose=True):
         for g in i["gpus"]:
             print(f"  GPU      : {g['name']}  cc {g['compute_capability']}  driver {g['driver']}  {g['memory']}")
         print(f"  {ok(i['gpu_meets_target'])} GPU target  : NVIDIA compute capability >= {GPU_MIN_CC} (GTX 1660 class or newer)")
-        print(f"  {ok(i['cupy'])} GPU backend : CuPy {'found' if i['cupy'] else 'not installed (pip install cupy-cuda12x)'}")
+        print(f"  {'✓' if i['cupy'] else '-'} CuPy        : {'found' if i['cupy'] else 'not installed; optional, only for use gpu tensors (apsi pkg install gpu)'}")
     else:
         print("  - GPU      : no NVIDIA GPU detected (CPU backend will be used)")
     ready = i["cpu_meets_target"] and i["os_meets_target"]
@@ -208,6 +208,8 @@ def doctor(verbose=True):
             for d in g["devices"]:
                 print(f"  {ok(True)} @gpu        : GPU {d['index']} {d['name']} (sm {d['compute_capability']}, "
                       f"{d['memory_gb']} GB) - driver PTX JIT, no toolkit needed")
+            print(f"  {ok(True)} use hub     : language models run on GPU {g['devices'][0]['index']} by themselves"
+                  " (nothing to install)")
         else:
             print(f"  - @gpu        : {g['reason']}; @gpu functions use all CPU cores")
     except Exception as e:                            # never let diagnostics fail

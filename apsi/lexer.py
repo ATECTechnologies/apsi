@@ -290,7 +290,9 @@ def _tokenize(src):
                 add(OP, c, c=start_col)
                 i += 1
             else:
-                raise LexError(f"unexpected character {c!r}", line, start_col)
+                hint = {"&": " (for 'both' write: and)", "|": " (for 'either' write: or)",
+                        "!": " (for 'not' write: not; for 'not equal' write: !=)"}.get(c, "")
+                raise LexError(f"unexpected character {c!r}{hint}", line, start_col)
 
     if toks and toks[-1].type not in (NEWLINE, DEDENT, INDENT):
         add(NEWLINE, "\n")

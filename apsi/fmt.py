@@ -10,7 +10,16 @@ from .values import (Function, StructType, StructInstance, Record, RangeVal, Nam
                      BoundMethod, Dtype)
 
 
+_INF = float("inf")
+
+
 def fmt_num(x, spec=None):
+    if spec is None:                                 # the most common cases first
+        t = type(x)
+        if t is int:
+            return str(x)
+        if t is float and x == x and x != _INF and x != -_INF:
+            return repr(x)
     if spec:
         if isinstance(x, Fraction):
             x = float(x)
@@ -73,6 +82,14 @@ def shape_str(shape):
 
 
 def fmt(v, top=True, spec=None):
+    t = type(v)
+    if spec is None:                                 # the most common cases first: exact type checks are cheap
+        if t is str:
+            return v if top else '"' + v.replace('"', '\\"') + '"'
+        if t is int:
+            return str(v)
+        if t is float:
+            return fmt_num(v)
     if v is None:
         return "none"
     if isinstance(v, str):

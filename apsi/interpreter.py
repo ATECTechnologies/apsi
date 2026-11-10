@@ -1,4 +1,5 @@
 """Tree-walking reference interpreter for Apsi."""
+import re
 import operator
 import os
 import sys
@@ -180,8 +181,12 @@ DTYPE_NAMES = {"f16", "f32", "f64", "i32", "i64", "bool", "bf16", "fp8_e4m3", "f
                "fp6_e2m3", "fp4_e2m1", "int8", "int4", "fp8", "bf8", "fp4", "fp6"}
 
 
+_PLAIN_GET = set()       # classes whose public attributes are read with plain getattr (learned on first use)
+_PLAIN_SET = set()       # classes whose public attributes may be set with plain setattr (after _safe_setattr allowed it)
 _FRAME_ATTRS = {"gi_frame", "gi_code", "f_globals", "f_builtins", "f_locals", "f_back", "f_code", "tb_frame",
                 "tb_next", "cr_frame", "cr_code", "ag_frame", "ag_code", "co_code", "func_globals", "mro"}
+_SLOW_NAMES = _FRAME_ATTRS | {"shape", "tofile", "dump"}
+_NOT_PLAIN = (StructInstance, Record, Namespace, UnitNamespace, np.ndarray)
 _PUBLIC_UNDERSCORE = {"_replace", "_asdict", "_fields", "_make", "_field_defaults", "_value_", "_name_",
                       "_missing_", "_member_names_", "_member_map_", "_value2member_map_", "_ignore_", "_order_",
                       "_generate_next_value_"}
@@ -206,6 +211,42 @@ def is_generator(body):
     return walk(body)
 
 
+def _no_attr(obj, name, msg=None, names=None):
+    """'X has no attribute y' with the closest real name, the caret on '.y'."""
+    from .errors import did_you_mean
+    if names is None:
+        try:
+            names = [n for n in dir(obj) if not n.startswith("_")]
+        except Exception:
+            names = []
+    err = RuntimeErr((msg or f"{type_name(obj)} has no attribute '{name}'") + did_you_mean(name, names))
+    err.focus = "." + name
+    return err
+
+
+_APSI_TYPES = {"list": "List", "tuple": "Tuple", "string": "Str", "str": "Str", "range object": "Range",
+               "int": "Int", "float": "Float", "bool": "Bool", "NoneType": "None", "dict": "Dict"}
+
+
+def _type_hint(msg):
+    """A plain-words fix for the most common Python type errors seen through Apsi."""
+    if "can only concatenate str" in msg or ("unsupported operand" in msg and "'str'" in msg):
+        return "; to join text and a number write str(x) (or an f-string: f\"total {x}\")"
+    if "takes no arguments" in msg:
+        return "; to take arguments, give the class an fn __init__(self, ...)"
+    if "object is not callable" in msg:
+        return "; a value, not a function, is being called (check for a missing operator or a name reused)"
+    if "has no len()" in msg:
+        return "; len() works on text, lists, tuples, dicts, sets and tensors"
+    if "does not support item assignment" in msg and "tuple" in msg:
+        return "; tuples cannot change: use a list ([...]) to change items"
+    if "not subscriptable" in msg:
+        return "; only lists, tuples, text, dicts and tensors can be indexed with [...]"
+    if "unhashable" in msg:
+        return "; dict keys and set items must not change: use a tuple instead of a list"
+    return ""
+
+
 def wrap_python_error(e):
     err = _wrap_python_error(e)
     err.original = e                     # `except ValueError` still recognises the error after wrapping
@@ -214,19 +255,61 @@ def wrap_python_error(e):
 
 def _wrap_python_error(e):
     if isinstance(e, ZeroDivisionError):
-        return RuntimeErr("division by zero")
+        err = RuntimeErr("division by zero")
+        err.focus = "/" if "modulo" not in str(e) else "%"
+        return err
     msg = str(e)
     if isinstance(e, ValueError) and any(k in msg for k in ("broadcast", "shape", "matmul", "aligned", "dimension")):
         return ShapeError(f"shape mismatch: {msg}")
     if isinstance(e, ValueError) and "truth value" in msg:
         return RuntimeErr("a tensor with several elements cannot be used as true/false; "
                           "use any(...) / all(...) style reductions")
+    if isinstance(e, AttributeError) and getattr(e, "name", None) and hasattr(e, "obj"):
+        return _no_attr(e.obj, e.name)
     if isinstance(e, IndexError):
-        return RuntimeErr(f"index out of range: {msg}")
+        what = msg.split(" index")[0] if " index out of range" in msg else ""
+        err = RuntimeErr(f"index out of range{' for this ' + _APSI_TYPES.get(what, what) if what else ''}"
+                         f" (positions start at 0; [-1] is the last element; len() gives the size)"
+                         if "out of range" in msg else f"index out of range: {msg}")
+        err.focus = "["
+        return err
     if isinstance(e, KeyError):
-        return RuntimeErr(f"key not found: {msg}")
+        key = e.args[0] if e.args else msg
+        err = RuntimeErr(f"key not found: {key!r} (use d.get(key, default) when a key may be missing, "
+                         f"or `key in d` to check first)")
+        if isinstance(key, (str, int)):
+            err.focus = repr(key) if isinstance(key, int) else None
+            if isinstance(key, str):
+                err.focus = f'"{key}"'
+        return err
     if isinstance(e, TypeError):
-        return RuntimeErr(f"type error: {msg}")
+        m = re.match(r'can only concatenate str \(not "(\w+)"\) to str', msg)
+        if m:
+            err = RuntimeErr(f"cannot join Str and {_APSI_TYPES.get(m.group(1), m.group(1).capitalize())} with '+'"
+                             + _type_hint(msg))
+            err.focus = "+"
+            return err
+        err = RuntimeErr(f"type error: {msg}" + _type_hint(msg))
+        if "has no len()" in msg:
+            err.focus = "len("
+        elif "item assignment" in msg:
+            err.focus = "["
+        return err
+    if isinstance(e, ValueError) and ("values to unpack" in msg):
+        return RuntimeErr(f"{msg} (the number of names must match the items; for a dict's keys and values "
+                          f"write: for k, v in d.items())")
+    if isinstance(e, ValueError):
+        m = re.match(r"invalid literal for (int|float)\(\)(?: with base \d+)?: (.*)", msg)
+        if m:
+            kind = "whole number" if m.group(1) == "int" else "number"
+            sample = "'42'" if m.group(1) == "int" else "'3.5'"
+            err = RuntimeErr(f"{m.group(2)} is not a {kind}: {m.group(1)}() reads text such as {sample}")
+            err.focus = m.group(1) + "("
+            return err
+        if "could not convert string to float" in msg:
+            err = RuntimeErr(f"{msg.split(': ', 1)[-1]} is not a number: float() reads text such as '3.5'")
+            err.focus = "float("
+            return err
     if isinstance(e, RecursionError):
         return RuntimeErr("maximum recursion depth exceeded")
     return RuntimeErr(f"{type(e).__name__}: {msg}")
@@ -598,6 +681,10 @@ class Interpreter:
             raise RuntimeErr("invalid assignment target")
 
     def set_index(self, obj, idx, v):
+        t = type(obj)
+        if t is dict or t is list:
+            obj[idx] = v
+            return
         if isinstance(obj, np.ndarray) and isinstance(v, Quantity):
             raise UnitError(f"cannot store {dim_name(v.dim)} into a dimensionless tensor")
         if isinstance(obj, np.ndarray) and isinstance(v, Fraction):
@@ -622,6 +709,12 @@ class Interpreter:
         delattr(obj, name)
 
     def set_attr(self, obj, name, v):
+        if obj.__class__ in _PLAIN_SET and name[0] != "_":
+            try:
+                setattr(obj, name, v)
+                return
+            except (AttributeError, TypeError) as e:
+                raise RuntimeErr(f"cannot set attribute '{name}' on {type_name(obj)}: {e}") from None
         if name.startswith("_") and not isinstance(obj, (StructInstance, Record)):
             from .pycompat import check_attr, trusted
             check_attr(self, name)
@@ -638,7 +731,9 @@ class Interpreter:
             obj.fields[name] = v
         else:
             from .stdlib import _safe_setattr
-            _safe_setattr(obj, name, v)
+            _safe_setattr(obj, name, v)                     # refuses modules, classes, functions, built-ins
+            if not name.startswith("_"):
+                _PLAIN_SET.add(obj.__class__)
 
     def ex_AugAssign(self, s, env):
         fn = IOPS[s.op] if s.op in ("|", "&", "<<", ">>", "^") else BINOPS[s.op]
@@ -1481,30 +1576,35 @@ class Interpreter:
 
     def get_attr(self, obj, name):
         c = obj.__class__
-        if c is StructInstance:                                   # fast paths for the most common receivers
+        if (c is str or c is list or c is dict or c in _PLAIN_GET) and name[0] != "_" and name not in _SLOW_NAMES:
+            try:                                                  # text, lists, dicts, class instances …
+                return getattr(obj, name)
+            except AttributeError:
+                raise _no_attr(obj, name) from None
+        if c is StructInstance:                                   # fast path for structs
             f = obj.fields
             if name in f:
                 return f[name]
-        elif (c is list or c is dict or c is str) and name[0] != "_":
-            try:
-                return getattr(obj, name)
-            except AttributeError:
-                raise RuntimeErr(f"{type_name(obj)} has no attribute '{name}'")
         if isinstance(obj, StructInstance):
             if name in obj.fields:
                 return obj.fields[name]
             m = obj.type.methods.get(name)
             if m is not None:
                 return BoundMethod(m, obj)
-            raise RuntimeErr(f"{obj.type.name} has no field or method '{name}'")
+            raise _no_attr(obj, name, f"{obj.type.name} has no field or method '{name}'",
+                           list(obj.fields) + list(obj.type.methods))
         if isinstance(obj, Record):
             if name in obj.fields:
                 return obj.fields[name]
-            raise RuntimeErr(f"record has no field '{name}' (fields: {', '.join(obj.fields)})")
+            raise _no_attr(obj, name, f"record has no field '{name}' (fields: {', '.join(obj.fields)})",
+                           list(obj.fields))
         if isinstance(obj, Namespace):
             if name in obj.members:
                 return obj.members[name]
-            raise NameErr(f"module '{obj.name}' has no member '{name}'")
+            from .errors import did_you_mean
+            err = NameErr(f"module '{obj.name}' has no member '{name}'" + did_you_mean(name, obj.members))
+            err.focus = "." + name
+            raise err
         if isinstance(obj, UnitNamespace):
             return obj.get(name)
         if name.startswith("_"):
@@ -1516,7 +1616,7 @@ class Interpreter:
             try:
                 return getattr(obj, name)
             except AttributeError:
-                raise RuntimeErr(f"{type_name(obj)} has no attribute '{name}'")
+                raise _no_attr(obj, name) from None
         if isinstance(obj, np.ndarray) and name == "shape":
             return tuple(obj.shape)
         if name in _FRAME_ATTRS:
@@ -1528,9 +1628,12 @@ class Interpreter:
                 raise RuntimeErr(f"array.{name}() writes a file without Apsi's permission checks; use "
                                  f"numpy.save() (checked by --allow-write) or run with --allow-python=all")
         try:
-            return getattr(obj, name)
+            v = getattr(obj, name)
         except AttributeError:
-            raise RuntimeErr(f"{type_name(obj)} has no attribute '{name}'")
+            raise _no_attr(obj, name) from None
+        if not isinstance(obj, _NOT_PLAIN):
+            _PLAIN_GET.add(c)                               # next time: straight to getattr (same checks apply)
+        return v
 
     def ev_ListLit(self, n, env):
         out = []

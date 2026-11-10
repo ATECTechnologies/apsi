@@ -86,7 +86,16 @@ class Checker:
             return Info(ops.dim_of(v) if not callable(v) else None, False, None, "builtin")
         if node is not None and not self.pyc:
             # Python-mode programs keep Python's rule: an unknown name is a NameError when (and if) it runs
-            self.err(node, f"'{name}' is not defined", NameErr)
+            from .errors import did_you_mean
+            known = set(self.builtins)
+            s_ = sc
+            while s_ is not None:
+                known.update(s_.names)
+                s_ = s_.parent
+            lit = {"True": "true", "False": "false", "None": "none", "null": "none", "nil": "none", "NULL": "none",
+                   "undefined": "none", "this": "self"}.get(name)
+            hint = f" (Apsi writes '{lit}')" if lit else did_you_mean(name, known)
+            self.err(node, f"'{name}' is not defined" + hint, NameErr)
         return None
 
     def type_dim(self, t, sc, node):
@@ -625,7 +634,12 @@ class Checker:
         if op in ("+", "-", "%", "//"):
             if isD(l) and isD(r) and l != r:
                 verb = {"+": "add", "-": "subtract", "%": "take modulo of", "//": "floor-divide"}[op]
-                self.err(e, f"cannot {verb} {dim_name(l)} and {dim_name(r)}", UnitError)
+                hint = ""
+                if DIMLESS in (l, r):
+                    unit = dim_name(r if l == DIMLESS else l).split("[")[-1].rstrip("]") if "[" in \
+                        dim_name(r if l == DIMLESS else l) else ""
+                    hint = f" (give the number a unit too, e.g. 1[{unit}])" if unit else ""
+                self.err(e, f"cannot {verb} {dim_name(l)} and {dim_name(r)}{hint}", UnitError)
             if op == "//":
                 return DIMLESS if isD(l) and isD(r) else None
             if isD(l):

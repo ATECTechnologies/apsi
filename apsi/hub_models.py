@@ -6,7 +6,9 @@ Architectures (from config.json "model_type" / "architectures"):
   embeddings, sentence similarity, text classification, token classification, fill-mask;
 * decoders — gpt2, llama, mistral, qwen2, qwen3, gemma: text generation with a key/value cache, greedy or sampled.
 
-Weights come from safetensors (also sharded, BF16/F16/F32); they are converted to float32 once and kept.
+Weights come from safetensors (also sharded, BF16/F16/F32). The file is read once, in its own format; a tensor is
+decoded to float32 the first time the processor needs it. On a GPU the bfloat16 weights go to the card as they are,
+so a float32 copy of the model is never made.
 """
 import json
 import math
@@ -55,11 +57,171 @@ def read_safetensors(path):
     return out
 
 
+class _Ref:
+    """A tensor still in its file: read when needed (no RAM is held for it until then)."""
+    __slots__ = ("path", "offset", "shape", "dtype")
+
+    def __init__(self, path, offset, shape, dtype):
+        self.path, self.offset, self.shape, self.dtype = path, offset, tuple(shape), np.dtype(dtype)
+
+    @property
+    def nbytes(self):
+        return int(np.prod(self.shape, dtype=np.int64)) * self.dtype.itemsize
+
+    def load(self):
+        n = int(np.prod(self.shape, dtype=np.int64))
+        a = np.fromfile(self.path, dtype=self.dtype, count=n, offset=self.offset)
+        if a.size != n:
+            raise ModelError(f"{self.path} is shorter than its header says (changed or damaged?)")
+        return a.reshape(self.shape)
+
+    def rows(self, ids):
+        """Some rows of a matrix, read one by one (embedding lookups)."""
+        ids = np.asarray(ids, np.int64).reshape(-1)
+        cols = int(np.prod(self.shape[1:], dtype=np.int64))
+        out = np.empty((ids.size, cols), self.dtype)
+        rb = cols * self.dtype.itemsize
+        with open(self.path, "rb") as fh:
+            for k, i in enumerate(ids):
+                if not 0 <= i < self.shape[0]:
+                    raise IndexError(f"token id {int(i)} is outside the vocabulary ({self.shape[0]})")
+                fh.seek(self.offset + int(i) * rb)
+                out[k] = np.frombuffer(fh.read(rb), self.dtype)
+        return out
+
+
+class Weights:
+    """name -> float32 array, decoded from the checkpoint's own format the first time it is used.
+
+    The file is not read when the model is opened: each tensor is read when first needed (on a GPU, straight to the
+    card, so a whole copy of the model is never held in RAM). raw(name) gives the stored form, ("bf16", uint16
+    array) or ("f32", float32 array); rows(name, ids) reads only some rows (embedding lookups); shape(name) reads
+    nothing."""
+
+    KEEP = 4 << 20                                          # stored tensors up to this size stay in memory once read
+
+    def __init__(self):
+        self._raw = {}
+        self._f32 = {}
+        self.mapped = False                                 # memory-mapped: no float32 cache of big matrices
+
+    def add(self, name, kind, arr):
+        self._raw[name] = (kind, arr)
+        self._f32.pop(name, None)
+
+    def __getitem__(self, name):
+        v = self._f32.get(name)
+        if v is None:
+            kind, arr = self.raw(name)                      # KeyError for a missing weight, like a dict
+            v = _decode(kind, arr)
+            if not self.mapped or v.ndim < 2:               # mapped: big matrices are decoded each time
+                self._f32[name] = v
+        return v
+
+    def get(self, name, default=None):
+        return self[name] if name in self._raw else default
+
+    def __contains__(self, name):
+        return name in self._raw
+
+    def __iter__(self):
+        return iter(self._raw)
+
+    def __len__(self):
+        return len(self._raw)
+
+    def keys(self):
+        return self._raw.keys()
+
+    def items(self):
+        return ((k, self[k]) for k in self._raw)
+
+    def raw_kind(self, name):
+        return self._raw[name][0]
+
+    def raw(self, name):
+        kind, arr = self._raw[name]
+        if isinstance(arr, _Ref):
+            ref = arr
+            arr = ref.load()
+            if ref.nbytes <= self.KEEP:
+                self._raw[name] = (kind, arr)
+        return kind, arr
+
+    def shape(self, name):
+        return tuple(self._raw[name][1].shape)
+
+    def rows(self, name, ids):
+        kind, arr = self._raw[name]
+        if name in self._f32:
+            return self._f32[name][ids]
+        if isinstance(arr, _Ref):
+            shape = np.shape(ids)
+            r = arr.rows(ids)
+            return _decode(kind, r).reshape(*shape, -1)
+        return _decode(kind, arr[ids])
+
+    def renamed(self, fn):
+        w = Weights()
+        w.mapped = self.mapped
+        w._raw = {fn(k): v for k, v in self._raw.items()}
+        w._f32 = {fn(k): v for k, v in self._f32.items()}
+        return w
+
+    def decode_all(self, drop_raw=False):
+        """Everything as float32 (the processor path); drop_raw frees the stored form afterwards."""
+        for k in self._raw:
+            self[k]
+        if drop_raw:
+            self._raw = {k: ("f32", v) for k, v in self._f32.items()}
+
+
+def _decode(kind, arr):
+    if kind == "bf16":
+        a = np.ascontiguousarray(arr)
+        return (a.astype(np.uint32) << np.uint32(16)).view(np.float32)
+    return np.ascontiguousarray(arr, np.float32) if arr.dtype.kind == "f" else np.asarray(arr)
+
+
+def read_safetensors_lazy(path, into=None, mmap=False):
+    """The tensors of a safetensors file in their stored format, read only when used (mmap=True maps the file
+    instead: the operating system pages the weights in from the disk). Returns a Weights."""
+    from .models import _read_header, _ST_TO_NP
+    header, start = _read_header(path)
+    size = os.path.getsize(path)
+    buf = np.memmap(path, dtype=np.uint8, mode="r") if mmap else None
+    W = into if into is not None else Weights()
+    W.mapped = W.mapped or bool(mmap)
+    for name, info in header.items():
+        if name == "__metadata__":
+            continue
+        a, b = info["data_offsets"]
+        if not (0 <= a <= b and start + b <= size):
+            raise ModelError(f"safetensors: tensor '{name}' points outside the file")
+        st, shape = info["dtype"], tuple(info["shape"])
+        if st == "BF16":
+            kind, dt = "bf16", np.uint16
+        elif st in _ST_TO_NP:
+            kind, dt = ("f32" if st == "F32" else st.lower()), _ST_TO_NP[st]
+        else:
+            raise ModelError(f"safetensors: tensor '{name}' has dtype {st}, which the native runner does not read")
+        if int(np.prod(shape, dtype=np.int64)) * np.dtype(dt).itemsize != b - a:
+            raise ModelError(f"safetensors: tensor '{name}' has the wrong size for its shape")
+        if buf is not None:
+            W.add(name, kind, buf[start + a:start + b].view(dt).reshape(shape))
+        else:
+            W.add(name, kind, _Ref(path, start + a, shape, dt))
+    return W
+
+
 def _strip(weights, prefixes):
     """Remove one leading model prefix (bert., roberta., model., transformer. …) when all body weights carry it."""
     for p in prefixes:
         if any(k.startswith(p) for k in weights):
-            return {(k[len(p):] if k.startswith(p) else k): v for k, v in weights.items()}, True
+            fn = lambda k: k[len(p):] if k.startswith(p) else k      # noqa: E731
+            if isinstance(weights, Weights):
+                return weights.renamed(fn), True
+            return {fn(k): v for k, v in weights.items()}, True
     return weights, False
 
 
@@ -270,6 +432,245 @@ class Decoder:
             self.act = _act(cfg.get("hidden_activation") or cfg.get("hidden_act") or "silu")
             self._rope_init(cfg)
         self.window = cfg.get("sliding_window") if cfg.get("use_sliding_window", True) else None
+        self.gpu = None                 # hub_gpu.Runner while the matrices live on a GPU
+        self._gm = {}                   # key -> (GPU matrix, split points): the per-product path
+        self._gl = None                 # per-layer GPU weights: the whole-network path
+
+    # ---------------------------------------------------------------- devices
+    def _groups(self):
+        """key -> weight names multiplied with the same input (fused into one matrix on the GPU)."""
+        out = {}
+        for i in range(self.L):
+            if self.gpt2:
+                p = f"h.{i}."
+                for k in ("attn.c_attn", "attn.c_proj", "mlp.c_fc", "mlp.c_proj"):
+                    out[p + k] = [p + k + ".weight"]
+            else:
+                p = f"model.layers.{i}."
+                out[p + "qkv"] = [p + "self_attn.q_proj.weight", p + "self_attn.k_proj.weight", p + "self_attn.v_proj.weight"]
+                out[p + "o"] = [p + "self_attn.o_proj.weight"]
+                out[p + "gate_up"] = [p + "mlp.gate_proj.weight", p + "mlp.up_proj.weight"]
+                out[p + "down"] = [p + "mlp.down_proj.weight"]
+        out["head"] = [None]
+        return out
+
+    def _head(self):
+        if self.gpt2:
+            return self.W.get("lm_head.weight", self.g("wte.weight"))
+        head = self.W.get("lm_head.weight")
+        return head if head is not None else self.g("model.embed_tokens.weight")
+
+    def _wshape(self, name):
+        if name is None:
+            name = self._head_name()
+        if isinstance(self.W, Weights):
+            return self.W.shape(name)
+        return self.W[name].shape
+
+    def _head_name(self):
+        if self.gpt2:
+            return "lm_head.weight" if "lm_head.weight" in self.W else "wte.weight"
+        return "lm_head.weight" if "lm_head.weight" in self.W else "model.embed_tokens.weight"
+
+    def _bf16(self, names):
+        """[rows, cols] bfloat16 bits (uint16) of these weights stacked by rows, without a float32 copy when the
+        checkpoint is already bfloat16."""
+        from . import hub_gpu
+        parts = []
+        for n in names:
+            kind, arr = self.W.raw(n) if isinstance(self.W, Weights) else ("f32", self.W[n])
+            if kind != "bf16":
+                arr = hub_gpu.to_bf16_pairs(np.asarray(arr, np.float32)).view(np.uint16).reshape(arr.shape)
+            parts.append(arr)
+        return parts[0] if len(parts) == 1 else np.concatenate(parts, 0)
+
+    def _weight(self, name):
+        """[out, in] for x @ W.T (GPT-2 stores [in, out])."""
+        if name is None:
+            return self._head()
+        w = self.g(name)
+        return w.T if self.gpt2 else w
+
+    def to_device(self, device="auto", pending=None, gpu_layers=None):
+        """Put the model on a GPU when one is usable. Returns (device name, reason when it is the processor).
+
+        device="auto": the GPU when there is one; a model larger than the card's free memory runs its first layers
+        on the GPU and the rest on the processor (from RAM, or from the SSD when the weights are memory-mapped).
+        device="cuda": all of it on the GPU, or an error. gpu_layers=N: exactly N layers on the GPU.
+        pending: a hub_gpu.prepare(device) started earlier (the GPU starts up while the weights are read)."""
+        self.release()
+        from . import hub_gpu
+        strict = str(device).lower().startswith(("cuda", "gpu"))
+        r, why = pending.result() if pending is not None else hub_gpu.runner(device)
+        if r is None:
+            if strict:
+                raise ModelError(f"no usable GPU: {why}")
+            return "cpu", why
+        groups = self._groups()
+        need = sum(int(np.prod(self._wshape(n))) * 2 for names in groups.values() for n in names)
+        full_ok = getattr(r, "full", False) and self._full_capable()
+        if not full_ok and need > 0.9 * r.dev.memory:
+            msg = f"the model needs {need / 2 ** 30:.1f} GB on the GPU, which has {r.dev.memory / 2 ** 30:.1f} GB"
+            r.close()
+            if strict:
+                raise ModelError(msg)
+            return "cpu", msg
+        try:
+            placed = self._upload_full(r, strict, gpu_layers) if full_ok else 0
+            if placed == 0 and full_ok:
+                r.close()
+                msg = "not even one layer of the model fits in the GPU's free memory"
+                if strict:
+                    raise ModelError(msg)
+                return "cpu", msg
+            if not full_ok:
+                for key, names in groups.items():
+                    ws = [self._weight(n) for n in names]
+                    m = r.upload(ws[0] if len(ws) == 1 else np.concatenate(ws, 0))
+                    if m is None:
+                        continue
+                    self._gm[key] = (m, list(np.cumsum([w.shape[0] for w in ws])[:-1]))
+        except Exception as e:
+            r.close()
+            self._gm = {}
+            self._gl = None
+            if str(device).lower().startswith(("cuda", "gpu")):
+                raise ModelError(f"could not put the model on the GPU: {e}")
+            return "cpu", f"{type(e).__name__}: {e}"
+        self.gpu = r
+        name = f"cuda:{r.dev.index} ({r.name})"
+        if self._gl is not None and self._ng < self.L:
+            return f"{name} + cpu ({self._ng} of {self.L} layers on the GPU)", \
+                f"the model is larger than the GPU's free memory: {self.L - self._ng} layers run on the processor"
+        return name, ""
+
+    def release(self):
+        self.__dict__.pop("_last", None)
+        if self.gpu is not None:
+            self.gpu.close()
+        self.gpu = None
+        self._gm = {}
+        self._gl = None
+
+    @property
+    def full(self):
+        """True while the whole network (weights, cache, attention) runs on the GPU."""
+        return self.gpu is not None and self._gl is not None
+
+    def _act_kind(self):
+        name = (self.cfg.get("hidden_activation") or self.cfg.get("hidden_act") or "silu").lower()
+        if name in ("silu", "swish"):
+            return 0
+        if name in ("gelu_new", "gelu_pytorch_tanh", "gelu_fast", "gelu_tanh"):
+            return 1
+        return None
+
+    def _full_capable(self):
+        from .hub_gpu import MAX_DH
+        if self.gpt2 or self._act_kind() is None or self.nh % self.kvh or self.dh > MAX_DH or self.dh % 4:
+            return False
+        names = [self._head_name()]
+        for i in range(self.L):
+            p = f"model.layers.{i}."
+            names += [p + f"self_attn.{n}_proj.weight" for n in "qkv"] + [
+                p + "self_attn.o_proj.weight", p + "mlp.gate_proj.weight", p + "mlp.up_proj.weight",
+                p + "mlp.down_proj.weight"]
+        return all(n in self.W and len(self._wshape(n)) == 2 and self._wshape(n)[1] % 2 == 0 for n in names)
+
+    def _layer_bytes(self, i):
+        p = f"model.layers.{i}."
+        return 2 * sum(int(np.prod(self._wshape(p + n))) for n in (
+            "self_attn.q_proj.weight", "self_attn.k_proj.weight", "self_attn.v_proj.weight", "self_attn.o_proj.weight",
+            "mlp.gate_proj.weight", "mlp.up_proj.weight", "mlp.down_proj.weight"))
+
+    def _upload_full(self, r, strict=False, gpu_layers=None):
+        """The weights on the GPU for the whole-network path: all layers when they fit, else the first ones that do
+        (the rest run on the processor). Returns the number of layers placed."""
+        W = self.W
+        head_bytes = 2 * int(np.prod(self._wshape(None)))
+        kv_tokens = min(self.ctx, 8192)
+        kv_bytes = 2 * 4 * self.kvh * self.dh * kv_tokens * self.L     # room for the cache to grow into
+        free = r.free_memory()
+        budget = free - head_bytes - kv_bytes - (384 << 20)
+        n = 0
+        used = 0
+        for i in range(self.L):
+            b = self._layer_bytes(i)
+            if used + b > budget:
+                break
+            used += b
+            n += 1
+        if gpu_layers is not None:
+            n = max(0, min(int(gpu_layers), self.L))
+        elif strict and n < self.L:
+            need = (sum(self._layer_bytes(i) for i in range(self.L)) + head_bytes + kv_bytes) / 2 ** 30
+            raise ModelError(f"the model needs about {need:.1f} GB on the GPU, which has {free / 2 ** 30:.1f} GB free"
+                             " (device=\"auto\" puts what fits on the GPU and the rest on the processor)")
+        if n == 0:
+            return 0
+        layers = []
+        for i in range(n):
+            p = f"model.layers.{i}."
+            qkv = [p + f"self_attn.{x}_proj.weight" for x in "qkv"]
+            L = {"qkv": r.matrix(self._bf16(qkv)), "o": r.matrix(self._bf16([p + "self_attn.o_proj.weight"])),
+                 "gu": r.matrix(self._bf16([p + "mlp.gate_proj.weight", p + "mlp.up_proj.weight"])),
+                 "down": r.matrix(self._bf16([p + "mlp.down_proj.weight"]))}
+            bias = [W.get(p + f"self_attn.{x}_proj.bias") for x in "qkv"]
+            L["qkv_b"] = r.vec(np.concatenate([b if b is not None else np.zeros(self._wshape(w)[0], np.float32)
+                                               for b, w in zip(bias, qkv)])) if any(b is not None for b in bias) else None
+            ob = W.get(p + "self_attn.o_proj.bias")
+            L["o_b"] = r.vec(ob) if ob is not None else None
+            L["ln1"] = r.vec(self.g(p + "input_layernorm.weight"))
+            L["ln2"] = r.vec(self.g(p + "post_attention_layernorm.weight"))
+            qn = W.get(p + "self_attn.q_norm.weight")
+            L["qn"] = r.vec(qn) if qn is not None else None
+            L["kn"] = r.vec(W[p + "self_attn.k_norm.weight"]) if qn is not None else None
+            L["I"] = self._wshape(p + "mlp.down_proj.weight")[1]
+            layers.append(L)
+        self._gnorm = r.vec(self.g("model.norm.weight"))
+        self._ghead = r.matrix(self._bf16([self._head_name()]))
+        self._gl = layers
+        self._ng = n
+        return n
+
+    def _prepare_cpu(self):
+        """bfloat16 matrices stacked like on the GPU, for the native product on the processor (half the memory
+        and time of float32). Only for bfloat16 checkpoints; otherwise the float32 path stays."""
+        self._cm = {}
+        self._cm_ready = True
+        if self.gpt2 or not isinstance(self.W, Weights):
+            return False
+        from . import hub_cpu
+        groups = self._groups()
+        names = [n for ns in groups.values() for n in ns]
+        if not all(self.W.raw_kind(n if n else self._head_name()) == "bf16" for n in names):
+            return False
+        if not hub_cpu.available():
+            return False
+        for key, ns in groups.items():
+            ns = [n if n else self._head_name() for n in ns]
+            self._cm[key] = (self._bf16(ns), list(np.cumsum([self._wshape(n)[0] for n in ns])[:-1]))
+        return True
+
+    def _mm(self, x, key, names):
+        """[x @ W.T for each named weight]; one fused product on the GPU."""
+        if self.gpu is None:
+            if not self.__dict__.get("_cm_ready"):
+                self._prepare_cpu()
+            if key in self._cm:
+                from . import hub_cpu
+                w, cuts = self._cm[key]
+                y = hub_cpu.matmul(x, w)
+                return np.split(y, cuts, -1) if cuts else [y]
+        if self.gpu is not None and key in self._gm:
+            m, cuts = self._gm[key]
+            try:
+                y = self.gpu.matmul(x, m)
+                return np.split(y, cuts, -1) if cuts else [y]
+            except Exception as e:                          # a driver error: carry on on the processor
+                _gpu_gave_up(e)
+                self.release()
+        return [x @ self._weight(n).T for n in names]
 
     def g(self, name):
         v = self.W.get(name)
@@ -309,10 +710,150 @@ class Decoder:
         return np.concatenate([out, rest], -1) if rest.shape[-1] else out
 
     def new_cache(self):
+        if self.full:
+            return _GpuCache(self)
         return [[None, None] for _ in range(self.L)]
 
-    def forward(self, ids, cache, start):
-        """Logits for ids [1, T] given `start` tokens already in the cache (which is updated)."""
+    CHUNK = 512                       # prompt positions per pass on the GPU (most; fewer when the context is long)
+    SCRATCH = 256 << 20               # bytes of attention scores per pass at most
+
+    def _forward_gpu(self, ids, cache, start, last, fetch=True):
+        r = self.gpu
+        ids = np.atleast_2d(np.asarray(ids, np.int64))
+        Tall = ids.shape[1]
+        cache.ensure(start + Tall)
+        r.begin()
+        H, nh, kvh, dh = self.H, self.nh, self.kvh, self.dh
+        width = (nh + 2 * kvh) * dh
+        half = self.rot // 2
+        eps, off = self.eps, (1.0 if self.gemma else 0.0)
+        sc = self.cfg.get("query_pre_attn_scalar")
+        scale = 1.0 / math.sqrt(sc) if sc else 1.0 / math.sqrt(dh)
+        kind = self._act_kind()
+        V = self._ghead.rows
+        outs = []
+        c0 = 0
+        while c0 < Tall:
+            T = min(self.CHUNK, Tall - c0)
+            while T > 64 and 4 * self.nh * T * (start + c0 + T) > self.SCRATCH:
+                T //= 2
+            c = ids[0, c0:c0 + T]
+            s0 = start + c0
+            c0 += T
+            if c.size and (int(c.min()) < 0 or int(c.max()) >= V):
+                raise ModelError(f"token id {int(c.max()) if c.max() >= V else int(c.min())} is outside the "
+                                 f"vocabulary of {V} tokens")
+            X = r.ws("x", T * H)
+            if self._head_name() == "model.embed_tokens.weight" and hasattr(r, "embed"):
+                r.embed(self._ghead, c, X, math.sqrt(H) if self.gemma else 1.0)   # tied: the head is the table
+            else:
+                x = self.W.rows("model.embed_tokens.weight", c) if isinstance(self.W, Weights) \
+                    else self.g("model.embed_tokens.weight")[c]
+                if self.gemma:
+                    x = x * np.float32(math.sqrt(H))
+                r.put(X, np.asarray(x, np.float32).reshape(-1))
+            COS, SIN = cache.cos, cache.sin
+            QKV = r.ws("qkv", T * width)
+            Q, O = r.ws("q", T * nh * dh), r.ws("o", T * nh * dh)
+            S = r.ws("s", nh * T * (s0 + T))
+            if self._ng < self.L:                      # the layers that did not fit run on the processor
+                pos = np.arange(s0, s0 + T)
+                causal = np.triu(np.full((T, s0 + T), -1e9, np.float32), k=s0 + 1)
+                if self.window and s0 + T > self.window:
+                    causal = causal + np.where(pos[:, None] - np.arange(s0 + T)[None, :] >= self.window,
+                                               np.float32(-1e9), 0)
+            for i, Ld in enumerate(self._gl):
+                I = Ld["I"]
+                GU, M = r.ws("gu", T * 2 * I), r.ws("m", T * I)
+                r.linear(Ld["qkv"], X, QKV, T, bias=Ld["qkv_b"], ln=Ld["ln1"], eps=eps, off=off)
+                r.qkv_prep(QKV, Q, cache.K[i], cache.V[i], COS, SIN, Ld["qn"], Ld["kn"], T, nh, kvh, dh, self.rot,
+                           s0, cache.cap, eps)
+                r.attention(Q, cache.K[i], cache.V[i], O, S, T, nh, kvh, dh, s0, cache.cap, self.window, scale)
+                r.linear(Ld["o"], O, X, T, bias=Ld["o_b"], acc=True)
+                r.linear(Ld["gu"], X, GU, T, ln=Ld["ln2"], eps=eps, off=off)
+                r.act_mul(GU, M, T, I, kind)
+                r.linear(Ld["down"], M, X, T, acc=True)
+            if self._ng < self.L:
+                x = r.get(X, T * H).reshape(1, T, H)
+                for i in range(self._ng, self.L):
+                    x = self._layer(i, x, cache.cpu, pos, causal, T)
+                r.put(X, np.ascontiguousarray(x, np.float32).reshape(-1))
+            if last and c0 < Tall:
+                continue
+            rows, first = (1, T - 1) if last else (T, 0)
+            LOG = r.ws("log", rows * V)
+            r.linear(self._ghead, X, LOG, rows, ln=self._gnorm, eps=eps, off=off, xoff=first * H)
+            if not fetch and last:
+                return None                         # the scores stay on the card (sampling there)
+            outs.append(r.get(LOG, rows * V).reshape(rows, V))
+        logits = np.concatenate(outs)[None]
+        cap = self.cfg.get("final_logit_softcapping")
+        if cap:
+            logits = np.tanh(logits / cap) * cap
+        return logits
+
+    def _layer(self, i, x, cache, pos, causal, T):
+        """One transformer block on the processor (cache[i] holds its keys and values)."""
+        W = self.W
+        if self.gpt2:
+            p = f"h.{i}."
+            h = _ln(x, self.g(p + "ln_1.weight"), self.g(p + "ln_1.bias"), self.eps)
+            qkv = self._mm(h, p + "attn.c_attn", [p + "attn.c_attn.weight"])[0] + self.g(p + "attn.c_attn.bias")
+            q, k, v = np.split(qkv, 3, axis=-1)
+        else:
+            p = f"model.layers.{i}."
+            h = _rms(x, self.g(p + "input_layernorm.weight"), self.eps, 1.0 if self.gemma else 0.0)
+            q, k, v = self._mm(h, p + "qkv", [p + "self_attn.q_proj.weight", p + "self_attn.k_proj.weight",
+                                              p + "self_attn.v_proj.weight"])
+            for name in ("q", "k", "v"):
+                bias = W.get(p + f"self_attn.{name}_proj.bias")
+                if bias is not None:
+                    if name == "q":
+                        q = q + bias
+                    elif name == "k":
+                        k = k + bias
+                    else:
+                        v = v + bias
+        q = q.reshape(1, T, self.nh, self.dh).transpose(0, 2, 1, 3)
+        k = k.reshape(1, T, self.kvh, self.dh).transpose(0, 2, 1, 3)
+        v = v.reshape(1, T, self.kvh, self.dh).transpose(0, 2, 1, 3)
+        if not self.gpt2:
+            if p + "self_attn.q_norm.weight" in W:             # Qwen3: per-head RMSNorm before RoPE
+                q = _rms(q, W[p + "self_attn.q_norm.weight"], self.eps)
+                k = _rms(k, W[p + "self_attn.k_norm.weight"], self.eps)
+            q = self._rope(q, pos)
+            k = self._rope(k, pos)
+        ck, cv = cache[i]
+        k = k if ck is None else np.concatenate([ck, k], 2)
+        v = v if cv is None else np.concatenate([cv, v], 2)
+        cache[i] = [k, v]
+        rep = self.nh // self.kvh
+        kk = np.repeat(k, rep, axis=1) if rep > 1 else k
+        vv = np.repeat(v, rep, axis=1) if rep > 1 else v
+        scale = self.cfg.get("query_pre_attn_scalar")
+        scale = 1.0 / math.sqrt(scale) if scale else 1.0 / math.sqrt(self.dh)
+        att = _softmax(q @ kk.transpose(0, 1, 3, 2) * scale + causal)
+        o = (att @ vv).transpose(0, 2, 1, 3).reshape(1, T, self.nh * self.dh)
+        if self.gpt2:
+            x = x + (self._mm(o, p + "attn.c_proj", [p + "attn.c_proj.weight"])[0] + self.g(p + "attn.c_proj.bias"))
+            h = _ln(x, self.g(p + "ln_2.weight"), self.g(p + "ln_2.bias"), self.eps)
+            m = _gelu_tanh(self._mm(h, p + "mlp.c_fc", [p + "mlp.c_fc.weight"])[0] + self.g(p + "mlp.c_fc.bias"))
+            x = x + (self._mm(m, p + "mlp.c_proj", [p + "mlp.c_proj.weight"])[0] + self.g(p + "mlp.c_proj.bias"))
+        else:
+            o = self._mm(o, p + "o", [p + "self_attn.o_proj.weight"])[0]
+            ob = W.get(p + "self_attn.o_proj.bias")
+            x = x + (o + ob if ob is not None else o)
+            h = _rms(x, self.g(p + "post_attention_layernorm.weight"), self.eps, 1.0 if self.gemma else 0.0)
+            gate, up = self._mm(h, p + "gate_up", [p + "mlp.gate_proj.weight", p + "mlp.up_proj.weight"])
+            x = x + self._mm(self.act(gate) * up, p + "down", [p + "mlp.down_proj.weight"])[0]
+        return x
+
+    def forward(self, ids, cache, start, last=False, fetch=True):
+        """Logits for ids [1, T] given `start` tokens already in the cache (which is updated).
+        last=True: only for the last position (all that generation needs)."""
+        if isinstance(cache, _GpuCache):
+            with self._lock:
+                return self._forward_gpu(ids, cache, start, last, fetch)
         ids = np.atleast_2d(np.asarray(ids, np.int64))
         T = ids.shape[1]
         pos = np.arange(start, start + T)
@@ -320,7 +861,8 @@ class Decoder:
         if self.gpt2:
             x = self.g("wte.weight")[ids] + self.g("wpe.weight")[pos]
         else:
-            x = self.g("model.embed_tokens.weight")[ids]
+            x = self.W.rows("model.embed_tokens.weight", ids) if isinstance(self.W, Weights) \
+                else self.g("model.embed_tokens.weight")[ids]
             if self.gemma:
                 x = x * np.float32(math.sqrt(self.H))
         total = start + T
@@ -330,56 +872,14 @@ class Decoder:
             kpos = np.arange(total)[None, :]
             causal = causal + np.where(qpos - kpos >= self.window, np.float32(-1e9), 0)
         for i in range(self.L):
-            if self.gpt2:
-                p = f"h.{i}."
-                h = _ln(x, self.g(p + "ln_1.weight"), self.g(p + "ln_1.bias"), self.eps)
-                qkv = h @ self.g(p + "attn.c_attn.weight") + self.g(p + "attn.c_attn.bias")
-                q, k, v = np.split(qkv, 3, axis=-1)
-            else:
-                p = f"model.layers.{i}."
-                h = _rms(x, self.g(p + "input_layernorm.weight"), self.eps, 1.0 if self.gemma else 0.0)
-                q = _lin(h, self.g(p + "self_attn.q_proj.weight"), W.get(p + "self_attn.q_proj.bias"))
-                k = _lin(h, self.g(p + "self_attn.k_proj.weight"), W.get(p + "self_attn.k_proj.bias"))
-                v = _lin(h, self.g(p + "self_attn.v_proj.weight"), W.get(p + "self_attn.v_proj.bias"))
-            q = q.reshape(1, T, self.nh, self.dh).transpose(0, 2, 1, 3)
-            k = k.reshape(1, T, self.kvh, self.dh).transpose(0, 2, 1, 3)
-            v = v.reshape(1, T, self.kvh, self.dh).transpose(0, 2, 1, 3)
-            if not self.gpt2:
-                if p + "self_attn.q_norm.weight" in W:             # Qwen3: per-head RMSNorm before RoPE
-                    q = _rms(q, W[p + "self_attn.q_norm.weight"], self.eps)
-                    k = _rms(k, W[p + "self_attn.k_norm.weight"], self.eps)
-                q = self._rope(q, pos)
-                k = self._rope(k, pos)
-            ck, cv = cache[i]
-            k = k if ck is None else np.concatenate([ck, k], 2)
-            v = v if cv is None else np.concatenate([cv, v], 2)
-            cache[i] = [k, v]
-            rep = self.nh // self.kvh
-            kk = np.repeat(k, rep, axis=1) if rep > 1 else k
-            vv = np.repeat(v, rep, axis=1) if rep > 1 else v
-            scale = self.cfg.get("query_pre_attn_scalar")
-            scale = 1.0 / math.sqrt(scale) if scale else 1.0 / math.sqrt(self.dh)
-            att = _softmax(q @ kk.transpose(0, 1, 3, 2) * scale + causal)
-            o = (att @ vv).transpose(0, 2, 1, 3).reshape(1, T, self.nh * self.dh)
-            if self.gpt2:
-                x = x + (o @ self.g(p + "attn.c_proj.weight") + self.g(p + "attn.c_proj.bias"))
-                h = _ln(x, self.g(p + "ln_2.weight"), self.g(p + "ln_2.bias"), self.eps)
-                m = _gelu_tanh(h @ self.g(p + "mlp.c_fc.weight") + self.g(p + "mlp.c_fc.bias"))
-                x = x + (m @ self.g(p + "mlp.c_proj.weight") + self.g(p + "mlp.c_proj.bias"))
-            else:
-                x = x + _lin(o, self.g(p + "self_attn.o_proj.weight"), W.get(p + "self_attn.o_proj.bias"))
-                h = _rms(x, self.g(p + "post_attention_layernorm.weight"), self.eps, 1.0 if self.gemma else 0.0)
-                m = self.act(_lin(h, self.g(p + "mlp.gate_proj.weight"))) * _lin(h, self.g(p + "mlp.up_proj.weight"))
-                x = x + _lin(m, self.g(p + "mlp.down_proj.weight"))
+            x = self._layer(i, x, cache, pos, causal, T)
+        if last:
+            x = x[:, -1:]
         if self.gpt2:
             x = _ln(x, self.g("ln_f.weight"), self.g("ln_f.bias"), self.eps)
-            head = W.get("lm_head.weight", self.g("wte.weight"))
         else:
             x = _rms(x, self.g("model.norm.weight"), self.eps, 1.0 if self.gemma else 0.0)
-            head = W.get("lm_head.weight")
-            if head is None:
-                head = self.g("model.embed_tokens.weight")
-        logits = x @ head.T
+        logits = self._mm(x, "head", [None])[0]
         cap = self.cfg.get("final_logit_softcapping")
         if cap:
             logits = np.tanh(logits / cap) * cap
@@ -387,43 +887,263 @@ class Decoder:
 
     def generate(self, ids, max_new_tokens=64, temperature=0.0, top_k=0, top_p=1.0, eos=None, seed=None,
                  repetition_penalty=1.0, stream=None):
+        """Token ids after `ids`. On a GPU, a failure part way is recovered from: out of memory frees the scratch
+        space and goes on in smaller steps; any other driver error moves the model to the processor, which carries on
+        from the tokens already produced (stream sees every token once)."""
         ids = list(np.asarray(ids).reshape(-1))
+        out = []
+        with self._lock:
+            tries = 0
+            while True:
+                more = []
+                try:
+                    self._generate(ids + out, more, max_new_tokens - len(out), temperature, top_k, top_p, eos, seed,
+                                   repetition_penalty, stream)
+                    out += more
+                    return out
+                except Exception as e:
+                    out += more
+                    if self.gpu is None or isinstance(e, ModelError):
+                        raise
+                    tries += 1
+                    if _out_of_memory(e) and tries == 1:
+                        self.gpu.trim()                    # scratch buffers go; retry on the GPU in small passes
+                        self.CHUNK = 64
+                        continue
+                    _gpu_gave_up(e)
+                    self.release()
+
+    @property
+    def _lock(self):
+        lk = self.__dict__.get("_lk")
+        if lk is None:
+            import threading
+            lk = self.__dict__.setdefault("_lk", threading.RLock())
+        return lk
+
+    def _generate(self, ids, out, max_new_tokens, temperature, top_k, top_p, eos, seed, repetition_penalty, stream):
+        ids = list(ids)
         if len(ids) + max_new_tokens > self.ctx:
             max_new_tokens = max(0, self.ctx - len(ids))
         rng = np.random.default_rng(seed)
-        cache = self.new_cache()
-        logits = self.forward(np.array([ids]), cache, 0)[0, -1]
-        out = []
+        cache, done = self._reuse(ids)                      # a conversation's earlier turns are already computed
+        on_gpu = isinstance(cache, _GpuCache) and bool(temperature) and getattr(self.gpu, "sample_prep", None)
+        fed = list(ids)
+        self._last = None
+        logits = self.forward(np.array([ids[done:]]), cache, done, last=True, fetch=not on_gpu)
+        self._last = (cache, fed)
+        V = self._ghead.rows if on_gpu else len(logits[0, -1])
+        seen = np.zeros(V, bool)                            # tokens the repetition penalty applies to
+        seen[[t for t in ids if 0 <= t < len(seen)]] = True
+        seen_ids, n_seen = None, [int(seen.sum())]
+        if on_gpu:                                          # sampling on the card: only candidates come back
+            SEEN = self.gpu.ws("seen", V)
+            self.gpu.put(SEEN, seen.astype(np.float32) if repetition_penalty != 1.0 else np.zeros(V, np.float32))
         eos = set([eos] if isinstance(eos, int) else (eos or []))
-        for _ in range(int(max_new_tokens)):
-            lg = logits.astype(np.float64)
-            if repetition_penalty != 1.0:
-                for t in set(ids + out):
-                    lg[t] = lg[t] / repetition_penalty if lg[t] > 0 else lg[t] * repetition_penalty
-            if not temperature:
-                nxt = int(np.argmax(lg))
-            else:
-                lg = lg / temperature
-                if top_k:
-                    kth = np.partition(lg, -int(top_k))[-int(top_k)]
-                    lg = np.where(lg < kth, -np.inf, lg)
-                pr = _softmax(lg)
-                if top_p < 1.0:
-                    order = np.argsort(-pr)
-                    c = np.cumsum(pr[order])
-                    keep = order[:max(1, int(np.searchsorted(c, top_p)) + 1)]
-                    mask = np.zeros_like(pr)
-                    mask[keep] = 1
-                    pr = pr * mask
-                    pr = pr / pr.sum()
-                nxt = int(rng.choice(len(pr), p=pr))
+        for step in range(int(max_new_tokens)):
+            nxt = self._sample_gpu(SEEN, V, temperature, top_k, top_p, repetition_penalty, rng) if on_gpu else None
+            if nxt is None:
+                lg = np.array(self.gpu.get(self.gpu.ws("log", V), V) if on_gpu else logits[0, -1], np.float32)
+                if repetition_penalty != 1.0:
+                    if seen_ids is None or len(seen_ids) != n_seen[0]:
+                        seen_ids = np.flatnonzero(seen)
+                    s = lg[seen_ids]
+                    lg[seen_ids] = np.where(s > 0, s / repetition_penalty, s * repetition_penalty)
+                if not temperature:
+                    nxt = int(np.argmax(lg))
+                else:
+                    nxt = _sample(lg, temperature, top_k, top_p, rng)
             if nxt in eos:
                 break
             out.append(nxt)
+            if nxt < len(seen) and not seen[nxt]:
+                seen[nxt] = True
+                n_seen[0] += 1
+                if on_gpu and repetition_penalty != 1.0:
+                    self.gpu.put(SEEN, np.ones(1, np.float32), nxt)
             if stream is not None:
                 stream(nxt)
-            logits = self.forward(np.array([[nxt]]), cache, len(ids) + len(out) - 1)[0, -1]
-        return out
+            if step + 1 == int(max_new_tokens):
+                break                                       # the last token needs no forward pass
+            self._last = None
+            logits = self.forward(np.array([[nxt]]), cache, len(fed), last=True, fetch=not on_gpu)
+            fed.append(nxt)
+            self._last = (cache, fed)
+
+    def _reuse(self, ids):
+        """(cache, positions in it to keep): the cache of the last generation when it starts with the same tokens
+        (a conversation re-sends its earlier turns), else a new one. At least one token is always recomputed."""
+        last = self.__dict__.get("_last")
+        if last is not None:
+            cache, fed = last
+            if isinstance(cache, _GpuCache) == self.full and (not isinstance(cache, _GpuCache) or cache.r is self.gpu):
+                n = 0
+                lim = min(len(fed), len(ids) - 1)
+                while n < lim and fed[n] == ids[n]:
+                    n += 1
+                if n >= 16:
+                    if isinstance(cache, _GpuCache):
+                        cache.cpu = [[k[:, :, :n] if k is not None else None, v[:, :, :n] if v is not None else None]
+                                     for k, v in cache.cpu]
+                    else:
+                        cache = [[k[:, :, :n] if k is not None else None, v[:, :, :n] if v is not None else None]
+                                 for k, v in cache]
+                    return cache, n
+        return self.new_cache(), 0
+
+    DELTA = 16.0                     # candidates: within e^16 of the most likely token (after the temperature)
+    CANDIDATES = 4096
+
+    def _sample_gpu(self, SEEN, V, temperature, top_k, top_p, rp, rng):
+        """The next token from the logits left on the GPU, or None when the processor must look at all of them
+        (a very flat distribution). Same choice rule as _sample."""
+        g, Z, ids, vals, count = self.gpu.sample_prep(self.gpu.ws("log", V), SEEN, V, float(rp), 1.0 / temperature,
+                                                      self.DELTA, self.CANDIDATES)
+        if count > self.CANDIDATES or count == 0:
+            return None
+        e = np.exp((vals.astype(np.float64) - g))
+        order = np.lexsort((ids, -e))                       # most likely first; ties by id (reproducible)
+        ids, e = ids[order], e[order]
+        if top_k and int(top_k) < V:
+            if count < int(top_k):
+                return None
+            ids, e = ids[:int(top_k)], e[:int(top_k)]
+            Z = float(e.sum())
+        if top_p < 1.0:
+            c = np.cumsum(e) / Z
+            if c[-1] < top_p:
+                return None
+            keep = max(1, int(np.searchsorted(c, top_p)) + 1)
+            ids, e = ids[:keep], e[:keep]
+        elif not top_k and e.sum() < Z * (1 - 1e-6):        # plain temperature sampling needs every token
+            return None
+        w = np.cumsum(e)
+        return int(ids[min(np.searchsorted(w, rng.random() * w[-1], side="right"), ids.size - 1)])
+
+
+def _out_of_memory(e):
+    t = str(e).upper()
+    return "OUT_OF_MEMORY" in t or "OUT OF MEMORY" in t or "CUDA ERROR 2:" in t or "CUDA ERROR 2 " in t
+
+
+_WARNED = set()
+
+
+def _gpu_gave_up(e):
+    """Say once per kind of failure that the model moved to the processor (APSI_QUIET=1 says nothing)."""
+    import sys
+    key = type(e).__name__ + str(e)[:80]
+    if key in _WARNED or os.environ.get("APSI_QUIET", "").strip() in ("1", "true", "yes"):
+        return
+    _WARNED.add(key)
+    print(f"apsi hub: the graphics card stopped working ({e}); the model carries on on the processor.",
+          file=sys.stderr)
+
+
+def _sample(lg, temperature, top_k, top_p, rng):
+    """One token from logits with temperature, top-k and nucleus (top-p) filtering. Only the few hundred most likely
+    tokens are sorted (a full sort of a 150,000-token vocabulary costs more than a GPU forward pass); when they do
+    not reach top_p, everything is. float32 throughout except the running sums."""
+    lg = np.asarray(lg, np.float32)
+    V = lg.size
+    inv = np.float32(1.0 / temperature)
+    pool = None
+    if top_k and int(top_k) < V:
+        kk = int(top_k)
+        pool = np.argpartition(lg, V - kk)[V - kk:]
+        kth = lg[pool].min()
+        pool = np.flatnonzero(lg >= kth)                       # ties at the edge stay in, as before
+    mx = lg.max()
+    if top_p < 1.0 or pool is not None:
+        Z = None if pool is not None else float(np.exp((lg - mx) * inv).sum(dtype=np.float64))
+        n = 256
+        while True:
+            cand = pool
+            if cand is None:
+                cand = np.argpartition(lg, V - n)[V - n:] if n < V else np.arange(V)
+            e = np.exp((lg[cand] - mx) * inv)
+            if Z is None:
+                Z = float(e.sum(dtype=np.float64))
+            order = np.argsort(-e, kind="stable")
+            cand, e = cand[order], e[order]
+            c = np.cumsum(e, dtype=np.float64) / Z
+            if top_p >= 1.0 or c[-1] >= top_p or pool is not None or cand.size >= V:
+                break
+            n = min(V, n * 8)                          # a flat distribution: look at more of the tail
+        if top_p < 1.0:
+            keep = max(1, int(np.searchsorted(c, top_p)) + 1)
+            cand, e = cand[:keep], e[:keep]
+        w = np.cumsum(e, dtype=np.float64)
+        return int(cand[min(np.searchsorted(w, rng.random() * w[-1], side="right"), cand.size - 1)])
+    e = np.exp((lg - mx) * inv)
+    w = np.cumsum(e, dtype=np.float64)
+    return int(min(np.searchsorted(w, rng.random() * w[-1], side="right"), V - 1))
+
+
+class _GpuCache:
+    """Keys and values of every layer in GPU memory, [kv heads, capacity, head dim], growing as needed."""
+
+    def __init__(self, dec):
+        self.dec = dec
+        self.r = dec.gpu
+        self.cap = 0
+        self.K, self.V = [], []
+        self.cpu = [[None, None] for _ in range(dec.L)]       # layers that run on the processor
+        self.cos = self.sin = None
+        self.rope_n = 0
+
+    def _rope(self, need):
+        """cos / sin of every position up to the cache's capacity, on the card once (not per token)."""
+        d = self.dec
+        n = min(d.ctx, max(need, 2 * self.cap, 256))
+        if n <= self.rope_n:
+            return
+        half = max(d.rot // 2, 1)
+        f = np.outer(np.arange(n), d.inv_freq) if d.rot // 2 else np.zeros((n, 1))
+        for name in ("cos", "sin"):
+            old = getattr(self, name)
+            if old is not None:
+                self.r.free(old)
+            buf = self.r.alloc(n * half)
+            self.r.put(buf, (np.cos(f) if name == "cos" else np.sin(f)).astype(np.float32).reshape(-1))
+            setattr(self, name, buf)
+        self.rope_n = n
+
+    def ensure(self, need):
+        if need <= self.cap:
+            return
+        self._rope(need)
+        d = self.dec
+        if need > d.ctx:
+            raise ModelError(f"the text is longer than the model's window ({d.ctx} tokens)")
+        new = min(d.ctx, max(need, 2 * self.cap, 256))
+        r, kvh, dh = self.r, d.kvh, d.dh
+        K, V = [], []
+        for i in range(d._ng):
+            k, v = r.alloc(kvh * new * dh), r.alloc(kvh * new * dh)
+            if self.cap:
+                for h in range(kvh):
+                    r.copy(k, h * new * dh, self.K[i], h * self.cap * dh, self.cap * dh)
+                    r.copy(v, h * new * dh, self.V[i], h * self.cap * dh, self.cap * dh)
+                r.free(self.K[i])
+                r.free(self.V[i])
+            K.append(k)
+            V.append(v)
+        self.K, self.V, self.cap = K, V, new
+
+    def free(self):
+        for b in self.K + self.V + [x for x in (self.cos, self.sin) if x is not None]:
+            try:
+                self.r.free(b)
+            except Exception:
+                pass
+        self.K, self.V, self.cap = [], [], 0
+
+    def __del__(self):
+        try:
+            self.free()
+        except Exception:
+            pass
 
 
 # ======================================================================================== loading
@@ -441,15 +1161,16 @@ def build(cfg, weights):
                      "use hf_pipeline with --allow-python")
 
 
-def load_folder(folder):
+def load_folder(folder, mmap=False):
+    """(config, Weights): the checkpoint read in its stored format (see Weights)."""
     with open(os.path.join(folder, "config.json"), encoding="utf-8") as fh:
         cfg = json.load(fh)
-    W = {}
+    W = Weights()
     idx = os.path.join(folder, "model.safetensors.index.json")
     if os.path.exists(idx):
         with open(idx, encoding="utf-8") as fh:
             for shard in sorted(set(json.load(fh)["weight_map"].values())):
-                W.update(read_safetensors(os.path.join(folder, shard)))
+                read_safetensors_lazy(os.path.join(folder, shard), W, mmap)
     else:
-        W.update(read_safetensors(os.path.join(folder, "model.safetensors")))
+        read_safetensors_lazy(os.path.join(folder, "model.safetensors"), W, mmap)
     return cfg, W

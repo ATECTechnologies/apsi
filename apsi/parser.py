@@ -4,7 +4,7 @@ from fractions import Fraction
 
 from . import ast as A
 from .errors import ParseError, UnitError
-from .lexer import (tokenize, NUMBER, STRING, FSTRING, NAME, KW, OP, UNIT, NEWLINE, INDENT,
+from .lexer import (Token, tokenize, NUMBER, STRING, FSTRING, NAME, KW, OP, UNIT, NEWLINE, INDENT,
                     DEDENT, EOF, BYTES)
 from .units import parse_unit
 
@@ -91,7 +91,16 @@ class Parser:
 
     def expect_op(self, v, ctx=""):
         if not self.at_op(v):
-            self.error(f"expected '{v}'{ctx}, found {self._desc(self.peek())}")
+            tok = self.peek()
+            prev = self.t[self.i - 1] if self.i > 0 else None
+            if v == ":" and tok.type == OP and tok.value == "=":
+                self.error(f"expected ':'{ctx}, found '=' (to compare two values write ==)")
+            if v in ")]}" and prev is not None and tok.line > prev.line:
+                # the bracket was left open at the end of a line: point there, not at the next line
+                opener = {")": "(", "]": "[", "}": "{"}[v]
+                at = Token(tok.type, tok.value, prev.line, prev.col + max(1, len(str(prev.value or ""))))
+                self.error(f"'{opener}' is not closed: expected '{v}'{ctx} at the end of line {prev.line}", at)
+            self.error(f"expected '{v}'{ctx}, found {self._desc(tok)}")
         return self.next()
 
     def expect_kw(self, v, ctx=""):
@@ -163,6 +172,15 @@ class Parser:
 
     def statement(self):
         tok = self.peek()
+        if tok.type == NAME and self.peek(1).type == NAME and tok.value in ("def", "function", "func", "fun"):
+            self.error(f"Apsi defines functions with 'fn': fn {self.peek(1).value}(...):")
+        if tok.type == NAME and tok.value == "print" and self.peek(1).type in (STRING, FSTRING, NUMBER):
+            self.error("print is a function: write print(...) with parentheses", self.peek(1))
+        if tok.type == NAME and self.peek(1).type == OP and self.peek(1).value in ("+", "-") \
+                and self.peek(2).type == OP and self.peek(2).value == self.peek(1).value \
+                and self.peek(3).type in (NEWLINE, EOF):
+            op = self.peek(1).value
+            self.error(f"Apsi has no {op}{op}: write {tok.value} {op}= 1", self.peek(1))
         if tok.type == OP and tok.value == "@":
             return self.decorated()
         if tok.type == NAME and tok.value == "async" and (self.at_kw("fn", 1) or self.at_word("with", 1)
@@ -232,7 +250,9 @@ class Parser:
             if v == "import":
                 self.next()
                 if self.peek().type != STRING:
-                    self.error('expected a file path string after import, e.g. import "lib.apsi"')
+                    nm = self.peek()
+                    hint = f"; to load a module write: use {nm.value}" if nm.type == NAME else ""
+                    self.error('expected a file path string after import, e.g. import "lib.apsi"' + hint)
                 path = self.next().value
                 alias = None
                 if self.accept_kw("as"):
@@ -677,6 +697,12 @@ class Parser:
             tok = self.expect_name(" for parameter")
             t = self.type_expr() if self.accept_op(":") else None
             d = None if star else (self.expr() if self.accept_op("=") else None)
+            if d is None and not star and not any(p.star in ("*", "*args") or (p.star == "*" and p.name)
+                                                  for p in ps if p.star is not None):
+                before = [p for p in ps if p.default is not None and p.star is None]
+                if before:
+                    self.error(f"parameter '{tok.value}' needs a default value: '{before[-1].name}' before it has "
+                               f"one (put the parameters without defaults first)", tok)
             ps.append(A.Param(tok.value, t, d, star, **self.pos(tok)))
             if not self.accept_op(","):
                 break
@@ -752,6 +778,8 @@ class Parser:
                 branches.append((self.expr(), self.block()))
             elif self.at_kw("else"):
                 self.next()
+                if self.at_kw("if"):
+                    self.error("write 'elif' for another condition (not 'else if')")
                 else_body = self.block()
                 break
             else:
@@ -1292,6 +1320,12 @@ class Parser:
                 if items is not None:
                     return A.SetLit(items, **p)
                 return A.DictLit(pairs, **p)
+        prev = self.t[self.i - 1] if self.i > 0 else None
+        if tok.type == OP and prev is not None and prev.type == OP and prev.value == tok.value and tok.value in "&|":
+            self.error(f"unexpected {self._desc(tok)} (Apsi writes '{'and' if tok.value == '&' else 'or'}' "
+                       f"for {tok.value}{tok.value})")
+        if tok.type == OP and tok.value == "!":
+            self.error("unexpected '!' (Apsi writes 'not' for !)")
         self.error(f"unexpected {self._desc(tok)}")
 
 
