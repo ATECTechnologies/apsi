@@ -27,12 +27,15 @@ jobs:
         run: python apsi/benchmarks/heavy/run.py --skip Mojo --out out/new
       - name: Heavy benchmarks, Apsi 2.0.0
         run: python apsi/benchmarks/heavy/run.py --apsi-root old --only Apsi --label "Apsi 2.0.0" --out out/old
+      - name: ode-rk4 with @native("fma")
+        run: mkdir -p out && python -m apsi run apsi/benchmarks/heavy/fma.apsi | tee out/fma.txt
+        env: { PYTHONPATH: apsi }
       - name: Version comparison
         run: python apsi/benchmarks/versions/compare.py --old old --new apsi --web --out out
       - name: Results
         if: always()
         run: |
-          for f in out/new/results.json out/old/results.json out/versions.json; do
+          for f in out/new/results.json out/old/results.json out/versions.json out/fma.txt; do
             [ -f "$f" ] && { echo "=====BEGIN $f"; cat "$f"; echo; echo "=====END $f"; }
           done
       - uses: actions/upload-artifact@v4
