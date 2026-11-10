@@ -9,7 +9,7 @@ guide.
 |---|---|---|
 | Python, exactly | any Python 3.13 program converts and behaves byte for byte the same | [From Python](PYTHON.md) |
 | Real time | 1–2 kHz control loops and video from 640×480 to 4K | [Real time](REALTIME.md) |
-| RAM, SSD, GPU | arrays that move to the SSD instead of running out of memory | [Memory](MEMORY.md) |
+| RAM, SSD, GPU | arrays that move to the SSD instead of running out of memory; container limits and memory pressure | [Memory](MEMORY.md) |
 | Fewer AI tokens | exactly reversible packing of what you send to language models | [Tokens](TOKENS.md) |
 | Hugging Face | download and run models (BERT family, GPT-2, Llama, Mistral, Qwen, Gemma) without Python packages | [Hub](HUB.md) |
 | Tables | a columnar engine, 3–24× faster than pandas | [Tables](DATAFRAME.md) |
@@ -107,6 +107,14 @@ let loss, batch = memory.fit_batch(fn(b) => train_step(b), 512)   # halves the b
 
 Spill files and stores live in `~/.apsi` and need no permission; a store at a path you choose needs `--allow-write`.
 Pickled cache entries are signed, so a file changed outside Apsi is never loaded.
+
+### Smarter memory, later in 2.4.4
+
+`use memory` now knows the container's real limit (cgroup v1/v2), measures memory pressure (`pressure()`, Linux
+PSI) and reacts by itself — big arrays go to the SSD, stores and pools give RAM back — with `relieve()` and
+`on_pressure(fn)` for your own reactions; `pool()` reuses big temporaries (1.36×); streaming a 3 GB file peaks at
+97 MB instead of 3.1 GB; store writes no longer slow down as the store grows (8.6 → 0.07 ms per `set` at 8,000
+entries). See [Memory](MEMORY.md).
 
 ## 4. Fewer AI tokens (`use tokens`)
 

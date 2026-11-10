@@ -124,6 +124,17 @@
 Apsi 2.0 replaces "everything runs on the Python VM" with a native compiler. Python stays where it helps (the
 tooling, libraries, the rest of the language), while numeric code runs as machine code built through LLVM.
 
+### Smarter memory (`use memory`)
+- Container-aware: the memory cgroup's limit (v1 and v2) is used when it is smaller than the machine's, for the
+  budget, `array()`, `status()` and the new `limits()`.
+- `pressure()` (ok / moderate / high / critical, from free memory and Linux PSI); under high pressure big arrays go
+  to the SSD and stores and pools give RAM back by themselves; `relieve()`; `on_pressure(fn)` watcher.
+- `pool()`: reusable buffers for big temporaries (`take` / `give`), 1.36× faster for 256 MB temporaries.
+- `chunks()` and `map()` stream memory-mapped files with flat memory (3 GB file: peak RSS 3,103 → 97 MB, same speed),
+  with kernel read-ahead; `chunks()` of arrays in RAM returns views.
+- Stores keep a running SSD total: `set` no longer lists the folder (8.6 → 0.07 ms per `set` at 8,000 entries).
+- `report()`: every array from `array()`, its size and whether it is in RAM or on the SSD.
+
 ### Speed on every processor
 - The jammed lanes of an outer loop (n-body forces, matrix-vector products, distances) are emitted as SIMD vector
   instructions by Apsi itself instead of relying on LLVM's SLP vectoriser, which with LLVM 22 failed on AVX2

@@ -136,7 +136,9 @@ refuses to report times unless all of them produce the same checksum. Apsi 2.4.4
 | ode-rk4 20M | 355.2 | **289** | 289.1 | 355.2 | 355.7 |
 | kmeans 200k k16 x20 | **51.5** | 60.8 | 60.5 | 64.4 | 213.6 |
 
-C's ode-rk4 is faster because gcc fuses multiply-adds by default; with `@native("fma")` Apsi takes 263 ms there.
+jacobi-2d is limited by memory bandwidth, which other jobs on the shared runner also use: on this runner model
+Apsi's jacobi has measured 152–207 ms and C's 166–196 ms in different runs; the commit-by-commit measurement (rounds
+in rotation on one runner) gives 152.5 ms. C's ode-rk4 is faster because gcc fuses multiply-adds by default; with `@native("fma")` Apsi takes 263 ms there.
 Results on another runner model (EPYC 9V45, AVX-512) and Mojo results from an earlier machine are in
 `benchmarks/heavy/results.md` and `benchmarks/heavy/versions/`.
 

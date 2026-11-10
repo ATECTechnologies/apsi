@@ -96,8 +96,9 @@ Then read [Getting started](docs/GETTING-STARTED.md) (15 minutes) or [Write Apsi
   generics, `import *`. 34 standard-library modules (about 38,000 lines) convert and print byte-identical output.
 * **Real time.** 1–2 kHz control loops and video pipelines from 640×480 to 4K with newest-frame hand-off and latency
   reports (`use rt`).
-* **Memory.** Arrays that move to the SSD instead of running out of RAM, out-of-core processing, OOM-safe batches,
-  data-parallel training on several processes (`use memory`, `fit(workers=…)`).
+* **Memory.** Arrays that move to the SSD instead of running out of RAM, container-aware limits, memory-pressure
+  reactions, reusable buffers, flat-memory streaming of files larger than RAM, OOM-safe batches, data-parallel
+  training on several processes (`use memory`, `fit(workers=…)`).
 * **Hugging Face without Python.** Download models with an access token and run them natively — embeddings,
   classification and named entities (BERT family), text generation (GPT-2, Llama, Mistral, Qwen, Gemma) (`use hub`).
 * **Every number format down to FP8.** f64, f32, f16, bf16, FP8 and int8 tensors in `@native` and `@gpu` code:
