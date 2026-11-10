@@ -37,3 +37,6 @@ jobs:
           echo "${{ inputs.script }}" | base64 -d | gunzip > /tmp/lab.py
           lscpu | grep -E "Model name|Flags" | cut -c1-200
           python /tmp/lab.py
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with: { name: lab-out, path: /tmp/lab-out, if-no-files-found: ignore }
