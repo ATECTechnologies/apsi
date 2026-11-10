@@ -6,62 +6,62 @@
  "rows": [
   {
    "name": "matmul 300, loops (compiled engine)",
-   "old": 20949.74,
-   "new": 3.19,
+   "old": 38358.6,
+   "new": 5.0,
    "unit": "ms",
    "higher": false,
-   "speedup": 6567.32,
+   "speedup": 7671.72,
    "note": ""
   },
   {
    "name": "matmul 512, @native loops",
-   "old": 14.62,
-   "new": 6.46,
+   "old": 27.5,
+   "new": 9.87,
    "unit": "ms",
    "higher": false,
-   "speedup": 2.26,
+   "speedup": 2.79,
    "note": ""
   },
   {
    "name": "harmonic sum 50M, @native",
-   "old": 44.73,
-   "new": 46.73,
+   "old": 70.07,
+   "new": 70.06,
    "unit": "ms",
    "higher": false,
-   "speedup": 0.96,
+   "speedup": 1.0,
    "note": ""
   },
   {
    "name": "fib(25), recursive calls",
-   "old": 41.0,
-   "new": 12.18,
+   "old": 88.26,
+   "new": 24.8,
    "unit": "ms",
    "higher": false,
-   "speedup": 3.37,
+   "speedup": 3.56,
    "note": ""
   },
   {
    "name": "200k objects: create and sum",
-   "old": 2129.56,
-   "new": 262.34,
+   "old": 3777.23,
+   "new": 437.03,
    "unit": "ms",
    "higher": false,
-   "speedup": 8.12,
+   "speedup": 8.64,
    "note": ""
   },
   {
    "name": "word count, 260k words",
-   "old": 154.62,
-   "new": 102.34,
+   "old": 326.6,
+   "new": 204.29,
    "unit": "ms",
    "higher": false,
-   "speedup": 1.51,
+   "speedup": 1.6,
    "note": ""
   },
   {
    "name": "200k f-strings and join",
-   "old": 116.21,
-   "new": 93.78,
+   "old": 237.25,
+   "new": 191.76,
    "unit": "ms",
    "higher": false,
    "speedup": 1.24,
@@ -69,26 +69,26 @@
   },
   {
    "name": "integer loop, 3M iterations",
-   "old": 87.17,
-   "new": 80.87,
+   "old": 192.78,
+   "new": 171.14,
    "unit": "ms",
    "higher": false,
-   "speedup": 1.08,
+   "speedup": 1.13,
    "note": ""
   },
   {
    "name": "start-up: apsi run hello.apsi",
-   "old": 181.13,
-   "new": 133.98,
+   "old": 239.85,
+   "new": 175.74,
    "unit": "ms",
    "higher": false,
-   "speedup": 1.35,
+   "speedup": 1.36,
    "note": ""
   },
   {
-   "name": "apsi check, 41 example programs (1,520 lines), empty cache",
-   "old": 6759.08,
-   "new": 6499.37,
+   "name": "apsi check, 43 example programs (1,594 lines), empty cache",
+   "old": 9980.5,
+   "new": 9556.65,
    "unit": "ms",
    "higher": false,
    "speedup": 1.04,
@@ -96,22 +96,22 @@
   },
   {
    "name": "web server, 64 connections",
-   "old": 11970,
-   "new": 39964,
+   "old": 5207,
+   "new": 13288,
    "unit": "req/s",
    "higher": true,
-   "speedup": 3.34,
+   "speedup": 2.55,
    "note": ""
   },
   {
    "name": "web server, 256 connections",
-   "old": 13144,
-   "new": 37956,
+   "old": 6035,
+   "new": 12251,
    "unit": "req/s",
    "higher": true,
-   "speedup": 2.89,
+   "speedup": 2.03,
    "note": ""
   }
  ],
- "geomean": 3.85
+ "geomean": 3.86
 }
