@@ -243,8 +243,17 @@ def cmd_native(args):
             for d in g["devices"]:
                 print(f"GPU {d['index']}           : {d['name']}, compute {d['compute_capability']}, "
                       f"{d['multiprocessors']} SMs, {d['memory_gb']} GB")
+            from .native import cublas
+            if cublas.library() is not None:
+                print("cuBLAS          : found: matrix products in @gpu functions use it "
+                      "(Tensor Cores for f16 / bf16)")
+            else:
+                print(f"cuBLAS          : not found ({cublas.reason()}); matrix products use Apsi's own kernels. "
+                      f"For Tensor Cores: pip install nvidia-cublas-cu12")
         else:
             print(f"GPU             : none ({g['reason']}); @gpu functions run on all CPU cores")
+        print("number formats  : f64, f32, f16, bf16, fp8_e4m3, fp8_e5m2, int8 tensors in @native and @gpu "
+              "(16/8-bit storage, 32-bit math)")
         return 0
     if action == "clear-cache":
         import shutil

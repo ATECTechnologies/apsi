@@ -29,6 +29,7 @@ import ctypes
 import os
 import sys
 import threading
+import time
 
 import numpy as np
 
@@ -43,7 +44,7 @@ ALLOWED_DECL = ("llvm.sqrt.", "llvm.fabs.", "llvm.floor.", "llvm.ceil.", "llvm.c
                 "llvm.maxnum.", "llvm.minimum.", "llvm.maximum.", "llvm.sadd.with.overflow", "llvm.ssub.with.overflow",
                 "llvm.smul.with.overflow", "llvm.fptosi.sat.", "llvm.roundeven.", "llvm.nvvm.")
 _lock = threading.RLock()
-STATS = {"gpu_calls": 0, "cpu_calls": 0}
+STATS = {"gpu_calls": 0, "cpu_calls": 0, "blas_calls": 0}
 _NO_GPU_NOTED = False
 
 
@@ -65,6 +66,11 @@ def _gwrap(f, opts):
     if getattr(f, "_apsi_def", None) is None and isinstance(f, Function):
         return _wrap(f, opts)                    # the interpreter engine: runs as an ordinary function
     return GpuFunction(f, opts)
+
+
+# Automatic CPU/GPU choice for small launches (off with APSI_GPU_AUTO=0; @gpu("strict") always uses the GPU).
+AUTO = os.environ.get("APSI_GPU_AUTO", "1") != "0"
+MIN_TRIPS = int(os.environ.get("APSI_GPU_MIN", "4096"))     # fewer iterations than this: the CPU, without trying
 
 
 class GpuFunction:
@@ -109,8 +115,34 @@ class GpuFunction:
         if isinstance(plan, _Fallback):
             STATS["cpu_calls"] += 1
             return self.cpu(*args)
+        r = plan.ranger(*args)
+        if not self.options.get("strict") and AUTO:
+            # Small launches: the GPU's fixed costs (launch, copies) can exceed the work. Per size class (powers of
+            # two of the iteration count) the first call runs on the GPU and the next on the CPU, both timed; later
+            # calls of that size use whichever was faster. Each call runs once, so side effects never repeat.
+            trips = plan.trips(r)
+            if trips < MIN_TRIPS:
+                STATS["cpu_calls"] += 1
+                return self.cpu(*args)
+            bucket = trips.bit_length()
+            seen = plan.timing.setdefault(bucket, [None, None])      # [gpu seconds, cpu seconds]
+            if seen[0] is not None and seen[1] is None:
+                t = time.perf_counter()
+                out = self.cpu(*args)
+                seen[1] = time.perf_counter() - t
+                STATS["cpu_calls"] += 1
+                return out
+            if seen[0] is not None and seen[1] < seen[0]:
+                STATS["cpu_calls"] += 1
+                return self.cpu(*args)
+            t = time.perf_counter()
+            out = plan.run(args, r)
+            if seen[0] is None:
+                seen[0] = time.perf_counter() - t
+            STATS["gpu_calls"] += 1
+            return out
         STATS["gpu_calls"] += 1
-        return plan.run(args)
+        return plan.run(args, r)
 
     def _plan(self, key):
         from . import cuda
@@ -412,6 +444,69 @@ class GpuPlan:
         self.params = [p.name for p in gf.fndef.params]
         self.devices = list(drv.devices)
         self.ptx_key = hash(self.ptx)
+        self.timing = {}
+        self.blas = self._blas_plan(gf, key)
+
+    def _blas_plan(self, gf, key):
+        """A matrix-product loop nest over parameters of one float type: (Gemm, a/b/c positions, elem, dims fn)."""
+        from ..idioms import match_gemm
+        try:
+            prelude, loop, ret = kernel_shape(gf.fndef)
+            g = match_gemm(loop) if ret is None else None
+            if g is None:
+                return None
+            names = [p.name for p in gf.fndef.params]
+            if not all(n in names for n in (g.a, g.b, g.c)):
+                return None
+            pos = [names.index(n) for n in (g.a, g.b, g.c)]
+            ts = [key[k][0] for k in pos]
+            if not all(t[0] == "a" and t[2] == 2 for t in ts) or len({t[1] for t in ts}) != 1:
+                return None
+            from . import cublas
+            if ts[0][1] not in cublas.TYPES:
+                return None
+            L, C = loop.line, loop.col
+            helper = A.FnDef(gf.fndef.name + "__gpu_dims", [], gf.fndef.params, None,
+                             list(prelude) + [A.Return(A.TupleLit([g.M, g.N, g.K], line=L, col=C), line=L, col=C)],
+                             False, [], line=gf.fndef.line, col=gf.fndef.col)
+            dims = NativeFunction(_Shim(gf.fn, helper), {"strict": True, "quiet": True})
+            return g, pos, ts[0][1], dims
+        except Exception:                                  # noqa: BLE001 - no cuBLAS path; the kernel runs
+            return None
+
+    def _run_blas(self, args):
+        """c (+)= a @ b with cuBLAS; False when this call cannot use it (nothing changed)."""
+        from . import cublas
+        g, pos, elem, dims = self.blas
+        if cublas.library() is None:
+            return False
+        a, b, c = (_raw(args[k]) for k in pos)
+        if not all(isinstance(x, np.ndarray) for x in (a, b, c)):
+            return False
+        M, N, K = (int(v) for v in dims(*args))
+        if min(M, N, K) <= 0 or M > a.shape[0] or K > a.shape[1] or K > b.shape[0] or N > b.shape[1] \
+                or M > c.shape[0] or N > c.shape[1] or np.may_share_memory(c, a) or np.may_share_memory(c, b):
+            return False
+        d = self.devices[0]
+        d.activate()
+        dense = [np.ascontiguousarray(x) for x in (a, b, c)]
+        bufs = []
+        try:
+            for x in dense:
+                p = d.alloc(x.nbytes)
+                bufs.append(p)
+                d.to_device(p, x.ctypes.data, x.nbytes)
+            cublas.gemm(d, elem, g.mode == 0, M, N, K, bufs[0], dense[0].shape[1], bufs[1], dense[1].shape[1],
+                        bufs[2], dense[2].shape[1])
+            d.sync()
+            d.to_host(dense[2].ctypes.data, bufs[2], dense[2].nbytes)
+        finally:
+            for p in bufs:
+                d.free(p)
+        if dense[2] is not c:
+            c[...] = dense[2]
+        STATS["blas_calls"] = STATS.get("blas_calls", 0) + 1
+        return True
 
     def _slot_name(self, key):
         # slot keys are ("let", id(node), k) or ("param", i); recover the declared name
@@ -423,9 +518,23 @@ class GpuPlan:
                 return n.targets[key[2]]
         return None
 
-    def run(self, args):
+    def trips(self, r):
+        start, stop, step = (int(x) for x in r[:3])
+        if step == 0:
+            return 0
+        return max(0, (stop - start + (step - 1 if step > 0 else step + 1)) // step)
+
+    def run(self, args, r=None):
         from . import compiler as C            # noqa: F401  (types for the reductions below)
-        r = self.ranger(*args)
+        if self.blas is not None:
+            try:
+                if self._run_blas(args):
+                    return None
+            except Exception as e:                         # noqa: BLE001 - the generated kernel instead
+                _REPORTS.append((self.gf.name, "cuBLAS: " + str(e)))
+                self.blas = None
+        if r is None:
+            r = self.ranger(*args)
         start, stop, step = (int(x) for x in r[:3])
         init = r[3 + self.n_extra] if self.ret_name else None
         unit = 1                                      # iterations per row of the written tensors

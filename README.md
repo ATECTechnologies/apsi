@@ -3,6 +3,23 @@
 <p align="center"><strong>A programming language for AI, physics and servers — that reads like Python and checks your work before it runs.</strong></p>
 
 <p align="center">
+  <a href="https://github.com/ATECTechnologies/apsi/actions/workflows/linux-x64.yml"><img src="https://github.com/ATECTechnologies/apsi/actions/workflows/linux-x64.yml/badge.svg" alt="linux-x64"></a>
+  <a href="https://github.com/ATECTechnologies/apsi/actions/workflows/darwin-x64.yml"><img src="https://github.com/ATECTechnologies/apsi/actions/workflows/darwin-x64.yml/badge.svg" alt="darwin-x64"></a>
+  <a href="https://github.com/ATECTechnologies/apsi/actions/workflows/windows-x64.yml"><img src="https://github.com/ATECTechnologies/apsi/actions/workflows/windows-x64.yml/badge.svg" alt="windows-x64"></a>
+</p>
+<p align="center">
+  <a href="https://github.com/ATECTechnologies/apsi/actions/workflows/linux-arm64.yml"><img src="https://github.com/ATECTechnologies/apsi/actions/workflows/linux-arm64.yml/badge.svg" alt="linux-arm64"></a>
+  <a href="https://github.com/ATECTechnologies/apsi/actions/workflows/darwin-arm64.yml"><img src="https://github.com/ATECTechnologies/apsi/actions/workflows/darwin-arm64.yml/badge.svg" alt="darwin-arm64"></a>
+</p>
+<p align="center">
+  <a href="https://github.com/ATECTechnologies/apsi/releases/latest"><img src="https://img.shields.io/github/v/release/ATECTechnologies/apsi?label=release&color=2ea44f" alt="latest release"></a>
+  <img src="https://img.shields.io/badge/python-3.12%20%7C%203.13%20%7C%203.14-3776ab" alt="Python 3.12 | 3.13 | 3.14">
+  <img src="https://img.shields.io/badge/native-LLVM%20%7C%20AVX2%20%7C%20AVX--512%20%7C%20NEON-555" alt="native code">
+  <img src="https://img.shields.io/badge/GPU-CUDA%20%7C%20Tensor%20Cores-76b900" alt="GPU">
+  <a href="LICENSE"><img src="https://img.shields.io/badge/license-Apsi%202.0-blue" alt="license"></a>
+</p>
+
+<p align="center">
   <a href="https://apsi.dev">Website</a> ·
   <a href="https://apsi.dev/docs">Documentation</a> ·
   <a href="docs/WHATS-NEW.md">What's new in 2.4.4</a> ·

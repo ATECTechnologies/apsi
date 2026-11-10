@@ -170,7 +170,8 @@ def match_gemm(s):
         else:
             return None
     elif len(b2) == 3 and isinstance(b2[0], A.Let) and b2[0].mutable and len(b2[0].targets) == 1 \
-            and isinstance(b2[0].targets[0], str) and b2[0].type is None:
+            and isinstance(b2[0].targets[0], str) and (b2[0].type is None or (
+                isinstance(b2[0].type, A.TName) and b2[0].type.name in ("f64", "f32", "f16", "bf16"))):
         # var s = 0.0; for k: s += a[i, k] * b[k, j]; c[i, j] = s
         name = b2[0].targets[0]
         init = b2[0].value

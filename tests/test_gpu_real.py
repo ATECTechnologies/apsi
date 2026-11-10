@@ -213,6 +213,25 @@ class RealGpu(unittest.TestCase):
             self.g("saxpy")(2.0, x, y)
             self.assertTrue(np.allclose(y.astype(np.float32), 2 * x.astype(np.float32) + 1, rtol=tol))
 
+    def test_cublas_tensor_cores(self):
+        """Matrix-product loop nests run as one cuBLAS GEMM when cuBLAS is installed (Tensor Cores for f16/bf16)."""
+        from apsi.native import cublas
+        from apsi.native.gpu import STATS
+        if cublas.library() is None:
+            self.skipTest(f"cuBLAS not installed ({cublas.reason()}): pip install nvidia-cublas-cu12")
+        rng = np.random.default_rng(8)
+        f = self.g("matmul_acc32")
+        for dt in (np.float64, np.float32, np.float16):
+            a = rng.standard_normal((300, 200)).astype(dt)
+            b = rng.standard_normal((200, 100)).astype(dt)
+            c = np.zeros((300, 100), dt)
+            before = STATS["blas_calls"]
+            f(a, b, c)
+            self.assertEqual(STATS["blas_calls"], before + 1, dt)
+            want = a.astype(np.float64) @ b.astype(np.float64)
+            tol = {np.float64: 1e-12, np.float32: 1e-4, np.float16: 2e-2}[dt]
+            self.assertTrue(np.allclose(c.astype(np.float64), want, rtol=tol, atol=tol * 10), dt)
+
     def test_speed_by_precision(self):
         """The same matrix product (2048 x 512 x 2048, one GPU thread per element) in f64, f32, f16, bf16.
         f64 uses a 64-bit accumulator; the others `var acc: f32` (16-bit data, 32-bit sums)."""
