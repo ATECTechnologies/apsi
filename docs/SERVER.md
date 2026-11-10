@@ -21,30 +21,32 @@ app.run(host="0.0.0.0", port=8080)            # run with --allow-net
 |---|---|
 | Accepting connections | one asyncio event loop holds tens of thousands of keep-alive clients with little memory |
 | Processing | handlers run on a worker thread pool (`workers=`), so numpy/AI work runs truly in parallel and never blocks accepting requests. A route that proves fast (under 0.5 ms, measured by CPU time so a busy server does not mislead it) runs directly on the event loop, without a thread hand-off; a route that is slow or blocks on I/O stays on the workers |
-| Several cores | on Linux, `app.run(processes=N)` forks N processes on the same port (SO_REUSEPORT) and the kernel spreads connections between them |
+| Several cores | `app.run(processes="auto")` (one per CPU) or `processes=N` forks processes on the same port (SO_REUSEPORT, Linux and macOS) and the kernel spreads connections between them. Each process has its own memory: keep shared state in a database or `memory.store()` |
+| Event loop | uvloop (libuv) when it is installed — `pip install "apsi[web]"` or `pip install uvloop` — otherwise asyncio's loop; `APSI_UVLOOP=0` turns uvloop off. The start-up line names the loop in use |
+| Per-request cost | request ids from a counter (no system call), the security headers merged in one step, routes without parameters found by a dictionary lookup, the header block validated by one regular expression, one timer per connection instead of one per request, and fast routes timed by the wall clock only |
 | Shutdown | on SIGINT/SIGTERM the server stops accepting new connections and lets running requests finish (graceful shutdown) |
 
-**Measured — a synthetic benchmark** (2 vCPU machine, a Go load generator on the same machine, keep-alive, a route
-that returns a fixed 25-byte JSON object):
+**Measured — a synthetic benchmark** (a route that returns a fixed 25-byte JSON object, keep-alive, the Go load
+generator in `benchmarks/web` on the same machine):
 
-| concurrent connections | requests/s | p50 | p99 | errors |
-|---|---|---|---|---|
-| 50 | 20,300 | 2.5 ms | 3.7 ms | 0 |
-| 256 | 20,700 | 12.4 ms | 19.3 ms | 0 |
-| 1,000 | 20,400 | 48 ms | 72 ms | 0 |
+| Machine | Apsi, 1 process | Apsi, `processes="auto"` | Node.js 22 bare `http` (1 process) |
+|---|---:|---:|---:|
+| GitHub runner, AMD EPYC 7763, 4 vCPU | 14,600–15,700 req/s | **38,800–41,500 req/s** | 23,400–24,100 req/s |
+| 2-vCPU cloud VM (load generator on the same 2 cores) | 22,100–23,000 req/s (26,200 with uvloop) | **43,400–50,800 req/s** | 39,600–55,700 req/s |
 
-The same machine and load generator measure Node.js 22's bare `http` module (no framework, no routing, no security
-headers) at 54,000–57,000 requests/s on the same route. While 64 connections keep a blocking 10 ms route busy, a
-fast route on the same server still answers 15,000 requests/s with a p99 of 1.0 ms.
+Per process, the work per request went down by about 16 % in this release (19,200 → 22,400 req/s on the VM). With
+one process per core Apsi answers more requests than a single Node.js process; Node.js itself also needs its
+`cluster` module to use more than one core. With 50 to 1,000 open connections the rate stays the same and no request
+fails; while 64 connections keep a blocking 10 ms route busy, a fast route on the same server still answers about
+15,000 requests/s with a p99 of 1.0 ms (the slow route runs on worker threads, the fast one on the event loop).
 
 **What these numbers are and are not.** This is a synthetic test of the server's fixed cost per request: no database,
-no request body to parse, no TLS, no real network (loopback), and the load generator shares the two cores with the
-server. It shows how much work the framework itself adds, and under that measure Node.js's bare `http` module is
-about 2.7× faster than Apsi's server. It does not predict a real application, where a request usually spends
-milliseconds in the database, in other services or in the handler's own work; there, the per-request overhead
-measured here (about 50 µs for Apsi, about 18 µs for Node.js on this machine) is a small part of the total, and
-Apsi's worker threads (which run handlers truly in parallel) and `processes=N` matter more. Measure your own
-routes with `tools/loadtest.py` or `benchmarks/web/`.
+no request body to parse, no TLS, no real network (loopback), and the load generator shares the cores with the
+server. It shows how much work the server itself adds. It does not predict a real application, where a request
+usually spends milliseconds in the database, in other services or in the handler's own work; there, the per-request
+overhead measured here (tens of microseconds) is a small part of the total, and the worker threads (which run
+handlers in parallel) and `processes="auto"` matter more. Measure your own routes with `tools/loadtest.py` or
+`benchmarks/web/`.
 
 ```bash
 python tools/loadtest.py http://127.0.0.1:8080/health --requests 20000 --concurrency 500

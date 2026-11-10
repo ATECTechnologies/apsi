@@ -14,7 +14,7 @@ guide.
 | Hugging Face | download and run models (BERT family, GPT-2, Llama, Mistral, Qwen, Gemma) without Python packages | [Hub](HUB.md) |
 | Tables | a columnar engine, 3–24× faster than pandas | [Tables](DATAFRAME.md) |
 | Databases | PostgreSQL, MySQL / MariaDB, MongoDB, Redis, SQLite without drivers | [Databases](DATABASES.md) |
-| Web | an HTTP server 2–3× faster than 2.0.0 (synthetic test), WebSocket | [Servers](SERVER.md) |
+| Web | an HTTP server 2–3× faster than 2.0.0 per process, one process per CPU with `processes="auto"`, uvloop, WebSocket |  [Servers](SERVER.md) |
 | Configuration | `.env` files, secrets, Python virtual environments | [Configuration](ENV.md) |
 | Debugger | breakpoints and stepping in VS Code or the terminal | [Debugging](DEBUGGING.md) |
 | Number formats | f64, f32, f16, bf16, FP8 and int8 tensors in `@native` and `@gpu` code | [Number formats](NUMBERS.md) |
@@ -116,6 +116,14 @@ PSI) and reacts by itself — big arrays go to the SSD, stores and pools give RA
 97 MB instead of 3.1 GB; store writes no longer slow down as the store grows (8.6 → 0.07 ms per `set` at 8,000
 entries). See [Memory](MEMORY.md).
 
+### More syntax and a collections module, later in 2.4.4
+
+`a ?? b` (a unless it is none), `a?.b`, `a?.f(x)` and `a?[i]` (none when `a` is none, and the rest of the chain is
+skipped), as in C#, Kotlin and JavaScript. `use collections` adds `Counter`, `DefaultDict`, `Deque`, `Heap`,
+`LRUCache`, `OrderedSet` and `BiMap`, and 17 functions are built in: `first`, `last`, `partition`, `take_while`,
+`drop_while`, `scan`, `fold`, `flat_map`, `zip_longest`, `interleave`, `distinct_by`, `min_by`, `max_by`, `sum_by`,
+`frequencies`, `compose`, `partial`. See [the language reference](LANGUAGE.md).
+
 ## 4. Fewer AI tokens (`use tokens`)
 
 ```apsi
@@ -168,10 +176,11 @@ let items = db.mongo("mongodb://app:secret@localhost/shop").collection("items")
 ## 7. Web
 
 * The HTTP server runs fast routes directly on its event loop and keeps slow or blocking ones on worker threads,
-  judged by CPU time so a busy server is not misled: 20,300–20,700 requests per second from 50 to 1,000 connections
-  on 2 cores (2.0.0: 6,700–7,700). This is a synthetic test of the server's own cost per request (a fixed JSON
-  reply over loopback); on the same test Node.js's bare `http` module is about 2.7× faster. See
-  [Servers](SERVER.md) for what it does and does not measure.
+  judged by CPU time so a busy server is not misled. The work per request is about 16 % lower than in the first
+  2.4.4 build, uvloop is used when installed (`pip install "apsi[web]"`), and `app.run(processes="auto")` runs one
+  process per CPU. In a synthetic test (a fixed JSON reply over loopback) on a 4-vCPU EPYC 7763: one process
+  14,600–15,700 requests/s, `processes="auto"` 38,800–41,500, Node.js 22's bare `http` module 23,400–24,100 (2.0.0:
+  6,700–7,700 on 2 cores). See [Servers](SERVER.md) for what this does and does not measure.
 * WebSocket routes, rooms and a client: `@app.websocket("/chat")`, `app.room("lobby").send(msg)`,
   `web.websocket_connect(url)`.
 

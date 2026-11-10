@@ -106,6 +106,9 @@ Then read [Getting started](docs/GETTING-STARTED.md) (15 minutes) or [Write Apsi
 * **Graphs that reach far.** Graph transformers, global attention (one hop to any node), k-hop and mixed-hop layers.
 * **A smarter GPU.** One thread per element, Tensor Cores through cuBLAS for f16/bf16 matrix products, and small
   launches sent to the CPU automatically.
+* **None-safe code.** `config.get("port") ?? 8080`, `user?.address?.city`, `rows?[0]`; and `use collections`
+  (`Counter`, `Heap`, `Deque`, `LRUCache`, `DefaultDict`, `OrderedSet`, `BiMap`) with `first`, `partition`,
+  `scan`, `fold`, `flat_map`, `min_by` and more built in.
 * **The same speed on every processor.** Independent outer iterations run as SIMD vectors that Apsi writes itself
   (bit-identical results), so AVX2 desktops get the same vector code as AVX-512 servers; `@native("fma")` fuses
   multiply-adds like C compilers do by default.

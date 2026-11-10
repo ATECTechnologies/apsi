@@ -124,6 +124,20 @@
 Apsi 2.0 replaces "everything runs on the Python VM" with a native compiler. Python stays where it helps (the
 tooling, libraries, the rest of the language), while numeric code runs as machine code built through LLVM.
 
+### Faster web server
+- Less work per request (request ids without a system call, merged security headers, literal routes without a
+  regular expression, one timer per connection, one-regex header validation, fast routes timed by the wall clock
+  only): 19,200 → 22,400 requests/s per process on a 2-vCPU VM.
+- uvloop when installed (`pip install "apsi[web]"`); `app.run(processes="auto")`; `stop()` also ends uvloop's
+  `serve_forever`. Synthetic test on a 4-vCPU EPYC 7763: 1 process 14,600–15,700 req/s, `processes="auto"`
+  38,800–41,500, Node.js 22 (bare `http`, one process) 23,400–24,100.
+
+### Syntax and library
+- `a ?? b`, `a?.b`, `a?.f(x)`, `a?[i]` in both engines, the checker, the formatter and the editor grammars.
+- `use collections`: `Counter`, `DefaultDict`, `Deque`, `Heap`, `LRUCache`, `OrderedSet`, `BiMap`; built-in
+  `first`, `last`, `partition`, `take_while`, `drop_while`, `scan`, `fold`, `flat_map`, `zip_longest`, `interleave`,
+  `distinct_by`, `min_by`, `max_by`, `sum_by`, `frequencies`, `compose`, `partial` (`tests/test_new_syntax.py`).
+
 ### Smarter memory (`use memory`)
 - Container-aware: the memory cgroup's limit (v1 and v2) is used when it is smaller than the machine's, for the
   budget, `array()`, `status()` and the new `limits()`.

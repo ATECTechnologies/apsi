@@ -13,4 +13,7 @@ node node_server.js &                   # the same route in Node.js, port 58092
 ./load 127.0.0.1:58092 /hello 256 5
 ```
 
+For several cores, end `srv.apsi` with `app.run(port=58090, processes="auto")`; with `pip install uvloop` the
+start-up line says `uvloop event loop`.
+
 `srv2.apsi` adds a blocking route to show that slow handlers do not hold up fast ones.
