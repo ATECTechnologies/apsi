@@ -449,7 +449,8 @@ class Specialization:
         info = repr((mc.print_sites and [(i, s, e) for i, s, e, _ in mc.print_sites], mc.assert_msgs,
                      mc.fn_names)).encode()
         tag = hashlib.sha256(str(mc.module).encode() + info).hexdigest()[:20]
-        text = str(mc.module).replace("apsi_direct_HASH", f"apsi_direct_{tag}") \
+        text = ("; apsi-slp\n" if getattr(mc, "jammed", False) else "") + \
+            str(mc.module).replace("apsi_direct_HASH", f"apsi_direct_{tag}") \
             .replace("apsi_entry_HASH", f"apsi_entry_{tag}") \
             .replace("apsi_gtab_HASH", f"apsi_gtab_{tag}").replace("apsi_sites_HASH", f"apsi_sites_{tag}")
         text += f'\n@"apsi_info_{tag}" = private constant [{len(info)} x i8] c"{_llstr(info)}"\n'

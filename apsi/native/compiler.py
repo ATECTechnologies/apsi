@@ -1197,6 +1197,7 @@ class FnEmitter:
             from .jam import jam
             rep = jam(s) if match_gemm(s) is None else None
             if rep is not None:                      # four independent outer iterations at once (see jam.py)
+                self.mc.jammed = True
                 for st in rep:
                     self.stmt(st)
                 return None

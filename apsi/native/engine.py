@@ -32,7 +32,7 @@ P_SLOTS = {"P_STOP": P_STOP, "P_GEN": P_GEN, "P_INF": P_INF, "P_SPIN": P_SPIN, "
            "P_FN": P_FN, "P_CTX": P_CTX, "P_LO": P_LO, "P_HI": P_HI, "P_N": P_N}
 SPIN_LIMIT = int(os.environ.get("APSI_SPIN", "200000"))   # idle spins (~2-10 ms) before a worker sleeps
 _PSTATE = None
-OPT_VERSION = "apsi-native-3"     # bump when the optimisation pipeline changes
+OPT_VERSION = "apsi-native-4"     # bump when the optimisation pipeline changes
 
 _lock = threading.RLock()
 _engine = None
@@ -500,11 +500,15 @@ leave:
         return h.hexdigest()
 
     # ---------------------------------------------------------------- compile
-    def optimize(self, mod):
+    def optimize(self, mod, slp=None):
         llvm = self.llvm
         pto = llvm.create_pipeline_tuning_options(speed_level=3)
         pto.loop_vectorization = True
-        pto.slp_vectorization = True
+        # The SLP vectoriser packs independent scalar operations into SIMD registers. That is exactly what jammed
+        # loops (jam.py) need, but in a single dependency chain (an ODE step) its shuffles lengthen the chain, so
+        # by default it runs only for modules with jammed loops. APSI_SLP=on / off overrides.
+        mode = os.environ.get("APSI_SLP", "auto")
+        pto.slp_vectorization = (mode == "on") or (mode == "auto" and bool(slp))
         pto.loop_unrolling = True
         pto.loop_interleaving = True
         pb = llvm.create_pass_builder(self.tm, pto)
@@ -526,7 +530,7 @@ leave:
             cached = self._cache_on() and os.path.exists(self._path(key))
             if not cached:
                 self.cache_misses += 1
-                self.optimize(mod)
+                self.optimize(mod, slp=ir_text.startswith("; apsi-slp"))
             self.ee.add_module(mod)
             self.ee.finalize_object()
             addrs = {e: self.ee.get_function_address(e) for e in entries}
@@ -540,7 +544,7 @@ leave:
         mod = self.llvm.parse_assembly(ir_text)
         mod.triple = self.triple
         mod.data_layout = self.data_layout
-        self.optimize(mod)
+        self.optimize(mod, slp=ir_text.startswith("; apsi-slp"))
         return str(mod), self.tm.emit_assembly(mod)
 
 
