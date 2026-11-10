@@ -198,7 +198,9 @@ class Editors(TempDir):
     def test_install_and_uninstall_in_every_found_editor(self):
         home = os.path.join(self.dir, "home")
         win = os.name == "nt"
-        sublime = "AppData/Roaming/Sublime Text/Packages" if win else ".config/sublime-text/Packages"
+        sublime = ("AppData/Roaming/Sublime Text/Packages" if win else
+                   "Library/Application Support/Sublime Text/Packages" if sys.platform == "darwin" else
+                   ".config/sublime-text/Packages")
         nvim = "AppData/Local/nvim" if win else ".config/nvim"
         vim = "vimfiles" if win else ".vim"
         for d in (".cursor", ".vscode/extensions", sublime, nvim, vim):

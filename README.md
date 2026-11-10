@@ -100,6 +100,11 @@ Then read [Getting started](docs/GETTING-STARTED.md) (15 minutes) or [Write Apsi
   data-parallel training on several processes (`use memory`, `fit(workers=…)`).
 * **Hugging Face without Python.** Download models with an access token and run them natively — embeddings,
   classification and named entities (BERT family), text generation (GPT-2, Llama, Mistral, Qwen, Gemma) (`use hub`).
+* **Every number format down to FP8.** f64, f32, f16, bf16, FP8 and int8 tensors in `@native` and `@gpu` code:
+  stored small, computed in f32, rounded correctly — bit-identical to NumPy and ml_dtypes.
+* **Graphs that reach far.** Graph transformers, global attention (one hop to any node), k-hop and mixed-hop layers.
+* **A smarter GPU.** One thread per element, Tensor Cores through cuBLAS for f16/bf16 matrix products, and small
+  launches sent to the CPU automatically.
 * **Matrix products from plain loops.** Three nested loops computing `c[i, j] += a[i, k] * b[k, j]` run on the tuned
   BLAS kernel: 10× faster than the same loops in C with `-O3` at 2048×2048.
 * **Fewer AI tokens.** Exactly reversible packing of what you send to language models: 57–63 % fewer tokens for
@@ -115,10 +120,10 @@ Details, examples and measurements: [`docs/WHATS-NEW.md`](docs/WHATS-NEW.md) · 
 
 | | |
 |---|---|
-| Operating systems | Windows 10 / 11 (x64), Linux x86-64 (Ubuntu 22.04+, Debian 12+, Fedora, Arch, WSL); macOS from source |
+| Operating systems | Windows 10 / 11 (x64), Linux x86-64 and ARM64 (Ubuntu 22.04+, Debian 12+, Fedora, Arch, WSL), macOS on Apple silicon and Intel — each tested on every push |
 | Python (host runtime) | 3.12, 3.13, 3.14 |
-| Native compiler | x86-64 with AVX2 / AVX-512, ARM64 with NEON (needs `llvmlite`) |
-| GPUs | NVIDIA GTX 1660 and newer for `@gpu`; CUDA, ROCm, Apple MPS, Intel XPU through the PyTorch backend |
+| Native compiler | x86-64 with AVX2 / AVX-512, ARM64 with NEON (needs `llvmlite`; on Intel Macs, where llvmlite has no wheels, Apsi runs without it) |
+| GPUs | NVIDIA GTX 1660 and newer for `@gpu` (Tensor Cores through cuBLAS); AMD ROCm, Apple MPS, Intel XPU through the PyTorch backend |
 | Editors | VS Code, Cursor, Windsurf, VSCodium, Sublime Text, Vim/Neovim, Notepad++, JetBrains, Helix, Zed, Emacs |
 
 ## Documentation
@@ -127,7 +132,7 @@ Details, examples and measurements: [`docs/WHATS-NEW.md`](docs/WHATS-NEW.md) · 
 |---|---|---|
 | [Getting started](docs/GETTING-STARTED.md) | [Language reference](docs/LANGUAGE.md) | [AI](docs/AI.md) · [Layers](docs/LAYERS.md) · [RL](docs/RL.md) |
 | [What's new](docs/WHATS-NEW.md) | [Everything on one page](docs/REFERENCE.md) | [From Python](docs/PYTHON.md) · [Native code](docs/NATIVE.md) |
-| [Install](docs/INSTALL.md) · [Linux](docs/INSTALL-LINUX.md) | [Project overview](docs/OVERVIEW.md) | [Real time](docs/REALTIME.md) · [Memory](docs/MEMORY.md) · [Tokens](docs/TOKENS.md) · [Hub](docs/HUB.md) |
+| [Install](docs/INSTALL.md) · [Linux](docs/INSTALL-LINUX.md) | [Project overview](docs/OVERVIEW.md) | [Real time](docs/REALTIME.md) · [Memory](docs/MEMORY.md) · [Tokens](docs/TOKENS.md) · [Hub](docs/HUB.md) · [Graphs](docs/GRAPHS.md) · [Number formats](docs/NUMBERS.md) |
 | [Troubleshooting](docs/TROUBLESHOOTING.md) | [Security](docs/SECURITY.md) | [Tables](docs/DATAFRAME.md) · [Databases](docs/DATABASES.md) · [Servers](docs/SERVER.md) |
 | [Versions compared](docs/VERSIONS.md) | [Editors](docs/EDITORS.md) | [Science](docs/SCIENCE.md) · [Debugging](docs/DEBUGGING.md) · [Configuration](docs/ENV.md) |
 

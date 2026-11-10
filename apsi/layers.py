@@ -14,6 +14,7 @@ Building blocks
   recurrent:    lstm_layer, gru_layer, last_step
   attention:    multi_head_attention, transformer_block, transformer_encoder
   graph (GNN):  gcn, sage, gat, gin, graph_pool   (+ graph(), segment_sum/mean/max/softmax ops)
+  long range:   graph_transformer, global_attention, mix_hop, k_hop, hop_distances, eccentricity (graphs.py)
   norm/reg:     layer_norm_layer, batch_norm_layer, rms_norm_layer, dropout_layer
   shape:        reshape_layer, select, identity
   composition:  sequential, residual, parallel, dag (any directed acyclic graph of layers),
@@ -89,43 +90,70 @@ def gather(x, ids):
 
 
 class Graph:
-    """A graph for graph neural networks: n nodes and directed edges src -> dst."""
+    """A graph for graph neural networks: n nodes and directed edges src -> dst. Every edge also has a relation type
+    (`rel`, 0 when the graph has one kind of edge) and a hop count (`hop`: 1 for an ordinary edge, k for a shortcut
+    made by k_hop(), 0 for a self loop)."""
 
-    def __init__(self, src, dst, n, self_loops=True, undirected=False):
+    def __init__(self, src, dst, n, self_loops=True, undirected=False, rel=None, hop=None):
         src, dst = _ids(src), _ids(dst)
+        rel = np.zeros(len(src), dtype=np.int64) if rel is None else _ids(rel)
+        hop = np.ones(len(src), dtype=np.int64) if hop is None else _ids(hop)
+        if len(rel) != len(src) or len(hop) != len(src):
+            raise ShapeError("graph(): types= needs one entry per edge")
         if undirected:
             src, dst = np.concatenate([src, dst]), np.concatenate([dst, src])
+            rel, hop = np.concatenate([rel, rel]), np.concatenate([hop, hop])
         if self_loops:
             loops = np.arange(int(n))
             keep = src != dst
             src, dst = np.concatenate([src[keep], loops]), np.concatenate([dst[keep], loops])
+            rel = np.concatenate([rel[keep], np.zeros(int(n), dtype=np.int64)])
+            hop = np.concatenate([hop[keep], np.zeros(int(n), dtype=np.int64)])
         if len(src) and (src.max() >= n or dst.max() >= n or src.min() < 0 or dst.min() < 0):
             raise ShapeError(f"graph(): edge refers to a node outside 0..{int(n) - 1}")
         self.src, self.dst, self.n = src, dst, int(n)
+        self.rel, self.hop = rel, hop
+        self.relations = int(rel.max()) + 1 if len(rel) else 1
         self.in_degree = np.bincount(dst, minlength=self.n).astype(float)
         self.out_degree = np.bincount(src, minlength=self.n).astype(float)
         self.edges = len(src)
+        self.batch = np.zeros(self.n, dtype=np.int64)
+        self.graphs = 1 if self.n else 0
 
     def __repr__(self):
-        return f"graph({self.n} nodes, {self.edges} edges)"
+        extra = f", {self.relations} relations" if self.relations > 1 else ""
+        return f"graph({self.n} nodes, {self.edges} edges{extra})"
 
     def adjacency(self):
         a = np.zeros((self.n, self.n))
         np.add.at(a, (self.dst, self.src), 1.0)
         return a
 
+    def _derived(self, src, dst, rel, hop):
+        g = Graph(src, dst, self.n, self_loops=False, rel=rel, hop=hop)
+        g.batch, g.graphs = self.batch, self.graphs
+        return g
 
-def graph(edges=None, n=None, src=None, dst=None, self_loops=True, undirected=False, batch=None):
+
+def graph(edges=None, n=None, src=None, dst=None, self_loops=True, undirected=False, batch=None, types=None,
+          reverse=False):
     """graph(edges=[[0, 1], [1, 2]], n=3) or graph(src=tensor, dst=tensor, n=…). `batch` assigns nodes to
-    separate graphs for graph-level tasks (used by graph_pool)."""
+    separate graphs for graph-level tasks (used by graph_pool). `types` gives every edge a relation (0, 1, …) for
+    graph_transformer layers; reverse=true adds each edge backwards as its own relation, so information flows both
+    ways with separate weights (use -> definition as well as definition -> use)."""
     if edges is not None:
         e = np.asarray(ops.raw(edges)).astype(np.int64).reshape(-1, 2) if len(edges) else np.zeros((0, 2), int)
         src, dst = e[:, 0], e[:, 1]
     if src is None or dst is None:
         raise RuntimeErr("graph() needs edges=[[from, to], …] or src= and dst=")
+    src, dst = _ids(src), _ids(dst)
     if n is None:
-        n = int(max(np.max(_ids(src), initial=-1), np.max(_ids(dst), initial=-1))) + 1
-    g = Graph(src, dst, n, self_loops=self_loops, undirected=undirected)
+        n = int(max(np.max(src, initial=-1), np.max(dst, initial=-1))) + 1
+    rel = _ids(types) if types is not None else np.zeros(len(src), dtype=np.int64)
+    if reverse:
+        R = int(rel.max()) + 1 if len(rel) else 1
+        src, dst, rel = np.concatenate([src, dst]), np.concatenate([dst, src]), np.concatenate([rel, rel + R])
+    g = Graph(src, dst, n, self_loops=self_loops, undirected=undirected, rel=rel)
     g.batch = _ids(batch) if batch is not None else np.zeros(g.n, dtype=np.int64)
     g.graphs = int(g.batch.max()) + 1 if g.n else 0
     return g
@@ -1580,4 +1608,6 @@ def module(interp=None):
         torch_module=guarded(torch_module, "torch_module()"), params_from_torch=guarded(params_from_torch, "params_from_torch()"),
         devices=devices_, check_torch=guarded(check_torch, "check_torch()"),
     )
+    from . import graphs                     # long-range graph layers (graph_transformer, global_attention, …)
+    names.update(graphs.names())
     return names

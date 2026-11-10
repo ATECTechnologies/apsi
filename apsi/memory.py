@@ -67,12 +67,54 @@ def _meminfo():
         ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(m))
         return m.ullTotalPhys, m.ullAvailPhys, m.ullTotalPageFile - m.ullTotalPhys, \
             max(0, m.ullAvailPageFile - m.ullAvailPhys)
+    if sys.platform == "darwin":
+        return _mac_meminfo()
     try:
         total = os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES")
         avail = os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_AVPHYS_PAGES")
         return total, avail, 0, 0
     except (ValueError, OSError, AttributeError):
         return 0, 0, 0, 0
+
+
+_MAC = [0.0, None]
+
+
+def _mac_meminfo():
+    """macOS: total from sysctl hw.memsize; available = free + inactive + purgeable + speculative pages (vm_stat).
+    Cached for one second (allocation decisions ask often)."""
+    import subprocess
+    import time as _t
+    if _MAC[1] is not None and _t.monotonic() - _MAC[0] < 1.0:
+        return _MAC[1]
+    total = avail = swt = swf = 0
+    try:
+        total = int(subprocess.run(["sysctl", "-n", "hw.memsize"], capture_output=True, text=True,
+                                   timeout=5).stdout.strip() or 0)
+        out = subprocess.run(["vm_stat"], capture_output=True, text=True, timeout=5).stdout
+        page = 4096
+        first = out.splitlines()[0] if out else ""
+        if "page size of" in first:
+            page = int(first.split("page size of")[1].split()[0])
+        pages = {}
+        for line in out.splitlines()[1:]:
+            if ":" in line:
+                k, v = line.split(":", 1)
+                v = v.strip().rstrip(".")
+                if v.isdigit():
+                    pages[k.strip()] = int(v)
+        avail = page * sum(pages.get(k, 0) for k in ("Pages free", "Pages inactive", "Pages purgeable",
+                                                     "Pages speculative"))
+        sw = subprocess.run(["sysctl", "-n", "vm.swapusage"], capture_output=True, text=True, timeout=5).stdout
+        def mb(tag):
+            part = sw.split(tag + " = ")[1].split()[0] if tag + " = " in sw else "0M"
+            unit = {"K": 2**10, "M": 2**20, "G": 2**30}.get(part[-1], 1)
+            return int(float(part.rstrip("KMG")) * unit)
+        swt, swf = mb("total"), mb("free")
+    except (OSError, ValueError, subprocess.SubprocessError, IndexError):
+        pass
+    _MAC[0], _MAC[1] = _t.monotonic(), (total, avail, swt, swf)
+    return _MAC[1]
 
 
 def _rss():

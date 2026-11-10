@@ -17,6 +17,9 @@ guide.
 | Web | a 3× faster HTTP server, WebSocket | [Servers](SERVER.md) |
 | Configuration | `.env` files, secrets, Python virtual environments | [Configuration](ENV.md) |
 | Debugger | breakpoints and stepping in VS Code or the terminal | [Debugging](DEBUGGING.md) |
+| Number formats | f64, f32, f16, bf16, FP8 and int8 tensors in `@native` and `@gpu` code | [Number formats](NUMBERS.md) |
+| Long-range graphs | graph transformers, one-step global attention, k-hop and mixed-hop layers | [Graphs](GRAPHS.md) |
+| GPU | one thread per element, automatic CPU/GPU choice, Tensor Cores through cuBLAS | [Native](NATIVE.md) |
 | Matrix products | loops written the textbook way run on BLAS: 7–10× faster than C loops | [Performance](PERFORMANCE.md#matrix-products-written-as-loops) |
 | Speed overall | 3.85–7.31× faster than 2.0.0 on the same programs (geometric mean) | [below](#how-much-faster-than-200) |
 
@@ -214,6 +217,38 @@ product takes 234 ms (73 GFLOP/s) — the same loops in C with `gcc -O3 -march=n
 they would take minutes. When the fast path would not give the loops' exact behaviour (integer arrays, `c`
 overlapping an input, bounds beyond the arrays) the loops run as written. See
 [Performance](PERFORMANCE.md#matrix-products-written-as-loops) and `benchmarks/matmul`.
+
+## 14. Number formats down to FP8, and a smarter GPU
+
+```apsi
+@gpu
+fn matmul(a, b, c):                       # a, b, c: f16 or bf16 tensors
+    parallel for i in 0..a.shape[0]:
+        for j in 0..b.shape[1]:
+            var acc: f32 = 0.0            # 16-bit data, 32-bit sums
+            for k in 0..a.shape[1]:
+                acc += a[i, k] * b[k, j]
+            c[i, j] = acc
+```
+
+* f64, f32, f16, bf16, FP8 (E4M3, E5M2) and int8 tensors work in `@native` and `@gpu` code. Small formats are
+  stored small and computed in f32, with correct rounding when stored ([Number formats](NUMBERS.md)).
+* The loop above gets one GPU thread per element of `c`; with cuBLAS installed it runs as a single GEMM on the
+  Tensor Cores. Launches too small for the GPU run on the CPU automatically.
+* Outer loops with a reduction inside run four iterations at once in SIMD registers, with bit-identical results
+  ([Performance](PERFORMANCE.md#outer-loops-four-at-a-time-exact-simd-for-reductions)).
+
+## 15. Graphs that reach far
+
+```apsi
+let g = graph(edges=edges, n=n, types=kinds, reverse=true, batch=graph_of_node)
+let model = graph_transformer_net(16, 64, 2, layers=4, heads=4, relations=g.relations, global_every=2)
+```
+
+Message passing moves one hop per layer and squeezes what a node heard into one vector. `graph_transformer`
+(pre-norm residual neighbour attention, per relation and per hop distance) keeps values alive over many layers;
+`global_attention` lets every node read any node of its graph in one step; `k_hop` and `mix_hop` read several
+hops at once; `graph_memory` hands a decoder the most salient nodes of each graph. See [Graphs](GRAPHS.md).
 
 ## How much faster than 2.0.0
 

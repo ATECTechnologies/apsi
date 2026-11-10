@@ -1,0 +1,49 @@
+# 42_long_range_graphs.apsi — graph models that reach far: one hop to anywhere, k hops at once, many hops deep
+use layers
+use nn
+
+# 24 chains of 6 nodes; node 0 of every chain must report the class written at the far end (5 hops away)
+let chains = 24
+let length = 6
+var edges = []
+var batch = []
+for k in 0..chains:
+    for i in 0..length - 1:
+        edges.append([k * length + i, k * length + i + 1])
+    for i in 0..length:
+        batch.append(k)
+let g = graph(edges=edges, n=chains * length, batch=batch, reverse=true)    # reverse edges: their own relation
+print(g, "- the longest path is", eccentricity(g), "hops")
+
+seed(0)
+let X = zeros(chains * length, 4)
+let y = zeros(chains * length, dtype=i64)
+let mask = zeros(chains * length, dtype=bool)
+for k in 0..chains:
+    let c = int(rand() < 0.5)
+    X[k * length + length - 1, c] = 1.0
+    for i in 0..length:
+        X[k * length + i, 2] = i / length
+    y[k * length] = c
+    mask[k * length] = true
+
+# one graph_transformer block plus one global_attention block: every node can read every node of its chain
+let model = graph_transformer_net(4, 16, 2, layers=1, heads=2, relations=2, global_every=1)
+let r = fit(model, model.init(seed=0), X, y, loss="cross_entropy", opt=adam(lr=0.01), epochs=150, graph=g,
+            mask=mask, verbose=false)
+let pred = argmax(model(r.params, X, graph=g), axis=1)
+var right = 0
+for k in 0..chains:
+    if pred[k * length] == y[k * length]:
+        right += 1
+print("node 0 knows the far end:", right, "of", chains)
+assert right >= chains - 1
+
+# k_hop: a shortcut edge to everything within 3 hops, so one layer reads 3 hops at once
+let g3 = k_hop(g, 3)
+print("3-hop graph:", g3)
+
+# graph_memory: the 4 most salient node states of each chain, for a decoder to attend into
+let mem = graph_memory(16, k=4)
+let h = model.layers[0](r.params[0], X)                  # node states after the input layer
+print("memory per graph:", shape(mem(mem.init(seed=0), h, graph=g)))

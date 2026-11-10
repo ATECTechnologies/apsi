@@ -822,7 +822,7 @@ Load a module with `use NAME` (all its names) or `use NAME as n` (then `n.member
 | `table_latex(rows, headers=None, caption=None, label=None)` | A LaTeX table (booktabs) from lists or records; text is escaped. |
 | `table_markdown(rows, headers=None)` | A Markdown table from lists or records. |
 
-### `use layers` — 70 names
+### `use layers` — 78 names
 
 | Name | What it is |
 |---|---|
@@ -843,6 +843,7 @@ Load a module with `use NAME` (all its names) or `use NAME as n` (then `n.member
 | `dense(n_in, n_out, act=None)` | function |
 | `devices()` | The compute devices available: NumPy, and PyTorch CPU / CUDA / ROCm / MPS / XPU when installed. |
 | `dropout_layer(p=0.1)` | type |
+| `eccentricity(g, undirected=True, samples=64, seed=0)` | The longest shortest path (in hops) seen from up to `samples` start nodes: how far information must travel. |
 | `embedding(vocab, d)` | type |
 | `fit(model, params, X, y=None, backend='numpy', **kw)` | Train `model`. Returns record(params, history, val_history, device). |
 | `flatten_layer(/, *args, **kwargs)` | type |
@@ -853,11 +854,17 @@ Load a module with `use NAME` (all its names) or `use NAME as n` (then `n.member
 | `gcn_net(n_in, hidden, classes, layers=2, dropout=0.5)` | function |
 | `gin(n_in, n_out, hidden=None)` | Graph isomorphism network layer: MLP((1 + eps) x_i + Σ_j x_j). |
 | `gin_net(n_in, hidden, classes, layers=3, pool='sum')` | Graph-level classifier: GIN layers, pooling per graph, linear head. |
+| `global_attention(d, heads=4, max_keys=4096)` | Pre-norm residual self-attention over all nodes of the same graph: any node reaches any other in one step. |
 | `global_avg_pool(/, *args, **kwargs)` | type |
-| `graph(edges=None, n=None, src=None, dst=None, self_loops=True, undirected=False, batch=None)` | graph(edges=[[0, 1], [1, 2]], n=3) or graph(src=tensor, dst=tensor, n=…). `batch` assigns nodes to separate graphs for graph-level tasks (used by graph_pool). |
+| `graph(edges=None, n=None, src=None, dst=None, self_loops=True, undirected=False, batch=None, types=None, rever…)` | graph(edges=[[0, 1], [1, 2]], n=3) or graph(src=tensor, dst=tensor, n=…). `batch` assigns nodes to separate graphs for graph-level tasks (used by graph_pool). `types` gives every edge a relation (0, 1, …) for graph_trans |
+| `graph_memory(d, k=16)` | The k most salient node states of every graph, weighted by a learned score: [graphs, k, d]. A decoder or any other model reads a whole graph through these k vectors with cross-attention (multi_head_attention([q, mem])) i |
 | `graph_pool(how='mean')` | Node features -> one vector per graph (mean, sum or max over each graph's nodes). |
+| `graph_transformer(d, heads=4, relations=1, ff=None, max_hop=16, activation='gelu')` | Pre-norm residual graph block: x + attention over neighbours (by relation and hop), then x + MLP. |
+| `graph_transformer_net(n_in, d, out, layers=4, heads=4, relations=1, global_every=2, max_keys=4096, task='node', pool='mean')` | Input projection, `layers` graph_transformer blocks with a global_attention block after every `global_every`-th one (0: none), a final layer norm, then a linear output per node (task="node") or per graph (task="graph", p |
 | `gru_layer(n_in, n_hidden, return_sequences=True)` | type |
+| `hop_distances(g, source, undirected=True)` | Number of hops from `source` to every node (-1 when unreachable), by breadth-first search. |
 | `identity(/, *args, **kwargs)` | type |
+| `k_hop(g, k, undirected=False)` | A graph with an edge u -> v for every v within 1..k hops of u (edge.hop = the distance), plus self loops. One layer over this graph reads k hops at once; graph_transformer learns a separate bias per distance. |
 | `lambda_layer(fn, name='lambda', torch_fn=None)` | type |
 | `last_step(/, *args, **kwargs)` | type |
 | `layer_norm_layer(d, eps=1e-05)` | type |
@@ -867,6 +874,7 @@ Load a module with `use NAME` (all its names) or `use NAME as n` (then `n.member
 | `lstm_layer(n_in, n_hidden, return_sequences=True)` | type |
 | `max_pool(k=2)` | type |
 | `mean_pool(axis=1)` | Mean over one axis, e.g. over time: [B, T, D] -> [B, D]. |
+| `mix_hop(n_in, n_out, hops=(0, 1, 2))` | Several hop distances in parallel: concat_k (Â^k x) W_k with Â the mean over incoming neighbours. |
 | `mlp(sizes, act='relu', dropout=0.0, norm=False, out_act=None)` | Multilayer perceptron, e.g. mlp([2, 64, 64, 3]). |
 | `multi_head_attention(d, heads=4, causal=False)` | type |
 | `multiply()` | function |

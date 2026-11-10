@@ -25,7 +25,7 @@ jobs:
         shell: cmd
         run: examples\native\build.bat
       - name: Native compiler
-        run: apsi native info
+        run: apsi native info || echo "no native compiler on this platform (bytecode engine)"
       - name: Language tests (compiler engine)
         run: apsi test examples tests/apsi --allow-all
       - name: Language tests (reference interpreter)

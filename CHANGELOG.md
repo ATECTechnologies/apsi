@@ -53,6 +53,24 @@
   from the Hugging Face Hub; access tokens for private and gated models, sent only to the Hub itself.
 - Native `tokenizer.json` engines: WordPiece (BERT family), byte-level BPE (GPT-2, Llama 3, Qwen),
   SentencePiece-style BPE with byte fallback (Llama 2, Mistral) and Unigram (T5, XLM-R).
+- **Graphs that reach far** (`use layers`): `graph_transformer` (pre-norm residual neighbour attention with
+  relations and hop biases), `global_attention` (one hop to any node of the same graph, landmark keys above
+  `max_keys`), `mix_hop` (several hop distances in parallel), `k_hop` shortcut graphs, `graph_memory` (the k most
+  salient node states per graph), `graph_transformer_net`, `hop_distances`, `eccentricity`; `graph(…, types=,
+  reverse=true)` for relations in both directions. `docs/GRAPHS.md`.
+- **Number formats in native and GPU code.** `@native` and `@gpu` functions accept f64, f32, f16, bf16, FP8
+  (E4M3, E5M2) and int8 tensors. 16- and 8-bit values are read into f32, computed in f32 and rounded once (to
+  nearest, ties to even) when stored; the conversions are bit-identical to NumPy and ml_dtypes for every 16-bit
+  and 8-bit pattern and work the same on every CPU and GPU. `var acc: f32 = 0.0` types a scalar's precision;
+  `zeros(n, dtype=bf16)` and `dtype=fp8_e4m3` create real tensors (ml_dtypes). `docs/NUMBERS.md`.
+- **GPU.** One thread per element for row loops with an independent inner loop (collapse); fewer than 4,096
+  iterations run on the CPU and larger sizes are timed once on each and then use the faster; matrix-product loop
+  nests run as one cuBLAS GEMM when cuBLAS is installed (Tensor Cores with f32 accumulation for f16/bf16).
+- **Exact outer-loop vectorisation.** Independent outer iterations with a reduction along the inner loop run four
+  at a time with bit-identical results (n-body forces, k-means assignment): n-body 2.8× faster relative to C,
+  now ahead of Rust; k-means now faster than C. `APSI_JAM=0` turns it off.
+- **Platforms.** The native compiler works on ARM64 (Linux and Apple silicon); every push is tested on linux-x64,
+  linux-arm64, windows-x64, darwin-x64 and darwin-arm64.
 - **Faster ordinary code.** Struct construction 9× faster (type checkers are built once per annotation, not per
   object); `Int`/`Float` argument and return checks, and `if`/`while` conditions on plain booleans, skip the checker
   call (recursive calls 2.3× faster); attribute access on structs, lists, dicts and strings takes a short path.
