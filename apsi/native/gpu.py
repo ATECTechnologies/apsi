@@ -156,6 +156,35 @@ def _host_args(args):
 
 # Automatic CPU/GPU choice for small launches (off with APSI_GPU_AUTO=0; @gpu("strict") always uses the GPU).
 AUTO = os.environ.get("APSI_GPU_AUTO", "1") != "0"
+RECHECK = 64                               # automatic CPU/GPU choice: time the losing side again every RECHECK calls
+
+
+class _Choice:
+    """Measured CPU-or-GPU choice for one size class: warm-up on the GPU, then one timed call on each side, then
+    the faster side, with the losing side re-timed every RECHECK calls (a moving best of the last two samples)."""
+    __slots__ = ("gpu", "cpu", "calls", "warm")
+
+    def __init__(self):
+        self.gpu, self.cpu, self.calls, self.warm = [], [], 0, False
+
+    def next(self):
+        self.calls += 1
+        if not self.warm or not self.gpu:
+            return "gpu"
+        if not self.cpu:
+            return "cpu"
+        g, c = min(self.gpu), min(self.cpu)
+        if self.calls % RECHECK == 0:
+            return "cpu" if g <= c else "gpu"
+        return "gpu" if g <= c else "cpu"
+
+    def record(self, side, seconds):
+        if side == "gpu" and not self.warm:
+            self.warm = True                     # the first launch loads the kernel: not representative
+            return
+        xs = self.gpu if side == "gpu" else self.cpu
+        xs.append(seconds)
+        del xs[:-2]
 MIN_TRIPS = int(os.environ.get("APSI_GPU_MIN", "4096"))     # fewer iterations than this: the CPU, without trying
 
 
@@ -205,30 +234,29 @@ class GpuFunction:
         r = plan.ranger(*plan.range_args(args))
         if not self.options.get("strict") and AUTO:
             # Small launches: the GPU's fixed costs (launch, copies) can exceed the work. Per size class (powers of
-            # two of the iteration count) the first call runs on the GPU and the next on the CPU, both timed; later
-            # calls of that size use whichever was faster. Each call runs once, so side effects never repeat.
+            # two of the iteration count) the choice is measured: the first GPU call is a warm-up (it loads the
+            # kernel), then one timed GPU call and one timed CPU call decide; every RECHECK calls the side that lost
+            # is timed once more, so a choice made under a passing load does not stick. Each call runs once, so
+            # side effects never repeat.
             trips = plan.trips(r)
             if trips < MIN_TRIPS and not on_gpu:
                 STATS["cpu_calls"] += 1
                 return self.cpu(*args)
-            bucket = trips.bit_length()
-            seen = plan.timing.setdefault(bucket, [None, None])      # [gpu seconds, cpu seconds]
-            if on_gpu:
-                seen = [None, None]           # data already on the GPU: moving it to the CPU is never cheaper
-            if seen[0] is not None and seen[1] is None:
-                t = time.perf_counter()
-                out = self.cpu(*args)
-                seen[1] = time.perf_counter() - t
-                STATS["cpu_calls"] += 1
-                return out
-            if seen[0] is not None and seen[1] < seen[0]:
-                STATS["cpu_calls"] += 1
-                return self.cpu(*args)
+            if on_gpu:                       # data already on the GPU: moving it to the CPU is never cheaper
+                STATS["gpu_calls"] += 1
+                return plan.run(args, r)
+            c = plan.timing.get(trips.bit_length())
+            if c is None:
+                c = plan.timing[trips.bit_length()] = _Choice()
+            side = c.next()
             t = time.perf_counter()
-            out = plan.run(args, r)
-            if seen[0] is None:
-                seen[0] = time.perf_counter() - t
-            STATS["gpu_calls"] += 1
+            if side == "cpu":
+                out = self.cpu(*args)
+                STATS["cpu_calls"] += 1
+            else:
+                out = plan.run(args, r)
+                STATS["gpu_calls"] += 1
+            c.record(side, time.perf_counter() - t)
             return out
         STATS["gpu_calls"] += 1
         return plan.run(args, r)

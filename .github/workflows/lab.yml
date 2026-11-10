@@ -1,0 +1,39 @@
+# Run an experiment on a runner with llvmlite (Actions -> lab -> Run workflow): optionally apply a patch to the
+# checked-out tree, then run a Python script. Both inputs are gzip + base64. Used to try native code generation
+# changes on real hardware before they are committed.
+name: lab
+on:
+  workflow_dispatch:
+    inputs:
+      patch:
+        description: "gzip+base64 git diff to apply (optional)"
+        default: ""
+      script:
+        description: "gzip+base64 Python script to run from the tree root"
+        required: true
+      runner:
+        description: "runner label"
+        default: ubuntu-24.04
+jobs:
+  lab:
+    runs-on: ${{ inputs.runner }}
+    timeout-minutes: 120
+    env:
+      PYTHONUTF8: "1"
+      TERM: dumb
+      APSI_NATIVE_QUIET: "1"
+    steps:
+      - uses: actions/checkout@v5
+        with: { fetch-depth: 0 }
+      - uses: actions/setup-python@v6
+        with: { python-version: "3.13" }
+      - name: Install
+        run: python -m pip install numpy llvmlite ml_dtypes
+      - name: Patch
+        if: inputs.patch != ''
+        run: echo "${{ inputs.patch }}" | base64 -d | gunzip | git apply -v
+      - name: Run
+        run: |
+          echo "${{ inputs.script }}" | base64 -d | gunzip > /tmp/lab.py
+          lscpu | grep -E "Model name|Flags" | cut -c1-200
+          python /tmp/lab.py

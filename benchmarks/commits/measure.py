@@ -14,6 +14,8 @@ What it measures, with the programs of the newest tree for every tree (so all tr
 * cold heavy — heavy.apsi with an empty native cache: compile time plus run time, whole process
 * check — `apsi check` of every example program with an empty cache
 
+--skip heavy programs check leaves rows out (heavy without llvmlite would run the @native code interpreted).
+
 Writes commits.json and commits.md. Exit status 0; regressions are listed at the end of the table (a row more than
 --tolerance slower than the first tree).
 """
@@ -49,9 +51,11 @@ def lines(out):
     return res
 
 
-def measure(root, home, progs, examples, quick):
+def measure(root, home, progs, examples, quick, skip=()):
     out = {}
     for label, src in (("heavy", progs["heavy"]), ("programs", progs["programs"])):
+        if label in skip:
+            continue
         r, _ = run(root, ["-m", "apsi", "run", src], home)
         if r.returncode != 0:
             sys.stderr.write(f"{root}: {src} failed\n{r.stderr[-1500:]}\n")
@@ -64,11 +68,14 @@ def measure(root, home, progs, examples, quick):
         out["start-up: apsi run hello.apsi"] = (min(run(root, ["-m", "apsi", "run", hello], home)[1]
                                                     for _ in range(5)), "")
         out["import apsi"] = (min(run(root, ["-c", "import apsi"], home)[1] for _ in range(5)), "")
-        if not quick:
+        if not quick and "heavy" not in skip:
             cold = os.path.join(d, "cold")
             os.makedirs(cold)
             r, ms = run(root, ["-m", "apsi", "run", progs["heavy"]], cold)
             out["cold heavy.apsi: compile + run, whole process"] = (ms, "")
+        if not quick and "check" not in skip:
+            cold = os.path.join(d, "cold2")
+            os.makedirs(cold)
             ms = 0.0
             for f in examples:
                 ms += run(root, ["-m", "apsi", "check", f], cold)[1]
@@ -95,6 +102,7 @@ def main():
     ap.add_argument("--commits", nargs="*", default=[])
     ap.add_argument("--rounds", type=int, default=3)
     ap.add_argument("--quick", action="store_true", help="skip the cold compile and check rows")
+    ap.add_argument("--skip", nargs="*", default=[], help="heavy, programs, check")
     ap.add_argument("--tolerance", type=float, default=0.03)
     ap.add_argument("--out", default=".")
     a = ap.parse_args()
@@ -113,7 +121,7 @@ def main():
         order = trees[rnd % len(trees):] + trees[:rnd % len(trees)]
         for name, path in order:
             t = time.perf_counter()
-            for row, (ms, check) in measure(path, homes[name], progs, examples, a.quick or rnd > 0).items():
+            for row, (ms, check) in measure(path, homes[name], progs, examples, a.quick or rnd > 0, a.skip).items():
                 key = (row, name)
                 best[key] = min(best.get(key, 1e18), ms)
                 checks.setdefault(row, {})[name] = check
