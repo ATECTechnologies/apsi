@@ -177,6 +177,15 @@ fn energy(x, m, inner: Int) -> Float:
         total += f + g
     return total
 
+fn matvec(a, v) -> Float:
+    var total = 0.0
+    for i in 0..a.shape[0]:
+        var acc = 0.0
+        for k in 0..a.shape[1]:
+            acc += a[i, k] * v[k]
+        total += acc * (i + 1)
+    return total
+
 fn by_python_float(x, s: Float) -> Float:
     var total = 0.0
     for i in 0..len(x):
@@ -200,13 +209,14 @@ class VectorLanes(unittest.TestCase):
             for inner in (0, 1, n):
                 out.append(env["energy"](x, m, min(inner, n)))
             out.append(env["by_python_float"](x, 0.75))
+            out.append(env["matvec"](rng.standard_normal((n, 7)), rng.standard_normal(7)))
         return out
 
     def test_vector_lanes_match_the_interpreter_and_scalar_lanes(self):
         plain_env = Interpreter().run(VEC_PROGRAMS, "<plain>")
         J.ENABLED = False
         try:
-            plain = self.run_all({k: plain_env.lookup(k) for k in ("energy", "by_python_float")})
+            plain = self.run_all({k: plain_env.lookup(k) for k in ("energy", "by_python_float", "matvec")})
         finally:
             J.ENABLED = True
         results = {}
@@ -214,11 +224,12 @@ class VectorLanes(unittest.TestCase):
             os.environ["APSI_JAM_VEC"] = mode
             try:
                 env = Interpreter().run(VEC_PROGRAMS, "<native>")
-                fns = {k: N.native("strict")(env.lookup(k)) for k in ("energy", "by_python_float")}
+                fns = {k: N.native("strict")(env.lookup(k)) for k in ("energy", "by_python_float", "matvec")}
                 results[mode] = self.run_all(fns)
                 if mode == "1":
                     ir_text = fns["energy"].llvm_ir(np.zeros(4), np.zeros(4), 4)
                     self.assertIn("<4 x double>", ir_text)
+                    self.assertIn("<4 x double>", fns["matvec"].llvm_ir(np.zeros((4, 4)), np.zeros(4)))
             finally:
                 os.environ.pop("APSI_JAM_VEC", None)
         for got in results.values():

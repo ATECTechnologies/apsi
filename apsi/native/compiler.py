@@ -1286,6 +1286,21 @@ class FnEmitter:
                 return inv_np(e)
             if isinstance(e, A.Name):
                 return var_np(e.id)
+            if isinstance(e, A.Index) and isinstance(e.obj, A.Name) and e.obj.id not in lane0:
+                # a[i, k]: one element per lane, loaded lane by lane (the index may use lane variables that the
+                # inner loop does not change)
+                key = self.find(e.obj.id)
+                t = slots[key][0] if key is not None else None
+                idxs = e.index.items if isinstance(e.index, A.TupleLit) else [e.index]
+                if t is None or not is_arr(t) or t[1] != "f8" or len(idxs) != t[2] \
+                        or any(isinstance(x, A.Slice) for x in idxs):
+                    raise No
+                for x in _walk([e.index]):
+                    if isinstance(x, A.Name) and x.id in lane0 and (x.id in inner_names or self.find(x.id) is None):
+                        raise No
+                if id(e) not in twins:
+                    raise No
+                return True
             if isinstance(e, A.Binary) and e.op in ("+", "-", "*", "/"):
                 np_ = por(chk(e.left), chk(e.right))
                 if e.op == "/" and np_ is not True and not (isinstance(e.right, A.Num) and e.right.unit is None
@@ -1313,6 +1328,28 @@ class FnEmitter:
                     dyn_state[n] = True
             elif np_ is None:
                 raise No
+
+        inner_names = set()                 # lane variables declared or assigned in the inner loop
+        for st in stmts0:
+            if isinstance(st, A.Let):
+                inner_names.update(t for t in st.targets if isinstance(t, str))
+            elif isinstance(st, (A.Assign, A.AugAssign)) and isinstance(st.target, A.Name):
+                inner_names.add(st.target.id)
+        twins = {}                          # id(node of lane 0) -> the same node in every lane's copy
+        if len(s.body) != len(stmts0) * L:
+            return False
+
+        def pair(a, others):
+            if isinstance(a, A.AST):
+                if isinstance(a, A.Index):
+                    twins[id(a)] = [a] + others
+                for f in a._fields:
+                    pair(getattr(a, f), [getattr(o, f) for o in others])
+            elif isinstance(a, (list, tuple)):
+                for q, x in enumerate(a):
+                    pair(x, [o[q] for o in others])
+        for q, st in enumerate(stmts0):
+            pair(st, [s.body[q * L + k] for k in range(1, L)])
 
         try:
             for st in stmts0:
@@ -1381,6 +1418,12 @@ class FnEmitter:
                 return broadcast(self.convert(self.materialize(v, e), F64, e).v)
             if isinstance(e, A.Name):
                 return bd.load(ptrs[e.id])
+            if isinstance(e, A.Index):
+                vec = ir.Constant(VT, ir.Undefined)
+                for k, node in enumerate(twins[id(e)]):
+                    x = self.convert(self.expr(node), F64, node)
+                    vec = bd.insert_element(vec, x.v, ir.Constant(ir.IntType(32), k))
+                return vec
             if isinstance(e, A.Binary):
                 a, b = vexpr(e.left), vexpr(e.right)
                 return flag({"+": bd.fadd, "-": bd.fsub, "*": bd.fmul, "/": bd.fdiv}[e.op](a, b))
