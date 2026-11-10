@@ -24,7 +24,8 @@ app.run(host="0.0.0.0", port=8080)            # run with --allow-net
 | Several cores | on Linux, `app.run(processes=N)` forks N processes on the same port (SO_REUSEPORT) and the kernel spreads connections between them |
 | Shutdown | on SIGINT/SIGTERM the server stops accepting new connections and lets running requests finish (graceful shutdown) |
 
-**Measured** (2 vCPU machine, a Go load generator on the same machine, a JSON route, keep-alive):
+**Measured — a synthetic benchmark** (2 vCPU machine, a Go load generator on the same machine, keep-alive, a route
+that returns a fixed 25-byte JSON object):
 
 | concurrent connections | requests/s | p50 | p99 | errors |
 |---|---|---|---|---|
@@ -32,9 +33,18 @@ app.run(host="0.0.0.0", port=8080)            # run with --allow-net
 | 256 | 20,700 | 12.4 ms | 19.3 ms | 0 |
 | 1,000 | 20,400 | 48 ms | 72 ms | 0 |
 
-The same machine and load generator measure Node.js 22's `http` module at 54,000–57,000 requests/s. While 64
-connections keep a blocking 10 ms route busy, a fast route on the same server still answers 15,000 requests/s with a
-p99 of 1.0 ms.
+The same machine and load generator measure Node.js 22's bare `http` module (no framework, no routing, no security
+headers) at 54,000–57,000 requests/s on the same route. While 64 connections keep a blocking 10 ms route busy, a
+fast route on the same server still answers 15,000 requests/s with a p99 of 1.0 ms.
+
+**What these numbers are and are not.** This is a synthetic test of the server's fixed cost per request: no database,
+no request body to parse, no TLS, no real network (loopback), and the load generator shares the two cores with the
+server. It shows how much work the framework itself adds, and under that measure Node.js's bare `http` module is
+about 2.7× faster than Apsi's server. It does not predict a real application, where a request usually spends
+milliseconds in the database, in other services or in the handler's own work; there, the per-request overhead
+measured here (about 50 µs for Apsi, about 18 µs for Node.js on this machine) is a small part of the total, and
+Apsi's worker threads (which run handlers truly in parallel) and `processes=N` matter more. Measure your own
+routes with `tools/loadtest.py` or `benchmarks/web/`.
 
 ```bash
 python tools/loadtest.py http://127.0.0.1:8080/health --requests 20000 --concurrency 500

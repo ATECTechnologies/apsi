@@ -14,7 +14,7 @@ guide.
 | Hugging Face | download and run models (BERT family, GPT-2, Llama, Mistral, Qwen, Gemma) without Python packages | [Hub](HUB.md) |
 | Tables | a columnar engine, 3–24× faster than pandas | [Tables](DATAFRAME.md) |
 | Databases | PostgreSQL, MySQL / MariaDB, MongoDB, Redis, SQLite without drivers | [Databases](DATABASES.md) |
-| Web | a 3× faster HTTP server, WebSocket | [Servers](SERVER.md) |
+| Web | an HTTP server 2–3× faster than 2.0.0 (synthetic test), WebSocket | [Servers](SERVER.md) |
 | Configuration | `.env` files, secrets, Python virtual environments | [Configuration](ENV.md) |
 | Debugger | breakpoints and stepping in VS Code or the terminal | [Debugging](DEBUGGING.md) |
 | Number formats | f64, f32, f16, bf16, FP8 and int8 tensors in `@native` and `@gpu` code | [Number formats](NUMBERS.md) |
@@ -161,7 +161,9 @@ let items = db.mongo("mongodb://app:secret@localhost/shop").collection("items")
 
 * The HTTP server runs fast routes directly on its event loop and keeps slow or blocking ones on worker threads,
   judged by CPU time so a busy server is not misled: 20,300–20,700 requests per second from 50 to 1,000 connections
-  on 2 cores (2.0.0: 6,700–7,700).
+  on 2 cores (2.0.0: 6,700–7,700). This is a synthetic test of the server's own cost per request (a fixed JSON
+  reply over loopback); on the same test Node.js's bare `http` module is about 2.7× faster. See
+  [Servers](SERVER.md) for what it does and does not measure.
 * WebSocket routes, rooms and a client: `@app.websocket("/chat")`, `app.room("lobby").send(msg)`,
   `web.websocket_connect(url)`.
 
