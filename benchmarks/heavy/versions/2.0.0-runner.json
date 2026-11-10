@@ -1,56 +1,185 @@
 {
  "machine": {
-  "cpu": "AMD EPYC 7763 64-Core Processor",
+  "cpu": "AMD EPYC 7763 64-Core Processor (GitHub Actions runner)",
   "cores_used": 1,
   "os": "Linux-7.0.0-1017-azure-x86_64-with-glibc2.39",
-  "python": "3.13.18"
+  "python": "3.13.18",
+  "method": "best of 5 rounds; Apsi 2.4.4 and 2.0.0 measured in turn on the same runner"
  },
  "languages": {
   "Apsi": {
    "version": "Apsi 2.0.0",
    "flags": "apsi run (@native, strict IEEE)"
+  },
+  "C": {
+   "version": "gcc (Ubuntu 13.3.0-6ubuntu2~24.04.1) 13.3.0",
+   "flags": "gcc -O3 -march=native"
+  },
+  "C++": {
+   "version": "g++ (Ubuntu 13.3.0-6ubuntu2~24.04.1) 13.3.0",
+   "flags": "g++ -O3 -march=native"
+  },
+  "Rust": {
+   "version": "rustc 1.99.1 (58cf8f9c3 2026-10-13)",
+   "flags": "rustc -C opt-level=3 -C target-cpu=native"
+  },
+  "Go": {
+   "version": "go version go1.24.13 linux/amd64",
+   "flags": "go build"
   }
  },
  "benchmarks": {
   "nbody-dense 2000x10": {
    "Apsi": {
-    "ms": 185.0,
+    "ms": 182.7,
+    "check": "0.000192436526863"
+   },
+   "C": {
+    "ms": 44.1,
+    "check": "0.000192436526863"
+   },
+   "C++": {
+    "ms": 44.1,
+    "check": "0.000192436526863"
+   },
+   "Rust": {
+    "ms": 181.9,
+    "check": "0.000192436526863"
+   },
+   "Go": {
+    "ms": 317.4,
     "check": "0.000192436526863"
    }
   },
   "jacobi-2d 1024x200": {
    "Apsi": {
-    "ms": 159.2,
+    "ms": 150.5,
+    "check": "1193940.35882"
+   },
+   "C": {
+    "ms": 167.1,
+    "check": "1193940.35882"
+   },
+   "C++": {
+    "ms": 157.3,
+    "check": "1193940.35882"
+   },
+   "Rust": {
+    "ms": 166.6,
+    "check": "1193940.35882"
+   },
+   "Go": {
+    "ms": 700.7,
     "check": "1193940.35882"
    }
   },
   "matmul 1024": {
    "Apsi": {
-    "ms": 191.6,
+    "ms": 178.9,
+    "check": "-12.2350796046"
+   },
+   "C": {
+    "ms": 199.6,
+    "check": "-12.2350796046"
+   },
+   "C++": {
+    "ms": 164.8,
+    "check": "-12.2350796046"
+   },
+   "Rust": {
+    "ms": 182.0,
+    "check": "-12.2350796046"
+   },
+   "Go": {
+    "ms": 479.4,
     "check": "-12.2350796046"
    }
   },
   "lu-pivot 800": {
    "Apsi": {
-    "ms": 41.3,
+    "ms": 40.3,
+    "check": "1278.5938216"
+   },
+   "C": {
+    "ms": 40.3,
+    "check": "1278.5938216"
+   },
+   "C++": {
+    "ms": 40.1,
+    "check": "1278.5938216"
+   },
+   "Rust": {
+    "ms": 41.2,
+    "check": "1278.5938216"
+   },
+   "Go": {
+    "ms": 116.5,
     "check": "1278.5938216"
    }
   },
   "ising 512x50": {
    "Apsi": {
-    "ms": 81.7,
+    "ms": 81.5,
+    "check": "26386"
+   },
+   "C": {
+    "ms": 90.6,
+    "check": "26386"
+   },
+   "C++": {
+    "ms": 90.4,
+    "check": "26386"
+   },
+   "Rust": {
+    "ms": 83.6,
+    "check": "26386"
+   },
+   "Go": {
+    "ms": 145.9,
     "check": "26386"
    }
   },
   "levenshtein 10k": {
    "Apsi": {
-    "ms": 195.5,
+    "ms": 193.8,
+    "check": "5202"
+   },
+   "C": {
+    "ms": 809.3,
+    "check": "5202"
+   },
+   "C++": {
+    "ms": 305.6,
+    "check": "5202"
+   },
+   "Rust": {
+    "ms": 268.7,
+    "check": "5202"
+   },
+   "Go": {
+    "ms": 1736.5,
     "check": "5202"
    }
   },
   "ode-rk4 20M": {
    "Apsi": {
-    "ms": 533.9,
+    "ms": 533.3,
+    "check": "1.30419893119"
+   },
+   "C": {
+    "ms": 288.7,
+    "check": "1.30419893119"
+   },
+   "C++": {
+    "ms": 288.8,
+    "check": "1.30419893119"
+   },
+   "Rust": {
+    "ms": 354.9,
+    "check": "1.30419893119"
+   },
+   "Go": {
+    "ms": 355.2,
     "check": "1.30419893119"
    }
   },
@@ -58,9 +187,25 @@
    "Apsi": {
     "ms": 65.3,
     "check": "201640.557564"
+   },
+   "C": {
+    "ms": 60.5,
+    "check": "201640.557564"
+   },
+   "C++": {
+    "ms": 59.0,
+    "check": "201640.557564"
+   },
+   "Rust": {
+    "ms": 64.2,
+    "check": "201640.557564"
+   },
+   "Go": {
+    "ms": 213.3,
+    "check": "201640.557564"
    }
   }
  },
- "measured_at": "2026-11-10T04:42:06Z",
+ "measured_at": "2026-11-10T11:22:59Z",
  "all_checks_agree": true
 }

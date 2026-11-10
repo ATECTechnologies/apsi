@@ -29,16 +29,19 @@ app.run(host="0.0.0.0", port=8080)            # run with --allow-net
 **Measured — a synthetic benchmark** (a route that returns a fixed 25-byte JSON object, keep-alive, the Go load
 generator in `benchmarks/web` on the same machine):
 
-| Machine | Apsi, 1 process | Apsi, `processes="auto"` | Node.js 22 bare `http` (1 process) |
-|---|---:|---:|---:|
-| GitHub runner, AMD EPYC 7763, 4 vCPU | 14,600–15,700 req/s | **38,800–41,500 req/s** | 23,400–24,100 req/s |
-| 2-vCPU cloud VM (load generator on the same 2 cores) | 22,100–23,000 req/s (26,200 with uvloop) | **43,400–50,800 req/s** | 39,600–55,700 req/s |
+| AMD EPYC 7763 GitHub Actions runner (4 vCPU), best of 3 rounds | 64 connections | 256 connections |
+|---|---:|---:|
+| Apsi, 1 process | 14,008–14,978 req/s | 13,671–14,830 req/s |
+| Apsi, 1 process, uvloop | 15,493–16,863 req/s | 14,958–15,392 req/s |
+| Apsi, `processes="auto"` | **41,718–42,085 req/s** | **44,042–44,269 req/s** |
+| Node.js 22 bare `http` (1 process) | 19,872–22,198 req/s | 22,862–25,155 req/s |
 
-Per process, the work per request went down by about 16 % in this release (19,200 → 22,400 req/s on the VM). With
-one process per core Apsi answers more requests than a single Node.js process; Node.js itself also needs its
-`cluster` module to use more than one core. With 50 to 1,000 open connections the rate stays the same and no request
-fails; while 64 connections keep a blocking 10 ms route busy, a fast route on the same server still answers about
-15,000 requests/s with a p99 of 1.0 ms (the slow route runs on worker threads, the fast one on the event loop).
+Per process, the work per request went down by about 16 % in this release (measured on a 2-core VM). With one process
+per core Apsi answers about 1.8× the requests of a single Node.js process; one Apsi process answers about two thirds
+of Node's (Node.js itself needs its `cluster` module to use more than one core). With 1,000 open connections no
+request fails (15,454 req/s); while 64 connections keep a blocking 10 ms route busy, a fast route on the same process
+still answers 9,888 requests/s with a p99 of 7.9 ms (the slow route runs on worker threads, the fast one on the event
+loop).
 
 **What these numbers are and are not.** This is a synthetic test of the server's fixed cost per request: no database,
 no request body to parse, no TLS, no real network (loopback), and the load generator shares the cores with the
@@ -141,8 +144,8 @@ print(c.receive())
 c.close()
 ```
 
-Measured on a 2-core VM with a Node.js 22 client: a round trip takes 206 µs; a burst of 20,000 messages is echoed
-at 36,800 messages per second, in order; 1,000 concurrent connections all answered. Reproduce with
+Measured on an AMD EPYC 7763 GitHub Actions runner (4 vCPU) with a Node.js 22 client: a round trip takes 225 µs; a burst of 20,000 messages is
+echoed at 50,591 messages/s, in order; 1,000 concurrent connections all answered. Reproduce with
 `benchmarks/websocket/`.
 
 ## Talking to Next.js / JavaScript / Java

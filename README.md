@@ -12,7 +12,7 @@
   <a href="https://github.com/ATECTechnologies/apsi/actions/workflows/darwin-arm64.yml"><img src="https://github.com/ATECTechnologies/apsi/actions/workflows/darwin-arm64.yml/badge.svg" alt="darwin-arm64"></a>
 </p>
 <p align="center">
-  <a href="https://github.com/ATECTechnologies/apsi/releases/latest"><img src="https://img.shields.io/github/v/release/ATECTechnologies/apsi?label=release&color=2ea44f" alt="latest release"></a>
+  <a href="https://apsi.dev/download"><img src="https://img.shields.io/badge/download-2.4.4-2ea44f" alt="Download Apsi 2.4.4"></a>
   <img src="https://img.shields.io/badge/python-3.12%20%7C%203.13%20%7C%203.14-3776ab" alt="Python 3.12 | 3.13 | 3.14">
   <img src="https://img.shields.io/badge/native-LLVM%20%7C%20AVX2%20%7C%20AVX--512%20%7C%20NEON-555" alt="native code">
   <img src="https://img.shields.io/badge/GPU-CUDA%20%7C%20Tensor%20Cores-76b900" alt="GPU">
@@ -24,7 +24,7 @@
   <a href="https://apsi.dev/docs">Documentation</a> ·
   <a href="docs/WHATS-NEW.md">What's new in 2.4.4</a> ·
   <a href="https://apsi.dev/benchmarks">Benchmarks</a> ·
-  <a href="https://github.com/ATECTechnologies/apsi/releases">Releases</a>
+  <a href="https://apsi.dev/download">Download</a>
 </p>
 
 ---
@@ -66,14 +66,13 @@ fn energy(x, v, k: Float) -> Float:
 
 ## Install
 
-Download from [Releases](https://github.com/ATECTechnologies/apsi/releases) or [apsi.dev/download](https://apsi.dev/download):
+**Download: [apsi.dev/download](https://apsi.dev/download)** — every version, with the SHA-256 of each file.
 
-| System | Install |
-|---|---|
-| Windows 10/11 (x64) | `ApsiSetup-2.4.4-x64.exe` (brings its own Python; no administrator rights) |
-| Any Linux, also WSL | `sh ApsiSetup-2.4.4-linux.sh` (no root) |
-| Ubuntu / Debian | `sudo apt install ./apsi_2.4.4_all.deb` |
-| Python 3.12+ anywhere | `pip install apsi-2.4.4-py3-none-any.whl` |
+| System | File | Install |
+|---|---|---|
+| Windows 10/11 (x64) | `ApsiSetup-2.4.4-x64.exe` | double-click (brings its own Python; no administrator rights) |
+| Any Linux, also WSL | `ApsiSetup-2.4.4-linux.sh` | `sh ApsiSetup-2.4.4-linux.sh` (no root) |
+| Ubuntu / Debian | `apsi_2.4.4_all.deb` | `sudo apt install ./apsi_2.4.4_all.deb` |
 
 From this repository: `pip install numpy`, then `./apsi.sh run examples/01_hello.apsi` (Linux, macOS) or
 `apsi.bat run examples\01_hello.apsi` (Windows). Building the installers: [`docs/BUILD.md`](docs/BUILD.md).
@@ -113,12 +112,12 @@ Then read [Getting started](docs/GETTING-STARTED.md) (15 minutes) or [Write Apsi
   (bit-identical results), so AVX2 desktops get the same vector code as AVX-512 servers; `@native("fma")` fuses
   multiply-adds like C compilers do by default.
 * **Matrix products from plain loops.** Three nested loops computing `c[i, j] += a[i, k] * b[k, j]` run on the tuned
-  BLAS kernel: 10× faster than the same loops in C with `-O3` at 2048×2048.
+  BLAS kernel: 11× faster than the same loops in C with `-O3` at 2048×2048.
 * **Fewer AI tokens.** Exactly reversible packing of what you send to language models: 57–63 % fewer tokens for
   record lists (`use tokens`).
-* **Data.** A columnar table engine, 3–24× faster than pandas (`use dataframe`); PostgreSQL, MySQL/MariaDB, MongoDB,
+* **Data.** A columnar table engine, up to 21× faster than pandas (`use dataframe`); PostgreSQL, MySQL/MariaDB, MongoDB,
   Redis and SQLite clients with no driver to install (`use db`).
-* **Web.** An HTTP server about 3× faster than 2.0.0, WebSocket routes and rooms, `.env` files and secrets.
+* **Web.** An HTTP server 2.4–2.7× faster than 2.0.0 per process (about 7.5× with `processes="auto"`), WebSocket routes and rooms, `.env` files and secrets.
 * **Tools.** A debugger, a 32 % faster cold compile, and the Apsi License 2.0, which allows commercial use.
 
 Details, examples and measurements: [`docs/WHATS-NEW.md`](docs/WHATS-NEW.md) · every change: [`CHANGELOG.md`](CHANGELOG.md).

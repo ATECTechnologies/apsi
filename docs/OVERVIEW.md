@@ -25,7 +25,9 @@ fn energy(x, v, k: Float) -> Float:
 
 ## Install
 
-| System | File in `dist/` |
+Download from [apsi.dev/download](https://apsi.dev/download) (built yourself: the `dist/` folder).
+
+| System | File |
 |---|---|
 | Windows 10/11 (x64) | `ApsiSetup-2.4.4-x64.exe` — setup wizard with its own Python; no administrator rights needed |
 | Any Linux (also WSL) | `sh ApsiSetup-2.4.4-linux.sh` — one-file installer, no root; commands, `.apsi` file type with icon, editor support |

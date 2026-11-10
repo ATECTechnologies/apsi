@@ -12,7 +12,7 @@ guide.
 | RAM, SSD, GPU | arrays that move to the SSD instead of running out of memory; container limits and memory pressure | [Memory](MEMORY.md) |
 | Fewer AI tokens | exactly reversible packing of what you send to language models | [Tokens](TOKENS.md) |
 | Hugging Face | download and run models (BERT family, GPT-2, Llama, Mistral, Qwen, Gemma) without Python packages | [Hub](HUB.md) |
-| Tables | a columnar engine, 3–24× faster than pandas | [Tables](DATAFRAME.md) |
+| Tables | a columnar engine, up to 21× faster than pandas (filters; joins 3.7×, group-bys 4–6×) | [Tables](DATAFRAME.md) |
 | Databases | PostgreSQL, MySQL / MariaDB, MongoDB, Redis, SQLite without drivers | [Databases](DATABASES.md) |
 | Web | an HTTP server 2–3× faster than 2.0.0 per process, one process per CPU with `processes="auto"`, uvloop, WebSocket |  [Servers](SERVER.md) |
 | Configuration | `.env` files, secrets, Python virtual environments | [Configuration](ENV.md) |
@@ -20,9 +20,9 @@ guide.
 | Number formats | f64, f32, f16, bf16, FP8 and int8 tensors in `@native` and `@gpu` code | [Number formats](NUMBERS.md) |
 | Long-range graphs | graph transformers, one-step global attention, k-hop and mixed-hop layers | [Graphs](GRAPHS.md) |
 | GPU | one thread per element, automatic CPU/GPU choice, Tensor Cores through cuBLAS | [Native](NATIVE.md) |
-| Matrix products | loops written the textbook way run on BLAS: 7–10× faster than C loops | [Performance](PERFORMANCE.md#matrix-products-written-as-loops) |
+| Matrix products | loops written the textbook way run on BLAS: 4–11× faster than C loops | [Performance](PERFORMANCE.md#matrix-products-written-as-loops) |
 | Same speed everywhere | SIMD lanes written by Apsi itself; `@native("fma")` | [below](#16-the-same-speed-on-every-processor) |
-| Speed overall | 3.83–7.31× faster than 2.0.0 on the same programs (geometric mean) | [below](#how-much-faster-than-200) |
+| Speed overall | 3.84–7.31× faster than 2.0.0 on the same programs (geometric mean) | [below](#how-much-faster-than-200) |
 
 ## 1. Python, exactly
 
@@ -90,8 +90,9 @@ print(rt.video(cam, process, fps=90, seconds=30, adapt=true))
   resolution under sustained overload and raises it again; one failing frame never stops the pipeline.
 * **Sizes:** any width × height from 16 to 16384, and names: `vga`, `svga`, `hd`, `wxga`, `hd+`, `fhd`, `qhd`, `4k` and
   more (`rt.sizes`).
-* **Measured** CPU-only on 2 cores: 640×480 at 976 fps, 1600×900 at 372 fps, 1920×1080 at 264 fps, 3840×2160 at
-  65 fps; capped runs reach 240/120/90/60/30 fps exactly with 0.8–12 ms latency. 2000 Hz loops: lateness p50 0.3 µs.
+* **Measured** CPU-only on one core of a GitHub runner (AMD EPYC 7763): 640×480 at 708 fps, 1600×900 at 169 fps,
+  1920×1080 at 106 fps, 3840×2160 at 20 fps; capped runs hold 240/120/90 fps up to 1920×1080 with 1.8–7.6 ms latency.
+  2000 Hz loops: 0 missed ticks, lateness p99 0.3–0.4 µs.
 
 ## 3. RAM, SSD, CPU and GPU (`use memory`)
 
@@ -179,8 +180,8 @@ let items = db.mongo("mongodb://app:secret@localhost/shop").collection("items")
   judged by CPU time so a busy server is not misled. The work per request is about 16 % lower than in the first
   2.4.4 build, uvloop is used when installed (`pip install "apsi[web]"`), and `app.run(processes="auto")` runs one
   process per CPU. In a synthetic test (a fixed JSON reply over loopback) on a 4-vCPU EPYC 7763: one process
-  14,600–15,700 requests/s, `processes="auto"` 38,800–41,500, Node.js 22's bare `http` module 23,400–24,100 (2.0.0:
-  6,700–7,700 on 2 cores). See [Servers](SERVER.md) for what this does and does not measure.
+  13,700–15,000 requests/s (15,000–16,900 with uvloop), `processes="auto"` 41,700–44,300, Node.js 22's bare `http`
+  module 19,900–25,200 (2.0.0 on the same runner: 5,100–5,800). See [Servers](SERVER.md) for what this does and does not measure.
 * WebSocket routes, rooms and a client: `@app.websocket("/chat")`, `app.room("lobby").send(msg)`,
   `web.websocket_connect(url)`.
 
@@ -232,8 +233,8 @@ fn matmul_into(a, b, c):
 ```
 
 Loop nests like this one (any loop order, or the dot-product form with `var s = 0.0`) are recognised as a matrix
-product and run with the tuned BLAS kernel, in the compiled engine and in `@native` code. On a 2-core VM a 2048×2048
-product takes 234 ms (73 GFLOP/s) — the same loops in C with `gcc -O3 -march=native` take 2,409 ms, and in Python
+product and run with the tuned BLAS kernel, in the compiled engine and in `@native` code. A 2048×2048
+product takes 192 ms (89 GFLOP/s) on a 4-vCPU runner — the same loops in C with `gcc -O3 -march=native` take 2,111 ms, and in Python
 they would take minutes. When the fast path would not give the loops' exact behaviour (integer arrays, `c`
 overlapping an input, bounds beyond the arrays) the loops run as written. See
 [Performance](PERFORMANCE.md#matrix-products-written-as-loops) and `benchmarks/matmul`.
@@ -301,20 +302,20 @@ The same programs on both versions, on the same machine, with identical results.
 
 | Program | 2.0.0 | 2.4.4 | runner | 2-core VM ¹ |
 |---|---:|---:|---:|---:|
-| matmul 300, loops (compiled engine) | 37,909 ms | 5.0 ms | **7658.43×** | 6374.16× |
-| 200k objects: create and sum | 3,793 ms | 419 ms | **9.05×** | 9.26× |
-| fib(25), recursive calls | 82.3 ms | 24.4 ms | **3.37×** | 2.26× |
-| matmul 512, @native loops | 26.7 ms | 9.8 ms | **2.73×** | 300.48× |
-| web server, 64 connections | 5,184 req/s | 12,554 req/s | **2.42×** | 3.06× |
-| web server, 256 connections | 6,037 req/s | 12,250 req/s | **2.03×** | 3.18× |
-| word count, 260k words | 324 ms | 202 ms | **1.6×** | 1.41× |
-| start-up: apsi run hello.apsi | 232 ms | 173 ms | **1.34×** | 6.69× |
-| 200k f-strings and join | 234 ms | 189 ms | **1.23×** | 1.26× |
-| integer loop, 3M iterations | 198 ms | 171 ms | **1.16×** | 0.99× |
-| apsi check, 43 example programs (1,594 lines), empty cache | 9,967 ms | 9,613 ms | **1.04×** | 4.9× |
+| matmul 300, loops (compiled engine) | 38,157 ms | 5.0 ms | **7708.43×** | 6374.16× |
+| 200k objects: create and sum | 3,758 ms | 434 ms | **8.65×** | 9.26× |
+| fib(25), recursive calls | 82.8 ms | 24.5 ms | **3.37×** | 2.26× |
+| matmul 512, @native loops | 24.7 ms | 9.6 ms | **2.56×** | 300.48× |
+| web server, 64 connections | 5,124 req/s | 13,949 req/s | **2.72×** | 3.06× |
+| web server, 256 connections | 5,848 req/s | 14,052 req/s | **2.4×** | 3.18× |
+| word count, 260k words | 320 ms | 205 ms | **1.56×** | 1.41× |
+| start-up: apsi run hello.apsi | 231 ms | 173 ms | **1.34×** | 6.69× |
+| 200k f-strings and join | 236 ms | 192 ms | **1.23×** | 1.26× |
+| integer loop, 3M iterations | 171 ms | 168 ms | **1.02×** | 0.99× |
+| apsi check, 43 example programs (1,594 lines), empty cache | 9,865 ms | 9,526 ms | **1.04×** | 4.9× |
 | harmonic sum 50M, @native | 70.1 ms | 70.1 ms | **1.0×** | 1.03× |
 
-Geometric mean: **3.83× faster** (runner), **7.31×** (2-core VM). `@native` code was already at C
+Geometric mean: **3.84× faster** (runner), **7.31×** (2-core VM). `@native` code was already at C
 speed in 2.0.0 and stays there. Reproduce with
 `python3 benchmarks/versions/compare.py --old ../apsi-2.0.0 --new . --web`.
 

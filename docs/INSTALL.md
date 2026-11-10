@@ -22,7 +22,9 @@ After installing, run `apsi doctor` to check your machine against these targets.
 | Ubuntu / Debian / Mint | `apsi_2.4.4_all.deb` | `sudo apt install ./apsi_2.4.4_all.deb` |
 | Any system with Python 3.12+ | `apsi-2.4.4-py3-none-any.whl` | `pip install apsi-2.4.4-py3-none-any.whl` |
 
-These files are in the `dist/` folder.
+**Download:** the Windows installer, the Linux installer (`ApsiSetup-2.4.4-linux.sh`) and the `.deb` are on
+[apsi.dev/download](https://apsi.dev/download), each with its SHA-256. When you build Apsi yourself
+([BUILD.md](BUILD.md)), all of these files are in the `dist/` folder.
 
 ### What the Windows setup wizard does
 

@@ -74,11 +74,11 @@
 - **Faster ordinary code.** Struct construction 9× faster (type checkers are built once per annotation, not per
   object); `Int`/`Float` argument and return checks, and `if`/`while` conditions on plain booleans, skip the checker
   call (recursive calls 2.3× faster); attribute access on structs, lists, dicts and strings takes a short path.
-  Measured against 2.0.0 on the same machine: `benchmarks/versions` (geometric mean 3.83× faster on a
+  Measured against 2.0.0 on the same machine: `benchmarks/versions` (geometric mean 3.84× faster on a
   GitHub runner with the native compiler, 7.31× on a 2-core VM without it).
 - **Matrix products written as loops run with BLAS.** Three nested loops computing `c[i, j] += a[i, k] * b[k, j]`
   (any loop order, a hoisted `a[i, k]`, or the dot-product form with an accumulator) are recognised in the compiled
-  engine and in `@native` code and run with the tuned BLAS kernel: 7–10× faster than the same loops in C with `-O3`,
+  engine and in `@native` code and run with the tuned BLAS kernel: 4–11× faster than the same loops in C with `-O3`,
   about 1,000× faster than before in the compiled engine. The loops remain the fallback (integer arrays, aliasing,
   out-of-range bounds) so behaviour never changes; `APSI_IDIOMS=0` turns it off. `benchmarks/matmul`.
 - **Models run natively** (`hub.model`, `hub.pipeline`): BERT, DistilBERT, RoBERTa, XLM-R and sentence-transformers

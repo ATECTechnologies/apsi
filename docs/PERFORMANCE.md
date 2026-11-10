@@ -121,12 +121,12 @@ fn matmul_into(a, b, c):
                 c[i, j] += aik * b[k, j]
 ```
 
-| n (float64, 2 cores) | same loops in C, `-O3 -march=native` | Apsi loops | |
+| n (float64; AMD EPYC 7763 GitHub Actions runner (4 vCPU); best of 3) | same loops in C, `-O3 -march=native` (1 core) | Apsi loops (BLAS, all cores) | |
 |---:|---:|---:|---|
-| 256 | 2.90 ms | 0.63 ms | 4.6× faster |
-| 512 | 28.96 ms | 4.30 ms | 6.7× faster |
-| 1024 | 251.1 ms | 33.0 ms | 7.6× faster |
-| 2048 | 2,409 ms | 234.2 ms | **10.3× faster** (73 GFLOP/s) |
+| 256 | 2.28 ms | 0.55 ms | 4.1× faster |
+| 512 | 18.85 ms | 3.40 ms | 5.5× faster |
+| 1024 | 155.2 ms | 24.27 ms | 6.4× faster |
+| 2048 | 2,111 ms | 192.4 ms | **11.0× faster** (89.3 GFLOP/s) |
 
 Details and how to reproduce: [`benchmarks/matmul`](../benchmarks/matmul/README.md).
 

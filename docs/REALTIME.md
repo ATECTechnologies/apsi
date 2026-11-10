@@ -36,9 +36,9 @@ s.every(100ms, redraw)           # 10 Hz
 print(s.run(seconds=10))         # per task: runs, worst lateness, errors
 ```
 
-Measured at 2000 Hz on a shared 2-core cloud VM (no real-time kernel, 3-second runs): **1996–1999 ticks per
-second, lateness p50 0.3 µs, p99 1–45 µs**; 0.1–0.3 % of ticks are skipped when the hypervisor takes the CPU away
-for 1–5 ms. On a desktop or a machine with an isolated core the misses go to zero. Reproduce with
+Measured at 2000 Hz on an AMD EPYC 7763 GitHub runner (no real-time kernel, three 3-second runs): **6,000 of 6,000
+ticks, 0 missed, lateness p50 0.2 µs, p99 0.3–0.4 µs, worst single tick 26–48 µs**. On a busy shared 2-core VM
+0.1–0.3 % of ticks were skipped when the hypervisor took the CPU away for 1–5 ms. Reproduce with
 `benchmarks/rt/loop.apsi`.
 
 On Linux the loop asks for 1 ns timer slack while it runs, so sleeps end on time. It deliberately does not switch to
@@ -80,22 +80,24 @@ Any width × height from 16 to 16384 works. Sizes can be given as numbers, `"WID
 
 ### Measured
 
-Pipeline: gray conversion + motion detection of every frame, CPU only, 2-core cloud VM, synthetic source in the same
+Pipeline: gray conversion + motion detection of every frame, CPU only, AMD EPYC 7763 GitHub Actions runner (4 vCPU), synthetic source in the same
 process (a real camera captures in hardware, so a real machine does better). "Capped" runs at the target frame rate
-and reports the end-to-end latency (frame captured → your function done) and jitter of the output rhythm.
+and reports the end-to-end latency (frame captured → your function done) and jitter of the output rhythm. Best of 2 runs.
 
 | size | pixels | uncapped fps | work p50 | work p99 | capped fps (target) | latency p50 | jitter |
 |---|---|---|---|---|---|---|---|
-| vga | 640×480 | 976 | 0.88 ms | 2.23 ms | 240.0 (240) | 0.91 ms | 1.02 ms |
-| svga | 800×600 | 940 | 0.86 ms | 1.73 ms | 240.0 (240) | 0.78 ms | 0.94 ms |
-| hd | 1280×720 | 533 | 1.51 ms | 4.30 ms | 120.0 (120) | 1.30 ms | 1.47 ms |
-| wxga | 1366×768 | 487 | 1.72 ms | 3.74 ms | 120.0 (120) | 1.43 ms | 1.26 ms |
-| hd+ | 1600×900 | 372 | 2.24 ms | 4.27 ms | 90.0 (90) | 1.83 ms | 1.32 ms |
-| fhd | 1920×1080 | 264 | 3.14 ms | 6.54 ms | 90.0 (90) | 2.54 ms | 1.91 ms |
-| qhd | 2560×1440 | 159 | 5.27 ms | 10.80 ms | 60.1 (60) | 4.62 ms | 2.46 ms |
-| 4k | 3840×2160 | 65 | 12.71 ms | 15.09 ms | 30.0 (30) | 11.79 ms | 2.04 ms |
+| vga | 640×480 | 708 | 1.36 ms | 1.67 ms | 240.0 (240) | 1.82 ms | 0.24 ms |
+| svga | 800×600 | 506 | 1.92 ms | 2.31 ms | 240.0 (240) | 1.80 ms | 0.29 ms |
+| hd | 1280×720 | 290 | 3.28 ms | 3.70 ms | 120.0 (120) | 3.45 ms | 0.35 ms |
+| wxga | 1366×768 | 251 | 3.82 ms | 4.15 ms | 120.0 (120) | 3.86 ms | 0.35 ms |
+| hd+ | 1600×900 | 169 | 5.62 ms | 6.17 ms | 90.0 (90) | 5.21 ms | 0.86 ms |
+| fhd | 1920×1080 | 106 | 8.84 ms | 9.77 ms | 90.0 (90) | 7.61 ms | 0.53 ms |
+| qhd | 2560×1440 | 50 | 19.28 ms | 21.68 ms | 40.0 (60) | 19.77 ms | 2.86 ms |
+| 4k | 3840×2160 | 20 | 46.61 ms | 51.37 ms | 20.0 (30) | 38.50 ms | 4.55 ms |
 
-Every size reaches its target exactly. Reproduce with `benchmarks/rt/sizes.apsi`.
+Every size up to 1920×1080 holds its target; 2560×1440 reaches 57 of 60 fps and 3840×2160 20 of 30 fps here, because
+the frame work alone takes longer than the frame time on this processor (a faster CPU or `@native` work functions
+reach the higher targets). Reproduce with `benchmarks/rt/sizes.apsi`.
 
 ### Staying smooth under load
 

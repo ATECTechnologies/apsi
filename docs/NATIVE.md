@@ -1,6 +1,6 @@
 # Native code: `@native`, `parallel for` and `@gpu`
 
-Apsi 2.0 compiles functions to machine code. A function marked `@native` is specialised on the types and units of
+Apsi compiles functions to machine code. A function marked `@native` is specialised on the types and units of
 its arguments, translated to LLVM IR, optimised at `-O3` for the exact CPU it runs on (AVX2, AVX-512, FMA, NEON), and
 called directly — no interpreter in between. `parallel for` spreads a loop over all CPU cores, and `@gpu` runs it on
 NVIDIA GPUs.
@@ -123,22 +123,37 @@ A second suite (`benchmarks/heavy/`) uses larger, harder programs: dense all-pai
 20-million-step Runge–Kutta integration and k-means clustering. Each is written the same way in Apsi (`@native`,
 strict IEEE), C, C++, Rust, Go and Mojo 1.2 (with raw pointers, as performance-oriented Mojo is written); the runner
 refuses to report times unless all of them produce the same checksum. Apsi 2.4.4 on a GitHub Actions runner
-(AMD EPYC 7763), single core, best of 3, milliseconds (geometric mean: Apsi takes 0.85× the time of C):
+(AMD EPYC 7763), single core, milliseconds, best of 5 rounds in which Apsi 2.4.4 and 2.0.0 ran in turn on the same
+runner (geometric mean: Apsi takes 0.81× the time of C):
 
 | Benchmark | Apsi | C | C++ | Rust | Go |
 |---|---:|---:|---:|---:|---:|
-| nbody-dense 2000x10 | 46.8 | **44.1** | 44.3 | 182.2 | 319.1 |
-| jacobi-2d 1024x200 | 207 | 173.9 | **161.4** | 177.8 | 707.1 |
-| matmul 1024 | 196.2 | 202.8 | **186.6** | 191.1 | 700.7 |
-| lu-pivot 800 | 41.2 | **40.5** | 41.4 | 42.4 | 116.9 |
-| ising 512x50 | **81.7** | 90.8 | 90.6 | 84.7 | 147.3 |
-| levenshtein 10k | **195.3** | 811.2 | 306.4 | 268.9 | 1739.1 |
-| ode-rk4 20M | 355.2 | **289** | 289.1 | 355.2 | 355.7 |
-| kmeans 200k k16 x20 | **51.5** | 60.8 | 60.5 | 64.4 | 213.6 |
+| nbody-dense 2000x10 | 46.5 | **44.1** | **44.1** | 181.9 | 317.4 |
+| jacobi-2d 1024x200 | **151.4** | 167.1 | 157.3 | 166.6 | 700.7 |
+| matmul 1024 | 177.6 | 199.6 | **164.8** | 182 | 479.4 |
+| lu-pivot 800 | **40** | 40.3 | 40.1 | 41.2 | 116.5 |
+| ising 512x50 | **81.5** | 90.6 | 90.4 | 83.6 | 145.9 |
+| levenshtein 10k | **195.1** | 809.3 | 305.6 | 268.7 | 1,736 |
+| ode-rk4 20M | 354.9 | **288.7** | 288.8 | 354.9 | 355.2 |
+| kmeans 200k k16 x20 | **51.3** | 60.5 | 59 | 64.2 | 213.3 |
 
-jacobi-2d is limited by memory bandwidth, which other jobs on the shared runner also use: on this runner model
-Apsi's jacobi has measured 152–207 ms and C's 166–196 ms in different runs; the commit-by-commit measurement (rounds
-in rotation on one runner) gives 152.5 ms. C's ode-rk4 is faster because gcc fuses multiply-adds by default; with `@native("fma")` Apsi takes 263 ms there.
+The same runner, Apsi 2.0.0 against 2.4.4 (geometric mean: 2.4.4 is 1.29× faster; `@native` code was already at C
+speed in 2.0.0):
+
+| Benchmark | Apsi 2.0.0 | Apsi 2.4.4 | 2.4.4 against 2.0.0 |
+|---|---:|---:|---:|
+| nbody-dense 2000x10 | 182.7 | 46.5 | **3.93× faster** |
+| jacobi-2d 1024x200 | 150.5 | 151.4 | same (0.99×) |
+| matmul 1024 | 178.9 | 177.6 | same (1.01×) |
+| lu-pivot 800 | 40.3 | 40 | same (1.01×) |
+| ising 512x50 | 81.5 | 81.5 | same (1.00×) |
+| levenshtein 10k | 193.8 | 195.1 | same (0.99×) |
+| ode-rk4 20M | 533.3 | 354.9 | **1.50× faster** |
+| kmeans 200k k16 x20 | 65.3 | 51.3 | **1.27× faster** |
+
+jacobi-2d is limited by memory bandwidth, which other jobs on the shared runner also use, so one round can be much
+slower than the others (one of the five rounds took 261 ms); the best of several rounds is the reliable number.
+C's ode-rk4 is faster because gcc fuses multiply-adds by default; with `@native("fma")` Apsi takes 263 ms there.
 Results on another runner model (EPYC 9V45, AVX-512) and Mojo results from an earlier machine are in
 `benchmarks/heavy/results.md` and `benchmarks/heavy/versions/`.
 

@@ -1,6 +1,6 @@
 # The Apsi Language Reference
 
-Version 2.0 · source files use the extension `.apsi` and the UTF-8 encoding.
+Apsi 2.4.4 · source files use the extension `.apsi` and the UTF-8 encoding.
 
 This document is the complete reference for Apsi: how programs are written, what every construct means, every
 built-in function and module, the interactive REPL and the `apsi` command line. Read it from the top to learn the

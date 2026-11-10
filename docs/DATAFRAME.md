@@ -67,17 +67,17 @@ Reading back: `height`, `width`, `shape`, `columns`, `dtypes`, `row(i)`, `rows()
 * **Group-by** factorises the keys once and reduces with `bincount` / `reduceat`. **Joins** match the factorised keys
   by direct addressing. **Filters** are boolean masks.
 
-Measured against pandas 2 on 2 million rows (2-core VM, best of 3, results checked equal):
+Measured against pandas 2 on 2 million rows (AMD EPYC 7763 GitHub Actions runner (4 vCPU), best of 3, results checked equal):
 
 | operation | pandas | Apsi | |
 |---|---|---|---|
-| filter with two conditions | 146 ms | 6.1 ms | **24× faster** |
-| group by 50,000 string keys: sum, mean, count | 180 ms | 42 ms | **4.3× faster** |
-| group by two keys: std, max | 187 ms | 44 ms | **4.2× faster** |
-| left join 2M × 50k on a string key | 227 ms | 74 ms | **3.1× faster** |
-| sort by a float column | 196 ms | 111 ms | **1.8× faster** |
-| arithmetic on columns | 8.9 ms | 6.5 ms | 1.4× faster |
-| read a 1M-row CSV | 0.36 s | 0.30 s | 1.2× faster |
+| filter with two conditions | 98.8 ms | 4.6 ms | **21.5× faster** |
+| group by 50,000 string keys: sum, mean, count | 202.2 ms | 35.6 ms | **5.7× faster** |
+| group by two keys: std, max | 170.1 ms | 39.0 ms | **4.4× faster** |
+| left join 2M × 50k on a string key | 168.9 ms | 45.1 ms | **3.7× faster** |
+| sort by a float column | 168.4 ms | 105.1 ms | **1.6× faster** |
+| arithmetic on columns | 2.8 ms | 2.7 ms | same |
+| read a 1M-row CSV | 0.18 s | 0.20 s | 1.1× slower |
 | memory for the table | 262 MB | 65 MB | **4× less** |
 
 Reproduce with `benchmarks/dataframe/run.py` and `benchmarks/dataframe/csv.py`.

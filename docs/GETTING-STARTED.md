@@ -6,8 +6,8 @@ This guide takes you from installation to a first program, a first trained model
 
 Apsi 2.4.4 runs on **Windows 10 or newer** and **Linux** (x86-64) and needs **Python 3.12 or newer** as its host runtime. The installers check for Python and offer to install it.
 
-- Windows: download the installer from the download page and run it. Details: [Install on Windows](INSTALL.md).
-- Linux: unpack the Linux package and run `sh install.sh`, or install the `.deb`. Details: [Install on Linux](INSTALL-LINUX.md).
+- Windows: download `ApsiSetup-2.4.4-x64.exe` from [apsi.dev/download](https://apsi.dev/download) and run it. Details: [Install on Windows](INSTALL.md).
+- Linux: download `ApsiSetup-2.4.4-linux.sh` from [apsi.dev/download](https://apsi.dev/download) and run `sh ApsiSetup-2.4.4-linux.sh`, or install the `.deb` with `sudo apt install ./apsi_2.4.4_all.deb`. Details: [Install on Linux](INSTALL-LINUX.md).
 
 Check the installation:
 

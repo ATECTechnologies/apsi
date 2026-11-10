@@ -3,6 +3,9 @@
 Works on every x86-64 distribution with glibc 2.17 or newer, such as Ubuntu 18.04+, Debian 10+, Fedora, Arch,
 openSUSE, Mint and Pop!_OS (the shell installer also on ARM, and in WSL on Windows).
 
+**Download:** `ApsiSetup-2.4.4-linux.sh` and `apsi_2.4.4_all.deb` are on [apsi.dev/download](https://apsi.dev/download).
+The other files below are made when you build Apsi yourself ([BUILD.md](BUILD.md)).
+
 | File | Best for | Bundled Python |
 |---|---|---|
 | `ApsiSetup-2.4.4-linux.sh` | **simplest** — one-file installer for every distribution, no root, works offline | uses the system python3 (installs numpy privately if missing) |
