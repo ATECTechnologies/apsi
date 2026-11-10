@@ -4,6 +4,7 @@
     fn energy(x: Tensor) -> Float: ...
 
     @native("fast")              # checks off, fast-math (reassociation, FMA) - like C with -O3 -ffast-math
+    @native("fma")               # checks on; a * b + c may become one fused multiply-add (like gcc -O3's default)
     @native("strict")            # fail instead of falling back to the bytecode engine
 
 A `NativeFunction` compiles one specialisation per combination of argument types and units, the first time it is
@@ -28,7 +29,7 @@ from . import engine as _eng
 from .types import type_of_value as _type_of_value
 
 _compile_lock = threading.RLock()
-OPTION_NAMES = {"fast", "strict", "quiet", "auto"}
+OPTION_NAMES = {"fast", "strict", "quiet", "auto", "fma"}
 STATS = {"compiled": 0, "fallbacks": 0, "calls": 0}
 _REPORTS = []          # (function name, message) for `apsi native explain`
 REGISTRY = []          # every NativeFunction made in this process (for explain/ir)

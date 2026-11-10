@@ -36,13 +36,14 @@ import os
 from .. import ast as A
 
 ENABLED = os.environ.get("APSI_JAM", "1") != "0"
-LANES = 4
+LANES = int(os.environ.get("APSI_JAM_LANES", "4"))
 PURE = {"sqrt", "abs", "min", "max", "exp", "log", "log2", "log10", "sin", "cos", "tan", "tanh", "atan", "atan2",
         "floor", "ceil", "float", "int", "round", "len", "pow", "hypot", "sinh", "cosh", "asin", "acos", "erf"}
 _EXPR = (A.Num, A.Name, A.Unary, A.Binary, A.Logic, A.IfExpr, A.Call, A.Index, A.Attr, A.TupleLit, A.Chain,
          A.Bool)
 _cache = {}
 _ids = itertools.count(1)
+VEC = {}            # id(jammed inner For) -> (node, statements of lane 0, lane renames): see Spec.jam_vector_for
 
 
 def jam(loop):
@@ -250,7 +251,9 @@ def _jam(loop):
     ibody = []
     for s in inner.body:
         ibody += [_clone(s, lanes[kk]) for kk in range(LANES)]
-    wbody.append(A.For([j], inner.iter, ibody, False, None, None, line=inner.line, col=inner.col))
+    jfor = A.For([j], inner.iter, ibody, False, None, None, line=inner.line, col=inner.col)
+    VEC[id(jfor)] = (jfor, ibody[0::LANES], lanes)       # the compiler may run the lanes as one SIMD vector
+    wbody.append(jfor)
     for kk in range(LANES):                             # lane by lane: shared updates keep their original order
         wbody += [_clone(st, lanes[kk]) for st in post]
     wbody.append(A.Assign(nm(base), A.Binary("+", nm(base), num(LANES), line=L, col=C), None, line=L, col=C))

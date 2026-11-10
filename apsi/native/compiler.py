@@ -20,6 +20,7 @@ given dtype / rank / layout) and on their physical dimensions. Everything else i
   `x = max(x, ..)` on outer variables become deterministic parallel reductions.
 """
 import math
+import os
 from fractions import Fraction
 
 import numpy as np
@@ -137,6 +138,7 @@ class Spec:
         self.callees = set()      # specs this one calls (for the may-fail fixed point)
         self.ret_np = None        # (must, may): are returned scalars NumPy scalars on every / some path
         self.fast = resolver.options.get("fast", False)
+        self.fma = resolver.options.get("fma", False)       # contract a * b + c into fused multiply-adds only
 
 
 # ============================================================================= module context
@@ -559,6 +561,7 @@ class FnEmitter:
         self.mc, self.spec, self.dry = mc, spec, dry
         self.r = spec.resolver
         self.fast = spec.fast
+        self.fma = spec.fma
         self.erased = bool(spec.resolver.options.get("erased"))   # called from unit-erased code: no units
         self.scopes = []
         self.proven = set()
@@ -1201,7 +1204,264 @@ class FnEmitter:
                 for st in rep:
                     self.stmt(st)
                 return None
+            from .jam import VEC
+            hit = VEC.get(id(s))
+            if hit is not None and hit[0] is s and not self.dry and self.jam_vector_for(s, hit[1], hit[2]):
+                return None
         return self.for_loop(s)
+
+    # ---- the inner loop of a jammed nest as SIMD vectors (jam.py)
+    def jam_vector_for(self, s, stmts0, lanes):
+        """Run the lanes of a jammed inner loop as one vector of LANES doubles: each lane still does exactly its
+        own operations in its own order (IEEE operations are element-wise), so results are bit-for-bit those of
+        the scalar loop, but the code no longer depends on LLVM's SLP vectoriser finding the vectors (which it
+        does not do on every CPU). Handles straight-line Float code (+ - * /, unary -, sqrt, abs) over lane
+        variables and values that are the same for every lane; anything else keeps the scalar lanes. Returns
+        True when the loop was emitted."""
+        if os.environ.get("APSI_JAM_VEC", "1") == "0" or self.mc.gpu:
+            return False
+        L = len(lanes)
+        lane0 = set(lanes[0].values())
+        orig = {v: k for k, v in lanes[0].items()}
+        slots = self.spec.slots
+
+        def kind_np(key):
+            """'bad' unless the slot holds a dimensionless Float; else its provenance True / False / None (run time)"""
+            t, d, must, may = slots[key]
+            if t != F64 or d != DIMLESS:
+                return "bad"
+            return True if must else (False if not may else None)
+
+        class No(Exception):
+            pass
+
+        declared = {}                       # lane-0 name -> provenance (True: NumPy scalar, None: known at run time)
+        carried, assigned = [], set()
+        dyn_state = {}                      # carried run-time-provenance variable -> provenance after one iteration
+
+        def var_np(n):
+            if n in declared:
+                return declared[n]
+            key = self.find(n)
+            if key is None:
+                raise No
+            np_ = kind_np(key)
+            if np_ == "bad":
+                raise No
+            for k in range(L):                                  # every lane's slot: the same kind
+                kk = self.find(lanes[k][orig[n]])
+                if kk is None or kind_np(kk) != np_:
+                    raise No
+            declared[n] = np_
+            carried.append(n)
+            if np_ is None:
+                dyn_state[n] = "same"
+            return np_
+
+        def uses_lane(e):
+            return any(isinstance(x, A.Name) and x.id in lane0 for x in _walk([e]))
+
+        def inv_np(e):
+            if isinstance(e, A.Index):
+                return True
+            if isinstance(e, A.Num):
+                return False
+            if isinstance(e, A.Name):
+                key = self.find(e.id)
+                if key is not None:
+                    t, d, must, may = slots[key]
+                    return True if must else (False if not may else None)
+            return None
+
+        def por(a, b):
+            if a is True or b is True:
+                return True
+            if a is False and b is False:
+                return False
+            return None
+
+        def chk(e):
+            """Provenance of a lane expression (True / False / None: only known at run time), or raise No."""
+            if not uses_lane(e):
+                return inv_np(e)
+            if isinstance(e, A.Name):
+                return var_np(e.id)
+            if isinstance(e, A.Binary) and e.op in ("+", "-", "*", "/"):
+                np_ = por(chk(e.left), chk(e.right))
+                if e.op == "/" and np_ is not True and not (isinstance(e.right, A.Num) and e.right.unit is None
+                                                             and e.right.value != 0):
+                    raise No                            # Python numbers: x / 0 must raise, lane by lane
+                return np_
+            if isinstance(e, A.Unary) and e.op == "-":
+                return chk(e.operand)
+            if isinstance(e, A.Call) and isinstance(e.func, A.Name) and e.func.id in ("sqrt", "abs") \
+                    and len(e.args) == 1 and not e.kwargs and self.find(e.func.id) is None:
+                np_ = chk(e.args[0])
+                return False if e.func.id == "sqrt" else np_
+            raise No
+
+        def assign(n, np_val, aug):
+            np_ = var_np(n)
+            if n in carried:
+                assigned.add(n)
+            if n in dyn_state:                  # follow the run-time provenance flag the scalar code keeps
+                if np_val is None:
+                    raise No
+                if not aug:
+                    dyn_state[n] = np_val
+                elif np_val is True:
+                    dyn_state[n] = True
+            elif np_ is None:
+                raise No
+
+        try:
+            for st in stmts0:
+                if isinstance(st, A.Pass):
+                    continue
+                if isinstance(st, A.Let):
+                    if len(st.targets) != 1 or not isinstance(st.targets[0], str) or st.type is not None:
+                        raise No
+                    chk(st.value)
+                    np_ = kind_np(("let", id(st), 0))
+                    if np_ == "bad":
+                        raise No
+                    declared[st.targets[0]] = np_
+                elif isinstance(st, (A.Assign, A.AugAssign)) and isinstance(st.target, A.Name) \
+                        and st.target.id in lane0 and not (isinstance(st, A.Assign) and st.more):
+                    if isinstance(st, A.AugAssign):
+                        if st.op not in ("+", "-", "*", "/"):
+                            raise No
+                        assign(st.target.id, chk(A.Binary(st.op, st.target, st.value, line=st.line, col=st.col)),
+                               False)
+                    else:
+                        assign(st.target.id, chk(st.value), False)
+                else:
+                    raise No
+        except No:
+            if os.environ.get("APSI_JAM_DEBUG"):
+                import traceback
+                traceback.print_exc()
+            return False
+
+        rng = self.range_of(s.iter, s)
+        if rng is None or rng[2] != 1:
+            return False
+        start, stop = rng[0], rng[1]
+        bd = self.f.b
+        fn = self.f.fn
+        nblocks = len(fn.blocks)
+        cur = bd.block
+        first = fn.append_basic_block("jam.vec")
+        bd.position_at_end(first)
+        n_scopes, proven = len(self.scopes), self.proven
+        dt = ir.DoubleType()
+        VT = ir.VectorType(dt, L)
+        zero32 = ir.Constant(ir.IntType(32), 0)
+        splat_mask = ir.Constant(ir.VectorType(ir.IntType(32), L), [0] * L)
+        fast, fma = self.fast, self.fma
+
+        def flag(r):
+            if fast:
+                r.flags.append("fast")
+            elif fma:
+                r.flags.append("contract")
+            return r
+
+        def broadcast(x):
+            v = bd.insert_element(ir.Constant(VT, ir.Undefined), x, zero32)
+            return bd.shuffle_vector(v, ir.Constant(VT, ir.Undefined), splat_mask)
+
+        ptrs = {}
+
+        def vexpr(e):
+            if not uses_lane(e):
+                v = self.expr(e)
+                if v.t not in (I64, BOOL, F64, F32) or v.d != DIMLESS:
+                    raise Unsupported("a lane-invariant value that is not a plain number", e)
+                return broadcast(self.convert(self.materialize(v, e), F64, e).v)
+            if isinstance(e, A.Name):
+                return bd.load(ptrs[e.id])
+            if isinstance(e, A.Binary):
+                a, b = vexpr(e.left), vexpr(e.right)
+                return flag({"+": bd.fadd, "-": bd.fsub, "*": bd.fmul, "/": bd.fdiv}[e.op](a, b))
+            if isinstance(e, A.Unary):
+                return flag(bd.fneg(vexpr(e.operand)))
+            name = {"sqrt": f"llvm.sqrt.v{L}f64", "abs": f"llvm.fabs.v{L}f64"}[e.func.id]
+            return bd.call(self.mc.decl(name, VT, [VT]), [vexpr(e.args[0])])
+
+        def emit_body(jv):
+            self.declare(s.targets[0], ("for", id(s), 0), jv, s)
+            for st in stmts0:
+                if isinstance(st, A.Pass):
+                    continue
+                if isinstance(st, A.Let):
+                    p = self.f.entry_b.alloca(VT, name="lanes")
+                    bd.store(vexpr(st.value), p)
+                    ptrs[st.targets[0]] = p
+                elif isinstance(st, A.AugAssign):
+                    p = ptrs[st.target.id]
+                    old = bd.load(p)
+                    val = vexpr(st.value)
+                    bd.store(flag({"+": bd.fadd, "-": bd.fsub, "*": bd.fmul, "/": bd.fdiv}[st.op](old, val)), p)
+                else:
+                    bd.store(vexpr(st.value), ptrs[st.target.id])
+
+        try:
+            for n in carried:                                   # lanes -> vector
+                vec = ir.Constant(VT, ir.Undefined)
+                for k in range(L):
+                    x = self.load_slot(self.find(lanes[k][orig[n]]), s)
+                    vec = bd.insert_element(vec, x.v, ir.Constant(ir.IntType(32), k))
+                p = self.f.entry_b.alloca(VT, name="lanes")
+                bd.store(vec, p)
+                ptrs[n] = p
+            ran = bd.icmp_signed("<", start.v, stop.v)
+            plan = self.bounds_plan(s, s.targets[0], start, stop, 1)
+            if plan is None:
+                self.counted_loop(s, start, stop, 1, None, emit_body)
+            else:
+                ok, pr = plan
+                fast_bb = fn.append_basic_block("for.fast")
+                slow_bb = fn.append_basic_block("for.checked")
+                join = fn.append_basic_block("for.join")
+                bd.cbranch(ok, fast_bb, slow_bb)
+                bd.position_at_end(fast_bb)
+                self.proven = proven | pr
+                self.counted_loop(s, start, stop, 1, None, emit_body)
+                self.proven = proven
+                if not bd.block.is_terminated:
+                    bd.branch(join)
+                bd.position_at_end(slow_bb)
+                self.counted_loop(s, start, stop, 1, None, emit_body)
+                if not bd.block.is_terminated:
+                    bd.branch(join)
+                bd.position_at_end(join)
+            for n in carried:                                   # vector -> lanes
+                if n not in assigned:
+                    continue
+                vec = bd.load(ptrs[n])
+                for k in range(L):
+                    key = self.find(lanes[k][orig[n]])
+                    x = bd.extract_element(vec, ir.Constant(ir.IntType(32), k))
+                    bd.store(x, self._alloca(key))
+                    st_ = dyn_state.get(n, "same")
+                    if st_ != "same" and self.slot_dyn(key):    # after >= 1 iteration: that provenance
+                        flag_p = self._np_alloca(key)
+                        bd.store(bd.select(ran, ir.Constant(i1t(), int(st_)), bd.load(flag_p)), flag_p)
+        except (Unsupported, UnitError, TypeCheckError, KeyError):
+            if os.environ.get("APSI_JAM_DEBUG"):
+                import traceback
+                traceback.print_exc()
+            del fn.blocks[nblocks:]                             # leave no trace: the scalar lanes run instead
+            del self.scopes[n_scopes:]
+            self.proven = proven
+            bd.position_at_end(cur)
+            return False
+        end = bd.block
+        ir.IRBuilder(cur).branch(first)
+        bd.position_at_end(end)
+        self.mc.jam_vector = True
+        return True
 
     def gemm_call(self, g, s):
         """Emit apsi_gemm(...) for a matched loop nest; an i1 that is true when BLAS did the work, or None when the
@@ -2363,6 +2623,8 @@ class FnEmitter:
         r = f(a.v, b.v)
         if self.fast:
             r.flags.append("fast")
+        elif self.fma and op != "/":
+            r.flags.append("contract")
         return Val(t, r, d)
 
     def int_arith(self, op, a, b, node, d=None, npv=False):
@@ -2515,6 +2777,8 @@ class FnEmitter:
         r = self.f.b.fmul(a, b)
         if self.fast:
             r.flags.append("fast")
+        elif self.fma:
+            r.flags.append("contract")
         return r
 
     def int_pow(self, a, b, node, d, npv=False):
@@ -3455,6 +3719,8 @@ class FnEmitter:
                 r = b.fadd(x, y) if fl else b.add(x, y)
                 if fl and fast:
                     r.flags.append("fast")
+                elif fl and self.fma:
+                    r.flags.append("contract")
                 return r
             return lt, ir.Constant(lt, 0.0 if fl else 0), comb
         if name == "prod":

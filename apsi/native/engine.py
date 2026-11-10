@@ -494,7 +494,8 @@ leave:
     def key(self, ir_text):
         from .. import __version__
         h = hashlib.sha256()
-        for part in (OPT_VERSION, __version__, self.llvm_version, self.triple, self.cpu, self.features, ir_text):
+        for part in (OPT_VERSION, __version__, self.llvm_version, self.triple, self.cpu, self.features,
+                     "slp=" + os.environ.get("APSI_SLP", "auto"), ir_text):        # APSI_SLP changes the code
             h.update(part.encode())
             h.update(b"\0")
         return h.hexdigest()

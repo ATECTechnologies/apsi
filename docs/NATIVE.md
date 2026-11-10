@@ -176,6 +176,12 @@ Native code means the same thing as the bytecode engine. Default `@native` keeps
 index checks are removed, and floating-point reassociation and FMA are allowed, so sums may differ in the last
 digits (like C with `-O3 -ffast-math`). Use it after the program works with `@native`.
 
+`@native("fma")` keeps every check and the order of every operation, and only allows `a * b + c` to become one
+fused multiply-add instruction (one rounding instead of two). That is what gcc and clang do for C by default, so it
+is the like-for-like setting against C. Results differ from strict IEEE in the last bits (usually they are slightly
+more accurate). On a chain of dependent arithmetic it is much faster: the ODE benchmark runs in 288 ms instead of
+440 ms on a Xeon 8573C, against 387 ms for gcc -O3 (`benchmarks/heavy/fma.apsi`).
+
 `@native("strict")` turns "cannot compile" into an error instead of a note — useful in tests and CI.
 
 ## Tensors
@@ -276,9 +282,10 @@ A `@gpu` function runs its `parallel for` with one GPU thread per iteration.
   iterations are independent (`c[i, j] = …`), the two loops become one loop over rows × columns, so a 2048 × 2048
   result gets 4 million GPU threads instead of 2,048. Nothing to write differently.
 - **CPU or GPU, chosen per call size:** a launch of fewer than 4,096 iterations runs on the CPU (the GPU's fixed
-  costs would dominate). For larger sizes, the first call of each size class (powers of two) is timed on the GPU,
-  the next on the CPU, and later calls use the faster one. Each call runs exactly once, so side effects never
-  repeat. `@gpu("strict")` or `APSI_GPU_AUTO=0` always uses the GPU; `APSI_GPU_MIN=n` changes the threshold.
+  costs would dominate). For larger sizes the choice is measured per size class (powers of two): the first GPU
+  call is a warm-up (it loads the kernel and is not counted), then one GPU call and one CPU call are timed, and
+  later calls use the faster side. Every 64 calls the slower side is timed once more, so a choice made while the
+  machine was busy does not stick. Each call runs exactly once, so side effects never repeat. `@gpu("strict")` or `APSI_GPU_AUTO=0` always uses the GPU; `APSI_GPU_MIN=n` changes the threshold.
 - **Matrix products and Tensor Cores:** a `@gpu` function whose loop nest is a matrix product runs as one cuBLAS
   GEMM when cuBLAS is installed (`pip install nvidia-cublas-cu12`): Tensor Cores with f32 accumulation for f16 and
   bf16 tensors, SGEMM / DGEMM for f32 / f64. See [Number formats](NUMBERS.md).

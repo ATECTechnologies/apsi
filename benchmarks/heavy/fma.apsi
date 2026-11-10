@@ -1,0 +1,67 @@
+# ode-rk4 (benchmarks/heavy) with exact IEEE arithmetic and with @native("fma"), which lets LLVM fuse a * b + c into
+# one instruction - what gcc and clang do by default for C. Fused results differ in the last bits.
+@native
+fn vdp_rk4(steps: Int) -> Float:
+    var x = 2.0
+    var v = 0.0
+    let h = 0.0001
+    let mu = 2.0
+    for i in 0..steps:
+        let k1x = v
+        let k1v = mu * (1.0 - x * x) * v - x
+        let x2 = x + 0.5 * h * k1x
+        let v2 = v + 0.5 * h * k1v
+        let k2x = v2
+        let k2v = mu * (1.0 - x2 * x2) * v2 - x2
+        let x3 = x + 0.5 * h * k2x
+        let v3 = v + 0.5 * h * k2v
+        let k3x = v3
+        let k3v = mu * (1.0 - x3 * x3) * v3 - x3
+        let x4 = x + h * k3x
+        let v4 = v + h * k3v
+        let k4x = v4
+        let k4v = mu * (1.0 - x4 * x4) * v4 - x4
+        x += h / 6.0 * (k1x + 2.0 * k2x + 2.0 * k3x + k4x)
+        v += h / 6.0 * (k1v + 2.0 * k2v + 2.0 * k3v + k4v)
+    return x + v
+
+# 8. k-means clustering: 200 000 points in 2-D, 16 clusters, 20 Lloyd iterations
+
+@native("fma")
+fn vdp_rk4_fma(steps: Int) -> Float:
+    var x = 2.0
+    var v = 0.0
+    let h = 0.0001
+    let mu = 2.0
+    for i in 0..steps:
+        let k1x = v
+        let k1v = mu * (1.0 - x * x) * v - x
+        let x2 = x + 0.5 * h * k1x
+        let v2 = v + 0.5 * h * k1v
+        let k2x = v2
+        let k2v = mu * (1.0 - x2 * x2) * v2 - x2
+        let x3 = x + 0.5 * h * k2x
+        let v3 = v + 0.5 * h * k2v
+        let k3x = v3
+        let k3v = mu * (1.0 - x3 * x3) * v3 - x3
+        let x4 = x + h * k3x
+        let v4 = v + h * k3v
+        let k4x = v4
+        let k4v = mu * (1.0 - x4 * x4) * v4 - x4
+        x += h / 6.0 * (k1x + 2.0 * k2x + 2.0 * k3x + k4x)
+        v += h / 6.0 * (k1v + 2.0 * k2v + 2.0 * k3v + k4v)
+    return x + v
+
+# 8. k-means clustering: 200 000 points in 2-D, 16 clusters, 20 Lloyd iterations
+
+fn timeit(name, f):
+    let r = f()
+    var best = 1e9
+    for rep in 0..3:
+        let t = clock()
+        f()
+        best = min(best, magnitude(clock() - t))
+    print(f"{name}: {best * 1000:.1f} ms  [check {r}]")
+
+timeit("ode-rk4 20M", fn() => vdp_rk4(20000000))
+timeit("ode-rk4 20M, @native(\"fma\")", fn() => vdp_rk4_fma(20000000))

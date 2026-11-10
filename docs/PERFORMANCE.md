@@ -171,3 +171,13 @@ accumulates into variables declared in the outer body, tensors written in the ne
 index (`ax[i]`) — or only after the inner loop, like `sums[cluster] += x[i]`, which keeps its original order — and
 only built-in math functions are called. Examples: n-body forces, k-means assignment, matrix-vector products,
 distance matrices. `APSI_JAM=0` turns it off.
+
+**The lanes are emitted as SIMD vectors directly.** Leaving the packing to LLVM's SLP vectoriser worked on some
+processors and not on others: with LLVM 22 on AVX2 machines (AMD Zen 2/3, Intel without AVX-512) it grouped the
+twelve n-body accumulators into one 12-wide vector and spent its time shuffling, so the n-body benchmark took
+127 ms on an EPYC 7763 instead of about 58 ms. Now, when the inner loop is straight-line Float code (`+ - * /`,
+unary minus, `sqrt`, `abs`) on lane variables and values shared by all lanes, `@native` writes the four lanes as
+`<4 x double>` operations itself: every lane still performs exactly its own operations in its own order, so the
+results stay bit-for-bit identical (`tests/test_jam.py` checks values and whether each result is a Python float or
+a NumPy scalar), and the speed no longer depends on the processor model. Loops with `if` (k-means) keep the scalar
+lanes. `APSI_JAM_VEC=0` turns the vector form off, `APSI_JAM_LANES=n` changes the number of lanes (default 4).

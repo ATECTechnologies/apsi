@@ -162,5 +162,70 @@ class SameResults(unittest.TestCase):
             self.assertTrue(np.array_equal(a.view(np.uint64), b.view(np.uint64)))
 
 
+VEC_PROGRAMS = r'''
+fn energy(x, m, inner: Int) -> Float:
+    var total = 0.0
+    for i in 0..len(x):
+        var f = 0.0
+        var g = 1.0
+        let xi = x[i]
+        for j in 0..inner:
+            let d = x[j] - xi
+            let r = sqrt(d * d + 0.5)
+            f += -m[j] * d / (r * r * r)
+            g *= abs(d) + 1.0
+        total += f + g
+    return total
+
+fn by_python_float(x, s: Float) -> Float:
+    var total = 0.0
+    for i in 0..len(x):
+        var f = 0.0
+        for j in 0..len(x):
+            f += (x[j] - x[i]) / s
+        total += f
+    return total
+'''
+
+
+@unittest.skipUnless(N.available(), "llvmlite is not installed")
+class VectorLanes(unittest.TestCase):
+    """The jammed inner loop as SIMD vectors (Spec.jam_vector_for): same bits, same Python/NumPy scalar types."""
+
+    def run_all(self, env):
+        rng = np.random.default_rng(3)
+        out = []
+        for n in (0, 1, 3, 4, 5, 9, 33):
+            x, m = rng.standard_normal(n), rng.random(n)
+            for inner in (0, 1, n):
+                out.append(env["energy"](x, m, min(inner, n)))
+            out.append(env["by_python_float"](x, 0.75))
+        return out
+
+    def test_vector_lanes_match_the_interpreter_and_scalar_lanes(self):
+        plain_env = Interpreter().run(VEC_PROGRAMS, "<plain>")
+        J.ENABLED = False
+        try:
+            plain = self.run_all({k: plain_env.lookup(k) for k in ("energy", "by_python_float")})
+        finally:
+            J.ENABLED = True
+        results = {}
+        for mode in ("1", "0"):
+            os.environ["APSI_JAM_VEC"] = mode
+            try:
+                env = Interpreter().run(VEC_PROGRAMS, "<native>")
+                fns = {k: N.native("strict")(env.lookup(k)) for k in ("energy", "by_python_float")}
+                results[mode] = self.run_all(fns)
+                if mode == "1":
+                    ir_text = fns["energy"].llvm_ir(np.zeros(4), np.zeros(4), 4)
+                    self.assertIn("<4 x double>", ir_text)
+            finally:
+                os.environ.pop("APSI_JAM_VEC", None)
+        for got in results.values():
+            for a, b in zip(plain, got):
+                self.assertEqual(type(a), type(b))
+                self.assertEqual(np.float64(a).view(np.uint64), np.float64(b).view(np.uint64))
+
+
 if __name__ == "__main__":
     unittest.main()
