@@ -50,6 +50,16 @@ fn matmul_rows(a, b, c):
             c[i, j] = acc
 
 @gpu("strict")
+fn matmul_acc32(a, b, c):
+    let k = a.shape[1]
+    parallel for i in 0..a.shape[0]:
+        for j in 0..b.shape[1]:
+            var acc: f32 = 0.0
+            for p in 0..k:
+                acc += a[i, p] * b[p, j]
+            c[i, j] = acc
+
+@gpu("strict")
 fn stencil(u, out):
     let n = len(u)
     parallel for i in 1..n - 1:
@@ -176,6 +186,56 @@ class RealGpu(unittest.TestCase):
         print(f"  {n}x256x{n}: GPU {gpu_t * 1000:.1f} ms, the same function on the CPU {cpu_t * 1000:.1f} ms",
               file=sys.stderr)
         self.assertTrue(np.allclose(c, a @ b, rtol=1e-10, atol=1e-10))
+
+
+    def test_16_bit_floats(self):
+        """float16 and bfloat16 tensors: stored in 16 bits on the GPU, computed in 32 bits."""
+        rng = np.random.default_rng(6)
+        f = self.g("matmul_rows")
+        dtypes = [np.float16]
+        try:
+            import ml_dtypes
+            dtypes.append(np.dtype(ml_dtypes.bfloat16))
+        except ImportError:
+            pass
+        for dt in dtypes:
+            a = rng.standard_normal((256, 64)).astype(dt)
+            b = rng.standard_normal((64, 128)).astype(dt)
+            c = np.zeros((256, 128), dt)
+            before = self.gpu_calls()
+            f(a, b, c)
+            self.check_on_gpu(before)
+            want = a.astype(np.float32) @ b.astype(np.float32)
+            tol = 2e-2 if dt != np.float16 else 4e-3
+            self.assertTrue(np.allclose(c.astype(np.float32), want, rtol=tol, atol=tol * 8), dt)
+            x = np.linspace(0, 1, 1_000_000).astype(dt)
+            y = np.ones_like(x)
+            self.g("saxpy")(2.0, x, y)
+            self.assertTrue(np.allclose(y.astype(np.float32), 2 * x.astype(np.float32) + 1, rtol=tol))
+
+    def test_speed_by_precision(self):
+        """The same matrix product (2048 x 512 x 2048, one GPU thread per element) in f64, f32, f16, bf16.
+        f64 uses a 64-bit accumulator; the others `var acc: f32` (16-bit data, 32-bit sums)."""
+        rng = np.random.default_rng(7)
+        dts = [("f64", np.float64), ("f32", np.float32), ("f16", np.float16)]
+        try:
+            import ml_dtypes
+            dts.append(("bf16", np.dtype(ml_dtypes.bfloat16)))
+        except ImportError:
+            pass
+        a64, b64 = rng.standard_normal((2048, 512)), rng.standard_normal((512, 2048))
+        ref = a64 @ b64
+        for name, dt in dts:
+            a, b, c = a64.astype(dt), b64.astype(dt), np.zeros((2048, 2048), dt)
+            f = self.g("matmul_rows" if name == "f64" else "matmul_acc32")
+            f(a, b, c)                                          # compile and warm up
+            t = time.perf_counter()
+            f(a, b, c)
+            dt_s = time.perf_counter() - t
+            err = float(np.max(np.abs(c.astype(np.float64) - ref)) / np.max(np.abs(ref)))
+            print(f"  {name:5} {dt_s * 1000:8.1f} ms  {2 * 2048 * 512 * 2048 / dt_s / 1e9:7.1f} GFLOP/s  "
+                  f"max relative error {err:.1e}", file=sys.stderr)
+            self.assertLess(err, 0.05)
 
 
 if __name__ == "__main__":

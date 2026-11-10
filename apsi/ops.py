@@ -45,8 +45,22 @@ def _np_dtype(dtype):
     if dtype is None:
         return None
     if isinstance(dtype, Dtype):
+        if dtype.np is None and dtype.name in ("bf16", "bfloat16"):
+            return bfloat16()
         return dtype.np
+    if isinstance(dtype, str) and dtype in ("bf16", "bfloat16"):
+        return bfloat16()
     return np.dtype(dtype)
+
+
+def bfloat16():
+    """NumPy's bfloat16 dtype (from the ml_dtypes package, which Apsi installs with its requirements)."""
+    try:
+        import ml_dtypes
+    except ImportError:
+        raise RuntimeErr("bf16 tensors need the ml_dtypes package: pip install ml_dtypes "
+                         "(or use @precision(bf16) / round_to(x, bf16), which work without it)") from None
+    return np.dtype(ml_dtypes.bfloat16)
 
 
 def _arr(x):

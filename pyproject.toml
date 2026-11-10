@@ -11,7 +11,7 @@ requires-python = ">=3.12"
 license = "LicenseRef-Apsi-License-2.0"
 license-files = ["LICENSE"]
 authors = [{name = "ATEC"}]
-dependencies = ["numpy>=1.26", "llvmlite>=0.43", "pyreadline3>=3.4; sys_platform == \"win32\""]
+dependencies = ["numpy>=1.26", "llvmlite>=0.43", "ml_dtypes>=0.5", "pyreadline3>=3.4; sys_platform == \"win32\""]
 
 [project.optional-dependencies]
 gpu = ["cupy-cuda12x"]

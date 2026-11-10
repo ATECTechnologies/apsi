@@ -133,7 +133,7 @@ def main():
     subprocess.check_call([sys.executable, "-m", "pip", "install", "--quiet", "--no-compile", "--upgrade",
                            "--target", os.path.join(rt, site), "--platform", pip_platform,
                            "--python-version", "3.12", "--implementation", "cp", "--only-binary=:all:",
-                           "numpy>=1.26", "llvmlite>=0.44", whl] + (["pyreadline3>=3.4"] if a.platform == "windows" else []))
+                           "numpy>=1.26", "llvmlite>=0.44", "ml_dtypes>=0.5", whl] + (["pyreadline3>=3.4"] if a.platform == "windows" else []))
 
     for d in ("examples", "docs"):
         shutil.copytree(os.path.join(ROOT, d), os.path.join(out, d),

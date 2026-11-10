@@ -1611,6 +1611,14 @@ class Interpreter:
             if isinstance(v, (int, float, Fraction, np.number, Node)) and not isinstance(v, bool):
                 return v
             raise TypeCheckError(f"{what} must be a Float, got {type_name(v)}")
+        if name in ("f64", "f32", "f16", "bf16"):              # a Float kept in that precision (f16/bf16: f32 math)
+            if isinstance(v, Quantity):
+                raise UnitError(f"{what} must be a dimensionless Float, got {self._describe(v)}")
+            if isinstance(v, (int, float, Fraction, np.number)) and not isinstance(v, bool):
+                return float(v) if name == "f64" else np.float32(v)
+            if isinstance(v, Node):
+                return v
+            raise TypeCheckError(f"{what} must be a Float, got {type_name(v)}")
         if name == "Int":
             if isinstance(v, (int, np.integer)) and not isinstance(v, bool):
                 return v

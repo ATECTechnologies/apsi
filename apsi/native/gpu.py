@@ -82,6 +82,10 @@ class GpuFunction:
         self._apsi_native_e = self.cpu._apsi_native_e
         self.plans = {}
         self.warned = False
+        try:
+            self.gpu_fndef, self.collapsed = collapse(self.fndef)
+        except Exception:                                  # noqa: BLE001 - analysis problems: keep the loop as is
+            self.gpu_fndef, self.collapsed = self.fndef, None
 
     def __repr__(self):
         return f"<gpu fn {self.name}>"
@@ -170,6 +174,103 @@ def kernel_shape(fd):
     return prelude, loop, ret
 
 
+def collapse(fd):
+    """GPU kernels get one thread per iteration of the parallel for. When its body is exactly one inner counting loop
+    whose iterations are independent (`c[i, j] = …`), both loops become one loop over i×j iterations, so a GPU gets
+    millions of threads instead of one per row (OpenMP calls this collapse(2)). Returns (fndef, info) where info is
+    None when nothing was changed. The CPU version of the function keeps the original loops."""
+    try:
+        prelude, loop, ret = kernel_shape(fd)
+    except Exception:                                      # noqa: BLE001
+        return fd, None
+    if len(loop.body) != 1 or not isinstance(loop.body[0], A.For):
+        return fd, None
+    inner = loop.body[0]
+    if inner.parallel or inner.else_body or inner.is_async or len(inner.targets) != 1 \
+            or not isinstance(inner.targets[0], str):
+        return fd, None
+    i, j = loop.targets[0], inner.targets[0]
+    if not isinstance(i, str) or i == j:
+        return fd, None
+    lo_i, hi_i, st_i = _range_parts(loop)
+    lo_j, hi_j, st_j = _range_parts(inner)
+    if not (_is_one(st_i) and _is_one(st_j)):
+        return fd, None
+    body = inner.body
+    declared = {t for n in _walk(body) if isinstance(n, A.Let) for t in n.targets if isinstance(t, str)}
+    declared |= {t for n in _walk(body) if isinstance(n, A.For) for t in n.targets if isinstance(t, str)}
+    outer_vars = {t for n in prelude if isinstance(n, A.Let) for t in n.targets if isinstance(t, str)}
+    # the inner bounds may not depend on the outer variable or on anything the loop body changes
+    used = set()
+    for e in (lo_j, hi_j):
+        for n in _walk([e]):
+            if isinstance(n, A.Name):
+                used.add(n.id)
+            elif isinstance(n, A.Call) and not (isinstance(n.func, A.Name) and n.func.id in _PURE):
+                return fd, None
+    if i in used or used & declared:
+        return fd, None
+    writes = {}                                            # array name -> the index text every access must use
+    for n in _walk(body):
+        if isinstance(n, (A.Break, A.Continue, A.Return, A.Yield, A.YieldExpr)):
+            return fd, None
+        if isinstance(n, A.Call) and not (isinstance(n.func, A.Name) and n.func.id in _PURE):
+            return fd, None
+        if isinstance(n, (A.Assign, A.AugAssign)):
+            t = n.target
+            if isinstance(n, A.Assign) and n.more:
+                return fd, None
+            if isinstance(t, A.Name):
+                if t.id in declared:
+                    continue
+                if isinstance(n, A.AugAssign) and n.op == "+" and t.id in outer_vars:
+                    continue                               # a reduction: added up across all threads anyway
+                return fd, None
+            if not (isinstance(t, A.Index) and isinstance(t.obj, A.Name) and isinstance(t.index, A.TupleLit)):
+                return fd, None
+            names = [x.id for x in t.index.items if isinstance(x, A.Name)]
+            if i not in names or j not in names:
+                return fd, None
+            key = repr(t.index)
+            if writes.setdefault(t.obj.id, key) != key:
+                return fd, None
+    if writes:                                             # written tensors are read only at the same element
+        for n in _walk(body):
+            if isinstance(n, A.Index) and isinstance(n.obj, A.Name) and n.obj.id in writes \
+                    and repr(n.index) != writes[n.obj.id]:
+                return fd, None
+        for n in _walk(body):                              # a written tensor used whole (e.g. passed on) is unsafe
+            if isinstance(n, A.Call):
+                for a in n.args:
+                    if isinstance(a, A.Name) and a.id in writes:
+                        return fd, None
+    L, C = loop.line, loop.col
+
+    def nm(x):
+        return A.Name(x, line=L, col=C)
+
+    def bi(op, a, b):
+        return A.Binary(op, a, b, line=L, col=C)
+
+    def nonneg(e):
+        return A.Call(nm("max"), [A.Num(0, "0", None, line=L, col=C), e], [], line=L, col=C)
+    t = "__apsi_flat"
+    n_inner = nonneg(bi("-", hi_j, lo_j))
+    total = bi("*", nonneg(bi("-", hi_i, lo_i)), n_inner)
+    lets = [A.Let([i], None, bi("+", lo_i, bi("//", nm(t), n_inner)), False, line=L, col=C),
+            A.Let([j], None, bi("+", lo_j, bi("%", nm(t), n_inner)), False, line=L, col=C)]
+    flat = A.For([t], A.Range(A.Num(0, "0", None, line=L, col=C), total, False, line=L, col=C),
+                 lets + list(body), True, None, None, line=L, col=C)
+    new_body = [flat if s is loop else s for s in fd.body]
+    nfd = A.FnDef(fd.name, fd.shape_params, fd.params, fd.ret, new_body, fd.is_expr, fd.decorators, fd.is_async,
+                  line=fd.line, col=fd.col)
+    return nfd, {"outer": i, "inner": j, "n_inner": n_inner, "outer_start": lo_i}
+
+
+def _is_one(e):
+    return isinstance(e, A.Num) and e.value == 1 and e.unit is None
+
+
 def _range_parts(loop):
     """AST for (start, stop, step) of the parallel for."""
     from .compiler import Unsupported
@@ -226,7 +327,7 @@ def build_kernel(gf, key):
     """(ptx text, root spec, module ctx) for these argument types."""
     from . import compiler as C
     import llvmlite.binding as llvm
-    fd = gf.fndef
+    fd = gf.gpu_fndef
     _, loop, _ = kernel_shape(fd)
     opts = dict(gf.cpu.options)
     opts["gpu"] = True
@@ -285,7 +386,7 @@ class GpuPlan:
     def __init__(self, gf, key, drv):
         from . import compiler as C
         self.gf, self.key, self.drv = gf, key, drv
-        prelude, loop, ret = kernel_shape(gf.fndef)
+        prelude, loop, ret = kernel_shape(gf.gpu_fndef)
         self.ptx, self.root, self.mc, self.targs = build_kernel(gf, key)
         self.ret_name = ret
         self.reds = [k for k, _ in self.mc.gpu_reds]
@@ -298,13 +399,16 @@ class GpuPlan:
                 raise Unsupported_(f"'{ret}' is not reduced with += in the parallel for")
         # host-side helper: start, stop, step and the reductions' initial values, computed natively on the CPU
         start, stop, step = _range_parts(loop)
-        items = [start, stop, step] + ([A.Name(ret, line=loop.line, col=loop.col)] if ret else [])
+        cl = gf.collapsed
+        extra = [cl["n_inner"], cl["outer_start"]] if cl else []
+        items = [start, stop, step] + extra + ([A.Name(ret, line=loop.line, col=loop.col)] if ret else [])
         helper = A.FnDef(gf.fndef.name + "__gpu_range", [], gf.fndef.params, None,
                          list(prelude) + [A.Return(A.TupleLit(items, line=loop.line, col=loop.col),
                                                    line=loop.line, col=loop.col)],
                          False, [], line=gf.fndef.line, col=gf.fndef.col)
         self.ranger = NativeFunction(_Shim(gf.fn, helper), {"strict": True, "quiet": True})
-        self.written = _written_arrays(loop.body, loop.targets[0])
+        self.written = _written_arrays(loop.body, cl["outer"] if cl else loop.targets[0])
+        self.n_extra = len(extra)
         self.params = [p.name for p in gf.fndef.params]
         self.devices = list(drv.devices)
         self.ptx_key = hash(self.ptx)
@@ -314,7 +418,7 @@ class GpuPlan:
         kind = key[0]
         if kind == "param":
             return self.gf.fndef.params[key[1]].name
-        for n in _walk(self.gf.fndef.body):
+        for n in _walk(self.gf.gpu_fndef.body):
             if id(n) == key[1] and isinstance(n, A.Let):
                 return n.targets[key[2]]
         return None
@@ -323,21 +427,30 @@ class GpuPlan:
         from . import compiler as C            # noqa: F401  (types for the reductions below)
         r = self.ranger(*args)
         start, stop, step = (int(x) for x in r[:3])
-        init = r[3] if self.ret_name else None
+        init = r[3 + self.n_extra] if self.ret_name else None
+        unit = 1                                      # iterations per row of the written tensors
+        if self.n_extra:
+            unit, outer_start = max(1, int(r[3])), int(r[4])
+            if outer_start != 0:
+                unit = -1                             # rows do not start at 0: no splitting across GPUs
         if step == 0:
             raise RuntimeErr("range() step must not be zero")
         span = stop - start
         trips = max(0, (span + (step - 1 if step > 0 else step + 1)) // step)
         devs = self.devices
-        split = len(devs) > 1 and start == 0 and step == 1 and all(
+        split = len(devs) > 1 and start == 0 and step == 1 and unit > 0 and all(
             self.written.get(n, True) for n, a in zip(self.params, args) if isinstance(_raw(a), np.ndarray)
             and n in self.written)
         if not split or trips < 2 * BLOCK * len(devs):
             devs = devs[:1]
         parts = []
+        rows = trips // unit if unit > 0 else trips
         for j, d in enumerate(devs):
-            lo = trips * j // len(devs)
-            hi = trips * (j + 1) // len(devs)
+            if len(devs) > 1:                         # whole rows per GPU: lo/hi below count iterations
+                lo = rows * j // len(devs) * unit
+                hi = (rows * (j + 1) // len(devs) * unit) if j < len(devs) - 1 else trips
+            else:
+                lo, hi = 0, trips
             parts.append((d, lo, hi))
         hosts = []
         for a in args:
@@ -412,7 +525,8 @@ class GpuPlan:
                         d.to_host(dense.ctypes.data, dp, dense.nbytes)
                     else:                                         # only this GPU's rows
                         row = dense.strides[0]
-                        d.to_host(dense.ctypes.data + lo * row, dp + lo * row, (hi - lo) * row)
+                        rlo, rhi = lo // max(unit, 1), hi // max(unit, 1)
+                        d.to_host(dense.ctypes.data + rlo * row, dp + rlo * row, (rhi - rlo) * row)
         finally:
             for d, mod, lo, hi, bufs in running:
                 d.activate()

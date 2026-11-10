@@ -18,7 +18,7 @@ TENSOR_TYPES = {"Tensor", "Vec", "Mat", "Matrix", "Vec2", "Vec3", "Vec4"}
 DTYPE_NAMES = {"f16", "f32", "f64", "i32", "i64", "bool", "bf16", "fp8_e4m3", "fp8_e5m2", "fp6_e3m2",
                "fp6_e2m3", "fp4_e2m1", "int8", "int4", "fp8", "bf8", "fp4", "fp6"}
 PLAIN_TYPES = {"Bool", "Str", "List", "Tuple", "Dict", "Any", "Fn", "Record", "None"}
-NUM_TYPES = {"Float", "Number", "Real", "Int"}
+NUM_TYPES = {"Float", "Number", "Real", "Int", "f64", "f32", "f16", "bf16"}   # f32 …: a Float in that precision
 
 DIMLESS_FNS = {"exp", "log", "log10", "log2", "sin", "cos", "tan", "asin", "acos", "atan",
                "sinh", "cosh", "tanh", "sigmoid", "softmax", "log_softmax", "gelu", "softplus"}

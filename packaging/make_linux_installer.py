@@ -72,7 +72,7 @@ if "$PY" -c 'import numpy' 2>/dev/null && ! "$PY" -c 'import llvmlite' 2>/dev/nu
   # packages, plus llvmlite (a prebuilt wheel). Without it Apsi still works, on the bytecode engine only.
   say "installing llvmlite (Apsi's native compiler) into a private Python environment"
   if "$PY" -m venv --system-site-packages "$PREFIX/venv" 2>/dev/null && \
-     "$PREFIX/venv/bin/python" -m pip install --quiet "llvmlite>=0.42" 2>/dev/null; then
+     "$PREFIX/venv/bin/python" -m pip install --quiet "llvmlite>=0.42" "ml_dtypes>=0.5" 2>/dev/null; then
     RUNPY="$PREFIX/venv/bin/python"
   else
     rm -rf "$PREFIX/venv"
@@ -83,7 +83,7 @@ fi
 if ! "$PY" -c 'import numpy' 2>/dev/null; then
   say "numpy is missing: creating a private Python environment and installing numpy"
   if "$PY" -m venv "$PREFIX/venv" 2>/dev/null && "$PREFIX/venv/bin/python" -m pip install --quiet "numpy>=1.22" && \
-     { "$PREFIX/venv/bin/python" -m pip install --quiet "llvmlite>=0.42" || say "llvmlite not installed: no native compiler"; }; then
+     { "$PREFIX/venv/bin/python" -m pip install --quiet "llvmlite>=0.42" "ml_dtypes>=0.5" || say "llvmlite not installed: no native compiler"; }; then
     RUNPY="$PREFIX/venv/bin/python"
   else
     rm -rf "$PREFIX/venv"

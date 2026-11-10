@@ -548,7 +548,7 @@ class Specialization:
                 vals.append(b.fptrunc(arg, ir.FloatType()))
             elif t[0] == "a":
                 nd = t[2]
-                esz = {"f8": 8, "f4": 4, "i8": 8, "i4": 4, "i2": 2, "i1": 1, "u1": 1, "b1": 1}[t[1]]
+                esz = C.ELEM_SIZE[t[1]]
 
                 def word(off):
                     return b.load(b.bitcast(b.gep(arg, [ir.Constant(C.i64t(), off)]), C.i64t().as_pointer()))
@@ -844,7 +844,7 @@ def _unpack_ret(t, d, ret, pos, args, spec, C):
     data, base = ret[k] & ((1 << 64) - 1), ret[k + 1] & ((1 << 64) - 1)
     shape = tuple(int(ret[k + 2 + j]) for j in range(nd))
     strides = tuple(int(ret[k + 2 + nd + j]) for j in range(nd))
-    dtype = np.dtype(C.ELEM_DTYPE[t[1]])
+    dtype = C.np_dtype(t[1])
     if base:
         total = 1
         for s in shape:

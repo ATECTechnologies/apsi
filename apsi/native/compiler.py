@@ -49,7 +49,7 @@ class Unsupported(Exception):
 
 
 # ============================================================================= types
-from .types import (I64, F64, F32, BOOL, NONE, ANY, SCALARS, ELEMS, ELEM_DTYPE, ELEM_SCALAR, SCALAR_ELEM,  # noqa: F401
+from .types import (I64, F64, F32, BOOL, NONE, ANY, SCALARS, ELEMS, ELEM_DTYPE, ELEM_SCALAR, SCALAR_ELEM, ELEM_SIZE, np_dtype,  # noqa: F401
                     ARR, TUP, is_arr, is_lazy, is_arrish, tname, type_of_value,
                     E_INDEX, E_OVERFLOW, E_ZERODIV, E_ASSERT, E_NEGEXP, E_SHAPE, E_NOMEM, E_NEGSIZE, E_NORETURN,
                     E_EMPTY, E_CONVERT, E_COND)
@@ -313,8 +313,64 @@ def i8p():
 
 
 def elem_ll(e):
-    return {"f8": ir.DoubleType(), "f4": ir.FloatType(), "i8": ir.IntType(64), "i4": ir.IntType(32),
-            "i2": ir.IntType(16), "i1": ir.IntType(8), "u1": ir.IntType(8), "b1": ir.IntType(8)}[e]
+    return {"f8": ir.DoubleType(), "f4": ir.FloatType(), "f2": ir.IntType(16), "h2": ir.IntType(16),
+            "i8": ir.IntType(64), "i4": ir.IntType(32), "i2": ir.IntType(16), "i1": ir.IntType(8),
+            "u1": ir.IntType(8), "b1": ir.IntType(8)}[e]
+
+
+# 16-bit floats are kept as raw 16-bit integers and converted with integer operations, so the same code works on
+# every CPU (no F16C or libcalls needed) and in GPU kernels; conversions to 16 bits round to nearest, ties to even.
+def _u32(v):
+    return ir.Constant(ir.IntType(32), v)
+
+
+def half_to_f32(bd, raw):
+    i32, f32 = ir.IntType(32), ir.FloatType()
+    h = bd.zext(raw, i32)
+    sign = bd.shl(bd.and_(h, _u32(0x8000)), _u32(16))
+    ex = bd.and_(bd.lshr(h, _u32(10)), _u32(0x1F))
+    man = bd.and_(h, _u32(0x3FF))
+    normal = bd.or_(sign, bd.or_(bd.shl(bd.add(ex, _u32(112)), _u32(23)), bd.shl(man, _u32(13))))
+    special = bd.or_(sign, bd.or_(_u32(0x7F800000), bd.shl(man, _u32(13))))
+    bits = bd.select(bd.icmp_unsigned("==", ex, _u32(0x1F)), special, normal)
+    as_f = bd.bitcast(bits, f32)
+    sub = bd.fmul(bd.uitofp(man, f32), ir.Constant(f32, 2.0 ** -24))          # zero and subnormals (exact)
+    sub = bd.select(bd.icmp_unsigned("!=", sign, _u32(0)), bd.fneg(sub), sub)
+    return bd.select(bd.icmp_unsigned("==", ex, _u32(0)), sub, as_f)
+
+
+def f32_to_half(bd, f):
+    i32, i16, f32 = ir.IntType(32), ir.IntType(16), ir.FloatType()
+    u = bd.bitcast(f, i32)
+    sign = bd.and_(u, _u32(0x80000000))
+    a = bd.xor(u, sign)
+    big = bd.select(bd.icmp_unsigned(">", a, _u32(0x7F800000)), _u32(0x7E00), _u32(0x7C00))   # NaN / overflow
+    magic = (127 - 15 + 23 - 10 + 1) << 23
+    small = bd.sub(bd.bitcast(bd.fadd(bd.bitcast(a, f32), ir.Constant(f32, struct_float(magic))), i32),
+                   _u32(magic))
+    odd = bd.and_(bd.lshr(a, _u32(13)), _u32(1))
+    norm = bd.lshr(bd.add(bd.add(a, _u32(((15 - 127) << 23) + 0xFFF)), odd), _u32(13))
+    o = bd.select(bd.icmp_unsigned(">=", a, _u32((127 + 16) << 23)), big,
+                  bd.select(bd.icmp_unsigned("<", a, _u32(113 << 23)), small, norm))
+    return bd.trunc(bd.or_(o, bd.lshr(sign, _u32(16))), i16)
+
+
+def bf16_to_f32(bd, raw):
+    return bd.bitcast(bd.shl(bd.zext(raw, ir.IntType(32)), _u32(16)), ir.FloatType())
+
+
+def f32_to_bf16(bd, f):
+    i32 = ir.IntType(32)
+    u = bd.bitcast(f, i32)
+    rounded = bd.lshr(bd.add(u, bd.add(_u32(0x7FFF), bd.and_(bd.lshr(u, _u32(16)), _u32(1)))), _u32(16))
+    nan = bd.or_(bd.lshr(u, _u32(16)), _u32(0x0040))                     # keep NaN a (quiet) NaN
+    is_nan = bd.icmp_unsigned(">", bd.and_(u, _u32(0x7FFFFFFF)), _u32(0x7F800000))
+    return bd.trunc(bd.select(is_nan, nan, rounded), ir.IntType(16))
+
+
+def struct_float(bits):
+    import struct
+    return struct.unpack("<f", struct.pack("<I", bits))[0]
 
 
 def arr_ll(e, nd):
@@ -671,7 +727,7 @@ class FnEmitter:
             if not self.fast:
                 self.check(bd.icmp_signed(">=", s_, ir.Constant(i64t(), 0)), E_NEGSIZE, node, s_)
             total = bd.mul(total, s_)
-        esz = {"f8": 8, "f4": 4, "i8": 8, "i4": 4, "i2": 2, "i1": 1, "u1": 1, "b1": 1}[elem]
+        esz = ELEM_SIZE[elem]
         nbytes = bd.add(bd.mul(total, ir.Constant(i64t(), esz)), ir.Constant(i64t(), 64))
         calloc = self.mc.decl("calloc", i8p(), [i64t(), i64t()])
         blk = bd.call(calloc, [ir.Constant(i64t(), 1), nbytes])
@@ -828,6 +884,13 @@ class FnEmitter:
                 return v
             if n in ("Float", "Number", "Real", "Any"):
                 return v
+            if n in ("f32", "f16", "bf16", "f64"):              # f16/bf16 scalars compute in f32
+                want = F64 if n == "f64" else F32
+                if v.t not in (I64, BOOL, F64, F32, ANY):
+                    raise TypeCheckError(f"expected a Float, got {tname(v.t)}", node.line, node.col)
+                if self.dry:
+                    return Val(want, None, v.d, const=v.const)
+                return self.convert(v, want, node)
             if n in DIM_NAMES and not t.args:
                 if v.d != DIM_NAMES[n] and v.t != ANY:
                     raise UnitError(f"expected {n}, got {dim_name(v.d)}", node.line, node.col)
@@ -1969,6 +2032,10 @@ class FnEmitter:
 
     def from_elem(self, raw, elem, d):
         bd = self.f.b
+        if elem == "f2":
+            return Val(F32, half_to_f32(bd, raw), d, npv=True)
+        if elem == "h2":
+            return Val(F32, bf16_to_f32(bd, raw), d, npv=True)
         if elem in ("f8", "f4", "i8"):
             return Val(ELEM_SCALAR[elem], raw, d, npv=True)
         if elem in ("i4", "i2", "i1"):
@@ -1982,6 +2049,10 @@ class FnEmitter:
         st = ELEM_SCALAR[elem]
         if elem == "b1":
             return bd.zext(self.truth(v, node), ir.IntType(8))
+        if elem == "f2":
+            return f32_to_half(bd, self.convert(v, F32, node).v)
+        if elem == "h2":
+            return f32_to_bf16(bd, self.convert(v, F32, node).v)
         if st in (F64, F32):
             return self.convert(v, st, node).v
         iv = self.convert(v, I64, node, store=True).v
@@ -2819,7 +2890,8 @@ class FnEmitter:
         if "dtype" in kw:
             dt = kw.pop("dtype")
             dn = dt.id if isinstance(dt, A.Name) else (dt.value if isinstance(dt, A.Str) else None)
-            elem = {"f64": "f8", "fp64": "f8", "float": "f8", "f32": "f4", "fp32": "f4", "i64": "i8",
+            elem = {"f64": "f8", "fp64": "f8", "float": "f8", "f32": "f4", "fp32": "f4", "f16": "f2", "fp16": "f2",
+                    "bf16": "h2", "bfloat16": "h2", "i64": "i8",
                     "int": "i8", "i32": "i4", "bool": "b1", "uint8": "u1", "int8": "i1"}.get(dn)
             if elem is None:
                 raise Unsupported(f"{name}() with dtype {dn}", e)
