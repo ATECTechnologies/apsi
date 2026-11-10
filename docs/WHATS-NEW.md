@@ -21,7 +21,8 @@ guide.
 | Long-range graphs | graph transformers, one-step global attention, k-hop and mixed-hop layers | [Graphs](GRAPHS.md) |
 | GPU | one thread per element, automatic CPU/GPU choice, Tensor Cores through cuBLAS | [Native](NATIVE.md) |
 | Matrix products | loops written the textbook way run on BLAS: 7–10× faster than C loops | [Performance](PERFORMANCE.md#matrix-products-written-as-loops) |
-| Speed overall | 3.86–7.31× faster than 2.0.0 on the same programs (geometric mean) | [below](#how-much-faster-than-200) |
+| Same speed everywhere | SIMD lanes written by Apsi itself; `@native("fma")` | [below](#16-the-same-speed-on-every-processor) |
+| Speed overall | 3.83–7.31× faster than 2.0.0 on the same programs (geometric mean) | [below](#how-much-faster-than-200) |
 
 ## 1. Python, exactly
 
@@ -250,6 +251,29 @@ Message passing moves one hop per layer and squeezes what a node heard into one 
 `global_attention` lets every node read any node of its graph in one step; `k_hop` and `mix_hop` read several
 hops at once; `graph_memory` hands a decoder the most salient nodes of each graph. See [Graphs](GRAPHS.md).
 
+## 16. The same speed on every processor
+
+`@native` already ran independent outer iterations four at a time ([Performance](PERFORMANCE.md#outer-loops-four-at-a-time-exact-simd-for-reductions)),
+but left the packing into SIMD registers to LLVM. With LLVM 22 that packing failed on AVX2 processors (AMD Zen 2
+and 3, Intel without AVX-512 — most desktop PCs): the n-body benchmark took 127 ms on an EPYC 7763, almost three times
+as long as C. Apsi now writes the vector instructions itself. Every lane still performs exactly its own operations in its
+own order, so results are bit-for-bit what they were.
+
+| n-body (2,000 bodies × 10 steps) | before | now |
+|---|---:|---:|
+| AMD EPYC 7763 (Zen 3, AVX2), same runner | 127.5 ms | 46.0 ms (gcc -O3: 44.2 ms) |
+| Intel Xeon (AVX-512) | 74.5 ms | 70.9 ms |
+
+`@native("fma")` is new: every check stays on and the order of operations is kept, but `a * b + c` may become one
+fused multiply-add, which is what gcc and clang do for C by default. The ODE benchmark (one long chain of dependent
+arithmetic) takes 288 ms instead of 440 ms, against 387 ms for gcc -O3.
+
+Every commit of this work was measured on one machine against the ones before it
+(`benchmarks/commits/measure.py`, Actions → commits; [results](https://github.com/ATECTechnologies/apsi/blob/main/benchmarks/commits/results-2.4.4.md)).
+From the start of the work to now, on the same AMD EPYC 7763: n-body **4.0×**, the ODE **1.5×**, k-means **1.27×**
+and compiling **1.21×** faster, and no row slower. Numbers from different GitHub runs are not comparable with each
+other: GitHub picks the processor, and the same C program takes 14 ms on one runner model and 44 ms on another.
+
 ## How much faster than 2.0.0
 
 The same programs on both versions, on the same machine, with identical results. Measured on a GitHub Actions runner
@@ -258,20 +282,20 @@ The same programs on both versions, on the same machine, with identical results.
 
 | Program | 2.0.0 | 2.4.4 | runner | 2-core VM ¹ |
 |---|---:|---:|---:|---:|
-| matmul 300, loops (compiled engine) | 38,359 ms | 5.0 ms | **7671.72×** | 6374.16× |
-| 200k objects: create and sum | 3,777 ms | 437 ms | **8.64×** | 9.26× |
-| fib(25), recursive calls | 88.3 ms | 24.8 ms | **3.56×** | 2.26× |
-| matmul 512, @native loops | 27.5 ms | 9.9 ms | **2.79×** | 300.48× |
-| web server, 64 connections | 5,207 req/s | 13,288 req/s | **2.55×** | 3.06× |
-| web server, 256 connections | 6,035 req/s | 12,251 req/s | **2.03×** | 3.18× |
-| word count, 260k words | 327 ms | 204 ms | **1.6×** | 1.41× |
-| start-up: apsi run hello.apsi | 240 ms | 176 ms | **1.36×** | 6.69× |
-| 200k f-strings and join | 237 ms | 192 ms | **1.24×** | 1.26× |
-| integer loop, 3M iterations | 193 ms | 171 ms | **1.13×** | 0.99× |
-| apsi check, 43 example programs (1,594 lines), empty cache | 9,980 ms | 9,557 ms | **1.04×** | 4.9× |
+| matmul 300, loops (compiled engine) | 37,909 ms | 5.0 ms | **7658.43×** | 6374.16× |
+| 200k objects: create and sum | 3,793 ms | 419 ms | **9.05×** | 9.26× |
+| fib(25), recursive calls | 82.3 ms | 24.4 ms | **3.37×** | 2.26× |
+| matmul 512, @native loops | 26.7 ms | 9.8 ms | **2.73×** | 300.48× |
+| web server, 64 connections | 5,184 req/s | 12,554 req/s | **2.42×** | 3.06× |
+| web server, 256 connections | 6,037 req/s | 12,250 req/s | **2.03×** | 3.18× |
+| word count, 260k words | 324 ms | 202 ms | **1.6×** | 1.41× |
+| start-up: apsi run hello.apsi | 232 ms | 173 ms | **1.34×** | 6.69× |
+| 200k f-strings and join | 234 ms | 189 ms | **1.23×** | 1.26× |
+| integer loop, 3M iterations | 198 ms | 171 ms | **1.16×** | 0.99× |
+| apsi check, 43 example programs (1,594 lines), empty cache | 9,967 ms | 9,613 ms | **1.04×** | 4.9× |
 | harmonic sum 50M, @native | 70.1 ms | 70.1 ms | **1.0×** | 1.03× |
 
-Geometric mean: **3.86× faster** (runner), **7.31×** (2-core VM). `@native` code was already at C
+Geometric mean: **3.83× faster** (runner), **7.31×** (2-core VM). `@native` code was already at C
 speed in 2.0.0 and stays there. Reproduce with
 `python3 benchmarks/versions/compare.py --old ../apsi-2.0.0 --new . --web`.
 

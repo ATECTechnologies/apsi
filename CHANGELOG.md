@@ -74,7 +74,7 @@
 - **Faster ordinary code.** Struct construction 9× faster (type checkers are built once per annotation, not per
   object); `Int`/`Float` argument and return checks, and `if`/`while` conditions on plain booleans, skip the checker
   call (recursive calls 2.3× faster); attribute access on structs, lists, dicts and strings takes a short path.
-  Measured against 2.0.0 on the same machine: `benchmarks/versions` (geometric mean 3.86× faster on a
+  Measured against 2.0.0 on the same machine: `benchmarks/versions` (geometric mean 3.83× faster on a
   GitHub runner with the native compiler, 7.31× on a 2-core VM without it).
 - **Matrix products written as loops run with BLAS.** Three nested loops computing `c[i, j] += a[i, k] * b[k, j]`
   (any loop order, a hoisted `a[i, k]`, or the dot-product form with an accumulator) are recognised in the compiled
@@ -123,6 +123,19 @@
 
 Apsi 2.0 replaces "everything runs on the Python VM" with a native compiler. Python stays where it helps (the
 tooling, libraries, the rest of the language), while numeric code runs as machine code built through LLVM.
+
+### Speed on every processor
+- The jammed lanes of an outer loop (n-body forces, matrix-vector products, distances) are emitted as SIMD vector
+  instructions by Apsi itself instead of relying on LLVM's SLP vectoriser, which with LLVM 22 failed on AVX2
+  processors: n-body 127.5 → 46.0 ms on an EPYC 7763 (gcc -O3: 44.2 ms); results bit-for-bit unchanged (`tests/test_jam.py`).
+- `@native("fma")`: checks on, `a * b + c` may fuse into one instruction (gcc's default for C); ODE benchmark
+  440 → 288 ms (gcc -O3: 387 ms).
+- `@gpu` CPU/GPU choice: the first GPU launch (kernel loading) is no longer counted, and the losing side is timed
+  again every 64 calls (`tests/test_gpu_choice.py`).
+- `benchmarks/commits/measure.py` and the `commits` workflow measure several commits on one machine, in rotating
+  rounds; the native cache now also depends on `APSI_SLP`. From the start of this work to the release, on one
+  EPYC 7763: n-body 4.0×, ODE 1.5×, k-means 1.27×, compiling 1.21× faster, nothing slower
+  (`benchmarks/commits/results-2.4.4.md`).
 
 ### Python compatibility — write Apsi the way you write Python
 - **Exceptions:** `try / except Kind, Other as e / else / finally` and `raise` (with Python's kind names; errors Apsi

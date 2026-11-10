@@ -6,26 +6,26 @@
  "rows": [
   {
    "name": "matmul 300, loops (compiled engine)",
-   "old": 38358.6,
-   "new": 5.0,
+   "old": 37909.22,
+   "new": 4.95,
    "unit": "ms",
    "higher": false,
-   "speedup": 7671.72,
+   "speedup": 7658.43,
    "note": ""
   },
   {
    "name": "matmul 512, @native loops",
-   "old": 27.5,
-   "new": 9.87,
+   "old": 26.69,
+   "new": 9.76,
    "unit": "ms",
    "higher": false,
-   "speedup": 2.79,
+   "speedup": 2.73,
    "note": ""
   },
   {
    "name": "harmonic sum 50M, @native",
-   "old": 70.07,
-   "new": 70.06,
+   "old": 70.13,
+   "new": 70.13,
    "unit": "ms",
    "higher": false,
    "speedup": 1.0,
@@ -33,26 +33,26 @@
   },
   {
    "name": "fib(25), recursive calls",
-   "old": 88.26,
-   "new": 24.8,
+   "old": 82.32,
+   "new": 24.41,
    "unit": "ms",
    "higher": false,
-   "speedup": 3.56,
+   "speedup": 3.37,
    "note": ""
   },
   {
    "name": "200k objects: create and sum",
-   "old": 3777.23,
-   "new": 437.03,
+   "old": 3793.03,
+   "new": 419.05,
    "unit": "ms",
    "higher": false,
-   "speedup": 8.64,
+   "speedup": 9.05,
    "note": ""
   },
   {
    "name": "word count, 260k words",
-   "old": 326.6,
-   "new": 204.29,
+   "old": 323.59,
+   "new": 202.4,
    "unit": "ms",
    "higher": false,
    "speedup": 1.6,
@@ -60,35 +60,35 @@
   },
   {
    "name": "200k f-strings and join",
-   "old": 237.25,
-   "new": 191.76,
+   "old": 233.76,
+   "new": 189.33,
    "unit": "ms",
    "higher": false,
-   "speedup": 1.24,
+   "speedup": 1.23,
    "note": ""
   },
   {
    "name": "integer loop, 3M iterations",
-   "old": 192.78,
-   "new": 171.14,
+   "old": 198.4,
+   "new": 171.04,
    "unit": "ms",
    "higher": false,
-   "speedup": 1.13,
+   "speedup": 1.16,
    "note": ""
   },
   {
    "name": "start-up: apsi run hello.apsi",
-   "old": 239.85,
-   "new": 175.74,
+   "old": 231.6,
+   "new": 173.14,
    "unit": "ms",
    "higher": false,
-   "speedup": 1.36,
+   "speedup": 1.34,
    "note": ""
   },
   {
    "name": "apsi check, 43 example programs (1,594 lines), empty cache",
-   "old": 9980.5,
-   "new": 9556.65,
+   "old": 9966.56,
+   "new": 9612.58,
    "unit": "ms",
    "higher": false,
    "speedup": 1.04,
@@ -96,22 +96,22 @@
   },
   {
    "name": "web server, 64 connections",
-   "old": 5207,
-   "new": 13288,
+   "old": 5184,
+   "new": 12554,
    "unit": "req/s",
    "higher": true,
-   "speedup": 2.55,
+   "speedup": 2.42,
    "note": ""
   },
   {
    "name": "web server, 256 connections",
-   "old": 6035,
-   "new": 12251,
+   "old": 6037,
+   "new": 12250,
    "unit": "req/s",
    "higher": true,
    "speedup": 2.03,
    "note": ""
   }
  ],
- "geomean": 3.86
+ "geomean": 3.83
 }

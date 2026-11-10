@@ -122,18 +122,23 @@ A second suite (`benchmarks/heavy/`) uses larger, harder programs: dense all-pai
 1024² matrix product, LU factorisation with pivoting, Ising Monte Carlo, a 100-million-cell dynamic program, a
 20-million-step Runge–Kutta integration and k-means clustering. Each is written the same way in Apsi (`@native`,
 strict IEEE), C, C++, Rust, Go and Mojo 1.2 (with raw pointers, as performance-oriented Mojo is written); the runner
-refuses to report times unless all six produce the same checksum. Single core, best of 3, milliseconds:
+refuses to report times unless all of them produce the same checksum. Apsi 2.4.4 on a GitHub Actions runner
+(AMD EPYC 7763), single core, best of 3, milliseconds (geometric mean: Apsi takes 0.85× the time of C):
 
-| Benchmark | Apsi | C | C++ | Rust | Go | Mojo |
-|---|---:|---:|---:|---:|---:|---:|
-| nbody-dense 2000x10 | 114 | **52** | 53 | 115 | 266 | 111 |
-| jacobi-2d 1024x200 | 244 | 259 | 360 | **239** | 605 | 322 |
-| matmul 1024 | 328 | 314 | 469 | **312** | 601 | 435 |
-| lu-pivot 800 | 49 | **48** | 65 | 58 | 132 | 72 |
-| ising 512x50 | 77 | 90 | 91 | **71** | 164 | 78 |
-| levenshtein 10k | **327** | 563 | 331 | 724 | 1107 | 444 |
-| ode-rk4 20M | 384 | 267 | 269 | 384 | 286 | **213** |
-| kmeans 200k k16 x20 | 69 | **49** | 52 | 57 | 137 | 50 |
+| Benchmark | Apsi | C | C++ | Rust | Go |
+|---|---:|---:|---:|---:|---:|
+| nbody-dense 2000x10 | 46.8 | **44.1** | 44.3 | 182.2 | 319.1 |
+| jacobi-2d 1024x200 | 207 | 173.9 | **161.4** | 177.8 | 707.1 |
+| matmul 1024 | 196.2 | 202.8 | **186.6** | 191.1 | 700.7 |
+| lu-pivot 800 | 41.2 | **40.5** | 41.4 | 42.4 | 116.9 |
+| ising 512x50 | **81.7** | 90.8 | 90.6 | 84.7 | 147.3 |
+| levenshtein 10k | **195.3** | 811.2 | 306.4 | 268.9 | 1739.1 |
+| ode-rk4 20M | 355.2 | **289** | 289.1 | 355.2 | 355.7 |
+| kmeans 200k k16 x20 | **51.5** | 60.8 | 60.5 | 64.4 | 213.6 |
+
+C's ode-rk4 is faster because gcc fuses multiply-adds by default; with `@native("fma")` Apsi takes 263 ms there.
+Results on another runner model (EPYC 9V45, AVX-512) and Mojo results from an earlier machine are in
+`benchmarks/heavy/results.md` and `benchmarks/heavy/versions/`.
 
 Run it on your own machine with `python3 benchmarks/heavy/run.py` (languages whose compiler is missing are skipped).
 

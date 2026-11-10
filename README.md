@@ -105,6 +105,9 @@ Then read [Getting started](docs/GETTING-STARTED.md) (15 minutes) or [Write Apsi
 * **Graphs that reach far.** Graph transformers, global attention (one hop to any node), k-hop and mixed-hop layers.
 * **A smarter GPU.** One thread per element, Tensor Cores through cuBLAS for f16/bf16 matrix products, and small
   launches sent to the CPU automatically.
+* **The same speed on every processor.** Independent outer iterations run as SIMD vectors that Apsi writes itself
+  (bit-identical results), so AVX2 desktops get the same vector code as AVX-512 servers; `@native("fma")` fuses
+  multiply-adds like C compilers do by default.
 * **Matrix products from plain loops.** Three nested loops computing `c[i, j] += a[i, k] * b[k, j]` run on the tuned
   BLAS kernel: 10× faster than the same loops in C with `-O3` at 2048×2048.
 * **Fewer AI tokens.** Exactly reversible packing of what you send to language models: 57–63 % fewer tokens for
@@ -170,7 +173,9 @@ Security problems: please report them privately as described in [`docs/SECURITY.
 Apsi is the work of one developer at ATEC, working together with Claude, the AI model made by Anthropic. Development
 started on 8 November 2026; everything from the first version to 2.4.4 — the language, checker and compilers, native
 and GPU code generation, the Python converter, the standard library, the tools, the documentation and the website —
-took about **19 hours of active work** in total (time actually spent working, in sessions over several days).
+took about **25 hours of active work** in total (time actually spent working, in sessions over several days).
+This figure is final: it covers the first build of the project, from nothing to a finished 2.4.4. Apsi 2.4.4 is
+complete as that first stage; later versions are new work and are not added to it.
 
 ## License
 

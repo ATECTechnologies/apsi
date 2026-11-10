@@ -189,7 +189,9 @@ python -m unittest discover tests           # toolchain, REPL, CLI, LSP, formatt
 
 ## Development
 
-Development started on **Sunday, 8 November 2026 at about 04:00** (Bangkok time, UTC+7); this release was completed the same morning at about **09:00** — about **5 hours** of development.
+Development started on **Sunday, 8 November 2026 at about 04:00** (Bangkok time, UTC+7). Everything from the first
+line to this release, Apsi 2.4.4, took about **25 hours of active work** in sessions over several days. That number
+is final: it is the first build of the project, completed with 2.4.4; later versions are new work.
 
 ## Documentation
 

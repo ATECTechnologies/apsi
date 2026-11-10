@@ -14,53 +14,53 @@
  "benchmarks": {
   "nbody-dense 2000x10": {
    "Apsi": {
-    "ms": 185.2,
+    "ms": 185.0,
     "check": "0.000192436526863"
    }
   },
   "jacobi-2d 1024x200": {
    "Apsi": {
-    "ms": 162.0,
+    "ms": 159.2,
     "check": "1193940.35882"
    }
   },
   "matmul 1024": {
    "Apsi": {
-    "ms": 189.4,
+    "ms": 191.6,
     "check": "-12.2350796046"
    }
   },
   "lu-pivot 800": {
    "Apsi": {
-    "ms": 40.6,
+    "ms": 41.3,
     "check": "1278.5938216"
    }
   },
   "ising 512x50": {
    "Apsi": {
-    "ms": 81.6,
+    "ms": 81.7,
     "check": "26386"
    }
   },
   "levenshtein 10k": {
    "Apsi": {
-    "ms": 195.1,
+    "ms": 195.5,
     "check": "5202"
    }
   },
   "ode-rk4 20M": {
    "Apsi": {
-    "ms": 533.8,
+    "ms": 533.9,
     "check": "1.30419893119"
    }
   },
   "kmeans 200k k16 x20": {
    "Apsi": {
-    "ms": 65.5,
+    "ms": 65.3,
     "check": "201640.557564"
    }
   }
  },
- "measured_at": "2026-11-10T03:24:16Z",
+ "measured_at": "2026-11-10T04:42:06Z",
  "all_checks_agree": true
 }
