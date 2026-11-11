@@ -518,7 +518,15 @@ class Gpu(_Ops):
         return info
 
     def alloc(self, n):
-        p = self.dev.alloc(4 * max(1, n))
+        try:
+            p = self.dev.alloc(4 * max(1, n))
+        except Exception as e:                           # noqa: BLE001
+            if "OUT_OF_MEMORY" not in str(e).upper() and "out of memory" not in str(e).lower():
+                raise
+            raise TrainError(f"the card ran out of memory ({self.used / 2 ** 30:.2f} GB in use, "
+                             f"{4 * n / 2 ** 20:.0f} MB more asked, {self.dev.memory / 2 ** 30:.1f} GB on the card): "
+                             "a smaller batch_size, fewer or narrower layers, a shorter context, or more cards "
+                             "(device=\"cuda:all\")") from None
         self.used += 4 * n
         return Buf(p, n)
 
@@ -1412,8 +1420,11 @@ def _inputs(X, ids):
 
 
 def _check_size(ops, params, opt, shards=1):
-    """Training keeps 4 float32 numbers per parameter on the card (weights, gradient, AdamW's two moments: 16 bytes);
-    a model that cannot fit is refused at once with the numbers, rather than failing half-way."""
+    """An estimate, not a limit: weights, gradients and the optimizer's state take about 8 + 8 / N bytes per parameter
+    on each card; what the activations take depends on the architecture (an LLM's on the context and the batch, other
+    models on their own layers), so nothing is refused here. When the estimate alone exceeds the card, a warning
+    says so with the numbers; if the card then really runs out, the error says what to change."""
+    import warnings
     from .stdlib import Adam
     total = getattr(getattr(ops, "dev", None), "memory", None)
     if not total:
@@ -1421,14 +1432,11 @@ def _check_size(ops, params, opt, shards=1):
     count = sum(int(np.asarray(a).size) for a in tree_leaves(params) if isinstance(a, np.ndarray))
     per = 8 + (8 if isinstance(opt, Adam) or opt is None else 4) / max(1, shards)
     need = count * per
-    if need > 0.92 * total:
-        fits = int(0.92 * total / per * 0.75)
-        raise TrainError(
-            f"{count / 1e9:.2f} B parameters need {need / 2 ** 30:.1f} GB on each card for training (weights, "
-            f"gradients and the optimizer's state, {per:g} bytes each; with several cards the optimizer's state is "
-            f"shared out among them) before any activations; this card has {total / 2 ** 30:.1f} GB. Models up to "
-            f"about {fits / 1e6:,.0f} M parameters train on it; larger ones need cards with more memory or more "
-            f"cards (device=\"cuda:all\"), and run here with use hub in int4 / int8")
+    if need > total:
+        warnings.warn(f"{count / 1e9:.2f} B parameters take about {need / 2 ** 30:.1f} GB per card for training "
+                      f"(weights, gradients, the optimizer's share) before activations; this card has "
+                      f"{total / 2 ** 30:.1f} GB: it may not fit (more cards: device=\"cuda:all\"; a smaller batch)",
+                      RuntimeWarning, stacklevel=3)
 
 
 def fit(model, params, X, y=None, loss="mse", opt=None, epochs=10, batch_size=None, seed=0, verbose=True,
@@ -1678,8 +1686,12 @@ def _fit_parallel(ops_list, model, params, X, y, loss, opt, epochs, batch_size, 
             rep["Yd"] = net.arena.get("Y", min(bs, n) * yw)
             R.append(rep)
         r0 = R[0]
-        TMP = r0["ops"].alloc(r0["net"].n)
         nP = r0["net"].n
+        for rep in R:
+            o = rep["ops"]
+            rep["TMP"] = o.alloc(max(1, rep["hi"] - rep["lo"]))
+            rep["SQX"], rep["SQ2"] = o.alloc(1), o.alloc(1)
+            o.fill((rep["SQ2"], 0), 1, 0.0)
         EMA = EWC = None
         if ema is not None:
             ema = float(ema)
@@ -1692,7 +1704,7 @@ def _fit_parallel(ops_list, model, params, X, y, loss, opt, epochs, batch_size, 
             anchor, fisher, lam = ewc
             for rep in R:
                 o = rep["ops"]
-                rep["EA"], rep["EF"], rep["ET"] = o.alloc(nP), o.alloc(nP), o.alloc(nP)
+                rep["EA"], rep["EF"], rep["ET"] = o.alloc(nP), o.alloc(nP), o.alloc(max(1, rep["hi"] - rep["lo"]))
                 o.put(rep["EA"], rep["net"].flat_like(anchor))
                 o.put(rep["EF"], rep["net"].flat_like(fisher))
             EWC = float(lam)
@@ -1728,37 +1740,59 @@ def _fit_parallel(ops_list, model, params, X, y, loss, opt, epochs, batch_size, 
                         m_all = len(b) * int(np.prod(shape[1:]))
                         o.mse(out, rep["Yd"], dout, lossv, rows * shape[-1], 1.0 / m_all, len(b) / (n * m_all))
                     net.backward(dout)
-                o0 = r0["ops"]                               # the sum of the gradients, on the first card
-                for rep in R[1:]:
+                o0 = r0["ops"]
+                for rep in R:                                # every card's gradient is complete
                     rep["ops"].sync()
-                    o0.pull((TMP, 0), rep["ops"], (rep["net"].G, 0), nP)
-                    o0.axpy((r0["net"].G, 0), (TMP, 0), nP, 1.0)
-                o0.sync()
-                for rep in R[1:]:                            # and back to every card
-                    rep["ops"].pull((rep["net"].G, 0), o0, (r0["net"].G, 0), nP)
-                t_step += 1
-                for rep in R:                                # the same update everywhere
-                    o, net = rep["ops"], rep["net"]
-                    if EWC is not None:
-                        o.fill((rep["ET"], 0), nP, 0.0)
-                        o.axpy((rep["ET"], 0), (net.P, 0), nP, 1.0)
-                        o.axpy((rep["ET"], 0), (rep["EA"], 0), nP, -1.0)
-                        o.mul3((rep["ET"], 0), (rep["ET"], 0), (rep["EF"], 0), nP)
-                        o.axpy((net.G, 0), (rep["ET"], 0), nP, EWC)
-                    if clip:
-                        o.fill((rep["SQ"], 0), 1, 0.0)
-                        o.sumsq((net.G, 0), nP, (rep["SQ"], 0))
-                    lo, k = rep["lo"], rep["hi"] - rep["lo"]
+                # reduce-scatter: card r sums only its own slice of the gradient, pulled from every other card (the
+                # cards pull at the same time, each on its own queue); no card needs the whole sum
+                for rep in R:
+                    o, lo, k = rep["ops"], rep["lo"], rep["hi"] - rep["lo"]
                     if k <= 0:
                         continue
+                    for q in R:
+                        if q is not rep:
+                            o.pull((rep["TMP"], 0), q["ops"], (q["net"].G, lo), k)
+                            o.axpy((rep["net"].G, lo), (rep["TMP"], 0), k, 1.0)
+                t_step += 1
+                for rep in R:
+                    o, net, lo, k = rep["ops"], rep["net"], rep["lo"], rep["hi"] - rep["lo"]
+                    if EWC is not None and k > 0:            # g += strength * F * (w - anchor), on the slice
+                        o.fill((rep["ET"], 0), k, 0.0)
+                        o.axpy((rep["ET"], 0), (net.P, lo), k, 1.0)
+                        o.axpy((rep["ET"], 0), (rep["EA"], lo), k, -1.0)
+                        o.mul3((rep["ET"], 0), (rep["ET"], 0), (rep["EF"], lo), k)
+                        o.axpy((net.G, lo), (rep["ET"], 0), k, EWC)
+                    if clip:
+                        o.fill((rep["SQ"], 0), 1, 0.0)
+                        if k > 0:
+                            o.sumsq((net.G, lo), k, (rep["SQ"], 0))
+                if clip:                                     # the norm of the whole gradient: the slices' sums added
+                    for rep in R:
+                        rep["ops"].sync()
+                    for rep in R:
+                        o = rep["ops"]
+                        for q in R:
+                            if q is not rep:
+                                o.pull((rep["SQX"], 0), q["ops"], (q["SQ"], 0), 1)
+                                o.axpy((rep["SQ2"], 0), (rep["SQX"], 0), 1, 1.0)
+                for rep in R:                                # each card updates its slice
+                    o, net = rep["ops"], rep["net"]
+                    lo, k = rep["lo"], rep["hi"] - rep["lo"]
+                    if clip:
+                        o.axpy((rep["SQ2"], 0), (rep["SQ"], 0), 1, 1.0)
+                    if k <= 0:
+                        continue
+                    sq = (rep["SQ2"], 0) if clip else (rep["SQ"], 0)
                     if adam:
                         c1, c2 = 1 - opt.b1 ** t_step, 1 - opt.b2 ** t_step
                         nd = min(max(net.n_decay - lo, 0), k)
-                        o.adam((net.P, lo), (net.G, lo), (rep["st1"], 0), (rep["st2"], 0), (rep["SQ"], 0), k,
+                        o.adam((net.P, lo), (net.G, lo), (rep["st1"], 0), (rep["st2"], 0), sq, k,
                                nd, lr, opt.b1, opt.b2, opt.eps, c1, c2, wd, float(clip or 0.0))
                     else:
-                        o.sgd((net.P, lo), (net.G, lo), (rep["st1"], 0), (rep["SQ"], 0), k, lr, float(opt.momentum),
+                        o.sgd((net.P, lo), (net.G, lo), (rep["st1"], 0), sq, k, lr, float(opt.momentum),
                               float(clip or 0.0))
+                    if clip:
+                        o.fill((rep["SQ2"], 0), 1, 0.0)
                 for rep in R:                                # every card gets the slices the others updated
                     rep["ops"].sync()
                 for rep in R:
@@ -1788,7 +1822,7 @@ def _fit_parallel(ops_list, model, params, X, y, loss, opt, epochs, batch_size, 
     finally:
         for rep in R:
             o = rep["ops"]
-            for key in ("st1", "st2", "SQ", "LOSSE", "XA", "YA", "IDX", "EA", "EF", "ET"):
+            for key in ("st1", "st2", "SQ", "LOSSE", "XA", "YA", "IDX", "EA", "EF", "ET", "TMP", "SQX", "SQ2"):
                 if rep.get(key) is not None:
                     o.free(rep[key])
             rep["net"].close()

@@ -474,10 +474,45 @@ def set_power(spec, index=None):
     return msgs
 
 
+def hold(target=77.0, index=0, seconds=None, quiet=False):
+    """apsi gpu hold 77: keeps the card near the temperature by its power limit for ANY program running on it (a
+    PyTorch job, a game, a renderer) until stopped (Ctrl+C) — the same control Apsi's own training uses, so other
+    programs can be measured under the same conditions. Needs an administrator or the GPU helper."""
+    os.environ["APSI_GPU_TEMP"] = str(target)
+    from .native import cuda
+    drv = cuda.driver()
+    devs = [d for d in (drv.devices if drv else []) if d.index == index]
+    if not devs:
+        print("no NVIDIA card")
+        return 1
+    g = governor(devs[0])
+    if g is NULL or getattr(g, "power", None) is None:
+        print("the power limit cannot be set from here: run as administrator, or apsi gpu setup once")
+        return 1
+    print(f"holding GPU {index} near {target:g} C by its power limit (Ctrl+C to stop)", flush=True)
+    t0 = last = time.monotonic()
+    try:
+        stop = os.environ.get("APSI_HOLD_STOP")           # a file whose appearance ends the hold (from another program)
+        while (seconds is None or time.monotonic() - t0 < seconds) and not (stop and os.path.exists(stop)):
+            g._adjust(time.monotonic())
+            g.fraction = 0.0                              # never pauses: only the power limit (the program is not ours)
+            g.integral = 0.0
+            if not quiet and time.monotonic() - last >= 5:
+                last = time.monotonic()
+                print(f"  {g.temp} C, power limit {round(g.power.limit / 1000)} W", flush=True)
+            time.sleep(g.PERIOD)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        g.power.set(g.power.orig)
+    return 0
+
+
 def add_parser(sub):
     p = sub.add_parser("gpu", help="the NVIDIA cards now: temperature, power, clocks; set a power limit")
-    p.add_argument("what", nargs="?", default="status", choices=["status", "power", "watch", "setup", "remove"])
-    p.add_argument("value", nargs="?", default=None, help="for power: 80%% (of the default), 130W or default")
+    p.add_argument("what", nargs="?", default="status", choices=["status", "power", "watch", "setup", "remove", "hold"])
+    p.add_argument("value", nargs="?", default=None,
+                   help="for power: 80%% (of the default), 130W or default; for hold: the temperature (77)")
     p.add_argument("--gpu", type=int, default=None)
     p.set_defaults(fn=_cmd)
 
@@ -488,6 +523,8 @@ def _cmd(args):
         for m in (gpu_helper.setup(args.value) if args.what == "setup" else gpu_helper.remove()):
             print(m)
         return 0
+    if args.what == "hold":
+        return hold(float(args.value or 77), args.gpu or 0)
     if args.what == "power":
         if not args.value:
             print("apsi gpu power 80%   (or 130W, or default)")

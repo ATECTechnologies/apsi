@@ -76,7 +76,10 @@ class Trainer(unittest.TestCase):
         for lossname, yy, last, mk in cases:
             m = L.mlp([6, 16, last], "gelu")
             p0 = m.init(seed=1)
-            kw = dict(loss=lossname, epochs=3, batch_size=16, verbose=False, precision="fp32", clip=1.0)
+            from apsi.values import tree_map
+            fisher = tree_map(lambda a: np.full_like(np.asarray(a), 0.5) if isinstance(a, np.ndarray) else a, p0)
+            kw = dict(loss=lossname, epochs=3, batch_size=16, verbose=False, precision="fp32", clip=0.05,
+                      ewc=(p0, fisher, 0.3))
             one = GT.fit(m, p0, X, yy, opt=mk(), ops=GT.Emulator(), **kw)
             many = GT.fit(m, p0, X, yy, opt=mk(), ops=[GT.Emulator(), GT.Emulator(), GT.Emulator()], ema=0.9, **kw)
             for a, b in zip(tree_leaves(one.params), tree_leaves(many.params)):

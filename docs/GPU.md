@@ -149,18 +149,21 @@ activations are bfloat16; Apsi keeps float32 activations). The products come in 
 for each shape the first time it sees it, keeping the faster (`APSI_GEMM_VARIANT=a|x` fixes one).
 
 **Several cards** — `fit(…, backend="gpu", device="cuda:all")` (or `device="cuda:0,1,2,3"`): data-parallel
-training. Every card holds the model, takes its share of each batch, the gradients are summed card to card (NVLink /
-PCIe peer copies where the driver allows, else through the processor) and every card applies the same update, so the
-result equals one card with the whole batch while the speed grows with the cards. The optimizer's state is shared out
-among the cards (each keeps and updates only its slice, then the cards exchange the updated slices), so with N cards
-each needs 8 + 8 / N bytes per parameter instead of 16.
+training for any model the trainer supports. Every card holds the model and takes its share of each batch; then each
+card sums only *its slice* of the gradient, pulled from all the others at the same time (reduce-scatter; NVLink /
+PCIe peer copies where the driver allows, else through the processor), updates only that slice with its slice of the
+optimizer's state, and the cards exchange the updated slices (all-gather). The gradient-norm clip adds the slices'
+squared sums across the cards. The result equals one card with the whole batch (tested: Adam, AdamW, SGD, clip, EMA,
+EWC); per card the memory is 8 + 8 / N bytes per parameter plus that card's activations.
 
-How big a model trains: per card, the weights and gradients (8 bytes per parameter) plus its share of AdamW's state
-(8 / N bytes) plus the activations of its share of the batch. One 12 GB card: up to roughly 500–600 M parameters;
-one 80 GB card (H100): about 4 B; 4 × B200 (192 GB each): about 18 B. `fit` checks this before it starts and says so
-with the numbers. Models beyond that (21 B and up on 4 cards, 100 B, 1 T) also need the weights and gradients
-themselves split across the cards and kept in bfloat16 (as the large training frameworks do); that is not in Apsi's
-GPU trainer yet. The architecture is yours to choose at any size: `transformer_lm(vocab, d=, heads=, layers=,
+**Any program at your temperature** — `apsi gpu hold 77` keeps the card near 77 °C by its power limit for whatever
+runs on it (a PyTorch job, a renderer) until Ctrl+C, with the same control Apsi's training uses; the benchmark uses
+it so PyTorch and Apsi are measured under the same temperature.
+
+How big a model trains depends on the architecture: per card the weights and gradients (8 bytes per parameter) and
+its share of AdamW's state (8 / N bytes), plus activations that depend on the layers, the context and the batch.
+Nothing is refused in advance: when the parameters alone look larger than the card, a warning gives the numbers,
+and if the card really runs out, the error says what to change (batch size, layers, context, more cards). The architecture is yours to choose at any size: `transformer_lm(vocab, d=, heads=, layers=,
 context=)`, or your own `Sequential` of the layers in the table above.
 
 Large products in three builds: the card times each one (8 warps of 64 × 32; the same loading first; 4 warps of
