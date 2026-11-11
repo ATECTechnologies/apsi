@@ -157,6 +157,13 @@ the band instead of swinging; a card that stays cool is never slowed.
 | `APSI_GPU_TEMP=77` | the target in °C (default 77 → band 75–78); any value from 50 to 95 |
 | `APSI_GPU_TEMP=off` | no control (the card's own limits only) |
 
+**Cooler without pauses: a lower power limit.** A card at its full power limit runs at its highest clocks and
+voltage, where each extra percent of speed costs several percent of power — that is the heat. `APSI_GPU_POWER=80`
+sets the limit to 80 % of the default while Apsi runs (and puts it back at exit): typically about 5 % slower and
+several degrees cooler, with no pauses at all. Windows and Linux allow it only to an administrator / root; without
+that, Apsi says so and paces as above. The pacing itself is a PI controller (it follows the temperature smoothly and
+settles at the target rather than switching between hot and paused).
+
 **The processor too.** `APSI_CPU_TEMP=77` (default; `off` for none) paces training and answering on the processor
 the same way. Linux reads the processor's own sensor (k10temp / zenpower on AMD, coretemp on Intel). Windows only
 shows a temperature to programs run as administrator (the ACPI thermal zone, which on some boards is the
@@ -227,6 +234,7 @@ Raise `--max-queue`, use a smaller model or format, or run another server on ano
 | `APSI_GPU_WEIGHTS` | `auto` | `bf16`, `int8`, `fp8`, `fp6`, `fp6_e2m3`, `int4`, `fp4` |
 | `APSI_GPU_TEMP` | `77` | temperature target in °C; `off` for none |
 | `APSI_CPU_TEMP` | `77` | the processor's target in °C; `off` for none |
+| `APSI_GPU_POWER` | | `80` (% of the default) or `130W`: a lower power limit while Apsi runs — cooler at almost the same speed; needs an administrator / root |
 | `APSI_TENSOR_CORES` | `1` | `0`: float32 kernels only |
 | `APSI_TC_PRECISE` | `1` | `0`: one tensor-core pass for bfloat16 weights too (faster, about 1e-2 instead of 1e-5) |
 | `APSI_KV_CACHE` | `fp16` | `fp32` for the old cache |

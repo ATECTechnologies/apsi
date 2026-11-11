@@ -69,6 +69,7 @@ class Governor:
         self.read_temp, self.target = read_temp, float(target)
         self.low, self.high = self.target - 2.0, self.target + 1.0
         self.fraction = 0.0            # of each piece of work, how much to wait after it (0 = full speed)
+        self.integral = 0.0
         self.temp = None
         self.max_temp = None
         self.paced = 0.0
@@ -77,15 +78,19 @@ class Governor:
         self.lock = threading.Lock()
 
     def _adjust(self, now):
+        """A PI controller on the temperature: the pause fraction follows the error smoothly (integral part) and
+        reacts at once to a change (proportional part), so the card settles at the target instead of swinging
+        between too hot and paused."""
         t = self.read_temp()
         if t is None:
             return
+        dt = min(2.0, max(0.05, now - self.last_read)) if self.last_read else self.PERIOD
         self.temp = t
         self.max_temp = t if self.max_temp is None else max(self.max_temp, t)
-        if t > self.high:              # too warm: pace more, harder the further above the band
-            self.fraction = min(0.85, self.fraction + 0.04 * (t - self.high + 1.0))
-        elif t < self.low:             # cool: give speed back, faster when well below
-            self.fraction = max(0.0, self.fraction - 0.03 * (self.low - t + 1.0))
+        err = t - self.target
+        if self.fraction > 0.0 or err > -1.0:           # cool and not pacing: nothing to wind up
+            self.integral = min(0.85, max(0.0, self.integral + 0.012 * err * dt))
+        self.fraction = min(0.85, max(0.0, self.integral + 0.035 * err))
         self.last_read = now
 
     def tick(self, sync=None):
@@ -108,8 +113,13 @@ class Governor:
         self.last_tick = time.monotonic()
 
     def status(self):
-        return {"temperature_c": self.temp, "target_c": self.target, "band_c": [self.low, self.high],
-                "paced_fraction": round(self.fraction, 3), "max_c": self.max_temp, "paced_s": round(self.paced, 1)}
+        out = {"temperature_c": self.temp, "target_c": self.target, "band_c": [self.low, self.high],
+               "paced_fraction": round(self.fraction, 3), "max_c": self.max_temp, "paced_s": round(self.paced, 1)}
+        if getattr(self, "read_power", None):
+            out["power_w"] = self.read_power()
+        if getattr(self, "power_note", None):
+            out["power_limit"] = self.power_note
+        return out
 
 
 class _Null:
@@ -162,6 +172,12 @@ def governor(dev):
             _govs[key] = NULL
             return NULL
         g = _govs[key] = Governor(read, target)
+
+        def watts():
+            mw = ctypes.c_uint()
+            return round(mw.value / 1000.0, 1) if lib.nvmlDeviceGetPowerUsage(h, ctypes.byref(mw)) == 0 else None
+        g.read_power = watts
+        g.power_note = _power_limit(lib, h)
         return g
 
 
@@ -248,6 +264,35 @@ def cpu_governor():
         elif g is not NULL:
             g.target, g.low, g.high = target, target - 2.0, target + 1.0
         return g
+
+
+def _power_limit(lib, h):
+    """APSI_GPU_POWER=80 (percent of the card's default limit) or =130W: a lower power limit for as long as this
+    program runs (restored at exit). The card then runs at lower clocks and voltage, where it does much more work per
+    watt: about -20 % power costs about -5 % speed, and the card runs several degrees cooler without any pauses.
+    Windows and Linux allow it only to an administrator (root); otherwise nothing changes and the reason is noted."""
+    want = os.environ.get("APSI_GPU_POWER", "").strip().lower()
+    if not want:
+        return None
+    cur, dflt, lo, hi = ctypes.c_uint(), ctypes.c_uint(), ctypes.c_uint(), ctypes.c_uint()
+    if lib.nvmlDeviceGetPowerManagementLimit(h, ctypes.byref(cur)) or \
+            lib.nvmlDeviceGetPowerManagementDefaultLimit(h, ctypes.byref(dflt)) or \
+            lib.nvmlDeviceGetPowerManagementLimitConstraints(h, ctypes.byref(lo), ctypes.byref(hi)):
+        return "this card does not report its power limit"
+    try:
+        mw = int(float(want[:-1]) * 1000) if want.endswith("w") else int(dflt.value * float(want.rstrip("%")) / 100)
+    except ValueError:
+        return f"APSI_GPU_POWER={want}: give a percentage (80) or watts (130W)"
+    mw = max(lo.value, min(hi.value, mw))
+    r = lib.nvmlDeviceSetPowerManagementLimit(h, ctypes.c_uint(mw))
+    if r == 4:
+        return "a lower power limit needs an administrator (Windows) or root (Linux); temperature pacing only"
+    if r != 0:
+        return f"the driver refused the power limit (NVML error {r})"
+    import atexit
+    old = cur.value
+    atexit.register(lambda: lib.nvmlDeviceSetPowerManagementLimit(h, ctypes.c_uint(old)))
+    return f"power limit {mw / 1000:.0f} W (default {dflt.value / 1000:.0f} W) while Apsi runs"
 
 
 def status():

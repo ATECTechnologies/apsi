@@ -1226,6 +1226,7 @@ def fit(model, params, X, y=None, loss="mse", opt=None, epochs=10, batch_size=No
     gov = thermal.governor(getattr(ops, "dev", None))        # keeps the card near APSI_GPU_TEMP (77 C)
     paced0 = (gov.status() or {}).get("paced_s") or 0.0
     wd = float(getattr(opt, "wd", 0.0)) if isinstance(opt, AdamW) else 0.0
+    ep_seconds, ep_temp, ep_t0 = [], [], time.perf_counter()
     try:
         for ep in range(int(epochs)):
             order = rng.permutation(n) if batch_size else np.arange(n)
@@ -1272,6 +1273,11 @@ def fit(model, params, X, y=None, loss="mse", opt=None, epochs=10, batch_size=No
                 step += 1
                 gov.tick(ops.sync)
             history.append(float(ops.get(net.LOSS, 1)[0]))          # the one wait of the epoch
+            now = time.perf_counter()
+            ep_seconds.append(round(now - ep_t0, 3))
+            ep_t0 = now
+            st = gov.status()
+            ep_temp.append(st.get("temperature_c") if st else None)
             extra = ""
             if val is not None:
                 vl = _eval_loss(net, ops, val, ids, ce, bs)
@@ -1293,7 +1299,7 @@ def fit(model, params, X, y=None, loss="mse", opt=None, epochs=10, batch_size=No
     if verbose and temp and temp["paced_s"]:
         print(f"GPU kept near {temp['target_c']:.0f} C (highest {temp['max_c']:.0f} C, paced {temp['paced_s']} s)")
     return Record(params=out_params, history=history, val_history=val_hist, gpu_memory_mb=round(peak / 2 ** 20),
-                  gpu_temperature=temp,
+                  gpu_temperature=temp, epoch_seconds=ep_seconds, epoch_temperature_c=ep_temp,
                   device=f"gpu ({getattr(ops, 'name', '?')}, Apsi kernels"
                          f"{', tensor cores' if ops.tc else ''})")
 
