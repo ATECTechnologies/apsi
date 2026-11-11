@@ -621,6 +621,8 @@ Development started on **Sunday, 8 November 2026 at about 04:00** (Bangkok time,
 - `tools/build_editors.py` keeps the Sublime/TextMate grammar and snippets identical to the VS Code ones
 
 ### VS Code extension
+- `apsi test examples` no longer downloads a model or opens ports: `31_ai_server` and `27_pretrained_models` load
+  their models only when run, not under `apsi test` (the Windows build waited for a 1 GB download there)
 - **finds the installed Apsi of every layout:** the side-by-side installs (`Programs\Apsi\<version>`, the version
   chosen with `apsi use` first) run through their own Python directly; a launcher found on PATH (`apsi.cmd`) is
   started through the shell, which current VS Code needs on Windows (before, the language server could not start and

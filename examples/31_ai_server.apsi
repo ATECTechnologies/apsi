@@ -11,14 +11,19 @@ let a = args()
 let name = a[0] if len(a) > 0 else "Qwen/Qwen2.5-0.5B-Instruct"
 let port = int(a[1]) if len(a) > 1 else 8000
 
+# `apsi test` checks this file without downloading a model or opening ports (the routes below are still checked)
+let live = not testing()
+
 # the model runs on the GPU when there is one (int8 / int4 / fp8 / fp6 weights when it would not fit otherwise)
-let lm = hub.model(name)
-print(f"{name} on {lm.device}")
+let lm = hub.model(name) if live else none
+if live:
+    print(f"{name} on {lm.device}")
 
 # 1) the whole OpenAI API in one line: /v1/chat/completions (streaming too), /v1/completions, /v1/models,
 #    /health, /metrics; requests take turns in arrival order, a client that hangs up frees the model at once
-let ai = hub.serve(lm, port=port, background=true)
-print(f"OpenAI API: {ai.url}/v1")
+if live:
+    let ai = hub.serve(lm, port=port, background=true)
+    print(f"OpenAI API: {ai.url}/v1")
 
 # 2) your own routes next to it, in plain Apsi, with the same model
 let app = server(name="my-ai-app", log=false)
@@ -40,6 +45,6 @@ fn classify(req):
                          {"role": "user", "content": text}], max_new_tokens=4, temperature=0.0)
     return {"label": label.strip().lower()}
 
-if "net" in permissions() and not testing():
+if live and "net" in permissions():
     print(f"your routes: http://127.0.0.1:{port + 1}/summarize and /classify")
     app.run(port=port + 1)

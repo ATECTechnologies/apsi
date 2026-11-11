@@ -11,7 +11,7 @@ app.rate_limit(20, per=1[s])
 app.health()
 
 # --- language/text models from Hugging Face (downloaded automatically the first time)
-let have_hf = "python" in permissions() and pyimport("importlib.util").find_spec("transformers") != none
+let have_hf = not testing() and "python" in permissions() and pyimport("importlib.util").find_spec("transformers") != none
 if have_hf:
     let sentiment = hf_pipeline("sentiment-analysis", model="distilbert-base-uncased-finetuned-sst-2-english")
     print(sentiment("Apsi makes physics and AI fun!"))
