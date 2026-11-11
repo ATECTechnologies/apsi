@@ -166,8 +166,9 @@ Nothing is refused in advance: when the parameters alone look larger than the ca
 and if the card really runs out, the error says what to change (batch size, layers, context, more cards). The architecture is yours to choose at any size: `transformer_lm(vocab, d=, heads=, layers=,
 context=)`, or your own `Sequential` of the layers in the table above.
 
-Large products in three builds: the card times each one (8 warps of 64 × 32; the same loading first; 4 warps of
-64 × 64 over slices of 16) for every shape the first time and keeps the fastest; the tiles are visited in groups of 8
+Large products in four builds: the card times each one (8 warps of 64 × 32; the same loading first; 4 warps of
+64 × 64 over slices of 16; the operands rounded to bfloat16 once and copied into shared memory with cp.async four
+slices ahead) for every shape the first time, the rounding pass included, and keeps the fastest; the tiles are visited in groups of 8
 rows so a large weight matrix is read from memory far less often.
 
 Older and newer cards: on Turing (RTX 20) and GTX 16 the trainer runs on its float32 kernels (no bfloat16 tensor

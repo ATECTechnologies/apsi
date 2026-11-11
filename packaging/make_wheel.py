@@ -51,7 +51,7 @@ def _record_line(name, data):
 def build(out_dir):
     name, version, summary, requires, deps = _project()
     readme = open(os.path.join(ROOT, "README.md"), encoding="utf-8").read()
-    meta = [f"Metadata-Version: 2.1", f"Name: {name}", f"Version: {version}", f"Summary: {summary}",
+    meta = ["Metadata-Version: 2.1", f"Name: {name}", f"Version: {version}", f"Summary: {summary}",
             f"Requires-Python: {requires}", "Author: ATEC", "License: Apsi License 2.0"] + [f"Requires-Dist: {_check_requirement(d)}" for d in deps] + \
            ["Provides-Extra: gpu", 'Requires-Dist: cupy-cuda12x; extra == "gpu"',
             "Provides-Extra: torch", 'Requires-Dist: torch; extra == "torch"',

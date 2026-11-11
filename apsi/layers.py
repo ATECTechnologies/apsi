@@ -1347,7 +1347,7 @@ def fit(model, params, X, y=None, loss="mse", opt=None, epochs=10, batch_size=No
         from . import torch_backend
         return torch_backend.fit(model, params, X, y, loss, opt, epochs, batch_size, seed, verbose, clip, schedule,
                                  graph, mask, val, device=device, precision=precision, compile=compile)
-    from .stdlib import Adam, value_and_grad, clip_grad_norm
+    from .stdlib import Adam, value_and_grad
     lf = _loss_fn(loss)
     opt = opt or Adam(1e-3)
     ctx = {"graph": graph} if graph is not None else {}
@@ -1684,7 +1684,6 @@ def diagnose(model, params, X, y=None, loss="mse", lr=1e-3, steps=60, batch=16, 
 
     Returns record(ok, problems, warnings, notes, suggested_lr, losses) and prints a report."""
     from .stdlib import Adam, value_and_grad
-    from .values import tree_leaves
     lf = _loss_fn(loss)
     problems, warnings, notes = [], [], []
     target = X if y is None else y

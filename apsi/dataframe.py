@@ -17,8 +17,6 @@ are evaluated column-wise without Python loops.
 """
 import csv
 import io
-import math
-import os
 
 import numpy as np
 

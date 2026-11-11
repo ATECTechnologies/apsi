@@ -16,9 +16,9 @@ from .errors import (ApsiError, RuntimeErr, NameErr, TypeCheckError, UnitError, 
                      AssertionFailed, CheckFailed)
 from .fmt import fmt, type_name
 from .parser import parse
-from .units import Quantity, DIMLESS, DIM_NAMES, dim_name, unit_string, make
+from .units import Quantity, DIM_NAMES, dim_name, make
 from .values import (Function, BoundMethod, StructType, StructInstance, Record, RangeVal,
-                     Namespace, Dtype, UnitNamespace)
+                     Namespace, UnitNamespace)
 
 np.seterr(all="ignore")
 sys.setrecursionlimit(max(sys.getrecursionlimit(), 20000))

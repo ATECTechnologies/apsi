@@ -34,11 +34,10 @@ import sys
 import threading
 import time
 import traceback
-import uuid
 from concurrent.futures import ThreadPoolExecutor
 from urllib.parse import unquote, parse_qs
 
-from .errors import ApsiError, RuntimeErr
+from .errors import ApsiError
 from .values import Record
 
 for _ext, _type in ((".mjs", "text/javascript"), (".jsx", "text/javascript"), (".ts", "text/javascript"),

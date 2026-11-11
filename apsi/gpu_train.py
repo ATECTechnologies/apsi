@@ -401,7 +401,7 @@ class Gpu(_Ops):
             try:                                         # shared-memory tiles: the fast products
                 tmod, self.fn["gemm_tkn"] = dev.load("apsi-train-tiled-1", KS.ptx("tiled"))
                 for name in KS.TILED[1:] + tuple(e[0] for e in KS.EPI_KERNELS) + \
-                        tuple(f"gemm_tmn_aa{j}" for j in KS.EPI_ACTS) + ("bf_lo",):
+                        tuple(f"gemm_tmn_aa{j}" for j in KS.EPI_ACTS) + ("bf_lo", "to_bf16"):
                     f = ctypes.c_void_p()
                     dev.drv.check(lib.cuModuleGetFunction(ctypes.byref(f), tmod, name.encode()), "cuModuleGetFunction")
                     self.fn[name] = f
@@ -411,12 +411,12 @@ class Gpu(_Ops):
         if self.tiled and os.environ.get("APSI_GEMM_VARIANT", "auto").strip().lower() != "a":
             # more builds of the same products: "x" loads first (2 blocks of 8 warps per SM), "w" 4 warps of 64 x 64
             # over slices of 16 (the shape of the fast GEMM libraries); the card times them per shape
-            for tag, which in (("x", "tiled_x"), ("w", "tiled_w")):
+            for tag, which in (("x", "tiled_x"), ("w", "tiled_w"), ("h", "tiled_h")):
                 try:
                     xmod, first = dev.load(f"apsi-train-tiled-{tag}", KS.ptx(which))
                     xf = {f"gemm_tkn#{tag}": first}
                     for name in KS.TILED[1:] + tuple(e[0] for e in KS.EPI_KERNELS) + \
-                            tuple(f"gemm_tmn_aa{j}" for j in KS.EPI_ACTS):
+                            (tuple(f"gemm_tmn_aa{j}" for j in KS.EPI_ACTS) if tag != "h" else ()):
                         f = ctypes.c_void_p()
                         dev.drv.check(lib.cuModuleGetFunction(ctypes.byref(f), xmod, name.encode()),
                                       "cuModuleGetFunction")
@@ -715,13 +715,34 @@ class Gpu(_Ops):
             n = self._occ[name] = max(1, v.value) if ok else 2
         return n
 
+    def _h_ready(self, name, args, M, N, K, nb):
+        """Can the bfloat16-operand build run this product? (dense operands, dimensions in 8s, no bias gradient)"""
+        if f"{name}#h" not in self.fn or nb != 1 or args[27][1] or "to_bf16" not in self.fn:
+            return False
+        sam, sak, sbk, sbn = (a[1] for a in args[7:11])
+        da = (sak == 1 and sam == K and K % 8 == 0) or (sam == 1 and sak == M and M % 8 == 0)
+        db = (sbn == 1 and sbk == N and N % 8 == 0) or (sbk == 1 and sbn == K and K % 8 == 0)
+        return da and db and args[0][1] % 8 == 0 and args[1][1] % 8 == 0
+
+    def _h_args(self, args, M, N, K):
+        """The operands rounded to bfloat16 into scratch memory (one pass each), and the arguments that point there."""
+        out = list(args)
+        for i, n, key in ((0, M * K, "h_a"), (1, K * N, "h_b")):
+            dst = self._scratch(key, (n + 1) // 2)
+            self._go("to_bf16", self.blocks((n + 1) // 2), 256, args[i], self.p(dst), ("u", n))
+            out[i] = self.p(dst)
+        return out
+
     def _variant(self, name, grid, args, M, N, ldc, nb):
         """Which build of a tiled product runs: the one the card itself measured faster for this shape (each is
         timed twice on scratch outputs the first time the shape comes; APSI_GEMM_VARIANT=a or x fixes it)."""
+        K = args[6][1]
         cands = [name] + [f"{name}#{t}" for t in ("x", "w") if f"{name}#{t}" in self.fn]
+        if self._h_ready(name, args, M, N, K, nb):
+            cands.append(f"{name}#h")
         force = os.environ.get("APSI_GEMM_VARIANT", "auto").strip().lower()
-        if force in ("x", "w"):
-            return f"{name}#{force}" if f"{name}#{force}" in self.fn else name
+        if force in ("x", "w", "h"):
+            return f"{name}#{force}" if f"{name}#{force}" in cands else name
         if force == "a" or len(cands) == 1 or nb != 1:
             return name
         key = (name, grid, tuple(a for a in args if a[0] != "p"))
@@ -740,7 +761,7 @@ class Gpu(_Ops):
         for cand in cands + cands:
             e0, e1 = self._event(), self._event()
             self._lib.cuEventRecord(e0, None)
-            self._go(cand, grid, self._threads(cand), *targs)
+            self._go(cand, grid, self._threads(cand), *(self._h_args(targs, M, N, K) if cand.endswith("#h") else targs))
             self._lib.cuEventRecord(e1, None)
             self._lib.cuEventSynchronize(e1)
             self._lib.cuEventElapsedTime(ctypes.byref(ms), e0, e1)
@@ -817,6 +838,8 @@ class Gpu(_Ops):
                     self.p(X2), ("u", epi), ("u", act), self.p(db), ("u", 1 if db is not None else 0)]
             grid = (tiles, nb1 * nb2, nz)
             use = self._variant(name, grid, args, M, N, ldc, nb1 * nb2)
+            if use.endswith("#h"):
+                args = self._h_args(args, M, N, K)
             self._go(use, grid, self._threads(use), *args)
             if db is not None:
                 self._db = None                          # taken

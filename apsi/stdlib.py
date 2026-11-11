@@ -12,9 +12,8 @@ from . import autodiff as ad
 from .autodiff import Node
 from .errors import RuntimeErr, ShapeError, UnitError
 from .fmt import fmt, type_name
-from .units import Quantity, make, DIMLESS, dim_name, unit_string, parse_unit
-from .values import (Record, RangeVal, Namespace, Dtype, UnitNamespace, tree_map, tree_leaves,
-                     StructInstance)
+from .units import Quantity, make, DIMLESS, dim_name, parse_unit
+from .values import (Record, Dtype, UnitNamespace, tree_map, tree_leaves)
 
 # =============================================================== autodiff API
 _TRACE_DEPTH = [0]
@@ -1276,7 +1275,7 @@ def core_builtins():
         "list": _list, "pmap": _pmap, "unique": _unique, "chars": _chars, "join": _join, "map": _map, "filter": _filter, "enumerate": _enumerate, "zip": _zip,
         "sorted": _sorted, "reversed": _reversed, "keys": _keys, "record": _record,
         **_python_compat(),
-        "clock": _clock, "platform": _platform, "args": _args, "input": _input, "exit": _exit, "exact": _exact, "to_float": _to_float,
+        "clock": _clock, "args": _args, "input": _input, "exit": _exit, "exact": _exact, "to_float": _to_float,
         "load_csv": _load_csv, "save_csv": _save_csv,
         # units
         "dim": _dim, "unit": _unit, "magnitude": _magnitude, "u": UnitNamespace(),

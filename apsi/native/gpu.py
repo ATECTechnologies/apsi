@@ -539,7 +539,6 @@ def Unsupported_(msg):
 
 class GpuPlan:
     def __init__(self, gf, key, drv):
-        from . import compiler as C
         self.gf, self.key, self.drv = gf, key, drv
         prelude, loop, ret = kernel_shape(gf.gpu_fndef)
         self.ptx, self.root, self.mc, self.targs = build_kernel(gf, key)

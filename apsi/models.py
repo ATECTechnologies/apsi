@@ -25,7 +25,7 @@ from . import modelio
 
 from . import ops
 from .errors import RuntimeErr
-from .precision import QTensor, quantize, dequantize, get_format, _bf16_decode, _minifloat_decode, FORMATS
+from .precision import QTensor, quantize, dequantize, _bf16_decode, _minifloat_decode, FORMATS
 from .units import Quantity
 from .values import Record, tree_map, tree_leaves
 

@@ -26,12 +26,11 @@ import numpy as np
 from . import ast as A
 from . import ops
 from .autodiff import Node
-from .errors import ApsiError, RuntimeErr, UnitError, ShapeError, TypeCheckError, AssertionFailed
+from .errors import ApsiError, RuntimeErr, UnitError, AssertionFailed
 from .fmt import fmt, type_name
 from .parser import parse
-from .units import Quantity, DIMLESS, DIM_NAMES, dim_name, make
-from .values import (StructType, StructInstance, Record, RangeVal, Namespace, BoundMethod,
-                     UnitNamespace)
+from .units import Quantity, DIM_NAMES, dim_name, make
+from .values import (StructType, StructInstance, Record, RangeVal, Namespace, BoundMethod)
 
 HELPER_PREFIX = "_A"
 _HELPER_NAME = re.compile(r"^_A[a-z_]*\d*$")

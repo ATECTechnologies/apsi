@@ -1,6 +1,5 @@
 """Recursive-descent parser for Apsi."""
 import itertools
-from fractions import Fraction
 
 from . import ast as A
 from .errors import ParseError, UnitError

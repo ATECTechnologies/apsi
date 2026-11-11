@@ -36,7 +36,6 @@ import numpy as np
 
 from . import dsp
 from . import stats as st
-from . import special as sp
 from .errors import RuntimeErr
 from .units import Quantity
 from .values import Record

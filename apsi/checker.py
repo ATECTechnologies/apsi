@@ -9,7 +9,7 @@ from fractions import Fraction
 from . import ast as A
 from .errors import TypeCheckError, UnitError, NameErr, ParseError, LexError
 from .units import Dim, DIMLESS, DIM_NAMES, dim_name
-from .parser import parse, EVOLVE_METHODS
+from .parser import parse
 from . import ops
 
 ZERO = "ZERO"          # literal 0: compatible with any unit in + and -

@@ -135,7 +135,7 @@ def cmd(args):
     rest = (args.what or [])[1:]
     r = roots()
     if action == "show":
-        print(f"Apsi caches (all safe to remove; rebuilt when needed)")
+        print("Apsi caches (all safe to remove; rebuilt when needed)")
         total = 0
         for k, desc in KINDS.items():
             n = size(r[k]) if os.path.exists(r[k]) else 0

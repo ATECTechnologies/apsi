@@ -7,13 +7,11 @@ on raw SI magnitudes, so physical units cost nothing inside the loop.
 """
 import operator
 
-import numpy as np
 
 from . import ast as A
 from . import ops
-from .autodiff import Node
 from .units import Quantity
-from .values import Function, StructInstance, Record, RangeVal, BoundMethod
+from .values import Function, RangeVal, BoundMethod
 
 
 class Unsupported(Exception):

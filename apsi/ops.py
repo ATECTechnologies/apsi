@@ -9,7 +9,7 @@ import numpy as np
 from . import autodiff as ad
 from .autodiff import Node
 from .errors import UnitError, ShapeError, RuntimeErr
-from .units import Quantity, make, DIMLESS, dim_name, Dim, _is_zero, parse_unit
+from .units import Quantity, make, DIMLESS, dim_name, _is_zero
 from .values import RangeVal, Dtype
 from .uncertain import Uncertain, DERIVS
 

@@ -16,6 +16,9 @@
 - **GPU temperature control:** long training, long answers and busy servers keep the card near 77 °C (75–78) by
   pacing the work while it is above the band (the driver's NVML gives the temperature); a cool card is never slowed.
   `APSI_GPU_TEMP=72` / `off`; `r.gpu_temperature`, `/metrics`, `hub.gpu_status()`.
+- **A fourth build of the products:** the operands rounded to bfloat16 once (one pass each), then copied into shared
+  memory with cp.async four slices ahead (no registers, no conversion in the loop); the card times it against the
+  others per shape, its rounding pass included, and keeps the fastest.
 - **Several cards:** `device="cuda:all"` (or "cuda:0,1,…") trains data-parallel: reduce-scatter of the gradient
   (each card sums its slice, all cards at once), the optimizer's state and update sharded, all-gather of the
   weights; the same result as one card with the whole batch (tested). No size is refused in advance (a warning

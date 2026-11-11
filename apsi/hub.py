@@ -266,7 +266,6 @@ class Hub:
     def _download_parallel(self, src, url, token, part, size, etag, name, progress):
         """A large file over several connections at once (each a byte range of the file), resumable: finished
         pieces are listed next to the .part file. The SHA-256 of the whole file is checked at the end."""
-        import concurrent.futures as cf
         ranges = part + ".ranges"
         n = (size + CHUNK - 1) // CHUNK
         done = set()
@@ -454,7 +453,7 @@ class Hub:
 
     def load(self, repo, filename=None, revision="main", token=None, dtype=None):
         """Weights as {name: tensor}: model.safetensors (also sharded), or a named .safetensors / .gguf file."""
-        from . import models, modelio
+        from . import modelio
         names = None if filename else self.files(repo, revision, token)
         if filename is None:
             if "model.safetensors" in names:

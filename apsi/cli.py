@@ -396,7 +396,7 @@ def cmd_test(args):
                 print(f"  - skipped: {e.msg}")
                 skipped += 1
                 continue
-            print(f"  ✗ file failed to load")
+            print("  ✗ file failed to load")
             _report(e, src, f)
             total_fail += 1
             continue

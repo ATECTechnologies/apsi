@@ -8,7 +8,6 @@ import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, wait as _fwait, FIRST_COMPLETED
 
-import numpy as np
 
 from .errors import RuntimeErr
 from .units import Quantity

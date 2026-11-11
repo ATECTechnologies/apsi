@@ -12,7 +12,7 @@ import os
 import numpy as np
 
 from . import ops
-from .errors import ApsiError, RuntimeErr
+from .errors import RuntimeErr
 from .units import Quantity, make, parse_unit
 from .values import Record, StructInstance, Dtype
 

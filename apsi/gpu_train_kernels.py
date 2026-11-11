@@ -886,7 +886,7 @@ EPI_KERNELS = tuple([(f"gemm_tkn_e1a{j}", True, False, 1, j) for j in EPI_ACTS] 
                     [(f"gemm_tkk_e2a{j}", True, True, 2, j) for j in EPI_ACTS] + [("gemm_tkn_e3", True, False, 3, None)])
 
 
-def _tiled_module(early=False, wide=False):
+def _tiled_module(early=False, wide=False, h=False):
     """Matrix products on tensor cores with shared-memory tiles (sm_80+), the way fast GEMM libraries do them.
 
     A block of 8 warps computes 128 x 128 of C; each warp 64 x 32 (4 x 4 mma tiles of 16 x 8). The operands are read
@@ -904,11 +904,15 @@ def _tiled_module(early=False, wide=False):
     # every value read from shared memory feeds twice as many products as a 64 x 32 warp tile
     if wide:
         early = True
-    BKv, NTH, WNW = (16, 128, 2) if wide else (BK, 256, 4)
+    # h: the operands already in bfloat16 in memory (copies made just before), copied into shared memory with
+    # cp.async (no registers, no conversion) four slices ahead: the tensor cores never wait for memory
+    STAGES = 4 if h else 2
+    BKv, NTH, WNW = (16, 128, 2) if wide else (16, 256, 4) if h else (BK, 256, 4)
     NTL = BN // WNW // 8                          # n8 tiles per warp
     PADv = BKv + 8
     VPR = BKv // 4                                # float32 vectors of 4 per row of a k-contiguous slice
-    ir, m = _setup("apsi_train_tiled_w" if wide else "apsi_train_tiled_x" if early else "apsi_train_tiled")
+    ir, m = _setup("apsi_train_tiled_h" if h else "apsi_train_tiled_w" if wide else "apsi_train_tiled_x" if early
+                   else "apsi_train_tiled")
     annotations = m.add_named_metadata("nvvm.annotations")
     g = _Gen(ir, m)
     i16, i32, i64, f32, C, F, G = ir.IntType(16), g.i32, g.i64, g.f32, g.C, g.F, g.G
@@ -916,7 +920,7 @@ def _tiled_module(early=False, wide=False):
     ctaz_f = d("llvm.nvvm.read.ptx.sreg.ctaid.z", i32, [])
     nctaz_f = d("llvm.nvvm.read.ptx.sreg.nctaid.z", i32, [])
     bar_f = d("llvm.nvvm.barrier0", ir.VoidType(), [])
-    HALVES = 2 * 2 * max(BM * PADv, BKv * PADT)
+    HALVES = STAGES * 2 * max(BM * PADv, BKv * PADT)
     smem = ir.GlobalVariable(m, ir.ArrayType(i16, HALVES), "apsi_tiles", addrspace=3)
     smem.linkage = "internal"
     smem.align = 16
@@ -934,6 +938,11 @@ def _tiled_module(early=False, wide=False):
                        side_effect=True)
     ldg4 = ir.InlineAsm(ir.FunctionType(ir.LiteralStructType([f32] * 4), [i64]),
                         "ld.global.v4.f32 {$0,$1,$2,$3}, [$4];", "=f,=f,=f,=f,l", side_effect=True)
+    cpa = ir.InlineAsm(ir.FunctionType(ir.VoidType(), [i64, i64, i32]), "cp.async.cg.shared.global [$0], [$1], 16, $2;",
+                       "l,l,r", side_effect=True)
+    cpa_commit = ir.InlineAsm(ir.FunctionType(ir.VoidType(), []), "cp.async.commit_group;", "", side_effect=True)
+    cpa_wait = ir.InlineAsm(ir.FunctionType(ir.VoidType(), []), f"cp.async.wait_group {max(0, STAGES - 2)};", "",
+                            side_effect=True)
     cvt2 = ir.InlineAsm(ir.FunctionType(i32, [f32, f32]), "cvt.rn.bf16x2.f32 $0, $1, $2;", "=r,f,f",
                         side_effect=False)
     ex2_f = d("llvm.nvvm.ex2.approx.f", f32, [f32])
@@ -1095,7 +1104,7 @@ def _tiled_module(early=False, wide=False):
                     store_row4(b.add(base, b.add(b.mul(c, C(PADT)), r)), hs)
 
         accs = [[[var(F(0.0)) for _ in range(4)] for _ in range(NTL)] for _ in range(4)]
-        dbs = [var(F(0.0)) for _ in range(4)] if (not a_kc and not b_kc and epi_mode == 0) else None
+        dbs = [var(F(0.0)) for _ in range(4)] if (not a_kc and not b_kc and epi_mode == 0 and not h) else None
 
         def add_db(regs):
             if dbs is None:
@@ -1104,10 +1113,42 @@ def _tiled_module(early=False, wide=False):
                 if r_[0] == "Bt" and r_[4]:
                     for j in range(4):
                         b.store(b.fadd(b.load(dbs[j]), r_[4][j]), dbs[j])
-        first_regs = fetch(C(0))
-        put(first_regs, C(0))
-        add_db(first_regs)
-        b.call(bar_f, [])
+        def issue(kt, stage):
+            """cp.async of slice kt (8 bfloat16 = 16 bytes per thread and operand) into a stage of shared memory;
+            outside the matrix the bytes are zeros."""
+            k0 = b.add(k_beg, b.mul(kt, C(BKv)))
+            sbase_a = b.mul(stage, C(2 * REG))
+            sbase_b = b.add(sbase_a, C(REG))
+            A16 = b.bitcast(p["A"], i16.as_pointer(1))
+            B16 = b.bitcast(p["B"], i16.as_pointer(1))
+            for which, ptr, kc, base_off, lim_o, s_o, o0 in (("A", A16, a_kc, offs[0], p["M"], p["sam"] if a_kc else p["sak"], bm),
+                                                           ("B", B16, b_kc, offs[1], p["N"], p["sbn"] if b_kc else p["sbk"], bn)):
+                sb_ = sbase_a if which == "A" else sbase_b
+                if kc:                                # [row][k]: 128 rows x 16 k = 2 chunks of 8 per row
+                    row, kq = b.lshr(tid, C(1)), b.mul(b.and_(tid, C(1)), C(8))
+                    ci, cl, oi, ol = b.add(k0, kq), k_end, b.add(o0, row), lim_o
+                    dst = b.add(sb_, b.add(b.mul(row, C(PADv)), kq))
+                else:                                 # [k][row]: 16 k x 128 = 16 chunks of 8 per k
+                    kk, q8 = b.lshr(tid, C(4)), b.mul(b.and_(tid, C(15)), C(8))
+                    ci, cl, oi, ol = b.add(o0, q8), lim_o, b.add(k0, kk), k_end
+                    dst = b.add(sb_, b.add(b.mul(kk, C(PADT)), q8))
+                ok = b.and_(b.icmp_unsigned("<", ci, cl), b.icmp_unsigned("<", oi, ol))
+                ci2 = umin(ci, b.sub(cl, C(8)))
+                oi2 = umin(oi, b.sub(ol, C(1)))
+                idx = b.add(base_off, b.add(b.mul(z64(oi2), z64(s_o)), z64(ci2)))
+                src = b.ptrtoint(b.gep(ptr, [idx], inbounds=True), i64)
+                b.call(cpa, [b.ptrtoint(sh_ptr(dst), i64), src, b.select(ok, C(16), C(0))])
+
+        if h:
+            for st_ in range(STAGES - 1):
+                with b.if_then(b.icmp_unsigned("<", C(st_), ntiles)):
+                    issue(C(st_), C(st_))
+                b.call(cpa_commit, [])
+        else:
+            first_regs = fetch(C(0))
+            put(first_regs, C(0))
+            add_db(first_regs)
+            b.call(bar_f, [])
         it = var(C(0))
         head = fn.append_basic_block("head")
         body = fn.append_basic_block("body")
@@ -1119,10 +1160,20 @@ def _tiled_module(early=False, wide=False):
         b.position_at_end(body)
         nxt = b.add(i, C(1))
         has_next = b.icmp_unsigned("<", nxt, ntiles)
-        regs = fetch(umin(nxt, b.sub(ntiles, C(1))))
-        buf = b.and_(i, C(1))
-        abase = b.select(b.icmp_unsigned("==", buf, C(0)), A_BASE[0], A_BASE[1])
-        bbase = b.select(b.icmp_unsigned("==", buf, C(0)), B_BASE[0], B_BASE[1])
+        if h:
+            b.call(cpa_wait, [])                      # slice i has arrived (the later ones may still be coming)
+            b.call(bar_f, [])                         # ... for every thread, and everyone is done with slice i - 1
+            ahead = b.add(i, C(STAGES - 1))
+            with b.if_then(b.icmp_unsigned("<", ahead, ntiles)):
+                issue(ahead, b.urem(ahead, C(STAGES)))
+            b.call(cpa_commit, [])
+            abase = b.mul(b.urem(i, C(STAGES)), C(2 * REG))
+            bbase = b.add(abase, C(REG))
+        else:
+            regs = fetch(umin(nxt, b.sub(ntiles, C(1))))
+            buf = b.and_(i, C(1))
+            abase = b.select(b.icmp_unsigned("==", buf, C(0)), A_BASE[0], A_BASE[1])
+            bbase = b.select(b.icmp_unsigned("==", buf, C(0)), B_BASE[0], B_BASE[1])
         for ks in range(BKv // 16):
             l7, l8, l16 = b.and_(lane, C(7)), b.and_(b.lshr(lane, C(3)), C(1)), b.lshr(lane, C(4))
             afr = []
@@ -1158,10 +1209,11 @@ def _tiled_module(early=False, wide=False):
                     r = b.call(mma, afr[mt] + bfr[nt] + acc)
                     for c in range(4):
                         b.store(b.extract_value(r, c), accs[mt][nt][c])
-        with b.if_then(has_next):
-            put(regs, b.and_(nxt, C(1)))
-            add_db(regs)
-        b.call(bar_f, [])
+        if not h:
+            with b.if_then(has_next):
+                put(regs, b.and_(nxt, C(1)))
+                add_db(regs)
+            b.call(bar_f, [])
         b.store(nxt, it)
         b.branch(head)
         b.position_at_end(done)
@@ -1213,11 +1265,24 @@ def _tiled_module(early=False, wide=False):
         kernel(name, a_kc, b_kc)
     for name, a_kc, b_kc, e, j in EPI_KERNELS:
         kernel(name, a_kc, b_kc, e, j)
-    for j in EPI_ACTS:                            # dW = act(h)^T dy without keeping act(h)
-        kernel(f"gemm_tmn_aa{j}", False, False, 0, None, j)
+    if not h:
+        for j in EPI_ACTS:                        # dW = act(h)^T dy without keeping act(h)
+            kernel(f"gemm_tmn_aa{j}", False, False, 0, None, j)
 
-    if early:
+    if early or h:
         return _emit(m, "sm_80")
+    # to_bf16: Y16 = bfloat16(X), two values per thread (the operands of the h build)
+    fn = ir.Function(m, ir.FunctionType(ir.VoidType(), [G(f32), G(i32), i32]), name="to_bf16")
+    fn.calling_convention = "ptx_kernel"
+    X_, Y_, n_ = fn.args
+    b = ir.IRBuilder(fn.append_basic_block("top"))
+    i = b.add(b.mul(b.call(g.ctax_f, []), C(256)), b.call(g.tid_f, []))
+    with b.if_then(b.icmp_unsigned("<", b.mul(i, C(2)), n_)):
+        ix = b.zext(b.mul(i, C(2)), i64)
+        v2 = b.load(b.bitcast(b.gep(X_, [ix], inbounds=True), ir.VectorType(f32, 2).as_pointer(1)), align=8)
+        w = b.call(cvt2, [b.extract_element(v2, C(1)), b.extract_element(v2, C(0))])
+        b.store(w, b.gep(Y_, [b.zext(i, i64)], inbounds=True), align=4)
+    b.ret_void()
     # bf_lo: Y = X - bfloat16(X), the part bfloat16 drops. float32 products as three bfloat16 products on the
     # tensor cores: A B = hi(A) hi(B) + lo(A) hi(B) + hi(A) lo(B), with an error near float32's own
     fn = ir.Function(m, ir.FunctionType(ir.VoidType(), [G(f32), G(f32), i32]), name="bf_lo")
@@ -1619,6 +1684,7 @@ def ptx(which):
         pass
     text = {"main": _main_module, "tc": _tc_module, "tiled": _tiled_module, "tiled_x": lambda: _tiled_module(True),
             "tiled_w": lambda: _tiled_module(True, True),
+            "tiled_h": lambda: _tiled_module(h=True),
             "flash": _flash_module}[which]()
     if path:
         try:

@@ -1,7 +1,7 @@
 """Runtime value types of Apsi (functions, structs, records, ranges, modules)."""
 import numpy as np
 
-from .units import Quantity, _is_zero
+from .units import Quantity
 
 
 class Function:
