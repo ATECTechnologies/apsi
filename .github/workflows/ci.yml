@@ -15,6 +15,7 @@ jobs:
         os: [ubuntu-22.04, windows-2022]
         python: ["3.12", "3.14"]
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
     env:
       PYTHONUTF8: "1"
     steps:
@@ -39,7 +40,7 @@ jobs:
       - name: Language tests (reference interpreter)
         run: apsi test examples tests/apsi --allow-all --engine interp
       - name: Toolchain tests
-        run: python -m unittest discover tests -v
+        run: python tools/ci_tests.py 20
       - name: Formatting
         run: apsi fmt --check examples tests/apsi
       - name: Apsi Guard (malware scan of the repository)
