@@ -1293,14 +1293,16 @@ def _backend(backend):
 
 def fit(model, params, X, y=None, loss="mse", opt=None, epochs=10, batch_size=None, seed=0, verbose=True,
         clip=None, schedule=None, graph=None, mask=None, val=None, backend="numpy", device="auto",
-        precision="fp32", compile=False, workers=1):
+        precision="auto", compile=False, workers=1):
     """Train `model`. Returns record(params, history, val_history, device).
 
     loss: "mse", "cross_entropy", "mae", "bce", "vae" ("huber" on torch) or a function loss(prediction, target).
     graph / mask: node-level graph tasks — the whole graph is used every step and only nodes where
     mask is true count in the loss. val=(X_val, y_val) records a validation loss each epoch.
     backend="torch" trains with PyTorch on device ("auto", "cpu", "cuda", "cuda:1", "mps", "xpu") with
-    precision "fp64", "fp32", "tf32", "bf16" or "fp16" (mixed precision) and optional torch.compile.
+    precision "auto" (default: bf16 mixed precision on GPUs that have it, fp16 with loss scaling on older GPUs, fp32
+    on the CPU; APSI_PRECISION overrides it), "fp64", "fp32", "tf32", "bf16", "fp16" or {store, compute} for any
+    pair of torch dtypes, and optional torch.compile. The numpy backend trains in fp32 for "auto".
     workers=N (numpy backend, mini-batches): data-parallel training on N processes — every batch is split into N
     shards, the gradients of the shards are averaged (weighted by shard size, so the result is the gradient of the
     whole batch) and one optimizer step is taken. "auto" uses every core.
@@ -1323,7 +1325,7 @@ def fit(model, params, X, y=None, loss="mse", opt=None, epochs=10, batch_size=No
         return lf(out, yb)
     vg = value_and_grad(objective)
     Xr, Yr = X, target
-    low = str(precision).lower() in ("fp32", "float32", "f32", "tf32")
+    low = str(precision).lower() in ("auto", "fp32", "float32", "f32", "tf32", "bf16", "fp16")
     if low:                                   # half the memory of float64 for weights, data and activations
         def _f32(t):
             return tree_map(lambda a: a.astype(np.float32) if isinstance(a, np.ndarray) and a.dtype.kind == "f"
@@ -1474,7 +1476,7 @@ def _team_worker(pipe):
             pipe.send((False, f"{type(e).__name__}: {e}"))
 
 
-def predict(model, params, X, backend="numpy", device="auto", precision="fp32", **ctx):
+def predict(model, params, X, backend="numpy", device="auto", precision="auto", **ctx):
     if _backend(backend) == "torch":
         from . import torch_backend
         return torch_backend.predict(model, params, X, device=device, precision=precision, **ctx)

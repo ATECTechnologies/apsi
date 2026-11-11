@@ -6,7 +6,7 @@ export function mockSetup() {
     osName: "Windows 11 (build 22631)", osOk: true, cpu: "Intel(R) Core(TM) i7-12700H", cpuOk: true,
     threads: 20, ramGB: 32, gpus: [{ name: "NVIDIA GeForce RTX 3060 Laptop GPU", compute_capability: 8.6, meets_target: true }],
     gpuOk: true, admin: false, editors: [{ id: "vscode", name: "Visual Studio Code", kind: "extension", found: true }, { id: "cursor", name: "Cursor", kind: "extension", found: true }, { id: "sublime", name: "Sublime Text", kind: "package", found: false }],
-    existing: null, defaultDir: "C:\\Users\\you\\AppData\\Local\\Programs\\Apsi", diskFree: 412e9, requiredBytes: 98e6,
+    existing: null, installed: { root: null, versions: [] }, defaultDir: "C:\\Users\\you\\AppData\\Local\\Programs\\Apsi", diskFree: 412e9, requiredBytes: 98e6,
     doctor: { simd: ["AVX2", "FMA3", "AVX512F"] },
   };
   let progress = () => {};

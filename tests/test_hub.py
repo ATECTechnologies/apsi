@@ -74,6 +74,24 @@ class Tokenizers(unittest.TestCase):
         self.assertEqual(t.decode(e.ids), "hi ✓")
 
 
+class FastMerges(unittest.TestCase):
+    def test_heap_merges_equal_the_reference(self):
+        import random
+        rng = random.Random(3)
+        alpha = list("abcde") + ["\u0e01", "\u0e02", "\u0e04"]           # Latin and Thai letters
+        toks, merges = list(alpha), []
+        for _ in range(250):
+            a, b = rng.choice(toks), rng.choice(toks)
+            if (a, b) not in merges:
+                merges.append((a, b))
+                toks.append(a + b)
+        t = H.Tokenizer.__new__(H.Tokenizer)
+        t.ranks = {m: i for i, m in enumerate(merges)}
+        for _ in range(2000):
+            w = "".join(rng.choice(alpha) for _ in range(rng.randint(1, 80)))
+            self.assertEqual(t._merge(w), t._merge_short(w), w)
+
+
 class FakeHub(http.server.BaseHTTPRequestHandler):
     files = {}
     seen_auth = []

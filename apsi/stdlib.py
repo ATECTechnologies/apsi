@@ -650,13 +650,19 @@ def mse(pred, target):
 
 def cross_entropy(logits, labels):
     """Mean cross-entropy of integer labels; labels [B] with logits [B, C], or labels [B, T] with logits
-    [B, T, C] (sequence models: every position counts)."""
+    [B, T, C] (sequence models: every position counts). Positions labelled -100 (any negative label) are left
+    out, e.g. the prompt part of an instruction example."""
     labels = np.asarray(ops.raw(labels)).astype(int)
     if labels.ndim > 1:
         c = ops.shape(logits)[-1]
         logits = ops.reshape(logits, -1, c)
         labels = labels.reshape(-1)
     lp = ops.log_softmax(logits, axis=-1)
+    if (labels < 0).any():                       # -100 (any negative label): not trained on, as in PyTorch
+        keep = np.nonzero(labels >= 0)[0]
+        if not len(keep):
+            return ops.mean(lp[(np.arange(1), np.zeros(1, int))]) * 0.0
+        return -ops.mean(lp[(keep, labels[keep])])
     n = labels.shape[0]
     picked = lp[(np.arange(n), labels)]
     return -ops.mean(picked)

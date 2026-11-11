@@ -942,10 +942,12 @@ class Converter:
             if skip_first and i == 0:
                 continue
             out.append(self._param(a, d))
-        for a, d in zip(args.kwonlyargs, args.kw_defaults):
-            out.append(self._param(a, d))
         if args.vararg:
             out.append(f"*{self._safe(args.vararg.arg)}")
+        elif args.kwonlyargs:
+            out.append("*")
+        for a, d in zip(args.kwonlyargs, args.kw_defaults):       # keyword-only: after *args, as in Python
+            out.append(self._param(a, d))
         if args.kwarg:
             out.append(f"**{self._safe(args.kwarg.arg)}")
         return out
@@ -1648,6 +1650,103 @@ def convert_source(source, filename="<python>"):
     return _postprocess(out), sorted(c.warnings)
 
 
+# ----------------------------------------------------------------------------------- idiomatic safety gate
+import builtins as _builtins
+_EXC_BASES = {n for n, v in vars(_builtins).items() if isinstance(v, type) and issubclass(v, BaseException)}
+_ODD_DUNDERS = {"__enter__", "__exit__", "__aenter__", "__aexit__", "__init_subclass__", "__new__", "__getattr__",
+                "__getattribute__", "__setattr__", "__delattr__", "__get__", "__set__", "__set_name__",
+                "__class_getitem__", "__del__", "__bool__", "__iter__", "__next__", "__call__", "__format__",
+                "__missing__", "__index__", "__slots__"}
+_OK_DECORATORS = {"staticmethod", "property", "dataclass", "lru_cache", "cache", "functools.lru_cache",
+                  "functools.cache", "dataclasses.dataclass"}
+
+
+def _dotted(n):
+    if isinstance(n, ast.Call):
+        n = n.func
+    if isinstance(n, ast.Name):
+        return n.id
+    if isinstance(n, ast.Attribute):
+        d = _dotted(n.value)
+        return d + "." + n.attr if d else None
+    return None
+
+
+def idiomatic_blockers(tree):
+    """Places where --idiomatic (Apsi's own built-ins and structs) would not do exactly what Python does:
+    [(line, reason)]. A file with any is converted with Python's exact semantics instead."""
+    out = []
+
+    def add(node, why):
+        out.append((getattr(node, "lineno", 1), why))
+
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Match):
+            add(node, "a match statement")
+        elif isinstance(node, (ast.AsyncFunctionDef, ast.Await, ast.AsyncFor, ast.AsyncWith)):
+            add(node, "async code")
+        elif isinstance(node, ast.Constant) and isinstance(node.value, complex):
+            add(node, "complex numbers")
+        elif isinstance(node, ast.Call) and _dotted(node.func) == "complex":
+            add(node, "complex numbers")
+        elif isinstance(node, ast.Attribute) and node.attr.startswith("__") and node.attr.endswith("__"):
+            add(node, f"the attribute {node.attr}")
+        elif isinstance(node, ast.Raise) and node.cause is not None:
+            add(node, "raise ... from")
+        elif isinstance(node, ast.ClassDef):
+            bases = [_dotted(b) for b in node.bases]
+            if len(node.bases) > 1:
+                add(node, f"class {node.name} with several base classes")
+            if node.keywords:
+                add(node, f"class {node.name} with a metaclass or class keywords")
+            for b in bases:
+                if b in _EXC_BASES:
+                    add(node, f"class {node.name} that extends {b}")
+            for st in node.body:
+                name = getattr(st, "name", None) or (
+                    st.targets[0].id if isinstance(st, ast.Assign) and isinstance(st.targets[0], ast.Name) else None)
+                if name in _ODD_DUNDERS:
+                    add(st, f"{node.name}.{name}")
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            for d in node.decorator_list:
+                if _dotted(d) not in _OK_DECORATORS:
+                    add(d, f"the decorator @{_dotted(d) or '...'}")
+        if isinstance(node, (ast.FunctionDef, ast.Lambda)):
+            for dv in node.args.defaults + [d for d in node.args.kw_defaults if d is not None]:
+                if isinstance(dv, (ast.List, ast.Dict, ast.Set, ast.ListComp, ast.DictComp, ast.SetComp)):
+                    add(dv, "a list/dict/set default value (Python shares it between calls)")
+    # loop variables: read after the loop, or captured late by a function made inside the loop
+    scopes = [tree] + [n for n in ast.walk(tree) if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))]
+    for sc in scopes:
+        own = []
+        stack = list(ast.iter_child_nodes(sc))
+        while stack:
+            n = stack.pop()
+            if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.Lambda)):
+                continue
+            own.append(n)
+            stack.extend(ast.iter_child_nodes(n))
+        for f in own:
+            if not isinstance(f, (ast.For, ast.comprehension)):
+                continue
+            names = {t.id for t in ast.walk(f.target) if isinstance(t, ast.Name)}
+            if isinstance(f, ast.For):
+                for n in own:
+                    if isinstance(n, ast.Name) and isinstance(n.ctx, ast.Load) and n.id in names and \
+                            n.lineno > f.end_lineno:
+                        add(n, f"the loop variable '{n.id}' read after its loop")
+            # a function made inside the loop that reads the loop variable sees its last value in Python
+            host = [f] if isinstance(f, ast.For) else [p for p in own if isinstance(p, (ast.ListComp, ast.SetComp,
+                    ast.DictComp, ast.GeneratorExp)) and f in p.generators]
+            for h in host:
+                for fn in ast.walk(h):
+                    if isinstance(fn, (ast.Lambda, ast.FunctionDef)):
+                        params = {a.arg for a in fn.args.args + fn.args.kwonlyargs}
+                        if any(isinstance(x, ast.Name) and x.id in names - params for x in ast.walk(fn)):
+                            add(fn, "a function made in a loop that reads the loop variable later")
+    return sorted(set(out))
+
+
 # ----------------------------------------------------------------------------------- CLI
 def _check(text, path):
     from .parser import parse
@@ -1732,12 +1831,21 @@ def cmd_convert(args):
         try:
             with open(src, encoding="utf-8-sig") as fh:
                 code = fh.read()
-            if idiomatic:
+            exact_why = idiomatic_blockers(ast.parse(code, src)) if idiomatic else []
+            if idiomatic and not exact_why:
                 text, warns = convert_source(code, src)
                 deps = set()
-            else:
+                gaps = [w for w in warns if "not converted" in w[1] or w[1].startswith("not ")]
+                if gaps:                                   # never leave a line out: exact mode converts everything
+                    exact_why = gaps
+            if not idiomatic or exact_why:
                 from .pyconvert import convert_source as faithful
                 text, warns, deps = faithful(code, src)
+                if exact_why:
+                    first = ", ".join(f"line {ln}: {why}" for ln, why in exact_why[:3])
+                    more = f" and {len(exact_why) - 3} more" if len(exact_why) > 3 else ""
+                    warns = sorted(warns + [(exact_why[0][0], f"kept Python's exact semantics (use pycompat): "
+                                             f"--idiomatic cannot express {first}{more}")])
         except SyntaxError as e:
             print(f"✗ {src}:{e.lineno}: Python syntax error: {e.msg}", file=sys.stderr)
             status = 1

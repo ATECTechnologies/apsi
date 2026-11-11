@@ -349,6 +349,7 @@ class WholeNetworkOnGpu(unittest.TestCase):
                 cpu = H.Model(td, device="cpu")
                 gpu = H.Model(td, device="auto")
                 self.assertTrue(gpu.net.full, gpu.device_note)
+                gpu.net.kv_cache = "fp32"                            # exact comparison (fp16: test below)
                 gpu.net.CHUNK = 128                                  # several passes over the prompt
                 gpu.net.SCRATCH = 4 * gpu.net.nh * 96 * 300          # and passes that shrink as the context grows
                 rng = np.random.default_rng(5)
@@ -383,6 +384,54 @@ class WholeNetworkOnGpu(unittest.TestCase):
     def test_qwen3_norms(self):
         from apsi import hub_gpu
         self.compare("qwen3", hub_gpu.Emulator)
+
+    def test_yarn_long_context_scaling(self):
+        """YaRN rope scaling (Qwen2.5 at 128k tokens): the GPU path and the processor agree, and the frequencies
+        follow the paper (high ones kept, low ones divided by the factor)."""
+        from apsi import hub_gpu
+
+        def go():
+            with tempfile.TemporaryDirectory() as td:
+                tiny_llama(td, "qwen2", ctx=600, exact=True)
+                cfg_path = os.path.join(td, "config.json")
+                with open(cfg_path) as fh:
+                    cfg = json.load(fh)
+                cfg["rope_scaling"] = {"type": "yarn", "factor": 4.0, "original_max_position_embeddings": 150}
+                with open(cfg_path, "w") as fh:
+                    json.dump(cfg, fh)
+                cpu = H.Model(td, device="cpu")
+                gpu = H.Model(td)
+                gpu.net.kv_cache = "fp32"
+                base = 1.0 / 10000.0 ** (np.arange(0, 4, 2) / 4)
+                inv = cpu.net.inv_freq
+                self.assertAlmostEqual(inv[0], base[0])                      # the highest frequency is kept
+                self.assertAlmostEqual(inv[-1], base[-1] / 4.0)             # the lowest is interpolated
+                self.assertAlmostEqual(cpu.net.rope_scale, 0.1 * math.log(4.0) + 1.0)
+                ids = [3, 5, 7, 11, 2, 9] * 60
+                a = cpu.net.forward(np.array([ids]), cpu.net.new_cache(), 0)
+                b = gpu.net.forward(np.array([ids]), gpu.net.new_cache(), 0)
+                np.testing.assert_allclose(a, b, atol=2e-3)
+        _on(hub_gpu.Emulator(), go)
+
+    def test_float16_cache(self):
+        """The default cache keeps keys and values as float16: close to float32, and the same tokens here."""
+        from apsi import hub_gpu
+
+        def go():
+            with tempfile.TemporaryDirectory() as td:
+                tiny_llama(td, "qwen2", ctx=600, exact=True)
+                cpu = H.Model(td, device="cpu")
+                gpu = H.Model(td)
+                self.assertEqual(gpu.net.kv_cache, "fp16")
+                c = gpu.net.new_cache()
+                self.assertTrue(c.half)
+                ids = [3, 5, 7, 11, 2, 9] * 40
+                a = cpu.net.forward(np.array([ids]), cpu.net.new_cache(), 0)
+                b = gpu.net.forward(np.array([ids]), c, 0)
+                np.testing.assert_allclose(a, b, atol=0.03)
+                self.assertEqual(gpu.net.generate(ids[:12], max_new_tokens=8, eos=[]),
+                                 cpu.net.generate(ids[:12], max_new_tokens=8, eos=[]))
+        _on(hub_gpu.Emulator(), go)
 
     def test_sliding_window(self):
         from apsi import hub_gpu
@@ -425,7 +474,7 @@ class WholeNetworkOnGpu(unittest.TestCase):
                 # too small a card: "auto" splits by itself, "cuda" refuses
                 small = hub_gpu.Emulator()
                 per_layer = H.Model(td, device="cpu").net._layer_bytes(0)
-                kv = 2 * 4 * 2 * 4 * 600 * 2
+                kv = 2 * 2 * 2 * 4 * 600 * 2                         # float16 cache: 2 bytes per number
                 small.free_memory = lambda: per_layer * 1.5 + kv + (384 << 20) + 2 * 20 * 16
                 fit = _on(small, lambda: H.Model(td))
                 self.assertIn("1 of 2 layers", fit.device)
@@ -635,6 +684,39 @@ class WholeNetworkOnGpu(unittest.TestCase):
                 self.assertEqual(a_[4], b_[4])
                 if a_[4] <= 4096:
                     self.assertEqual(sorted(a_[2].tolist()), sorted(b_[2].tolist()))
+            # the float16 cache: keys and values stored at 2 bytes, read back to float32
+            for nh, kvh, dh, start in ((14, 2, 64, 300), (16, 2, 128, 1500)):
+                cap, rot, T = start + 40, dh, 3
+                n = kvh * cap * dh
+                Kg, Vg = g.alloc_kv(n, True), g.alloc_kv(n, True)
+                Ke, Ve = e.alloc_kv(n, True), e.alloc_kv(n, True)
+                for buf in (Kg, Vg):
+                    g.put(buf, np.zeros((n + 1) // 2, np.float32))
+                width = (nh + 2 * kvh) * dh
+                for step in range(2):                       # the second step reads what the first stored
+                    s0 = start + step * T
+                    qg, qe = pair(T * width)
+                    Qg, Qe = pair(T * nh * dh)
+                    cs = rng.standard_normal(cap * rot // 2).astype(np.float32)
+                    sn = rng.standard_normal(cap * rot // 2).astype(np.float32)
+                    g.qkv_prep(qg, Qg, Kg, Vg, g.vec(cs), g.vec(sn), None, None, T, nh, kvh, dh, rot, s0, cap, 1e-6,
+                               half=True)
+                    e.qkv_prep(qe, Qe, Ke, Ve, e.vec(cs), e.vec(sn), None, None, T, nh, kvh, dh, rot, s0, cap, 1e-6,
+                               half=True)
+                    Og, Oe = pair(T * nh * dh)
+                    Sg, Se = pair(nh * T * (s0 + T))
+                    g.attention(Qg, Kg, Vg, Og, Sg, T, nh, kvh, dh, s0, cap, 0, 0.125, None, half=True)
+                    e.attention(Qe, Ke, Ve, Oe, Se, T, nh, kvh, dh, s0, cap, 0, 0.125)
+                    same(Og, Oe, T * nh * dh, 2e-3, f"float16 cache attention nh={nh} dh={dh} step={step}")
+                # growing the cache copies float16 elements
+                K2 = g.alloc_kv(2 * n, True)
+                g.copy_kv(K2, 0, Kg, 0, n, True)
+                K2e = e.alloc_kv(2 * n, True)
+                e.copy_kv(K2e, 0, Ke, 0, n, True)
+                O2g, O2e = pair(T * nh * dh)
+                g.attention(Qg, K2, Vg, O2g, Sg, T, nh, kvh, dh, s0, cap, 0, 0.125, None, half=True)
+                e.attention(Qe, K2e, Ve, O2e, Se, T, nh, kvh, dh, s0, cap, 0, 0.125)
+                same(O2g, O2e, T * nh * dh, 2e-3, "float16 cache after a copy")
             for kind in (0, 1):
                 gug, gue = pair(5 * 2 * 300)
                 mg_, me_ = pair(5 * 300)

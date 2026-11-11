@@ -432,6 +432,7 @@ class Decoder:
             self.act = _act(cfg.get("hidden_activation") or cfg.get("hidden_act") or "silu")
             self._rope_init(cfg)
         self.window = cfg.get("sliding_window") if cfg.get("use_sliding_window", True) else None
+        self.kv_cache = os.environ.get("APSI_KV_CACHE", "fp16").lower()   # GPU cache: "fp16" or "fp32"
         self.gpu = None                 # hub_gpu.Runner while the matrices live on a GPU
         self._gm = {}                   # key -> (GPU matrix, split points): the per-product path
         self._gl = None                 # per-layer GPU weights: the whole-network path
@@ -589,7 +590,7 @@ class Decoder:
         W = self.W
         head_bytes = 2 * int(np.prod(self._wshape(None)))
         kv_tokens = min(self.ctx, 8192)
-        kv_bytes = 2 * 4 * self.kvh * self.dh * kv_tokens * self.L     # room for the cache to grow into
+        kv_bytes = 2 * (2 if self.kv_cache == "fp16" else 4) * self.kvh * self.dh * kv_tokens * self.L
         free = r.free_memory()
         budget = free - head_bytes - kv_bytes - (384 << 20)
         n = 0
@@ -694,15 +695,31 @@ class Decoder:
             inv = np.where((wave <= old / lo) & (wave >= old / hi), mid, scaled)
         elif kind == "linear":
             inv = inv / sc["factor"]
+        elif kind == "yarn":                          # long contexts (Qwen2.5 to 128k, DeepSeek, …)
+            factor = float(sc["factor"])
+            old = sc.get("original_max_position_embeddings") or cfg.get("max_position_embeddings", 4096) / factor
+            fast, slow = float(sc.get("beta_fast", 32)), float(sc.get("beta_slow", 1))
+
+            def corr(n_rot):
+                return rot * math.log(old / (n_rot * 2 * math.pi)) / (2 * math.log(base))
+            lo_, hi_ = max(math.floor(corr(fast)), 0), min(math.ceil(corr(slow)), rot - 1)
+            if lo_ == hi_:
+                hi_ += 0.001
+            ramp = np.clip((np.arange(rot // 2, dtype=np.float64) - lo_) / (hi_ - lo_), 0, 1)
+            keep = 1 - ramp                                 # 1: extrapolate (high frequencies), 0: interpolate
+            inv = inv / factor * (1 - keep) + inv * keep
+            att = sc.get("attention_factor")
+            self.rope_scale = float(att) if att else (0.1 * math.log(factor) + 1.0 if factor > 1 else 1.0)
         elif kind not in (None, "default"):
-            raise ModelError(f"rope scaling '{kind}' is not supported natively")
+            raise ModelError(f"rope scaling '{kind}' is not supported natively (supported: llama3, linear, yarn)")
         self.inv_freq = inv
         self.rot = rot
 
     def _rope(self, x, pos):
         f = np.outer(pos, self.inv_freq)                           # [T, rot/2]
         emb = np.concatenate([f, f], -1)
-        cos, sin = np.cos(emb).astype(np.float32), np.sin(emb).astype(np.float32)
+        m = getattr(self, "rope_scale", 1.0)
+        cos, sin = (np.cos(emb) * m).astype(np.float32), (np.sin(emb) * m).astype(np.float32)
         r, rest = x[..., :self.rot], x[..., self.rot:]
         half = self.rot // 2
         rh = np.concatenate([-r[..., half:], r[..., :half]], -1)
@@ -767,8 +784,9 @@ class Decoder:
                 GU, M = r.ws("gu", T * 2 * I), r.ws("m", T * I)
                 r.linear(Ld["qkv"], X, QKV, T, bias=Ld["qkv_b"], ln=Ld["ln1"], eps=eps, off=off)
                 r.qkv_prep(QKV, Q, cache.K[i], cache.V[i], COS, SIN, Ld["qn"], Ld["kn"], T, nh, kvh, dh, self.rot,
-                           s0, cache.cap, eps)
-                r.attention(Q, cache.K[i], cache.V[i], O, S, T, nh, kvh, dh, s0, cache.cap, self.window, scale)
+                           s0, cache.cap, eps, half=cache.half)
+                r.attention(Q, cache.K[i], cache.V[i], O, S, T, nh, kvh, dh, s0, cache.cap, self.window, scale,
+                            half=cache.half)
                 r.linear(Ld["o"], O, X, T, bias=Ld["o_b"], acc=True)
                 r.linear(Ld["gu"], X, GU, T, ln=Ld["ln2"], eps=eps, off=off)
                 r.act_mul(GU, M, T, I, kind)
@@ -1091,6 +1109,7 @@ class _GpuCache:
         self.cpu = [[None, None] for _ in range(dec.L)]       # layers that run on the processor
         self.cos = self.sin = None
         self.rope_n = 0
+        self.half = dec.kv_cache == "fp16"                    # float16 keys and values: half the memory
 
     def _rope(self, need):
         """cos / sin of every position up to the cache's capacity, on the card once (not per token)."""
@@ -1105,7 +1124,8 @@ class _GpuCache:
             if old is not None:
                 self.r.free(old)
             buf = self.r.alloc(n * half)
-            self.r.put(buf, (np.cos(f) if name == "cos" else np.sin(f)).astype(np.float32).reshape(-1))
+            m = getattr(d, "rope_scale", 1.0)
+            self.r.put(buf, ((np.cos(f) if name == "cos" else np.sin(f)) * m).astype(np.float32).reshape(-1))
             setattr(self, name, buf)
         self.rope_n = n
 
@@ -1120,11 +1140,11 @@ class _GpuCache:
         r, kvh, dh = self.r, d.kvh, d.dh
         K, V = [], []
         for i in range(d._ng):
-            k, v = r.alloc(kvh * new * dh), r.alloc(kvh * new * dh)
+            k, v = r.alloc_kv(kvh * new * dh, self.half), r.alloc_kv(kvh * new * dh, self.half)
             if self.cap:
                 for h in range(kvh):
-                    r.copy(k, h * new * dh, self.K[i], h * self.cap * dh, self.cap * dh)
-                    r.copy(v, h * new * dh, self.V[i], h * self.cap * dh, self.cap * dh)
+                    r.copy_kv(k, h * new * dh, self.K[i], h * self.cap * dh, self.cap * dh, self.half)
+                    r.copy_kv(v, h * new * dh, self.V[i], h * self.cap * dh, self.cap * dh, self.half)
                 r.free(self.K[i])
                 r.free(self.V[i])
             K.append(k)

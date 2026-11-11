@@ -2,6 +2,35 @@
 
 ## 2.4.4 — Python, exactly; real time; data, databases and the web
 
+### Long context, logs, training data, side-by-side installs
+- **Twice the context in the same GPU memory:** the key/value cache is float16 by default (`APSI_KV_CACHE=fp32` for
+  the old one), read four values at a time; long prompts split attention over more blocks of the card.
+- **Long-context models work past their training length:** YaRN rope scaling (Qwen2.5 `rope_scaling`, Llama 3.1
+  style) with the attention temperature, on the GPU and the processor alike.
+- **`use log` and `apsi log`:** logging to the terminal (coloured) and to `.log` files, text or JSON lines, rotation
+  by size or by day, named loggers with fields, `with log.timer("step"):`; `apsi log FILE --level warn --grep x -f`
+  reads, filters and follows them (also across rotations). See [`docs/LOG.md`](docs/LOG.md).
+- **Faster tokenizers:** BPE merges with a heap (long words were quadratic), Unigram results cached; the same tokens.
+- **Downloads that do not give up:** an interrupted download resumes by itself (up to 8 times); large files use
+  several connections only when that is faster on your network.
+- **Training text in any shape:** `data.text_dataset` reads txt/md/jsonl/json/csv/tsv/parquet and plain text,
+  chat (`messages`, ShareGPT), Alpaca, prompt/completion and question/answer records, or your own template; any
+  tokenizer (hub, `"bytes"`, `"chars"`, a function); packed windows; the prompt part labelled -100, which
+  `cross_entropy` now leaves out.
+- **Mixed precision chosen by itself:** `fit(..., backend="torch")` defaults to `precision="auto"` — bf16 on GPUs
+  that have it, fp16 with loss scaling on older ones, fp32 on the CPU; any name or `{store, compute}` pair to choose
+  yourself, `APSI_PRECISION` for every program.
+- **`apsi convert --idiomatic` never changes what a program does:** a file that uses something the idiomatic form
+  cannot express exactly (match, async, metaclasses, `__exit__`, exception subclasses, loop variables read after the
+  loop, late-binding closures, shared list defaults, complex numbers, a line it could not translate) is converted with
+  the exact form instead, and the converter says why. Keyword-only parameters after `*args` are kept in place.
+  24 test programs give the same output as Python.
+- **Several versions side by side:** 2.4.4, 2.5 … each install in its own folder (`<Apsi folder>/<version>`), none
+  removed or overwritten; `apsi` runs the newest (or the one chosen with `apsi use 2.4.4`), `apsi-2.4.4` always that
+  one, `apsi versions` lists them. Removing a version keeps the others; an install from before 2.4.4 is moved into
+  its own version folder. Both the Windows/Linux setup app and the Linux `.sh` installer do this.
+- Launchers start Python with `-P`, so a folder named `apsi` in the current directory can no longer replace Apsi.
+
 ### Language models on the GPU (`use hub`)
 - **Decoders run on an NVIDIA graphics card by themselves, with nothing to install but the display driver.** The
   whole network runs on the card (weights as bfloat16, key/value cache, norms, rotary embeddings, attention, MLP) in

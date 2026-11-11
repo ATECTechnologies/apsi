@@ -25,7 +25,7 @@ _ptx = None
 ROWS_PER_BLOCK = 8                      # matrix products: one warp per output row, 8 warps per block
 NT = 128                                # threads per block of the other kernels
 LOG2E = 1.4426950408889634
-KERNELS = ("apsi_kernel", "gemv2", "gemv8n", "gemv2n", "gemv16", "gemv16n", "gemm", "gemm32", "rms", "qkv_prep", "attention", "attn_merge",
+KERNELS = ("apsi_kernel", "gemv2", "gemv8n", "gemv2n", "gemv16", "gemv16n", "gemm", "gemm32", "rms", "qkv_prep", "attention", "attn_merge", "qkv_prep_h", "attention_h",
            "act_mul", "lg_prep", "lg_sum", "lg_pick", "embed")                           # apsi_kernel = gemv8 (the module's first entry)
 GEMM_ROWS = 8                           # from this many rows on, the tiled product
 NTA = 256                               # threads per attention block (8 warps)
@@ -367,180 +367,208 @@ def _generate_ptx():
     k.loop(k.tid, p["n"], C(NT), norm)
     k.ret()
 
-    # ---------------------------------------------------------------- q / k / v: norm (Qwen3), RoPE, cache
-    k = K("qkv_prep", [("QKV", G(f32)), ("Q", G(f32)), ("Kc", G(f32)), ("Vc", G(f32)), ("COS", G(f32)),
-                       ("SIN", G(f32)), ("QN", G(f32)), ("KN", G(f32)), ("has_n", i32), ("nh", i32), ("kvh", i32),
-                       ("dh", i32), ("rot", i32), ("start", i32), ("cap", i32), ("eps", f32)])
-    b, p = k.b, k.p
-    per = b.add(p["nh"], b.mul(p["kvh"], C(2)))
-    t = b.udiv(k.cta, per)
-    r = b.urem(k.cta, per)
-    dh = p["dh"]
-    src = b.add(b.mul(b.zext(t, i64), b.zext(b.mul(per, dh), i64)), b.zext(b.mul(r, dh), i64))
-    pos = b.add(p["start"], t)
-    is_v = b.icmp_unsigned(">=", r, b.add(p["nh"], p["kvh"]))
-    with b.if_else(is_v) as (then, other):
-        with then:
-            kh = b.sub(r, b.add(p["nh"], p["kvh"]))
-            dst = b.mul(b.add(b.mul(b.zext(kh, i64), b.zext(p["cap"], i64)), b.zext(pos, i64)), b.zext(dh, i64))
-            k.loop(k.tid, dh, C(NT), lambda d: k.st(k.ld(p["QKV"], b.add(src, b.zext(d, i64))), p["Vc"],
-                                                    b.add(dst, b.zext(d, i64))))
-        with other:
-            is_q = b.icmp_unsigned("<", r, p["nh"])
-            wn = b.select(is_q, p["QN"], p["KN"])
-            fac = k.var(F(1.0))
-            with b.if_then(b.icmp_unsigned("!=", p["has_n"], C(0))):
-                ss = k.var(F(0.0))
-
-                def sq2(d):
-                    x = k.ld(p["QKV"], b.add(src, b.zext(d, i64)))
-                    b.store(b.call(fma_f, [x, x, b.load(ss)]), ss)
-                k.loop(k.tid, dh, C(NT), sq2)
-                tot = k.block_reduce(b.load(ss), fadd(k), NT)
-                b.store(b.fdiv(F(1.0), b.call(sqrt_f, [b.fadd(b.fdiv(tot, b.uitofp(dh, f32)), p["eps"])])), fac)
-            facv = b.load(fac)
-            half = b.udiv(p["rot"], C(2))
-            has_n = b.icmp_unsigned("!=", p["has_n"], C(0))
-
-            def val(d):
-                x = b.fmul(k.ld(p["QKV"], b.add(src, b.zext(d, i64))), facv)
-                return b.select(has_n, b.fmul(x, k.ld(wn, b.select(has_n, d, C(0)))), x)
-
-            def one(d):
-                out = k.var(val(d))
-                with b.if_then(b.icmp_unsigned("<", d, p["rot"])):
-                    first = b.icmp_unsigned("<", d, half)
-                    j = b.select(first, d, b.sub(d, half))
-                    ci = b.add(b.mul(pos, half), j)          # tables indexed by absolute position
-                    c, s = k.ld(p["COS"], ci), k.ld(p["SIN"], ci)
-                    partner = val(b.select(first, b.add(d, half), b.sub(d, half)))
-                    me = val(d)
-                    b.store(b.select(first, b.fsub(b.fmul(me, c), b.fmul(partner, s)),
-                                     b.fadd(b.fmul(me, c), b.fmul(partner, s))), out)
-                v = b.load(out)
-                with b.if_else(is_q) as (qt, kt):
-                    with qt:
-                        qi = b.add(b.mul(b.zext(b.add(b.mul(t, p["nh"]), r), i64), b.zext(dh, i64)), b.zext(d, i64))
-                        k.st(v, p["Q"], qi)
-                    with kt:
-                        kh = b.sub(r, p["nh"])
-                        ki = b.add(b.mul(b.add(b.mul(b.zext(kh, i64), b.zext(p["cap"], i64)), b.zext(pos, i64)),
-                                         b.zext(dh, i64)), b.zext(d, i64))
-                        k.st(v, p["Kc"], ki)
-            k.loop(k.tid, dh, C(NT), one)
-    k.ret()
-
-    # ---------------------------------------------------------------- attention
-    # One block per (position, head, split of the keys). Scores: a thread per key (256 keys at once), the head
-    # dimension read 4 at a time. Weighted values: a warp per key, lanes across the dimension, 4 keys per step.
-    # With one split the block writes the output; with several it writes its partial result (max, sum, vector)
-    # and attn_merge combines them (long contexts: all SMs busy instead of one per head).
     part = ir.GlobalVariable(m, ir.ArrayType(f32, 8 * MAX_DH), "apsi_att", addrspace=3)
     part.linkage = "internal"
     part.initializer = ir.Constant(part.type.pointee, None)
-    v4p = lambda ptr, idx: b.load(b.bitcast(b.gep(ptr, [idx], inbounds=True), ir.VectorType(f32, 4).as_pointer(1)),
-                                  align=16)                                     # noqa: E731
-    k = K("attention", [("Q", G(f32)), ("Kc", G(f32)), ("Vc", G(f32)), ("O", G(f32)), ("S", G(f32)),
-                        ("PM", G(f32)), ("PL", G(f32)), ("PO", G(f32)), ("nh", i32), ("kvh", i32), ("dh", i32),
-                        ("start", i32), ("cap", i32), ("window", i32), ("scale", f32), ("total", i32),
-                        ("splits", i32)])
-    b, p = k.b, k.p
-    lane = b.and_(k.tid, C(31))
-    warp = b.lshr(k.tid, C(5))
-    nw = NTA // 32
-    sp = b.urem(k.cta, p["splits"])
-    th = b.udiv(k.cta, p["splits"])                # (position, head)
-    t = b.udiv(th, p["nh"])
-    h = b.urem(th, p["nh"])
-    kh = b.udiv(h, b.udiv(p["nh"], p["kvh"]))
-    dh = p["dh"]
-    qpos = b.add(p["start"], t)
-    n = b.add(qpos, C(1))
-    lo = k.var(C(0))
-    with b.if_then(b.icmp_unsigned("!=", p["window"], C(0))):
-        with b.if_then(b.icmp_unsigned(">=", qpos, p["window"])):
-            b.store(b.add(b.sub(qpos, p["window"]), C(1)), lo)
-    lov = b.load(lo)
-    span = b.sub(n, lov)
-    per = b.udiv(b.add(span, b.sub(p["splits"], C(1))), p["splits"])
-    j0 = b.add(lov, b.mul(sp, per))
-    j1v = k.var(b.add(j0, per))
-    with b.if_then(b.icmp_unsigned(">", b.load(j1v), n)):
-        b.store(n, j1v)
-    j1 = b.load(j1v)
-    srow = b.mul(b.zext(th, i64), b.zext(p["total"], i64))
-    qrow = b.mul(b.zext(th, i64), b.zext(dh, i64))
-    kbase = b.mul(b.zext(kh, i64), b.zext(p["cap"], i64))
-    d4 = b.lshr(dh, C(2))
-    mx = k.var(F(-3.0e38))
 
-    def score(j):
-        krow = b.mul(b.add(kbase, b.zext(j, i64)), b.zext(dh, i64))
-        acc = k.var(F(0.0))
+    def st_kv(k, val, ptr, idx):
+        """A key / value into the cache: float32, or float16 (half the memory and reads)."""
+        if ptr.type.pointee == ir.HalfType():
+            k.b.store(k.b.fptrunc(val, ir.HalfType()), k.b.gep(ptr, [k.b.zext(idx, i64) if idx.type == i32 else idx],
+                                                              inbounds=True), align=2)
+        else:
+            k.st(val, ptr, idx)
 
-        def dot4(c):
-            off = b.mul(b.zext(c, i64), ir.Constant(i64, 4))
-            qv = v4p(p["Q"], b.add(qrow, off))
-            kv = v4p(p["Kc"], b.add(krow, off))
-            a_ = b.load(acc)
+    def ld_kv(k, ptr, idx):
+        if ptr.type.pointee == ir.HalfType():
+            return k.b.fpext(k.ld(ptr, idx, align=2), f32)
+        return k.ld(ptr, idx)
+
+    def kv_kernels(suffix, f16):
+        kvt = ir.HalfType() if f16 else f32
+        # ---------------------------------------------------------------- q / k / v: norm (Qwen3), RoPE, cache
+        k = K("qkv_prep" + suffix, [("QKV", G(f32)), ("Q", G(f32)), ("Kc", G(kvt)), ("Vc", G(kvt)), ("COS", G(f32)),
+                           ("SIN", G(f32)), ("QN", G(f32)), ("KN", G(f32)), ("has_n", i32), ("nh", i32), ("kvh", i32),
+                           ("dh", i32), ("rot", i32), ("start", i32), ("cap", i32), ("eps", f32)])
+        b, p = k.b, k.p
+        per = b.add(p["nh"], b.mul(p["kvh"], C(2)))
+        t = b.udiv(k.cta, per)
+        r = b.urem(k.cta, per)
+        dh = p["dh"]
+        src = b.add(b.mul(b.zext(t, i64), b.zext(b.mul(per, dh), i64)), b.zext(b.mul(r, dh), i64))
+        pos = b.add(p["start"], t)
+        is_v = b.icmp_unsigned(">=", r, b.add(p["nh"], p["kvh"]))
+        with b.if_else(is_v) as (then, other):
+            with then:
+                kh = b.sub(r, b.add(p["nh"], p["kvh"]))
+                dst = b.mul(b.add(b.mul(b.zext(kh, i64), b.zext(p["cap"], i64)), b.zext(pos, i64)), b.zext(dh, i64))
+                k.loop(k.tid, dh, C(NT), lambda d: st_kv(k, k.ld(p["QKV"], b.add(src, b.zext(d, i64))), p["Vc"],
+                                                           b.add(dst, b.zext(d, i64))))
+            with other:
+                is_q = b.icmp_unsigned("<", r, p["nh"])
+                wn = b.select(is_q, p["QN"], p["KN"])
+                fac = k.var(F(1.0))
+                with b.if_then(b.icmp_unsigned("!=", p["has_n"], C(0))):
+                    ss = k.var(F(0.0))
+
+                    def sq2(d):
+                        x = k.ld(p["QKV"], b.add(src, b.zext(d, i64)))
+                        b.store(b.call(fma_f, [x, x, b.load(ss)]), ss)
+                    k.loop(k.tid, dh, C(NT), sq2)
+                    tot = k.block_reduce(b.load(ss), fadd(k), NT)
+                    b.store(b.fdiv(F(1.0), b.call(sqrt_f, [b.fadd(b.fdiv(tot, b.uitofp(dh, f32)), p["eps"])])), fac)
+                facv = b.load(fac)
+                half = b.udiv(p["rot"], C(2))
+                has_n = b.icmp_unsigned("!=", p["has_n"], C(0))
+
+                def val(d):
+                    x = b.fmul(k.ld(p["QKV"], b.add(src, b.zext(d, i64))), facv)
+                    return b.select(has_n, b.fmul(x, k.ld(wn, b.select(has_n, d, C(0)))), x)
+
+                def one(d):
+                    out = k.var(val(d))
+                    with b.if_then(b.icmp_unsigned("<", d, p["rot"])):
+                        first = b.icmp_unsigned("<", d, half)
+                        j = b.select(first, d, b.sub(d, half))
+                        ci = b.add(b.mul(pos, half), j)          # tables indexed by absolute position
+                        c, s = k.ld(p["COS"], ci), k.ld(p["SIN"], ci)
+                        partner = val(b.select(first, b.add(d, half), b.sub(d, half)))
+                        me = val(d)
+                        b.store(b.select(first, b.fsub(b.fmul(me, c), b.fmul(partner, s)),
+                                         b.fadd(b.fmul(me, c), b.fmul(partner, s))), out)
+                    v = b.load(out)
+                    with b.if_else(is_q) as (qt, kt):
+                        with qt:
+                            qi = b.add(b.mul(b.zext(b.add(b.mul(t, p["nh"]), r), i64), b.zext(dh, i64)), b.zext(d, i64))
+                            k.st(v, p["Q"], qi)
+                        with kt:
+                            kh = b.sub(r, p["nh"])
+                            ki = b.add(b.mul(b.add(b.mul(b.zext(kh, i64), b.zext(p["cap"], i64)), b.zext(pos, i64)),
+                                             b.zext(dh, i64)), b.zext(d, i64))
+                            st_kv(k, v, p["Kc"], ki)
+                k.loop(k.tid, dh, C(NT), one)
+        k.ret()
+
+        # ---------------------------------------------------------------- attention
+        # One block per (position, head, split of the keys). Scores: a thread per key (256 keys at once), the head
+        # dimension read 4 at a time. Weighted values: a warp per key, lanes across the dimension, 4 keys per step.
+        # With one split the block writes the output; with several it writes its partial result (max, sum, vector)
+        # and attn_merge combines them (long contexts: all SMs busy instead of one per head).
+        k = K("attention" + suffix, [("Q", G(f32)), ("Kc", G(kvt)), ("Vc", G(kvt)), ("O", G(f32)), ("S", G(f32)),
+                            ("PM", G(f32)), ("PL", G(f32)), ("PO", G(f32)), ("nh", i32), ("kvh", i32), ("dh", i32),
+                            ("start", i32), ("cap", i32), ("window", i32), ("scale", f32), ("total", i32),
+                            ("splits", i32)])
+        b, p = k.b, k.p
+        v4p = lambda ptr, idx: b.load(b.bitcast(b.gep(ptr, [idx], inbounds=True), ir.VectorType(f32, 4).as_pointer(1)),
+                                      align=16)                                     # noqa: E731
+
+        def v4k(ptr, idx):
+            if not f16:
+                return v4p(ptr, idx)
+            v = b.load(b.bitcast(b.gep(ptr, [idx], inbounds=True), ir.VectorType(kvt, 4).as_pointer(1)), align=8)
+            out = ir.Constant(ir.VectorType(f32, 4), None)
             for e_ in range(4):
-                a_ = b.call(fma_f, [b.extract_element(qv, C(e_)), b.extract_element(kv, C(e_)), a_])
-            b.store(a_, acc)
-        k.loop(C(0), d4, C(1), dot4)
-        s_ = b.fmul(b.load(acc), p["scale"])
-        k.st(s_, p["S"], b.add(srow, b.zext(j, i64)))
-        b.store(b.call(max_f, [b.load(mx), s_]), mx)
-    k.loop(b.add(j0, k.tid), j1, C(NTA), score)
-    M = k.block_reduce(b.load(mx), fmax(k), NTA)
-    sm = k.var(F(0.0))
+                out = b.insert_element(out, b.fpext(b.extract_element(v, C(e_)), f32), C(e_))
+            return out
+        lane = b.and_(k.tid, C(31))
+        warp = b.lshr(k.tid, C(5))
+        nw = NTA // 32
+        sp = b.urem(k.cta, p["splits"])
+        th = b.udiv(k.cta, p["splits"])                # (position, head)
+        t = b.udiv(th, p["nh"])
+        h = b.urem(th, p["nh"])
+        kh = b.udiv(h, b.udiv(p["nh"], p["kvh"]))
+        dh = p["dh"]
+        qpos = b.add(p["start"], t)
+        n = b.add(qpos, C(1))
+        lo = k.var(C(0))
+        with b.if_then(b.icmp_unsigned("!=", p["window"], C(0))):
+            with b.if_then(b.icmp_unsigned(">=", qpos, p["window"])):
+                b.store(b.add(b.sub(qpos, p["window"]), C(1)), lo)
+        lov = b.load(lo)
+        span = b.sub(n, lov)
+        per = b.udiv(b.add(span, b.sub(p["splits"], C(1))), p["splits"])
+        j0 = b.add(lov, b.mul(sp, per))
+        j1v = k.var(b.add(j0, per))
+        with b.if_then(b.icmp_unsigned(">", b.load(j1v), n)):
+            b.store(n, j1v)
+        j1 = b.load(j1v)
+        srow = b.mul(b.zext(th, i64), b.zext(p["total"], i64))
+        qrow = b.mul(b.zext(th, i64), b.zext(dh, i64))
+        kbase = b.mul(b.zext(kh, i64), b.zext(p["cap"], i64))
+        d4 = b.lshr(dh, C(2))
+        mx = k.var(F(-3.0e38))
 
-    def expo(j):
-        i = b.add(srow, b.zext(j, i64))
-        e_ = exp(k, b.fsub(k.ld(p["S"], i), M))
-        k.st(e_, p["S"], i)
-        b.store(b.fadd(b.load(sm), e_), sm)
-    k.loop(b.add(j0, k.tid), j1, C(NTA), expo)
-    Z = k.block_reduce(b.load(sm), fadd(k), NTA)
-    chunks = MAX_DH // 32
-    accs = [k.var(F(0.0)) for _ in range(chunks)]
-    # 4 keys per step for the warp (independent loads in flight), then the remainder one by one
-    j4 = b.add(j0, b.mul(b.udiv(b.sub(j1, b.select(b.icmp_unsigned(">", j1, j0), j0, j1)), C(4)), C(4)))
+        def score(j):
+            krow = b.mul(b.add(kbase, b.zext(j, i64)), b.zext(dh, i64))
+            acc = k.var(F(0.0))
 
-    def weigh_n(jb, count):
-        ws_ = [k.ld(p["S"], b.add(srow, b.zext(b.add(jb, C(q)), i64))) for q in range(count)]
-        rows = [b.mul(b.add(kbase, b.zext(b.add(jb, C(q)), i64)), b.zext(dh, i64)) for q in range(count)]
+            def dot4(c):
+                off = b.mul(b.zext(c, i64), ir.Constant(i64, 4))
+                qv = v4p(p["Q"], b.add(qrow, off))
+                kv = v4k(p["Kc"], b.add(krow, off))
+                a_ = b.load(acc)
+                for e_ in range(4):
+                    a_ = b.call(fma_f, [b.extract_element(qv, C(e_)), b.extract_element(kv, C(e_)), a_])
+                b.store(a_, acc)
+            k.loop(C(0), d4, C(1), dot4)
+            s_ = b.fmul(b.load(acc), p["scale"])
+            k.st(s_, p["S"], b.add(srow, b.zext(j, i64)))
+            b.store(b.call(max_f, [b.load(mx), s_]), mx)
+        k.loop(b.add(j0, k.tid), j1, C(NTA), score)
+        M = k.block_reduce(b.load(mx), fmax(k), NTA)
+        sm = k.var(F(0.0))
+
+        def expo(j):
+            i = b.add(srow, b.zext(j, i64))
+            e_ = exp(k, b.fsub(k.ld(p["S"], i), M))
+            k.st(e_, p["S"], i)
+            b.store(b.fadd(b.load(sm), e_), sm)
+        k.loop(b.add(j0, k.tid), j1, C(NTA), expo)
+        Z = k.block_reduce(b.load(sm), fadd(k), NTA)
+        chunks = MAX_DH // 32
+        accs = [k.var(F(0.0)) for _ in range(chunks)]
+        # 4 keys per step for the warp (independent loads in flight), then the remainder one by one
+        j4 = b.add(j0, b.mul(b.udiv(b.sub(j1, b.select(b.icmp_unsigned(">", j1, j0), j0, j1)), C(4)), C(4)))
+
+        def weigh_n(jb, count):
+            ws_ = [k.ld(p["S"], b.add(srow, b.zext(b.add(jb, C(q)), i64))) for q in range(count)]
+            rows = [b.mul(b.add(kbase, b.zext(b.add(jb, C(q)), i64)), b.zext(dh, i64)) for q in range(count)]
+            for c in range(chunks):
+                d = b.add(lane, C(32 * c))
+                with b.if_then(b.icmp_unsigned("<", d, dh)):
+                    vals = [ld_kv(k, p["Vc"], b.add(r_, b.zext(d, i64))) for r_ in rows]
+                    a_ = b.load(accs[c])
+                    for w_, v_ in zip(ws_, vals):
+                        a_ = b.call(fma_f, [w_, v_, a_])
+                    b.store(a_, accs[c])
+        k.loop(b.add(j0, b.mul(warp, C(4))), j4, C(4 * nw), lambda jb: weigh_n(jb, 4))
+        k.loop(b.add(j4, warp), j1, C(nw), lambda jb: weigh_n(jb, 1))
         for c in range(chunks):
             d = b.add(lane, C(32 * c))
             with b.if_then(b.icmp_unsigned("<", d, dh)):
-                vals = [k.ld(p["Vc"], b.add(r_, b.zext(d, i64))) for r_ in rows]
-                a_ = b.load(accs[c])
-                for w_, v_ in zip(ws_, vals):
-                    a_ = b.call(fma_f, [w_, v_, a_])
-                b.store(a_, accs[c])
-    k.loop(b.add(j0, b.mul(warp, C(4))), j4, C(4 * nw), lambda jb: weigh_n(jb, 4))
-    k.loop(b.add(j4, warp), j1, C(nw), lambda jb: weigh_n(jb, 1))
-    for c in range(chunks):
-        d = b.add(lane, C(32 * c))
-        with b.if_then(b.icmp_unsigned("<", d, dh)):
-            b.store(b.load(accs[c]), b.gep(part, [C(0), b.add(b.mul(warp, C(MAX_DH)), d)], inbounds=True))
-    b.call(bar_f, [])
-    single = b.icmp_unsigned("==", p["splits"], C(1))
-    pidx = b.add(b.mul(th, p["splits"]), sp)
+                b.store(b.load(accs[c]), b.gep(part, [C(0), b.add(b.mul(warp, C(MAX_DH)), d)], inbounds=True))
+        b.call(bar_f, [])
+        single = b.icmp_unsigned("==", p["splits"], C(1))
+        pidx = b.add(b.mul(th, p["splits"]), sp)
 
-    def outd(d):
-        tot = F(0.0)
-        for w_ in range(nw):
-            tot = b.fadd(tot, b.load(b.gep(part, [C(0), b.add(C(w_ * MAX_DH), d)], inbounds=True)))
-        with b.if_else(single) as (one, many):
-            with one:
-                k.st(b.fdiv(tot, Z), p["O"], b.add(qrow, b.zext(d, i64)))
-            with many:
-                k.st(tot, p["PO"], b.add(b.mul(b.zext(pidx, i64), b.zext(dh, i64)), b.zext(d, i64)))
-    k.loop(k.tid, dh, C(NTA), outd)
-    with b.if_then(b.and_(b.icmp_unsigned("==", k.tid, C(0)), b.not_(single))):
-        k.st(M, p["PM"], pidx)
-        k.st(Z, p["PL"], pidx)
-    k.ret()
+        def outd(d):
+            tot = F(0.0)
+            for w_ in range(nw):
+                tot = b.fadd(tot, b.load(b.gep(part, [C(0), b.add(C(w_ * MAX_DH), d)], inbounds=True)))
+            with b.if_else(single) as (one, many):
+                with one:
+                    k.st(b.fdiv(tot, Z), p["O"], b.add(qrow, b.zext(d, i64)))
+                with many:
+                    k.st(tot, p["PO"], b.add(b.mul(b.zext(pidx, i64), b.zext(dh, i64)), b.zext(d, i64)))
+        k.loop(k.tid, dh, C(NTA), outd)
+        with b.if_then(b.and_(b.icmp_unsigned("==", k.tid, C(0)), b.not_(single))):
+            k.st(M, p["PM"], pidx)
+            k.st(Z, p["PL"], pidx)
+        k.ret()
+
+    kv_kernels("", False)
+    kv_kernels("_h", True)
 
     # combine the splits: o = sum_s exp(m_s - M) o_s / sum_s exp(m_s - M) l_s
     k = K("attn_merge", [("O", G(f32)), ("PM", G(f32)), ("PL", G(f32)), ("PO", G(f32)), ("dh", i32),
@@ -888,22 +916,35 @@ class Runner(_Base):
         self._go("rms", rows, NT, ("p", X.ptr + 4 * xoff), ("p", Y.ptr + 4 * yoff), ("p", W.ptr), ("u", n),
                  ("f", eps), ("f", off))
 
-    def qkv_prep(self, QKV, Q, Kc, Vc, COS, SIN, QN, KN, T, nh, kvh, dh, rot, start, cap, eps):
+    def alloc_kv(self, n, half):
+        """A key / value cache buffer of n elements: float16 (half) or float32."""
+        return self.alloc((n + 1) // 2 if half else n)
+
+    def copy_kv(self, dst, doff, src, soff, n, half):
+        if not half:
+            return self.copy(dst, doff, src, soff, n)
+        if n:                                           # element offsets of 2 bytes
+            self.dev.activate()
+            self.dev.drv.check(self.dev.drv.lib.cuMemcpyDtoD_v2(ctypes.c_uint64(dst.ptr + 2 * doff),
+                                                                 ctypes.c_uint64(src.ptr + 2 * soff),
+                                                                 ctypes.c_size_t(2 * n)), "cuMemcpyDtoD")
+
+    def qkv_prep(self, QKV, Q, Kc, Vc, COS, SIN, QN, KN, T, nh, kvh, dh, rot, start, cap, eps, half=False):
         dummy = self.ws("dummy", 64)                    # read (and unused) when there is no q/k norm
-        self._go("qkv_prep", T * (nh + 2 * kvh), NT,
+        self._go("qkv_prep_h" if half else "qkv_prep", T * (nh + 2 * kvh), NT,
                  ("p", QKV.ptr), ("p", Q.ptr), ("p", Kc.ptr), ("p", Vc.ptr), ("p", COS.ptr), ("p", SIN.ptr),
                  ("p", (QN or dummy).ptr), ("p", (KN or dummy).ptr), ("u", 1 if QN else 0), ("u", nh), ("u", kvh),
                  ("u", dh), ("u", rot), ("u", start), ("u", cap), ("f", eps))
 
-    def attention(self, Q, Kc, Vc, O, S, T, nh, kvh, dh, start, cap, window, scale, splits=None):
+    def attention(self, Q, Kc, Vc, O, S, T, nh, kvh, dh, start, cap, window, scale, splits=None, half=False):
         if splits is None:                          # long context, few blocks: split the keys over more SMs
             span = min(start + T, window) if window else start + T
             room = max(1, (4 * self.dev.sms) // max(1, T * nh))
-            splits = max(1, min((span + 63) // 64, room, 64))
+            splits = max(1, min(span // 256, room, 64))     # a split is worth its merge from 256 keys on
         blocks = T * nh
         PM, PL = self.ws("att_m", blocks * splits), self.ws("att_l", blocks * splits)
         PO = self.ws("att_o", blocks * splits * dh)
-        self._go("attention", blocks * splits, NTA,
+        self._go("attention_h" if half else "attention", blocks * splits, NTA,
                  ("p", Q.ptr), ("p", Kc.ptr), ("p", Vc.ptr), ("p", O.ptr), ("p", S.ptr), ("p", PM.ptr), ("p", PL.ptr),
                  ("p", PO.ptr), ("u", nh), ("u", kvh), ("u", dh), ("u", start), ("u", cap), ("u", window or 0),
                  ("f", scale), ("u", start + T), ("u", splits))
@@ -1009,7 +1050,14 @@ class Emulator(_Base):
         y = x / np.sqrt((x * x).mean(-1, keepdims=True) + eps) * (W.a[:n] + off)
         Y.a[yoff:yoff + rows * n] = y.reshape(-1)
 
-    def qkv_prep(self, QKV, Q, Kc, Vc, COS, SIN, QN, KN, T, nh, kvh, dh, rot, start, cap, eps):
+    def alloc_kv(self, n, half):
+        return self.alloc(n)
+
+    def copy_kv(self, dst, doff, src, soff, n, half):
+        self.copy(dst, doff, src, soff, n)
+
+    def qkv_prep(self, QKV, Q, Kc, Vc, COS, SIN, QN, KN, T, nh, kvh, dh, rot, start, cap, eps, half=False):
+        kv_half = half
         per = nh + 2 * kvh
         x = QKV.a[:T * per * dh].reshape(T, per, dh)
         half = rot // 2
@@ -1027,10 +1075,12 @@ class Emulator(_Base):
         Q.a[:T * nh * dh] = q.reshape(-1)
         kc = Kc.a[:kvh * cap * dh].reshape(kvh, cap, dh)
         vc = Vc.a[:kvh * cap * dh].reshape(kvh, cap, dh)
+        if kv_half:                                     # what a float16 cache keeps
+            k, v = k.astype(np.float16).astype(np.float32), v.astype(np.float16).astype(np.float32)
         kc[:, start:start + T] = k.transpose(1, 0, 2)
         vc[:, start:start + T] = v.transpose(1, 0, 2)
 
-    def attention(self, Q, Kc, Vc, O, S, T, nh, kvh, dh, start, cap, window, scale, splits=None):
+    def attention(self, Q, Kc, Vc, O, S, T, nh, kvh, dh, start, cap, window, scale, splits=None, half=False):
         q = Q.a[:T * nh * dh].reshape(T, nh, dh)
         kc = Kc.a[:kvh * cap * dh].reshape(kvh, cap, dh)
         vc = Vc.a[:kvh * cap * dh].reshape(kvh, cap, dh)

@@ -66,10 +66,37 @@ precision and `torch.compile`; the result is a normal Apsi parameter tree again 
 
 ```apsi
 let r = fit(model, params, X, y, loss="cross_entropy", epochs=20, batch_size=256,
-            backend="torch", device="cuda", precision="bf16", compile=true)     # run with --allow-python
+            backend="torch", device="cuda", compile=true)     # run with --allow-python
+# precision="auto" (default): bf16 on cards that have it, fp16 on older ones, fp32 on the CPU; "fp32", "fp16",
+# {"store": "float32", "compute": "bfloat16"} … to choose yourself
 let m = torch_module(model, r.params)        # a real torch.nn.Module: state_dict, DDP, ONNX export
 check_torch()                                # every layer compared with NumPy (outputs and gradients)
 ```
+
+**Training text in any shape** — `data.text_dataset` reads `.txt .md .jsonl .json .csv .tsv .parquet` (a path,
+a glob, a folder or a list) or records you already have, turns each record into text by its shape, tokenizes it with
+any tokenizer and packs the tokens into training windows `(x, y)` (y is x moved by one):
+
+```apsi
+use data
+let tok = hub.tokenizer("Qwen/Qwen2.5-0.5B-Instruct")         # or "bytes", "chars", a function, lm.tokenizer
+let ds = data.text_dataset("corpus/*.jsonl", tokenizer=tok, seq_len=1024) |> shuffle(256) |> batch(8)
+let qa = data.text_dataset("faq.csv", template="Q: {question}\nA: {answer}")   # your own layout
+```
+
+| record | read as |
+|---|---|
+| text, or `text` / `content` / `body` | the text |
+| `messages` / `conversations` (`role`+`content` or ShareGPT `from`+`value`) | a conversation in the tokenizer's own chat format (ChatML, Llama 3, Gemma, Mistral) |
+| `instruction` + `input` + `output` (Alpaca) | prompt and answer |
+| `prompt` + `completion` / `response`, `question` + `answer` | prompt and answer |
+| anything else | `template="…{field}…"`, `template=fn(record)` (text, or `[prompt, answer]`) or `field="name"` |
+
+The prompt part of a conversation or an instruction is labelled -100 and `cross_entropy` leaves it out, so the model
+learns the answers (`train_on_prompt=true` trains on everything). `pack=true` (default) joins records end to end, so
+no window is padding; `pack=false` gives one window per record. `eos=` the id put after each record (found from the
+tokenizer by itself; `eos=false` for none), `stride=` overlapping windows, `text_split="line"`/`"paragraph"` for
+text files with one example per line or paragraph. `data.detect_format(record)` shows how a record will be read.
 
 ## 2. Design your own, function by function
 

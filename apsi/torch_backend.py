@@ -13,6 +13,8 @@ so `check_torch()` can compare both backends layer by layer on your machine.
 """
 import math
 
+import os
+
 import numpy as np
 
 from . import ops
@@ -105,11 +107,42 @@ _PRECISION = {"fp64": ("float64", None), "float64": ("float64", None), "f64": ("
               "fp16": ("float32", "float16"), "float16": ("float32", "float16"), "f16": ("float32", "float16")}
 
 
-def _precision(name, dev):
+def auto_precision(dev):
+    """The fastest precision that trains reliably on `dev`: bf16 mixed precision where the GPU has bf16 (NVIDIA
+    Ampere and newer, AMD MI200+, Intel XPU), fp16 with loss scaling on older CUDA GPUs and Apple MPS, fp32 on the
+    CPU. APSI_PRECISION overrides it for every program."""
     torch = _import()
-    key = str(name or "fp32").lower()
+    env = os.environ.get("APSI_PRECISION", "").strip().lower()
+    if env and env != "auto":
+        return env
+    if dev.type == "cuda":
+        try:
+            return "bf16" if torch.cuda.is_bf16_supported() else "fp16"
+        except Exception:
+            return "fp16"
+    if dev.type == "xpu":
+        return "bf16"
+    if dev.type == "mps":
+        return "fp16"
+    return "fp32"
+
+
+def _precision(name, dev):
+    """(storage dtype, autocast dtype or None). `name` is "auto" (default), a name such as "bf16", or a record /
+    dict {store: "float32", compute: "bfloat16"} for any pair torch has."""
+    torch = _import()
+    if isinstance(name, dict) or hasattr(name, "fields") or hasattr(name, "store"):
+        get = (lambda k: name.get(k)) if isinstance(name, dict) else (lambda k: getattr(name, k, None))
+        store, amp = get("store") or "float32", get("compute")
+        for t in (store, amp):
+            if t is not None and not isinstance(getattr(torch, str(t), None), torch.dtype):
+                raise RuntimeErr(f"precision: '{t}' is not a torch dtype (e.g. float32, bfloat16, float16)")
+        return getattr(torch, str(store)), (getattr(torch, str(amp)) if amp and amp != store else None)
+    key = str(name or "auto").lower()
+    if key == "auto":
+        key = auto_precision(dev)
     if key not in _PRECISION:
-        raise RuntimeErr(f"precision must be one of fp64, fp32, tf32, bf16, fp16 (got '{name}')")
+        raise RuntimeErr(f"precision must be auto, fp64, fp32, tf32, bf16, fp16 or {{store, compute}} (got '{name}')")
     store, amp = _PRECISION[key]
     if store == "float64" and dev.type == "mps":
         raise RuntimeErr("precision=\"fp64\" is not supported on Apple MPS; use fp32")
@@ -669,7 +702,7 @@ def _optimizer(opt, tensors):
 
 
 def fit(model, params, X, y=None, loss="mse", opt=None, epochs=10, batch_size=None, seed=0, verbose=True,
-        clip=None, schedule=None, graph=None, mask=None, val=None, device="auto", precision="fp32",
+        clip=None, schedule=None, graph=None, mask=None, val=None, device="auto", precision="auto",
         compile=False):
     ensure()
     torch = _import()
@@ -778,7 +811,7 @@ def _float(out):
     return out.float() if out.dtype in (torch.float16, torch.bfloat16) else out
 
 
-def predict(model, params, X, device="auto", precision="fp32", **ctx):
+def predict(model, params, X, device="auto", precision="auto", **ctx):
     ensure()
     torch = _import()
     dev = pick_device(device)

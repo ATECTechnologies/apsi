@@ -102,7 +102,7 @@ export default function App() {
     if (!opts) return undefined;
     const t = setTimeout(async () => {
       const v = setup().validateDir ? await setup().validateDir(opts.dir) : { ok: true, problems: [], warnings: [] };
-      const upgrading = sys && sys.existing && sys.existing.dir === opts.dir;
+      const upgrading = sys && sys.existing && (sys.existing.root || sys.existing.dir) === opts.dir;
       setDirCheck(upgrading ? { ok: true, problems: [], warnings: v.warnings || [] } : v);
     }, 250);
     return () => clearTimeout(t);
@@ -170,12 +170,14 @@ export default function App() {
       return (
         <div className="page">
           <h1>Apsi {sys.existing.version} is already installed</h1>
-          <p className="lead">Installed in <code>{sys.existing.dir}</code>. Choose what Setup should do.</p>
+          <p className="lead">Installed in <code>{sys.existing.dir}</code>. Choose what Setup should do.
+            {sys.existing.others && sys.existing.others.length > 0 &&
+              <> Other versions ({sys.existing.others.join(", ")}) are not changed.</>}</p>
           <div className="cards">
             {[
               ["modify", "Modify or upgrade", `Change components and settings, and update to ${sys.version}.`],
               ["repair", "Repair", "Reinstall the runtime with your current settings and verify it."],
-              ["uninstall", "Uninstall", "Remove Apsi and everything Setup created."],
+              ["uninstall", "Uninstall", `Remove Apsi ${sys.existing.version} (other installed versions stay).`],
             ].map(([id, t, d]) => (
               <button key={id} className="card" onClick={() => { setMaintenance(id); setStep(id === "modify" ? "system" : "review"); }}>
                 <div className="card-title">{t}</div><div className="card-text">{d}</div>
@@ -197,6 +199,9 @@ export default function App() {
           <li>Self-contained: Python 3.12 and numpy are bundled and private to Apsi. No administrator rights needed.</li>
           <li>Every installer file is checked against its SHA-256 list before anything is copied.</li>
           <li>No telemetry. The uninstaller removes exactly what Setup lists on the Review page.</li>
+          <li>Versions install side by side: <code>apsi</code> runs the newest, <code>apsi-{sys ? sys.version : "X.Y.Z"}</code> this
+            one, and <code>apsi use VERSION</code> switches.{sys && sys.installed && sys.installed.versions.length > 0 &&
+              <> Installed now: {sys.installed.versions.join(", ")} (kept).</>}</li>
         </ul>
         {sys && (
           <>
@@ -247,7 +252,7 @@ export default function App() {
     return (
       <div className="page">
         <h1>Installation folder</h1>
-        <p className="lead">Apsi will be installed into this folder.</p>
+        <p className="lead">The Apsi folder: this version goes into its own <code>{sys ? sys.version : ""}</code> folder inside it, next to any other versions.</p>
         <div className="path-row">
           <input className="path" value={opts.dir} spellCheck={false} onChange={(e) => set("dir", e.target.value)} />
           <button className="btn secondary" onClick={async () => { const d = await setup().pickDir(opts.dir); if (d) set("dir", d); }}>Browse…</button>

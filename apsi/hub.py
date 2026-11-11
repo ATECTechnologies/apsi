@@ -1135,6 +1135,60 @@ class Tokenizer:
         hit = self.cache.get(word)
         if hit is not None:
             return hit
+        parts = self._merge(word) if len(word) > 12 else self._merge_short(word)
+        out = []
+        for p in parts:
+            if p in self.vocab:
+                out.append(p)
+            elif self.byte_fallback:
+                out += [f"<0x{b:02X}>" for b in p.encode("utf-8")]
+            elif self.unk:
+                out.append(self.unk)
+        if len(self.cache) > 200_000:                  # bounded: long documents do not grow it forever
+            self.cache.clear()
+        self.cache[word] = out
+        return out
+
+    def _merge(self, word):
+        """BPE merges with a heap: the lowest-ranked pair first, equal ranks left to right (the order of the
+        reference implementation), in O(n log n) instead of O(n^2) for long words (text without spaces: Thai,
+        Chinese, Japanese, code)."""
+        import heapq
+        ranks = self.ranks
+        sym = list(word)
+        n = len(sym)
+        nxt = list(range(1, n + 1))
+        prv = list(range(-1, n - 1))
+        alive = [True] * n
+        heap = []
+        for i in range(n - 1):
+            r = ranks.get((sym[i], sym[i + 1]))
+            if r is not None:
+                heap.append((r, i, sym[i], sym[i + 1]))
+        heapq.heapify(heap)
+        while heap:
+            r, i, a, b = heapq.heappop(heap)
+            j = nxt[i] if i < n else n
+            if not alive[i] or j >= n or sym[i] != a or sym[j] != b:
+                continue                                # stale: one side was merged already
+            sym[i] = a + b
+            alive[j] = False
+            nxt[i] = nxt[j]
+            if nxt[i] < n:
+                prv[nxt[i]] = i
+            p = prv[i]
+            if p >= 0:
+                rr = ranks.get((sym[p], sym[i]))
+                if rr is not None:
+                    heapq.heappush(heap, (rr, p, sym[p], sym[i]))
+            q = nxt[i]
+            if q < n:
+                rr = ranks.get((sym[i], sym[q]))
+                if rr is not None:
+                    heapq.heappush(heap, (rr, i, sym[i], sym[q]))
+        return [sym[i] for i in range(n) if alive[i]]
+
+    def _merge_short(self, word):
         parts = list(word)
         while len(parts) > 1:
             best, bi = None, -1
@@ -1154,18 +1208,19 @@ class Tokenizer:
                     merged.append(parts[i])
                     i += 1
             parts = merged
-        out = []
-        for p in parts:
-            if p in self.vocab:
-                out.append(p)
-            elif self.byte_fallback:
-                out += [f"<0x{b:02X}>" for b in p.encode("utf-8")]
-            elif self.unk:
-                out.append(self.unk)
-        self.cache[word] = out
-        return out
+        return parts
 
     def _unigram(self, word):
+        cache = self.__dict__.setdefault("cache", {})
+        hit = cache.get(word)
+        if hit is None:
+            hit = self._viterbi(word)
+            if len(cache) > 200_000:
+                cache.clear()
+            cache[word] = hit
+        return hit
+
+    def _viterbi(self, word):
         """SentencePiece's Viterbi: the segmentation with the highest total log-probability; characters no piece
         covers become <unk> (consecutive ones merged), or bytes with byte fallback."""
         n = len(word)

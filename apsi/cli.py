@@ -566,6 +566,100 @@ def cmd_config(args):
     return 0
 
 
+def _installed_versions(root):
+    """Versions installed side by side in root (each in its own folder), oldest first."""
+    import re
+    out = []
+    try:
+        names = os.listdir(root)
+    except OSError:
+        return out
+    for n in names:
+        d = os.path.join(root, n)
+        if re.fullmatch(r"\d+\.\d+(\.\d+)?([.-]?\w+)?", n) and (
+                os.path.exists(os.path.join(d, "bin-apsi")) or os.path.exists(os.path.join(d, "bin", "apsi.cmd"))
+                or os.path.exists(os.path.join(d, "bin", "apsi"))):
+            out.append(n)
+
+    def key(v):
+        return [int(x) if x.isdigit() else x for x in re.split(r"[.-]", v)]
+    return sorted(out, key=key)
+
+
+def cmd_versions(args):
+    """The Apsi versions installed side by side, and which one `apsi` runs."""
+    from . import __version__
+    root = os.environ.get("APSI_INSTALL_ROOT")
+    if not root:
+        print(f"Apsi {__version__} (not installed by an Apsi installer: no other versions to list)")
+        return 0
+    try:
+        with open(os.path.join(root, "current.txt"), encoding="utf-8") as fh:
+            cur = fh.read().strip()
+    except OSError:
+        cur = ""
+    vs = _installed_versions(root)
+    cur = cur if cur in vs else (vs[-1] if vs else "")
+    for v in vs:
+        mark = "*" if v == cur else " "
+        print(f"{mark} {v}" + ("   (apsi)" if v == cur else f"   (apsi-{v})"))
+    print(f"\nin {root}   ·   switch with: apsi use VERSION")
+    return 0
+
+
+def cmd_use(args):
+    """Make `apsi` run another installed version (each stays available as apsi-VERSION)."""
+    root = os.environ.get("APSI_INSTALL_ROOT")
+    if not root:
+        print("apsi use: this Apsi was not installed by an Apsi installer", file=sys.stderr)
+        return 1
+    vs = _installed_versions(root)
+    if args.version not in vs:
+        print(f"apsi use: Apsi {args.version} is not installed (installed: {', '.join(vs) or 'none'})",
+              file=sys.stderr)
+        return 1
+    tmp = os.path.join(root, "current.txt.tmp")
+    with open(tmp, "w", encoding="utf-8") as fh:
+        fh.write(args.version + "\n")
+    os.replace(tmp, os.path.join(root, "current.txt"))
+    print(f"apsi now runs Apsi {args.version} (new terminals and this one)")
+    return 0
+
+
+def cmd_log(args):
+    """Show a .log file (text or JSON lines) in colour, filtered; --follow keeps showing new records."""
+    import time as _t
+    from . import log as L
+    if not os.path.exists(args.file):
+        print(f"apsi log: no such file: {args.file}", file=sys.stderr)
+        return 1
+    recs = L.read(args.file, args.level, args.grep, args.tail, args.name, args.older)
+    L.show(recs)
+    if not args.follow:
+        return 0
+    seen = os.path.getsize(args.file)
+    try:
+        while True:
+            _t.sleep(0.5)
+            size = os.path.getsize(args.file) if os.path.exists(args.file) else 0
+            if size < seen:                                # rotated: start the new file from the top
+                seen = 0
+            if size > seen:
+                with open(args.file, encoding="utf-8", errors="replace") as fh:
+                    fh.seek(seen)
+                    chunk = fh.read()
+                seen = size
+                import tempfile
+                with tempfile.NamedTemporaryFile("w", suffix=".log", delete=False, encoding="utf-8") as tmp:
+                    tmp.write(chunk)
+                try:
+                    L.show(L.read(tmp.name, args.level, args.grep, None, args.name))
+                finally:
+                    os.remove(tmp.name)
+    except KeyboardInterrupt:
+        return 0
+
+
 def cmd_doctor(args):
     from .hardware import doctor, info
     if getattr(args, "json", False):
@@ -736,6 +830,23 @@ def _parser(light=False):
 
     p = sub.add_parser("lsp", help="run the language server (stdio) for editors")
     p.set_defaults(fn=cmd_lsp)
+
+    p = sub.add_parser("versions", help="the Apsi versions installed side by side, and which one apsi runs")
+    p.set_defaults(fn=cmd_versions)
+
+    p = sub.add_parser("use", help="make apsi run another installed version")
+    p.add_argument("version")
+    p.set_defaults(fn=cmd_use)
+
+    p = sub.add_parser("log", help="show a .log file in colour: filter by level, name or text, follow new lines")
+    p.add_argument("file")
+    p.add_argument("--level", help="debug, info, warn or error: that level and above")
+    p.add_argument("--grep", help="only records matching this text (a regular expression)")
+    p.add_argument("--name", help="only records from this logger (and its children)")
+    p.add_argument("--tail", type=int, help="only the last N records")
+    p.add_argument("--older", action="store_true", help="also the rotated files (app.1.log …), oldest first")
+    p.add_argument("-f", "--follow", action="store_true", help="keep showing new records (Ctrl+C stops)")
+    p.set_defaults(fn=cmd_log)
 
     p = sub.add_parser("doctor", help="check this machine against Apsi's hardware targets")
     p.add_argument("--json", action="store_true", help="machine-readable output")

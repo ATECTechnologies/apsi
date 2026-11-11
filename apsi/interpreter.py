@@ -358,6 +358,7 @@ class Interpreter:
         self.modules.lazy("hub", lambda: __import__("apsi.hub", fromlist=["module"]).module(self))
         self.modules.lazy("tokens", lambda: __import__("apsi.tokens", fromlist=["module"]).module(self))
         self.modules.lazy("memory", lambda: __import__("apsi.memory", fromlist=["module"]).module(self))
+        self.modules.lazy("log", lambda: __import__("apsi.log", fromlist=["module"]).module(self))
         from . import structures as _st
         self.modules.lazy("collections", _st.module)
         for k, v in _st.FUNCTIONS.items():

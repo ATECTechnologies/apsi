@@ -257,7 +257,8 @@ let trained = r.params
 | `verbose` | `true` | print the loss about ten times during training |
 | `workers` | `1` | data-parallel training on several processes (Linux, macOS): every batch is split into shards, their gradients are averaged by shard size — the same step as one process — then one optimizer step is taken. `"auto"` uses every core. It pays off when the model's matrix products are too small to keep all cores busy on their own |
 | `backend` | `"numpy"` | `"numpy"`, `"torch"` or `"auto"` — see [`BACKENDS.md`](BACKENDS.md) |
-| `device`, `precision`, `compile` | `"auto"`, `"fp32"`, `false` | torch backend only |
+| `device`, `compile` | `"auto"`, `false` | torch backend only |
+| `precision` | `"auto"` | torch backend: bf16 mixed precision on GPUs that have bf16 (NVIDIA RTX 30xx and newer, AMD MI200+, Intel XPU), fp16 with loss scaling on older GPUs and Apple MPS, fp32 on the CPU. Choose yourself with `"fp32"`, `"tf32"`, `"bf16"`, `"fp16"`, `"fp64"`, or any pair of torch dtypes as `{"store": "float32", "compute": "bfloat16"}`; `APSI_PRECISION=fp32` sets it for every program. The numpy backend trains in fp32 |
 
 `fit` returns `record(params, history, val_history, device)` — `device` is `"numpy"` or the torch device used.
 

@@ -42,7 +42,7 @@ cp editors/vscode/syntaxes/apsi.tmLanguage.json "$P/usr/share/apsi/"
 [ -f "$DIST/apsi-language-$V.vsix" ] && cp "$DIST/apsi-language-$V.vsix" "$P/usr/share/apsi/" || true
 cat > "$P/usr/bin/apsi" <<'SH'
 #!/bin/sh
-exec /usr/bin/python3 -m apsi "$@"
+exec /usr/bin/python3 -P -m apsi "$@"
 SH
 chmod 755 "$P/usr/bin/apsi"
 SIZE="$(du -sk "$P/usr" | cut -f1)"
