@@ -621,6 +621,12 @@ Development started on **Sunday, 8 November 2026 at about 04:00** (Bangkok time,
 - `tools/build_editors.py` keeps the Sublime/TextMate grammar and snippets identical to the VS Code ones
 
 ### VS Code extension
+- **finds the installed Apsi of every layout:** the side-by-side installs (`Programs\Apsi\<version>`, the version
+  chosen with `apsi use` first) run through their own Python directly; a launcher found on PATH (`apsi.cmd`) is
+  started through the shell, which current VS Code needs on Windows (before, the language server could not start and
+  **Convert Python File to Apsi** failed with an empty output)
+- **Convert Python File to Apsi** runs in the background, the progress note closes when it ends, and a failure says
+  why (the command line and the error are in the Apsi output)
 - richer grammar: definitions vs. calls, built-ins, parameters, types and generic types, units in their own colour,
   `as [unit]`, `±`, derivatives, f-string formats, triple-quoted strings, decorators, `TODO`, Apsi code blocks in Markdown
 - **Apsi Dark** / **Apsi Light** themes, snippets, smarter indentation and folding

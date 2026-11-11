@@ -14,11 +14,35 @@ let cachedApsi = undefined; // { command, args, version } | null
 let statusItem = null;
 
 // ------------------------------------------------------------------ locating Apsi
-function probe(cmd, args) {
+// Windows refuses to start a .cmd or .bat file without a shell (Node 18.20.2 and later, every current VS Code),
+// so a launcher found on PATH runs through cmd.exe; the bundled runtime's python.exe runs directly.
+function needsShell(cmd) {
+  return IS_WIN && /\.(cmd|bat)$/i.test(cmd);
+}
+
+// The command line to start Apsi with these arguments: { command, args, shell }.
+function invocation(apsi, extra) {
+  const all = [...apsi.args, ...extra];
+  if (!needsShell(apsi.command)) return { command: apsi.command, args: all, shell: false };
+  return { command: quote(apsi.command), args: all.map(quote), shell: true };
+}
+
+function apsiEnv(apsi, more) {
+  return { ...process.env, PYTHONUTF8: "1", ...(apsi && apsi.env), ...(more || {}) };
+}
+
+// One Apsi command, waited for. Never throws: a failure to start comes back as { error }.
+function runApsi(apsi, extra, opts = {}) {
+  const inv = invocation(apsi, extra);
+  return cp.spawnSync(inv.command, inv.args, {
+    encoding: "utf8", windowsHide: true, maxBuffer: 256 * 1024 * 1024, shell: inv.shell,
+    cwd: opts.cwd, timeout: opts.timeout, env: apsiEnv(apsi, opts.env),
+  });
+}
+
+function probe(apsi) {
   try {
-    const r = cp.spawnSync(cmd, [...args, "version"], {
-      timeout: 15000, encoding: "utf8", windowsHide: true, shell: IS_WIN && !path.isAbsolute(cmd) && /\.cmd$/i.test(cmd),
-    });
+    const r = runApsi(apsi, ["version"], { timeout: 15000 });
     const m = r.status === 0 && /Apsi\s+([\w.\-]+)/.exec(r.stdout || "");
     return m ? m[1] : null;
   } catch (e) {
@@ -26,29 +50,56 @@ function probe(cmd, args) {
   }
 }
 
+// The Apsi installs on this computer, newest first: the version in current.txt (`apsi use`), then the others.
+// Layout: <root>/<version>/runtime/python/..., and the older single-version layout <root>/runtime/python/...
+function installedRuntimes() {
+  const roots = [];
+  if (IS_WIN) {
+    const local = process.env.LOCALAPPDATA || path.join(process.env.USERPROFILE || "", "AppData", "Local");
+    roots.push(path.join(local, "Programs", "Apsi"), path.join(process.env.ProgramFiles || "C:\\Program Files", "Apsi"),
+      path.join(local, "Apsi"));
+  } else {
+    roots.push(path.join(process.env.HOME || "", ".local", "share", "apsi"), "/opt/apsi");
+  }
+  const python = (dir) => (IS_WIN ? path.join(dir, "runtime", "python", "python.exe")
+                                  : path.join(dir, "runtime", "python", "bin", "python3"));
+  const num = (v) => v.split(/[.\-]/).map((x) => parseInt(x, 10) || 0);
+  const newer = (a, b) => { const x = num(a), y = num(b); for (let i = 0; i < Math.max(x.length, y.length); i++) { if ((x[i] || 0) !== (y[i] || 0)) return (y[i] || 0) - (x[i] || 0); } return 0; };
+  const out = [];
+  for (const root of roots) {
+    let versions = [];
+    try { versions = fs.readdirSync(root).filter((d) => /^\d+\.\d+/.test(d)).sort(newer); } catch (e) { continue; }
+    let current = "";
+    try { current = fs.readFileSync(path.join(root, "current.txt"), "utf8").trim(); } catch (e) { /* none */ }
+    if (current && versions.includes(current)) versions = [current, ...versions.filter((v) => v !== current)];
+    for (const v of versions) {
+      const py = python(path.join(root, v));
+      if (fs.existsSync(py)) out.push({ command: py, args: ["-I", "-X", "utf8", "-m", "apsi"], env: { APSI_INSTALL_ROOT: root, APSI_INSTALL_VERSION: v, PYTHONNOUSERSITE: "1" } });
+    }
+    const legacy = python(root);
+    if (fs.existsSync(legacy)) out.push({ command: legacy, args: ["-I", "-X", "utf8", "-m", "apsi"], env: { PYTHONNOUSERSITE: "1" } });
+  }
+  return out;
+}
+
 function findApsi(force) {
   if (cachedApsi !== undefined && !force) return cachedApsi;
   const cfg = vscode.workspace.getConfiguration("apsi").get("command") || [];
   const candidates = [];
-  if (cfg.length) candidates.push([cfg[0], cfg.slice(1)]);
+  if (cfg.length) candidates.push({ command: cfg[0], args: cfg.slice(1) });
+  candidates.push(...installedRuntimes());
   if (IS_WIN) {
     const local = process.env.LOCALAPPDATA;
-    if (local) {
-      candidates.push([path.join(local, "Programs", "Apsi", "runtime", "python", "python.exe"), ["-m", "apsi"]]);
-      candidates.push([path.join(local, "Apsi", "runtime", "python", "python.exe"), ["-m", "apsi"]]);
-      candidates.push([path.join(local, "Apsi", "venv", "Scripts", "python.exe"), ["-m", "apsi"]]);
-    }
-    candidates.push(["apsi.cmd", []], ["py", ["-3", "-m", "apsi"]], ["python", ["-m", "apsi"]]);
+    if (local) candidates.push({ command: path.join(local, "Apsi", "venv", "Scripts", "python.exe"), args: ["-m", "apsi"] });
+    candidates.push({ command: "apsi.cmd", args: [] }, { command: "py", args: ["-3", "-m", "apsi"] }, { command: "python", args: ["-m", "apsi"] });
   } else {
-    const home = process.env.HOME || "";
-    candidates.push([path.join(home, ".local", "share", "apsi", "runtime", "python", "bin", "python3"), ["-m", "apsi"]]);
-    candidates.push([path.join(home, ".apsi", "venv", "bin", "python"), ["-m", "apsi"]]);
-    candidates.push(["apsi", []], ["python3", ["-m", "apsi"]]);
+    candidates.push({ command: path.join(process.env.HOME || "", ".apsi", "venv", "bin", "python"), args: ["-m", "apsi"] });
+    candidates.push({ command: "apsi", args: [] }, { command: "python3", args: ["-m", "apsi"] });
   }
-  for (const [command, args] of candidates) {
-    if (path.isAbsolute(command) && !fs.existsSync(command)) continue;
-    const version = probe(command, args);
-    if (version) return (cachedApsi = { command, args, version });
+  for (const c of candidates) {
+    if (path.isAbsolute(c.command) && !fs.existsSync(c.command)) continue;
+    const version = probe(c);
+    if (version) return (cachedApsi = { ...c, version });
   }
   return (cachedApsi = null);
 }
@@ -126,7 +177,10 @@ function repl(show = true) {
     const ws = vscode.workspace.workspaceFolders;
     replTerminal = vscode.window.createTerminal({
       name: "Apsi REPL", cwd: ws && ws.length ? ws[0].uri.fsPath : undefined,
-      shellPath: apsi.command, shellArgs: [...apsi.args, "repl"], iconPath: new vscode.ThemeIcon("terminal"),
+      ...(needsShell(apsi.command)
+        ? { shellPath: process.env.ComSpec || "cmd.exe", shellArgs: ["/d", "/c", apsi.command, ...apsi.args, "repl"] }
+        : { shellPath: apsi.command, shellArgs: [...apsi.args, "repl"] }),
+      env: apsi.env, iconPath: new vscode.ThemeIcon("terminal"),
     });
   }
   if (show) replTerminal.show(true);
@@ -210,13 +264,19 @@ async function pickTask() {
   if (pick) runInTerminal(["task", pick.label], { cwd: pick.root });
 }
 
+function taskExecution(apsi, parts, cwd) {
+  const opts = { cwd, env: apsi.env };
+  if (needsShell(apsi.command)) return new vscode.ShellExecution(apsi.command, [...apsi.args, ...parts], opts);
+  return new vscode.ProcessExecution(apsi.command, [...apsi.args, ...parts], opts);
+}
+
 class TaskProvider {
   provideTasks() {
     const apsi = findApsi();
     if (!apsi) return [];
     const tasks = [];
     const make = (def, label, folder, parts, group) => {
-      const exec = new vscode.ProcessExecution(apsi.command, [...apsi.args, ...parts], { cwd: folder.uri.fsPath });
+      const exec = taskExecution(apsi, parts, folder.uri.fsPath);
       const t = new vscode.Task(def, folder, label, "apsi", exec, "$apsi");
       if (group) t.group = group;
       return t;
@@ -245,7 +305,7 @@ class TaskProvider {
     if (Array.isArray(d.args)) parts.push(...d.args);
     const folder = task.scope && task.scope.uri ? task.scope.uri.fsPath : undefined;
     return new vscode.Task(d, task.scope || vscode.TaskScope.Workspace, task.name, "apsi",
-      new vscode.ProcessExecution(apsi.command, [...apsi.args, ...parts], { cwd: folder }), "$apsi");
+      taskExecution(apsi, parts, folder), "$apsi");
   }
 }
 
@@ -268,10 +328,9 @@ async function newProject() {
   if (!parent || !parent.length) return;
   const apsi = requireApsi();
   if (!apsi) return;
-  const r = cp.spawnSync(apsi.command, [...apsi.args, "new", name, "--template", template.label],
-    { cwd: parent[0].fsPath, encoding: "utf8", windowsHide: true });
+  const r = runApsi(apsi, ["new", name, "--template", template.label], { cwd: parent[0].fsPath });
   if (r.status !== 0) {
-    vscode.window.showErrorMessage(`apsi new failed: ${(r.stderr || r.stdout || "").trim()}`);
+    vscode.window.showErrorMessage(`apsi new failed: ${(r.stderr || r.stdout || (r.error && r.error.message) || "").trim()}`);
     return;
   }
   const dir = vscode.Uri.file(path.join(parent[0].fsPath, name));
@@ -288,10 +347,10 @@ async function showDoc() {
   if (!name) return;
   const apsi = requireApsi();
   if (!apsi) return;
-  const r = cp.spawnSync(apsi.command, [...apsi.args, "doc", name], { encoding: "utf8", windowsHide: true });
+  const r = runApsi(apsi, ["doc", name]);
   const ch = getOutput();
   ch.clear();
-  ch.appendLine((r.stdout || "") + (r.stderr || ""));
+  ch.appendLine((r.stdout || "") + (r.stderr || "") + (r.error ? `Apsi could not be started: ${r.error.message}` : ""));
   ch.show(true);
 }
 
@@ -306,23 +365,45 @@ async function convertPython(uri) {
   const apsi = requireApsi();
   if (!apsi) return;
   const ch = getOutput();
-  await vscode.window.withProgress({ location: vscode.ProgressLocation.Notification, title: "Converting to Apsi…" }, async () => {
-    const r = cp.spawnSync(apsi.command, [...apsi.args, "convert", target],
-      { encoding: "utf8", windowsHide: true, env: { ...process.env, NO_COLOR: "1", PYTHONUTF8: "1" } });
-    ch.clear();
-    ch.appendLine((r.stdout || "") + (r.stderr || ""));
-    const isDir = fs.existsSync(target) && fs.statSync(target).isDirectory();
-    const out = isDir ? null : target.replace(/\.py$/i, ".apsi");
-    if (out && fs.existsSync(out)) {
-      const doc = await vscode.workspace.openTextDocument(out);
-      await vscode.window.showTextDocument(doc, vscode.ViewColumn.Beside);
-    }
-    const notes = ((r.stdout || "").match(/\((\d+) notes?/) || [])[1];
-    const msg = r.status === 0 ? `Converted to Apsi${notes && notes !== "0" ? ` — ${notes} place(s) to review` : ""}.`
-                               : "Converted with problems — see the Apsi output.";
-    const pick = await vscode.window.showInformationMessage(msg, "Show Details");
-    if (pick) ch.show(true);
-  });
+  // the conversion runs in the background (the editor stays responsive); the result message is shown after the
+  // progress note has closed, so "Converting to Apsi…" never stays on screen
+  const r = await vscode.window.withProgress({ location: vscode.ProgressLocation.Notification, title: "Converting to Apsi…" },
+    () => new Promise((resolve) => {
+      const inv = invocation(apsi, ["convert", target]);
+      let stdout = "", stderr = "";
+      let child;
+      try {
+        child = cp.spawn(inv.command, inv.args, { windowsHide: true, shell: inv.shell, env: apsiEnv(apsi, { NO_COLOR: "1" }) });
+      } catch (e) {
+        resolve({ status: null, stdout, stderr, error: e });
+        return;
+      }
+      child.stdout.setEncoding("utf8"); child.stderr.setEncoding("utf8");
+      child.stdout.on("data", (d) => { stdout += d; });
+      child.stderr.on("data", (d) => { stderr += d; });
+      child.on("error", (e) => resolve({ status: null, stdout, stderr, error: e }));
+      child.on("close", (code) => resolve({ status: code, stdout, stderr }));
+    }));
+  ch.clear();
+  ch.appendLine(`> ${[apsi.command, ...apsi.args, "convert", target].join(" ")}`);
+  if (r.stdout) ch.appendLine(r.stdout.trimEnd());
+  if (r.stderr) ch.appendLine(r.stderr.trimEnd());
+  if (r.error) ch.appendLine(`Apsi could not be started: ${r.error.message}`);
+  const isDir = fs.existsSync(target) && fs.statSync(target).isDirectory();
+  const out = isDir ? null : target.replace(/\.py$/i, ".apsi");
+  if (r.status === 0 && out && fs.existsSync(out)) {
+    const doc = await vscode.workspace.openTextDocument(out);
+    await vscode.window.showTextDocument(doc, vscode.ViewColumn.Beside);
+  }
+  const notes = ((r.stdout || "").match(/\((\d+) notes?/) || [])[1];
+  if (r.status === 0) {
+    vscode.window.showInformationMessage(`Converted to Apsi${notes && notes !== "0" ? ` — ${notes} place(s) to review` : ""}.`, "Show Details")
+      .then((pick) => pick && ch.show(true));
+  } else {
+    const why = r.error ? "Apsi could not be started" : "the converter reported problems";
+    vscode.window.showErrorMessage(`Not converted: ${why}. See the Apsi output for the details.`, "Show Details")
+      .then((pick) => pick && ch.show(true));
+  }
 }
 
 async function customCommand() {
@@ -355,9 +436,10 @@ async function startServer(context) {
     vscode.window.showWarningMessage("Apsi was not found — syntax colours and snippets only. Install Apsi or set 'apsi.command'.");
     return;
   }
+  const inv = invocation(apsi, ["lsp"]);
   const serverOptions = {
-    command: apsi.command, args: [...apsi.args, "lsp"],
-    options: { env: { ...process.env, PYTHONUTF8: "1", PYTHONDONTWRITEBYTECODE: "1" } },
+    command: inv.command, args: inv.args,
+    options: { shell: inv.shell, env: apsiEnv(apsi, { PYTHONDONTWRITEBYTECODE: "1" }) },
   };
   const clientOptions = {
     documentSelector: [{ scheme: "file", language: "apsi" }, { scheme: "untitled", language: "apsi" }],
@@ -367,7 +449,10 @@ async function startServer(context) {
   try {
     await client.start();
   } catch (e) {
-    getOutput().appendLine(`language server failed to start: ${e && e.message}`);
+    const msg = `The Apsi language server did not start (${[apsi.command, ...apsi.args, "lsp"].join(" ")}): ${e && e.message}`;
+    getOutput().appendLine(msg);
+    vscode.window.showErrorMessage("The Apsi language server did not start. See the Apsi output; \"Apsi: Restart Language Server\" tries again.", "Show Details")
+      .then((pick) => pick && getOutput().show(true));
   }
 }
 
@@ -400,7 +485,10 @@ function activate(context) {
     createDebugAdapterDescriptor() {
       const apsi = requireApsi();
       if (!apsi) return undefined;
-      return new vscode.DebugAdapterExecutable(apsi.command, [...apsi.args, "dap"]);
+      if (needsShell(apsi.command)) {
+        return new vscode.DebugAdapterExecutable(process.env.ComSpec || "cmd.exe", ["/d", "/c", apsi.command, ...apsi.args, "dap"], { env: apsiEnv(apsi) });
+      }
+      return new vscode.DebugAdapterExecutable(apsi.command, [...apsi.args, "dap"], { env: apsiEnv(apsi) });
     },
   }));
   context.subscriptions.push(vscode.debug.registerDebugConfigurationProvider("apsi", {
