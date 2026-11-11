@@ -620,6 +620,11 @@ Development started on **Sunday, 8 November 2026 at about 04:00** (Bangkok time,
 - **JetBrains** TextMate bundle, **Helix**, **Zed** and **Emacs** (`apsi-mode`) configurations
 - `tools/build_editors.py` keeps the Sublime/TextMate grammar and snippets identical to the VS Code ones
 
+### Fixes
+- `use hub` on the processor: a product could wait forever when several threads used the model and a worker
+  thread went to sleep at the same moment (a lost wake-up, seen on ARM64). Publishing a job and counting the
+  sleeping workers are now sequentially consistent atomics, and a worker leaves its sleep with an atomic count.
+
 ### Python conversion: libraries come along
 - `apsi convert` converts the installed libraries a program imports that are written in Python (found in the
   program's `.venv` of any Python version, or in the converting Python) into `apsi_packages/` next to it, with their

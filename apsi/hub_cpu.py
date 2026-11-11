@@ -378,10 +378,27 @@ def _build_team(eng, kernels):
     b.position_at_end(end_bb)
     b.ret_void()
 
-    addrs = eng.compile("; apsi hub team\n" + str(m), ["apsi_hub_worker", "apsi_hub_wait"])
+    # publish a job: the new generation (seq_cst) and then the number of sleeping workers (seq_cst), so a worker
+    # that is just going to sleep either sees the job or is counted and woken (no lost wake-up on ARM's weak memory)
+    fp = ir.Function(m, ir.FunctionType(i64, [P, i64]), name="apsi_hub_publish")
+    st3, gen = fp.args
+    b = ir.IRBuilder(fp.append_basic_block("entry"))
+    b.store_atomic(gen, slot(b, st3, _S_GEN), "seq_cst", 8)
+    b.ret(b.load_atomic(slot(b, st3, _S_SLEEP), "seq_cst", 8))
+
+    # a worker leaving its sleep: the count goes down atomically (other workers add to it at the same time)
+    fu = ir.Function(m, ir.FunctionType(ir.VoidType(), [P]), name="apsi_hub_unsleep")
+    b = ir.IRBuilder(fu.append_basic_block("entry"))
+    b.atomic_rmw("sub", slot(b, fu.args[0], _S_SLEEP), ir.Constant(i64, 1), "seq_cst")
+    b.ret_void()
+
+    addrs = eng.compile("; apsi hub team v2\n" + str(m), ["apsi_hub_worker", "apsi_hub_wait", "apsi_hub_publish",
+                                                                  "apsi_hub_unsleep"])
     worker = ctypes.CFUNCTYPE(ctypes.c_int64, ctypes.c_void_p, ctypes.c_int64, ctypes.c_int64)(addrs["apsi_hub_worker"])
     wait = ctypes.CFUNCTYPE(None, ctypes.c_void_p, ctypes.c_int64)(addrs["apsi_hub_wait"])
-    return worker, wait
+    publish = ctypes.CFUNCTYPE(ctypes.c_int64, ctypes.c_void_p, ctypes.c_int64)(addrs["apsi_hub_publish"])
+    unsleep = ctypes.CFUNCTYPE(None, ctypes.c_void_p)(addrs["apsi_hub_unsleep"])
+    return worker, wait, publish, unsleep
 
 
 class _Team:
@@ -392,7 +409,7 @@ class _Team:
         eng = _eng.engine()
         kq = ctypes.cast(_q8, ctypes.c_void_p).value if _q8 else ctypes.cast(_fn, ctypes.c_void_p).value
         kb = ctypes.cast(_fn, ctypes.c_void_p).value
-        self.worker, self.wait = _build_team(eng, (kb, kq))
+        self.worker, self.wait, self.publish, self.unsleep = _build_team(eng, (kb, kq))
         self.state = np.zeros(_S_LAST + n + 8, np.int64)
         self.addr = self.state.ctypes.data
         self.n = n                                       # threads including the caller
@@ -413,7 +430,7 @@ class _Team:
             with self.cond:
                 while st[_S_GEN] == st[_S_LAST + i] and not st[_S_QUIT]:
                     self.cond.wait()
-                st[_S_SLEEP] -= 1                        # under the lock: the main thread reads it there too
+            self.unsleep(self.addr)                      # atomic: other workers count themselves in meanwhile
 
     def run(self, kind, W, S, X, Y, I, T, O, parts, step):
         st = self.state
@@ -422,9 +439,8 @@ class _Team:
             st[_S_I], st[_S_T], st[_S_O], st[_S_PARTS], st[_S_STEP] = I, T, O, parts, step
             st[_S_DONE] = 0
             gen = int(st[_S_GEN]) + 1
-            ctypes.c_int64.from_address(self.addr + 8 * _S_GEN).value = gen    # publishes the job
-            with self.cond:
-                if st[_S_SLEEP] > 0:
+            if self.publish(self.addr, gen) > 0:         # the job is visible; then wake whoever went to sleep
+                with self.cond:
                     self.cond.notify_all()
             e = min(O, step)
             if e > 0:
