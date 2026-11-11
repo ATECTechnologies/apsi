@@ -77,32 +77,34 @@ class Governor:
         self.last_tick = None
         self.lock = threading.Lock()
 
+    KP, KI = 0.02, 0.004               # pause fraction per degree; per degree-second
+
     def _adjust(self, now):
-        """A PI controller on the temperature: the pause fraction follows the error smoothly (integral part) and
-        reacts at once to a change (proportional part), so the card settles at the target instead of swinging
-        between too hot and paused."""
+        """A PI controller on the smoothed temperature. The die of a graphics card jumps several degrees within a
+        fraction of a second whenever the load changes, and the sensor reads whole degrees, so the raw reading (and
+        above all its rate of change) is mostly noise: reacting to it made the pauses swing between none and most of
+        the time (the card between 62 and 77 C, the speed halved). Smoothed over about two seconds with a half-degree
+        dead band, the pause fraction moves slowly to the one value that holds the target, so the temperature and
+        the speed stay level. Above target + 1 the integral moves three times faster (no lasting overshoot)."""
         t = self.read_temp()
         if t is None:
             return
         dt = min(2.0, max(0.05, now - self.last_read)) if self.last_read else self.PERIOD
         self.temp = t
         self.max_temp = t if self.max_temp is None else max(self.max_temp, t)
-        err = t - self.target
-        power = getattr(self, "power", None)
-        if power is not None and not power.step(err, dt) and self.integral == 0.0:
-            self.fraction = 0.0                         # the power limit holds it: no pauses, steady speed
-            self.last_read = now
-            return
-        # the rate of change (smoothed): a card heating fast is paced before it passes the target (no overshoot)
-        prev = getattr(self, "prev_temp", None)
-        rate = 0.0 if prev is None else (t - prev) / dt
-        self.rate = 0.7 * getattr(self, "rate", 0.0) + 0.3 * rate
-        self.prev_temp = t
-        if self.fraction > 0.0 or err > -1.0:           # cool and not pacing: nothing to wind up
-            self.integral = min(0.85, max(0.0, self.integral + 0.012 * err * dt))
-        lead = 0.4 * max(0.0, self.rate) if err > -5.0 else 0.0
-        self.fraction = min(0.85, max(0.0, self.integral + 0.035 * err + lead))
+        sm = getattr(self, "smooth", None)
+        self.smooth = t if sm is None else sm + min(1.0, dt / 2.0) * (t - sm)
+        err = self.smooth - self.target
+        e = 0.0 if abs(err) < 0.5 else err - (0.5 if err > 0 else -0.5)
         self.last_read = now
+        power = getattr(self, "power", None)
+        if power is not None and not power.step(e, dt) and self.integral == 0.0:
+            self.fraction = 0.0                         # the power limit holds it: no pauses, steady speed
+            return
+        if self.fraction > 0.0 or e > 0.0:              # a cool card that is not paced winds nothing up
+            gain = self.KI * (3.0 if e > 1.0 else 1.0)
+            self.integral = min(0.85, max(0.0, self.integral + gain * e * dt))
+        self.fraction = min(0.85, max(0.0, self.integral + self.KP * max(e, -5.0)))
 
     def tick(self, sync=None):
         """Call after each piece of work. Waits when the card should cool down; `sync` (optional) first waits for
@@ -112,16 +114,21 @@ class Governor:
             if now - self.last_read >= self.PERIOD:
                 self._adjust(now)
             frac = self.fraction
-        if frac > 0.0:
+        work = 0.0 if self.last_tick is None else min(now - self.last_tick, 2.0)
+        self.last_tick = now
+        if frac <= 0.0:
+            self.debt = 0.0
+            return
+        # the pauses are gathered into pieces of at least 20 ms (one wait for the card each), so short steps are not
+        # each followed by a wait for the card, which by itself would leave the card idle while the next is queued
+        self.debt = getattr(self, "debt", 0.0) + work * frac / (1.0 - frac)
+        if self.debt >= 0.02:
             if sync is not None:
                 sync()
-                now = time.monotonic()
-            work = 0.0 if self.last_tick is None else min(now - self.last_tick, 2.0)
-            if work > 0.0:
-                wait = work * frac / (1.0 - frac)
-                time.sleep(wait)
-                self.paced += wait
-        self.last_tick = time.monotonic()
+            time.sleep(self.debt)
+            self.paced += self.debt
+            self.debt = 0.0
+            self.last_tick = time.monotonic()
 
     def status(self):
         out = {"temperature_c": self.temp, "target_c": self.target, "band_c": [self.low, self.high],

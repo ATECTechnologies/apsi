@@ -55,5 +55,59 @@ class Thermal(unittest.TestCase):
         thermal.NULL.tick()
 
 
+class SimulatedCard(unittest.TestCase):
+    """A card whose die jumps with every change of load (a fast part, 0.3 s) on top of the slow heating of the cooler
+    (40 s), read in whole degrees: the pacing must hold it level, not swing between paused and hot."""
+
+    def run_card(self, slow_gain, secs=300.0, step=0.028):
+        import math
+        import random
+        from apsi import thermal as th
+        rnd = random.Random(0)
+
+        class Clock:
+            t = 0.0
+
+            def monotonic(self):
+                return self.t
+
+            def sleep(self, d):
+                self.t += d
+        clk = Clock()
+        s = {"f": 0.0, "s": slow_gain * 0.75}
+
+        def heat(dt, on):
+            s["f"] += (15.0 * on - s["f"]) * (1 - math.exp(-dt / 0.3))
+            s["s"] += (slow_gain * on - s["s"]) * (1 - math.exp(-dt / 40.0))
+        with mock.patch.object(th, "time", clk):
+            g = th.Governor(lambda: float(round(35 + s["f"] + s["s"] + rnd.uniform(-0.3, 0.3))), 77)
+            samples, last, work = [], 0.0, 0.0
+            while clk.t < secs:
+                clk.t += step
+                work += step
+                heat(step, 1.0)
+                b = clk.t
+                g.tick(lambda: None)
+                p = clk.t - b
+                for _ in range(max(1, int(p / 0.02))):
+                    heat(p / max(1, int(p / 0.02)), 0.0)
+                if clk.t - last >= 2.0:
+                    samples.append((35 + s["f"] + s["s"], work / (clk.t - last)))
+                    last, work = clk.t, 0.0
+        return samples[len(samples) // 3:]
+
+    def test_level_temperature_and_speed(self):
+        for gain in (30.0, 36.0):
+            tail = self.run_card(gain)
+            temps, speeds = [t for t, _ in tail], [v for _, v in tail]
+            self.assertGreater(min(temps), 74.5)
+            self.assertLess(max(temps), 78.5)
+            self.assertLess(max(speeds) - min(speeds), 0.05)          # steady speed, no swings
+        self.assertGreater(min(v for _, v in self.run_card(30.0)), 0.9)
+
+    def test_a_cool_card_is_never_slowed(self):
+        self.assertAlmostEqual(min(v for _, v in self.run_card(20.0)), 1.0, places=6)
+
+
 if __name__ == "__main__":
     unittest.main()

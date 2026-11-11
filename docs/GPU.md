@@ -149,8 +149,11 @@ Long work — training, long answers, a busy server — keeps the card near **77
 run up to its own limit (often 83–90 °C on desktop cards). Apsi reads the temperature from the driver's management
 library (NVML, installed with the driver) twice a second; above the band it paces the work (after each training
 step or generated token it waits a fraction of the time that step took, so the card does less per second and
-cools), below the band it gives the speed back. The fraction moves in small steps, so the temperature settles in
-the band instead of swinging; a card that stays cool is never slowed.
+cools), below the band it gives the speed back. The control follows the temperature smoothed over about two seconds
+(the die jumps several degrees within a fraction of a second whenever the load changes, and the sensor reads whole
+degrees, so reacting to the raw reading made the pauses swing between none and most of the time); the pauses are
+gathered into pieces of at least 20 ms, so the card is never left waiting between short steps. The temperature and
+the speed stay level, and a card that stays cool is never slowed.
 
 | Setting | |
 |---|---|
@@ -171,6 +174,22 @@ back in both cases.
 an Apsi program asks (localhost only, with a key only your account can read, never above the card's default). From
 then on every Apsi program holds the temperature by the power limit without administrator rights. `apsi gpu setup 80%`
 also applies 80 % at every logon; `apsi gpu remove` takes it all away and restores the default.
+
+**The Apsi GPU Tuner (download page).** Two plain-text files per system, no installation: *Apply* sets every
+NVIDIA card in the computer to the power limit measured as the best for sustained training and keeps it after
+every restart (a Task Scheduler task on Windows, a systemd service on Linux); *Restore* removes all of it and puts
+every card back to its factory default. Windows asks once for administrator rights (the file asks by itself).
+
+| Card | Power limit | Effect |
+|---|---|---|
+| GeForce RTX 50 / RTX 40 | 75 % | about -25 % power for about -5 % training speed |
+| GeForce RTX 30 | 80 % | about -5 % speed, 6–10 °C cooler |
+| GeForce RTX 20, GTX 16, GTX 10 | 85 % | about -4 % speed, cooler |
+| Workstation (RTX PRO, RTX A-series, Ada, Quadro) | 90 % | steadier clocks for about -2 % |
+| Data center (H100, H200, B200, A100, L40S, L4, T4…) | unchanged | built and cooled for full sustained power |
+| Laptop GPUs | unchanged | the laptop manages the limit |
+
+With Apsi installed, *Apply* also runs `apsi gpu setup`, so Apsi fine-tunes the limit around 77 °C while it trains.
 
 **Once per start of the computer: `apsi gpu power 80%`.** Run it once from a terminal opened as administrator (or
 with sudo): the card keeps that limit for every program until the computer or the driver restarts, so Apsi (and

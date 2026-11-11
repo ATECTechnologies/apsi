@@ -16,6 +16,10 @@
 - **GPU temperature control:** long training, long answers and busy servers keep the card near 77 °C (75–78) by
   pacing the work while it is above the band (the driver's NVML gives the temperature); a cool card is never slowed.
   `APSI_GPU_TEMP=72` / `off`; `r.gpu_temperature`, `/metrics`, `hub.gpu_status()`.
+- **Level pacing:** the temperature control follows the smoothed temperature and gathers its pauses (a card whose
+  die jumps with each change of load was paced between none and most of the time: 62-77 C and half the speed).
+- **Apsi GPU Tuner** (tools/gpu-tuner, on the download page): Apply / Restore files for Windows and Linux that set
+  every NVIDIA card to the recommended sustained-training power limit, kept after restarts, and undo it.
 - **Steady speed at a steady temperature:** with the right to set the card's power limit Apsi holds the temperature
   with it (PI control, no pauses); `apsi gpu setup` (once) installs a helper so no program ever needs to run as
   administrator for that; `apsi gpu` / `apsi gpu watch` / `apsi gpu power 80%`.
