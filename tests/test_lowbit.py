@@ -88,7 +88,7 @@ class LowBit(unittest.TestCase):
                                              device=dev)).argmax(-1)
             self.assertGreater((pred == y).mean(), 0.8, prec)
 
-    @unittest.skipIf(torch is None or not torch.cuda.is_available(), "no CUDA GPU")
+    @unittest.skipIf(torch is None or not torch.cuda.is_available(), "needs PyTorch with CUDA (fp8 tensor cores through torch)")
     def test_fp8_tensor_cores_when_the_card_has_them(self):
         dev = torch.device("cuda")
         if not lowbit.fp8_matmul_available(dev):

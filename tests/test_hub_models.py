@@ -10,6 +10,7 @@ import os
 import struct
 import tempfile
 import unittest
+from unittest import mock
 
 import numpy as np
 
@@ -281,7 +282,8 @@ class DecoderOnGpu(unittest.TestCase):
                 # a driver error part way falls back to the processor
                 fake.matmul = lambda x, m: (_ for _ in ()).throw(RuntimeError("lost"))
                 M._WARNED.clear()
-                with contextlib.redirect_stderr(io.StringIO()) as err:
+                with contextlib.redirect_stderr(io.StringIO()) as err, \
+                        mock.patch.dict(os.environ, {"APSI_QUIET": ""}):          # the warning is what is checked
                     again = gpu.net.generate(ids, max_new_tokens=5, eos=[])
                 self.assertIn("processor", err.getvalue())
                 self.assertEqual(again, cpu.net.generate(ids, max_new_tokens=5, eos=[]))
