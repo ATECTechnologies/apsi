@@ -368,6 +368,10 @@ class Kernels(unittest.TestCase):
     """Every kernel module builds (no GPU needed): a mistake in one of them must fail here, not on the card."""
 
     def test_every_module_builds(self):
+        try:
+            import llvmlite  # noqa: F401
+        except ImportError:
+            self.skipTest("llvmlite is not installed here (the GPU kernels are generated with it)")
         from apsi import gpu_train_kernels as KS
         for which, build in (("main", KS._main_module), ("tc", KS._tc_module), ("tiled", KS._tiled_module),
                              ("tiled_x", lambda: KS._tiled_module(True)),
