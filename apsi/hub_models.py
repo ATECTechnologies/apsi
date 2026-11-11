@@ -13,6 +13,8 @@ so a float32 copy of the model is never made.
 import json
 import math
 import os
+import shutil
+import sys
 
 import numpy as np
 
@@ -91,6 +93,34 @@ class _Ref:
 
 
 
+def _progress(msg):
+    """A line on stderr about long work (making the int8 copy of a large model …), so a wait is never silent.
+    APSI_PROGRESS=0 turns it off."""
+    if os.environ.get("APSI_PROGRESS", "1").strip() in ("0", "false", "no"):
+        return
+    try:
+        sys.stderr.write(f"apsi hub: {msg}\n")
+        sys.stderr.flush()
+    except Exception:
+        pass
+
+
+def _free_of(r):
+    try:
+        return int(r.free_memory())
+    except Exception:
+        return None
+
+
+def _ram_available():
+    try:
+        from .memory import _meminfo
+        total, avail, _, _ = _meminfo()
+        return int(total), int(avail)
+    except Exception:
+        return 0, 0
+
+
 class _Q8Store:
     """int8 copies of the matrices for the processor, made once and kept on disk next to the GPU kernel cache
     (memory-mapped afterwards: the next start reads them at disk speed and the OS shares the pages)."""
@@ -114,6 +144,24 @@ class _Q8Store:
         self.dir = os.path.join(config_dir(), "cache", "cpu-int8", h.hexdigest()[:24]) if h is not None else None
         self.ok = self.dir is not None and os.path.exists(os.path.join(self.dir, "complete"))
         self.made = 0
+        self.total = sum(int(np.prod(net._wshape(n if n else net._head_name()))) for ns in groups.values() for n in ns)
+        self.done_values = 0
+        self.t0 = None
+        self.last = 0.0
+        if not self.ok and self.dir is not None:
+            need = self.total * 1.13                         # int8 values and one float32 scale per 32
+            try:
+                os.makedirs(os.path.dirname(self.dir), exist_ok=True)
+                free = shutil.disk_usage(os.path.dirname(self.dir)).free
+            except OSError:
+                free = need * 2
+            if free < need * 1.1:                            # no room for the copy: kept in RAM instead
+                _progress(f"only {free / 2 ** 30:.1f} GB free on the disk for the int8 copy "
+                          f"({need / 2 ** 30:.1f} GB needed): it stays in RAM")
+                self.dir = None
+            elif self.total * 2 > 2 ** 30:
+                _progress(f"making the int8 copy of the processor's weights once ({need / 2 ** 30:.1f} GB in "
+                          f"{os.path.dirname(self.dir)}); later starts read it directly")
 
     def _paths(self, key):
         safe = key.replace("/", "_")
@@ -127,8 +175,19 @@ class _Q8Store:
                 return hub_cpu.Q8(np.load(c, mmap_mode="r"), np.load(sc, mmap_mode="r"))
             except (OSError, ValueError):
                 self.ok = False
+        import time as _t
+        if self.t0 is None:
+            self.t0 = _t.perf_counter()
         q = hub_cpu.Q8.from_bf16(self.net._bf16(names))
         self.made += 1
+        self.done_values += q.codes.size
+        now = _t.perf_counter()
+        if self.total * 2 > 2 ** 30 and (now - self.last > 5 or self.done_values >= self.total):
+            self.last = now
+            frac = self.done_values / max(self.total, 1)
+            left = (now - self.t0) / max(frac, 1e-9) * (1 - frac)
+            _progress(f"int8 copy {frac * 100:.0f} % ({self.done_values * 1.13 / 2 ** 30:.1f} of "
+                      f"{self.total * 1.13 / 2 ** 30:.1f} GB)" + (f", about {left:.0f} s left" if frac < 1 else ", done"))
         if self.dir is not None:
             try:
                 os.makedirs(self.dir, exist_ok=True)
@@ -601,7 +660,14 @@ class Decoder:
             return "cpu", f"{type(e).__name__}: {e}"
         self.gpu = r
         name = f"cuda:{r.dev.index} ({r.name})"
+        ng = self._ng if self._gl is not None else (self.L if self._gm else 0)
+        self.plan = {"gpu": {"name": getattr(r, "name", "gpu"), "layers": ng, "of": self.L,
+                             "bytes": int(getattr(r, "used", 0) or 0),
+                             "free_after": _free_of(r),
+                             "tensor_cores": bool(getattr(r, "tc", None)), "kv_cache": self.kv_cache}}
         if self._gl is not None and self._ng < self.L:
+            _progress(f"{self._ng} of {self.L} layers on {getattr(r, 'name', 'the GPU')} "
+                      f"({int(getattr(r, 'used', 0) or 0) / 2 ** 30:.1f} GB), {self.L - self._ng} on the processor")
             return f"{name} + cpu ({self._ng} of {self.L} layers on the GPU)", \
                 f"the model is larger than the GPU's free memory: {self.L - self._ng} layers run on the processor"
         return name, ""
@@ -727,7 +793,30 @@ class Decoder:
             self._cm[key] = (store.get(key, ns) if q8 else self._bf16(ns), cuts)
         if store is not None:
             store.done()
+        self._plan_cpu(groups, q8)
         return True
+
+    def _plan_cpu(self, groups, q8):
+        """Where the processor's share of the weights lives, and why (self.plan["cpu"])."""
+        values = sum(int(np.prod(self._wshape(n if n else self._head_name()))) for ns in groups.values() for n in ns)
+        size = values * (1.13 if q8 else 2)
+        total, avail = _ram_available()
+        mapped = q8 and all(isinstance(w[0].codes, np.memmap) for w in self._cm.values()
+                            if hasattr(w[0], "codes"))
+        where = "RAM"
+        note = ""
+        if avail and size > 0.8 * avail:
+            where = "SSD, memory-mapped" if mapped else "RAM (more than is free: the system may swap)"
+            note = (f"the processor's {size / 2 ** 30:.1f} GB of weights are more than 80 % of the free RAM "
+                    f"({avail / 2 ** 30:.1f} GB): tokens are limited by the SSD's read speed")
+            _progress(note)
+        if self.gpu is not None or size > 2 ** 30:
+            _progress(f"processor: {len(groups)} weight groups, {'int8' if q8 else 'bfloat16'}, "
+                      f"{size / 2 ** 30:.1f} GB in {where}")
+        self.plan = dict(getattr(self, "plan", {}) or {})
+        self.plan["cpu"] = {"layers": sorted({int(k.split(".")[2]) for k in groups if k.startswith("model.layers.")}),
+                            "weights": "int8" if q8 else "bf16", "bytes": int(size), "in": where,
+                            "ram_total": total, "ram_available": avail, "note": note}
 
     def _mm(self, x, key, names):
         """[x @ W.T for each named weight]; one fused product on the GPU."""

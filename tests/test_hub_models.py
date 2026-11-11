@@ -468,6 +468,10 @@ class WholeNetworkOnGpu(unittest.TestCase):
                 for memory in ("ram", "disk"):
                     half = H.Model(td, gpu_layers=1, memory=memory)
                     self.assertIn("1 of 2 layers", half.device)
+                    plan = half.plan                              # where each part runs, and from where
+                    self.assertEqual((plan["gpu"]["layers"], plan["gpu"]["of"]), (1, 2))
+                    self.assertEqual(plan["cpu"]["layers"], [1])
+                    self.assertIn(plan["cpu"]["weights"], ("int8", "bf16"))
                     got = half.net.forward(np.array([ids]), half.net.new_cache(), 0)
                     np.testing.assert_allclose(got, want, atol=2e-3)
                     self.assertEqual(half.generate("hello", max_new_tokens=6),

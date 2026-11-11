@@ -557,6 +557,12 @@ class Hub:
 class Model:
     """A Hub model running natively: embed / classify / fill_mask / tokens / generate, depending on the model."""
 
+    @property
+    def plan(self):
+        """Where the model runs: {"gpu": {layers, of, bytes, tensor_cores, ...}, "cpu": {layers, weights, bytes, in,
+        ram_available, note}} — what was placed on the GPU, what runs on the processor and from where."""
+        return dict(getattr(self.net, "plan", {}) or {})
+
     def __init__(self, folder, name=None, device="auto", gpu_layers=None, memory="auto"):
         """memory: "ram" reads the weights into memory, "disk" maps them from the file (SSD) and decodes them as they
         are used, "auto" maps them only when the model is larger than half the free memory."""
@@ -580,6 +586,9 @@ class Model:
         self.last_tokens = 0
         if self.kind == "decoder":
             self.device, self.device_note = self.net.to_device(device, pending, gpu_layers)
+            if self.net.gpu is not None and getattr(self.net, "_gl", None) is not None and self.net._ng < self.net.L:
+                self.net._cm_for = self.net.gpu            # split: the processor's layers are made ready now, with
+                self.net._prepare_cpu()                    # progress lines, not silently at the first token
         if self.device == "cpu" and isinstance(weights, hub_models.Weights) and not weights.mapped:
             if not (self.kind == "decoder" and self.net._prepare_cpu()):
                 weights.decode_all(drop_raw=True)      # the processor works in float32: decode once, keep one copy
