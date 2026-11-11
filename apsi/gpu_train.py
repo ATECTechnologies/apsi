@@ -323,6 +323,14 @@ class Gpu(_Ops):
         self.sms = int(getattr(dev, "sms", 0) or 28)
         self._calls = {}
         self.profile = None                              # {kernel: (seconds, launches)} while profiling
+        self._pending = []
+        self._lib = lib
+        lib.cuEventRecord.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+        lib.cuEventElapsedTime.argtypes = [ctypes.POINTER(ctypes.c_float), ctypes.c_void_p, ctypes.c_void_p]
+        lib.cuEventDestroy_v2.argtypes = [ctypes.c_void_p]
+        lib.cuEventSynchronize.argtypes = [ctypes.c_void_p]
+        lib.cuEventCreate.argtypes = [ctypes.POINTER(ctypes.c_void_p), ctypes.c_uint]
+        lib.cuFuncGetAttribute.argtypes = [ctypes.POINTER(ctypes.c_int), ctypes.c_int, ctypes.c_void_p]
         self._launch = lib.cuLaunchKernel
 
     _CT = {"p": ctypes.c_uint64, "u": ctypes.c_uint32, "i": ctypes.c_int32, "f": ctypes.c_float}
@@ -338,18 +346,50 @@ class Gpu(_Ops):
                 self._calls.clear()
             hit = self._calls[key] = (objs, arr)
         self.dev.ensure()
-        if self.profile is not None:
-            self.sync()
-            t0 = time.perf_counter()
+        prof = self.profile is not None
+        if prof:                                         # CUDA events around the launch: the card's own clock
+            e0, e1 = self._event(), self._event()
+            self._lib.cuEventRecord(e0, None)
         r = self._launch(self.fn[name], max(1, gx), max(1, gy), max(1, gz), block, 1, 1, 0, None, hit[1], None)
-        if self.profile is not None:
-            self.sync()
-            key2 = name if name not in ("gemm_tc", "gemm_tc3", "gemm_simt") and not name.startswith("gemm_t") else \
+        if prof:
+            self._lib.cuEventRecord(e1, None)
+            label = name if not name.startswith("gemm") else \
                 f"{name} {args[4][1]}x{args[5][1]}x{args[6][1]}" + (f" b{gy}" if gy > 1 else "") + (f" k/{gz}" if gz > 1 else "")
-            t, c = self.profile.get(key2, (0.0, 0))
-            self.profile[key2] = (t + time.perf_counter() - t0, c + 1)
+            self._pending.append((label, e0, e1))
         if r:
             self.dev.drv.check(r, f"launching {name}")
+
+    def _event(self):
+        e = ctypes.c_void_p()
+        self.dev.drv.check(self._lib.cuEventCreate(ctypes.byref(e), 0), "cuEventCreate")
+        return e
+
+    def start_profile(self):
+        self.profile, self._pending = {}, []
+
+    def stop_profile(self):
+        """{kernel: (seconds on the card, launches)} since start_profile()."""
+        self.sync()
+        out = {}
+        ms = ctypes.c_float()
+        for label, e0, e1 in self._pending:
+            self._lib.cuEventElapsedTime(ctypes.byref(ms), e0, e1)
+            t, c = out.get(label, (0.0, 0))
+            out[label] = (t + ms.value / 1000.0, c + 1)
+            self._lib.cuEventDestroy_v2(e0)
+            self._lib.cuEventDestroy_v2(e1)
+        self.profile, self._pending = None, []
+        return out
+
+    def kernel_info(self):
+        """Registers per thread and static shared memory of every kernel (what limits how many run at once)."""
+        info = {}
+        v = ctypes.c_int()
+        for name, f in self.fn.items():
+            regs = self._lib.cuFuncGetAttribute(ctypes.byref(v), 4, f) == 0 and v.value
+            smem = self._lib.cuFuncGetAttribute(ctypes.byref(v), 1, f) == 0 and v.value
+            info[name] = {"registers": regs, "shared_bytes": smem}
+        return info
 
     def alloc(self, n):
         p = self.dev.alloc(4 * max(1, n))

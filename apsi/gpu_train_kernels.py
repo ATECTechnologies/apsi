@@ -780,6 +780,7 @@ def _tc_module():
 BM = BN = 128
 BK = 32
 PAD = 40                        # halves per shared-memory row: 80 bytes, so ldmatrix's 8 rows hit 8 different banks
+PADT = 136                      # rows of a transposed tile (k rows of 128 m or n): 272 bytes, conflict-free too
 TILED = ("gemm_tkn", "gemm_tkk", "gemm_tmn", "gemm_tmk")
 
 
@@ -815,6 +816,9 @@ def _tiled_module():
     ldm = ir.InlineAsm(ir.FunctionType(ir.LiteralStructType([i32] * 4), [i64]),
                        "ldmatrix.sync.aligned.m8n8.x4.shared.b16 {$0,$1,$2,$3}, [$4];", "=r,=r,=r,=r,l",
                        side_effect=True)
+    ldmt = ir.InlineAsm(ir.FunctionType(ir.LiteralStructType([i32] * 4), [i64]),
+                        "ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {$0,$1,$2,$3}, [$4];", "=r,=r,=r,=r,l",
+                        side_effect=True)
     red = ir.InlineAsm(ir.FunctionType(ir.VoidType(), [i64, f32]), "red.global.add.f32 [$0], $1;", "l,f",
                        side_effect=True)
     args = [("A", G(f32)), ("B", G(f32)), ("C", G(f32)), ("BIAS", G(f32)), ("M", i32), ("N", i32), ("K", i32),
@@ -924,11 +928,10 @@ def _tiled_module():
                     base = b.select(b.icmp_unsigned("==", buf, C(0)), A_BASE[0], A_BASE[1])
                 else:
                     base = b.select(b.icmp_unsigned("==", buf, C(0)), B_BASE[0], B_BASE[1])
-                h = b.add(base, b.add(b.mul(r, C(PAD)), c))
-                if kind in ("A", "B"):
-                    store_row4(h, hs)
-                else:
-                    store_col4(h, hs)
+                if kind in ("A", "B"):                # [m or n][k]: 4 consecutive k
+                    store_row4(b.add(base, b.add(b.mul(r, C(PAD)), c)), hs)
+                else:                                 # [k][m or n]: 4 consecutive m or n, stored the same way
+                    store_row4(b.add(base, b.add(b.mul(c, C(PADT)), r)), hs)
 
         accs = [[[var(F(0.0)) for _ in range(4)] for _ in range(4)] for _ in range(4)]
         put(fetch(C(0)), C(0))
@@ -949,20 +952,32 @@ def _tiled_module():
         abase = b.select(b.icmp_unsigned("==", buf, C(0)), A_BASE[0], A_BASE[1])
         bbase = b.select(b.icmp_unsigned("==", buf, C(0)), B_BASE[0], B_BASE[1])
         for ks in range(BK // 16):
+            l7, l8, l16 = b.and_(lane, C(7)), b.and_(b.lshr(lane, C(3)), C(1)), b.lshr(lane, C(4))
             afr = []
             for mt in range(4):
-                row = b.add(b.add(b.mul(wm, C(64)), C(mt * 16)), b.and_(lane, C(15)))
-                col = b.add(C(ks * 16), b.mul(b.lshr(lane, C(4)), C(8)))
-                addr = b.ptrtoint(sh_ptr(b.add(abase, b.add(b.mul(row, C(PAD)), col))), i64)
-                r = b.call(ldm, [addr])
+                if a_kc:                              # [m][k]: rows of A
+                    row = b.add(b.add(b.mul(wm, C(64)), C(mt * 16)), b.and_(lane, C(15)))
+                    col = b.add(C(ks * 16), b.mul(l16, C(8)))
+                    addr = b.ptrtoint(sh_ptr(b.add(abase, b.add(b.mul(row, C(PAD)), col))), i64)
+                    r = b.call(ldm, [addr])
+                else:                                 # [k][m]: transposed while loading
+                    krow = b.add(C(ks * 16), b.add(l7, b.mul(l16, C(8))))
+                    mcol = b.add(b.add(b.mul(wm, C(64)), C(mt * 16)), b.mul(l8, C(8)))
+                    addr = b.ptrtoint(sh_ptr(b.add(abase, b.add(b.mul(krow, C(PADT)), mcol))), i64)
+                    r = b.call(ldmt, [addr])
                 afr.append([b.extract_value(r, j) for j in range(4)])
             bfr = []
             for pr in range(2):
-                nrow = b.add(b.add(b.mul(wn, C(32)), C(pr * 16)),
-                             b.add(b.and_(lane, C(7)), b.mul(b.lshr(lane, C(4)), C(8))))
-                col = b.add(C(ks * 16), b.mul(b.and_(b.lshr(lane, C(3)), C(1)), C(8)))
-                addr = b.ptrtoint(sh_ptr(b.add(bbase, b.add(b.mul(nrow, C(PAD)), col))), i64)
-                r = b.call(ldm, [addr])
+                if b_kc:                              # [n][k]
+                    nrow = b.add(b.add(b.mul(wn, C(32)), C(pr * 16)), b.add(l7, b.mul(l16, C(8))))
+                    col = b.add(C(ks * 16), b.mul(l8, C(8)))
+                    addr = b.ptrtoint(sh_ptr(b.add(bbase, b.add(b.mul(nrow, C(PAD)), col))), i64)
+                    r = b.call(ldm, [addr])
+                else:                                 # [k][n], transposed while loading
+                    krow = b.add(C(ks * 16), b.add(l7, b.mul(l8, C(8))))
+                    ncol = b.add(b.add(b.mul(wn, C(32)), C(pr * 16)), b.mul(l16, C(8)))
+                    addr = b.ptrtoint(sh_ptr(b.add(bbase, b.add(b.mul(krow, C(PADT)), ncol))), i64)
+                    r = b.call(ldmt, [addr])
                 q = [b.extract_value(r, j) for j in range(4)]
                 bfr += [[q[0], q[1]], [q[2], q[3]]]
             for mt in range(4):
