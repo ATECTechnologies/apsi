@@ -192,9 +192,9 @@ def governor(dev):
         g.read_power = watts
         g.power_note = _power_limit(lib, h)
         if g.power_note is None:
-            g.power = _PowerControl.try_make(lib, h)       # administrator: steer the power limit, not pauses
+            g.power = _PowerControl.try_make(lib, h, key)  # steer the power limit, not pauses (when allowed)
             if g.power is not None:
-                g.power_note = "temperature held by the power limit (no pauses)"
+                g.power_note = f"temperature held by the power limit, {g.power.via} (no pauses)"
         return g
 
 
@@ -290,7 +290,8 @@ class _PowerControl:
     original limit is put back at exit."""
 
     @staticmethod
-    def try_make(lib, h):
+    def try_make(lib, h, index=0):
+        """Directly (this program is an administrator), or through the GPU helper (apsi gpu setup, once)."""
         if os.environ.get("APSI_GPU_POWER_CONTROL", "1").strip().lower() in ("0", "off", "no", "false"):
             return None
         cur, dflt, lo, hi = ctypes.c_uint(), ctypes.c_uint(), ctypes.c_uint(), ctypes.c_uint()
@@ -299,18 +300,26 @@ class _PowerControl:
                     lib.nvmlDeviceGetPowerManagementDefaultLimit(h, ctypes.byref(dflt)) or \
                     lib.nvmlDeviceGetPowerManagementLimitConstraints(h, ctypes.byref(lo), ctypes.byref(hi)):
                 return None
-            if lib.nvmlDeviceSetPowerManagementLimit(h, ctypes.c_uint(cur.value)) != 0:   # allowed at all?
-                return None
+            direct = lib.nvmlDeviceSetPowerManagementLimit(h, ctypes.c_uint(cur.value)) == 0
         except AttributeError:
             return None
         pc = _PowerControl()
-        pc.lib, pc.h = lib, h
+        if direct:
+            pc.set = lambda mw: lib.nvmlDeviceSetPowerManagementLimit(h, ctypes.c_uint(int(mw)))
+            pc.via = "directly"
+        else:
+            from . import gpu_helper
+            st = gpu_helper.call("status", gpu=index)
+            if not st or not st.get("ok"):
+                return None
+            pc.set = lambda mw: gpu_helper.call("set", gpu=index, mw=int(mw))
+            pc.via = "through the GPU helper"
         pc.orig = cur.value
         pc.top = dflt.value
         pc.floor = max(lo.value, int(dflt.value * 0.55))
         pc.limit = float(cur.value)
         import atexit
-        atexit.register(lambda: lib.nvmlDeviceSetPowerManagementLimit(h, ctypes.c_uint(pc.orig)))
+        atexit.register(lambda: pc.set(pc.orig))
         return pc
 
     def step(self, err, dt):
@@ -318,7 +327,7 @@ class _PowerControl:
         new = min(self.top, max(self.floor, self.limit - (4000.0 * err * dt + 1500.0 * err * (err > 0))))
         if abs(new - self.limit) >= 1000.0 or new in (self.top, self.floor):
             if int(new) != int(self.limit):
-                self.lib.nvmlDeviceSetPowerManagementLimit(self.h, ctypes.c_uint(int(new)))
+                self.set(int(new))
         self.limit = new
         return new <= self.floor + 1.0                 # at the floor: pauses may still be needed
 
@@ -436,12 +445,19 @@ def set_power(spec, index=None):
             mw = int(dflt.value * float(sp.rstrip("%")) / 100.0)
         mw = max(lo.value, min(hi.value, mw))
         r = lib.nvmlDeviceSetPowerManagementLimit(h, ctypes.c_uint(mw))
+        if r == 4:                                      # not an administrator: the GPU helper, when set up
+            from . import gpu_helper
+            hr = gpu_helper.call("default" if sp == "default" else "set", gpu=i, mw=mw)
+            if hr and hr.get("ok"):
+                msgs.append(f"GPU {i}: power limit {hr['mw'] / 1000:.0f} W (through the GPU helper)")
+                continue
         if r == 0:
             msgs.append(f"GPU {i}: power limit {mw / 1000:.0f} W (default {dflt.value / 1000:.0f} W) until the next "
                         "restart")
         elif r == 4:
-            msgs.append(f"GPU {i}: needs an administrator — open a terminal with 'Run as administrator' (Windows) or "
-                        "use sudo (Linux), run this once; it then holds for every program until the computer restarts")
+            msgs.append(f"GPU {i}: needs an administrator once: 'apsi gpu setup' from a terminal opened as "
+                        "administrator (or with sudo) installs the GPU helper, and from then on no program needs "
+                        "administrator rights for this")
         else:
             msgs.append(f"GPU {i}: the driver refused (NVML error {r})")
     return msgs
@@ -449,13 +465,18 @@ def set_power(spec, index=None):
 
 def add_parser(sub):
     p = sub.add_parser("gpu", help="the NVIDIA cards now: temperature, power, clocks; set a power limit")
-    p.add_argument("what", nargs="?", default="status", choices=["status", "power", "watch"])
+    p.add_argument("what", nargs="?", default="status", choices=["status", "power", "watch", "setup", "remove"])
     p.add_argument("value", nargs="?", default=None, help="for power: 80%% (of the default), 130W or default")
     p.add_argument("--gpu", type=int, default=None)
     p.set_defaults(fn=_cmd)
 
 
 def _cmd(args):
+    if args.what in ("setup", "remove"):
+        from . import gpu_helper
+        for m in (gpu_helper.setup(args.value) if args.what == "setup" else gpu_helper.remove()):
+            print(m)
+        return 0
     if args.what == "power":
         if not args.value:
             print("apsi gpu power 80%   (or 130W, or default)")

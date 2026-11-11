@@ -16,6 +16,9 @@
 - **GPU temperature control:** long training, long answers and busy servers keep the card near 77 °C (75–78) by
   pacing the work while it is above the band (the driver's NVML gives the temperature); a cool card is never slowed.
   `APSI_GPU_TEMP=72` / `off`; `r.gpu_temperature`, `/metrics`, `hub.gpu_status()`.
+- **Steady speed at a steady temperature:** with the right to set the card's power limit Apsi holds the temperature
+  with it (PI control, no pauses); `apsi gpu setup` (once) installs a helper so no program ever needs to run as
+  administrator for that; `apsi gpu` / `apsi gpu watch` / `apsi gpu power 80%`.
 - **A model works from any thread:** every call to the card makes its context current on the calling thread first.
   (Before, a server's request threads could not use the card and the model quietly moved to the processor.)
 - **`docs/GPU.md`:** everything on NVIDIA cards in one guide — formats, training, serving, temperature, measured

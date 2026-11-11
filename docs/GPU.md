@@ -166,6 +166,12 @@ speed falls as far as the cooler needs (on the RTX 3060 in a small case: from 14
 the card is warm). `APSI_GPU_POWER_CONTROL=0` keeps pauses only. Better airflow or a higher fan curve gives the speed
 back in both cases.
 
+**Never as administrator again: `apsi gpu setup` (once).** It installs a small helper that Windows' Task Scheduler
+(or systemd on Linux) starts at every logon with administrator rights; its only job is to set the power limit when
+an Apsi program asks (localhost only, with a key only your account can read, never above the card's default). From
+then on every Apsi program holds the temperature by the power limit without administrator rights. `apsi gpu setup 80%`
+also applies 80 % at every logon; `apsi gpu remove` takes it all away and restores the default.
+
 **Once per start of the computer: `apsi gpu power 80%`.** Run it once from a terminal opened as administrator (or
 with sudo): the card keeps that limit for every program until the computer or the driver restarts, so Apsi (and
 everything else) runs cooler at almost full speed without administrator rights afterwards. `apsi gpu power default`
