@@ -231,7 +231,7 @@ class RealGpu(unittest.TestCase):
             pair(np.zeros(M * K))
         for act in (0, 1, 2):
             for dv, i in ((g, 0), (e, 1)):
-                dv.gemm(Hm[i], Dy[i], Wg[i], K, N, M, 1, K, N, 1, N, a_act=act, tmp=(tmp[i][0], M * K))
+                dv.gemm(Hm[i], Dy[i], Wg[i], K, N, M, 1, K, N, 1, N, a_act=act, tmp=(tmp[i], M * K))
             a, b_ = g.get(Wg[0][0], K * N), e.get(Wg[1][0], K * N)
             self.assertLess(np.abs(a - b_).max() / (np.abs(b_).max() + 1e-9), 3e-3, ("a_act", act))
         # attention heads: batched, offsets inside the rows
