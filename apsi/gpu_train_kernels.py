@@ -808,11 +808,53 @@ def _act_ir(b, x, kind, F, C, ex2_f):
     return f, d
 
 
+def _act_one(b, x, j, F, ex2_f, deriv):
+    """f(x) (or f'(x)) of the one activation numbered j."""
+    def exp(v):
+        return b.call(ex2_f, [b.fmul(v, F(LOG2E))])
+
+    def tanh(v):
+        return b.fsub(F(1.0), b.fdiv(F(2.0), b.fadd(exp(b.fmul(F(2.0), v)), F(1.0))))
+    pos = b.fcmp_ordered(">", x, F(0.0))
+    if j == 0:
+        return b.select(pos, F(1.0), F(0.0)) if deriv else b.select(pos, x, F(0.0))
+    if j == 1:
+        c = 0.7978845608028654
+        t = tanh(b.fmul(F(c), b.fadd(x, b.fmul(F(0.044715), b.fmul(x, b.fmul(x, x))))))
+        if not deriv:
+            return b.fmul(b.fmul(F(0.5), x), b.fadd(F(1.0), t))
+        return b.fadd(b.fmul(F(0.5), b.fadd(F(1.0), t)),
+                      b.fmul(b.fmul(b.fmul(F(0.5), x), b.fsub(F(1.0), b.fmul(t, t))),
+                             b.fmul(F(c), b.fadd(F(1.0), b.fmul(F(3 * 0.044715), b.fmul(x, x))))))
+    if j in (2, 4):
+        sg = b.fdiv(F(1.0), b.fadd(F(1.0), exp(b.fsub(F(0.0), x))))
+        if j == 2:
+            return b.fadd(sg, b.fmul(x, b.fmul(sg, b.fsub(F(1.0), sg)))) if deriv else b.fmul(x, sg)
+        return b.fmul(sg, b.fsub(F(1.0), sg)) if deriv else sg
+    if j == 3:
+        th = tanh(x)
+        return b.fsub(F(1.0), b.fmul(th, th)) if deriv else th
+    if j == 5:
+        return F(1.0) if deriv else x
+    return b.select(pos, F(1.0), F(0.01)) if deriv else b.select(pos, x, b.fmul(F(0.01), x))
+
+
+def _act_switch(b, x, kind, F, C, ex2_f, deriv, var):
+    """Only the activation in use is computed (a branch per kind; every thread takes the same one)."""
+    out = var(x)
+    for j in range(7):
+        with b.if_then(b.icmp_unsigned("==", kind, C(j))):
+            b.store(_act_one(b, x, j, F, ex2_f, deriv), out)
+    return b.load(out)
+
+
 BM = BN = 128
 BK = 32
 PAD = 40                        # halves per shared-memory row: 80 bytes, so ldmatrix's 8 rows hit 8 different banks
 PADT = 136                      # rows of a transposed tile (k rows of 128 m or n): 272 bytes, conflict-free too
 TILED = ("gemm_tkn", "gemm_tkk", "gemm_tmn", "gemm_tmk")
+# products with a last step compiled in: x W + b -> act (forward), dy W^T * act'(h) (backward), x W + b + residual
+EPI_KERNELS = (("gemm_tkn_e1", True, False, 1), ("gemm_tkk_e2", True, True, 2), ("gemm_tkn_e3", True, False, 3))
 
 
 def _tiled_module():
@@ -860,7 +902,7 @@ def _tiled_module():
     # epi (after alpha, bias and beta): 1 = X2 <- v, C <- act(v) (a linear layer and its activation in one pass);
     # 2 = C <- v * act'(X2) (the backward pass through that activation); 3 = C <- v + X2 (a residual connection)
 
-    def kernel(name, a_kc, b_kc):
+    def kernel(name, a_kc, b_kc, epi_mode=0):
         fn = ir.Function(m, ir.FunctionType(ir.VoidType(), [t for _, t in args]), name=name)
         fn.calling_convention = "ptx_kernel"
         p = {n: a for (n, _), a in zip(args, fn.args)}
@@ -1047,17 +1089,17 @@ def _tiled_module():
                             with other:
                                 with b.if_then(b.icmp_unsigned("!=", p["beta"], C(0))):
                                     b.store(b.fadd(b.load(tmp), b.load(ptr, align=4)), tmp)
-                                with b.if_then(b.icmp_unsigned("!=", p["epi"], C(0))):
+                                if epi_mode:              # this kernel's own last step, compiled in
                                     xp = b.gep(p["X2"], [idx], inbounds=True)
                                     vv = b.load(tmp)
-                                    epi = p["epi"]
-                                    with b.if_then(b.icmp_unsigned("==", epi, C(1))):
+                                    if epi_mode == 1:
                                         b.store(vv, xp, align=4)
-                                    xin = b.select(b.icmp_unsigned("==", epi, C(1)), vv, b.load(xp, align=4))
-                                    fv, dv = _act_ir(b, xin, p["act"], F, C, ex2_f)
-                                    out = b.select(b.icmp_unsigned("==", epi, C(1)), fv,
-                                                   b.select(b.icmp_unsigned("==", epi, C(2)), b.fmul(vv, dv),
-                                                            b.fadd(vv, xin)))
+                                        out = _act_switch(b, vv, p["act"], F, C, ex2_f, False, var)
+                                    elif epi_mode == 2:
+                                        out = b.fmul(vv, _act_switch(b, b.load(xp, align=4), p["act"], F, C, ex2_f,
+                                                                     True, var))
+                                    else:
+                                        out = b.fadd(vv, b.load(xp, align=4))
                                     b.store(out, tmp)
                                 b.store(b.load(tmp), ptr, align=4)
         b.ret_void()
@@ -1066,6 +1108,8 @@ def _tiled_module():
     kernel("apsi_kernel", True, False)            # = gemm_tkn: x @ W
     for name, a_kc, b_kc in (("gemm_tkk", True, True), ("gemm_tmn", False, False), ("gemm_tmk", False, True)):
         kernel(name, a_kc, b_kc)
+    for name, a_kc, b_kc, e in EPI_KERNELS:
+        kernel(name, a_kc, b_kc, e)
     return _emit(m, "sm_80")
 
 
@@ -1108,11 +1152,12 @@ def _flash_module():
     def build(name, hd, backward):
         SP = hd + 8
         TILE = BQ * SP
-        ntile = 5 if backward else 3
-        sm = ir.GlobalVariable(m, ir.ArrayType(i16, ntile * TILE), f"{name}_s", addrspace=3)
+        SPS = BQ + 8                  # rows of dS^T: 64 queries (+8), whatever the head size
+        halves = 4 * TILE + BQ * SPS if backward else 3 * TILE
+        sm = ir.GlobalVariable(m, ir.ArrayType(i16, halves), f"{name}_s", addrspace=3)
         sm.linkage = "internal"
         sm.align = 16
-        sm.initializer = ir.Constant(ir.ArrayType(i16, ntile * TILE), None)
+        sm.initializer = ir.Constant(ir.ArrayType(i16, halves), None)
         smf = ir.GlobalVariable(m, ir.ArrayType(f32, 2 * BQ), f"{name}_f", addrspace=3)
         smf.linkage = "internal"
         smf.align = 16
@@ -1151,7 +1196,8 @@ def _flash_module():
             return b.or_(rne(x0), b.shl(rne(x1), C(16)))
 
         def shp(tile, row, col):
-            return b.gep(sm, [C(0), b.add(C(tile * TILE), b.add(b.mul(row, C(SP)), col))], inbounds=True)
+            stride = SPS if (backward and tile == 4) else SP
+            return b.gep(sm, [C(0), b.add(C(tile * TILE), b.add(b.mul(row, C(stride)), col))], inbounds=True)
 
         def fp(i):
             return b.gep(smf, [C(0), i], inbounds=True)
@@ -1395,36 +1441,30 @@ def _flash_module():
         b.ret_void()
         ab.branch(top)
 
-    # D[z, t] = sum over the head of dO * O, one thread a row
+    # D[z, t] = sum over the head of dO * O: a warp a row (the 32 lanes read the row together), 4 rows a block
     fn = ir.Function(m, ir.FunctionType(ir.VoidType(), [G(f32), G(f32), G(f32), i32, i32, i32, i32, i32]),
                      name="apsi_kernel")
     fn.calling_convention = "ptx_kernel"
     DO_, O_, DD_, T_, D_, H_, hd_, rows_ = fn.args
     b = ir.IRBuilder(fn.append_basic_block("e"))
-    accv = b.alloca(f32)
-    jv = b.alloca(i32)
-    i = b.add(b.mul(b.call(g.ctax_f, []), C(128)), b.call(g.tid_f, []))
+    tid = b.call(g.tid_f, [])
+    lane = b.and_(tid, C(31))
+    i = b.add(b.mul(b.call(g.ctax_f, []), C(4)), b.lshr(tid, C(5)))
     with b.if_then(b.icmp_unsigned("<", i, rows_)):
         zz, t = b.udiv(i, T_), b.urem(i, T_)
         bs = b.add(b.mul(b.zext(b.udiv(zz, H_), i64), b.mul(b.zext(T_, i64), b.zext(D_, i64))),
                    b.zext(b.add(b.mul(b.urem(zz, H_), hd_), b.mul(t, D_)), i64))
-        b.store(F(0.0), accv)
-        b.store(C(0), jv)
-        head = fn.append_basic_block("h")
-        bod = fn.append_basic_block("b")
-        end = fn.append_basic_block("x")
-        b.branch(head)
-        b.position_at_end(head)
-        j = b.load(jv)
-        b.cbranch(b.icmp_unsigned("<", j, hd_), bod, end)
-        b.position_at_end(bod)
-        gi = b.add(bs, b.zext(j, i64))
-        b.store(b.fadd(b.load(accv), b.fmul(b.load(b.gep(DO_, [gi], inbounds=True), align=4),
-                                             b.load(b.gep(O_, [gi], inbounds=True), align=4))), accv)
-        b.store(b.add(j, C(1)), jv)
-        b.branch(head)
-        b.position_at_end(end)
-        b.store(b.load(accv), b.gep(DD_, [b.zext(i, i64)], inbounds=True), align=4)
+        acc = F(0.0)
+        for j in range(4):                            # head sizes up to 128
+            col = b.add(lane, C(32 * j))
+            ok = b.icmp_unsigned("<", col, hd_)
+            gi = b.add(bs, b.zext(b.select(ok, col, C(0)), i64))
+            prod = b.fmul(b.load(b.gep(DO_, [gi], inbounds=True), align=4), b.load(b.gep(O_, [gi], inbounds=True), align=4))
+            acc = b.fadd(acc, b.select(ok, prod, F(0.0)))
+        for k in (16, 8, 4, 2, 1):
+            acc = b.fadd(acc, b.call(shfl_f, [C(-1), acc, C(k), C(31)]))
+        with b.if_then(b.icmp_unsigned("==", lane, C(0))):
+            b.store(acc, b.gep(DD_, [b.zext(i, i64)], inbounds=True), align=4)
     b.ret_void()
     for hd in FLASH_HD:
         build(f"flash_f{hd}", hd, False)

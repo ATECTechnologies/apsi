@@ -89,20 +89,22 @@ class Governor:
         self.last_read = now
 
     def tick(self, sync=None):
-        """Call after each piece of work. Waits when the card should cool down; `sync` (optional) is called first so
-        that the waiting is real time off for the card, not time while queued work still runs."""
+        """Call after each piece of work. Waits when the card should cool down; `sync` (optional) first waits for
+        the work queued on the card, so the pause is real time off for the card and its length matches the work."""
         now = time.monotonic()
         with self.lock:
             if now - self.last_read >= self.PERIOD:
                 self._adjust(now)
-            work = 0.0 if self.last_tick is None else min(now - self.last_tick, 2.0)
             frac = self.fraction
-        if frac > 0.0 and work > 0.0:
+        if frac > 0.0:
             if sync is not None:
                 sync()
-            wait = work * frac / (1.0 - frac)
-            time.sleep(wait)
-            self.paced += wait
+                now = time.monotonic()
+            work = 0.0 if self.last_tick is None else min(now - self.last_tick, 2.0)
+            if work > 0.0:
+                wait = work * frac / (1.0 - frac)
+                time.sleep(wait)
+                self.paced += wait
         self.last_tick = time.monotonic()
 
     def status(self):

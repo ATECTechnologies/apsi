@@ -212,13 +212,16 @@ class RealGpu(unittest.TestCase):
                 check(256, 384, 2048, ta, tb)                      # split k into a cleared C
         # the last step fused in: activation (and its pre-activation kept), its derivative, a residual
         M, N, K = 256, 384, 128
-        A, Bm = pair(rng.normal(size=(M, K))), pair(rng.normal(size=(K, N)))
+        A, Bm, Bt = pair(rng.normal(size=(M, K))), pair(rng.normal(size=(K, N))), pair(rng.normal(size=(N, K)))
         X2, Cc = pair(rng.normal(size=(M, N))), pair(np.zeros((M, N)))
         bias = pair(rng.normal(size=N))
         for epi in (1, 2, 3):
             for act in (0, 1, 2):
                 for dv, i in ((g, 0), (e, 1)):
-                    dv.gemm(A[i], Bm[i], Cc[i], M, N, K, K, 1, N, 1, N, bias=bias[i], epi=epi, X2=X2[i], act=act)
+                    if epi == 2:                       # as in backward: dy W^T, W read transposed
+                        dv.gemm(A[i], Bt[i], Cc[i], M, N, K, K, 1, 1, K, N, epi=epi, X2=X2[i], act=act)
+                    else:
+                        dv.gemm(A[i], Bm[i], Cc[i], M, N, K, K, 1, N, 1, N, bias=bias[i], epi=epi, X2=X2[i], act=act)
                 for view, what in ((Cc, "C"), (X2, "X2")):
                     a, b_ = g.get(view[0][0], M * N), e.get(view[1][0], M * N)
                     err = np.abs(a - b_).max() / (np.abs(b_).max() + 1e-9)

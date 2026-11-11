@@ -374,7 +374,7 @@ class Gpu(_Ops):
         if self.tc and os.environ.get("APSI_TILED", "1").strip() not in ("0", "false", "no"):
             try:                                         # shared-memory tiles: the fast products
                 tmod, self.fn["gemm_tkn"] = dev.load("apsi-train-tiled-1", KS.ptx("tiled"))
-                for name in KS.TILED[1:]:
+                for name in KS.TILED[1:] + tuple(e[0] for e in KS.EPI_KERNELS):
                     f = ctypes.c_void_p()
                     dev.drv.check(lib.cuModuleGetFunction(ctypes.byref(f), tmod, name.encode()), "cuModuleGetFunction")
                     self.fn[name] = f
@@ -581,7 +581,7 @@ class Gpu(_Ops):
 
     def flash_dot(self, DO, O, DD, B, T, H, hd):
         rows = B * H * T
-        self._go("flash_dot", -(-rows // 128), 128, self.p(DO), self.p(O), self.p(DD), ("u", T), ("u", H * hd),
+        self._go("flash_dot", -(-rows // 4), 128, self.p(DO), self.p(O), self.p(DD), ("u", T), ("u", H * hd),
                  ("u", H), ("u", hd), ("u", rows))
 
     def flash_bwd(self, Q, K, V, DO, L, DD, DQ, DK, DV, B, T, H, hd, causal, scale):
@@ -622,8 +622,10 @@ class Gpu(_Ops):
     def _gemm(self, A, B, Cv, bias, M, N, K, sam, sak, sbk, sbn, ldc, nb1, nb2, sa, sb, sc, alpha, beta, passes,
               epi=0, X2=None, act=0):
         name = self._tiled_ok(A, B, M, N, K, sam, sak, sbk, sbn, sa, sb) if self.tiled and passes == 1 else None
-        if epi and (name is None or ldc != N or nb1 * nb2 != 1):
-            return False
+        if epi:
+            if name is None or ldc != N or nb1 * nb2 != 1 or f"{name}_e{epi}" not in self.fn:
+                return False
+            name = f"{name}_e{epi}"
         if name is not None:
             tiles = ((M + KS.BM - 1) // KS.BM) * ((N + KS.BN - 1) // KS.BN)
             nz, kchunk = 1, K
@@ -1222,6 +1224,7 @@ def fit(model, params, X, y=None, loss="mse", opt=None, epochs=10, batch_size=No
     history, val_hist, step = [], [], 0
     from . import thermal
     gov = thermal.governor(getattr(ops, "dev", None))        # keeps the card near APSI_GPU_TEMP (77 C)
+    paced0 = (gov.status() or {}).get("paced_s") or 0.0
     wd = float(getattr(opt, "wd", 0.0)) if isinstance(opt, AdamW) else 0.0
     try:
         for ep in range(int(epochs)):
@@ -1285,6 +1288,8 @@ def fit(model, params, X, y=None, loss="mse", opt=None, epochs=10, batch_size=No
                 ops.free(bf)
         net.close()
     temp = gov.status()
+    if temp:
+        temp = dict(temp, paced_s=round(temp["paced_s"] - paced0, 1))     # this run's pauses only
     if verbose and temp and temp["paced_s"]:
         print(f"GPU kept near {temp['target_c']:.0f} C (highest {temp['max_c']:.0f} C, paced {temp['paced_s']} s)")
     return Record(params=out_params, history=history, val_history=val_hist, gpu_memory_mb=round(peak / 2 ** 20),
