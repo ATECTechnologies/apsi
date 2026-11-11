@@ -1,4 +1,4 @@
-"""Build and run the heavy CPU benchmarks in Apsi, C, C++, Rust, Go and Mojo with one command; check that every
+"""Build and run the heavy CPU benchmarks in Apsi, C, C++, Rust, Go, Java, JavaScript, C#, Julia and Mojo with one command; check that every
 language computed the same answer; write results.json and results.md.
 
     python3 benchmarks/heavy/run.py                      everything that is installed, live table in the terminal

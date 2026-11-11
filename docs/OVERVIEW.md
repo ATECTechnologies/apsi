@@ -199,7 +199,7 @@ is final: it is the first build of the project, completed with 2.4.4; later vers
 
 - [`WHATS-NEW.md`](WHATS-NEW.md) — **everything new in 2.4.4**, with examples, measurements and limits
 - [`GETTING-STARTED.md`](GETTING-STARTED.md) — install, first program, first model, first library
-- [`NATIVE.md`](NATIVE.md) — **native code**: `@native`, `parallel for`, `@gpu`, benchmarks against C, C++, Rust, Go and Mojo
+- [`NATIVE.md`](NATIVE.md) — **native code**: `@native`, `parallel for`, `@gpu`, benchmarks against C, C++, Rust, Go, Java, JavaScript, C#, Julia and Mojo
 - [`LIBRARIES.md`](LIBRARIES.md) — `.apsil` libraries: install, create, pack, publish, the registry API
 - [`RL.md`](RL.md) — reinforcement learning and learning from preferences
 - [`SCALE.md`](SCALE.md) — planning 21B–2T-parameter training runs (`apsi plan`, `use scale`)

@@ -131,12 +131,12 @@ def bf16(a):
     return u.view(np.float32)
 
 
-def tiny_llama(folder, kind="llama", ctx=64, window=None, exact=False, dtype="F32"):
+def tiny_llama(folder, kind="llama", ctx=64, window=None, exact=False, dtype="F32", hd=16, inter=32):
     rng = np.random.default_rng(1)
     G = "Ġ"
     vocab = ["<s>", "</s>", "h", "e", "l", "o", G, "w", "r", "d", "he", "ll", "hell", "hello", G + "w", "or",
              G + "wor", "ld", G + "world", "!"]
-    V, Hd, nh, kvh, I, L = len(vocab), 16, 4, 2, 32, 2
+    V, Hd, nh, kvh, I, L = len(vocab), hd, 4, 2, inter, 2
     dh = Hd // nh
     W = {"model.embed_tokens.weight": rnd(rng, V, Hd), "model.norm.weight": 1 + rnd(rng, Hd, s=0.1)}
     for i in range(L):

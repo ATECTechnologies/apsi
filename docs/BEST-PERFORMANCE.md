@@ -81,7 +81,7 @@ SI numbers. You keep the safety and pay nothing in the inner loop.
 apsi bench app.apsi            # repeated timed runs
 apsi native explain app.apsi   # which functions are native, and why not
 apsi native asm app.apsi FN    # the machine code, if you want to see it
-python3 benchmarks/heavy/run.py     # compare with C, C++, Rust, Go and Mojo on your machine — live table
+python3 benchmarks/heavy/run.py     # compare with C, C++, Rust, Go, Java, JavaScript, C#, Julia and Mojo on your machine — live table
 ```
 
 **Why:** the slow part is rarely where it seems. Two minutes with `apsi bench` saves hours of rewriting the wrong

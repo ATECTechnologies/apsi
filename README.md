@@ -98,8 +98,14 @@ Then read [Getting started](docs/GETTING-STARTED.md) (15 minutes) or [Write Apsi
 * **Memory.** Arrays that move to the SSD instead of running out of RAM, container-aware limits, memory-pressure
   reactions, reusable buffers, flat-memory streaming of files larger than RAM, OOM-safe batches, data-parallel
   training on several processes (`use memory`, `fit(workers=…)`).
-* **Hugging Face without Python.** Download models with an access token and run them natively — embeddings,
-  classification and named entities (BERT family), text generation (GPT-2, Llama, Mistral, Qwen, Gemma) (`use hub`).
+* **Language models on your GPU, no install.** Hugging Face models (BERT family, GPT-2, Llama, Mistral, Qwen, Gemma)
+  run natively; on NVIDIA cards only the display driver is needed. On an RTX 3060: Qwen2.5-0.5B at about 190 tokens/s,
+  3B at 47 (82 % of what the card's memory allows), a 14B model split across GPU and RAM by itself; tensor cores for
+  prompts, a float16 cache, int8 weights on the processor, `lm.plan` to see where everything runs (`use hub`).
+* **Logs, settings, checkpoints.** `use log` and `apsi log`; `use config` (TOML/JSON/YAML/INI/.env, layered,
+  overridable, checked); `save_checkpoint` with optimizer state in one file or shards; `diagnose()` for models built
+  from scratch; `data.text_dataset` for training text in any shape; `apsi cache`.
+* **Several versions side by side.** 2.4.4, 2.5 … each in its own folder; `apsi versions`, `apsi use 2.4.4`.
 * **Every number format down to FP8.** f64, f32, f16, bf16, FP8 and int8 tensors in `@native` and `@gpu` code:
   stored small, computed in f32, rounded correctly — bit-identical to NumPy and ml_dtypes.
 * **Graphs that reach far.** Graph transformers, global attention (one hop to any node), k-hop and mixed-hop layers.
@@ -119,6 +125,8 @@ Then read [Getting started](docs/GETTING-STARTED.md) (15 minutes) or [Write Apsi
   Redis and SQLite clients with no driver to install (`use db`).
 * **Web.** An HTTP server 2.4–2.7× faster than 2.0.0 per process (about 7.5× with `processes="auto"`), WebSocket routes and rooms, `.env` files and secrets.
 * **Tools.** A debugger, a 32 % faster cold compile, and the Apsi License 2.0, which allows commercial use.
+* **Speed.** 4.21× faster than 2.0.0 on the same programs; on eight CPU programs 0.83× the time of C (C++ 0.88×,
+  Rust 1.07×, Julia 1.22×, Java 1.66×, Go 2.75×, C# 2.89×, JavaScript 3.56×) — [benchmarks](https://github.com/ATECTechnologies/apsi/tree/main/benchmarks).
 
 Details, examples and measurements: [`docs/WHATS-NEW.md`](docs/WHATS-NEW.md) · every change: [`CHANGELOG.md`](CHANGELOG.md).
 
@@ -152,7 +160,7 @@ apsi/native/   the native compiler (LLVM) and GPU code generation
 docs/          documentation (also published on apsi.dev)
 examples/      runnable examples, also used as tests
 tests/         the test suite (python -m unittest discover tests; apsi test tests/apsi examples)
-benchmarks/    benchmark programs in Apsi, C, C++, Rust, Go, Mojo, plus pandas, Node.js and Python comparisons
+benchmarks/    benchmark programs in Apsi, C, C++, Rust, Go, Java, JavaScript, C#, Julia, Mojo, plus pandas, Node.js and Python comparisons
 editors/       editor extensions (VS Code family, Sublime Text, Vim, Notepad++ …)
 installer/     the Windows setup wizard;  packaging/  wheel, .deb and Linux installer builders
 playground/    the WebAssembly playground

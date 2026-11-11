@@ -22,7 +22,10 @@ guide.
 | GPU | one thread per element, automatic CPU/GPU choice, Tensor Cores through cuBLAS | [Native](NATIVE.md) |
 | Matrix products | loops written the textbook way run on BLAS: 4–11× faster than C loops | [Performance](PERFORMANCE.md#matrix-products-written-as-loops) |
 | Same speed everywhere | SIMD lanes written by Apsi itself; `@native("fma")` | [below](#16-the-same-speed-on-every-processor) |
-| Speed overall | 3.84–7.31× faster than 2.0.0 on the same programs (geometric mean) | [below](#how-much-faster-than-200) |
+| Speed overall | 4.21× faster than 2.0.0 on the same programs (geometric mean) | [below](#how-much-faster-than-200) |
+| Language models on your GPU | Qwen2.5-0.5B at ~190 tokens/s, 3B at 47, 14B split across GPU and RAM, only the display driver needed | [below](#17-language-models-on-your-gpu-and-processor) |
+| Logs, settings, checkpoints | `use log`, `use config`, `save_checkpoint`, `diagnose()`, `apsi cache` | [below](#18-logs-settings-checkpoints-and-diagnosis) |
+| Several versions side by side | 2.4.4, 2.5 … installed next to each other; `apsi versions`, `apsi use` | [below](#19-several-versions-side-by-side) |
 
 ## 1. Python, exactly
 
@@ -294,32 +297,99 @@ From the start of the work to now, on the same AMD EPYC 7763: n-body **4.0×**, 
 and compiling **1.21×** faster, and no row slower. Numbers from different GitHub runs are not comparable with each
 other: GitHub picks the processor, and the same C program takes 14 ms on one runner model and 44 ms on another.
 
+## 17. Language models on your GPU and processor
+
+`use hub` runs Hugging Face decoders on NVIDIA cards with only the display driver: kernels are written by Apsi, compiled
+to PTX and cached, no CUDA toolkit or PyTorch. A model larger than the card runs its first layers on the GPU and the
+rest on the processor, by itself.
+
+```apsi
+use hub
+let lm = hub.model("Qwen/Qwen2.5-3B-Instruct")       # or a local folder with config.json + safetensors
+print(lm.device, lm.plan)                            # where every part runs and from where
+print(lm.chat("Explain how a rainbow forms.", max_new_tokens=200))
+```
+
+Measured on a desktop: AMD Ryzen 5 5500 (6 cores), 16 GB RAM, NVIDIA GeForce RTX 3060 12 GB, Windows 11:
+
+| Model | Placement | Answer speed | Prompt of 512 tokens | Processor only (int8) |
+|---|---|---:|---:|---:|
+| Qwen2.5-0.5B-Instruct | 24 of 24 layers on the GPU, 0.9 GB | 176–212 tokens/s | 102 ms | 20.5 tokens/s |
+| Qwen2.5-3B-Instruct | 36 of 36 layers on the GPU, 5.9 GB | 47 tokens/s | 604 ms | 3.8 tokens/s |
+| Qwen2.5-14B-Instruct | 16 of 48 layers on the GPU, 32 on the processor | 1.3–1.4 tokens/s | see below | — |
+
+What makes it fast:
+
+* **Float16 key/value cache** (half the memory, so twice the context; `APSI_KV_CACHE=fp32` for the old one) and
+  attention split over the card's multiprocessors for long contexts.
+* **Tensor cores for prompts** on RTX 30 series and newer (`mma.sync`, the activations split into two bfloat16 parts so
+  the result matches float32 to about 1e-5; checked against the float32 kernel at start-up): a 512-token prompt on the
+  3B model 786 → 604 ms.
+* **int8 weights on the processor** (one scale per 32 values, the Q8_0 layout of llama.cpp; error below bfloat16's own
+  rounding): half the memory and 1.4–1.5× the speed of bfloat16; made once and memory-mapped from
+  `~/.apsi/cache/cpu-int8`. A native thread team starts every product on all cores in about a microsecond.
+* **Split models** keep the processor's share memory-mapped (a 14B model's 10 GB never has to fit in free RAM at once),
+  show progress while preparing it, and send long prompts through the processor's layers to the GPU
+  (`APSI_PROMPT_ON_GPU`); `lm.plan` says what went where.
+* **YaRN rope scaling** for long-context checkpoints; downloads that resume by themselves.
+
+Where the time goes: a 3B model reads 6.2 GB of weights per token, and the RTX 3060 reads 360 GB/s, so about
+58 tokens/s is the ceiling — Apsi reaches 82 % of it. The 0.5B model is limited by the number of kernel launches per
+token, not by memory. A 14B model on a 12 GB card is limited by the processor's memory speed for the 32 layers that do
+not fit.
+
+## 18. Logs, settings, checkpoints and diagnosis
+
+* **`use log`** — the terminal and `.log` files (text or JSON lines), rotation by size or day, named loggers with
+  fields, `with log.timer("step"):`; `apsi log FILE --level warn --grep x -f` reads and follows them. [Logging](LOG.md)
+* **`use config`** — settings in TOML, JSON, YAML, INI or `.env` files, layered, overridden by environment variables
+  and `--set key=value`, types checked against defaults, `${other.key}` references. [Configuration](ENV.md)
+* **`save_checkpoint` / `load_checkpoint`** — weights, optimizer state, step, config and files in one `.apsim`, or shards
+  above 4 GB; resuming is exact. [Model files](MODEL-FILES.md)
+* **`diagnose(model, params, X, y)`** — checks a model built from scratch before a long run: data, shapes, first loss,
+  dead or exploding gradients, whether it can fit a small batch; suggests a learning rate. [Layers](LAYERS.md)
+* **`data.text_dataset`** — training text in any shape (txt, jsonl, csv, parquet; chat, Alpaca, prompt/completion or
+  your own template), any tokenizer, packed windows, the prompt part left out of the loss. [AI](AI.md)
+* **`precision="auto"`** for `fit(backend="torch")`: bf16 on cards that have it, fp16 on older ones, fp32 on the CPU.
+* **`apsi cache`** — every cache and its size; `apsi cache clean` removes what can never be used again.
+* **`apsi convert --idiomatic`** falls back to the exact form wherever the idiomatic one would behave differently.
+
+## 19. Several versions side by side
+
+From 2.4.4 on, every version installs into its own folder (`<Apsi folder>/2.4.4`, `<Apsi folder>/2.5.0` …) and none is
+removed or overwritten. `apsi` runs the newest (or the one chosen with `apsi use 2.4.4`), `apsi-2.4.4` always that one,
+and `apsi versions` lists them. Removing one version keeps the others. The Windows/Linux setup app and the Linux `.sh`
+installer both work this way; an older install is moved into its own version folder.
+
 ## How much faster than 2.0.0
 
-The same programs on both versions, on the same machine, with identical results. Measured on a GitHub Actions runner
-(AMD EPYC, native compiler installed) and on a 2-core VM without the native compiler
+The same programs on both versions, on the same machine (an AMD EPYC 7763 GitHub Actions runner with the native
+compiler, November 2026), with identical results
 ([`benchmarks/versions`](https://github.com/ATECTechnologies/apsi/tree/main/benchmarks/versions)):
 
-| Program | 2.0.0 | 2.4.4 | runner | 2-core VM ¹ |
-|---|---:|---:|---:|---:|
-| matmul 300, loops (compiled engine) | 38,157 ms | 5.0 ms | **7708.43×** | 6374.16× |
-| 200k objects: create and sum | 3,758 ms | 434 ms | **8.65×** | 9.26× |
-| fib(25), recursive calls | 82.8 ms | 24.5 ms | **3.37×** | 2.26× |
-| matmul 512, @native loops | 24.7 ms | 9.6 ms | **2.56×** | 300.48× |
-| web server, 64 connections | 5,124 req/s | 13,949 req/s | **2.72×** | 3.06× |
-| web server, 256 connections | 5,848 req/s | 14,052 req/s | **2.4×** | 3.18× |
-| word count, 260k words | 320 ms | 205 ms | **1.56×** | 1.41× |
-| start-up: apsi run hello.apsi | 231 ms | 173 ms | **1.34×** | 6.69× |
-| 200k f-strings and join | 236 ms | 192 ms | **1.23×** | 1.26× |
-| integer loop, 3M iterations | 171 ms | 168 ms | **1.02×** | 0.99× |
-| apsi check, 43 example programs (1,594 lines), empty cache | 9,865 ms | 9,526 ms | **1.04×** | 4.9× |
-| harmonic sum 50M, @native | 70.1 ms | 70.1 ms | **1.0×** | 1.03× |
+| Program | 2.0.0 | 2.4.4 | 2.4.4 is |
+|---|---:|---:|---:|
+| matmul 300, loops (compiled engine) | 38,638 ms | 6.1 ms | **6,313.42×** |
+| 200k objects: create and sum | 3,781 ms | 456 ms | **8.30×** |
+| fib(25), recursive calls | 81.5 ms | 24.2 ms | **3.37×** |
+| 200k f-strings and join | 243 ms | 85.1 ms | **2.85×** |
+| web server, 64 connections | 5,352 req/s | 14,774 req/s | **2.76×** |
+| matmul 512, @native loops | 24.6 ms | 9.6 ms | **2.56×** |
+| word count, 260k words | 320 ms | 136 ms | **2.36×** |
+| web server, 256 connections | 6,338 req/s | 14,673 req/s | **2.32×** |
+| start-up: apsi run hello.apsi | 231 ms | 172 ms | **1.34×** |
+| integer loop, 3M iterations | 196 ms | 172 ms | **1.14×** |
+| apsi check, 43 example programs (1,594 lines), empty cache | 9,826 ms | 9,526 ms | **1.03×** |
+| harmonic sum 50M, @native | 70.1 ms | 70.2 ms | **1.00×** |
 
-Geometric mean: **3.84× faster** (runner), **7.31×** (2-core VM). `@native` code was already at C
-speed in 2.0.0 and stays there. Reproduce with
-`python3 benchmarks/versions/compare.py --old ../apsi-2.0.0 --new . --web`.
+Geometric mean: **4.21× faster**. `@native` code was already at C speed in 2.0.0 and stays there. Reproduce
+with `python3 benchmarks/versions/compare.py --old ../apsi-2.0.0 --new . --web`.
 
-¹ Without the native compiler; 2.0.0 also started much more slowly there.
+On the eight CPU programs of `benchmarks/heavy` (one core, same runner), Apsi 2.4.4 takes 0.83× the time of C on the
+geometric mean, and is the fastest of nine languages on jacobi, ising, levenshtein and k-means. Relative to C: C++ 0.88×,
+Rust 1.07×, Julia 1.22×, Java 1.66×, Go 2.75×, C# 2.89×, JavaScript 3.56×. The ODE program is the one where gcc is
+ahead (it fuses multiply-adds by default: 289 ms against Apsi's 355 ms; with `@native("fma")` Apsi takes 263 ms).
+Every language prints the same checksum.
 
 ## Upgrading from 2.0.0
 

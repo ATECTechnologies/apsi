@@ -779,13 +779,13 @@ class GpuPlan:
                         h = raw.host
                         slots += [raw.device_ptr(), 0] + list(h.shape) + [s // h.itemsize for s in h.strides]
                         continue
-                    dp = d.alloc(dense.nbytes)
-                    bufs.append(dp)
+                    dp = d.take(dense.nbytes)
+                    bufs.append((dp, dense.nbytes))
                     d.to_device(dp, dense.ctypes.data, dense.nbytes)
                     slots += [dp, 0] + list(dense.shape) + [s // dense.itemsize for s in dense.strides]
                 arg = np.array(slots or [0], dtype=np.int64)
-                dargs = d.alloc(arg.nbytes)
-                bufs.append(dargs)
+                dargs = d.take(arg.nbytes)
+                bufs.append((dargs, arg.nbytes))
                 d.to_device(dargs, arg.ctypes.data, arg.nbytes)
                 kr, _ = d.global_ptr(mod, "apsi_krange")
                 krange = np.array([lo, hi], dtype=np.int64)
@@ -825,7 +825,7 @@ class GpuPlan:
                         if name in self.written:
                             raw.written_on_gpu()               # the values stay on the GPU
                         continue
-                    dp = bufs[bi]
+                    dp = bufs[bi][0]
                     bi += 1
                     if name not in self.written:
                         continue
@@ -838,8 +838,8 @@ class GpuPlan:
         finally:
             for d, mod, lo, hi, bufs in running:
                 d.activate()
-                for p in bufs:
-                    d.free(p)
+                for p, n in bufs:
+                    d.give(p, n)
         for (raw, dense), name in zip(hosts, self.params):
             if dense is not None and not isinstance(dense, str) and dense is not raw and name in self.written:
                 raw[...] = dense

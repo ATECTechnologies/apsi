@@ -92,6 +92,40 @@ class Device:
         if p:
             self.drv.lib.cuMemFree_v2(ctypes.c_uint64(p))
 
+    # Buffers for a call: kept by size and reused by the next call (a frame of a video, a step of a loop), instead
+    # of cuMemAlloc + cuMemFree each time — those cost up to a millisecond each and cuMemFree waits for the GPU.
+    POOL_CAP = 1 << 30
+
+    def take(self, n):
+        pool = self.__dict__.setdefault("_pool", {})
+        lst = pool.get(n)
+        if lst:
+            self._pooled -= n
+            return lst.pop()
+        try:
+            return self.alloc(n)
+        except Exception:
+            self.drain()                                 # out of memory: give the cached buffers back first
+            return self.alloc(n)
+
+    def give(self, p, n):
+        if not p:
+            return
+        pool = self.__dict__.setdefault("_pool", {})
+        self.__dict__.setdefault("_pooled", 0)
+        if self._pooled + n > self.POOL_CAP:
+            self.free(p)
+            return
+        pool.setdefault(n, []).append(p)
+        self._pooled += n
+
+    def drain(self):
+        for n, lst in list(self.__dict__.get("_pool", {}).items()):
+            for p in lst:
+                self.free(p)
+        self._pool = {}
+        self._pooled = 0
+
     def to_device(self, dptr, host_addr, n):
         if n:
             self.drv.check(self.drv.lib.cuMemcpyHtoD_v2(ctypes.c_uint64(dptr), ctypes.c_void_p(host_addr),

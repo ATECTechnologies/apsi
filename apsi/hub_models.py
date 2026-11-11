@@ -664,7 +664,8 @@ class Decoder:
         self.plan = {"gpu": {"name": getattr(r, "name", "gpu"), "layers": ng, "of": self.L,
                              "bytes": int(getattr(r, "used", 0) or 0),
                              "free_after": _free_of(r),
-                             "tensor_cores": bool(getattr(r, "tc", None)), "kv_cache": self.kv_cache}}
+                             "tensor_cores": bool(getattr(r, "tc", None)), "kv_cache": self.kv_cache,
+                             "weights": getattr(self, "gpu_weights_used", "bf16")}}
         if self._gl is not None and self._ng < self.L:
             _progress(f"{self._ng} of {self.L} layers on {getattr(r, 'name', 'the GPU')} "
                       f"({int(getattr(r, 'used', 0) or 0) / 2 ** 30:.1f} GB), {self.L - self._ng} on the processor")
@@ -711,39 +712,101 @@ class Decoder:
             "self_attn.q_proj.weight", "self_attn.k_proj.weight", "self_attn.v_proj.weight", "self_attn.o_proj.weight",
             "mlp.gate_proj.weight", "mlp.up_proj.weight", "mlp.down_proj.weight"))
 
+    def _layer_values(self, i):
+        return self._layer_bytes(i) // 2
+
+    def _head_tied(self):
+        return self._head_name() in ("model.embed_tokens.weight", "wte.weight")
+
     def _upload_full(self, r, strict=False, gpu_layers=None):
         """The weights on the GPU for the whole-network path: all layers when they fit, else the first ones that do
-        (the rest run on the processor). Returns the number of layers placed."""
+        (the rest run on the processor). Returns the number of layers placed.
+
+        The weight format is chosen to keep the whole model on the card (APSI_GPU_WEIGHTS, or gpu_weights=):
+        "auto" takes the first of bfloat16, int8 and int4 in which every layer fits, and int4 with as many
+        layers as fit when none does (a 14B model on a 12 GB card: all 48 layers in int4 instead of 16 in bfloat16,
+        which makes it about 20x faster). "bf16", "int8", "int4" force one."""
+        from .hub_gpu import QBYTES
         W = self.W
-        head_bytes = 2 * int(np.prod(self._wshape(None)))
-        kv_tokens = min(self.ctx, 8192)
-        kv_layer = 2 * (2 if self.kv_cache == "fp16" else 4) * self.kvh * self.dh * kv_tokens
-        kv_bytes = kv_layer * self.L
+        mode = str(getattr(self, "gpu_weights", None) or os.environ.get("APSI_GPU_WEIGHTS", "auto")).strip().lower()
+        mode = {"q8": "int8", "q4": "int4", "fp16": "bf16", "bfloat16": "bf16"}.get(mode, mode)
+        if mode not in ("auto", "bf16", "int8", "int4"):
+            raise ModelError(f"gpu_weights must be auto, bf16, int8 or int4 (got '{mode}')")
+        head_vals = int(np.prod(self._wshape(None)))
         free = r.free_memory()
-        budget = free - head_bytes - (384 << 20)               # the cache of a layer counts with that layer
-        n = 0
-        used = 0
-        for i in range(self.L):
-            b = self._layer_bytes(i) + kv_layer
-            if used + b > budget:
+
+        def fit(kind, kv_tokens):
+            kv_layer = 2 * (2 if self.kv_cache == "fp16" else 4) * self.kvh * self.dh * kv_tokens
+            hk = kind if not self._head_tied() else "bf16"      # a tied head is also the embedding table
+            head = head_vals * QBYTES[hk]
+            gu = 2 * int(np.prod(self._wshape("model.layers.0.mlp.gate_proj.weight")))
+            scratch = 0 if kind == "bf16" else 2 * gu               # the largest matrix, dequantized for prompts
+            budget = free - head - scratch - (384 << 20)        # the cache of a layer counts with that layer
+            n, used = 0, 0
+            for i in range(self.L):
+                b = self._layer_values(i) * QBYTES[kind] + kv_layer
+                if used + b > budget:
+                    break
+                used += b
+                n += 1
+            return n, kv_layer
+        kinds = [mode] if mode != "auto" else ["bf16", "int8", "int4"]
+        choice = None
+        for kind in kinds:
+            for kv_tokens in sorted({min(self.ctx, 8192), min(self.ctx, 4096)}, reverse=True):
+                n, kv_layer = fit(kind, kv_tokens)
+                if n == self.L:
+                    choice = (kind, n, kv_layer)
+                    break
+            if choice:
                 break
-            used += b
-            n += 1
+        if choice is None:                                     # nothing fits whole: the most layers on the card
+            kind = kinds[-1]
+            n, kv_layer = fit(kind, min(self.ctx, 8192))
+            choice = (kind, n, kv_layer)
+        kind, n, kv_layer = choice
+        if any(self._wshape(f"model.layers.0.{w}")[1] % 32 for w in ("self_attn.q_proj.weight", "mlp.down_proj.weight")):
+            kind = "bf16"                                      # widths the int formats cannot take
+            n, kv_layer = fit("bf16", min(self.ctx, 8192))
+        kinds_of = [kind] * n
+        if mode == "auto" and kind == "int4" and n == self.L:
+            # the room left over turns layers back into int8, from the first (the most sensitive) on
+            hk = "int4" if not self._head_tied() else "bf16"
+            gu = 2 * int(np.prod(self._wshape("model.layers.0.mlp.gate_proj.weight")))
+            spare = free - head_vals * QBYTES[hk] - 2 * gu - (384 << 20) - \
+                sum(self._layer_values(i) * QBYTES["int4"] + kv_layer for i in range(n))
+            for i in range(n):
+                extra = self._layer_values(i) * (QBYTES["int8"] - QBYTES["int4"])
+                if spare < extra:
+                    break
+                spare -= extra
+                kinds_of[i] = "int8"
+        self.gpu_weights_used = kind if len(set(kinds_of)) <= 1 else \
+            f"int8 ({kinds_of.count('int8')} layers) + int4 ({kinds_of.count('int4')} layers)"
+        kv_bytes = kv_layer * self.L
         if gpu_layers is not None:
             n = max(0, min(int(gpu_layers), self.L))
         elif strict and n < self.L:
-            need = (sum(self._layer_bytes(i) for i in range(self.L)) + head_bytes + kv_bytes) / 2 ** 30
+            need = (sum(self._layer_values(i) for i in range(self.L)) * QBYTES[kind] + head_vals * 2 + kv_bytes) \
+                / 2 ** 30
             raise ModelError(f"the model needs about {need:.1f} GB on the GPU, which has {free / 2 ** 30:.1f} GB free"
                              " (device=\"auto\" puts what fits on the GPU and the rest on the processor)")
         if n == 0:
             return 0
+        if kind != "bf16":
+            _progress(f"weights on the GPU in {self.gpu_weights_used} (to fit the card; APSI_GPU_WEIGHTS=bf16 keeps "
+                      f"bfloat16): {n} of {self.L} layers")
+        def up_for(k_):
+            return (lambda ws: r.qmatrix(ws, k_)) if k_ != "bf16" else r.matrix
+        up = up_for(kind)
         layers = []
         for i in range(n):
             p = f"model.layers.{i}."
             qkv = [p + f"self_attn.{x}_proj.weight" for x in "qkv"]
-            L = {"qkv": r.matrix(self._bf16(qkv)), "o": r.matrix(self._bf16([p + "self_attn.o_proj.weight"])),
-                 "gu": r.matrix(self._bf16([p + "mlp.gate_proj.weight", p + "mlp.up_proj.weight"])),
-                 "down": r.matrix(self._bf16([p + "mlp.down_proj.weight"]))}
+            up = up_for(kinds_of[i])
+            L = {"qkv": up(self._bf16(qkv)), "o": up(self._bf16([p + "self_attn.o_proj.weight"])),
+                 "gu": up(self._bf16([p + "mlp.gate_proj.weight", p + "mlp.up_proj.weight"])),
+                 "down": up(self._bf16([p + "mlp.down_proj.weight"]))}
             bias = [W.get(p + f"self_attn.{x}_proj.bias") for x in "qkv"]
             L["qkv_b"] = r.vec(np.concatenate([b if b is not None else np.zeros(self._wshape(w)[0], np.float32)
                                                for b, w in zip(bias, qkv)])) if any(b is not None for b in bias) else None
@@ -757,7 +820,8 @@ class Decoder:
             L["I"] = self._wshape(p + "mlp.down_proj.weight")[1]
             layers.append(L)
         self._gnorm = r.vec(self.g("model.norm.weight"))
-        self._ghead = r.matrix(self._bf16([self._head_name()]))
+        self._ghead = up_for(kind)(self._bf16([self._head_name()])) if not self._head_tied() else \
+            r.matrix(self._bf16([self._head_name()]))
         self._gl = layers
         self._ng = n
         return n
