@@ -954,6 +954,20 @@ class _Base:
             y = self.get(yb, T * m.rows)
         return y.reshape(*lead, m.rows)
 
+    def matmul_rows(self, x, m):
+        """x @ W.T with x on the host, many rows: the tiled (tensor-core) product."""
+        lead = x.shape[:-1]
+        x2 = np.ascontiguousarray(x.reshape(-1, m.cols), np.float32)
+        T = x2.shape[0]
+        with _lock:
+            xb = self.ws("mm_x", x2.size)
+            yb = self.ws("mm_y", T * m.rows)
+            self.put(xb, x2.reshape(-1))
+            self.begin()
+            self.linear(m, xb, yb, T)
+            y = self.get(yb, T * m.rows)
+        return y.reshape(*lead, m.rows)
+
     def trim(self):
         """Free the scratch buffers (they come back, as large as needed, on the next use)."""
         for b in list(self._ws.values()):

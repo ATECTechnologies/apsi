@@ -820,6 +820,10 @@ class Decoder:
 
     def _mm(self, x, key, names):
         """[x @ W.T for each named weight]; one fused product on the GPU."""
+        if self.gpu is not None and key not in self._gm and self.__dict__.get("_gl") is not None:
+            y = self._mm_streamed(x, key, names)            # a long prompt in a split model: on the GPU after all
+            if y is not None:
+                return y
         if self.gpu is None or key not in self._gm:         # the processor: also the layers of a split model
             if self.__dict__.get("_cm_for") is not self.gpu or not self.__dict__.get("_cm_ready"):
                 self._cm_for = self.gpu
@@ -838,6 +842,42 @@ class Decoder:
                 _gpu_gave_up(e)
                 self.release()
         return [x @ self._weight(n).T for n in names]
+
+    PROMPT_ON_GPU = 64
+
+    def _mm_streamed(self, x, key, names):
+        """A prompt of many tokens through a layer that lives on the processor: its bfloat16 weights go to the GPU
+        for this product (about 25 GB/s over PCIe 4.0) and the tensor cores do the rest — a 512-token prompt
+        through 32 processor layers of a 14B model takes seconds instead of a minute. Decoding (one token at a
+        time) stays on the processor, where reading the weights once is cheaper than sending them."""
+        rows = int(np.prod(x.shape[:-1]))
+        if rows < self.PROMPT_ON_GPU or os.environ.get("APSI_PROMPT_ON_GPU", "1").strip() in ("0", "false", "no"):
+            return None
+        if self.__dict__.get("_stream_off"):
+            return None
+        try:
+            ns = [n if n else self._head_name() for n in names]
+            if self.gpt2:
+                return None
+            bits = self._bf16(ns)
+            out = sum(int(self._wshape(n)[0]) for n in ns)
+            need = bits.nbytes + rows * (bits.shape[1] + out) * 4 + (128 << 20)
+            free = _free_of(self.gpu)
+            if free is not None and free < need:
+                return None
+            m = self.gpu.matrix(bits)
+            if m is None:
+                return None
+            try:
+                y = self.gpu.matmul_rows(x, m)
+            finally:
+                self.gpu.free(m.buf)
+            cuts = list(np.cumsum([self._wshape(n)[0] for n in ns])[:-1])
+            return np.split(y, cuts, -1) if cuts else [y]
+        except Exception as e:                              # anything odd: the processor path, from now on
+            self._stream_off = True
+            _progress(f"long prompts stay on the processor ({type(e).__name__}: {e})")
+            return None
 
     def g(self, name):
         v = self.W.get(name)
