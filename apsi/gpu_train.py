@@ -517,16 +517,16 @@ class Gpu(_Ops):
         self._go("act_b", self.blocks(n), 256, self.p(X), self.p(DY), self.p(DX), ("u", n), ("u", kind))
 
     def colsum(self, DY, X, MEAN, RSTD, DG, DB, M, N, mode):
-        rows = 16
+        rows = 64
         self._go("colsum", ((N + 255) // 256, (M + rows - 1) // rows), 256, self.p(DY), self.p(X), self.p(MEAN),
                  self.p(RSTD), self.p(DG), self.p(DB), ("u", M), ("u", N), ("u", rows), ("u", mode))
 
     def ln_f(self, X, Gm, Bt, Y, MEAN, RSTD, M, N, eps, rms):
-        self._go("ln_f", M, 256, self.p(X), self.p(Gm), self.p(Bt), self.p(Y), self.p(MEAN), self.p(RSTD),
+        self._go("ln_f", -(-M // 8), 256, self.p(X), self.p(Gm), self.p(Bt), self.p(Y), self.p(MEAN), self.p(RSTD),
                  ("u", M), ("u", N), ("f", eps), ("u", 1 if rms else 0))
 
     def ln_b(self, X, Gm, DY, MEAN, RSTD, DX, M, N, rms, RES=None):
-        self._go("ln_b", M, 256, self.p(X), self.p(Gm), self.p(DY), self.p(MEAN), self.p(RSTD), self.p(DX),
+        self._go("ln_b", -(-M // 8), 256, self.p(X), self.p(Gm), self.p(DY), self.p(MEAN), self.p(RSTD), self.p(DX),
                  ("u", M), ("u", N), ("u", 1 if rms else 0), self.p(RES), ("u", 1 if RES is not None else 0))
 
     def embed_f(self, E, IDS, Y, M, D):
@@ -623,9 +623,10 @@ class Gpu(_Ops):
               epi=0, X2=None, act=0):
         name = self._tiled_ok(A, B, M, N, K, sam, sak, sbk, sbn, sa, sb) if self.tiled and passes == 1 else None
         if epi:
-            if name is None or ldc != N or nb1 * nb2 != 1 or f"{name}_e{epi}" not in self.fn:
+            ename = f"{name}_e{epi}" + (f"a{act}" if epi in (1, 2) else "") if name else None
+            if name is None or ldc != N or nb1 * nb2 != 1 or ename not in self.fn:
                 return False
-            name = f"{name}_e{epi}"
+            name = ename
         if name is not None:
             tiles = ((M + KS.BM - 1) // KS.BM) * ((N + KS.BN - 1) // KS.BN)
             nz, kchunk = 1, K

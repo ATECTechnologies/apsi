@@ -250,82 +250,101 @@ def _main_module():
         r0 = b.mul(k.ctay, p["rows"])
         r1 = b.select(b.icmp_unsigned("<", b.add(r0, p["rows"]), p["M"]), b.add(r0, p["rows"]), p["M"])
         sb, sg = k.var(F(0.0)), k.var(F(0.0))
+        Mm1 = b.sub(p["M"], C(1))
 
-        def row(r):
-            idx = b.add(b.mul(i64of(b, r), i64of(b, p["N"])), i64of(b, n))
-            dy = k.ld(p["DY"], idx)
-            b.store(b.fadd(b.load(sb), dy), sb)
-            with b.if_then(b.icmp_unsigned("!=", p["mode"], C(0))):
-                x = k.ld(p["X"], idx)
-                mu = b.select(b.icmp_unsigned("==", p["mode"], C(1)), k.ld(p["MEAN"], r), F(0.0))
-                xh = b.fmul(b.fsub(x, mu), k.ld(p["RSTD"], r))
-                b.store(b.call(fma_f, [dy, xh, b.load(sg)]), sg)
-        k.loop(r0, r1, C(1), row)
+        def rows4(with_x):
+            def body(r):                              # 4 rows at a time: 4 independent loads in flight
+                for u in range(4):
+                    rr = b.add(r, C(u))
+                    ok = b.icmp_unsigned("<", rr, r1)
+                    rc = b.select(ok, rr, Mm1)
+                    idx = b.add(b.mul(i64of(b, rc), i64of(b, p["N"])), i64of(b, n))
+                    dy = b.select(ok, k.ld(p["DY"], idx), F(0.0))
+                    b.store(b.fadd(b.load(sb), dy), sb)
+                    if with_x:
+                        mu = b.select(b.icmp_unsigned("==", p["mode"], C(1)), k.ld(p["MEAN"], rc), F(0.0))
+                        xh = b.fmul(b.fsub(k.ld(p["X"], idx), mu), k.ld(p["RSTD"], rc))
+                        b.store(b.call(fma_f, [dy, xh, b.load(sg)]), sg)
+            return body
+        with b.if_else(b.icmp_unsigned("==", p["mode"], C(0))) as (plain, norm):
+            with plain:
+                k.loop(r0, r1, C(4), rows4(False))
+            with norm:
+                k.loop(r0, r1, C(4), rows4(True))
         with b.if_then(b.icmp_unsigned("!=", p["mode"], C(2))):
             k.atomic_add(p["DB"], n, b.load(sb))
         with b.if_then(b.icmp_unsigned("!=", p["mode"], C(0))):
             k.atomic_add(p["DG"], n, b.load(sg))
     k.ret()
 
-    # ------------------------------------------------------------------------- layer norm / RMS norm, a block a row
+    # ------------------------------------------------------------------------- layer norm / RMS norm, a warp a row
     k = K("ln_f", [("X", G(f32)), ("G", G(f32)), ("B", G(f32)), ("Y", G(f32)), ("MEAN", G(f32)), ("RSTD", G(f32)),
                    ("M", i32), ("N", i32), ("eps", f32), ("rms", i32)])
     b, p = k.b, k.p
-    base = b.mul(i64of(b, k.cta), i64of(b, p["N"]))
-    s1 = k.var(F(0.0))
-    k.loop(k.tid, p["N"], C(256), lambda i: b.store(b.fadd(b.load(s1), k.ld(p["X"], b.add(base, i64of(b, i)))), s1))
-    isrms = b.icmp_unsigned("!=", p["rms"], C(0))
-    mean = b.select(isrms, F(0.0), b.fdiv(k.block_sum(b.load(s1)), b.uitofp(p["N"], f32)))
-    s2 = k.var(F(0.0))
+    lane = b.and_(k.tid, C(31))
+    row = b.add(b.mul(k.cta, C(8)), b.lshr(k.tid, C(5)))
+    with b.if_then(b.icmp_unsigned("<", row, p["M"])):
+        base = b.mul(i64of(b, row), i64of(b, p["N"]))
+        isrms = b.icmp_unsigned("!=", p["rms"], C(0))
+        s1 = k.var(F(0.0))
+        k.loop(lane, p["N"], C(32), lambda i: b.store(b.fadd(b.load(s1), k.ld(p["X"], b.add(base, i64of(b, i)))), s1))
+        nf = b.uitofp(p["N"], f32)
+        mean = b.select(isrms, F(0.0), b.fdiv(k.warp_reduce(b.load(s1)), nf))
+        s2 = k.var(F(0.0))
 
-    def sq(i):
-        d = b.fsub(k.ld(p["X"], b.add(base, i64of(b, i))), mean)
-        b.store(b.call(fma_f, [d, d, b.load(s2)]), s2)
-    k.loop(k.tid, p["N"], C(256), sq)
-    var = b.fdiv(k.block_sum(b.load(s2)), b.uitofp(p["N"], f32))
-    rstd = b.fdiv(F(1.0), b.call(sqrt_f, [b.fadd(var, p["eps"])]))
+        def sq(i):
+            dd = b.fsub(k.ld(p["X"], b.add(base, i64of(b, i))), mean)
+            b.store(b.call(fma_f, [dd, dd, b.load(s2)]), s2)
+        k.loop(lane, p["N"], C(32), sq)
+        rstd = b.fdiv(F(1.0), b.call(sqrt_f, [b.fadd(b.fdiv(k.warp_reduce(b.load(s2)), nf), p["eps"])]))
 
-    def out(i):
-        idx = b.add(base, i64of(b, i))
-        y = b.fmul(b.fmul(b.fsub(k.ld(p["X"], idx), mean), rstd), k.ld(p["G"], i))
-        y = b.select(isrms, y, b.fadd(y, k.ld(p["B"], i)))
-        k.st(y, p["Y"], idx)
-    k.loop(k.tid, p["N"], C(256), out)
-    with b.if_then(b.icmp_unsigned("==", k.tid, C(0))):
-        k.st(mean, p["MEAN"], k.cta)
-        k.st(rstd, p["RSTD"], k.cta)
+        def out(i):
+            idx = b.add(base, i64of(b, i))
+            y = b.fmul(b.fmul(b.fsub(k.ld(p["X"], idx), mean), rstd), k.ld(p["G"], i))
+            yv = k.var(y)
+            with b.if_then(b.not_(isrms)):
+                b.store(b.fadd(y, k.ld(p["B"], i)), yv)
+            k.st(b.load(yv), p["Y"], idx)
+        k.loop(lane, p["N"], C(32), out)
+        with b.if_then(b.icmp_unsigned("==", lane, C(0))):
+            k.st(mean, p["MEAN"], row)
+            k.st(rstd, p["RSTD"], row)
     k.ret()
 
     k = K("ln_b", [("X", G(f32)), ("G", G(f32)), ("DY", G(f32)), ("MEAN", G(f32)), ("RSTD", G(f32)), ("DX", G(f32)),
                    ("M", i32), ("N", i32), ("rms", i32), ("RES", G(f32)), ("has_res", i32)])
     b, p = k.b, k.p
-    base = b.mul(i64of(b, k.cta), i64of(b, p["N"]))
-    isrms = b.icmp_unsigned("!=", p["rms"], C(0))
-    mean = b.select(isrms, F(0.0), k.ld(p["MEAN"], k.cta))
-    rstd = k.ld(p["RSTD"], k.cta)
-    a1, a2 = k.var(F(0.0)), k.var(F(0.0))
+    lane = b.and_(k.tid, C(31))
+    row = b.add(b.mul(k.cta, C(8)), b.lshr(k.tid, C(5)))
+    with b.if_then(b.icmp_unsigned("<", row, p["M"])):
+        base = b.mul(i64of(b, row), i64of(b, p["N"]))
+        isrms = b.icmp_unsigned("!=", p["rms"], C(0))
+        mean = b.select(isrms, F(0.0), k.ld(p["MEAN"], row))
+        rstd = k.ld(p["RSTD"], row)
+        a1, a2 = k.var(F(0.0)), k.var(F(0.0))
 
-    def acc(i):
-        idx = b.add(base, i64of(b, i))
-        gdy = b.fmul(k.ld(p["DY"], idx), k.ld(p["G"], i))
-        xh = b.fmul(b.fsub(k.ld(p["X"], idx), mean), rstd)
-        b.store(b.fadd(b.load(a1), gdy), a1)
-        b.store(b.call(fma_f, [gdy, xh, b.load(a2)]), a2)
-    k.loop(k.tid, p["N"], C(256), acc)
-    nf = b.uitofp(p["N"], f32)
-    m1 = b.select(isrms, F(0.0), b.fdiv(k.block_sum(b.load(a1)), nf))
-    m2 = b.fdiv(k.block_sum(b.load(a2)), nf)
+        def acc(i):
+            idx = b.add(base, i64of(b, i))
+            gdy = b.fmul(k.ld(p["DY"], idx), k.ld(p["G"], i))
+            xh = b.fmul(b.fsub(k.ld(p["X"], idx), mean), rstd)
+            b.store(b.fadd(b.load(a1), gdy), a1)
+            b.store(b.call(fma_f, [gdy, xh, b.load(a2)]), a2)
+        k.loop(lane, p["N"], C(32), acc)
+        nf = b.uitofp(p["N"], f32)
+        m1 = b.select(isrms, F(0.0), b.fdiv(k.warp_reduce(b.load(a1)), nf))
+        m2 = b.fdiv(k.warp_reduce(b.load(a2)), nf)
+        hasres = b.icmp_unsigned("!=", p["has_res"], C(0))
 
-    def dx(i):
-        idx = b.add(base, i64of(b, i))
-        gdy = b.fmul(k.ld(p["DY"], idx), k.ld(p["G"], i))
-        xh = b.fmul(b.fsub(k.ld(p["X"], idx), mean), rstd)
-        v = b.fmul(rstd, b.fsub(b.fsub(gdy, m1), b.fmul(xh, m2)))
-        out = k.var(v)
-        with b.if_then(b.icmp_unsigned("!=", p["has_res"], C(0))):    # + the skip connection's gradient
-            b.store(b.fadd(v, k.ld(p["RES"], idx)), out)
-        k.st(b.load(out), p["DX"], idx)
-    k.loop(k.tid, p["N"], C(256), dx)
+        def dx(i):
+            idx = b.add(base, i64of(b, i))
+            gdy = b.fmul(k.ld(p["DY"], idx), k.ld(p["G"], i))
+            xh = b.fmul(b.fsub(k.ld(p["X"], idx), mean), rstd)
+            v = b.fmul(rstd, b.fsub(b.fsub(gdy, m1), b.fmul(xh, m2)))
+            out = k.var(v)
+            with b.if_then(hasres):                   # + the skip connection's gradient
+                b.store(b.fadd(v, k.ld(p["RES"], idx)), out)
+            k.st(b.load(out), p["DX"], idx)
+        k.loop(lane, p["N"], C(32), dx)
     k.ret()
 
     # ------------------------------------------------------------------------- embeddings, learned positions
@@ -809,12 +828,20 @@ def _act_ir(b, x, kind, F, C, ex2_f):
 
 
 def _act_one(b, x, j, F, ex2_f, deriv):
-    """f(x) (or f'(x)) of the one activation numbered j."""
+    """f(x) (or f'(x)) of the one activation numbered j (approximate reciprocals: the products round to bfloat16
+    anyway)."""
+    import llvmlite.ir as ir
+    m = b.module
+    try:
+        rcp_f = m.get_global("llvm.nvvm.rcp.approx.ftz.f")
+    except KeyError:
+        rcp_f = ir.Function(m, ir.FunctionType(ir.FloatType(), [ir.FloatType()]), name="llvm.nvvm.rcp.approx.ftz.f")
+
     def exp(v):
         return b.call(ex2_f, [b.fmul(v, F(LOG2E))])
 
     def tanh(v):
-        return b.fsub(F(1.0), b.fdiv(F(2.0), b.fadd(exp(b.fmul(F(2.0), v)), F(1.0))))
+        return b.fsub(F(1.0), b.fmul(F(2.0), b.call(rcp_f, [b.fadd(exp(b.fmul(F(2.0), v)), F(1.0))])))
     pos = b.fcmp_ordered(">", x, F(0.0))
     if j == 0:
         return b.select(pos, F(1.0), F(0.0)) if deriv else b.select(pos, x, F(0.0))
@@ -827,7 +854,7 @@ def _act_one(b, x, j, F, ex2_f, deriv):
                       b.fmul(b.fmul(b.fmul(F(0.5), x), b.fsub(F(1.0), b.fmul(t, t))),
                              b.fmul(F(c), b.fadd(F(1.0), b.fmul(F(3 * 0.044715), b.fmul(x, x))))))
     if j in (2, 4):
-        sg = b.fdiv(F(1.0), b.fadd(F(1.0), exp(b.fsub(F(0.0), x))))
+        sg = b.call(rcp_f, [b.fadd(F(1.0), exp(b.fsub(F(0.0), x)))])
         if j == 2:
             return b.fadd(sg, b.fmul(x, b.fmul(sg, b.fsub(F(1.0), sg)))) if deriv else b.fmul(x, sg)
         return b.fmul(sg, b.fsub(F(1.0), sg)) if deriv else sg
@@ -854,7 +881,9 @@ PAD = 40                        # halves per shared-memory row: 80 bytes, so ldm
 PADT = 136                      # rows of a transposed tile (k rows of 128 m or n): 272 bytes, conflict-free too
 TILED = ("gemm_tkn", "gemm_tkk", "gemm_tmn", "gemm_tmk")
 # products with a last step compiled in: x W + b -> act (forward), dy W^T * act'(h) (backward), x W + b + residual
-EPI_KERNELS = (("gemm_tkn_e1", True, False, 1), ("gemm_tkk_e2", True, True, 2), ("gemm_tkn_e3", True, False, 3))
+EPI_ACTS = (0, 1, 2)            # relu, gelu, silu: compiled into their own product kernels (no choice per element)
+EPI_KERNELS = tuple([(f"gemm_tkn_e1a{j}", True, False, 1, j) for j in EPI_ACTS] +
+                    [(f"gemm_tkk_e2a{j}", True, True, 2, j) for j in EPI_ACTS] + [("gemm_tkn_e3", True, False, 3, None)])
 
 
 def _tiled_module():
@@ -902,7 +931,7 @@ def _tiled_module():
     # epi (after alpha, bias and beta): 1 = X2 <- v, C <- act(v) (a linear layer and its activation in one pass);
     # 2 = C <- v * act'(X2) (the backward pass through that activation); 3 = C <- v + X2 (a residual connection)
 
-    def kernel(name, a_kc, b_kc, epi_mode=0):
+    def kernel(name, a_kc, b_kc, epi_mode=0, act_j=None):
         fn = ir.Function(m, ir.FunctionType(ir.VoidType(), [t for _, t in args]), name=name)
         fn.calling_convention = "ptx_kernel"
         p = {n: a for (n, _), a in zip(args, fn.args)}
@@ -1094,10 +1123,9 @@ def _tiled_module():
                                     vv = b.load(tmp)
                                     if epi_mode == 1:
                                         b.store(vv, xp, align=4)
-                                        out = _act_switch(b, vv, p["act"], F, C, ex2_f, False, var)
+                                        out = _act_one(b, vv, act_j, F, ex2_f, False)
                                     elif epi_mode == 2:
-                                        out = b.fmul(vv, _act_switch(b, b.load(xp, align=4), p["act"], F, C, ex2_f,
-                                                                     True, var))
+                                        out = b.fmul(vv, _act_one(b, b.load(xp, align=4), act_j, F, ex2_f, True))
                                     else:
                                         out = b.fadd(vv, b.load(xp, align=4))
                                     b.store(out, tmp)
@@ -1108,8 +1136,8 @@ def _tiled_module():
     kernel("apsi_kernel", True, False)            # = gemm_tkn: x @ W
     for name, a_kc, b_kc in (("gemm_tkk", True, True), ("gemm_tmn", False, False), ("gemm_tmk", False, True)):
         kernel(name, a_kc, b_kc)
-    for name, a_kc, b_kc, e in EPI_KERNELS:
-        kernel(name, a_kc, b_kc, e)
+    for name, a_kc, b_kc, e, j in EPI_KERNELS:
+        kernel(name, a_kc, b_kc, e, j)
     return _emit(m, "sm_80")
 
 
