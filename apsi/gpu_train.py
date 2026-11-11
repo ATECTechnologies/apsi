@@ -128,6 +128,10 @@ class Emulator(_Ops):
         y = self.v(Y, n)
         y[:] = np.float32(a) * self.v(X, n) + y
 
+    def pull(self, dst, src_ops, src, n):
+        """dst (on this device) <- src (on src_ops' device): n float32."""
+        self.v(dst, n)[:] = src_ops.v(src, n)
+
     def add3(self, Z, X, Y, n):
         self.v(Z, n)[:] = self.v(X, n) + self.v(Y, n)
 
@@ -366,6 +370,13 @@ class Gpu(_Ops):
         lib = dev.drv.lib
         dev.activate()
         lib.cuMemcpyDtoD_v2.argtypes = [ctypes.c_uint64, ctypes.c_uint64, ctypes.c_size_t]
+        for fname, at in (("cuMemcpyDtoDAsync_v2", [ctypes.c_uint64, ctypes.c_uint64, ctypes.c_size_t, ctypes.c_void_p]),
+                          ("cuMemcpyPeerAsync", [ctypes.c_uint64, ctypes.c_void_p, ctypes.c_uint64, ctypes.c_void_p,
+                                                 ctypes.c_size_t, ctypes.c_void_p])):
+            try:
+                getattr(lib, fname).argtypes = at
+            except AttributeError:
+                pass
         mod, first = dev.load("apsi-train-1", KS.ptx("main"))
         self.fn = {"fill": first}
         for name in KS.MAIN[1:]:
@@ -544,6 +555,24 @@ class Gpu(_Ops):
 
     def axpy(self, Y, X, n, a=1.0):
         self._go("axpy", self.blocks(n), 256, self.p(Y), self.p(X), ("u", n), ("f", a))
+
+    def pull(self, dst, src_ops, src, n):
+        """dst (on this card) <- src (on src_ops' card): n float32, card to card (NVLink / PCIe peer access) when the
+        driver allows it, else through the processor's memory. Queued on this card after its earlier work; the
+        source must be finished (the caller syncs it)."""
+        self.dev.ensure()
+        dptr, sptr = self.p(dst)[1], src_ops.p(src)[1]
+        if src_ops is self or src_ops.dev is self.dev:
+            self.dev.drv.check(self._lib.cuMemcpyDtoDAsync_v2(ctypes.c_uint64(dptr), ctypes.c_uint64(sptr),
+                                                              ctypes.c_size_t(4 * n), None), "cuMemcpyDtoDAsync")
+            return
+        try:
+            r = self._lib.cuMemcpyPeerAsync(ctypes.c_uint64(dptr), self.dev.ctx, ctypes.c_uint64(sptr),
+                                            src_ops.dev.ctx, ctypes.c_size_t(4 * n), None)
+        except AttributeError:
+            r = 1
+        if r != 0:                                       # no peer copy: through the host
+            self.put(dst[0], src_ops.get(src[0], n, src[1]), dst[1])
 
     def add3(self, Z, X, Y, n):
         self._go("add3", self.blocks(n), 256, self.p(Z), self.p(X), self.p(Y), ("u", n))
@@ -807,6 +836,24 @@ def _split_k(blocks, K, slots):
         if best_cost is None or cost < best_cost - 1e-9:
             best, best_cost = w, cost
     return best
+
+
+def devices_for(name):
+    """The cards of "cuda:all" or "cuda:0,1,2" (several cards: data-parallel training), as a list of ops; or None."""
+    d = str(name or "").lower().replace(" ", "")
+    if not d.startswith("cuda:") or ("," not in d and d != "cuda:all"):
+        return None
+    from .native import cuda
+    drv = cuda.driver()
+    if drv is None:
+        return []
+    idx = [x.index for x in drv.devices] if d == "cuda:all" else [int(t) for t in d[5:].split(",") if t]
+    out = []
+    for i in idx:
+        o, _ = device(f"cuda:{i}")
+        if o is not None:
+            out.append(o)
+    return out
 
 
 def device(name="cuda"):
@@ -1364,7 +1411,7 @@ def _inputs(X, ids):
     return np.ascontiguousarray(a.astype(np.float32))
 
 
-def _check_size(ops, params, opt):
+def _check_size(ops, params, opt, shards=1):
     """Training keeps 4 float32 numbers per parameter on the card (weights, gradient, AdamW's two moments: 16 bytes);
     a model that cannot fit is refused at once with the numbers, rather than failing half-way."""
     from .stdlib import Adam
@@ -1372,16 +1419,16 @@ def _check_size(ops, params, opt):
     if not total:
         return
     count = sum(int(np.asarray(a).size) for a in tree_leaves(params) if isinstance(a, np.ndarray))
-    per = 16 if isinstance(opt, Adam) or opt is None else 12
+    per = 8 + (8 if isinstance(opt, Adam) or opt is None else 4) / max(1, shards)
     need = count * per
     if need > 0.92 * total:
         fits = int(0.92 * total / per * 0.75)
         raise TrainError(
-            f"{count / 1e9:.2f} B parameters need {need / 2 ** 30:.1f} GB on the card for training (weights, gradients "
-            f"and the optimizer's state, {per} bytes each) before any activations; this card has "
-            f"{total / 2 ** 30:.1f} GB. On it, models up to about {fits / 1e6:,.0f} M parameters train; larger ones "
-            f"need cards with more memory (or several), and run here with use hub in int4 / int8 (up to about 14 B "
-            f"on 12 GB)")
+            f"{count / 1e9:.2f} B parameters need {need / 2 ** 30:.1f} GB on each card for training (weights, "
+            f"gradients and the optimizer's state, {per:g} bytes each; with several cards the optimizer's state is "
+            f"shared out among them) before any activations; this card has {total / 2 ** 30:.1f} GB. Models up to "
+            f"about {fits / 1e6:,.0f} M parameters train on it; larger ones need cards with more memory or more "
+            f"cards (device=\"cuda:all\"), and run here with use hub in int4 / int8")
 
 
 def fit(model, params, X, y=None, loss="mse", opt=None, epochs=10, batch_size=None, seed=0, verbose=True,
@@ -1392,6 +1439,17 @@ def fit(model, params, X, y=None, loss="mse", opt=None, epochs=10, batch_size=No
     squared gradients on the old task), so a model learns a new task without forgetting the old one."""
     from . import layers as L, ops as aops
     from .stdlib import Adam, AdamW, SGD
+    if ops is None:
+        many = devices_for(device)
+        if many is not None:
+            if not many:
+                raise TrainError(f"no GPU to train on for device='{device}'")
+            ops = many if len(many) > 1 else many[0]
+    if isinstance(ops, (list, tuple)):
+        if len(ops) > 1:
+            return _fit_parallel(list(ops), model, params, X, y, loss, opt, epochs, batch_size, seed, verbose, clip,
+                                 schedule, val, precision, ema, ewc)
+        ops = ops[0]
     if ops is None:
         ops, why = globals()["device"](device)
         if ops is None:
@@ -1567,6 +1625,178 @@ def fit(model, params, X, y=None, loss="mse", opt=None, epochs=10, batch_size=No
                   gpu_temperature=temp, epoch_seconds=ep_seconds, epoch_temperature_c=ep_temp, ema_params=ema_params,
                   device=f"gpu ({getattr(ops, 'name', '?')}, Apsi kernels"
                          f"{', tensor cores' if ops.tc else ''})")
+
+
+def _fit_parallel(ops_list, model, params, X, y, loss, opt, epochs, batch_size, seed, verbose, clip, schedule, val,
+                  precision, ema, ewc):
+    """Data-parallel training on several cards: every card keeps the whole model and its optimizer state, takes its
+    share of each batch, and the gradients are summed across the cards (card to card where the driver allows it)
+    before the identical update on each, so the result is that of one card with the whole batch. Throughput grows
+    with the cards; the model must fit on one of them."""
+    from . import layers as L, ops as aops, thermal
+    from .stdlib import Adam, AdamW, SGD
+    loss = str(loss)
+    if loss not in ("cross_entropy", "mse"):
+        raise TrainError(f"loss '{loss}' is not on the GPU trainer (cross_entropy, mse)")
+    opt = opt or Adam(1e-3)
+    if not isinstance(opt, (Adam, SGD)):
+        raise TrainError(f"optimizer {type(opt).__name__} is not on the GPU trainer (adam, adamw, sgd)")
+    first = model.layers[0] if isinstance(model, L.Sequential) and model.layers else model
+    ids = isinstance(first, L.Embedding)
+    Xa = _inputs(aops.raw(X), ids)
+    Ya = np.asarray(aops.raw(X if y is None else y))
+    ce = loss == "cross_entropy"
+    Ya = np.ascontiguousarray(Ya.astype(np.int32) if ce else Ya.astype(np.float32))
+    n, E = Xa.shape[0], int(epochs)
+    bs = int(batch_size) if batch_size else n
+    rng = np.random.default_rng(int(seed))
+    orders = [rng.permutation(n) if batch_size else np.arange(n) for _ in range(E)]
+    xw, yw = int(np.prod(Xa.shape[1:])), int(np.prod(Ya.shape[1:]))
+    adam = isinstance(opt, Adam)
+    wd = float(getattr(opt, "wd", 0.0)) if isinstance(opt, AdamW) else 0.0
+    R = []
+    try:
+        for r, o in enumerate(ops_list):
+            _check_size(o, params, opt, len(ops_list))
+            net = Net(o, model, params, precision)
+            net.seed = int(seed) * 7919 + 1 + 104729 * r
+            # the optimizer's state is shared out: card r keeps (and updates) only its slice of the parameters
+            lo, hi = net.n * r // len(ops_list), net.n * (r + 1) // len(ops_list)
+            ln = max(1, hi - lo)
+            rep = {"ops": o, "net": net, "lo": lo, "hi": hi, "st1": o.alloc(ln), "st2": o.alloc(ln) if adam else None,
+                   "SQ": o.alloc(1), "LOSSE": o.alloc(max(1, E)), "gov": thermal.governor(getattr(o, "dev", None))}
+            o.fill((rep["st1"], 0), ln, 0.0)
+            if rep["st2"] is not None:
+                o.fill((rep["st2"], 0), ln, 0.0)
+            o.fill((rep["LOSSE"], 0), max(1, E), 0.0)
+            rep["XA"], rep["YA"], rep["IDX"] = o.alloc(Xa.size), o.alloc(Ya.size), o.alloc(max(1, n * E))
+            o.put(rep["XA"], Xa.reshape(-1))
+            o.put(rep["YA"], Ya.reshape(-1))
+            if E:
+                o.put(rep["IDX"], np.concatenate(orders).astype(np.int32))
+            rep["Xd"] = net.arena.get("X", min(bs, n) * xw)
+            rep["Yd"] = net.arena.get("Y", min(bs, n) * yw)
+            R.append(rep)
+        r0 = R[0]
+        TMP = r0["ops"].alloc(r0["net"].n)
+        nP = r0["net"].n
+        EMA = EWC = None
+        if ema is not None:
+            ema = float(ema)
+            if not 0.0 < ema < 1.0:
+                raise TrainError(f"ema={ema}: give the decay, between 0 and 1 (0.999 is usual)")
+            EMA = r0["ops"].alloc(nP)
+            r0["ops"].fill((EMA, 0), nP, 0.0)
+            r0["ops"].axpy((EMA, 0), (r0["net"].P, 0), nP, 1.0)
+        if ewc is not None:
+            anchor, fisher, lam = ewc
+            for rep in R:
+                o = rep["ops"]
+                rep["EA"], rep["EF"], rep["ET"] = o.alloc(nP), o.alloc(nP), o.alloc(nP)
+                o.put(rep["EA"], rep["net"].flat_like(anchor))
+                o.put(rep["EF"], rep["net"].flat_like(fisher))
+            EWC = float(lam)
+        t_step, step, history, val_hist, ep_seconds = int(getattr(opt, "t", 0)), 0, [], [], []
+        for ep in range(E):
+            t0 = time.perf_counter()
+            for s in range(0, n, bs):
+                b = orders[ep][s:s + bs]
+                yb = Ya[b]
+                lr = float(aops.raw(schedule(step))) if schedule is not None else float(opt.lr)
+                parts = np.array_split(np.arange(len(b)), len(R))
+                valid = max(int((yb >= 0).sum()), 1) if ce else None
+                m_all = None
+                for rep, part in zip(R, parts):              # every card starts its share at once
+                    o, net = rep["ops"], rep["net"]
+                    o.fill((net.G, 0), net.n, 0.0)
+                    if not len(part):
+                        continue
+                    k = len(part)
+                    o.gather((rep["XA"], 0), (rep["IDX"], 0), rep["Xd"], k, xw, ep * n + s + int(part[0]))
+                    o.gather((rep["YA"], 0), (rep["IDX"], 0), rep["Yd"], k, yw, ep * n + s + int(part[0]))
+                    net.round_weights()
+                    net.train = True
+                    xshape = (k,) + Xa.shape[1:]
+                    out, shape = net.forward(rep["Xd"], xshape)
+                    rows = _rows(shape)
+                    dout = net.arena.get("dout", rows * shape[-1])
+                    lossv = (rep["LOSSE"], ep)
+                    if ce:
+                        w = 1.0 / valid
+                        o.ce(out, rep["Yd"], dout, lossv, rows, shape[-1], w, w * len(b) / n)
+                    else:
+                        m_all = len(b) * int(np.prod(shape[1:]))
+                        o.mse(out, rep["Yd"], dout, lossv, rows * shape[-1], 1.0 / m_all, len(b) / (n * m_all))
+                    net.backward(dout)
+                o0 = r0["ops"]                               # the sum of the gradients, on the first card
+                for rep in R[1:]:
+                    rep["ops"].sync()
+                    o0.pull((TMP, 0), rep["ops"], (rep["net"].G, 0), nP)
+                    o0.axpy((r0["net"].G, 0), (TMP, 0), nP, 1.0)
+                o0.sync()
+                for rep in R[1:]:                            # and back to every card
+                    rep["ops"].pull((rep["net"].G, 0), o0, (r0["net"].G, 0), nP)
+                t_step += 1
+                for rep in R:                                # the same update everywhere
+                    o, net = rep["ops"], rep["net"]
+                    if EWC is not None:
+                        o.fill((rep["ET"], 0), nP, 0.0)
+                        o.axpy((rep["ET"], 0), (net.P, 0), nP, 1.0)
+                        o.axpy((rep["ET"], 0), (rep["EA"], 0), nP, -1.0)
+                        o.mul3((rep["ET"], 0), (rep["ET"], 0), (rep["EF"], 0), nP)
+                        o.axpy((net.G, 0), (rep["ET"], 0), nP, EWC)
+                    if clip:
+                        o.fill((rep["SQ"], 0), 1, 0.0)
+                        o.sumsq((net.G, 0), nP, (rep["SQ"], 0))
+                    lo, k = rep["lo"], rep["hi"] - rep["lo"]
+                    if k <= 0:
+                        continue
+                    if adam:
+                        c1, c2 = 1 - opt.b1 ** t_step, 1 - opt.b2 ** t_step
+                        nd = min(max(net.n_decay - lo, 0), k)
+                        o.adam((net.P, lo), (net.G, lo), (rep["st1"], 0), (rep["st2"], 0), (rep["SQ"], 0), k,
+                               nd, lr, opt.b1, opt.b2, opt.eps, c1, c2, wd, float(clip or 0.0))
+                    else:
+                        o.sgd((net.P, lo), (net.G, lo), (rep["st1"], 0), (rep["SQ"], 0), k, lr, float(opt.momentum),
+                              float(clip or 0.0))
+                for rep in R:                                # every card gets the slices the others updated
+                    rep["ops"].sync()
+                for rep in R:
+                    for q in R:
+                        if q is not rep and q["hi"] > q["lo"]:
+                            rep["ops"].pull((rep["net"].P, q["lo"]), q["ops"], (q["net"].P, q["lo"]), q["hi"] - q["lo"])
+                if EMA is not None:
+                    o0.axpy((EMA, 0), (EMA, 0), nP, ema - 1.0)
+                    o0.axpy((EMA, 0), (r0["net"].P, 0), nP, 1.0 - ema)
+                step += 1
+                for rep in R:
+                    rep["gov"].tick(rep["ops"].sync)
+            for rep in R:
+                rep["ops"].sync()
+            ep_seconds.append(round(time.perf_counter() - t0, 3))
+            if val is not None:
+                val_hist.append(_eval_loss(r0["net"], o0, val, ids, ce, bs))
+            if verbose and (ep % max(1, E // 10) == 0 or ep == E - 1):
+                lv = sum(float(rep["ops"].get(rep["LOSSE"], 1, ep)[0]) for rep in R)
+                print(f"epoch {ep:4}  loss {lv:.5f}  ({len(R)} cards)")
+        history = [float(sum(v)) for v in zip(*[rep["ops"].get(rep["LOSSE"], max(1, E))[:E] for rep in R])]
+        opt.t = t_step
+        out_params = r0["net"].params()
+        ema_params = r0["net"].params(EMA) if EMA is not None else None
+        peak = max(rep["ops"].used for rep in R)
+        temps = [rep["gov"].status() for rep in R]
+    finally:
+        for rep in R:
+            o = rep["ops"]
+            for key in ("st1", "st2", "SQ", "LOSSE", "XA", "YA", "IDX", "EA", "EF", "ET"):
+                if rep.get(key) is not None:
+                    o.free(rep[key])
+            rep["net"].close()
+    return Record(params=out_params, history=history, val_history=val_hist, gpu_memory_mb=round(peak / 2 ** 20),
+                  gpu_temperature=temps[0], gpu_temperatures=temps, epoch_seconds=ep_seconds,
+                  epoch_temperature_c=[t.get("temperature_c") if t else None for t in temps], ema_params=ema_params,
+                  device=f"{len(R)} GPUs ({', '.join(getattr(rep['ops'], 'name', '?') for rep in R)}), Apsi kernels, "
+                         "data-parallel")
 
 
 def _forward_batches(net, ops, Xa, bs):

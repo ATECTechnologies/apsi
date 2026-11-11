@@ -65,6 +65,26 @@ class Trainer(unittest.TestCase):
                        verbose=False, precision="fp32", clip=1.0, ops=GT.Emulator())
             np.testing.assert_allclose(a.history, b.history, rtol=1e-4)
 
+    def test_several_cards_train_like_one(self):
+        """Data-parallel training on several cards (here 3 emulated) gives the result of one card with the batch."""
+        from apsi.values import tree_leaves
+        rng = np.random.default_rng(5)
+        X, y = rng.normal(size=(50, 6)), rng.integers(0, 3, 50)
+        cases = (("cross_entropy", y, 3, lambda: Adam(0.01)), ("mse", rng.normal(size=(50, 2)), 2, lambda: Adam(0.01)),
+                 ("cross_entropy", y, 3, lambda: adamw(lr=0.01, weight_decay=0.1)),
+                 ("cross_entropy", y, 3, lambda: SGD(0.1, momentum=0.9)))
+        for lossname, yy, last, mk in cases:
+            m = L.mlp([6, 16, last], "gelu")
+            p0 = m.init(seed=1)
+            kw = dict(loss=lossname, epochs=3, batch_size=16, verbose=False, precision="fp32", clip=1.0)
+            one = GT.fit(m, p0, X, yy, opt=mk(), ops=GT.Emulator(), **kw)
+            many = GT.fit(m, p0, X, yy, opt=mk(), ops=[GT.Emulator(), GT.Emulator(), GT.Emulator()], ema=0.9, **kw)
+            for a, b in zip(tree_leaves(one.params), tree_leaves(many.params)):
+                np.testing.assert_allclose(np.asarray(a), np.asarray(b), rtol=2e-4, atol=2e-5)
+            np.testing.assert_allclose(one.history, many.history, rtol=1e-4)
+            self.assertIn("3 GPUs", many.device)
+            self.assertIsNotNone(many.ema_params)
+
     def test_ema_and_ewc(self):
         """EMA of the weights (the GLA project's teacher weights) and EWC (keep what an earlier task needed)."""
         from apsi.values import tree_leaves

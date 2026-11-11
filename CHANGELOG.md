@@ -16,6 +16,8 @@
 - **GPU temperature control:** long training, long answers and busy servers keep the card near 77 °C (75–78) by
   pacing the work while it is above the band (the driver's NVML gives the temperature); a cool card is never slowed.
   `APSI_GPU_TEMP=72` / `off`; `r.gpu_temperature`, `/metrics`, `hub.gpu_status()`.
+- **Several cards:** `device="cuda:all"` (or "cuda:0,1,…") trains data-parallel, gradients summed card to card,
+  the optimizer's state shared out among the cards; the same result as one card with the whole batch (tested).
 - **Large models:** a third build of the tiled products (4 warps of 64 x 64 over slices of 16), tiles visited in
   groups of 8 rows (large weights hit the L2 cache), and a size check before training starts.
 - **Measured after the fix (RTX 3060): 151,008 tokens/s for the 10.9 M GPT (PyTorch bf16 133,491), 17,134 for

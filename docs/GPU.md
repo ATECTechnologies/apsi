@@ -148,13 +148,20 @@ rate; PyTorch's cuBLAS float32 is still faster than Apsi's three-pass float32. P
 activations are bfloat16; Apsi keeps float32 activations). The products come in two builds and the card times both
 for each shape the first time it sees it, keeping the faster (`APSI_GEMM_VARIANT=a|x` fixes one).
 
-How big a model trains: training keeps four float32 numbers per parameter on the card (weights, gradients and
-AdamW's two moments, 16 bytes) plus the activations of a batch, so a 12 GB card trains up to roughly 500–600 M
-parameters, a 24 GB card about twice that, an 80 GB card a few billion. `fit` checks this first and says so with the
-numbers instead of failing half-way. Models of tens or hundreds of billions of parameters (21 B, 40 B, 100 B, 1 T)
-are trained on many large cards at once; on one consumer card such models *run* (`use hub`, int4 / int8: up to
-about 14 B on 12 GB) but cannot be trained. The architecture is yours to choose: `transformer_lm(vocab, d=, heads=,
-layers=, context=)` for any size, or your own `Sequential` of the layers in the table above.
+**Several cards** — `fit(…, backend="gpu", device="cuda:all")` (or `device="cuda:0,1,2,3"`): data-parallel
+training. Every card holds the model, takes its share of each batch, the gradients are summed card to card (NVLink /
+PCIe peer copies where the driver allows, else through the processor) and every card applies the same update, so the
+result equals one card with the whole batch while the speed grows with the cards. The optimizer's state is shared out
+among the cards (each keeps and updates only its slice, then the cards exchange the updated slices), so with N cards
+each needs 8 + 8 / N bytes per parameter instead of 16.
+
+How big a model trains: per card, the weights and gradients (8 bytes per parameter) plus its share of AdamW's state
+(8 / N bytes) plus the activations of its share of the batch. One 12 GB card: up to roughly 500–600 M parameters;
+one 80 GB card (H100): about 4 B; 4 × B200 (192 GB each): about 18 B. `fit` checks this before it starts and says so
+with the numbers. Models beyond that (21 B and up on 4 cards, 100 B, 1 T) also need the weights and gradients
+themselves split across the cards and kept in bfloat16 (as the large training frameworks do); that is not in Apsi's
+GPU trainer yet. The architecture is yours to choose at any size: `transformer_lm(vocab, d=, heads=, layers=,
+context=)`, or your own `Sequential` of the layers in the table above.
 
 Large products in three builds: the card times each one (8 warps of 64 × 32; the same loading first; 4 warps of
 64 × 64 over slices of 16) for every shape the first time and keeps the fastest; the tiles are visited in groups of 8
