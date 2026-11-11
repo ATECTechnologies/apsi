@@ -55,15 +55,37 @@ def langs(tmp, apsi_root, apsi_src):
          [f"{tmp}/rs"], "rustc -C opt-level=3 -C target-cpu=native", None),
         ("Go", ["go", "build", "-o", f"{tmp}/go", f"{HERE}/heavy.go"], [f"{tmp}/go"], "go build", None),
         ("Mojo", ["mojo", "build", "-o", f"{tmp}/mojo", f"{HERE}/heavy.mojo"], [f"{tmp}/mojo"], "mojo build", None),
+        ("Java", ["javac", "-d", f"{tmp}/java", f"{HERE}/Heavy.java"], ["java", "-cp", f"{tmp}/java", "Heavy"],
+         "javac + java (HotSpot JIT)", None),
+        ("JavaScript", None, ["node", f"{HERE}/heavy.js"], "node (V8 JIT)", None),
+        ("C#", ["dotnet", "build", _csproj(tmp), "-c", "Release", "-o", f"{tmp}/cs", "-nologo", "-v", "q"],
+         ["dotnet", f"{tmp}/cs/heavy.dll"], "dotnet build -c Release (RyuJIT)", None),
+        ("Julia", None, ["julia", "-O3", f"{HERE}/heavy.jl"], "julia -O3", None),
     ]
+
+
+def _csproj(tmp):
+    d = os.path.join(tmp, "csproj")
+    os.makedirs(d, exist_ok=True)
+    shutil.copy(os.path.join(HERE, "heavy.cs"), os.path.join(d, "heavy.cs"))
+    path = os.path.join(d, "heavy.csproj")
+    with open(path, "w") as fh:
+        fh.write('<Project Sdk="Microsoft.NET.Sdk"><PropertyGroup><OutputType>Exe</OutputType>'
+                 '<TargetFramework>net8.0</TargetFramework><Optimize>true</Optimize><TieredPGO>true</TieredPGO>'
+                 '<InvariantGlobalization>true</InvariantGlobalization><AssemblyName>heavy</AssemblyName>'
+                 '</PropertyGroup></Project>')
+    return path
 
 
 def version(name, root):
     cmd = {"Apsi": [sys.executable, "-m", "apsi", "version"], "C": ["gcc", "--version"], "C++": ["g++", "--version"],
-           "Rust": ["rustc", "--version"], "Go": ["go", "version"], "Mojo": ["mojo", "--version"]}[name]
+           "Rust": ["rustc", "--version"], "Go": ["go", "version"], "Mojo": ["mojo", "--version"],
+           "Java": ["java", "-version"], "JavaScript": ["node", "--version"], "C#": ["dotnet", "--version"],
+           "Julia": ["julia", "--version"]}[name]
     try:
-        return subprocess.run(cmd, capture_output=True, text=True, env=env_for(root or SRC_ROOT),
-                              timeout=60).stdout.splitlines()[0].strip()
+        r = subprocess.run(cmd, capture_output=True, text=True, env=env_for(root or SRC_ROOT), timeout=60)
+        lines = [l for l in (r.stdout + r.stderr).splitlines() if l.strip() and "JAVA_TOOL_OPTIONS" not in l]
+        return (("Node.js " if name == "JavaScript" else ".NET " if name == "C#" else "") + lines[0].strip())
     except Exception:                       # noqa: BLE001
         return "?"
 
@@ -222,7 +244,12 @@ def main():
                 board.status[name] = "building" if build else "running"
                 board.draw()
                 if build:
-                    subprocess.run(build, capture_output=True, text=True, check=True)
+                    b_ = subprocess.run(build, capture_output=True, text=True)
+                    if b_.returncode:                       # one compiler failing must not stop the others
+                        print(f"skip {name}: build failed\n{(b_.stdout + b_.stderr)[-2000:]}", flush=True)
+                        res["languages"].pop(name, None)
+                        board.status[name] = "build failed"
+                        continue
                 board.status[name] = "running"
                 board.started[name] = time.time()
                 proc = subprocess.Popen(exe, cwd=HERE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,

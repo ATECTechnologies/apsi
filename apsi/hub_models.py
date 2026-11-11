@@ -701,6 +701,12 @@ class Decoder:
             return False
         from . import hub_cpu
         groups = self._groups()
+        if self.gpu is not None:                            # split: only the layers that run on the processor
+            on_gpu = set(self._gm)
+            if self._gl is not None:
+                on_gpu |= {k for k in groups if k == "head" or (k.startswith("model.layers.") and
+                                                               int(k.split(".")[2]) < self._ng)}
+            groups = {k: v for k, v in groups.items() if k not in on_gpu}
         names = [n for ns in groups.values() for n in ns]
         if not all(self.W.raw_kind(n if n else self._head_name()) == "bf16" for n in names):
             return False
@@ -721,8 +727,9 @@ class Decoder:
 
     def _mm(self, x, key, names):
         """[x @ W.T for each named weight]; one fused product on the GPU."""
-        if self.gpu is None:
-            if not self.__dict__.get("_cm_ready"):
+        if self.gpu is None or key not in self._gm:         # the processor: also the layers of a split model
+            if self.__dict__.get("_cm_for") is not self.gpu or not self.__dict__.get("_cm_ready"):
+                self._cm_for = self.gpu
                 self._prepare_cpu()
             if key in self._cm:
                 from . import hub_cpu

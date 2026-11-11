@@ -1,0 +1,57 @@
+# Token savings of `use tokens` on realistic inputs; every transform is checked to reverse exactly.
+# Exact counts with tiktoken installed (o200k, GPT-4o), otherwise Apsi's estimate.
+use tokens
+seed(7)
+
+let names = ["ann", "bob", "cid", "dee", "eve", "fay", "gus", "hal", "ivy", "jon"]
+let cities = ["Bangkok", "Chiang Mai", "Phuket", "Khon Kaen", "Hat Yai"]
+var orders = []
+for i in 0..200:
+    orders.append({"id": 1000 + i, "customer": names[i % 10], "city": cities[i % 5],
+                   "total": round(rand() * 500, 2), "items": int(rand() * 9) + 1, "paid": i % 3 != 0,
+                   "date": f"2026-11-{(i % 28) + 1:02d}"})
+
+fn row(name, before, after, back_ok):
+    let a = tokens.count(before)
+    let b = tokens.count(after)
+    let ok = "exact" if back_ok else "DIFFERENT"
+    print(f"{name} | {a} | {b} | {100 * (a - b) / a:.1f} % | {ok}")
+
+let how = "tiktoken o200k (exact)" if tokens.exact() else "estimate"
+print(f"counter | {how}")
+let pretty = json_str(orders, indent=2)
+let packed = tokens.pack(orders)
+row("200 orders as pretty JSON -> pack()", pretty, packed, tokens.unpack(packed) == orders)
+row("200 orders as minified JSON -> pack()", json_str(orders), packed, tokens.unpack(packed) == orders)
+
+var lines = []
+for i in 0..500:
+    let k = i % 7
+    if k == 0:
+        lines.append(f"2026-11-11 08:{(i // 60) % 60:02d}:{i % 60:02d} INFO  worker-3 heartbeat ok; queue depth normal, latency within budget")
+    elif k == 1:
+        lines.append("2026-11-11 WARN  cache miss for key user:profile:settings, fetching from the primary database")
+    elif k == 2:
+        lines.append(f"2026-11-11 INFO  request {i} GET /api/v1/orders?page={i % 9} served in {i % 13} ms")
+    else:
+        lines.append("2026-11-11 DEBUG connection pool: 8 active, 24 idle, 0 waiting; nothing to do")
+let log = "\n".join(lines)
+let short = tokens.dedupe(log)
+row("500-line log -> dedupe()", log, short, tokens.expand(short) == log)
+
+var para = []
+for i in 0..240:
+    para.append(f"Section {i // 12 + 1}, paragraph {i % 12 + 1}: the controller keeps the plant within {i % 5 + 1} percent of its set point while the load changes, and reports every deviation to the operator.")
+let doc = "\n".join(para)
+var edited_lines = list(para)
+edited_lines[37] = "Section 4, paragraph 2: the controller now also limits the rate of change of its output."
+edited_lines.insert(120, "A new paragraph about the safety interlock that stops the plant when a sensor fails.")
+let edited = "\n".join(edited_lines)
+let delta = tokens.diff(doc, edited)
+row("Edited document (~6,000 tokens) -> diff()", edited, delta, tokens.patch(doc, delta) == edited)
+
+let both = tokens.dedupe(tokens.pack(orders + orders))
+row("400 orders with every record twice -> dedupe(pack())", json_str(orders + orders, indent=2), both,
+    tokens.unpack(tokens.expand(both)) == orders + orders)
+let best = tokens.best(orders)
+row(f"tokens.best() on the orders (chose {best[1]})", pretty, best[0], tokens.restore(best[0], best[1]) == orders)
