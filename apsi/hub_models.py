@@ -1213,6 +1213,7 @@ class Decoder:
                         self.CHUNK = 64
                         continue
                     _gpu_gave_up(e)
+                    self.gpu_failure = f"{type(e).__name__}: {e}"     # lm.plan and servers report it
                     self.release()
 
     @property

@@ -10,6 +10,7 @@ import sys
 import threading
 
 _lock = threading.RLock()
+_tls = threading.local()                 # the context this thread made current (CUDA contexts are per thread)
 _driver = None
 _failed = None
 
@@ -53,6 +54,13 @@ class Device:
             self.drv.check(lib.cuDevicePrimaryCtxRetain(ctypes.byref(c), self.handle), "cuDevicePrimaryCtxRetain")
             self.ctx = c
         self.drv.check(lib.cuCtxSetCurrent(self.ctx), "cuCtxSetCurrent")
+        _tls.ctx = self.ctx
+
+    def ensure(self):
+        """Make this GPU current on the calling thread if it is not already: every call that touches the device
+        goes through here, so a model loaded on one thread works from any other (a server's request threads)."""
+        if self.ctx is None or getattr(_tls, "ctx", None) is not self.ctx:
+            self.activate()
 
     # ---------------------------------------------------------------- modules
     def load(self, key, ptx):
@@ -84,12 +92,14 @@ class Device:
 
     # ---------------------------------------------------------------- memory
     def alloc(self, n):
+        self.ensure()
         p = ctypes.c_uint64()
         self.drv.check(self.drv.lib.cuMemAlloc_v2(ctypes.byref(p), ctypes.c_size_t(max(1, n))), "cuMemAlloc")
         return p.value
 
     def free(self, p):
         if p:
+            self.ensure()
             self.drv.lib.cuMemFree_v2(ctypes.c_uint64(p))
 
     # Buffers for a call: kept by size and reused by the next call (a frame of a video, a step of a loop), instead
@@ -128,16 +138,19 @@ class Device:
 
     def to_device(self, dptr, host_addr, n):
         if n:
+            self.ensure()
             self.drv.check(self.drv.lib.cuMemcpyHtoD_v2(ctypes.c_uint64(dptr), ctypes.c_void_p(host_addr),
                                                          ctypes.c_size_t(n)), "cuMemcpyHtoD")
 
     def to_host(self, host_addr, dptr, n):
         if n:
+            self.ensure()
             self.drv.check(self.drv.lib.cuMemcpyDtoH_v2(ctypes.c_void_p(host_addr), ctypes.c_uint64(dptr),
                                                          ctypes.c_size_t(n)), "cuMemcpyDtoH")
 
     def launch(self, fn, grid, block, params):
         """params: list of ctypes objects; the kernel receives pointers to them."""
+        self.ensure()
         arr = (ctypes.c_void_p * len(params))(*[ctypes.cast(ctypes.pointer(p), ctypes.c_void_p) for p in params])
         self.drv.check(self.drv.lib.cuLaunchKernel(fn, grid, 1, 1, block, 1, 1, 0, None, arr, None),
                        "cuLaunchKernel")

@@ -1447,7 +1447,7 @@ class Runner(_Base):
 
     def copy(self, dst, doff, src, soff, n):
         if n:
-            self.dev.activate()
+            self.dev.ensure()
             self.dev.drv.check(self.dev.drv.lib.cuMemcpyDtoD_v2(ctypes.c_uint64(dst.ptr + 4 * doff),
                                                                  ctypes.c_uint64(src.ptr + 4 * soff),
                                                                  ctypes.c_size_t(4 * n)), "cuMemcpyDtoD")
@@ -1465,6 +1465,7 @@ class Runner(_Base):
             if len(self._calls) > 8192:
                 self._calls.clear()
             hit = self._calls[key] = (objs, arr)
+        self.dev.ensure()
         r = self._launch(self.fn[name], max(1, grid), 1, 1, block, 1, 1, 0, None, hit[1], None)
         if r:
             self.dev.drv.check(r, f"launching {name}")
@@ -1538,7 +1539,7 @@ class Runner(_Base):
         if not half:
             return self.copy(dst, doff, src, soff, n)
         if n:                                           # element offsets of 2 bytes
-            self.dev.activate()
+            self.dev.ensure()
             self.dev.drv.check(self.dev.drv.lib.cuMemcpyDtoD_v2(ctypes.c_uint64(dst.ptr + 2 * doff),
                                                                  ctypes.c_uint64(src.ptr + 2 * soff),
                                                                  ctypes.c_size_t(2 * n)), "cuMemcpyDtoD")

@@ -323,6 +323,7 @@ class Gpu(_Ops):
             if len(self._calls) > 16384:
                 self._calls.clear()
             hit = self._calls[key] = (objs, arr)
+        self.dev.ensure()
         r = self._launch(self.fn[name], max(1, gx), max(1, gy), 1, block, 1, 1, 0, None, hit[1], None)
         if r:
             self.dev.drv.check(r, f"launching {name}")
@@ -349,6 +350,7 @@ class Gpu(_Ops):
         return out
 
     def sync(self):
+        self.dev.ensure()
         self.dev.drv.check(self.dev.drv.lib.cuCtxSynchronize(), "cuCtxSynchronize")
 
     @staticmethod

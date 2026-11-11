@@ -141,6 +141,7 @@ class Server:
         self.gate = _Gate(int(max_queue))
         self.stats = _Stats()
         self.created = int(time.time())
+        self.on_gpu = getattr(getattr(model, "net", None), "gpu", None) is not None
         server = self
 
         class Handler(BaseHTTPRequestHandler):
@@ -183,7 +184,7 @@ class Server:
                 path = self.path.split("?")[0].rstrip("/") or "/"
                 if path == "/health":
                     return self._json(200, {"status": "ok", "model": server.name, "queue": server.gate.waiting(),
-                                            "device": str(getattr(server.model, "device", "?"))})
+                                            "device": server.device()})
                 if not self._authorized():
                     return self._error(_ApiError(401, "missing or wrong API key", "authentication_error"))
                 if path == "/v1/models":
@@ -343,6 +344,7 @@ class Server:
             in_tokens = int(getattr(m, "last_prompt_tokens", 0) or 0)
         finally:
             self.gate.leave()
+            self._check_device()
         t_end = time.monotonic()
         raw = "".join(text)                                       # exactly what the stream has seen
         full = reply if not (stop or state["gone"]) else (raw.strip() if chat else raw)
@@ -400,6 +402,20 @@ class Server:
             obj["usage"] = usage
         h.wfile.write(b"data: " + json.dumps(obj, ensure_ascii=False).encode() + b"\n\n")
         h.wfile.flush()
+
+    def device(self):
+        net = getattr(self.model, "net", None)
+        if self.on_gpu and net is not None and getattr(net, "gpu", None) is None:
+            return f"cpu (the GPU failed: {getattr(net, 'gpu_failure', '?')})"
+        return str(getattr(self.model, "device", "?"))
+
+    def _check_device(self):
+        """A model that fell back to the processor is said once, loudly: a server must not slow down silently."""
+        if self.on_gpu and getattr(getattr(self.model, "net", None), "gpu", None) is None and not getattr(self, "_said", 0):
+            self._said = 1
+            import sys
+            print(f"apsi serve-model: WARNING the model now runs on the processor: {self.device()}", file=sys.stderr,
+                  flush=True)
 
     # ------------------------------------------------------------------ running
     @property
