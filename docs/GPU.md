@@ -147,6 +147,10 @@ documentation to train on, 234 held out; batch 32, AdamW 1e-3, 3 epochs; RTX 306
 | PyTorch tf32 | 94,031 tokens/s | | 2.309 | 797 MB |
 | PyTorch fp32 | 73,929 tokens/s | | 2.310 | 796 MB |
 
+Without administrator rights, through the GPU helper (set up once by the installer or `apsi gpu setup`), the same
+training ran at 146,051 tokens/s (148,783 · 148,898 · 143,629 by epoch) and the 127 M model at 17,968 tokens/s, with
+no pauses: an ordinary run gets the same steady speed.
+
 In bfloat16 Apsi trains this model **1.19× as fast as PyTorch**, every epoch at the same speed. One step takes
 26.8 ms of kernels on the card; the matrix products are 75 % of it.
 
