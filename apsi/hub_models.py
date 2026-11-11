@@ -132,10 +132,14 @@ class _Q8Store:
         h = hashlib.sha256(b"apsi-q8-1")
         for ns in groups.values():
             for n in ns:
-                kind, ref = net.W._raw.get(n if n else net._head_name(), (None, None))
+                nm = n if n else net._head_name()
+                kind, ref = net.W._raw.get(nm, (None, None))
+                src = getattr(net.W, "src", {}).get(nm)
                 if isinstance(ref, _Ref):
-                    st = os.stat(ref.path)
-                    h.update(f"{os.path.abspath(ref.path)}|{st.st_size}|{int(st.st_mtime)}|{ref.offset}|{ref.shape}".encode())
+                    src = (ref.path, ref.offset, ref.shape)
+                if src is not None:                         # read lazily or memory-mapped: keyed by the file
+                    st = os.stat(src[0])
+                    h.update(f"{os.path.abspath(src[0])}|{st.st_size}|{int(st.st_mtime)}|{src[1]}|{src[2]}".encode())
                 else:
                     h = None
                     break
@@ -329,6 +333,7 @@ def read_safetensors_lazy(path, into=None, mmap=False):
             raise ModelError(f"safetensors: tensor '{name}' has the wrong size for its shape")
         if buf is not None:
             W.add(name, kind, buf[start + a:start + b].view(dt).reshape(shape))
+            W.__dict__.setdefault("src", {})[name] = (path, start + a, shape)     # for caches keyed by the file
         else:
             W.add(name, kind, _Ref(path, start + a, shape, dt))
     return W
