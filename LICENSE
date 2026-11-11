@@ -1,92 +1,190 @@
-# Apsi Non-Commercial License
+# Apsi License
 
-Version 1.0
+Version 2.0 · 10 November 2026
 
-Copyright © ATEC. All rights reserved except as granted below.
+Copyright © 2026 ATEC. All rights not granted below are reserved.
 
-Original developer: **ATEC**
-Official source: https://github.com/OWNER/apsi (to be published)
-Official website: the official Apsi website
+Licensor: **ATEC** · Official source: https://github.com/ATECTechnologies/apsi · Official website: https://apsi.dev
+
+A plain-language guide with examples is in `docs/LICENSING.md`. It explains this License but does not change it;
+if the two ever differ, this License applies.
 
 ## 1. Purpose
 
-Apsi is free, and its source code is open so that everyone can learn from it, improve it, adapt it and build on it. This License keeps it that way: anyone may use and change Apsi without paying, nobody may sell it or charge for it, and the original developer is always credited.
+Apsi is free to use, and its source code is open so that anyone can learn from it, build with it and improve it.
+This License keeps three promises at the same time:
+
+1. **Anyone may use Apsi for any purpose**, including at work, in companies, in government and in products they
+   sell, without paying.
+2. **Nobody may sell Apsi itself**, or charge for access to Apsi itself, without a separate written licence from
+   ATEC. Changed versions of Apsi stay available under this License.
+3. **The origin is always credited** to ATEC.
 
 ## 2. Definitions
 
-- **“Software”** means the Apsi programming language implementation published by ATEC: its compiler, interpreter, runtime, standard library, tools, documentation, examples, website source code, and any part of them, in source or compiled form.
-- **“Derivative Work”** means any work that contains, is based on, or is adapted from the Software or any part of it, including modified versions, translations, ports, forks and works that bundle the Software.
-- **“You”** means the person or organisation exercising the rights in this License.
-- **“Commercial Use”** means any use of the Software or a Derivative Work that is intended for, or directed towards, commercial advantage or monetary compensation. It includes, in particular:
-  1. selling, renting or licensing the Software or a Derivative Work, or copies of them, for a fee;
-  2. offering the Software or a Derivative Work, or access to it, as a paid service, including hosted, cloud, subscription, “software as a service”, API or consulting offerings whose price depends on the Software;
-  3. including the Software or a Derivative Work in a product, device or service that is sold, rented or offered for a fee;
-  4. charging for distribution, downloading, installation, hosting or access, or placing the Software behind a paywall;
-  5. using the Software or a Derivative Work to provide paid support, training or certification that is presented as an offering of the Software.
-- **“Non-Commercial Purpose”** means any purpose that is not Commercial Use, including personal use, study, teaching, academic and scientific research, use by non-profit organisations, and internal evaluation.
+**"Software"** means the Apsi programming language implementation that ATEC publishes under this License: its
+compiler, interpreter, runtime, standard library, command-line tools, editor extensions, installers, documentation,
+examples and website source code, and any part of them, in source or compiled form.
 
-## 3. What you may do
+**"Modified Version"** means a work that contains the Software or a substantial part of it, changed or not,
+including forks, ports, translations into another language, and works that are based on the Software's source code.
+A Modified Version does not include Your Programs.
 
-Subject to the conditions in this License, ATEC grants You a worldwide, royalty-free, non-exclusive licence, for Non-Commercial Purposes only, to:
+**"Your Programs"** means anything You create *with* the Software rather than *from* it: programs and libraries
+written in the Apsi language, programs converted to Apsi with `apsi convert`, models You train, data, files and
+other results Your programs produce, and executables made from Your programs with `apsi build`.
 
-1. use and run the Software;
-2. read, study and modify the source code;
-3. create Derivative Works and improve the Software;
-4. copy and distribute the Software and Derivative Works, free of charge.
+**"Runtime Copy"** means an unmodified copy of the Software's runtime and standard library that is included in, or
+installed together with, one of Your Programs so that it can run (for example inside an executable made with
+`apsi build`, a container image, or an installer of Your application).
 
-## 4. Conditions
+**"Selling the Software"** means any of the following, done for money or other compensation:
 
-### 4.1 No commercial use
+1. selling, renting, sublicensing or charging for copies of the Software or a Modified Version;
+2. charging for downloading, installing or accessing the Software or a Modified Version, or placing it behind a
+   paywall or a paid account;
+3. offering the Software or a Modified Version to third parties as a hosted service — for example a paid online
+   Apsi compiler, notebook, playground, IDE, API or package registry — where the Software provides a substantial
+   part of what the customer pays for;
+4. selling a product whose main value is the Software or a Modified Version itself, such as a paid distribution,
+   a paid plug-in that unlocks parts of the Software, or a paid language or compiler built from the Software.
 
-You may not engage in Commercial Use of the Software or of any Derivative Work. Every copy and every Derivative Work that You distribute must be made available free of charge.
+Selling the Software does **not** include: selling or running Your Programs (with Runtime Copies); using the
+Software inside an organisation; charging for Your own work, such as development, consulting, teaching, training,
+support or hosting of Your Programs; or receiving donations, grants or sponsorship.
 
-### 4.2 Credit is always required
+**"You"** means the person or legal entity exercising rights under this License. For a legal entity, "You" includes
+every entity that controls it, is controlled by it, or is under common control with it.
 
-Every copy and every Derivative Work, in source or compiled form, must:
+## 3. Licence granted to You
 
-1. keep this License and all copyright and attribution notices intact;
-2. state clearly, in its documentation and in its “about” information or README, that it is based on Apsi, originally developed by **ATEC**, with the official source address **https://github.com/OWNER/apsi (to be published)**;
-3. state that it was modified, if it was, and by whom.
+Subject to the conditions of this License, ATEC grants You a worldwide, royalty-free, non-exclusive licence, for as
+long as the copyright lasts, to:
 
-The credit must be easy to find for an ordinary user. It may not be hidden, removed or made misleading.
+1. **use** the Software for any purpose, commercial or not, including running it in production;
+2. **study** the source code and **modify** it;
+3. **make and distribute copies** of the Software and of Modified Versions, free of charge;
+4. **create, use, sell and distribute Your Programs**, including with Runtime Copies;
+5. **analyse** the Software with any tool, including automated analysis and the training of machine-learning
+   models. Distributing a substantial part of the Software's code, also when a model reproduces it, is distribution
+   under this License.
 
-### 4.3 The same license for derivative works
+## 4. Patent licence
 
-You must distribute Derivative Works only under this License, with its non-commercial and credit conditions unchanged. You may not add terms that restrict the rights this License gives to others.
+ATEC grants You a licence under every patent claim it can license that would be infringed by using the Software as
+ATEC published it, for the purposes allowed in section 3. If You, or an entity acting on Your behalf, start a legal
+claim alleging that the Software infringes a patent, this patent licence ends on the date the claim is filed.
 
-### 4.4 No endorsement
+## 5. Conditions
 
-The names “Apsi” and “ATEC” may be used to describe the origin of a Derivative Work as required by section 4.2, but not to suggest that ATEC endorses it. A modified version must not be presented as the official Apsi.
+### 5.1 Do not sell the Software
 
-## 5. Your own programs and libraries
+You may not engage in Selling the Software without a separate written licence from ATEC (section 11). This applies
+to the Software and to every Modified Version.
 
-Programs that You write in the Apsi language, libraries You publish to the registry, and the results Your programs compute belong to You. This License does not restrict them, and You choose their licence. However, distributing the Software or a Derivative Work together with them is still governed by this License: You may not sell the Software, or include it in something You sell, and You must credit it as section 4.2 requires.
+### 5.2 Credit
 
-## 6. Contributions
+Every copy of the Software and every Modified Version that You distribute, in source or compiled form, must:
 
-Unless You state otherwise in writing, any contribution You submit for inclusion in the official Software is provided under this License, and You confirm that You have the right to submit it.
+1. keep this License and all copyright, licence and attribution notices intact;
+2. say, where users will see it (for example in the README, the "about" screen or the documentation), that it is
+   based on Apsi, originally developed by ATEC, with the address https://github.com/ATECTechnologies/apsi;
+3. say that it was changed, if it was, and by whom.
 
-## 7. Termination
+For Your Programs that include a Runtime Copy, a one-line credit in the program's documentation, licence file or
+"about" information is enough: `Uses the Apsi runtime by ATEC (https://apsi.dev), Apsi License 2.0.`
 
-Your rights under this License end automatically if You break its conditions. If You stop the breach and correct it within 30 days of learning about it, Your rights are restored, unless ATEC has notified You in writing that they are terminated. People who received copies from You keep their rights as long as they comply.
+Credit may not be hidden, removed or made misleading.
 
-## 8. No warranty
+### 5.3 Modified Versions stay under this License
 
-THE SOFTWARE IS PROVIDED “AS IS”, WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE, ACCURACY AND NON-INFRINGEMENT. YOU ARE RESPONSIBLE FOR CHECKING THAT RESULTS PRODUCED WITH THE SOFTWARE ARE CORRECT FOR YOUR PURPOSE, IN PARTICULAR IN MEDICAL, SAFETY-CRITICAL, ENGINEERING AND FINANCIAL USE.
+Modified Versions may be distributed only under this License, with sections 5.1 to 5.4 unchanged, and with their
+source code available to the people who receive them at no charge. You may not add terms that take away rights this
+License gives. This condition does not apply to Your Programs, which You may license as You choose.
 
-## 9. Limitation of liability
+### 5.4 Names and logo
 
-TO THE EXTENT PERMITTED BY LAW, IN NO EVENT SHALL ATEC OR ANY CONTRIBUTOR BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR ITS USE.
+This License does not grant rights to the names "Apsi" and "ATEC" or to the Apsi logo, except to state truthfully
+where a work comes from as section 5.2 requires. You may not suggest that ATEC endorses, sponsors or certifies You
+or Your work. A Modified Version must not be presented as the official Apsi; give it a name of its own (for example
+"X, based on Apsi"). Your Programs may say that they are written in Apsi.
 
-## 10. Commercial licences
+## 6. What stays Yours
 
-If You want to use the Software in a way this License does not allow, contact ATEC through the official website or repository. Any other permission must be given in writing.
+Your Programs and everything they produce belong to You. ATEC claims no rights in them, and this License places no
+conditions on them other than the credit for a Runtime Copy in section 5.2.
 
-## 11. Notice to include
+## 7. Rights the law gives You
 
-Put the following notice in the README or “about” information of every copy and Derivative Work:
+Nothing in this License limits what the law allows without a licence, such as fair use, fair dealing, or the
+exceptions for computer programs in the copyright law that applies to You (in Thailand, the Copyright Act B.E. 2537,
+including sections 32 and 35). Where such an exception allows more than this License, You may rely on it.
+
+## 8. Contributions
+
+If You submit a contribution (code, documentation, examples or other material) for inclusion in the official
+Software, You confirm that You have the right to do so and You grant ATEC and everyone who receives the Software a
+licence to it under this License. You also grant ATEC a perpetual, worldwide, royalty-free, irrevocable licence to
+use, change and relicense Your contribution as part of the Software, including under the separate licences of
+section 11, so that the Software can keep a single licence. You keep the copyright in Your contribution. A
+contribution You mark in writing as "not a contribution" is not covered by this section.
+
+## 9. Violations and how to fix them
+
+If You break a condition of this License and ATEC notifies You in writing, Your rights continue if, within 30 days
+of the notice, You stop the violation and take reasonable steps to correct its effects (for example removing paid
+offers or adding the missing credit). If You do not, all Your rights under this License end. The first time You are
+notified about a violation, Your rights are restored as soon as You comply, even after the 30 days. People who
+received copies from You keep their rights as long as they comply themselves. Section 4 ends patent rights
+separately.
+
+## 10. No warranty; limitation of liability
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING THE WARRANTIES OF
+MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE, ACCURACY AND NON-INFRINGEMENT, TO THE EXTENT THE APPLICABLE LAW
+ALLOWS. YOU ARE RESPONSIBLE FOR CHECKING THAT RESULTS PRODUCED WITH THE SOFTWARE ARE CORRECT FOR YOUR PURPOSE, IN
+PARTICULAR IN MEDICAL, SAFETY-CRITICAL, ENGINEERING, LEGAL AND FINANCIAL USE.
+
+TO THE EXTENT THE APPLICABLE LAW ALLOWS, ATEC AND THE CONTRIBUTORS ARE NOT LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR ITS
+USE. THIS DOES NOT LIMIT LIABILITY THAT CANNOT BE LIMITED BY LAW, SUCH AS LIABILITY FOR FRAUD, FOR WILFUL
+MISCONDUCT OR GROSS NEGLIGENCE, OR UNDER CONSUMER-PROTECTION LAW THAT CANNOT BE WAIVED.
+
+## 11. Other licences
+
+ATEC may grant other permissions, including commercial licences for Selling the Software, in writing. Contact ATEC
+through https://apsi.dev or the official repository. No permission exists unless it is in writing.
+
+## 12. Third-party components
+
+Parts of the Software that were written by others (for example fonts, icons and libraries in the `node_modules`,
+`fonts` or vendor folders, and the Python packages Apsi uses) remain under their own licences, which are listed with
+them. This License does not change those licences.
+
+## 13. Versions of this License
+
+ATEC may publish new versions of this License. Each version of the Software is licensed under the version of this
+License that comes with it. You may also choose to follow the terms of a later version that ATEC publishes.
+Versions of the Software released earlier under the Apsi Non-Commercial License 1.0 may, at Your choice, be used
+under this version instead.
+
+## 14. General
+
+1. **Governing law.** This License is governed by the laws of Thailand, without regard to conflict-of-law rules.
+   This does not take away protection that mandatory law where You live gives You.
+2. **Courts.** Disputes go to the courts of Thailand that have jurisdiction, including the Central Intellectual
+   Property and International Trade Court, unless mandatory law gives You the right to go to another court.
+3. **Severability.** If a court finds a provision unenforceable, it is changed to the minimum extent needed to make
+   it enforceable, and the rest of this License stays in force.
+4. **Language.** This License is written in English. Translations are for convenience; the English text applies.
+5. **Entire licence.** This License is the whole licence between You and ATEC for the Software, unless You have a
+   separate written agreement with ATEC.
+
+## 15. Notice to include
+
+Put this notice in the README, "about" information or documentation of every copy and every Modified Version:
 
 ```text
-Based on Apsi, originally developed by ATEC — https://github.com/OWNER/apsi (to be published)
-Licensed under the Apsi Non-Commercial License 1.0. Not for sale or paid services.
+Based on Apsi, originally developed by ATEC — https://github.com/ATECTechnologies/apsi
+Licensed under the Apsi License 2.0. Apsi itself may not be sold; programs written in Apsi are yours.
 ```

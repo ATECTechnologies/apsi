@@ -1,0 +1,26 @@
+use db
+let time = pyimport("time")
+let pg = db.postgres("postgres://apsi:secretpw@127.0.0.1:55432/postgres")
+pg.execute("drop table if exists bench_t; create table bench_t (id int primary key, name text, v float8)")
+var t = time.perf_counter()
+pg.insert_many("bench_t", [[i, f"n{i}", i * 0.5] for i in range(20000)], columns=["id", "name", "v"])
+print(f"pg insert_many 20000 rows: {(time.perf_counter() - t) * 1000:.0f} ms")
+t = time.perf_counter()
+for i in range(2000):
+    pg.query("select name, v from bench_t where id = $1", i).one()
+print(f"pg 2000 point queries: {(time.perf_counter() - t) * 1000:.0f} ms")
+t = time.perf_counter()
+let rows = pg.query("select * from bench_t")
+print(f"pg read 20000 rows: {(time.perf_counter() - t) * 1000:.0f} ms ({len(rows.dicts())})")
+let r = db.redis("redis://:redispw@127.0.0.1:56379/0")
+r.delete("q")
+t = time.perf_counter()
+let p = r.pipeline()
+for i in range(10000):
+    p.rpush("q", i)
+p.execute()
+print(f"redis 10000 pipelined pushes: {(time.perf_counter() - t) * 1000:.0f} ms")
+t = time.perf_counter()
+for i in range(2000):
+    r.set(f"k{i}", i)
+print(f"redis 2000 SET round trips: {(time.perf_counter() - t) * 1000:.0f} ms")

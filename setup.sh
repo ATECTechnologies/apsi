@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Apsi 2.0.0 — one-shot setup for Linux (run from the source folder).
+# Apsi 2.4.4 — one-shot setup for Linux (run from the source folder).
 #
 #   ./setup.sh                      install Apsi for development + run tests
 #   ./setup.sh --installer          also build the setup wizard (AppImage) and the Windows payload

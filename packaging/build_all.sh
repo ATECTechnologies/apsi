@@ -33,7 +33,7 @@ cp apsi/*.py apsi/MANIFEST.json "$P/usr/lib/python3/dist-packages/apsi/"
 for sub in apsi/*/; do                                   # subpackages (apsi/native), without caches
   case "$sub" in *__pycache__*) continue ;; esac
   mkdir -p "$P/usr/lib/python3/dist-packages/$sub"
-  cp "$sub"*.py "$P/usr/lib/python3/dist-packages/$sub"
+  find "$sub" -maxdepth 1 -type f \( -name '*.py' -o -name '*.c' -o -name '*.h' -o -name '*.json' \) -exec cp {} "$P/usr/lib/python3/dist-packages/$sub" \;
 done
 cp README.md CHANGELOG.md "$P/usr/share/doc/apsi/"
 cp -r examples docs "$P/usr/share/apsi/"          # /usr/share/doc may be stripped on minimal systems
@@ -42,7 +42,7 @@ cp editors/vscode/syntaxes/apsi.tmLanguage.json "$P/usr/share/apsi/"
 [ -f "$DIST/apsi-language-$V.vsix" ] && cp "$DIST/apsi-language-$V.vsix" "$P/usr/share/apsi/" || true
 cat > "$P/usr/bin/apsi" <<'SH'
 #!/bin/sh
-exec /usr/bin/python3 -m apsi "$@"
+exec /usr/bin/python3 -P -m apsi "$@"
 SH
 chmod 755 "$P/usr/bin/apsi"
 SIZE="$(du -sk "$P/usr" | cut -f1)"

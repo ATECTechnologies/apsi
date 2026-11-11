@@ -121,10 +121,15 @@ def kinds_of(ex):
     return ks
 
 
-def matches(ex, kinds):
-    """True when the exception `ex` is one of `kinds` (names as written after `except`)."""
+def matches(ex, kinds, classes=()):
+    """True when the exception `ex` is one of `kinds` (names as written after `except`) or an instance of one of
+    `classes` (exception classes the program defined or imported)."""
     if isinstance(ex, (KeyboardInterrupt, SystemExit, GeneratorExit)):
         return False
+    if classes:
+        orig = getattr(ex, "original", None)
+        if isinstance(ex, classes) or (orig is not None and isinstance(orig, classes)):
+            return True
     have = None
     for k in kinds:
         k = ALIASES.get(k, k).split(".")[-1]
@@ -161,9 +166,12 @@ class ErrorValue:
 
     def __getattr__(self, name):
         # fields of an error struct raised by the program (raise InsufficientFunds("…", amount=30))
-        payload = getattr(object.__getattribute__(self, "error"), "payload", None)
+        err = object.__getattribute__(self, "error")
+        payload = getattr(err, "payload", None)
         if payload is not None and name in getattr(payload, "fields", {}):
             return payload.fields[name]
+        if not name.startswith("_") and name in getattr(err, "__dict__", {}):
+            return err.__dict__[name]                  # e.code of a database error, e.status of an HTTP error …
         raise AttributeError(name)
 
     @property
@@ -178,11 +186,32 @@ class ErrorValue:
 
 
 def value(ex):
-    return ex if isinstance(ex, ErrorValue) else ErrorValue(ex)
+    """What `except … as e` binds. Python's own exceptions (and classes the program defined) are bound as they are —
+    isinstance(), e.args, e.__cause__, raise e all behave as in Python — with .kind/.message/.line added; Apsi's
+    own errors are wrapped in an ErrorValue."""
+    if isinstance(ex, ErrorValue):
+        return ex
+    orig = getattr(ex, "original", None)
+    real = orig if isinstance(orig, BaseException) and not isinstance(orig, ApsiError) else ex
+    if not isinstance(real, (ApsiError, UserError)):
+        try:
+            ev = ErrorValue(real)
+            if "kind" not in getattr(real, "__dict__", {}):
+                real.kind = ev.kind
+            if "message" not in getattr(real, "__dict__", {}):
+                real.message = ev.message
+            if "line" not in getattr(real, "__dict__", {}):
+                real.line = getattr(ex, "line", None)
+            return real
+        except (AttributeError, TypeError):
+            pass
+    return ErrorValue(ex)
 
 
 def to_raise(v):
     """Turn the value after `raise` into a Python exception to raise."""
+    if v is None:
+        return None
     if isinstance(v, ErrorValue):
         return v.error
     if isinstance(v, BaseException):

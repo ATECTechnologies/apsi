@@ -1,5 +1,9 @@
 # Compute backends: NumPy and PyTorch (CPU, CUDA, ROCm, MPS, XPU)
 
+> **A third backend, with nothing installed:** `backend="gpu"` trains on NVIDIA cards with Apsi's own kernels — no
+> PyTorch, no CUDA toolkit — and is faster than PyTorch on the models it supports (a 10.9 M-parameter GPT: 151,744
+> against 126,993 tokens/s on an RTX 3060). See [`GPU.md`](GPU.md); this page covers NumPy and PyTorch.
+
 Every model built with [`use layers`](LAYERS.md) runs on two backends without changing a line of the model:
 
 | Backend | Devices | Number formats | When to use it |

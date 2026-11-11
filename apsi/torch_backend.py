@@ -13,6 +13,8 @@ so `check_torch()` can compare both backends layer by layer on your machine.
 """
 import math
 
+import os
+
 import numpy as np
 
 from . import ops
@@ -105,11 +107,52 @@ _PRECISION = {"fp64": ("float64", None), "float64": ("float64", None), "f64": ("
               "fp16": ("float32", "float16"), "float16": ("float32", "float16"), "f16": ("float32", "float16")}
 
 
-def _precision(name, dev):
+def auto_precision(dev):
+    """The fastest precision that trains reliably on `dev`: bf16 mixed precision where the GPU has bf16 (NVIDIA
+    Ampere and newer, AMD MI200+, Intel XPU), fp16 with loss scaling on older CUDA GPUs and Apple MPS, fp32 on the
+    CPU. APSI_PRECISION overrides it for every program."""
     torch = _import()
-    key = str(name or "fp32").lower()
+    env = os.environ.get("APSI_PRECISION", "").strip().lower()
+    if env and env != "auto":
+        return env
+    if dev.type == "cuda":
+        try:
+            return "bf16" if torch.cuda.is_bf16_supported() else "fp16"
+        except Exception:
+            return "fp16"
+    if dev.type == "xpu":
+        return "bf16"
+    if dev.type == "mps":
+        return "fp16"
+    return "fp32"
+
+
+def _precision(name, dev):
+    """(storage dtype, autocast dtype or None). `name` is "auto" (default), a name such as "bf16", or a record /
+    dict {store: "float32", compute: "bfloat16"} for any pair torch has."""
+    torch = _import()
+    if isinstance(name, dict) or hasattr(name, "fields") or hasattr(name, "store"):
+        get = (lambda k: name.get(k)) if isinstance(name, dict) else (lambda k: getattr(name, k, None))
+        store, amp = get("store") or "float32", get("compute")
+        for t in (store, amp):
+            if t is not None and not isinstance(getattr(torch, str(t), None), torch.dtype):
+                raise RuntimeErr(f"precision: '{t}' is not a torch dtype (e.g. float32, bfloat16, float16)")
+        return getattr(torch, str(store)), (getattr(torch, str(amp)) if amp and amp != store else None)
+    key = str(name or "auto").lower()
+    if key == "auto":
+        key = auto_precision(dev)
+    from . import lowbit
+    if lowbit.parse(key):                   # fp8 / fp6 / fp4 / int8 / int4 weights: float32 master, 16-bit products
+        if dev.type == "cuda":
+            try:
+                half = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
+            except Exception:
+                half = torch.float16
+            return torch.float32, half
+        return torch.float32, (torch.bfloat16 if dev.type == "xpu" else None)
     if key not in _PRECISION:
-        raise RuntimeErr(f"precision must be one of fp64, fp32, tf32, bf16, fp16 (got '{name}')")
+        raise RuntimeErr(f"precision must be auto, fp64, fp32, tf32, bf16, fp16, fp8, fp6, fp6_e2m3, fp4, int8, int4 "
+                         f"or {{store, compute}} (got '{name}')")
     store, amp = _PRECISION[key]
     if store == "float64" and dev.type == "mps":
         raise RuntimeErr("precision=\"fp64\" is not supported on Apple MPS; use fp32")
@@ -263,9 +306,11 @@ def _register():
     torch = _import()
     F = torch.nn.functional
 
+    from .lowbit import matmul as _mm
+
     @impl(L.Linear)
     def _linear(l, p, x, train, ctx):
-        y = x @ p.W
+        y = _mm(x, p.W)
         return y + p.b if l.bias else y
 
     @impl(L.Bilinear)
@@ -350,7 +395,7 @@ def _register():
 
         def split(t, n):
             return t.reshape(B, n, l.h, hd).permute(0, 2, 1, 3)
-        q, k, v = split(src @ p.Wq, T), split(mem @ p.Wk, S), split(mem @ p.Wv, S)
+        q, k, v = split(_mm(src, p.Wq), T), split(_mm(mem, p.Wk), S), split(_mm(mem, p.Wv), S)
         mask = ctx.get("mask")
         bias = None
         if l.causal:
@@ -366,7 +411,7 @@ def _register():
                 s = s + bias
             o = torch.softmax(s, dim=-1) @ v
         o = o.permute(0, 2, 1, 3).reshape(B, T, D)
-        return o @ p.Wo + p.bo
+        return _mm(o, p.Wo) + p.bo
 
     @impl(L.LayerNorm)
     def _ln(l, p, x, train, ctx):
@@ -669,12 +714,19 @@ def _optimizer(opt, tensors):
 
 
 def fit(model, params, X, y=None, loss="mse", opt=None, epochs=10, batch_size=None, seed=0, verbose=True,
-        clip=None, schedule=None, graph=None, mask=None, val=None, device="auto", precision="fp32",
+        clip=None, schedule=None, graph=None, mask=None, val=None, device="auto", precision="auto",
         compile=False):
     ensure()
     torch = _import()
     dev = pick_device(device)
     store, amp = _precision(precision, dev)
+    from . import lowbit
+    kind = lowbit.parse(auto_precision(dev) if str(precision).lower() == "auto" else precision)
+    lowbit._HW["on"] = kind == "fp8" and lowbit.fp8_matmul_available(dev)
+    if kind and verbose:
+        print(f"training with {kind} weights (one scale per 32 values, float32 master copy)"
+              + (", products on fp8 tensor cores" if lowbit._HW["on"] else
+                 f", products in {str(amp).replace('torch.', '') if amp else 'float32'}"))
     torch.manual_seed(int(seed))
     np.random.seed(int(seed))
     lf = _loss(loss)
@@ -714,11 +766,12 @@ def fit(model, params, X, y=None, loss="mse", opt=None, epochs=10, batch_size=No
             else torch.cuda.amp.GradScaler()
 
     def objective(xb, yb):
+        p = lowbit.fake_quant_tree_torch(tp, kind) if kind and not lowbit._HW["on"] else tp
         if amp is not None:
             with torch.autocast(device_type=dev.type, dtype=amp):
-                out = step_fn(tp, xb, True)
+                out = step_fn(p, xb, True)
         else:
-            out = step_fn(tp, xb, True)
+            out = step_fn(p, xb, True)
         if sel is not None:
             out, yb = out[sel], yb[sel]
         return lf(_float(out), yb)
@@ -763,11 +816,13 @@ def fit(model, params, X, y=None, loss="mse", opt=None, epochs=10, batch_size=No
         if val is not None:
             vx, vy = val
             with torch.no_grad():
-                vl = float(lf(_float(run(tp, _inputs(vx, dev, store), False)), _inputs(vy, dev, store)))
+                pv = lowbit.fake_quant_tree_torch(tp, kind) if kind and not lowbit._HW["on"] else tp
+                vl = float(lf(_float(run(pv, _inputs(vx, dev, store), False)), _inputs(vy, dev, store)))
             val_hist.append(vl)
             extra = f"  val {vl:.5f}"
         if verbose and (ep % max(1, int(epochs) // 10) == 0 or ep == int(epochs) - 1):
             print(f"epoch {ep:4}  loss {history[-1]:.5f}{extra}")
+    lowbit._HW["on"] = False
     return Record(params=params_to_numpy(tp), history=history, val_history=val_hist, device=str(dev))
 
 
@@ -778,13 +833,17 @@ def _float(out):
     return out.float() if out.dtype in (torch.float16, torch.bfloat16) else out
 
 
-def predict(model, params, X, device="auto", precision="fp32", **ctx):
+def predict(model, params, X, device="auto", precision="auto", **ctx):
     ensure()
     torch = _import()
     dev = pick_device(device)
     store, amp = _precision(precision, dev)
+    from . import lowbit
+    kind = lowbit.parse(auto_precision(dev) if str(precision).lower() == "auto" else precision)
     with torch.no_grad():
         tp = params_to_torch(params, dev, store, requires_grad=False)
+        if kind:
+            tp = lowbit.fake_quant_tree_torch(tp, kind)
         if amp is not None:
             with torch.autocast(device_type=dev.type, dtype=amp):
                 out = forward(model, tp, _inputs(X, dev, store), False, **_ctx(ctx, dev, store))

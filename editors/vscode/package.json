@@ -2,7 +2,7 @@
   "name": "apsi-language",
   "displayName": "Apsi Language",
   "description": "Apsi for VS Code, Cursor, Windsurf and VSCodium: syntax colours, live unit/shape diagnostics, hover, go to definition, completion, formatting, run/test/REPL commands, apsi.toml tasks and snippets",
-  "version": "2.0.0",
+  "version": "2.4.4",
   "publisher": "apsi",
   "license": "MIT",
   "engines": {
@@ -29,7 +29,9 @@
     "onLanguage:apsi",
     "workspaceContains:**/*.apsi",
     "workspaceContains:apsi.toml",
-    "onCommand:apsi.convertPython"
+    "onCommand:apsi.convertPython",
+    "onDebugResolve:apsi",
+    "onDebugDynamicConfigurations:apsi"
   ],
   "contributes": {
     "languages": [
@@ -421,6 +423,71 @@
           "code": 4,
           "message": 5
         }
+      }
+    ],
+    "breakpoints": [
+      {
+        "language": "apsi"
+      }
+    ],
+    "debuggers": [
+      {
+        "type": "apsi",
+        "label": "Apsi",
+        "languages": [
+          "apsi"
+        ],
+        "configurationAttributes": {
+          "launch": {
+            "required": [
+              "program"
+            ],
+            "properties": {
+              "program": {
+                "type": "string",
+                "description": "The .apsi file to debug",
+                "default": "${file}"
+              },
+              "args": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                },
+                "description": "Program arguments",
+                "default": []
+              },
+              "cwd": {
+                "type": "string",
+                "description": "Working folder",
+                "default": "${workspaceFolder}"
+              },
+              "stopOnEntry": {
+                "type": "boolean",
+                "description": "Pause at the first line",
+                "default": false
+              }
+            }
+          }
+        },
+        "initialConfigurations": [
+          {
+            "type": "apsi",
+            "request": "launch",
+            "name": "Debug Apsi file",
+            "program": "${file}"
+          }
+        ],
+        "configurationSnippets": [
+          {
+            "label": "Apsi: Debug current file",
+            "body": {
+              "type": "apsi",
+              "request": "launch",
+              "name": "Debug Apsi file",
+              "program": "^\"\\${file}\""
+            }
+          }
+        ]
       }
     ]
   },

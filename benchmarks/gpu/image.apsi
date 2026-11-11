@@ -1,0 +1,61 @@
+# Image and video work on the GPU (@gpu) against all CPU cores (@native): luminance + Sobel edges on RGB frames
+# from 1280x720 to 7680x4320, the frames kept on the card (to_gpu) and with a copy each way per frame.
+let time = pyimport("time")
+
+fn lum(r, g, b, i: Int, j: Int) -> Float:
+    return 0.299 * r[i, j] + 0.587 * g[i, j] + 0.114 * b[i, j]
+
+fn edge(r, g, b, i: Int, j: Int, h: Int, w: Int) -> Float:
+    let i0 = max(i - 1, 0)
+    let i1 = min(i + 1, h - 1)
+    let j0 = max(j - 1, 0)
+    let j1 = min(j + 1, w - 1)
+    let gx = (lum(r, g, b, i0, j1) + 2.0 * lum(r, g, b, i, j1) + lum(r, g, b, i1, j1)) - (lum(r, g, b, i0, j0) + 2.0 * lum(r, g, b, i, j0) + lum(r, g, b, i1, j0))
+    let gy = (lum(r, g, b, i1, j0) + 2.0 * lum(r, g, b, i1, j) + lum(r, g, b, i1, j1)) - (lum(r, g, b, i0, j0) + 2.0 * lum(r, g, b, i0, j) + lum(r, g, b, i0, j1))
+    return sqrt(gx * gx + gy * gy)
+
+@native
+fn edges_cpu(r, g, b, out, h: Int, w: Int):
+    parallel for i in 0..h:
+        for j in 0..w:
+            out[i, j] = edge(r, g, b, i, j, h, w)
+
+@gpu("strict")
+fn edges_gpu(r, g, b, out, h: Int, w: Int):
+    parallel for i in 0..h:
+        for j in 0..w:
+            out[i, j] = edge(r, g, b, i, j, h, w)
+
+fn best(f, n):
+    var b = 1e9
+    for k in 0..n:
+        let t = time.perf_counter()
+        f()
+        b = min(b, time.perf_counter() - t)
+    return b * 1000
+
+let info = gpu_info()
+print(f"gpu | {info}")
+let sizes = [["720p", 1280, 720], ["1080p", 1920, 1080], ["1440p", 2560, 1440], ["4K", 3840, 2160], ["8K", 7680, 4320]]
+print("size | pixels | cpu ms (all cores) | cpu fps | gpu ms (frame on the card) | gpu fps | gpu ms with copies | same result")
+for s in sizes:
+    let w = s[1]
+    let h = s[2]
+    seed(1)
+    let r = rand(h, w).astype("float32")              # 8-bit-like pixel values in f32, as video pipelines use
+    let g = rand(h, w).astype("float32")
+    let b = rand(h, w).astype("float32")
+    var oc = zeros(h, w, dtype=f32)
+    edges_cpu(r, g, b, oc, h, w)
+    let tc = best(fn() => edges_cpu(r, g, b, oc, h, w), 5)
+    var og = zeros(h, w, dtype=f32)
+    edges_gpu(r, g, b, og, h, w)
+    let tcopy = best(fn() => edges_gpu(r, g, b, og, h, w), 5)
+    let rg = to_gpu(r)
+    let gg = to_gpu(g)
+    let bg = to_gpu(b)
+    let ogg = to_gpu(zeros(h, w, dtype=f32))
+    edges_gpu(rg, gg, bg, ogg, h, w)
+    let tg = best(fn() => edges_gpu(rg, gg, bg, ogg, h, w), 10)
+    let same = max(abs(to_host(ogg) - oc)) < 1e-4 and max(abs(og - oc)) < 1e-4
+    print(f"{s[0]} | {w}x{h} | {tc:.2f} | {1000 / tc:.0f} | {tg:.3f} | {1000 / tg:.0f} | {tcopy:.2f} | {same}")

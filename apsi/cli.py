@@ -125,7 +125,26 @@ def _guard(args, src, path):
         prog = parse(src, cache=path != "<stdin>")
     except ApsiError:
         return True          # syntax errors are reported by the normal run path
-    return gate_program(prog, src, path, _profile_name(args), trust=getattr(args, "trust", False))
+    ap = str(getattr(args, "allow_python", "") or "").lower()
+    return gate_program(prog, src, path, _profile_name(args), trust=getattr(args, "trust", False),
+                        python_all=ap in ("all", "unsafe") or bool(getattr(args, "allow_all", False)))
+
+
+def _quiet_numpy_warnings():
+    """NumPy's RuntimeWarnings name internal files; show each kind once, in Apsi's words."""
+    import warnings
+    seen = set()
+
+    def show(message, category, filename, lineno, file=None, line=None):
+        if category is RuntimeWarning:
+            msg = str(message).replace(" encountered in ", " in ")
+            if msg not in seen:
+                seen.add(msg)
+                sys.stderr.write(f"apsi: note: {msg} — the result holds inf/nan; run with --fp-check to stop at "
+                                 "the line where it happens\n")
+            return
+        sys.stderr.write(warnings.formatwarning(message, category, filename, lineno, line))
+    warnings.showwarning = show
 
 
 def cmd_run(args):
@@ -144,17 +163,46 @@ def cmd_run(args):
                                             interval=0.3, no_clear=False))
     from . import stdlib
     stdlib.PROGRAM_ARGS[:] = list(args.args or [])
+    sys.argv[:] = [args.file] + list(args.args or [])         # Python-exact programs read sys.argv
     src = _read(args.file)
     name = "<stdin>" if args.file == "-" else args.file
     if not _guard(args, src, name):
         return 3
     _limits(args)
+    if getattr(args, "fp_check", False):
+        import numpy as _np
+        _np.seterr(over="raise", divide="raise", invalid="raise", under="ignore")
+    else:
+        _quiet_numpy_warnings()
     if getattr(args, "native", False):
         os.environ["APSI_NATIVE"] = "auto"          # every function gets a native tier (silent fallback)
     if getattr(args, "threads", None):
         from . import native as _nat
         _nat.set_threads(args.threads)
     it = _make_interp(args, args.file)
+    if getattr(args, "env_file", None):
+        from .envfile import parse as _parse_env
+        from .security import check_path as _cp
+        with open(_cp(it, args.env_file, "read", "--env-file"), encoding="utf-8-sig") as fh:
+            vals = _parse_env(fh.read())
+        it.env_file_values = vals
+        it.modules["env"]["values"].update(vals)
+    # a .venv next to the program is not used by itself: `apsi convert` turns the libraries written in Python into
+    # Apsi (apsi_packages/), so a converted program runs on Apsi alone; --venv DIR still adds one on request
+    venv = getattr(args, "venv", None)
+    if venv:
+        from .envfile import find_venv_site, venv_mismatch
+        why = venv_mismatch(venv)
+        site = find_venv_site(venv)
+        if why:
+            # loading it anyway gives confusing errors ("No module named 'pyarrow.lib'"); say what to do instead
+            print(f"apsi: not using the packages of {why}.\n"
+                  f"      Install what the program needs for Apsi's own Python:\n"
+                  f"      \"{sys.executable}\" -m pip install PACKAGE …\n"
+                  f"      or make the venv with Python {sys.version_info.major}.{sys.version_info.minor} "
+                  f"(py -{sys.version_info.major}.{sys.version_info.minor} -m venv .venv).", file=sys.stderr)
+        elif site and site not in sys.path:
+            sys.path.insert(0, site)
     t0 = time.perf_counter()
     try:
         it.run(src, name, check=not args.no_check)
@@ -164,8 +212,11 @@ def cmd_run(args):
     except KeyboardInterrupt:
         print("\napsi: interrupted", file=sys.stderr)
         return 130
-    except SystemExit as e:
-        return e.code if isinstance(e.code, int) else 0
+    except SystemExit as e:                                # as Python: None → 0, int → itself, text → stderr, 1
+        if e.code is None or isinstance(e.code, int):
+            return e.code or 0
+        print(e.code, file=sys.stderr)
+        return 1
     finally:
         if args.time:
             print(f"apsi: {name} ran in {time.perf_counter() - t0:.3f}s", file=sys.stderr)
@@ -196,8 +247,17 @@ def cmd_native(args):
             for d in g["devices"]:
                 print(f"GPU {d['index']}           : {d['name']}, compute {d['compute_capability']}, "
                       f"{d['multiprocessors']} SMs, {d['memory_gb']} GB")
+            from .native import cublas
+            if cublas.library() is not None:
+                print("cuBLAS          : found: matrix products in @gpu functions use it "
+                      "(Tensor Cores for f16 / bf16)")
+            else:
+                print(f"cuBLAS          : not found ({cublas.reason()}); matrix products use Apsi's own kernels. "
+                      f"For Tensor Cores: pip install nvidia-cublas-cu12")
         else:
             print(f"GPU             : none ({g['reason']}); @gpu functions run on all CPU cores")
+        print("number formats  : f64, f32, f16, bf16, fp8_e4m3, fp8_e5m2, int8 tensors in @native and @gpu "
+              "(16/8-bit storage, 32-bit math)")
         return 0
     if action == "clear-cache":
         import shutil
@@ -340,7 +400,7 @@ def cmd_test(args):
                 print(f"  - skipped: {e.msg}")
                 skipped += 1
                 continue
-            print(f"  ✗ file failed to load")
+            print("  ✗ file failed to load")
             _report(e, src, f)
             total_fail += 1
             continue
@@ -510,6 +570,100 @@ def cmd_config(args):
     return 0
 
 
+def _installed_versions(root):
+    """Versions installed side by side in root (each in its own folder), oldest first."""
+    import re
+    out = []
+    try:
+        names = os.listdir(root)
+    except OSError:
+        return out
+    for n in names:
+        d = os.path.join(root, n)
+        if re.fullmatch(r"\d+\.\d+(\.\d+)?([.-]?\w+)?", n) and (
+                os.path.exists(os.path.join(d, "bin-apsi")) or os.path.exists(os.path.join(d, "bin", "apsi.cmd"))
+                or os.path.exists(os.path.join(d, "bin", "apsi"))):
+            out.append(n)
+
+    def key(v):
+        return [int(x) if x.isdigit() else x for x in re.split(r"[.-]", v)]
+    return sorted(out, key=key)
+
+
+def cmd_versions(args):
+    """The Apsi versions installed side by side, and which one `apsi` runs."""
+    from . import __version__
+    root = os.environ.get("APSI_INSTALL_ROOT")
+    if not root:
+        print(f"Apsi {__version__} (not installed by an Apsi installer: no other versions to list)")
+        return 0
+    try:
+        with open(os.path.join(root, "current.txt"), encoding="utf-8") as fh:
+            cur = fh.read().strip()
+    except OSError:
+        cur = ""
+    vs = _installed_versions(root)
+    cur = cur if cur in vs else (vs[-1] if vs else "")
+    for v in vs:
+        mark = "*" if v == cur else " "
+        print(f"{mark} {v}" + ("   (apsi)" if v == cur else f"   (apsi-{v})"))
+    print(f"\nin {root}   ·   switch with: apsi use VERSION")
+    return 0
+
+
+def cmd_use(args):
+    """Make `apsi` run another installed version (each stays available as apsi-VERSION)."""
+    root = os.environ.get("APSI_INSTALL_ROOT")
+    if not root:
+        print("apsi use: this Apsi was not installed by an Apsi installer", file=sys.stderr)
+        return 1
+    vs = _installed_versions(root)
+    if args.version not in vs:
+        print(f"apsi use: Apsi {args.version} is not installed (installed: {', '.join(vs) or 'none'})",
+              file=sys.stderr)
+        return 1
+    tmp = os.path.join(root, "current.txt.tmp")
+    with open(tmp, "w", encoding="utf-8") as fh:
+        fh.write(args.version + "\n")
+    os.replace(tmp, os.path.join(root, "current.txt"))
+    print(f"apsi now runs Apsi {args.version} (new terminals and this one)")
+    return 0
+
+
+def cmd_log(args):
+    """Show a .log file (text or JSON lines) in colour, filtered; --follow keeps showing new records."""
+    import time as _t
+    from . import log as L
+    if not os.path.exists(args.file):
+        print(f"apsi log: no such file: {args.file}", file=sys.stderr)
+        return 1
+    recs = L.read(args.file, args.level, args.grep, args.tail, args.name, args.older)
+    L.show(recs)
+    if not args.follow:
+        return 0
+    seen = os.path.getsize(args.file)
+    try:
+        while True:
+            _t.sleep(0.5)
+            size = os.path.getsize(args.file) if os.path.exists(args.file) else 0
+            if size < seen:                                # rotated: start the new file from the top
+                seen = 0
+            if size > seen:
+                with open(args.file, encoding="utf-8", errors="replace") as fh:
+                    fh.seek(seen)
+                    chunk = fh.read()
+                seen = size
+                import tempfile
+                with tempfile.NamedTemporaryFile("w", suffix=".log", delete=False, encoding="utf-8") as tmp:
+                    tmp.write(chunk)
+                try:
+                    L.show(L.read(tmp.name, args.level, args.grep, None, args.name))
+                finally:
+                    os.remove(tmp.name)
+    except KeyboardInterrupt:
+        return 0
+
+
 def cmd_doctor(args):
     from .hardware import doctor, info
     if getattr(args, "json", False):
@@ -566,8 +720,9 @@ def _glue_flag_values(argv):
     return out
 
 
-def _parser():
-    """The argument parser of every command (also used by programs built with `apsi build`)."""
+def _parser(light=False):
+    """The argument parser of every command (also used by programs built with `apsi build`). light=True builds
+    only `run` (and its flags): starting a program does not import the code of the other commands."""
     ap = argparse.ArgumentParser(
         prog="apsi", formatter_class=argparse.RawDescriptionHelpFormatter,
         description="The Apsi language toolchain.",
@@ -607,14 +762,29 @@ def _parser():
     p.add_argument("file", nargs="?", help="program to run; '-' reads it from stdin")
     p.add_argument("args", nargs="*", help="arguments for the program (read them with args())")
     p.add_argument("--no-check", action="store_true", help="skip the static checker")
+    p.add_argument("--env-file", metavar="FILE", help="load KEY=value settings from a .env file (use env)")
+    p.add_argument("--venv", metavar="DIR", help="use the Python packages of a virtual environment for pyimport()")
     p.add_argument("--time", action="store_true", help="print how long the program ran")
     p.add_argument("-w", "--watch", action="store_true", help="run again every time the file changes")
     p.add_argument("--native", action="store_true",
                    help="compile every function to machine code when possible (as if each had @native)")
     p.add_argument("--threads", type=int, metavar="N", help="CPU threads for parallel for (default: all cores)")
+    p.add_argument("--fp-check", action="store_true",
+                   help="stop at the first floating-point overflow, division by zero or NaN in tensor maths "
+                        "(instead of carrying inf/nan along) and show the line")
     perm_flags(p)
     p.set_defaults(fn=cmd_run)
+    if light:
+        return ap, sub
 
+    p = sub.add_parser("debug", help="debug a program in the terminal (breakpoints, stepping, variables)")
+    p.add_argument("file")
+    p.add_argument("args", nargs="*", help="arguments for the program")
+    p.add_argument("-b", "--break", dest="breakpoints", action="append", metavar="LINE",
+                   help="a breakpoint: LINE, FILE:LINE or 'LINE if CONDITION' (repeatable)")
+    p.set_defaults(fn=lambda a: __import__("apsi.debugger", fromlist=["cmd_debug"]).cmd_debug(a))
+    p = sub.add_parser("dap", help="the Debug Adapter Protocol server (VS Code starts it for F5)")
+    p.set_defaults(fn=lambda a: __import__("apsi.debugger", fromlist=["cmd_dap"]).cmd_dap(a))
     p = sub.add_parser("native", help="native compiler: info, explain FILE, ir FILE [FN], asm FILE [FN], clear-cache")
     p.add_argument("action", choices=["info", "explain", "ir", "asm", "clear-cache"])
     p.add_argument("file", nargs="?", help="program to run (explain / ir / asm)")
@@ -665,6 +835,23 @@ def _parser():
     p = sub.add_parser("lsp", help="run the language server (stdio) for editors")
     p.set_defaults(fn=cmd_lsp)
 
+    p = sub.add_parser("versions", help="the Apsi versions installed side by side, and which one apsi runs")
+    p.set_defaults(fn=cmd_versions)
+
+    p = sub.add_parser("use", help="make apsi run another installed version")
+    p.add_argument("version")
+    p.set_defaults(fn=cmd_use)
+
+    p = sub.add_parser("log", help="show a .log file in colour: filter by level, name or text, follow new lines")
+    p.add_argument("file")
+    p.add_argument("--level", help="debug, info, warn or error: that level and above")
+    p.add_argument("--grep", help="only records matching this text (a regular expression)")
+    p.add_argument("--name", help="only records from this logger (and its children)")
+    p.add_argument("--tail", type=int, help="only the last N records")
+    p.add_argument("--older", action="store_true", help="also the rotated files (app.1.log …), oldest first")
+    p.add_argument("-f", "--follow", action="store_true", help="keep showing new records (Ctrl+C stops)")
+    p.set_defaults(fn=cmd_log)
+
     p = sub.add_parser("doctor", help="check this machine against Apsi's hardware targets")
     p.add_argument("--json", action="store_true", help="machine-readable output")
     p.set_defaults(fn=cmd_doctor)
@@ -690,6 +877,10 @@ def _parser():
     _scale.add_parser(sub)
     from . import modelio as _modelio
     _modelio.add_parser(sub)
+    from . import ai_server as _ai_server
+    _ai_server.add_parser(sub)
+    from . import thermal as _thermal
+    _thermal.add_parser(sub)
     _packages.add_parser(sub)
     from . import apsil as _apsil
     _apsil.add_parser(sub)
@@ -697,6 +888,8 @@ def _parser():
     _remote.add_parser(sub)
     _editors.add_parser(sub)
     _convert.add_parser(sub)
+    from . import cachectl as _cachectl
+    _cachectl.add_parser(sub)
 
     p = sub.add_parser("version", help="print the version")
     p.set_defaults(fn=cmd_version)
@@ -767,11 +960,21 @@ def main(argv=None):
     _utf8()
     _sigpipe()
     argv = _glue_flag_values(list(sys.argv[1:] if argv is None else argv))
-    ap, sub = _parser()
+    light = bool(argv) and (argv[0] == "run" or (argv[0].endswith(".apsi") and os.path.isfile(argv[0]))) \
+        and not any(a in ("-h", "--help") for a in argv[1:2])
+    ap, sub = _parser(light=light)
+    if light and argv[0] != "run":
+        argv = ["run"] + argv
     argv = _shortcut(argv, set(sub.choices), ap)
     if argv is None:
         return 2
-    if argv and argv[0] == "run" and not any(a in ("-h", "--help") for a in argv[1:]):
+    if argv and argv[0] == "run" and "--" in argv[1:]:
+        # apsi run app.apsi [apsi flags] -- [program arguments, passed untouched]
+        cut = argv.index("--", 1)
+        args = sub.choices["run"].parse_intermixed_args(argv[1:cut])
+        args.args = list(args.args or []) + argv[cut + 1:]
+        args.cmd = "run"
+    elif argv and argv[0] == "run" and not any(a in ("-h", "--help") for a in argv[1:]):
         # flags may come before or after the program arguments: apsi run app.apsi a b --allow-net
         args = sub.choices["run"].parse_intermixed_args(argv[1:])
         args.cmd = "run"

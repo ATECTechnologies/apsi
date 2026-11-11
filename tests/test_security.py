@@ -115,6 +115,13 @@ class Scanner(unittest.TestCase):
         r = self.scan('print("stratum+tcp://p:1")\nlet s = pyimport("subprocess")\nlet m = pyimport("o" + "s")\n')
         self.assertTrue({"suspicious-endpoint", "sandbox-escape", "dynamic-import"} <= r)
 
+    def test_prose_and_lookalike_names_are_not_credentials(self):
+        doc = 'let d = """A downloader.\nPut GITHUB_TOKEN in .env; it never reads credentials or cookies.\n"""\n'
+        self.assertEqual(set(), self.scan(doc + 'let r = ["netdata/netdata", "the metadata"]\n'))
+        self.assertIn("credential-access", self.scan('let t = "C:/Users/u/AppData/Roaming/Telegram Desktop/tdata"\n'))
+        found = guard.scan_program(parse('let e = [".env", ".env", ".env"]\n'), "")
+        self.assertEqual(1, len([f for f in found if f.rule == "credential-access"]))     # one finding per line
+
     def test_examples_have_no_high_findings(self):
         res, _ = guard.scan_paths([os.path.join(ROOT, "examples")])
         bad = [(f, x) for f, _, fs in res for x in fs if guard.SEVERITY[x.severity] >= 3]

@@ -198,7 +198,9 @@ class Editors(TempDir):
     def test_install_and_uninstall_in_every_found_editor(self):
         home = os.path.join(self.dir, "home")
         win = os.name == "nt"
-        sublime = "AppData/Roaming/Sublime Text/Packages" if win else ".config/sublime-text/Packages"
+        sublime = ("AppData/Roaming/Sublime Text/Packages" if win else
+                   "Library/Application Support/Sublime Text/Packages" if sys.platform == "darwin" else
+                   ".config/sublime-text/Packages")
         nvim = "AppData/Local/nvim" if win else ".config/nvim"
         vim = "vimfiles" if win else ".vim"
         for d in (".cursor", ".vscode/extensions", sublime, nvim, vim):
@@ -215,7 +217,7 @@ class Editors(TempDir):
         res = {x["id"]: x for x in json.loads(r.stdout)["results"]}
         for ed in ("vscode", "cursor", "sublime", "vim"):
             self.assertTrue(res[ed]["ok"], res[ed])
-        self.assertTrue(os.path.isfile(os.path.join(home, ".cursor", "extensions", "apsi.apsi-language-2.0.0", "package.json")))
+        self.assertTrue(os.path.isfile(os.path.join(home, ".cursor", "extensions", "apsi.apsi-language-2.4.4", "package.json")))
         self.assertTrue(os.path.isfile(os.path.join(home, vim, "pack", "apsi", "start", "apsi", "syntax", "apsi.vim")))
         with open(os.path.join(home, ".vscode", "extensions", "extensions.json")) as fh:
             self.assertEqual(json.load(fh)[0]["identifier"]["id"], "apsi.apsi-language")
@@ -320,11 +322,26 @@ class Convert(TempDir):
         self.assertIn("converted 2 files", out)
         with open(os.path.join(self.dir, "out", "a.apsi")) as fh:
             a = fh.read()
+        self.assertIn("use pycompat", a)                       # Python's exact semantics by default
+        self.assertIn('pyimport("torch.nn")', a)
+        self.assertIn("nn.Sequential(nn.Linear(2, 3), nn.ReLU())", a)
+        with open(os.path.join(self.dir, "out", "b.apsi")) as fh:
+            b = fh.read()
+        try:
+            import requests  # noqa: F401
+            # requests is written in Python: converted into apsi_packages/ with the program
+            self.assertIn('import "apsi_packages/requests/__init__.apsi" as requests', b)
+            self.assertTrue(os.path.exists(os.path.join(self.dir, "out", "apsi_packages", "requests", "api.apsi")))
+        except ImportError:
+            self.assertIn('pyimport("requests")', b)
+        self.assertIn("--allow-python", out)
+        # --idiomatic maps libraries onto Apsi's own built-ins
+        rc, out, err = apsi("convert", os.path.join(self.dir, "pkg"), "-o", os.path.join(self.dir, "out2"),
+                            "--idiomatic")
+        with open(os.path.join(self.dir, "out2", "a.apsi")) as fh:
+            a = fh.read()
         self.assertIn("torch.Sequential(torch.Linear(2, 3), torch.ReLU())", a)
         self.assertIn("json_str(", a)
-        with open(os.path.join(self.dir, "out", "b.apsi")) as fh:
-            self.assertIn('pyimport("requests")', fh.read())
-        self.assertIn("--allow-python", out)
 
 
 class BuildAndCompile(TempDir):
