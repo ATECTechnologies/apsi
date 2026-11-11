@@ -32,7 +32,7 @@ P_SLOTS = {"P_STOP": P_STOP, "P_GEN": P_GEN, "P_INF": P_INF, "P_SPIN": P_SPIN, "
            "P_FN": P_FN, "P_CTX": P_CTX, "P_LO": P_LO, "P_HI": P_HI, "P_N": P_N}
 SPIN_LIMIT = int(os.environ.get("APSI_SPIN", "200000"))   # idle spins (~2-10 ms) before a worker sleeps
 _PSTATE = None
-OPT_VERSION = "apsi-native-3"     # bump when the optimisation pipeline changes
+OPT_VERSION = "apsi-native-4"     # bump when the optimisation pipeline changes
 
 _lock = threading.RLock()
 _engine = None
@@ -131,6 +131,10 @@ class Engine:
         self.llvm = llvm
         llvm.initialize_native_target()
         llvm.initialize_native_asmprinter()
+        try:
+            llvm.initialize_native_asmparser()      # inline assembly (the ARM64 spin-wait hint) needs the parser
+        except Exception:                           # noqa: BLE001 - older llvmlite: x86 needs no parser
+            pass
         self.llvm_version = ".".join(map(str, llvm.llvm_version_info))
         self.llvmlite_version = llvmlite.__version__
         self.triple = llvm.get_process_triple()
@@ -210,6 +214,10 @@ class Engine:
         mcb = ctypes.CFUNCTYPE(None, ctypes.c_int64, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p)(_matmul_cb)
         self._callbacks.append(mcb)
         llvm.add_symbol("apsi_matmul", ctypes.cast(mcb, ctypes.c_void_p).value)
+        gcb = ctypes.CFUNCTYPE(ctypes.c_int64, ctypes.c_int64, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
+                               ctypes.c_int64, ctypes.c_int64, ctypes.c_int64)(_gemm_cb)
+        self._callbacks.append(gcb)
+        llvm.add_symbol("apsi_gemm", ctypes.cast(gcb, ctypes.c_void_p).value)
         pcb = ctypes.CFUNCTYPE(None, ctypes.c_int64, ctypes.c_void_p)(_print_cb)
         self._callbacks.append(pcb)
         llvm.add_symbol("apsi_print", ctypes.cast(pcb, ctypes.c_void_p).value)
@@ -219,7 +227,7 @@ class Engine:
         if self.triple.startswith(("x86_64", "i686", "i386")):
             pause_decl, pause = "declare void @llvm.x86.sse2.pause()", "call void @llvm.x86.sse2.pause()"
         elif self.triple.startswith(("aarch64", "arm64")):
-            pause_decl, pause = "", 'call void asm sideeffect "yield", ""()'
+            pause_decl, pause = "declare void @llvm.aarch64.hint(i32)", "call void @llvm.aarch64.hint(i32 1)"
         else:
             pause_decl, pause = "", ""
         ir_text = r"""
@@ -486,17 +494,22 @@ leave:
     def key(self, ir_text):
         from .. import __version__
         h = hashlib.sha256()
-        for part in (OPT_VERSION, __version__, self.llvm_version, self.triple, self.cpu, self.features, ir_text):
+        for part in (OPT_VERSION, __version__, self.llvm_version, self.triple, self.cpu, self.features,
+                     "slp=" + os.environ.get("APSI_SLP", "auto"), ir_text):        # APSI_SLP changes the code
             h.update(part.encode())
             h.update(b"\0")
         return h.hexdigest()
 
     # ---------------------------------------------------------------- compile
-    def optimize(self, mod):
+    def optimize(self, mod, slp=None):
         llvm = self.llvm
         pto = llvm.create_pipeline_tuning_options(speed_level=3)
         pto.loop_vectorization = True
-        pto.slp_vectorization = True
+        # The SLP vectoriser packs independent scalar operations into SIMD registers. That is exactly what jammed
+        # loops (jam.py) need, but in a single dependency chain (an ODE step) its shuffles lengthen the chain, so
+        # by default it runs only for modules with jammed loops. APSI_SLP=on / off overrides.
+        mode = os.environ.get("APSI_SLP", "auto")
+        pto.slp_vectorization = (mode == "on") or (mode == "auto" and bool(slp))
         pto.loop_unrolling = True
         pto.loop_interleaving = True
         pb = llvm.create_pass_builder(self.tm, pto)
@@ -518,7 +531,7 @@ leave:
             cached = self._cache_on() and os.path.exists(self._path(key))
             if not cached:
                 self.cache_misses += 1
-                self.optimize(mod)
+                self.optimize(mod, slp=ir_text.startswith("; apsi-slp"))
             self.ee.add_module(mod)
             self.ee.finalize_object()
             addrs = {e: self.ee.get_function_address(e) for e in entries}
@@ -532,7 +545,7 @@ leave:
         mod = self.llvm.parse_assembly(ir_text)
         mod.triple = self.triple
         mod.data_layout = self.data_layout
-        self.optimize(mod)
+        self.optimize(mod, slp=ir_text.startswith("; apsi-slp"))
         return str(mod), self.tm.emit_assembly(mod)
 
 
@@ -624,6 +637,19 @@ def _matmul_cb(code, da, db, dout):
         if _error is not None and _error[0] == 0:
             _error[0] = 99
         sys.stderr.write(f"apsi native: matmul failed: {e}\n")
+
+
+def _gemm_cb(code, da, db, dc, M, N, K):
+    """apsi_gemm: a loop nest recognised as a matrix product (see apsi/idioms.py). 0 = done with BLAS, 1 = the
+    compiled loops must run (nothing was written)."""
+    try:
+        import numpy as np
+        from ..idioms import gemm
+        dtype = np.dtype(np.float64 if code // 100 == 8 else np.float32)
+        a, b, c = (_as_numpy(d, 2, dtype) for d in (da, db, dc))
+        return 0 if gemm(code % 100, a, b, c, M, N, K) else 1
+    except BaseException:                                     # noqa: BLE001
+        return 1
 
 
 def _print_cb(site, slots):

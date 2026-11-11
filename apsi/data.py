@@ -563,7 +563,15 @@ def install(interp):
         full = _rpath(path)
         return Pipeline(lambda: _parquet_batches(full, columns, rows), None, "parquet")
 
+    def text_dataset(source, tokenizer="bytes", seq_len=512, format="auto", field=None, template=None, chat="auto",
+                     eos=None, train_on_prompt=False, pack=True, stride=None, text_split="file"):
+        """Training windows (x, y) from text in any shape and any tokenizer (see textdata.py)."""
+        from .textdata import text_dataset as td
+        return td(source, tokenizer, seq_len, format, field, template, chat, eos, train_on_prompt, pack, stride,
+                  text_split, path_check=_rpath)
+
     mod = {
+        "text_dataset": text_dataset, "detect_format": lambda rec: __import__("apsi.textdata", fromlist=["x"]).detect(rec),
         "from_jsonl": from_jsonl, "from_parquet": from_parquet, "interleave": interleave, "window": window,
         "shard": shard,
         "from_tensors": from_tensors, "from_list": from_list, "from_range": from_range,

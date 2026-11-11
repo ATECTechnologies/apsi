@@ -38,7 +38,7 @@ import numpy as np
 from . import ops
 from .errors import RuntimeErr
 from .units import Quantity
-from .values import Record, tree_map
+from .values import Record
 
 
 def _v(x):

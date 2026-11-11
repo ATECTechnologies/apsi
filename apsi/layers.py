@@ -14,6 +14,7 @@ Building blocks
   recurrent:    lstm_layer, gru_layer, last_step
   attention:    multi_head_attention, transformer_block, transformer_encoder
   graph (GNN):  gcn, sage, gat, gin, graph_pool   (+ graph(), segment_sum/mean/max/softmax ops)
+  long range:   graph_transformer, global_attention, mix_hop, k_hop, hop_distances, eccentricity (graphs.py)
   norm/reg:     layer_norm_layer, batch_norm_layer, rms_norm_layer, dropout_layer
   shape:        reshape_layer, select, identity
   composition:  sequential, residual, parallel, dag (any directed acyclic graph of layers),
@@ -89,43 +90,70 @@ def gather(x, ids):
 
 
 class Graph:
-    """A graph for graph neural networks: n nodes and directed edges src -> dst."""
+    """A graph for graph neural networks: n nodes and directed edges src -> dst. Every edge also has a relation type
+    (`rel`, 0 when the graph has one kind of edge) and a hop count (`hop`: 1 for an ordinary edge, k for a shortcut
+    made by k_hop(), 0 for a self loop)."""
 
-    def __init__(self, src, dst, n, self_loops=True, undirected=False):
+    def __init__(self, src, dst, n, self_loops=True, undirected=False, rel=None, hop=None):
         src, dst = _ids(src), _ids(dst)
+        rel = np.zeros(len(src), dtype=np.int64) if rel is None else _ids(rel)
+        hop = np.ones(len(src), dtype=np.int64) if hop is None else _ids(hop)
+        if len(rel) != len(src) or len(hop) != len(src):
+            raise ShapeError("graph(): types= needs one entry per edge")
         if undirected:
             src, dst = np.concatenate([src, dst]), np.concatenate([dst, src])
+            rel, hop = np.concatenate([rel, rel]), np.concatenate([hop, hop])
         if self_loops:
             loops = np.arange(int(n))
             keep = src != dst
             src, dst = np.concatenate([src[keep], loops]), np.concatenate([dst[keep], loops])
+            rel = np.concatenate([rel[keep], np.zeros(int(n), dtype=np.int64)])
+            hop = np.concatenate([hop[keep], np.zeros(int(n), dtype=np.int64)])
         if len(src) and (src.max() >= n or dst.max() >= n or src.min() < 0 or dst.min() < 0):
             raise ShapeError(f"graph(): edge refers to a node outside 0..{int(n) - 1}")
         self.src, self.dst, self.n = src, dst, int(n)
+        self.rel, self.hop = rel, hop
+        self.relations = int(rel.max()) + 1 if len(rel) else 1
         self.in_degree = np.bincount(dst, minlength=self.n).astype(float)
         self.out_degree = np.bincount(src, minlength=self.n).astype(float)
         self.edges = len(src)
+        self.batch = np.zeros(self.n, dtype=np.int64)
+        self.graphs = 1 if self.n else 0
 
     def __repr__(self):
-        return f"graph({self.n} nodes, {self.edges} edges)"
+        extra = f", {self.relations} relations" if self.relations > 1 else ""
+        return f"graph({self.n} nodes, {self.edges} edges{extra})"
 
     def adjacency(self):
         a = np.zeros((self.n, self.n))
         np.add.at(a, (self.dst, self.src), 1.0)
         return a
 
+    def _derived(self, src, dst, rel, hop):
+        g = Graph(src, dst, self.n, self_loops=False, rel=rel, hop=hop)
+        g.batch, g.graphs = self.batch, self.graphs
+        return g
 
-def graph(edges=None, n=None, src=None, dst=None, self_loops=True, undirected=False, batch=None):
+
+def graph(edges=None, n=None, src=None, dst=None, self_loops=True, undirected=False, batch=None, types=None,
+          reverse=False):
     """graph(edges=[[0, 1], [1, 2]], n=3) or graph(src=tensor, dst=tensor, n=…). `batch` assigns nodes to
-    separate graphs for graph-level tasks (used by graph_pool)."""
+    separate graphs for graph-level tasks (used by graph_pool). `types` gives every edge a relation (0, 1, …) for
+    graph_transformer layers; reverse=true adds each edge backwards as its own relation, so information flows both
+    ways with separate weights (use -> definition as well as definition -> use)."""
     if edges is not None:
         e = np.asarray(ops.raw(edges)).astype(np.int64).reshape(-1, 2) if len(edges) else np.zeros((0, 2), int)
         src, dst = e[:, 0], e[:, 1]
     if src is None or dst is None:
         raise RuntimeErr("graph() needs edges=[[from, to], …] or src= and dst=")
+    src, dst = _ids(src), _ids(dst)
     if n is None:
-        n = int(max(np.max(_ids(src), initial=-1), np.max(_ids(dst), initial=-1))) + 1
-    g = Graph(src, dst, n, self_loops=self_loops, undirected=undirected)
+        n = int(max(np.max(src, initial=-1), np.max(dst, initial=-1))) + 1
+    rel = _ids(types) if types is not None else np.zeros(len(src), dtype=np.int64)
+    if reverse:
+        R = int(rel.max()) + 1 if len(rel) else 1
+        src, dst, rel = np.concatenate([src, dst]), np.concatenate([dst, src]), np.concatenate([rel, rel + R])
+    g = Graph(src, dst, n, self_loops=self_loops, undirected=undirected, rel=rel)
     g.batch = _ids(batch) if batch is not None else np.zeros(g.n, dtype=np.int64)
     g.graphs = int(g.batch.max()) + 1 if g.n else 0
     return g
@@ -1253,32 +1281,73 @@ def _take(x, rows):
     return [_take(v, rows) for v in x] if isinstance(x, (list, tuple)) else x[rows]
 
 
-def _backend(backend):
+def _backend(backend, model=None, loss=None, plain=True):
+    """numpy, torch or gpu. "auto": Apsi's own GPU trainer when there is an NVIDIA card and it takes the model,
+    else PyTorch when installed, else NumPy."""
     b = str(backend or "numpy").lower()
-    if b == "auto":
+    b = {"apsi-gpu": "gpu", "native-gpu": "gpu", "cuda": "gpu", "apsi": "numpy", "cpu": "numpy"}.get(b, b)
+    if b in ("auto", "auto-notorch"):
+        if model is not None and plain and loss in ("cross_entropy", "mse") and _gpu_ready() and \
+                _gpu_supports(model) is None:
+            return "gpu"
+        if b == "auto-notorch":
+            return "numpy"
         from . import torch_backend
         return "torch" if torch_backend.available() else "numpy"
-    if b not in ("numpy", "torch"):
-        raise RuntimeErr(f"backend must be \"numpy\", \"torch\" or \"auto\" (got '{backend}')")
+    if b not in ("numpy", "torch", "gpu"):
+        raise RuntimeErr(f"backend must be \"numpy\", \"gpu\" (Apsi's own GPU trainer), \"torch\" or \"auto\" "
+                         f"(got '{backend}')")
     return b
+
+
+def _gpu_ready():
+    try:
+        from .native import cuda
+        drv = cuda.driver()
+        return drv is not None and bool(drv.devices)
+    except Exception:
+        return False
+
+
+def _gpu_supports(model):
+    from . import gpu_train
+    return gpu_train.supports(model)
 
 
 def fit(model, params, X, y=None, loss="mse", opt=None, epochs=10, batch_size=None, seed=0, verbose=True,
         clip=None, schedule=None, graph=None, mask=None, val=None, backend="numpy", device="auto",
-        precision="fp32", compile=False):
+        precision="auto", compile=False, workers=1, ema=None, ewc=None):
     """Train `model`. Returns record(params, history, val_history, device).
 
     loss: "mse", "cross_entropy", "mae", "bce", "vae" ("huber" on torch) or a function loss(prediction, target).
     graph / mask: node-level graph tasks — the whole graph is used every step and only nodes where
     mask is true count in the loss. val=(X_val, y_val) records a validation loss each epoch.
     backend="torch" trains with PyTorch on device ("auto", "cpu", "cuda", "cuda:1", "mps", "xpu") with
-    precision "fp64", "fp32", "tf32", "bf16" or "fp16" (mixed precision) and optional torch.compile.
+    precision "auto" (default: bf16 mixed precision on GPUs that have it, fp16 with loss scaling on older GPUs, fp32
+    on the CPU; APSI_PRECISION overrides it), "fp64", "fp32", "tf32", "bf16", "fp16" or {store, compute} for any
+    pair of torch dtypes, and optional torch.compile. The numpy backend trains in fp32 for "auto".
+    workers=N (numpy backend, mini-batches): data-parallel training on N processes — every batch is split into N
+    shards, the gradients of the shards are averaged (weighted by shard size, so the result is the gradient of the
+    whole batch) and one optimizer step is taken. "auto" uses every core.
     """
-    if _backend(backend) == "torch":
+    which = _backend(backend, model, loss if isinstance(loss, str) else None, graph is None and mask is None)
+    if which == "gpu":
+        from . import gpu_train
+        if graph is not None or mask is not None:
+            raise RuntimeErr("backend=\"gpu\": graph tasks train with backend=\"torch\" or \"numpy\"")
+        dev = "cuda" if str(device).lower() in ("auto", "gpu", "cuda") else device
+        try:
+            return gpu_train.fit(model, params, X, y, loss, opt, epochs, batch_size, seed, verbose, clip, schedule, val,
+                                 device=dev, precision=precision, ema=ema, ewc=ewc)
+        except gpu_train.TrainError as e:
+            raise RuntimeErr(f"backend=\"gpu\": {e}")
+    if ema is not None or ewc is not None:
+        raise RuntimeErr("ema= and ewc= train on the GPU trainer: fit(..., backend=\"gpu\")")
+    if which == "torch":
         from . import torch_backend
         return torch_backend.fit(model, params, X, y, loss, opt, epochs, batch_size, seed, verbose, clip, schedule,
                                  graph, mask, val, device=device, precision=precision, compile=compile)
-    from .stdlib import Adam, value_and_grad, clip_grad_norm
+    from .stdlib import Adam, value_and_grad
     lf = _loss_fn(loss)
     opt = opt or Adam(1e-3)
     ctx = {"graph": graph} if graph is not None else {}
@@ -1290,9 +1359,17 @@ def fit(model, params, X, y=None, loss="mse", opt=None, epochs=10, batch_size=No
         if sel is not None:
             out, yb = out[np.nonzero(sel)[0]], yb[np.nonzero(sel)[0]]
         return lf(out, yb)
+    from . import lowbit
+    kind = lowbit.parse(precision)
     vg = value_and_grad(objective)
+    if kind:                                  # weights in the low-bit format forward, straight-through gradient
+        _vg_full = vg
+
+        def vg(p, *a):
+            return _vg_full(lowbit.round_tree(p, kind), *a)
+    vparams = (lambda p: lowbit.round_tree(p, kind)) if kind else (lambda p: p)
     Xr, Yr = X, target
-    low = str(precision).lower() in ("fp32", "float32", "f32", "tf32")
+    low = kind is not None or str(precision).lower() in ("auto", "fp32", "float32", "f32", "tf32", "bf16", "fp16")
     if low:                                   # half the memory of float64 for weights, data and activations
         def _f32(t):
             return tree_map(lambda a: a.astype(np.float32) if isinstance(a, np.ndarray) and a.dtype.kind == "f"
@@ -1304,6 +1381,27 @@ def fit(model, params, X, y=None, loss="mse", opt=None, epochs=10, batch_size=No
     rng = np.random.default_rng(int(seed))
     np.random.seed(int(seed))
     history, val_hist, step = [], [], 0
+    team = _Team(vg, Xr, Yr, workers) if not full and _want_workers(workers) > 1 else None
+    if team is not None:
+        vg = team.vg
+    try:
+        return _fit_loop(locals())
+    finally:
+        if team is not None:
+            team.close()
+
+
+def _fit_loop(env):
+    env.setdefault("vparams", (lambda p: p))
+    (model, epochs, full, rng, n, batch_size, Xr, Yr, schedule, opt, vg, params, clip, low, history, val, lf, ctx,
+     val_hist, verbose) = (env[k] for k in ("model", "epochs", "full", "rng", "n", "batch_size", "Xr", "Yr",
+                                             "schedule", "opt", "vg", "params", "clip", "low", "history", "val",
+                                             "lf", "ctx", "val_hist", "verbose"))
+    from .stdlib import clip_grad_norm
+    _f32 = env.get("_f32")
+    step = 0
+    from . import thermal
+    cool = thermal.cpu_governor()                      # keeps the processor near APSI_CPU_TEMP (77 C)
     for ep in range(int(epochs)):
         if full:
             batches = [None]
@@ -1312,11 +1410,12 @@ def fit(model, params, X, y=None, loss="mse", opt=None, epochs=10, batch_size=No
             batches = [idx[i:i + int(batch_size)] for i in range(0, n, int(batch_size))]
         total = 0.0
         for b in batches:
-            xb = Xr if b is None else _take(Xr, b)
-            yb = Yr if b is None else _take(Yr, b)
             if schedule is not None:
                 opt.lr = schedule(step)
-            l, g = vg(params, xb, yb)
+            if hasattr(vg, "shards"):
+                l, g = vg(params, b)
+            else:
+                l, g = vg(params, Xr if b is None else _take(Xr, b), Yr if b is None else _take(Yr, b))
             if clip:
                 g = clip_grad_norm(g, clip)
             params = opt.step(params, g)
@@ -1324,11 +1423,12 @@ def fit(model, params, X, y=None, loss="mse", opt=None, epochs=10, batch_size=No
                 params = _f32(params)
             total += float(ops.raw(l)) * (1 if b is None else len(b))
             step += 1
+            cool.tick()
         history.append(total / (1 if full else n))
         extra = ""
         if val is not None:
             vx, vy = val
-            vl = float(ops.raw(lf(model(params, vx, **ctx), vy)))
+            vl = float(ops.raw(lf(model(env["vparams"](params), vx, **ctx), vy)))
             val_hist.append(vl)
             extra = f"  val {vl:.5f}"
         if verbose and (ep % max(1, int(epochs) // 10) == 0 or ep == int(epochs) - 1):
@@ -1336,10 +1436,107 @@ def fit(model, params, X, y=None, loss="mse", opt=None, epochs=10, batch_size=No
     return Record(params=params, history=history, val_history=val_hist, device="numpy")
 
 
-def predict(model, params, X, backend="numpy", device="auto", precision="fp32", **ctx):
-    if _backend(backend) == "torch":
+def _want_workers(w):
+    import os as _os
+    if w in (None, 0, 1, False):
+        return 1
+    n = (_os.cpu_count() or 1) if str(w).lower() == "auto" else int(w)
+    return max(1, min(int(n), 256))
+
+
+class _Team:
+    """Data-parallel helpers: forked processes that compute the loss and gradients of one shard of each batch."""
+
+    def __init__(self, vg, X, Y, workers):
+        import multiprocessing as mp
+        import sys as _sys
+        self.n = _want_workers(workers)
+        self.procs = []
+        if _sys.platform.startswith("win") or "fork" not in mp.get_all_start_methods():
+            print("apsi: note: fit(workers=…) needs fork (Linux, macOS); training on one process", file=_sys.stderr)
+            self.vg = vg
+            return
+        global _TEAM_STATE
+        _TEAM_STATE = (vg, X, Y)
+        ctx = mp.get_context("fork")
+        self.pipes = []
+        for _ in range(self.n - 1):                       # the parent computes one shard itself
+            a, b = ctx.Pipe()
+            p = ctx.Process(target=_team_worker, args=(b,), daemon=True)
+            p.start()
+            self.procs.append(p)
+            self.pipes.append(a)
+        self.local = vg
+        self.X, self.Y = X, Y
+
+        def parallel(params, b):
+            shards = [s for s in np.array_split(np.asarray(b), self.n) if len(s)]
+            for pipe, sh in zip(self.pipes, shards[1:]):
+                pipe.send((params, sh))
+            l0, g0 = self.local(params, _take(self.X, shards[0]), _take(self.Y, shards[0]))
+            total = len(b)
+            loss = float(ops.raw(l0)) * len(shards[0]) / total
+            grad = tree_map(lambda a: np.asarray(ops.raw(a)) * (len(shards[0]) / total), g0)
+            for pipe, sh in zip(self.pipes, shards[1:]):
+                ok, res = pipe.recv()
+                if not ok:
+                    raise RuntimeErr(f"fit(workers=…): a worker failed: {res}")
+                l, g = res
+                w = len(sh) / total
+                loss += l * w
+                grad = tree_map2(lambda a, c: a + np.asarray(c) * w, grad, g)
+            return loss, grad
+        parallel.shards = True
+        self.vg = parallel
+
+    def close(self):
+        for pipe in getattr(self, "pipes", []):
+            try:
+                pipe.send(None)
+            except (OSError, BrokenPipeError):
+                pass
+        for p in self.procs:
+            p.join(timeout=2)
+            if p.is_alive():
+                p.terminate()
+
+
+_TEAM_STATE = None
+
+
+def tree_map2(f, a, b):
+    """f over the leaves of two trees of the same shape (records, dicts, lists of arrays)."""
+    it = iter([f(x, y) for x, y in zip(tree_leaves(a), tree_leaves(b))])
+    return tree_map(lambda _: next(it), a)
+
+
+def _team_worker(pipe):
+    vg, X, Y = _TEAM_STATE
+    while True:
+        msg = pipe.recv()
+        if msg is None:
+            return
+        params, sh = msg
+        try:
+            l, g = vg(params, _take(X, sh), _take(Y, sh))
+            pipe.send((True, (float(ops.raw(l)), tree_map(lambda a: np.asarray(ops.raw(a)), g))))
+        except Exception as e:                            # noqa: BLE001 - reported to the parent
+            pipe.send((False, f"{type(e).__name__}: {e}"))
+
+
+def predict(model, params, X, backend="numpy", device="auto", precision="auto", **ctx):
+    which = _backend(backend)
+    if which == "gpu":
+        from . import gpu_train
+        dev = "cuda" if str(device).lower() in ("auto", "gpu", "cuda") else device
+        return gpu_train.predict(model, params, X, device=dev, precision=precision)
+    if which == "torch":
         from . import torch_backend
         return torch_backend.predict(model, params, X, device=device, precision=precision, **ctx)
+    from . import lowbit
+    kind = lowbit.parse(precision)
+    if kind:
+        params = lowbit.round_tree(params, kind)
     return model(params, X, train=False, **ctx)
 
 
@@ -1419,9 +1616,8 @@ def module(interp=None):
 
     def resolve(backend, what):
         b = str(backend or "numpy").lower()
-        if b == "auto":
-            from . import torch_backend
-            return "torch" if permitted() and torch_backend.available() else "numpy"
+        if b == "auto":                     # Apsi's GPU trainer first, then PyTorch when allowed, then NumPy
+            return "auto" if permitted() else "auto-notorch"
         if b == "torch" and interp is not None:
             need(interp, "python", what)
         return b
@@ -1459,7 +1655,7 @@ def module(interp=None):
         gcn=GCN, sage=SAGE, gat=GAT, gin=GIN, graph_pool=GraphPool,
         # composition
         sequential=sequential, residual=residual, parallel=parallel, dag=dag, add=add, multiply=multiply,
-        concatenate=concatenate, custom_layer=custom_layer, checkpoint=checkpoint, load_torch_weights=load_torch_weights,
+        concatenate=concatenate, custom_layer=custom_layer, checkpoint=checkpoint, diagnose=diagnose, load_torch_weights=load_torch_weights,
         # model zoo
         mlp=mlp, resnet_mlp=resnet_mlp, cnn=cnn, lstm_classifier=lstm_classifier, transformer_lm=transformer_lm,
         transformer_classifier=transformer_classifier, autoencoder=autoencoder, vae=vae, vae_loss=vae_loss,
@@ -1470,4 +1666,169 @@ def module(interp=None):
         torch_module=guarded(torch_module, "torch_module()"), params_from_torch=guarded(params_from_torch, "params_from_torch()"),
         devices=devices_, check_torch=guarded(check_torch, "check_torch()"),
     )
+    from . import graphs                     # long-range graph layers (graph_transformer, global_attention, …)
+    names.update(graphs.names())
     return names
+
+
+# =============================================================== diagnose: what is wrong with a model built from scratch
+def diagnose(model, params, X, y=None, loss="mse", lr=1e-3, steps=60, batch=16, seed=0, verbose=True):
+    """Checks a new model before a long training run, the way an experienced person would, and says what to fix:
+
+    1. data: NaN / inf in inputs or targets, labels outside the model's classes, one class only, unscaled inputs
+    2. forward: the output shape against the targets, NaN / inf in the output
+    3. the first loss against what an untrained model should give (log(classes) for cross_entropy)
+    4. gradients: parameters that get no gradient (unused or dead), NaN / inf, very large or vanishing ones
+    5. it can learn: a small batch is trained for `steps` steps and the loss must fall (otherwise: a bug or the
+       learning rate), and the learning rates 10x around `lr` are tried to suggest a better one.
+
+    Returns record(ok, problems, warnings, notes, suggested_lr, losses) and prints a report."""
+    from .stdlib import Adam, value_and_grad
+    lf = _loss_fn(loss)
+    problems, warnings, notes = [], [], []
+    target = X if y is None else y
+    Xr = np.asarray(ops.raw(X)) if not isinstance(X, (list, tuple)) else None
+    Yr = np.asarray(ops.raw(target)) if not isinstance(target, (list, tuple)) else None
+
+    # 1. data
+    for name, a in (("inputs", Xr), ("targets", Yr)):
+        if a is not None and a.dtype.kind == "f":
+            bad = int((~np.isfinite(a)).sum())
+            if bad:
+                problems.append(f"{bad} NaN/inf value(s) in the {name}: clean them (e.g. where(isnan(x), 0, x))")
+    if Xr is not None and Xr.dtype.kind == "f" and np.isfinite(Xr).all() and Xr.size:
+        spread = float(np.abs(Xr).max())
+        if spread > 1e3:
+            warnings.append(f"inputs reach {spread:.3g}: scale them (standardize: (x - mean) / std) or training will "
+                            "be slow or unstable")
+    n = _rows(X)
+    k = min(int(batch), n)
+    rng = np.random.default_rng(int(seed))
+    idx = np.sort(rng.choice(n, size=k, replace=False))
+    xb, yb = _take(X, idx), _take(target, idx)
+
+    # 2. forward
+    try:
+        out = model(params, xb, train=False)
+    except Exception as e:
+        problems.append(f"the model cannot run on the inputs: {type(e).__name__}: {e}")
+        return _report(False, problems, warnings, notes, None, [], verbose)
+    o = np.asarray(ops.raw(out)) if not isinstance(out, (list, tuple)) else None
+    if o is not None:
+        if o.dtype.kind == "f" and not np.isfinite(o).all():
+            problems.append("the output has NaN/inf before any training: check the initialisation and operations "
+                            "such as log / sqrt / division of values that can be 0 or negative")
+        yb_a = np.asarray(ops.raw(yb)) if not isinstance(yb, (list, tuple)) else None
+        if loss == "cross_entropy" and yb_a is not None:
+            classes = o.shape[-1]
+            labels = np.asarray(ops.raw(target)).astype(int) if Yr is not None else yb_a.astype(int)
+            valid = labels[labels >= 0]
+            if valid.size and valid.max() >= classes:
+                problems.append(f"labels go up to {int(valid.max())} but the model has {classes} outputs: "
+                                f"the last layer needs {int(valid.max()) + 1} outputs")
+            if valid.size and len(np.unique(valid)) == 1:
+                warnings.append("every label is the same class: the model can only learn to predict it")
+            if o.shape[:-1] != yb_a.shape:
+                problems.append(f"output {tuple(o.shape)} does not fit labels {tuple(yb_a.shape)} "
+                                "(cross_entropy wants outputs [..., classes] and labels [...])")
+        elif yb_a is not None and loss in ("mse", "mae", "bce") and o.shape != yb_a.shape:
+            if o.size == yb_a.size:
+                warnings.append(f"output {tuple(o.shape)} and targets {tuple(yb_a.shape)} have the same values but "
+                                "different shapes: reshape the targets, or the loss may broadcast wrongly")
+            else:
+                problems.append(f"output {tuple(o.shape)} does not match targets {tuple(yb_a.shape)}")
+    if problems:
+        return _report(False, problems, warnings, notes, None, [], verbose)
+
+    # 3. first loss
+    try:
+        l0 = float(ops.raw(lf(model(params, xb, train=True), yb)))
+    except Exception as e:
+        problems.append(f"the loss cannot be computed: {type(e).__name__}: {e}")
+        return _report(False, problems, warnings, notes, None, [], verbose)
+    if not np.isfinite(l0):
+        problems.append("the first loss is NaN/inf")
+        return _report(False, problems, warnings, notes, None, [], verbose)
+    if loss == "cross_entropy" and o is not None:
+        expect = float(np.log(o.shape[-1]))
+        notes.append(f"first loss {l0:.4g} (an untrained model with {o.shape[-1]} classes gives about {expect:.4g})")
+        if l0 > 3 * expect + 1:
+            warnings.append("the first loss is far above log(classes): the last layer starts with too large weights "
+                            "(the model is confidently wrong); initialise it smaller")
+    else:
+        notes.append(f"first loss {l0:.4g}")
+
+    # 4. gradients
+    def obj(p):
+        return lf(model(p, xb, train=True), yb)
+    _, g = value_and_grad(obj)(params)
+    from .models import _flatten
+    flat_g = _flatten(g)
+    flat_p = _flatten(params)
+    dead, huge = [], []
+    for name, gv in flat_g.items():
+        a = np.asarray(ops.raw(gv), np.float64)
+        if not np.isfinite(a).all():
+            problems.append(f"gradient of '{name}' has NaN/inf")
+            continue
+        g_rms = float(np.sqrt((a * a).mean())) if a.size else 0.0
+        pv = np.asarray(ops.raw(flat_p.get(name, 0)), np.float64)
+        p_rms = float(np.sqrt((pv * pv).mean())) if pv.size else 0.0
+        if g_rms == 0.0:
+            dead.append(name)
+        elif g_rms / max(p_rms, 0.05) > 100:             # one step at lr 1e-3 would move it by over 10 %
+            huge.append(name)
+    if dead:
+        warnings.append(f"{len(dead)} parameter(s) get no gradient (not used by the output, or dead ReLUs): "
+                        + ", ".join(dead[:6]) + (" …" if len(dead) > 6 else ""))
+    if huge:
+        warnings.append("very large gradients for " + ", ".join(huge[:4]) + ": add normalisation or clip=1.0")
+    if problems:
+        return _report(False, problems, warnings, notes, None, [], verbose)
+
+    # 5. can it learn? a small batch, a few learning rates
+    def run(rate):
+        p, o_ = params, Adam(rate)
+        vg = value_and_grad(obj)
+        hist = []
+        for _ in range(int(steps)):
+            lv, gg = vg(p)
+            lv = float(ops.raw(lv))
+            hist.append(lv)
+            if not np.isfinite(lv):
+                break
+            p = o_.step(p, gg)
+        return hist
+    tried = {}
+    for rate in (lr / 10, lr, lr * 10):
+        h = run(rate)
+        tried[rate] = h
+    def score(h):
+        return h[-1] if h and np.isfinite(h[-1]) else np.inf
+    best = min(tried, key=lambda r: score(tried[r]))
+    h = tried[lr]
+    drop = (h[0] - min(h)) / (abs(h[0]) + 1e-12) if h and np.isfinite(min(h)) else 0.0
+    if not np.isfinite(score(h)):
+        problems.append(f"training diverges at lr={lr:g} (the loss became NaN/inf): lower the learning rate")
+    elif drop < 0.1 and score(tried[best]) > 0.9 * h[0]:
+        problems.append(f"the loss does not fall on {k} examples in {steps} steps at any learning rate "
+                        f"({h[0]:.4g} → {h[-1]:.4g}): the model cannot fit even a tiny batch — usually a bug (wrong "
+                        "targets, a detached part of the network, an activation at the output where none belongs)")
+    else:
+        notes.append(f"learns: loss {h[0]:.4g} → {h[-1]:.4g} on {k} examples in {steps} steps at lr={lr:g}")
+    if best != lr and score(tried[best]) < 0.7 * score(h):
+        notes.append(f"lr={best:g} learned faster ({score(tried[best]):.4g} vs {score(h):.4g}): try it")
+    return _report(not problems, problems, warnings, notes, best, h, verbose)
+
+
+def _report(ok, problems, warnings, notes, best, losses, verbose):
+    if verbose:
+        print("diagnose: " + ("no problems found" if ok and not warnings else
+                              f"{len(problems)} problem(s), {len(warnings)} warning(s)"))
+        for p in problems:
+            print("  ✗ " + p)
+        for w in warnings:
+            print("  ! " + w)
+        for n_ in notes:
+            print("  · " + n_)
+    return Record(ok=bool(ok), problems=problems, warnings=warnings, notes=notes, suggested_lr=best, losses=losses)

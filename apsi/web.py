@@ -22,6 +22,8 @@ import asyncio
 import base64
 import hashlib
 import hmac
+import collections
+import itertools
 import json
 import mimetypes
 import os
@@ -32,12 +34,17 @@ import sys
 import threading
 import time
 import traceback
-import uuid
 from concurrent.futures import ThreadPoolExecutor
 from urllib.parse import unquote, parse_qs
 
-from .errors import ApsiError, RuntimeErr
+from .errors import ApsiError
 from .values import Record
+
+for _ext, _type in ((".mjs", "text/javascript"), (".jsx", "text/javascript"), (".ts", "text/javascript"),
+                    (".tsx", "text/javascript"), (".jsonl", "application/jsonl"), (".ndjson", "application/x-ndjson"),
+                    (".wasm", "application/wasm"), (".webp", "image/webp"), (".avif", "image/avif"),
+                    (".woff2", "font/woff2"), (".map", "application/json"), (".webmanifest", "application/manifest+json")):
+    mimetypes.add_type(_type, _ext)
 
 STATUS = {200: "OK", 201: "Created", 202: "Accepted", 204: "No Content", 301: "Moved Permanently",
           302: "Found", 304: "Not Modified", 400: "Bad Request", 401: "Unauthorized", 403: "Forbidden",
@@ -57,6 +64,15 @@ SECURITY_HEADERS = {
 
 
 # =========================================================================== request / response
+_ID_PREFIX = os.urandom(5).hex()
+_ID_COUNT = itertools.count(1)
+
+
+def _next_id():
+    """A request id unique in this process (random per process, then a counter): no system call per request."""
+    return f"{_ID_PREFIX}{next(_ID_COUNT):06x}"
+
+
 class Request:
     __slots__ = ("method", "path", "query", "headers", "body", "params", "client", "id", "started", "user")
 
@@ -64,7 +80,7 @@ class Request:
         self.method, self.path, self.query, self.headers = method, path, query, headers
         self.body, self.client = body, client
         self.params = {}
-        self.id = uuid.uuid4().hex[:16]
+        self.id = _next_id()
         self.started = time.perf_counter()
         self.user = None
 
@@ -135,10 +151,24 @@ def _clean(o):
     return o
 
 
-def _json_response(obj, status=200, headers=None):
+def _json_default(o):
     from .interop import to_py
-    body = json.dumps(_clean(to_py(obj)), ensure_ascii=False, separators=(",", ":"),
-                      allow_nan=False).encode("utf-8")
+    v = to_py(o)
+    if v is o:
+        raise TypeError(f"{type(o).__name__} is not JSON serializable")
+    return _clean(v)
+
+
+_dumps = json.JSONEncoder(ensure_ascii=False, separators=(",", ":"), allow_nan=False, default=_json_default).encode
+
+
+def _json_response(obj, status=200, headers=None):
+    try:
+        body = _dumps(obj).encode("utf-8")              # fast path: plain JSON values (and anything to_py knows)
+    except ValueError:                                  # NaN / Infinity somewhere: JSON has no such numbers
+        from .interop import to_py
+        body = json.dumps(_clean(to_py(obj)), ensure_ascii=False, separators=(",", ":"),
+                          allow_nan=False).encode("utf-8")
     h = {"Content-Type": "application/json; charset=utf-8"}
     h.update(headers or {})
     return Response(body, status, h)
@@ -217,7 +247,7 @@ class Metrics:
         self.requests = 0
         self.errors = 0
         self.by_status = {}
-        self.latencies = []
+        self.latencies = collections.deque(maxlen=10000)
         self.started = time.time()
         self.active = 0
 
@@ -228,8 +258,6 @@ class Metrics:
                 self.errors += 1
             self.by_status[status] = self.by_status.get(status, 0) + 1
             self.latencies.append(seconds)
-            if len(self.latencies) > 10000:
-                self.latencies = self.latencies[-5000:]
 
     def snapshot(self):
         with self.lock:
@@ -274,6 +302,15 @@ class App:
         self._loop = None
         self._stopping = False
         self.tls = False
+        self.ws_routes = []
+        self._fast = {}                  # route index -> fast-run score (≥ _INLINE_AFTER: runs on the event loop)
+        self._probe = {}                 # route index -> run the next request on the loop to measure it exactly
+        self._strikes = {}               # route index -> slow runs on the loop in a row
+        self._route_cache = {}
+        self._sec_headers = None
+        self._literal = None             # literal path -> routes without parameters (no regex needed)
+        self.rooms = {}
+        self._rooms_lock = threading.Lock()
 
     # ------------------------------------------------------------- registration
     def route(self, method, path, handler=None):
@@ -296,6 +333,34 @@ class App:
 
     def delete(self, path, handler=None):
         return self.route("DELETE", path, handler)
+
+    def websocket(self, path, handler=None, origins=None, max_message=16 << 20, ping=20.0, on_open=None,
+                  on_close=None, subprotocols=None):
+        """A WebSocket route. handler(ws, msg) is called for every message (message mode, scales to many
+        connections); handler(ws) runs the whole conversation in its own thread (session mode)."""
+        def add(h):
+            r = Route("WS", str(path), h)
+            r.options = {"origins": list(origins) if origins else None, "max_message": int(max_message),
+                         "ping": float(ping.v) if hasattr(ping, "v") else float(ping or 0), "on_open": on_open,
+                         "on_close": on_close, "subprotocols": list(subprotocols or []),
+                         "message_mode": _arity(h) >= 2}
+            self.ws_routes.append(r)
+            return h
+        return add(handler) if handler is not None else add
+
+    def room(self, name):
+        """A named group of WebSocket connections: ws.join(name), app.room(name).send(msg)."""
+        from .websocket import Room
+        with self._rooms_lock:
+            r = self.rooms.get(name)
+            if r is None:
+                r = self.rooms[name] = Room(name)
+            return r
+
+    def _log_ws_error(self, ws, err):
+        if self.log:
+            print(f"[{self.name}] websocket {ws.path} ({ws.id}) handler failed: {type(err).__name__}: {err}",
+                  file=sys.stderr)
 
     def before(self, hook):
         """hook(req) runs before every handler; return a response to short-circuit (e.g. auth)."""
@@ -352,6 +417,17 @@ class App:
                 if r is not None:
                     return self._finish(req, _to_response(r))
             allowed = []
+            lit = self._literal
+            if lit is None or lit[0] != len(self.routes):
+                table = {}
+                for route in self.routes:
+                    if not route.converters:
+                        table.setdefault(route.pattern, []).append(route)
+                lit = self._literal = (len(self.routes), table)
+            for route in lit[1].get(req.path, ()):
+                if route.method == req.method or (route.method == "GET" and req.method == "HEAD"):
+                    req.params = {}
+                    return self._finish(req, _to_response(route.handler(req)))
             for route in self.routes:
                 params = route.match(req.path)
                 if params is None:
@@ -429,11 +505,19 @@ class App:
             resp.headers.setdefault("Access-Control-Allow-Methods", "GET, POST, PUT, PATCH, DELETE, OPTIONS")
             resp.headers.setdefault("Access-Control-Allow-Headers", "Content-Type, Authorization")
         if self.security_headers:
-            for k, v in SECURITY_HEADERS.items():
-                resp.headers.setdefault(k, v)
-            if self.tls:
-                resp.headers.setdefault("Strict-Transport-Security", "max-age=63072000; includeSubDomains")
-        resp.headers.setdefault("X-Request-Id", req.id)
+            sec = self._sec_headers
+            if sec is None:
+                sec = dict(SECURITY_HEADERS)
+                if self.tls:
+                    sec["Strict-Transport-Security"] = "max-age=63072000; includeSubDomains"
+                self._sec_headers = sec
+            h = resp.headers
+            merged = sec.copy()                         # defaults first, the handler's own headers win
+            if h:
+                merged.update(h)
+            resp.headers = merged
+        if "X-Request-Id" not in resp.headers:
+            resp.headers["X-Request-Id"] = req.id
         for hook in self.after_hooks:
             try:
                 hook(req, resp)
@@ -469,7 +553,9 @@ class App:
 
     # ------------------------------------------------------------- network server
     def run(self, host="127.0.0.1", port=8080, tls_cert=None, tls_key=None, processes=1, workers=None):
-        """Start serving (blocks). processes > 1 forks workers sharing the port (Linux)."""
+        """Start serving (blocks). processes > 1 forks workers sharing the port (Linux, macOS); processes="auto"
+        uses one per CPU this process may run on. Each process has its own memory: share state through a
+        database, memory.store() or rooms only within one process."""
         if self.interp is not None:
             from .security import check_net
             check_net(self.interp, host, int(port), "app.run() (listening)")
@@ -483,11 +569,19 @@ class App:
             ssl_ctx.load_cert_chain(tls_cert, tls_key)
             ssl_ctx.set_alpn_protocols(["http/1.1"])
             self.tls = True
+        if str(processes).lower() == "auto":
+            try:
+                processes = len(os.sched_getaffinity(0))
+            except (AttributeError, OSError):
+                processes = os.cpu_count() or 1
+            if not hasattr(os, "fork"):
+                processes = 1
         processes = int(processes or 1)
         sock = _bind(host, int(port), reuse_port=processes > 1)
         scheme = "https" if ssl_ctx else "http"
         print(f"{self.name} listening on {scheme}://{host}:{sock.getsockname()[1]}  "
-              f"({processes} process{'es' if processes > 1 else ''} × {self.workers} worker threads)")
+              f"({processes} process{'es' if processes > 1 else ''} × {self.workers} worker threads, "
+              f"{event_loop_name()} event loop)")
         if processes > 1 and hasattr(os, "fork"):
             children = []
             for _ in range(processes - 1):
@@ -528,17 +622,27 @@ class App:
     def stop(self):
         self._stopping = True
         if self._loop is not None and self._server is not None:
-            self._loop.call_soon_threadsafe(self._server.close)
+            def close():
+                self._server.close()
+                task = getattr(self, "_main_task", None)
+                if task is not None and not task.done():
+                    task.cancel()                  # serve_forever ends (uvloop does not end it on close alone)
+            try:
+                self._loop.call_soon_threadsafe(close)
+            except RuntimeError:                   # the loop has already finished
+                pass
 
     def _serve(self, sock, ssl_ctx, ready=None):
-        loop = asyncio.new_event_loop()
+        loop = _new_loop()
         self._loop = loop
         self._executor = ThreadPoolExecutor(max_workers=self.workers, thread_name_prefix=f"{self.name}-w")
         loop.set_default_executor(self._executor)
 
         async def main():
-            self._server = await asyncio.start_server(self._client, sock=sock, ssl=ssl_ctx,
-                                                      limit=self.max_header + 1024, backlog=2048)
+            app = self
+            self._main_task = asyncio.current_task()
+            self._server = await loop.create_server(lambda: _HTTPProtocol(app), sock=sock, ssl=ssl_ctx,
+                                                    backlog=4096)
             if threading.current_thread().name == "apsi-program":
                 # running under apsi.runner: Ctrl+C / SIGTERM arrive in the main thread and call stop()
                 from . import runner
@@ -602,6 +706,16 @@ class App:
                 except HTTPError as e:
                     await self._send(writer, _json_response({"error": e.message}, e.status), False)
                     break
+                if headers.get("upgrade", "").lower() == "websocket" and self.ws_routes:
+                    path_only = target.partition("?")[0]
+                    for wr in self.ws_routes:
+                        params = wr.match(unquote(path_only))
+                        if params is not None:
+                            from . import websocket as _ws
+                            req = Request(method, path_only, _query(target.partition("?")[2]), headers, b"", client)
+                            req.params = params
+                            await _ws.serve(self, wr, req, reader, writer, headers)
+                            return
                 keep = version == "HTTP/1.1" and headers.get("connection", "").lower() != "close"
                 if headers.get("transfer-encoding", "").lower() not in ("", "identity"):
                     await self._send(writer, _json_response({"error": "chunked request bodies are not supported"}, 411), False)
@@ -661,6 +775,320 @@ class App:
             pass
 
 
+class _HTTPProtocol(asyncio.Protocol):
+    """One HTTP/1.1 connection on the event loop (a protocol, not streams: no task or timer per request).
+
+    Fast handlers run inline on the loop — no thread hop — and the app measures every route: a route whose calls
+    take more than 2 ms (or that blocks once for longer than 20 ms) moves to the worker threads for good. Pipelined
+    requests are answered in order; reading pauses while a request is being handled on a worker."""
+    __slots__ = ("app", "t", "buf", "busy", "client", "timer", "closed", "first", "loop", "requests", "deadline")
+
+    def __init__(self, app):
+        self.app = app
+        self.buf = bytearray()
+        self.busy = False
+        self.closed = False
+        self.first = True
+        self.timer = None
+        self.deadline = 0.0
+        self.requests = 0
+
+    def connection_made(self, transport):
+        self.t = transport
+        self.loop = asyncio.get_running_loop()
+        peer = transport.get_extra_info("peername")
+        self.client = peer[0] if isinstance(peer, tuple) else "unknown"
+        app = self.app
+        if app.metrics.active >= app.max_connections or app._stopping:
+            transport.close()
+            self.closed = True
+            return
+        app.metrics.active += 1
+        sock = transport.get_extra_info("socket")
+        if sock is not None:
+            try:
+                sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+            except OSError:
+                pass
+        self._arm(app.header_timeout)
+
+    def _arm(self, seconds):
+        """Move the connection's deadline. One timer per connection: it is re-armed only when it fires early,
+        not on every request (scheduling and cancelling a timer per request costs more than the rest)."""
+        self.deadline = self.loop.time() + seconds
+        if self.timer is None:
+            self.timer = self.loop.call_at(self.deadline, self._timeout)
+
+    def _timeout(self):
+        self.timer = None
+        if self.closed:
+            return
+        if self.loop.time() < self.deadline - 0.001:
+            self.timer = self.loop.call_at(self.deadline, self._timeout)
+            return
+        if not self.closed:
+            if self.first or self.buf:
+                self._write(_json_response({"error": "request timeout"}, 408), False)
+            self._close()
+
+    def connection_lost(self, exc):
+        if not self.closed:
+            self.closed = True
+            self.app.metrics.active -= 1
+        if self.timer is not None:
+            self.timer.cancel()
+
+    def _close(self):
+        if not self.closed:
+            self.closed = True
+            self.app.metrics.active -= 1
+            if self.timer is not None:
+                self.timer.cancel()
+            self.t.close()
+
+    def data_received(self, data):
+        self.buf += data
+        if not self.busy:
+            self._process()
+
+    def _process(self):
+        app = self.app
+        while self.buf and not self.closed and not self.busy:
+            end = self.buf.find(b"\r\n\r\n")
+            if end < 0:
+                if len(self.buf) > app.max_header:
+                    self._write(_json_response({"error": "headers too large"}, 431), False)
+                    self._close()
+                return
+            head = bytes(self.buf[:end + 4])
+            try:
+                method, target, version, headers = _parse_head(head, app.max_header)
+            except HTTPError as e:
+                self._write(_json_response({"error": e.message}, e.status), False)
+                self._close()
+                return
+            if headers.get("transfer-encoding", "").lower() not in ("", "identity"):
+                self._write(_json_response({"error": "chunked request bodies are not supported"}, 411), False)
+                self._close()
+                return
+            try:
+                n = int(headers.get("content-length", "0") or 0)
+            except ValueError:
+                n = -1
+            if n < 0:
+                self._write(_json_response({"error": "bad Content-Length"}, 400), False)
+                self._close()
+                return
+            if n > app.max_body:
+                self._write(_json_response({"error": "payload too large"}, 413), False)
+                self._close()
+                return
+            if len(self.buf) < end + 4 + n:
+                self._arm(app.body_timeout)
+                return                                         # wait for the rest of the body
+            body = bytes(self.buf[end + 4:end + 4 + n])
+            del self.buf[:end + 4 + n]
+            self.first = False
+            path, _, qs = target.partition("?")
+            if not path.startswith("/") or "\x00" in path:
+                self._write(_json_response({"error": "bad request target"}, 400), False)
+                self._close()
+                return
+            if headers.get("upgrade", "").lower() == "websocket" and app.ws_routes:
+                self._upgrade(method, path, qs, headers)
+                return
+            keep = version == "HTTP/1.1" and headers.get("connection", "").lower() != "close"
+            if "%" in path and "%2f" not in path.lower():
+                path = unquote(path)
+            req = Request(method, path, _query(qs), headers, body, self.client)
+            route_key = _route_key(app, req)
+            score = app._fast.get(route_key, 0) if route_key is not None else -1
+            if score >= _INLINE_AFTER:                         # proven fast: run it here, watch the wall time only
+                t0 = req.started
+                resp = app.dispatch(req)
+                dt = time.perf_counter() - t0
+                if dt > 0.002:                                 # slow this time: three strikes and it moves
+                    strikes = app._strikes.get(route_key, 0) + 1
+                    app._strikes[route_key] = strikes
+                    if strikes >= 3:
+                        app._fast[route_key] = -1_000_000
+                elif dt < 0.0005 and route_key in app._strikes:
+                    app._strikes.pop(route_key, None)
+                self._write(resp, keep, method == "HEAD")
+                if not keep:
+                    self._close()
+                    return
+                self._arm(app.keepalive_timeout)
+                continue
+            if score >= 0 and app._probe.pop(route_key, False):
+                t0, c0 = time.perf_counter(), time.thread_time()
+                resp = app.dispatch(req)
+                dt, cpu = time.perf_counter() - t0, time.thread_time() - c0
+                if cpu > 0.002:                                # too heavy for the loop: back to the workers for good
+                    app._fast[route_key] = -1_000_000
+                elif dt > 0.002:                               # blocked (I/O) or waited for the GIL: three strikes
+                    strikes = app._strikes.get(route_key, 0) + 1
+                    app._strikes[route_key] = strikes
+                    if strikes >= 3:
+                        app._fast[route_key] = -1_000_000
+                elif dt < 0.0005:
+                    app._strikes.pop(route_key, None)
+                    if score < _INLINE_AFTER:                  # a probe that was fast: promote in a few steps
+                        app._fast[route_key] = score + 4
+                self._write(resp, keep, method == "HEAD")
+                if not keep:
+                    self._close()
+                    return
+                self._arm(app.keepalive_timeout)
+                continue
+            self.busy = True
+            if self.timer is not None:                         # the handler timeout governs from here
+                self.timer.cancel()
+                self.timer = None
+            self.t.pause_reading()
+            fut = self.loop.run_in_executor(None, _timed, app.dispatch, req)
+            timer = self.loop.call_later(app.handler_timeout, lambda f=fut: f.cancel())
+
+            def done(f, keep=keep, head_only=method == "HEAD", req=req, timer=timer, rk=route_key):
+                timer.cancel()
+                if f.cancelled():
+                    resp = _json_response({"error": "handler timed out", "id": req.id}, 504)
+                    if rk is not None:
+                        app._fast[rk] = -1_000_000
+                else:
+                    resp, dt, cpu = f.result()
+                    if rk is not None:                         # fast and steady on the workers: run it inline
+                        if dt < 0.0005:
+                            app._fast[rk] = app._fast.get(rk, 0) + 1
+                        elif cpu >= 0.002 or dt >= 1.0:        # heavy or blocking: stays on the workers
+                            app._fast[rk] = -1_000_000
+                        elif cpu < 0.0005 and app._fast.get(rk, 0) >= 0:
+                            # little CPU but a long wall time: busy server or blocking I/O — measure it once on
+                            # the loop itself (exact there) to tell which
+                            app._probe[rk] = True
+                self.busy = False
+                if self.closed:
+                    return
+                self._write(resp, keep, head_only)
+                if not keep:
+                    self._close()
+                    return
+                self._arm(app.keepalive_timeout)
+                try:
+                    self.t.resume_reading()
+                except Exception:                              # noqa: BLE001
+                    pass
+                if self.buf:
+                    self._process()
+            fut.add_done_callback(done)
+            return
+
+    def _write(self, resp, keep, head_only=False):
+        h = resp.headers
+        status = resp.status
+        head = f"HTTP/1.1 {status} {STATUS.get(status, 'Status')}\r\nContent-Length: {len(resp.body)}\r\n" \
+               f"{'Connection: keep-alive' if keep else 'Connection: close'}\r\n" \
+               f"{'' if 'Server' in h else 'Server: apsi' + chr(13) + chr(10)}"
+        lines = "".join([f"{k}: {v}\r\n" for k, v in h.items()])
+        if "\n" in lines.replace("\r\n", "") or lines.count("\r") != lines.count("\n"):
+            lines = "".join(f"{k}: {v}\r\n" for k, v in h.items()              # header injection guard
+                            if "\r" not in str(v) and "\n" not in str(v))
+        data = (head + lines + "\r\n").encode("latin-1", "replace")
+        self.t.write(data if head_only else data + resp.body)
+
+    def _upgrade(self, method, path, qs, headers):
+        """Hand the connection to the WebSocket code (stream based) without losing buffered bytes."""
+        from . import websocket as _ws
+        app = self.app
+        for wr in app.ws_routes:
+            params = wr.match(unquote(path))
+            if params is None:
+                continue
+            reader = asyncio.StreamReader(limit=1 << 22)
+            proto = asyncio.StreamReaderProtocol(reader)
+            self.t.set_protocol(proto)
+            proto.connection_made(self.t)
+            if self.buf:
+                reader.feed_data(bytes(self.buf))
+                self.buf.clear()
+            writer = asyncio.StreamWriter(self.t, proto, reader, self.loop)
+            if self.timer is not None:
+                self.timer.cancel()
+            req = Request(method, path, _query(qs), headers, b"", self.client)
+            req.params = params
+
+            async def run():
+                try:
+                    await _ws.serve(app, wr, req, reader, writer, headers)
+                finally:
+                    if not self.closed:
+                        self.closed = True
+                        app.metrics.active -= 1
+            self.loop.create_task(run())
+            return
+        self._write(_json_response({"error": "not found"}, 404), False)
+        self._close()
+
+
+def _new_loop():
+    """uvloop (libuv; about twice the requests per second) when it is installed and APSI_UVLOOP is not 0,
+    otherwise asyncio's own loop."""
+    if os.environ.get("APSI_UVLOOP", "1") != "0" and sys.platform != "win32":
+        try:
+            import uvloop
+            return uvloop.new_event_loop()
+        except ImportError:
+            pass
+    return asyncio.new_event_loop()
+
+
+def event_loop_name():
+    loop = _new_loop()
+    try:
+        return type(loop).__module__.split(".")[0]
+    finally:
+        loop.close()
+
+
+_INLINE_AFTER = 32          # a route runs on the event loop after this many calls that each took < 0.5 ms
+
+
+def _timed(f, req):
+    """(response, wall seconds, CPU seconds of this thread). Under many connections the wall time includes
+    waiting for the interpreter lock; the CPU time does not."""
+    t0, c0 = time.perf_counter(), time.thread_time()
+    r = f(req)
+    return r, time.perf_counter() - t0, time.thread_time() - c0
+
+
+def _route_key(app, req):
+    """The handler a request will reach (for the inline/worker decision), or None for static files etc."""
+    cache = app._route_cache
+    k = (req.method, req.path)
+    hit = cache.get(k)
+    if hit is not None:
+        return hit
+    for i, route in enumerate(app.routes):
+        if route.match(req.path) is not None:
+            if len(cache) < 4096:
+                cache[k] = i
+            return i
+    return None
+
+
+def _arity(f):
+    """How many positional parameters a handler takes (Apsi functions and Python callables)."""
+    node = getattr(f, "_apsi_def", None)
+    if node is not None and getattr(node, "params", None) is not None:
+        return len([p for p in node.params if not p.star])
+    import inspect
+    try:
+        return len([p for p in inspect.signature(f).parameters.values()
+                    if p.kind in (p.POSITIONAL_ONLY, p.POSITIONAL_OR_KEYWORD) and p.default is p.empty])
+    except (TypeError, ValueError):
+        return 1
+
+
 def _bind(host, port, reuse_port=False):
     fam = socket.AF_INET6 if ":" in host else socket.AF_INET
     s = socket.socket(fam, socket.SOCK_STREAM)
@@ -679,32 +1107,36 @@ def _bind(host, port, reuse_port=False):
 _TOKEN = re.compile(r"^[!#$%&'*+\-.^_`|~0-9A-Za-z]+$")
 
 
+_HDR_BLOCK = re.compile(r"(?:[!#$%&'*+\-.^_`|~0-9A-Za-z]+:[^\r\n]*\r\n)*")
+_HDR_LINE = re.compile(r"([!#$%&'*+\-.^_`|~0-9A-Za-z]+):[ \t]*([^\r\n]*?)[ \t]*\r\n")
+_GUARDED = ("content-length", "host", "transfer-encoding")
+
+
 def _parse_head(head, limit):
+    """Request line and headers. The whole header block is validated by one regular expression (token names,
+    no folded or bare-CR lines) before it is split, which is both strict and fast."""
     if len(head) > limit:
         raise HTTPError(431, "headers too large")
-    try:
-        text = head.decode("latin-1")
-    except UnicodeDecodeError:
-        raise HTTPError(400, "bad header encoding")
-    lines = text.split("\r\n")
-    parts = lines[0].split(" ")
+    text = head.decode("latin-1")
+    i = text.find("\r\n")
+    parts = text[:i].split(" ")
     if len(parts) != 3 or not parts[2].startswith("HTTP/1.") or not _TOKEN.match(parts[0]):
         raise HTTPError(400, "bad request line")
     method, target, version = parts
-    headers = {}
-    for line in lines[1:]:
-        if not line:
-            continue
-        if line[0] in " \t":
+    end = len(text) - 2                                  # the block ends with the empty line
+    if not _HDR_BLOCK.fullmatch(text, i + 2, end):
+        if any(line[:1] in (" ", "\t") for line in text[i + 2:end].split("\r\n")):
             raise HTTPError(400, "obsolete header folding is not allowed")
-        k, sep, v = line.partition(":")
-        if not sep or not _TOKEN.match(k):
-            raise HTTPError(400, "bad header")
-        k = k.lower()
-        if k in headers and k in ("content-length", "host", "transfer-encoding"):
+        raise HTTPError(400, "bad header")
+    headers = {}
+    n = 0
+    for m in _HDR_LINE.finditer(text, i + 2, end):
+        k = m.group(1).lower()
+        if k in headers and k in _GUARDED:
             raise HTTPError(400, f"duplicate {k} header")     # request-smuggling guard
-        headers[k] = v.strip()
-    if len(headers) > 100:
+        headers[k] = m.group(2)
+        n += 1
+    if n > 100:
         raise HTTPError(431, "too many headers")
     return method.upper(), target, version, headers
 
@@ -809,7 +1241,15 @@ def install(interp):
                    log=log, handler_timeout=sec(handler_timeout), header_timeout=sec(header_timeout),
                    body_timeout=sec(body_timeout), keepalive_timeout=sec(keepalive_timeout),
                    security_headers=security_headers, interp=interp)
+    def websocket_connect(url, headers=None, timeout=10.0, subprotocols=None):
+        from urllib.parse import urlparse
+        from .security import check_net
+        from .websocket import Client
+        u = urlparse(str(url))
+        check_net(interp, u.hostname, u.port or (443 if u.scheme == "wss" else 80), "websocket_connect()")
+        return Client(str(url), headers, float(timeout.v) if hasattr(timeout, "v") else float(timeout), subprotocols)
     interp.modules["web"] = {
+        "websocket_connect": websocket_connect,
         "server": server, "response": response, "redirect": redirect, "abort": abort,
         "jwt_sign": jwt_sign, "jwt_verify": jwt_verify, "bearer_token": bearer_token,
         "require_jwt": require_jwt, "require_api_key": require_api_key,

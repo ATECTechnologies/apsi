@@ -3,6 +3,8 @@ __pycache__/
 *.egg-info/
 .venv/
 build/
+# the setup wizard's icons, splash and after-pack hook are sources, not build output
+!installer/build/
 dist/
 packaging/.cache/
 installer/node_modules/
@@ -17,3 +19,4 @@ _tmp_models/
 *.vsix
 examples/out/
 experiments/
+apsi/MANIFEST.json

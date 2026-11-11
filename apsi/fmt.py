@@ -10,7 +10,16 @@ from .values import (Function, StructType, StructInstance, Record, RangeVal, Nam
                      BoundMethod, Dtype)
 
 
+_INF = float("inf")
+
+
 def fmt_num(x, spec=None):
+    if spec is None:                                 # the most common cases first
+        t = type(x)
+        if t is int:
+            return str(x)
+        if t is float and x == x and x != _INF and x != -_INF:
+            return repr(x)
     if spec:
         if isinstance(x, Fraction):
             x = float(x)
@@ -28,10 +37,8 @@ def fmt_num(x, spec=None):
         return "nan"
     if x in (float("inf"), float("-inf")):
         return "inf" if x > 0 else "-inf"
-    s = format(x, ".12g")
-    if "e" not in s and "." not in s:
-        s += ".0"
-    return s
+    # the shortest text that reads back as exactly the same number (like Python): nothing is hidden or rounded
+    return repr(x)
 
 
 def _short(v):
@@ -75,6 +82,14 @@ def shape_str(shape):
 
 
 def fmt(v, top=True, spec=None):
+    t = type(v)
+    if spec is None:                                 # the most common cases first: exact type checks are cheap
+        if t is str:
+            return v if top else '"' + v.replace('"', '\\"') + '"'
+        if t is int:
+            return str(v)
+        if t is float:
+            return fmt_num(v)
     if v is None:
         return "none"
     if isinstance(v, str):
@@ -126,7 +141,11 @@ def fmt(v, top=True, spec=None):
         return repr(v)
     if callable(v) and type(v).__repr__ is object.__repr__:
         return f"<builtin {getattr(v, '__name__', 'fn')}>"
-    return repr(v) if not isinstance(v, str) else v
+    if isinstance(v, str):
+        return v
+    if type(v).__name__ == "Decimal":
+        return format(v, spec) if spec else str(v)        # hp numbers print as their digits everywhere
+    return str(v) if top else repr(v)          # like Python: print(x) uses str(), containers use repr()
 
 
 def type_name(v):

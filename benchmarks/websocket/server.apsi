@@ -1,0 +1,19 @@
+use web
+let app = web.server(log=true)
+
+@app.websocket("/echo")
+fn echo(ws, msg):
+    ws.send(msg)
+
+@app.websocket("/chat/{room}")
+fn chat(ws):
+    let room = ws.params["room"]
+    ws.join(room)
+    ws.send({"hello": ws.id, "room": room})
+    for msg in ws:
+        app.room(room).send({"room": room, "text": msg})
+
+@app.get("/health")
+fn health(req) = {"ok": true}
+
+app.run(port=58080)

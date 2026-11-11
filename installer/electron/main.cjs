@@ -46,7 +46,7 @@ function sanitizeOptions(o) {
   }
   if (o.security && [50, 150, 500, 2000].includes(o.security.guardLimit)) out.security.guardLimit = o.security.guardLimit;
   const v = core.validateDir(out.dir);
-  const upgrading = sys.existing && path.resolve(sys.existing.dir) === path.resolve(out.dir);
+  const upgrading = sys.existing && path.resolve(sys.existing.root || sys.existing.dir) === path.resolve(out.dir);
   if (!v.ok && !upgrading) throw new Error(v.problems.join(" "));
   return out;
 }

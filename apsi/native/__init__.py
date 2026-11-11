@@ -4,6 +4,7 @@
     fn energy(x: Tensor) -> Float: ...
 
     @native("fast")              # checks off, fast-math (reassociation, FMA) - like C with -O3 -ffast-math
+    @native("fma")               # checks on; a * b + c may become one fused multiply-add (like gcc -O3's default)
     @native("strict")            # fail instead of falling back to the bytecode engine
 
 A `NativeFunction` compiles one specialisation per combination of argument types and units, the first time it is
@@ -22,12 +23,13 @@ import numpy as np
 
 from .. import ast as A
 from ..errors import RuntimeErr, AssertionFailed, ApsiError
+from ..fmt import type_name
 from ..units import Quantity, DIMLESS, DIM_NAMES
 from . import engine as _eng
 from .types import type_of_value as _type_of_value
 
 _compile_lock = threading.RLock()
-OPTION_NAMES = {"fast", "strict", "quiet", "auto"}
+OPTION_NAMES = {"fast", "strict", "quiet", "auto", "fma"}
 STATS = {"compiled": 0, "fallbacks": 0, "calls": 0}
 _REPORTS = []          # (function name, message) for `apsi native explain`
 REGISTRY = []          # every NativeFunction made in this process (for explain/ir)
@@ -73,7 +75,7 @@ def reports():
 def native(*args, **kwargs):
     """@native, @native("fast"), @native("strict"), @native(fast=true)."""
     if len(args) == 1 and not kwargs and callable(args[0]) and not isinstance(args[0], str):
-        return NativeFunction(args[0], {})
+        return _wrap(args[0], {})
     opts = {}
     for a in args:
         if not isinstance(a, str) or a not in OPTION_NAMES:
@@ -85,8 +87,24 @@ def native(*args, **kwargs):
         opts[k] = bool(v)
 
     def deco(f):
-        return NativeFunction(f, opts)
+        return _wrap(f, opts)
     return deco
+
+
+_NOTED = []
+
+
+def _wrap(f, opts):
+    """In the tree-walking interpreter (the REPL, --engine interp) a @native function simply runs as written."""
+    from ..values import Function
+    if getattr(f, "_apsi_def", None) is None and isinstance(f, Function):
+        if not _NOTED:
+            _NOTED.append(1)
+            import sys
+            print("apsi: note: @native functions run as ordinary functions in the interpreter engine; "
+                  "`apsi run` compiles them", file=sys.stderr)
+        return f
+    return NativeFunction(f, opts)
 
 
 def _plain_function(fd):
@@ -132,9 +150,10 @@ class NativeFunction:
         if erased:
             self.options["erased"] = True
         self.erased = erased
-        self.fndef = fn._apsi_def
+        from .lower import lower
+        self.fndef = lower(fn._apsi_def)          # list-style code → tensors (only in the compiled copy)
         self.name = getattr(fn, "name", self.fndef.name)
-        self._apsi_def = self.fndef
+        self._apsi_def = fn._apsi_def
         self._apsi_free = getattr(fn, "_apsi_free", None)
         self.specs = {}
         self.warned = False
@@ -172,15 +191,34 @@ class NativeFunction:
             args = bound
         key = []
         mask = 0
+        orig = args
+        lists = None
+        for j, a in enumerate(args):
+            if type(a) is list:                     # numbers in (nested) lists → a tensor for native code
+                from .lower import as_array
+                arr = as_array(a)
+                if arr is not None:
+                    if lists is None:
+                        lists, args = [], list(args)
+                    lists.append((a, arr))
+                    args[j] = arr
         for j, a in enumerate(args):
             if isinstance(a.v if isinstance(a, Quantity) else a, np.generic):
                 mask |= 1 << j                      # a NumPy scalar: NumPy's arithmetic rules apply
             tv = _key_of(a)
             if tv is None:
                 self.py_calls += 1
+                why = (f"argument {j + 1} ('{fd.params[j].name}') is a {type_name(a)}; native code takes numbers, "
+                       "tensors and lists of numbers")
+                if self.options.get("strict"):
+                    raise RuntimeErr(f"@native(strict): {self.name}() cannot run natively: {why}")
+                if not self.warned and not self.options.get("quiet") and not self.auto and \
+                        os.environ.get("APSI_NATIVE_QUIET", "") not in ("1", "true"):
+                    sys.stderr.write(f"apsi: note: {self.name}() runs on the bytecode engine: {why}\n")
+                    self.warned = True
                 if self.auto and self.py_calls >= 8:
-                    self.retired = True             # called with records/lists/...: stay on the bytecode path
-                return self._py_fallback(*args)
+                    self.retired = True             # called with records/strings/...: stay on the bytecode path
+                return self._py_fallback(*orig)
             key.append(tv)
         key = (tuple(key), mask)
         for _ in range(3):
@@ -190,17 +228,22 @@ class NativeFunction:
             if isinstance(spec, _Fallback):
                 if self.auto and spec.permanent:
                     self.retired = True
-                return self._py_fallback(*args)
+                return self._py_fallback(*orig)
             STATS["calls"] += 1
             if spec.fast_call is not None and not kwargs and len(args) == len(fd.params):
                 sig = tuple(_fast_sig(a) for a in args)
                 if None not in sig:
                     self.fast[sig] = spec.fast_call
             try:
-                return spec.call(args)
+                result = spec.call(args)
             except _Retry:                         # a global tensor changed type: specialise again
                 continue
-        return self._py_fallback(*args)
+            if lists:
+                from .lower import write_back
+                for lst, arr in lists:              # the caller's lists see every change, as before
+                    write_back(lst, arr)
+            return result
+        return self._py_fallback(*orig)
 
     def _bind(self, args, kwargs):
         """Positional arguments in parameter order, filling simple defaults; None -> use the bytecode engine."""
@@ -407,7 +450,8 @@ class Specialization:
         info = repr((mc.print_sites and [(i, s, e) for i, s, e, _ in mc.print_sites], mc.assert_msgs,
                      mc.fn_names)).encode()
         tag = hashlib.sha256(str(mc.module).encode() + info).hexdigest()[:20]
-        text = str(mc.module).replace("apsi_direct_HASH", f"apsi_direct_{tag}") \
+        text = ("; apsi-slp\n" if getattr(mc, "jammed", False) else "") + \
+            str(mc.module).replace("apsi_direct_HASH", f"apsi_direct_{tag}") \
             .replace("apsi_entry_HASH", f"apsi_entry_{tag}") \
             .replace("apsi_gtab_HASH", f"apsi_gtab_{tag}").replace("apsi_sites_HASH", f"apsi_sites_{tag}")
         text += f'\n@"apsi_info_{tag}" = private constant [{len(info)} x i8] c"{_llstr(info)}"\n'
@@ -506,7 +550,7 @@ class Specialization:
                 vals.append(b.fptrunc(arg, ir.FloatType()))
             elif t[0] == "a":
                 nd = t[2]
-                esz = {"f8": 8, "f4": 4, "i8": 8, "i4": 4, "i2": 2, "i1": 1, "u1": 1, "b1": 1}[t[1]]
+                esz = C.ELEM_SIZE[t[1]]
 
                 def word(off):
                     return b.load(b.bitcast(b.gep(arg, [ir.Constant(C.i64t(), off)]), C.i64t().as_pointer()))
@@ -802,7 +846,7 @@ def _unpack_ret(t, d, ret, pos, args, spec, C):
     data, base = ret[k] & ((1 << 64) - 1), ret[k + 1] & ((1 << 64) - 1)
     shape = tuple(int(ret[k + 2 + j]) for j in range(nd))
     strides = tuple(int(ret[k + 2 + nd + j]) for j in range(nd))
-    dtype = np.dtype(C.ELEM_DTYPE[t[1]])
+    dtype = C.np_dtype(t[1])
     if base:
         total = 1
         for s in shape:

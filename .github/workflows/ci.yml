@@ -1,20 +1,26 @@
-# Apsi CI: test everything on Windows and Linux, Python 3.12 – 3.14
+# Apsi CI: the oldest and newest supported Python on Windows and Linux (Python 3.13 on every platform runs in the
+# linux-x64, linux-arm64, windows-x64, darwin-x64 and darwin-arm64 workflows)
 name: ci
-on: [push, pull_request, workflow_dispatch]
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
 
 jobs:
   test:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-22.04, ubuntu-24.04, windows-2022, windows-2025]
-        python: ["3.12", "3.13", "3.14"]
+        os: [ubuntu-22.04, windows-2022]
+        python: ["3.12", "3.14"]
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
     env:
       PYTHONUTF8: "1"
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
         with:
           python-version: ${{ matrix.python }}
       - name: Install
@@ -34,7 +40,7 @@ jobs:
       - name: Language tests (reference interpreter)
         run: apsi test examples tests/apsi --allow-all --engine interp
       - name: Toolchain tests
-        run: python -m unittest discover tests -v
+        run: python tools/ci_tests.py 20
       - name: Formatting
         run: apsi fmt --check examples tests/apsi
       - name: Apsi Guard (malware scan of the repository)

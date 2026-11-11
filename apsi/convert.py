@@ -85,6 +85,12 @@ SIMPLE.update({
     "random.random": "rand", "random.seed": "seed",
     "json.loads": "json_parse", "json.dumps": "json_str",
     "time.time": "clock", "time.perf_counter": "clock", "time.monotonic": "clock", "time.process_time": "clock",
+    "sys.maxsize": "9223372036854775807", "sys.float_info.epsilon": "2.220446049250313e-16",
+    "sys.float_info.max": "1.7976931348623157e308", "sys.float_info.min": "2.2250738585072014e-308",
+    "sys.float_info.dig": "15", "sys.setrecursionlimit": "set_recursion_limit", "sys.getrecursionlimit": "fn() => 1000",
+    "sys.stdout.write": "write_out", "sys.stderr.write": "write_err", "sys.stdout.flush": "flush_out",
+    "sys.stderr.flush": "flush_out", "sys.platform": "platform()", "sys.stdout": '"stdout"', "sys.stderr": '"stderr"',
+    "sys.version": '"Apsi"', "sys.byteorder": '"little"',
     "os.path.exists": "exists", "os.path.isfile": "exists", "sys.exit": "exit", "exit": "exit", "quit": "exit",
     "statistics.mean": "mean", "statistics.fmean": "mean", "statistics.pstdev": "std",
     "functools.reduce": None,
@@ -371,7 +377,7 @@ class Converter:
                         self.lazy_py[mod_alias] = (s.module, s)
 
     def _native(self, mod):
-        return mod in NATIVE_MODULES or mod.split(".")[0] in ("numpy", "math", "random", "json", "time",
+        return mod in NATIVE_MODULES or mod.split(".")[0] in ("numpy", "math", "random", "json", "time", "sys",
                                                               "typing", "dataclasses", "functools", "__future__")
 
     def _safe(self, name):
@@ -936,10 +942,12 @@ class Converter:
             if skip_first and i == 0:
                 continue
             out.append(self._param(a, d))
-        for a, d in zip(args.kwonlyargs, args.kw_defaults):
-            out.append(self._param(a, d))
         if args.vararg:
             out.append(f"*{self._safe(args.vararg.arg)}")
+        elif args.kwonlyargs:
+            out.append("*")
+        for a, d in zip(args.kwonlyargs, args.kw_defaults):       # keyword-only: after *args, as in Python
+            out.append(self._param(a, d))
         if args.kwarg:
             out.append(f"**{self._safe(args.kwarg.arg)}")
         return out
@@ -1213,6 +1221,18 @@ class Converter:
         fv = self._file_of(n.value)
         if fv:
             raise Unsupported(f"file method .{n.attr} outside a call")
+        if n.attr == "__name__":
+            if isinstance(n.value, ast.Call) and isinstance(n.value.func, ast.Name) and n.value.func.id == "type" \
+                    and len(n.value.args) == 1:
+                return f"py_type_name({self.ex(n.value.args[0])})", PREC["atom"]
+            if isinstance(n.value, ast.Name):
+                return _q(n.value.id), PREC["atom"]
+        if n.attr == "__class__":
+            return f"type({self.ex(n.value)})", PREC["atom"]
+        if n.attr == "__dict__":
+            return f"vars({self.ex(n.value)})", PREC["atom"]
+        if n.attr == "__doc__":
+            return '""', PREC["atom"]
         if n.attr.startswith("__"):
             raise Unsupported(f"special attribute {n.attr}")
         return f"{self.ex(n.value, PREC['atom'])}.{n.attr}", PREC["atom"]
@@ -1281,12 +1301,23 @@ class Converter:
         return "set([" + ", ".join(self.ex(e) for e in n.elts) + "])", PREC["atom"]
 
     def e_Dict(self, n):
-        items = []
+        items, parts = [], []
         for k, v in zip(n.keys, n.values):
-            if k is None:
-                raise Unsupported("**dict unpacking")
-            items.append(f"{self.ex(k)}: {self.ex(v)}")
-        return "{" + ", ".join(items) + "}", PREC["atom"]
+            if k is None:                          # {**a, "k": 1, **b}  →  bor(bor(bor({}, a), {"k": 1}), b)
+                if items:
+                    parts.append("{" + ", ".join(items) + "}")
+                    items = []
+                parts.append(self.ex(v))
+            else:
+                items.append(f"{self.ex(k)}: {self.ex(v)}")
+        if not parts:
+            return "{" + ", ".join(items) + "}", PREC["atom"]
+        if items:
+            parts.append("{" + ", ".join(items) + "}")
+        out = "dict()"
+        for p in parts:
+            out = f"bor({out}, {p})"
+        return out, PREC["atom"]
 
     def _gens(self, gens):
         out = []
@@ -1311,10 +1342,6 @@ class Converter:
     def e_ListComp(self, n):
         saved, self.in_comprehension = self.in_comprehension, True
         try:
-            if len(n.generators) > 1:
-                # [e for a in A for b in B if c]  →  chain_lists([[e for b in B if c] for a in A])
-                inner = ast.ListComp(elt=n.elt, generators=n.generators[1:])
-                return f"chain_lists([{self.e_ListComp(inner)[0]} {self._gens(n.generators[:1])}])", PREC["atom"]
             return f"[{self.ex(n.elt)} {self._gens(n.generators)}]", PREC["atom"]
         finally:
             self.in_comprehension = saved
@@ -1326,10 +1353,6 @@ class Converter:
         return f"set({self.e_ListComp(ast.ListComp(elt=n.elt, generators=n.generators))[0]})", PREC["atom"]
 
     def e_DictComp(self, n):
-        if len(n.generators) > 1:
-            pairs = self.e_ListComp(ast.ListComp(elt=ast.Tuple(elts=[n.key, n.value], ctx=ast.Load()),
-                                                 generators=n.generators))[0]
-            return f"dict({pairs})", PREC["atom"]
         return f"{{{self.ex(n.key)}: {self.ex(n.value)} {self._gens(n.generators)}}}", PREC["atom"]
 
     def e_Subscript(self, n):
@@ -1502,8 +1525,8 @@ class Converter:
             names = [dotted(e) for e in t.elts] if isinstance(t, ast.Tuple) else [dotted(t)]
             tests = []
             for tn in names:
-                if tn in ISINSTANCE:
-                    tests.append(f"type({args[0]}) == {ISINSTANCE[tn]}")
+                if tn in ISINSTANCE or tn in ("set", "frozenset", "bytes", "complex"):
+                    tests.append(f"isinstance({args[0]}, {tn})")       # Python's rules (bool is an int, …)
                 elif tn in self.classes:
                     subs = [tn] + self._subclasses(tn)
                     tests.append(f"type({args[0]}) == {_q(tn)}" if len(subs) == 1
@@ -1627,6 +1650,103 @@ def convert_source(source, filename="<python>"):
     return _postprocess(out), sorted(c.warnings)
 
 
+# ----------------------------------------------------------------------------------- idiomatic safety gate
+import builtins as _builtins
+_EXC_BASES = {n for n, v in vars(_builtins).items() if isinstance(v, type) and issubclass(v, BaseException)}
+_ODD_DUNDERS = {"__enter__", "__exit__", "__aenter__", "__aexit__", "__init_subclass__", "__new__", "__getattr__",
+                "__getattribute__", "__setattr__", "__delattr__", "__get__", "__set__", "__set_name__",
+                "__class_getitem__", "__del__", "__bool__", "__iter__", "__next__", "__call__", "__format__",
+                "__missing__", "__index__", "__slots__"}
+_OK_DECORATORS = {"staticmethod", "property", "dataclass", "lru_cache", "cache", "functools.lru_cache",
+                  "functools.cache", "dataclasses.dataclass"}
+
+
+def _dotted(n):
+    if isinstance(n, ast.Call):
+        n = n.func
+    if isinstance(n, ast.Name):
+        return n.id
+    if isinstance(n, ast.Attribute):
+        d = _dotted(n.value)
+        return d + "." + n.attr if d else None
+    return None
+
+
+def idiomatic_blockers(tree):
+    """Places where --idiomatic (Apsi's own built-ins and structs) would not do exactly what Python does:
+    [(line, reason)]. A file with any is converted with Python's exact semantics instead."""
+    out = []
+
+    def add(node, why):
+        out.append((getattr(node, "lineno", 1), why))
+
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Match):
+            add(node, "a match statement")
+        elif isinstance(node, (ast.AsyncFunctionDef, ast.Await, ast.AsyncFor, ast.AsyncWith)):
+            add(node, "async code")
+        elif isinstance(node, ast.Constant) and isinstance(node.value, complex):
+            add(node, "complex numbers")
+        elif isinstance(node, ast.Call) and _dotted(node.func) == "complex":
+            add(node, "complex numbers")
+        elif isinstance(node, ast.Attribute) and node.attr.startswith("__") and node.attr.endswith("__"):
+            add(node, f"the attribute {node.attr}")
+        elif isinstance(node, ast.Raise) and node.cause is not None:
+            add(node, "raise ... from")
+        elif isinstance(node, ast.ClassDef):
+            bases = [_dotted(b) for b in node.bases]
+            if len(node.bases) > 1:
+                add(node, f"class {node.name} with several base classes")
+            if node.keywords:
+                add(node, f"class {node.name} with a metaclass or class keywords")
+            for b in bases:
+                if b in _EXC_BASES:
+                    add(node, f"class {node.name} that extends {b}")
+            for st in node.body:
+                name = getattr(st, "name", None) or (
+                    st.targets[0].id if isinstance(st, ast.Assign) and isinstance(st.targets[0], ast.Name) else None)
+                if name in _ODD_DUNDERS:
+                    add(st, f"{node.name}.{name}")
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            for d in node.decorator_list:
+                if _dotted(d) not in _OK_DECORATORS:
+                    add(d, f"the decorator @{_dotted(d) or '...'}")
+        if isinstance(node, (ast.FunctionDef, ast.Lambda)):
+            for dv in node.args.defaults + [d for d in node.args.kw_defaults if d is not None]:
+                if isinstance(dv, (ast.List, ast.Dict, ast.Set, ast.ListComp, ast.DictComp, ast.SetComp)):
+                    add(dv, "a list/dict/set default value (Python shares it between calls)")
+    # loop variables: read after the loop, or captured late by a function made inside the loop
+    scopes = [tree] + [n for n in ast.walk(tree) if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))]
+    for sc in scopes:
+        own = []
+        stack = list(ast.iter_child_nodes(sc))
+        while stack:
+            n = stack.pop()
+            if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.Lambda)):
+                continue
+            own.append(n)
+            stack.extend(ast.iter_child_nodes(n))
+        for f in own:
+            if not isinstance(f, (ast.For, ast.comprehension)):
+                continue
+            names = {t.id for t in ast.walk(f.target) if isinstance(t, ast.Name)}
+            if isinstance(f, ast.For):
+                for n in own:
+                    if isinstance(n, ast.Name) and isinstance(n.ctx, ast.Load) and n.id in names and \
+                            n.lineno > f.end_lineno:
+                        add(n, f"the loop variable '{n.id}' read after its loop")
+            # a function made inside the loop that reads the loop variable sees its last value in Python
+            host = [f] if isinstance(f, ast.For) else [p for p in own if isinstance(p, (ast.ListComp, ast.SetComp,
+                    ast.DictComp, ast.GeneratorExp)) and f in p.generators]
+            for h in host:
+                for fn in ast.walk(h):
+                    if isinstance(fn, (ast.Lambda, ast.FunctionDef)):
+                        params = {a.arg for a in fn.args.args + fn.args.kwonlyargs}
+                        if any(isinstance(x, ast.Name) and x.id in names - params for x in ast.walk(fn)):
+                            add(fn, "a function made in a loop that reads the loop variable later")
+    return sorted(set(out))
+
+
 # ----------------------------------------------------------------------------------- CLI
 def _check(text, path):
     from .parser import parse
@@ -1639,6 +1759,36 @@ def _check(text, path):
         return [e.format(text, path) for e in errs]
     except ApsiError as e:
         return [e.format(text, path)]
+
+
+def _permissions_needed(text):
+    """The --allow-python level a converted file needs (pure standard modules and pycompat stand-ins need none)."""
+    from .interop import PURE_MODULES
+    from .guard import ESCAPE_MODULES, SAFE_SUBMODULES, PYCOMPAT_STANDINS
+    mods = re.findall(r'py(?:import|from)\("([^"]+)"', text)
+    pyc = "use pycompat" in text
+    level = ""
+    for m in mods:
+        root = m.split(".")[0]
+        if root in PURE_MODULES or (pyc and (m in PYCOMPAT_STANDINS or root == "numpy")) or \
+                m in ("urllib.parse", "html.parser"):
+            continue
+        if root in ESCAPE_MODULES and m not in SAFE_SUBMODULES:
+            return "--allow-python=all (it uses " + m + ")"
+        level = "--allow-python"
+    return level
+
+
+def _up_to_date(apsi_path, py_path):
+    """A converted module can be reused only if it is newer than its source and was written by this version."""
+    from . import __version__
+    try:
+        if os.path.getmtime(apsi_path) < os.path.getmtime(py_path):
+            return False
+        with open(apsi_path, encoding="utf-8") as fh:
+            return f"`apsi convert` {__version__} " in fh.readline()
+    except OSError:
+        return False
 
 
 def cmd_convert(args):
@@ -1666,21 +1816,67 @@ def cmd_convert(args):
     if not jobs:
         print("apsi convert: no .py files found", file=sys.stderr)
         return 2
+    idiomatic = getattr(args, "idiomatic", False)
     status = 0
     total_warn = 0
-    for src, dst in jobs:
+    done = set()
+    written = []
+    queue = [(a, b, False) for a, b in jobs]
+    packages = {}                                   # program folder -> Packages (libraries converted with it)
+    convert_libs = not getattr(args, "no_packages", False) and not args.stdout
+    while queue:
+        src, dst, vendored = queue.pop(0)
+        key = os.path.abspath(src)
+        if key in done:
+            continue
+        done.add(key)
         try:
             with open(src, encoding="utf-8-sig") as fh:
                 code = fh.read()
-            text, warns = convert_source(code, src)
+            exact_why = idiomatic_blockers(ast.parse(code, src)) if idiomatic else []
+            if idiomatic and not exact_why:
+                text, warns = convert_source(code, src)
+                deps = set()
+                gaps = [w for w in warns if "not converted" in w[1] or w[1].startswith("not ")]
+                if gaps:                                   # never leave a line out: exact mode converts everything
+                    exact_why = gaps
+            if not idiomatic or exact_why:
+                from .pyconvert import convert_source as faithful, Packages
+                pk = None
+                if convert_libs:
+                    if vendored:
+                        pk = vendored
+                    else:
+                        out_dir0 = os.path.dirname(os.path.abspath(dst))
+                        pk = packages.setdefault(out_dir0, Packages(os.path.dirname(os.path.abspath(src)),
+                                                                    os.path.join(out_dir0, "apsi_packages")))
+                text, warns, deps = faithful(code, src, packages=pk, out_path=os.path.abspath(dst),
+                                             vendored=bool(vendored))
+                if exact_why:
+                    first = ", ".join(f"line {ln}: {why}" for ln, why in exact_why[:3])
+                    more = f" and {len(exact_why) - 3} more" if len(exact_why) > 3 else ""
+                    warns = sorted(warns + [(exact_why[0][0], f"kept Python's exact semantics (use pycompat): "
+                                             f"--idiomatic cannot express {first}{more}")])
         except SyntaxError as e:
             print(f"✗ {src}:{e.lineno}: Python syntax error: {e.msg}", file=sys.stderr)
             status = 1
             continue
+        # modules next to the program are converted with it (unless written already and newer)
+        if not args.stdout:
+            out_dir = os.path.dirname(os.path.abspath(dst))
+            for dep in sorted(deps, key=lambda d: d if isinstance(d, str) else d[0]):
+                if isinstance(dep, tuple):                 # a module of a library, converted into apsi_packages/
+                    dep, ddst = dep
+                    lib = pk
+                else:
+                    rel = os.path.relpath(dep, os.path.dirname(os.path.abspath(src)))
+                    ddst = os.path.splitext(os.path.join(out_dir, rel))[0] + ".apsi"
+                    lib = vendored                         # a sibling inside a library stays a library module
+                if os.path.abspath(dep) not in done and not (
+                        _up_to_date(ddst, dep)
+                        and not any(os.path.abspath(j[0]) == os.path.abspath(dep) for j in jobs)):
+                    queue.append((dep, ddst, lib))
         total_warn += len(warns)
-        notes = {}
-        for line, msg in warns:
-            notes.setdefault(line, []).append(msg)
         if args.stdout:
             sys.stdout.write(text)
         else:
@@ -1693,26 +1889,65 @@ def cmd_convert(args):
             os.makedirs(os.path.dirname(os.path.abspath(dst)), exist_ok=True)
             with open(dst, "w", encoding="utf-8", newline="\n") as fh:
                 fh.write(text)
+        written.append((src, dst, text, warns, bool(vendored)))
+    out = sys.stderr if args.stdout else sys.stdout
+    libs = {}
+    for src, dst, text, warns, is_lib in written:
         problems = [] if args.no_check else _check(text, dst)
+        if is_lib:
+            top = os.path.relpath(dst, os.path.join(os.path.dirname(dst).split("apsi_packages")[0], "apsi_packages"))
+            name = top.replace(os.sep, "/").split("/")[0].removesuffix(".apsi")
+            libs.setdefault(name, [0, 0])
+            libs[name][0] += 1
+            libs[name][1] += len(problems)
+            if not problems:
+                continue                                   # libraries: one summary line each, below
         mark = "✓" if not problems else "!"
-        if not args.stdout or len(jobs) > 1:
+        notes = {}
+        for line, msg in warns:
+            notes.setdefault(line, []).append(msg)
+        if not args.stdout or len(written) > 1:
             print(f"{mark} {src} → {dst if not args.stdout else '(stdout)'}  "
                   f"({len(warns)} note{'s' if len(warns) != 1 else ''}"
                   f"{', ' + str(len(problems)) + ' check error' + ('s' if len(problems) != 1 else '') if problems else ''})",
-                  file=sys.stderr if args.stdout else sys.stdout)
+                  file=out)
         for line, msgs in sorted(notes.items()):
             for m in msgs:
-                print(f"    line {line}: {m}", file=sys.stderr if args.stdout else sys.stdout)
+                print(f"    line {line}: {m}", file=out)
         for p in problems[:20]:
-            print("    " + p.replace("\n", "\n    "), file=sys.stderr if args.stdout else sys.stdout)
+            print("    " + p.replace("\n", "\n    "), file=out)
         if problems:
             status = 1
-        if args.run and not problems and len(jobs) == 1:
-            from .cli import main as apsi_main
-            run_args = ["run", dst] + (["--allow-python"] if "pyimport(" in text else [])
-            return apsi_main(run_args)
-    if len(jobs) > 1:
-        print(f"\nconverted {len(jobs)} files, {total_warn} notes")
+        need = _permissions_needed(text)
+        if need:
+            print(f"    run with {need}", file=out)
+    for pk in packages.values():
+        pk.copy_data()
+    for name, (n, bad) in sorted(libs.items()):
+        print(f"{'✓' if not bad else '!'} library {name}: {n} module{'s' if n != 1 else ''} converted into "
+              f"apsi_packages/{name}{f' ({bad} with check errors)' if bad else ''}", file=out)
+    import re as _re
+    compiled = sorted({m.group(1) for w in written if not w[4] for _l, msg in w[3]
+                       for m in [_re.match(r"'([\w.]+)' is a compiled", msg)] if m})
+    missing = sorted({m.group(1) for w in written if not w[4] for _l, msg in w[3]
+                      for m in [_re.match(r"'([\w.]+)' is not installed", msg)] if m})
+    if compiled:
+        print(f"  compiled libraries kept as Python imports (C/C++ code cannot be converted): {', '.join(compiled)}",
+              file=out)
+    if missing:
+        print(f"  not installed where the conversion looked (program's .venv, this Python), kept as Python imports: "
+              f"{', '.join(missing)}", file=out)
+    if args.run and status == 0 and len(jobs) == 1 and written:
+        from .cli import main as apsi_main
+        text = written[0][2]
+        perms = ["--allow-python=all"] if "pyimport(" in text or "pyfrom(" in text else []
+        return apsi_main(["run", written[0][1]] + perms)
+    progs = [w for w in written if not w[4]]
+    if len(written) > 1:
+        nlib = len(written) - len(progs)
+        print(f"\nconverted {len(progs)} file{'s' if len(progs) != 1 else ''}"
+              f"{f' and {nlib} library module' + ('s' if nlib != 1 else '') if nlib else ''}, "
+              f"{sum(len(w[3]) for w in progs)} notes", file=out)
     return status
 
 
@@ -1724,4 +1959,10 @@ def add_parser(sub):
     p.add_argument("--run", action="store_true", help="run the result (single file) when it checks cleanly")
     p.add_argument("--no-check", action="store_true", help="do not run the Apsi checker on the result")
     p.add_argument("--force", action="store_true", help="overwrite .apsi files that were not made by apsi convert")
+    p.add_argument("--no-packages", action="store_true",
+                   help="keep installed libraries as Python imports instead of converting the pure-Python ones "
+                        "into apsi_packages/ next to the program")
+    p.add_argument("--idiomatic", action="store_true",
+                   help="map numpy/math/torch onto Apsi's own built-ins and structs (small numeric scripts); the "
+                        "default keeps Python's exact semantics with `use pycompat`")
     p.set_defaults(fn=cmd_convert)

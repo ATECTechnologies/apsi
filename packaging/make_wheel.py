@@ -51,8 +51,8 @@ def _record_line(name, data):
 def build(out_dir):
     name, version, summary, requires, deps = _project()
     readme = open(os.path.join(ROOT, "README.md"), encoding="utf-8").read()
-    meta = [f"Metadata-Version: 2.1", f"Name: {name}", f"Version: {version}", f"Summary: {summary}",
-            f"Requires-Python: {requires}", "Author: ATEC", "License: Apsi Non-Commercial License 1.0"] + [f"Requires-Dist: {_check_requirement(d)}" for d in deps] + \
+    meta = ["Metadata-Version: 2.1", f"Name: {name}", f"Version: {version}", f"Summary: {summary}",
+            f"Requires-Python: {requires}", "Author: ATEC", "License: Apsi License 2.0"] + [f"Requires-Dist: {_check_requirement(d)}" for d in deps] + \
            ["Provides-Extra: gpu", 'Requires-Dist: cupy-cuda12x; extra == "gpu"',
             "Provides-Extra: torch", 'Requires-Dist: torch; extra == "torch"',
             "Description-Content-Type: text/markdown", "", readme]
@@ -64,7 +64,7 @@ def build(out_dir):
         rel = os.path.relpath(root, pkg)
         arc = "apsi" if rel == "." else "apsi/" + rel.replace(os.sep, "/")
         for f in sorted(names):
-            if f.endswith(".py") or (f == "MANIFEST.json" and rel == "."):
+            if f.endswith((".py", ".c", ".h")) or (f == "MANIFEST.json" and rel == "."):
                 with open(os.path.join(root, f), "rb") as fh:
                     files[f"{arc}/{f}"] = fh.read()
     files[f"{info}/METADATA"] = "\n".join(meta).encode("utf-8")

@@ -1,0 +1,5 @@
+use web
+let app = web.server(log=false)
+@app.get("/hello")
+fn hello(req) = {"message": "hi", "n": 1}
+app.run(port=58090)

@@ -1,6 +1,6 @@
 # Native code: `@native`, `parallel for` and `@gpu`
 
-Apsi 2.0 compiles functions to machine code. A function marked `@native` is specialised on the types and units of
+Apsi compiles functions to machine code. A function marked `@native` is specialised on the types and units of
 its arguments, translated to LLVM IR, optimised at `-O3` for the exact CPU it runs on (AVX2, AVX-512, FMA, NEON), and
 called directly — no interpreter in between. `parallel for` spreads a loop over all CPU cores, and `@gpu` runs it on
 NVIDIA GPUs.
@@ -122,18 +122,40 @@ A second suite (`benchmarks/heavy/`) uses larger, harder programs: dense all-pai
 1024² matrix product, LU factorisation with pivoting, Ising Monte Carlo, a 100-million-cell dynamic program, a
 20-million-step Runge–Kutta integration and k-means clustering. Each is written the same way in Apsi (`@native`,
 strict IEEE), C, C++, Rust, Go and Mojo 1.2 (with raw pointers, as performance-oriented Mojo is written); the runner
-refuses to report times unless all six produce the same checksum. Single core, best of 3, milliseconds:
+refuses to report times unless all of them produce the same checksum. Apsi 2.4.4 on a GitHub Actions runner
+(AMD EPYC 7763), single core, milliseconds, best of 5 rounds in which Apsi 2.4.4 and 2.0.0 ran in turn on the same
+runner (geometric mean: Apsi takes 0.81× the time of C):
 
-| Benchmark | Apsi | C | C++ | Rust | Go | Mojo |
-|---|---:|---:|---:|---:|---:|---:|
-| nbody-dense 2000x10 | 114 | **52** | 53 | 115 | 266 | 111 |
-| jacobi-2d 1024x200 | 244 | 259 | 360 | **239** | 605 | 322 |
-| matmul 1024 | 328 | 314 | 469 | **312** | 601 | 435 |
-| lu-pivot 800 | 49 | **48** | 65 | 58 | 132 | 72 |
-| ising 512x50 | 77 | 90 | 91 | **71** | 164 | 78 |
-| levenshtein 10k | **327** | 563 | 331 | 724 | 1107 | 444 |
-| ode-rk4 20M | 384 | 267 | 269 | 384 | 286 | **213** |
-| kmeans 200k k16 x20 | 69 | **49** | 52 | 57 | 137 | 50 |
+| Benchmark | Apsi | C | C++ | Rust | Go |
+|---|---:|---:|---:|---:|---:|
+| nbody-dense 2000x10 | 46.5 | **44.1** | **44.1** | 181.9 | 317.4 |
+| jacobi-2d 1024x200 | **151.4** | 167.1 | 157.3 | 166.6 | 700.7 |
+| matmul 1024 | 177.6 | 199.6 | **164.8** | 182 | 479.4 |
+| lu-pivot 800 | **40** | 40.3 | 40.1 | 41.2 | 116.5 |
+| ising 512x50 | **81.5** | 90.6 | 90.4 | 83.6 | 145.9 |
+| levenshtein 10k | **195.1** | 809.3 | 305.6 | 268.7 | 1,736 |
+| ode-rk4 20M | 354.9 | **288.7** | 288.8 | 354.9 | 355.2 |
+| kmeans 200k k16 x20 | **51.3** | 60.5 | 59 | 64.2 | 213.3 |
+
+The same runner, Apsi 2.0.0 against 2.4.4 (geometric mean: 2.4.4 is 1.29× faster; `@native` code was already at C
+speed in 2.0.0):
+
+| Benchmark | Apsi 2.0.0 | Apsi 2.4.4 | 2.4.4 against 2.0.0 |
+|---|---:|---:|---:|
+| nbody-dense 2000x10 | 182.7 | 46.5 | **3.93× faster** |
+| jacobi-2d 1024x200 | 150.5 | 151.4 | same (0.99×) |
+| matmul 1024 | 178.9 | 177.6 | same (1.01×) |
+| lu-pivot 800 | 40.3 | 40 | same (1.01×) |
+| ising 512x50 | 81.5 | 81.5 | same (1.00×) |
+| levenshtein 10k | 193.8 | 195.1 | same (0.99×) |
+| ode-rk4 20M | 533.3 | 354.9 | **1.50× faster** |
+| kmeans 200k k16 x20 | 65.3 | 51.3 | **1.27× faster** |
+
+jacobi-2d is limited by memory bandwidth, which other jobs on the shared runner also use, so one round can be much
+slower than the others (one of the five rounds took 261 ms); the best of several rounds is the reliable number.
+C's ode-rk4 is faster because gcc fuses multiply-adds by default; with `@native("fma")` Apsi takes 263 ms there.
+Results on another runner model (EPYC 9V45, AVX-512) and Mojo results from an earlier machine are in
+`benchmarks/heavy/results.md` and `benchmarks/heavy/versions/`.
 
 Run it on your own machine with `python3 benchmarks/heavy/run.py` (languages whose compiler is missing are skipped).
 
@@ -175,6 +197,12 @@ Native code means the same thing as the bytecode engine. Default `@native` keeps
 `@native("fast")` is for code that is known to be correct and must be as fast as possible: integer overflow and
 index checks are removed, and floating-point reassociation and FMA are allowed, so sums may differ in the last
 digits (like C with `-O3 -ffast-math`). Use it after the program works with `@native`.
+
+`@native("fma")` keeps every check and the order of every operation, and only allows `a * b + c` to become one
+fused multiply-add instruction (one rounding instead of two). That is what gcc and clang do for C by default, so it
+is the like-for-like setting against C. Results differ from strict IEEE in the last bits (usually they are slightly
+more accurate). On a chain of dependent arithmetic it is much faster: the ODE benchmark runs in 288 ms instead of
+440 ms on a Xeon 8573C, against 387 ms for gcc -O3 (`benchmarks/heavy/fma.apsi`).
 
 `@native("strict")` turns "cannot compile" into an error instead of a note — useful in tests and CI.
 
@@ -272,18 +300,37 @@ A `@gpu` function runs its `parallel for` with one GPU thread per iteration.
   and creating tensors are not available inside GPU kernels yet.
 - **Always runs:** without a usable GPU, or for a function outside these rules, the same function runs as native
   code on all CPU cores, with the same results; one note says why.
-- **Data movement:** tensor arguments are copied to GPU memory for each call and written tensors are copied back.
-  This suits work that is large compared with the data (many operations per element). Consumer GPUs compute f32
-  far faster than f64: pass f32 tensors for speed.
-- **Precision:** IEEE f64/f32 arithmetic; `sqrt` is correctly rounded, as on the CPU.
+- **One thread per element:** when the body of the `parallel for` over rows is a single inner loop whose
+  iterations are independent (`c[i, j] = …`), the two loops become one loop over rows × columns, so a 2048 × 2048
+  result gets 4 million GPU threads instead of 2,048. Nothing to write differently.
+- **CPU or GPU, chosen per call size:** a launch of fewer than 4,096 iterations runs on the CPU (the GPU's fixed
+  costs would dominate). For larger sizes the choice is measured per size class (powers of two): the first GPU
+  call is a warm-up (it loads the kernel and is not counted), then one GPU call and one CPU call are timed, and
+  later calls use the faster side. Every 64 calls the slower side is timed once more, so a choice made while the
+  machine was busy does not stick. Each call runs exactly once, so side effects never repeat. `@gpu("strict")` or `APSI_GPU_AUTO=0` always uses the GPU; `APSI_GPU_MIN=n` changes the threshold.
+- **Matrix products and Tensor Cores:** a `@gpu` function whose loop nest is a matrix product runs as one cuBLAS
+  GEMM when cuBLAS is installed (`pip install nvidia-cublas-cu12`): Tensor Cores with f32 accumulation for f16 and
+  bf16 tensors, SGEMM / DGEMM for f32 / f64. See [Number formats](NUMBERS.md).
+- **Number formats:** f64, f32, f16, bf16, FP8 (E4M3, E5M2) and int8 tensors; 16- and 8-bit values are computed
+  in f32 and rounded once when stored ([Number formats](NUMBERS.md)). `var acc: f32 = 0.0` keeps an accumulator in
+  f32, which consumer GPUs run up to 64× faster than f64.
+- **Data movement:** ordinary tensor arguments are copied to GPU memory for each call and written tensors are
+  copied back. `to_gpu(x)` keeps a tensor in GPU memory instead: kernels read and write it in place, with no copy
+  per call, and `to_host(g)` brings the values back when you need them. Without a GPU, `to_gpu` returns the tensor
+  itself, so the program runs everywhere.
+- **Precision:** IEEE arithmetic; `sqrt` is correctly rounded, as on the CPU.
 - **Status:** PTX generation, the kernel rules and the CPU path are covered by the test suite. The launch path
   uses the CUDA driver API (`nvcuda.dll` / `libcuda.so.1`) and needs a GPU to run, so it is not exercised by
   continuous integration on GPU-less machines. `apsi native info` and `gpu_info()` show the GPUs Apsi can use;
   `apsi doctor` reports them too.
 
 For training neural networks on the GPU, the PyTorch backend (`fit(…, backend="torch")`, see
-[`BACKENDS.md`](BACKENDS.md)) remains the right tool: it brings cuDNN, tensor cores and mixed precision. `@gpu` is
-for your own loops and kernels.
+[`BACKENDS.md`](BACKENDS.md)) remains the right tool: it brings cuDNN and fused training kernels. `@gpu` is for your
+own loops and kernels, including matrix products on Tensor Cores.
+
+**Other GPU APIs.** `@gpu` targets NVIDIA GPUs through CUDA. Vulkan, DirectX 12 and Metal compute backends (which
+would add AMD, Intel and Apple GPUs) are planned; until then those GPUs are used through the PyTorch backend
+(ROCm, XPU, MPS).
 
 ## Tools and settings
 

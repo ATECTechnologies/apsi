@@ -37,10 +37,21 @@ def _hz(v):
     return float(v)
 
 
-try:                                    # optional accelerator for the recursive loop
-    from scipy.signal import sosfilt as _sp_sosfilt
-except Exception:                        # pragma: no cover - depends on the machine
-    _sp_sosfilt = None
+_UNSET = object()
+_sp_sosfilt = _UNSET          # scipy.signal.sosfilt once loaded (None: not available or switched off)
+
+
+def _sp_sosfilt_get():
+    """scipy's sosfilt as an optional accelerator, imported on first use (scipy.signal takes ~0.6 s to load, so
+    loading it at start-up made every program start slower)."""
+    global _sp_sosfilt
+    if _sp_sosfilt is _UNSET:
+        try:
+            from scipy.signal import sosfilt
+        except Exception:                # pragma: no cover - depends on the machine
+            sosfilt = None
+        _sp_sosfilt = sosfilt
+    return _sp_sosfilt
 
 
 # =================================================================== filter design
@@ -157,10 +168,11 @@ def _sosfilt_py(sos, x, zi):
 
 
 def _sosfilt(sos, x, zi=None):
-    if _sp_sosfilt is not None:
+    f = _sp_sosfilt_get()
+    if f is not None:
         if zi is None:
-            return _sp_sosfilt(sos, x), None
-        return _sp_sosfilt(sos, x, zi=zi)
+            return f(sos, x), None
+        return f(sos, x, zi=zi)
     return _sosfilt_py(sos, x, zi)
 
 

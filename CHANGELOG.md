@@ -1,5 +1,317 @@
 # Changelog
 
+## 2.4.4 — Python, exactly; real time; data, databases and the web
+
+### Training on the GPU with Apsi alone, low-bit formats, an AI server
+- **`fit(..., backend="gpu")`: Apsi's own GPU trainer** — CUDA kernels written in Apsi's code generator and loaded
+  through the driver: no PyTorch, no CUDA toolkit, nothing to download. Matrix products on the tensor cores (any
+  strides, so transposes and attention heads need no copies), layer/RMS norm, attention softmax, embeddings,
+  cross-entropy, AdamW / SGD over all parameters in one kernel, gradient clipping on the card, the data set on the
+  card. Gradients equal Apsi's autodiff (tested to 1e-5) and the training curve equals the NumPy backend's.
+  `backend="auto"` uses it whenever there is an NVIDIA card and the model fits its layers.
+- **Low-bit training:** `precision="fp8" | "fp6" | "fp6_e2m3" | "fp4" | "int8" | "int4"` on the GPU trainer, NumPy and
+  PyTorch; real fp8 products on Ada / Hopper / Blackwell tensor cores with PyTorch.
+- **fp6 on the card:** `APSI_GPU_WEIGHTS=fp6` (E3M2) and `fp6_e2m3` (E2M3: as close as fp8 at 6 bits), bit-exact
+  with ml_dtypes.
+- **GPU temperature control:** long training, long answers and busy servers keep the card near 77 °C (75–78) by
+  pacing the work while it is above the band (the driver's NVML gives the temperature); a cool card is never slowed.
+  `APSI_GPU_TEMP=72` / `off`; `r.gpu_temperature`, `/metrics`, `hub.gpu_status()`.
+- **The installer sets up full GPU speed:** an option (on when an NVIDIA card is found) installs the GPU helper with
+  one administrator prompt, so ordinary, non-administrator runs hold the temperature by the power limit too.
+- **Less work per step:** the optimizer kernel clears the gradient it has used (no separate pass over all the
+  gradients each step), and each weight matrix is rounded to bfloat16 once per update instead of once per product.
+- **A fourth build of the products:** the operands rounded to bfloat16 once (one pass each), then copied into shared
+  memory with cp.async four slices ahead (no registers, no conversion in the loop); the card times it against the
+  others per shape, its rounding pass included, and keeps the fastest.
+- **Several cards:** `device="cuda:all"` (or "cuda:0,1,…") trains data-parallel: reduce-scatter of the gradient
+  (each card sums its slice, all cards at once), the optimizer's state and update sharded, all-gather of the
+  weights; the same result as one card with the whole batch (tested). No size is refused in advance (a warning
+  with the numbers; a clear error if the card runs out).
+- **`apsi gpu hold 77`:** holds the card's temperature by its power limit for any program (used to measure PyTorch
+  under the same conditions as Apsi).
+- **Large models:** a third build of the tiled products (4 warps of 64 x 64 over slices of 16), tiles visited in
+  groups of 8 rows (large weights hit the L2 cache), and a size check before training starts.
+- **Measured after the fix (RTX 3060): 151,008 tokens/s for the 10.9 M GPT (PyTorch bf16 133,491), 17,134 for
+  127 M parameters (PyTorch bf16 20,111).**
+- **Fused attention works again** (a build error had left the trainer on the slower separate kernels); every kernel
+  module is now built by the test suite, without a card, so such a mistake fails there.
+- **The Linux release zip carries the Apsi GPU Tuner** (gpu-tuner/), built offline by packaging/make_release_zip.sh.
+- **GPU trainer:** `ema=` (moving average of the weights) and `ewc=` (elastic weight consolidation); each tiled
+  product shape runs the faster of two builds, measured on the card; split-k sized from the real occupancy; the
+  temperature pacing counts the card's queued work (large models were paced too little and ran hot).
+- **Faster matrix products on the card:** the loads of the next slice now overlap the tensor-core work (LLVM had
+  moved them after it, so every slice waited the full memory latency), the rounding to bfloat16 is one
+  cvt.rn.bf16x2 per pair, and split-k fills whole waves of the card (float32 on the tiled kernels as three bfloat16
+  products is there with APSI_FP32_TILED=1; the default stays the faster separate kernel).
+- **Level pacing:** the temperature control follows the smoothed temperature and gathers its pauses (a card whose
+  die jumps with each change of load was paced between none and most of the time: 62-77 C and half the speed).
+- **Apsi GPU Tuner** (tools/gpu-tuner, on the download page): Apply / Restore files for Windows and Linux that set
+  every NVIDIA card to the recommended sustained-training power limit, kept after restarts, and undo it.
+- **Steady speed at a steady temperature:** with the right to set the card's power limit Apsi holds the temperature
+  with it (PI control, no pauses); `apsi gpu setup` (once) installs a helper so no program ever needs to run as
+  administrator for that; `apsi gpu` / `apsi gpu watch` / `apsi gpu power 80%`.
+- **A model works from any thread:** every call to the card makes its context current on the calling thread first.
+  (Before, a server's request threads could not use the card and the model quietly moved to the processor.)
+- **`docs/GPU.md`:** everything on NVIDIA cards in one guide — formats, training, serving, temperature, measured
+  numbers, and troubleshooting.
+- **`apsi serve-model` / `hub.serve(lm)`: the OpenAI API** (`/v1/chat/completions` with streaming, `/v1/completions`,
+  `/v1/models`, `/health`, `/metrics`), first-come-first-served queue with a limit and 429, a client that leaves frees
+  the model at once, time limits, API keys. `examples/31_ai_server.apsi` adds your own routes in Apsi.
+
+### Long context, logs, training data, side-by-side installs
+- **Twice the context in the same GPU memory:** the key/value cache is float16 by default (`APSI_KV_CACHE=fp32` for
+  the old one), read four values at a time; long prompts split attention over more blocks of the card.
+- **Long-context models work past their training length:** YaRN rope scaling (Qwen2.5 `rope_scaling`, Llama 3.1
+  style) with the attention temperature, on the GPU and the processor alike.
+- **`use log` and `apsi log`:** logging to the terminal (coloured) and to `.log` files, text or JSON lines, rotation
+  by size or by day, named loggers with fields, `with log.timer("step"):`; `apsi log FILE --level warn --grep x -f`
+  reads, filters and follows them (also across rotations). See [`docs/LOG.md`](docs/LOG.md).
+- **Faster tokenizers:** BPE merges with a heap (long words were quadratic), Unigram results cached; the same tokens.
+- **Downloads that do not give up:** an interrupted download resumes by itself (up to 8 times); large files use
+  several connections only when that is faster on your network.
+- **Training text in any shape:** `data.text_dataset` reads txt/md/jsonl/json/csv/tsv/parquet and plain text,
+  chat (`messages`, ShareGPT), Alpaca, prompt/completion and question/answer records, or your own template; any
+  tokenizer (hub, `"bytes"`, `"chars"`, a function); packed windows; the prompt part labelled -100, which
+  `cross_entropy` now leaves out.
+- **Mixed precision chosen by itself:** `fit(..., backend="torch")` defaults to `precision="auto"` — bf16 on GPUs
+  that have it, fp16 with loss scaling on older ones, fp32 on the CPU; any name or `{store, compute}` pair to choose
+  yourself, `APSI_PRECISION` for every program.
+- **`apsi convert --idiomatic` never changes what a program does:** a file that uses something the idiomatic form
+  cannot express exactly (match, async, metaclasses, `__exit__`, exception subclasses, loop variables read after the
+  loop, late-binding closures, shared list defaults, complex numbers, a line it could not translate) is converted with
+  the exact form instead, and the converter says why. Keyword-only parameters after `*args` are kept in place.
+  24 test programs give the same output as Python.
+- **Several versions side by side:** 2.4.4, 2.5 … each install in its own folder (`<Apsi folder>/<version>`), none
+  removed or overwritten; `apsi` runs the newest (or the one chosen with `apsi use 2.4.4`), `apsi-2.4.4` always that
+  one, `apsi versions` lists them. Removing a version keeps the others; an install from before 2.4.4 is moved into
+  its own version folder. Both the Windows/Linux setup app and the Linux `.sh` installer do this.
+- Launchers start Python with `-P`, so a folder named `apsi` in the current directory can no longer replace Apsi.
+- **Models on the processor twice as fast and half the RAM:** int8 matrices (Q8_0 layout, error below bfloat16's
+  rounding; made once and memory-mapped afterwards) and a native thread team that starts a product on every core in
+  about a microsecond. A Qwen2.5-0.5B-sized model: 96 → 52 ms per token on 2 cores. `APSI_CPU_WEIGHTS=bf16` for the
+  exact weights.
+- **Large models whole on the GPU:** weights are quantized on the card itself to int8 or int4 (32 values per scale;
+  int4 as ggml's Q4_0) with new matrix-vector kernels that read them directly and a dequantize step for the
+  tensor-core prompt product. `gpu_weights="auto"` (`APSI_GPU_WEIGHTS`) keeps bfloat16 when the model fits, else
+  int8, else int4, and turns layers back into int8 where room is left — a 14B model on a 12 GB card runs all 48
+  layers on the GPU instead of 16.
+- **Split models done properly:** the processor's layers use the native int8 products (they fell back to float32
+  NumPy before), their int8 copy is cached on disk and memory-mapped (also for memory-mapped checkpoints, whose copy
+  stayed in RAM and could fill it), long prompts through them run on the GPU, and loading shows progress lines.
+  `lm.plan` tells what runs where, in which format, from RAM or SSD.
+- **`@gpu` calls reuse device buffers** instead of allocating and freeing them on every call (cuMemFree waits for
+  the GPU): faster video frames and loops.
+- **Benchmarks in four more languages:** Java, JavaScript (Node.js), C# (.NET) and Julia join C, C++, Rust and Go in
+  `benchmarks/heavy` (identical checksums); `benchmarks/tokens` and `benchmarks/gpu` added.
+- **Prompts on tensor cores** (RTX 30 series and newer): bfloat16 `mma.sync` with the activations split in two
+  bfloat16 parts (matches float32 to about 1e-5), checked against the float32 kernel at start-up.
+- **`save_checkpoint` / `load_checkpoint`:** weights, optimizer state, step, config and files (tokenizer …) in one
+  `.apsim`, or shards above 4 GB; loads from the file, the index, the bare name or any shard; resuming is exact.
+- **`use config`:** settings in their own files (TOML, JSON, YAML, INI, .env), layered, overridden by environment
+  variables and `--set key=value`, types checked against defaults, `${other.key}` references, `config.save`.
+- **`diagnose(model, params, X, y)`:** checks a model built from scratch before a long run (data, shapes, first loss,
+  dead or exploding gradients, whether it can fit a small batch) and suggests a learning rate.
+- **`apsi cache`:** every cache and its size, downloaded models, and `apsi cache clean` for what can never be used
+  again (or one model, or everything).
+
+### Language models on the GPU (`use hub`)
+- **Decoders run on an NVIDIA graphics card by themselves, with nothing to install but the display driver.** The
+  whole network runs on the card (weights as bfloat16, key/value cache, norms, rotary embeddings, attention, MLP) in
+  kernels Apsi generates as PTX and the driver compiles: no CUDA Toolkit, CuPy or PyTorch. Measured on an RTX 3060
+  with Qwen2.5-0.5B: 193 tokens/s greedy, 190 sampled, 211 through `lm.chat` (7.7 on the processor before this
+  release); a prompt of 512 tokens in 118 ms, of 2,048 in 0.81 s; a token after 2,000 tokens of context in 5.5 ms;
+  the model ready in 0.86 s.
+- **Starts in a fraction of the time:** bfloat16 checkpoints go from the file to the card as they are (no float32
+  copy); the driver starts while the file is read; kernels are compiled once and cached; a model downloaded before
+  starts with no network request (the Hub is asked for a newer version at most once a day; without a connection the
+  cached copy is used).
+- **Prompts in passes of up to 512 positions** with a tiled matrix product; single tokens with a product that normalises
+  its input on the fly; attention with a warp per key.
+- **Models larger than the card:** the first layers that fit run on the GPU, the rest on the processor, from RAM or
+  memory-mapped from the SSD (`gpu_layers=`, `memory="disk"`); `device="cuda"` insists on the card alone.
+- **Steady under failure:** out of GPU memory frees scratch space and continues in smaller passes; any other driver
+  error moves the model to the processor, which carries on from the tokens already produced, reported once.
+  One model serves several threads.
+- **`lm.chat(messages)` and `lm.conversation()`:** the model's own chat format (ChatML, Llama 3, Gemma, Mistral),
+  stops at the end of the turn, oldest turns left out when the window is full; `hub.devices()` lists the GPUs.
+- **The next token is chosen on the card:** penalty, temperature and softmax there; only the candidates come back.
+- **Conversations reuse their cache:** a prompt that starts like the previous generation computes only the new part.
+- **On the processor, bfloat16 products on all cores** (native code from Apsi's compiler): half the memory of
+  float32 NumPy and faster per token (124 → 91 ms on the same machine).
+- Faster sampling (top-p sorts only the likely tokens), streamed text that never splits a character, the output head
+  computed for the last position only (long prompts on the processor were paying for every position), no forward
+  pass after the last token, weights read from the file only when needed (a GPU model never holds a copy in RAM).
+
+### Faster everyday code, clearer errors
+- **Objects 4–6× faster:** `self.x` inside a method of an Apsi class compiles to Python's own attribute access;
+  other attribute reads and writes on ordinary objects, text, lists and dicts skip straight to it after the first
+  check. Creating objects and calling methods: 0.646 s → 0.102 s for 300,000 (CPython: 0.041 s).
+- **`str()` / f-strings / `print` of numbers and text, conditions, dict and list stores** take their common case
+  first: f-string building 1.8×, dict updates 1.7×, float loops 1.5× faster.
+- **Every error says how to fix it, and the caret points at what failed** (not the start of the line):
+  `'ad' is not defined (did you mean 'add'?)`, `Str has no attribute 'uper' (did you mean 'upper'?)`,
+  `cannot join Str and Int with '+'; … write str(x)`, `'[' is not closed: expected ']' … at the end of line 1`,
+  `'abc' is not a whole number`, `key not found: 'b' (use d.get(key, default) …)`, index, tuple, `len()`,
+  unpacking (`for k, v in d.items()`) and classes without `__init__`.
+- **Habits from other languages are translated:** `def` → `fn`, `else if` → `elif`, `print "x"` → `print(x)`,
+  `x++` → `x += 1`, `&&` / `||` / `!` → `and` / `or` / `not`, `if x = 5` → `==`, `True` / `null` → `true` / `none`,
+  `import os` → `use os`, `3[m] + 1` → give the number a unit.
+- A parameter without a default after one with a default is reported at the parameter (it used to stop with a
+  Python traceback); no program can show a Python traceback for a compile problem any more.
+
+### Python conversion: exact, complete
+- **`apsi convert` keeps Python's semantics byte for byte.** Converted files start with `use pycompat`, which gives
+  them Python's object model, scoping and built-ins. Real classes (inheritance from any library class, metaclasses,
+  descriptors, `__slots__`, `__init_subclass__`, `__class_getitem__`, name mangling of `__private` names),
+  dataclasses, enums, `with`, `try/except/else/finally`, `raise … from`, generators with `send`/`throw`, closures,
+  `global`/`nonlocal`, chained comparisons, walrus, star targets, `del`, f-strings with every conversion and nested
+  spec — all with Python's behaviour.
+- **Every Python 3.13 construct converts:** `match`/`case` (all pattern kinds and guards), `except*` and exception
+  groups, `async def`/`await`/`async for`/`async with` and async comprehensions, comprehensions that assign to
+  attributes or indexes, `type X = …` and generic functions/classes (`def f[T]`), `from x import *`, `a[*idx]`,
+  `a[1,]`, error kinds computed at run time (`except KINDS:`), names that are Apsi keywords (written in backticks
+  and kept as the same name), names read before they are bound (`UnboundLocalError`, `NameError` as in Python).
+- **Verified on the standard library:** 34 pure-Python standard modules (`_pydecimal`, `_pydatetime`, `argparse`,
+  `tomllib`, `json`, `pickle`, `dataclasses`, `enum`, `statistics`, `ipaddress` …, about 38,000 lines) convert and
+  print byte-identical output to CPython (`tests/test_stdlib_convert.py`), alongside 15 feature programs.
+- Faithful conversion is the default (`--idiomatic` keeps the old mapping onto Apsi built-ins); local modules and
+  packages convert with the program; a converted module is reused only when it is newer than its source and was
+  written by the same Apsi version; `apsi run file.apsi -- args` passes `sys.argv`; `SystemExit` behaves as in Python.
+- The sandbox stays on: `sys`, `os`, `pathlib` and `numpy` are permission-checked stand-ins; interpreter internals
+  (frames, `__globals__`, `__subclasses__`, `eval`, `exec` …) need `--allow-python=all`.
+
+### Language
+- New syntax (available everywhere, with Python's meaning): `class`, `with`, `del`, `global`, `nonlocal`, `match`,
+  `async`/`await`, set literals and comprehensions, generator expressions, `is`/`is not`, chained comparisons,
+  `| & ~ << >>` and their assignments, `:=`, `for … else`, `while … else`, bytes literals, `\x \u \U` escapes,
+  positional-only and keyword-only parameters, `` `name` `` for identifiers that are keywords.
+
+### Real time (`use rt`)
+- Loops at 1–2 kHz with microsecond lateness (`rt.loop`, `rt.ticks`, `rt.scheduler` for many rates on one loop),
+  missed ticks counted and skipped instead of drifting, the garbage collector paused, 1 ns timer slack on Linux and
+  1 ms timer resolution on Windows while a loop runs.
+- Video pipelines (`rt.video`): capture thread, newest-frame-only hand-off, adaptive resolution under sustained
+  overload, error isolation, a report with fps, latency, jitter and dropped frames. **Any size from 16×16 to
+  16384×16384** with 17 named sizes (`vga`, `hd`, `hd+`, `fhd`, `qhd`, `4k` …). Measured CPU-only on 2 cores:
+  640×480 at 976 fps, 1600×900 at 372 fps, 1920×1080 at 264 fps, 3840×2160 at 65 fps; capped runs hit 240/120/90/60/30
+  fps exactly with 1–12 ms latency.
+- Frame helpers on OpenCV, NumPy or the GPU (`rt.backend("gpu")` through PyTorch or CuPy).
+
+### RAM, SSD, CPU and GPU (`use memory`)
+- `memory.array` stays in RAM while it fits a budget and moves to a memory-mapped SSD file when it does not;
+  `memory.chunks` and `memory.map` process data larger than RAM on all cores with read-ahead; `memory.store` and
+  `@memory.cached` are two-tier caches (RAM, then SSD) with signed entries; `memory.fit_batch` halves a batch on
+  out-of-memory (CPU or CUDA) until it fits; `memory.status`, `memory.devices`, `memory.best_device`.
+
+### Hugging Face without Python (`use hub`)
+- Search, download (cached by commit, resumed, SHA-256 checked, offline mode) and load safetensors / GGUF weights
+  from the Hugging Face Hub; access tokens for private and gated models, sent only to the Hub itself.
+- Native `tokenizer.json` engines: WordPiece (BERT family), byte-level BPE (GPT-2, Llama 3, Qwen),
+  SentencePiece-style BPE with byte fallback (Llama 2, Mistral) and Unigram (T5, XLM-R).
+- **Graphs that reach far** (`use layers`): `graph_transformer` (pre-norm residual neighbour attention with
+  relations and hop biases), `global_attention` (one hop to any node of the same graph, landmark keys above
+  `max_keys`), `mix_hop` (several hop distances in parallel), `k_hop` shortcut graphs, `graph_memory` (the k most
+  salient node states per graph), `graph_transformer_net`, `hop_distances`, `eccentricity`; `graph(…, types=,
+  reverse=true)` for relations in both directions. `docs/GRAPHS.md`.
+- **Number formats in native and GPU code.** `@native` and `@gpu` functions accept f64, f32, f16, bf16, FP8
+  (E4M3, E5M2) and int8 tensors. 16- and 8-bit values are read into f32, computed in f32 and rounded once (to
+  nearest, ties to even) when stored; the conversions are bit-identical to NumPy and ml_dtypes for every 16-bit
+  and 8-bit pattern and work the same on every CPU and GPU. `var acc: f32 = 0.0` types a scalar's precision;
+  `zeros(n, dtype=bf16)` and `dtype=fp8_e4m3` create real tensors (ml_dtypes). `docs/NUMBERS.md`.
+- **GPU.** `to_gpu(x)` keeps tensors in GPU memory between calls (no copy per call; `to_host` brings them back). One thread per element for row loops with an independent inner loop (collapse); fewer than 4,096
+  iterations run on the CPU and larger sizes are timed once on each and then use the faster; matrix-product loop
+  nests run as one cuBLAS GEMM when cuBLAS is installed (Tensor Cores with f32 accumulation for f16/bf16).
+- **Exact outer-loop vectorisation.** Independent outer iterations with a reduction along the inner loop run four
+  at a time with bit-identical results (n-body forces, k-means assignment): n-body 2.8× faster relative to C,
+  now ahead of Rust; k-means now faster than C. `APSI_JAM=0` turns it off.
+- **Platforms.** The native compiler works on ARM64 (Linux and Apple silicon); every push is tested on linux-x64,
+  linux-arm64, windows-x64, darwin-x64 and darwin-arm64.
+- **Faster ordinary code.** Struct construction 9× faster (type checkers are built once per annotation, not per
+  object); `Int`/`Float` argument and return checks, and `if`/`while` conditions on plain booleans, skip the checker
+  call (recursive calls 2.3× faster); attribute access on structs, lists, dicts and strings takes a short path.
+  Measured against 2.0.0 on the same machine: `benchmarks/versions` (geometric mean 3.84× faster on a
+  GitHub runner with the native compiler, 7.31× on a 2-core VM without it).
+- **Matrix products written as loops run with BLAS.** Three nested loops computing `c[i, j] += a[i, k] * b[k, j]`
+  (any loop order, a hoisted `a[i, k]`, or the dot-product form with an accumulator) are recognised in the compiled
+  engine and in `@native` code and run with the tuned BLAS kernel: 4–11× faster than the same loops in C with `-O3`,
+  about 1,000× faster than before in the compiled engine. The loops remain the fallback (integer arrays, aliasing,
+  out-of-range bounds) so behaviour never changes; `APSI_IDIOMS=0` turns it off. `benchmarks/matmul`.
+- **Models run natively** (`hub.model`, `hub.pipeline`): BERT, DistilBERT, RoBERTa, XLM-R and sentence-transformers
+  (embeddings, similarity, classification, named entities, fill-mask); GPT-2, Llama, Mistral, Qwen 2/3 and Gemma
+  (text generation with a key/value cache, greedy or sampled, streaming).
+
+### Fewer AI tokens (`use tokens`)
+- Exactly reversible transforms for what you send to language models: `pack`/`unpack` (lists of records as
+  tables: 57–63 % fewer tokens than JSON), `dedupe`/`expand` (repeated lines once: 59 % on a log), `diff`/`patch`
+  (only the changed lines: 99.7 % on an edited document), `best`, and `count` (exact with tiktoken).
+
+### Data, databases, web
+- **`use dataframe`**: a columnar table engine (filter, select, group by, join, sort, windows, CSV/JSON/JSONL, a C
+  CSV parser). Against pandas on 2M rows: filters 24×, group-by 4.2–4.3×, joins 3.1×, sorting 1.8× faster, 4× less memory.
+- **`use db`**: PostgreSQL (v3 protocol, SCRAM, TLS, parameters, prepared statements, LISTEN/NOTIFY, pools),
+  MySQL / MariaDB (caching_sha2 and native authentication, TLS), MongoDB (OP_MSG, BSON with decimal128,
+  SCRAM-SHA-256/1, cursors), Redis (pipelines, pub/sub) and SQLite — no driver to install.
+- **Data-parallel training:** `fit(…, workers=N)` splits every batch across N processes and averages the gradients
+  (the same step as one process).
+- **WebSocket** server routes, rooms and a client (`app.websocket`, `web.websocket_connect`), RFC 6455 complete.
+- **The HTTP server is about 3× faster** (an asyncio protocol; routes that prove fast run on the event loop, measured
+  by CPU time so a busy server never misleads it; slow or blocking routes stay on the workers): 20,300–20,700
+  requests per second from 50 to 1,000 concurrent connections on 2 cores, up from 6,700–7,700.
+- **`use env`**: `.env` files, typed settings and secrets that print as `******`; `apsi run --env-file`, `--venv`
+  (or a `.venv` next to the program) for `pyimport`.
+
+### Tools
+- **Apsi License 2.0** replaces the Non-Commercial License 1.0: any use is allowed, including commercial work;
+  only selling Apsi itself needs a licence. `docs/LICENSING.md` explains it with examples.
+- The formatter keeps hand-aligned continuation lines and comment columns; `@native` and `@gpu` functions run as
+  ordinary functions in the interpreter engine instead of stopping it.
+- **Debugger**: `apsi debug` in the terminal and F5 in VS Code-family editors (`apsi dap`): breakpoints with
+  conditions, hit counts and log points, stepping, the call stack, variables, tensor summaries, stop on errors.
+- **Faster programs:** the main program starts with the loaded runtime frozen out of the cycle collector and a
+  50,000-allocation first generation: object-heavy code runs about 8 % faster than on CPython (`APSI_GC=default`
+  turns it off). Module attribute access (`math.sqrt`) is a plain attribute lookup.
+- **Faster start and compile:** start-up about 30 % faster (heavy modules load on first use); a cold compile of a 20,000-line program 3.7 → 2.5 s (faster
+  lexer and parser, the Guard scan 3× faster, a signed "checked clean" marker so unchanged programs are not checked
+  again).
+
+### Faster web server
+- Less work per request (request ids without a system call, merged security headers, literal routes without a
+  regular expression, one timer per connection, one-regex header validation, fast routes timed by the wall clock
+  only): 19,200 → 22,400 requests/s per process on a 2-vCPU VM.
+- uvloop when installed (`pip install "apsi[web]"`); `app.run(processes="auto")`; `stop()` also ends uvloop's
+  `serve_forever`. Synthetic test on a 4-vCPU EPYC 7763: 1 process 14,600–15,700 req/s, `processes="auto"`
+  38,800–41,500, Node.js 22 (bare `http`, one process) 23,400–24,100.
+
+### Syntax and library
+- `a ?? b`, `a?.b`, `a?.f(x)`, `a?[i]` in both engines, the checker, the formatter and the editor grammars.
+- `use collections`: `Counter`, `DefaultDict`, `Deque`, `Heap`, `LRUCache`, `OrderedSet`, `BiMap`; built-in
+  `first`, `last`, `partition`, `take_while`, `drop_while`, `scan`, `fold`, `flat_map`, `zip_longest`, `interleave`,
+  `distinct_by`, `min_by`, `max_by`, `sum_by`, `frequencies`, `compose`, `partial` (`tests/test_new_syntax.py`).
+
+### Smarter memory (`use memory`)
+- Container-aware: the memory cgroup's limit (v1 and v2) is used when it is smaller than the machine's, for the
+  budget, `array()`, `status()` and the new `limits()`.
+- `pressure()` (ok / moderate / high / critical, from free memory and Linux PSI); under high pressure big arrays go
+  to the SSD and stores and pools give RAM back by themselves; `relieve()`; `on_pressure(fn)` watcher.
+- `pool()`: reusable buffers for big temporaries (`take` / `give`), 1.36× faster for 256 MB temporaries.
+- `chunks()` and `map()` stream memory-mapped files with flat memory (3 GB file: peak RSS 3,103 → 97 MB, same speed),
+  with kernel read-ahead; `chunks()` of arrays in RAM returns views.
+- Stores keep a running SSD total: `set` no longer lists the folder (8.6 → 0.07 ms per `set` at 8,000 entries).
+- `report()`: every array from `array()`, its size and whether it is in RAM or on the SSD.
+
+### Speed on every processor
+- The jammed lanes of an outer loop (n-body forces, matrix-vector products, distances) are emitted as SIMD vector
+  instructions by Apsi itself instead of relying on LLVM's SLP vectoriser, which with LLVM 22 failed on AVX2
+  processors: n-body 127.5 → 46.0 ms on an EPYC 7763 (gcc -O3: 44.2 ms); results bit-for-bit unchanged (`tests/test_jam.py`).
+- `@native("fma")`: checks on, `a * b + c` may fuse into one instruction (gcc's default for C); ODE benchmark
+  440 → 288 ms (gcc -O3: 387 ms).
+- `@gpu` CPU/GPU choice: the first GPU launch (kernel loading) is no longer counted, and the losing side is timed
+  again every 64 calls (`tests/test_gpu_choice.py`).
+- `benchmarks/commits/measure.py` and the `commits` workflow measure several commits on one machine, in rotating
+  rounds; the native cache now also depends on `APSI_SLP`. From the start of this work to the release, on one
+  EPYC 7763: n-body 4.0×, ODE 1.5×, k-means 1.27×, compiling 1.21× faster, nothing slower
+  (`benchmarks/commits/results-2.4.4.md`).
+
 ## 2.0.0 — native machine code, all CPU cores and NVIDIA GPUs
 
 Apsi 2.0 replaces "everything runs on the Python VM" with a native compiler. Python stays where it helps (the
@@ -306,7 +618,37 @@ Development started on **Sunday, 8 November 2026 at about 04:00** (Bangkok time,
 - **JetBrains** TextMate bundle, **Helix**, **Zed** and **Emacs** (`apsi-mode`) configurations
 - `tools/build_editors.py` keeps the Sublime/TextMate grammar and snippets identical to the VS Code ones
 
+### Fixes
+- `use hub` on the processor: a product could wait forever when several threads used the model and a worker
+  thread went to sleep at the same moment (a lost wake-up, seen on ARM64). Publishing a job and counting the
+  sleeping workers are now sequentially consistent atomics, and a worker leaves its sleep with an atomic count.
+
+### Python conversion: libraries come along
+- `apsi convert` converts the installed libraries a program imports that are written in Python (found in the
+  program's `.venv` of any Python version, or in the converting Python) into `apsi_packages/` next to it, with their
+  data files and `.dist-info`; the result runs on Apsi alone. Dynamic imports, `importlib.resources` and
+  `importlib.metadata` find the converted libraries. Verified with `requests` + `urllib3` + `idna` + `certifi`
+  (63 modules) against a local HTTP server with the real libraries blocked. `--no-packages` keeps Python imports.
+- Libraries of compiled code (C, C++, Rust) stay Python imports; the notes say so and name Apsi's own tool for the
+  job; libraries that are not installed are listed once
+- `apsi run` no longer uses a `.venv` next to the program by itself (only `--venv DIR`)
+- `from .pkg import submodule` inside a package converts to the submodule (relative level kept)
+
 ### VS Code extension
+- `apsi run` does not mix in a `.venv` of another Python version or build (for example a free-threaded 3.14 venv
+  under Apsi's 3.12): its compiled packages cannot load there ("No module named 'pyarrow.lib'"); it says so and
+  how to install the packages for Apsi instead
+- Apsi Guard: words in a docstring or long message are checked only when they are paths (a sentence that mentions
+  `.env` or credentials is not code that reads them), `tdata` must be a folder name (no match inside `netdata` or
+  `metadata`), and a line gives one finding per kind
+- `apsi test examples` no longer downloads a model or opens ports: `31_ai_server` and `27_pretrained_models` load
+  their models only when run, not under `apsi test` (the Windows build waited for a 1 GB download there)
+- **finds the installed Apsi of every layout:** the side-by-side installs (`Programs\Apsi\<version>`, the version
+  chosen with `apsi use` first) run through their own Python directly; a launcher found on PATH (`apsi.cmd`) is
+  started through the shell, which current VS Code needs on Windows (before, the language server could not start and
+  **Convert Python File to Apsi** failed with an empty output)
+- **Convert Python File to Apsi** runs in the background, the progress note closes when it ends, and a failure says
+  why (the command line and the error are in the Apsi output)
 - richer grammar: definitions vs. calls, built-ins, parameters, types and generic types, units in their own colour,
   `as [unit]`, `±`, derivatives, f-string formats, triple-quoted strings, decorators, `TODO`, Apsi code blocks in Markdown
 - **Apsi Dark** / **Apsi Light** themes, snippets, smarter indentation and folding

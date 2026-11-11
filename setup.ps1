@@ -1,5 +1,5 @@
 <#
-  Apsi 2.0.0 — one-shot setup for Windows 10/11 (run from the source folder).
+  Apsi 2.4.4 — one-shot setup for Windows 10/11 (run from the source folder).
 
     powershell -ExecutionPolicy Bypass -File setup.ps1               # install Apsi for development + run tests
     powershell -ExecutionPolicy Bypass -File setup.ps1 -Installer    # also build the setup wizard (ApsiSetup-*.exe)
@@ -57,7 +57,7 @@ if ($Installer) {
   Step "Building the VS Code extension (optional)"
   Push-Location editors\vscode
   try {
-    $vsixOut = Join-Path $PSScriptRoot "dist\apsi-language-2.0.0.vsix"
+    $vsixOut = Join-Path $PSScriptRoot "dist\apsi-language-2.4.4.vsix"
     New-Item -ItemType Directory -Force (Split-Path $vsixOut) | Out-Null
     npm install --no-audit --no-fund --silent
     npx --yes @vscode/vsce@2 package --allow-missing-repository --skip-license -o $vsixOut
@@ -80,7 +80,7 @@ if ($Installer) {
   if ($LASTEXITCODE) { Pop-Location; exit 1 }
   Pop-Location
   Get-ChildItem installer\release\*.exe | ForEach-Object { Write-Host "built $($_.FullName)" -ForegroundColor Green }
-  Write-Host "Run it:     .\installer\release\ApsiSetup-2.0.0-x64.exe" -ForegroundColor Green
+  Write-Host "Run it:     .\installer\release\ApsiSetup-2.4.4-x64.exe" -ForegroundColor Green
 }
 
 Step "Done"

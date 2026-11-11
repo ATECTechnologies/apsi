@@ -1,0 +1,20 @@
+import math, time
+def run(n):
+    bodies = [[0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 39.47], [4.84, -1.16, -0.10, 0.606, 2.81, -0.02, 0.037],
+              [8.34, 4.12, -0.40, -1.01, 1.82, 0.008, 0.011], [12.89, -15.11, -0.22, 1.08, 0.868, -0.01, 0.0017],
+              [15.37, -25.9, 0.179, 0.979, 0.594, -0.034, 0.002]]
+    dt = 0.01
+    for _ in range(n):
+        for i in range(5):
+            bi = bodies[i]
+            for j in range(i + 1, 5):
+                bj = bodies[j]
+                dx, dy, dz = bi[0] - bj[0], bi[1] - bj[1], bi[2] - bj[2]
+                d2 = dx * dx + dy * dy + dz * dz
+                mag = dt / (d2 * math.sqrt(d2))
+                bi[3] -= dx * bj[6] * mag; bi[4] -= dy * bj[6] * mag; bi[5] -= dz * bj[6] * mag
+                bj[3] += dx * bi[6] * mag; bj[4] += dy * bi[6] * mag; bj[5] += dz * bi[6] * mag
+        for b in bodies:
+            b[0] += dt * b[3]; b[1] += dt * b[4]; b[2] += dt * b[5]
+    return sum(b[0] for b in bodies)
+t = time.perf_counter(); r = run(200000); print(f"nbody {r:.9f} {time.perf_counter() - t:.3f}s")

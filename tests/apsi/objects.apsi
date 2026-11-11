@@ -1,0 +1,122 @@
+# Classes, with, del, sets, generators and the other parts of Python's object model (Apsi 2.4.4)
+
+class Account:
+    rate: Float = 0.02
+    let opened = [0]
+    fn __init__(self, owner, balance=0.0):
+        self.owner = owner
+        self._balance = balance
+        Account.opened[0] += 1
+    fn deposit(self, amount):
+        if amount <= 0:
+            raise ValueError("amount must be positive")
+        self._balance += amount
+        return self
+    @property
+    fn balance(self):
+        return self._balance
+    fn __repr__(self):
+        return f"Account({self.owner}, {self._balance})"
+    fn __eq__(self, other):
+        return isinstance(other, Account) and other.owner == self.owner
+
+class Savings(Account):
+    fn __init__(self, owner):
+        super().__init__(owner, 10.0)
+    fn interest(self):
+        return self.balance * Account.rate
+
+class Recorder:
+    fn __init__(self):
+        self.log = []
+    fn __enter__(self):
+        self.log.append("in")
+        return self
+    fn __exit__(self, kind, value, tb):
+        self.log.append("out")
+        return false
+
+class Problem(ValueError):
+    pass
+
+fn squares(n):
+    for i in range(n):
+        yield i * i
+
+test "classes: fields, methods, properties, inheritance, super()":
+    let a = Savings("ann")
+    a.deposit(5).deposit(5)
+    assert a.balance == 20.0
+    assert a.interest() ~= 0.4
+    assert isinstance(a, Account)
+    assert a == Savings("ann")
+    assert Account.opened[0] >= 2
+    assert str(a) == "Account(ann, 20.0)"
+
+test "with runs __enter__ and __exit__ even when the block fails":
+    let r = Recorder()
+    try:
+        with r as same:
+            assert same is r
+            raise Problem("x")
+    except Problem as e:
+        assert str(e) == "x"
+    assert r.log == ["in", "out"]
+
+test "exceptions: own classes, causes":
+    try:
+        try:
+            raise KeyError("k")
+        except KeyError as e:
+            raise Problem("wrapped") from e
+    except ValueError as e:
+        assert isinstance(e, Problem)
+        assert isinstance(e.__cause__, KeyError)
+
+test "generators are lazy, generator expressions too":
+    assert sum(squares(4)) == 14
+    let g = (x * 2 for x in squares(1000000000))
+    assert next(g) == 0
+    assert next(g) == 2
+
+test "sets, set comprehensions, bit operators, is":
+    let s = {1, 2, 3}
+    assert {x % 2 for x in range(10)} == {0, 1}
+    assert (s | {4}) == {1, 2, 3, 4}
+    assert (s & {2, 9}) == {2}
+    assert 6 & 3 == 2 and 6 | 1 == 7 and 1 << 4 == 16 and 256 >> 4 == 16 and ~5 == -6
+    let empty = none
+    assert empty is none and s is not none
+
+test "unpacking with a star, nested loop targets, chained assignment":
+    let first, *rest = [1, 2, 3, 4]
+    assert first == 1 and rest == [2, 3, 4]
+    var total = 0
+    for (i, (a, b)) in enumerate([(1, 2), (3, 4)]):
+        total += i * 100 + a * b
+    assert total == 114
+    var x = 0
+    var y = 0
+    x = y = 7
+    assert x == 7 and y == 7
+
+test "loop else, del, walrus, dict spread":
+    var found = false
+    for v in [1, 3, 5]:
+        if v % 2 == 0:
+            break
+    else:
+        found = true
+    assert found
+    var d = {**{"a": 1}, "b": 2}
+    del d["a"]
+    assert d == {"b": 2}
+    var n = 0
+    if (n := len(d)) == 1:
+        assert n == 1
+
+test "f-string conversions and nested format specs":
+    let w = 6
+    assert f"{3.14159:{w}.2f}" == "  3.14"
+    let q = "q"
+    assert f"{q!r}" == "\"q\""

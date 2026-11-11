@@ -1,0 +1,24 @@
+# Prints the optimised LLVM IR and machine code Apsi generates for the heavy benchmark functions, so code
+# generation can be inspected on every platform (Actions -> native-ir -> Run workflow).
+name: native-ir
+on:
+  workflow_dispatch:
+jobs:
+  ir:
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-24.04, ubuntu-24.04-arm]
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with: { python-version: "3.13" }
+      - run: python -m pip install -e .
+      - run: apsi native info
+      - name: vdp_rk4
+        run: apsi native asm benchmarks/heavy/diag/small.apsi vdp_rk4 && apsi native ir benchmarks/heavy/diag/small.apsi vdp_rk4
+      - name: nbody_dense
+        run: apsi native asm benchmarks/heavy/diag/small.apsi nbody_dense
+      - name: kmeans
+        run: apsi native asm benchmarks/heavy/diag/small.apsi kmeans
