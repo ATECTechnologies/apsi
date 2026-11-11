@@ -621,6 +621,9 @@ Development started on **Sunday, 8 November 2026 at about 04:00** (Bangkok time,
 - `tools/build_editors.py` keeps the Sublime/TextMate grammar and snippets identical to the VS Code ones
 
 ### VS Code extension
+- `apsi run` does not mix in a `.venv` of another Python version or build (for example a free-threaded 3.14 venv
+  under Apsi's 3.12): its compiled packages cannot load there ("No module named 'pyarrow.lib'"); it says so and
+  how to install the packages for Apsi instead
 - Apsi Guard: words in a docstring or long message are checked only when they are paths (a sentence that mentions
   `.env` or credentials is not code that reads them), `tdata` must be a folder name (no match inside `netdata` or
   `metadata`), and a line gives one finding per kind

@@ -179,6 +179,32 @@ class Env:
         return name in self.values or name in os.environ
 
 
+def venv_mismatch(venv):
+    """Why the packages of this virtual environment cannot load in the running Python, or None when they can.
+    Compiled modules (.pyd / .so: numpy, pyarrow, torch …) are built for one Python version and one build
+    (free-threaded "t" or not), so a venv of another version fails with errors like "No module named 'pyarrow.lib'"."""
+    import sys
+    try:
+        with open(os.path.join(venv, "pyvenv.cfg"), encoding="utf-8") as fh:
+            cfg = dict(line.split("=", 1) for line in fh.read().splitlines() if "=" in line)
+    except OSError:
+        return None
+    cfg = {k.strip().lower(): v.strip() for k, v in cfg.items()}
+    ver = cfg.get("version") or cfg.get("version_info") or ""
+    m = re.match(r"(\d+)\.(\d+)", ver)
+    if not m:
+        return None
+    exe = os.path.basename(cfg.get("executable", "") or cfg.get("command", "").split(" ")[0]).lower()
+    venv_ft = bool(re.search(r"python3?\.?\d*t(\.exe)?$", exe)) or cfg.get("gil", "").lower() in ("false", "disabled")
+    run_ft = not getattr(sys, "_is_gil_enabled", lambda: True)()
+    here = f"{sys.version_info.major}.{sys.version_info.minor}"
+    there = f"{m.group(1)}.{m.group(2)}"
+    if there == here and venv_ft == run_ft:
+        return None
+    return (f"{venv} is Python {there}{' free-threaded' if venv_ft else ''}, Apsi runs on Python {here}"
+            f"{' free-threaded' if run_ft else ''}: its compiled packages cannot load here")
+
+
 def find_venv_site(venv):
     """site-packages of a virtual environment, or None."""
     import glob

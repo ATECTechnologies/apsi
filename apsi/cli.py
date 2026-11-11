@@ -195,9 +195,17 @@ def cmd_run(args):
                 venv = d
                 break
     if venv:
-        from .envfile import find_venv_site
+        from .envfile import find_venv_site, venv_mismatch
+        why = venv_mismatch(venv)
         site = find_venv_site(venv)
-        if site and site not in sys.path:
+        if why:
+            # loading it anyway gives confusing errors ("No module named 'pyarrow.lib'"); say what to do instead
+            print(f"apsi: not using the packages of {why}.\n"
+                  f"      Install what the program needs for Apsi's own Python:\n"
+                  f"      \"{sys.executable}\" -m pip install PACKAGE …\n"
+                  f"      or make the venv with Python {sys.version_info.major}.{sys.version_info.minor} "
+                  f"(py -{sys.version_info.major}.{sys.version_info.minor} -m venv .venv).", file=sys.stderr)
+        elif site and site not in sys.path:
             sys.path.insert(0, site)
     t0 = time.perf_counter()
     try:
