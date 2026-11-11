@@ -1,5 +1,21 @@
 ## 2.4.4 — Python, exactly; real time; data, databases and the web
 
+### AI training on your own GPU — faster than PyTorch, nothing else to install
+- **`fit(…, backend="gpu")`** trains with kernels Apsi generates itself from the NVIDIA display driver alone: tiled
+  tensor-core matrix products with the bias, activation and residual fused in, fused attention, one-kernel AdamW, the
+  data set kept on the card. Measured on an RTX 3060, same model and same data: **151,744 tokens/s against PyTorch
+  2.14 bfloat16's 126,993 (1.19×)**, every epoch at the same speed (153,552 · 154,009 · 151,667), the card held near
+  77 °C. fp8 144,176, fp4 142,284 tokens/s. A 127 M-parameter GPT: 18,074 tokens/s held at 77 °C.
+- **Four builds of every matrix product**, timed by the card on the real shapes the first time; the fastest is kept.
+- **Several cards:** `device="cuda:all"` — reduce-scatter, sharded optimizer state, all-gather; identical results
+  to one card with the whole batch.
+- **Steady temperature without pauses:** the card's power limit is moved to hold 77 °C. Set it up once with the
+  **Apsi GPU Tuner** (download page: Apply / Restore, Windows and Linux) or `apsi gpu setup`; `apsi gpu hold 77`
+  holds the temperature for any program.
+- **`ema=` and `ewc=`** for smoother weights and continual learning; low-bit training in fp8, fp6, fp4, int8, int4.
+- **`apsi serve-model`:** the OpenAI API with streaming, a fair queue and metrics; 0.5B, 3B and 14B models fully on
+  a 12 GB card.
+
 ### Python conversion: exact, complete
 - **`apsi convert` keeps Python's semantics byte for byte.** Converted files start with `use pycompat`, which gives
   them Python's object model, scoping and built-ins. Real classes (inheritance from any library class, metaclasses,

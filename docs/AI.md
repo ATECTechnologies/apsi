@@ -68,7 +68,9 @@ gradients and the AdamW state sit in three flat arrays updated by one kernel; th
 batch is gathered there, so the processor never makes the card wait inside an epoch. `backend="auto"` picks it when
 there is a card and the model is made of the layers it has: linear, activations, dropout, layer_norm, rms_norm,
 embedding, positional_encoding, residual, multi_head_attention, transformer_block (so `mlp`, `resnet_mlp`,
-`transformer_lm`, `transformer_encoder`), with `cross_entropy` or `mse`, Adam / AdamW / SGD, `clip=`, `schedule=`.
+`transformer_lm`, `transformer_encoder`), with `cross_entropy` or `mse`, Adam / AdamW / SGD, `clip=`, `schedule=`,
+`ema=` and `ewc=`. Several cards: `device="cuda:all"`. Measured on an RTX 3060: a 10.9 M-parameter GPT at 151,744
+tokens/s (PyTorch bf16 on the same data: 126,993), the card held at 77 °C — details in [`GPU.md`](GPU.md).
 
 ```apsi
 let r = fit(model, params, X, y, loss="cross_entropy", opt=adamw(lr=1e-3), epochs=3, batch_size=32,

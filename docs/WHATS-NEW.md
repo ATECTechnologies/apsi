@@ -363,16 +363,27 @@ installer both work this way; an older install is moved into its own version fol
 
 ## 20. Training and serving on the GPU with Apsi alone
 
-* **`fit(…, backend="gpu")`** trains on an NVIDIA card with Apsi's own kernels: tensor cores, the whole optimizer in
-  one kernel, the data on the card. A 10.9 M-parameter GPT: 64,398 tokens/s on an RTX 3060 (PyTorch with cuBLAS:
-  142,287), the same held-out loss, nothing installed; 17× the processor.
-* **Low-bit training:** `precision="fp8" | "fp6" | "fp6_e2m3" | "fp4" | "int8" | "int4"` — and the model then runs in
-  that format with the weights it learned.
+* **`fit(…, backend="gpu")` trains on an NVIDIA card with Apsi's own kernels**, generated on your machine from the
+  display driver alone: tiled tensor-core matrix products with the bias, activation and residual fused in, fused
+  attention, one-kernel AdamW, the data set kept on the card. A 10.9 M-parameter GPT on an RTX 3060:
+  **151,744 tokens/s, 1.19× PyTorch 2.14's bfloat16 (126,993) on the same data**, every epoch at the same speed,
+  the card held at 77 °C. A 127 M-parameter GPT: 18,074 tokens/s held at 77 °C (2.3× PyTorch's fp32).
+* **Four builds of every product, picked by your card:** the card times them on the real shapes the first time
+  (8 warps; loads first; 4 warps of 64 × 64; bfloat16 operands copied with cp.async four slices ahead) and keeps the
+  fastest. Every kernel is checked against an exact reference by `tests/test_gpu_train.py` on the card.
+* **Several cards:** `device="cuda:all"` — data-parallel with reduce-scatter of the gradients, the optimizer's state
+  shared out among the cards and all-gather of the weights; the same result as one card with the whole batch.
+* **Low-bit training:** `precision="fp8" | "fp6" | "fp6_e2m3" | "fp4" | "int8" | "int4"`, float32 master weights —
+  and the model then runs in that format with the weights it learned.
+* **Continual learning:** `ema=0.999` (a moving average of the weights) and `ewc=(anchor, fisher, strength)` (learn a
+  new task without forgetting the old one).
+* **Temperature and power:** the card stays near 77 °C at a steady speed, held by its power limit (no pauses) when
+  Apsi may set it — run as administrator once with `apsi gpu setup`, or use the **Apsi GPU Tuner** (Apply / Restore
+  files for Windows and Linux on the download page). `apsi gpu hold 77` does the same for any other program.
 * **fp6 weights on the card** (E3M2 and E2M3), next to bf16, int8, fp8, int4 and fp4: a 3B model in 3.0 GB.
 * **`apsi serve-model` / `hub.serve(lm)`:** the OpenAI API with streaming, a fair queue, API keys and metrics. Under
   load on the RTX 3060 (0.5B, 3B, 14B): every request answered, 0 errors, the same answer for the same question.
-* **Temperature control:** the card stays near 77 °C (75–78) during long work instead of 85–90 °C.
-* Everything with the measurements and a troubleshooting guide: [`GPU.md`](GPU.md).
+* Everything, with the measurements and a troubleshooting guide: [`GPU.md`](GPU.md).
 
 ## How much faster than 2.0.0
 

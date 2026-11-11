@@ -91,6 +91,13 @@ Then read [Getting started](docs/GETTING-STARTED.md) (15 minutes) or [Write Apsi
 
 ## What's new in 2.4.4
 
+* **Train AI on your own NVIDIA card, faster than PyTorch, with nothing else installed.** `fit(…, backend="gpu")`
+  runs Apsi's own tensor-core kernels: a 10.9 M-parameter GPT trains at **151,744 tokens/s** on an RTX 3060 against
+  PyTorch 2.14's 126,993 on the same data, every epoch at the same speed, the card held at 77 °C by its power limit.
+  bf16, fp8, fp6 and fp4 training; several cards with `device="cuda:all"`; `ema=` and `ewc=`; the **Apsi GPU Tuner**
+  sets the best power limit for every NVIDIA card in one click ([GPU guide](docs/GPU.md)).
+* **Serve what you train.** `apsi serve-model` puts a language model behind the OpenAI API (streaming, queue, metrics);
+  Qwen2.5 0.5B, 3B and 14B run fully on a 12 GB card.
 * **Python, exactly.** Every Python 3.13 construct converts — classes and metaclasses, `match`, `async`, `except*`,
   generics, `import *`. 34 standard-library modules (about 38,000 lines) convert and print byte-identical output.
 * **Real time.** 1–2 kHz control loops and video pipelines from 640×480 to 4K with newest-frame hand-off and latency

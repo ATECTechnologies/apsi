@@ -14,10 +14,28 @@ and the driver compiles them for whatever card is present.
 
 `apsi doctor` shows the card, the driver and what Apsi will use. `hub.devices()` from a program.
 
+### Quick start: train on your card in three steps
+
+1. **Once**, give Apsi the right to set the card's power limit (it holds the temperature this way, at full and
+   steady speed): download **Apsi GPU Tuner → Apply** from the download page and double-click it (or run
+   `apsi gpu setup` from a terminal opened as administrator).
+2. Train with `backend="gpu"` (the example in section 2). Nothing else to install.
+3. Read the report: the speed of every epoch, the temperature, and how it was held. `apsi gpu` shows the card at any
+   time, `apsi gpu watch` every second.
+
+| Section | What it covers |
+|---|---|
+| [1. Language models](#1-language-models-use-hub) | running Hugging Face models on the card, weight formats, tensor cores, threads |
+| [2. Training](#2-training-on-the-gpu-with-apsi-alone-backendgpu) | layers, precisions, measured speed against PyTorch, several cards, model size |
+| [3. Serving](#3-serving-the-openai-api) | the OpenAI API in front of a model, queues, metrics |
+| [4. Temperature control](#4-temperature-control) | the 77 °C control, the power limit, the GPU Tuner, `apsi gpu hold` |
+| [5. Images, video, your own kernels](#5-images-video-and-your-own-kernels-gpu) | `@gpu` functions |
+| [6. Troubleshooting](#6-troubleshooting) | slow training, out of memory, the card not found, and more |
+
 > **Important — for the full, steady speed of long training, give Apsi the right to set the card's power limit.**
 > Without it, the only way Apsi can keep a hot card at 77 °C is to *pause* the work, and a card that needs cooling
 > then loses a large share of its speed (measured on an RTX 3060: a 127 M-parameter model trained at 10,332 tokens/s
-> with pauses, **15,000–17,000 tokens/s** with the power limit, at the same temperature). Do one of these:
+> with pauses, **18,074 tokens/s** with the power limit, at the same temperature). Do one of these:
 >
 > 1. **Run Apsi as administrator** (Windows: right-click the terminal → *Run as administrator*; Linux: `sudo`), or
 > 2. **once**, run `apsi gpu setup` as administrator (or the *Apsi GPU Tuner — Apply* file from the download page):
@@ -114,30 +132,35 @@ NumPy backend's (tests/test_gpu_train.py), on the Emulator and on the real card.
 
 | Extras | `ema=0.999` keeps a moving average of the weights (`r.ema_params`); `ewc=(anchor_params, fisher, strength)` pulls each weight toward an earlier task's value in proportion to its importance (continual learning without forgetting) |
 
-**Measured** (the GPT above, 10.9 M parameters; data.bin: windows of 128 bytes of Apsi's documentation, 4,396 to
-train on for PyTorch, 4,441 for Apsi after the documentation grew; batch 32, AdamW 1e-3, 3 epochs; RTX 3060 12 GB,
-Apsi run as administrator, the temperature held near 77 °C by the power limit):
+**Measured** (the GPT above, 10.9 M parameters; the same data.bin for both: 4,441 windows of 128 bytes of Apsi's
+documentation to train on, 234 held out; batch 32, AdamW 1e-3, 3 epochs; RTX 3060 12 GB; Apsi held the card near
+77 °C by its power limit, PyTorch 2.14 ran without temperature control and reached 79 °C at 121–132 W):
 
-| Run | Throughput (steady, every epoch) | Held-out loss | GPU memory |
-|---|---:|---:|---:|
-| **Apsi `backend="gpu"`, bf16** | **151,008 tokens/s** (149,434 / 153,801 / 153,055) | 6.25 → 2.373 | 858 MB |
-| Apsi, fp8 / fp4 weights | 142,218 / 141,584 tokens/s | 2.367 / 2.446 | 947 MB |
-| Apsi, fp32 (3 bfloat16 passes) | 58,889 tokens/s | 2.366 | 1,097 MB |
-| PyTorch bf16 autocast (cuBLAS, flash attention) | 133,491 tokens/s | 2.355 | 610 MB |
-| PyTorch tf32 | 89,762 tokens/s | 2.348 | |
-| PyTorch fp32 | 76,506 tokens/s | 2.346 | |
+| Run | Throughput | Every epoch | Held-out loss | GPU memory |
+|---|---:|---|---:|---:|
+| **Apsi `backend="gpu"`, bf16** | **151,744 tokens/s** | 153,552 · 154,009 · 151,667 | 6.25 → 2.371 | 873 MB |
+| Apsi, fp8 weights | 144,176 tokens/s | 147,038 · 145,831 · 145,160 | 2.365 | 974 MB |
+| Apsi, fp4 weights | 142,284 tokens/s | 145,197 · 143,729 · 141,405 | 2.456 | 974 MB |
+| Apsi, fp32 (3 bfloat16 passes) | 60,000 tokens/s | 60,647 · 60,294 · 59,811 | 2.362 | 1,124 MB |
+| PyTorch bf16 autocast (cuBLAS, flash attention) | 126,993 tokens/s | | 6.89 → 2.320 | 610 MB |
+| PyTorch tf32 | 94,031 tokens/s | | 2.309 | 797 MB |
+| PyTorch fp32 | 73,929 tokens/s | | 2.310 | 796 MB |
+
+In bfloat16 Apsi trains this model **1.19× as fast as PyTorch**, every epoch at the same speed. One step takes
+26.8 ms of kernels on the card; the matrix products are 75 % of it.
 
 **A larger model** (10 blocks, d=1024, 16 heads: 126.6 M parameters; batch 32, 2 epochs, same card):
 
 | Run | Throughput | Held-out loss | GPU memory |
 |---|---:|---:|---:|
-| Apsi bf16 (administrator: power limit) | 17,134 tokens/s | 6.65 → 2.811 | 4,524 MB |
-| PyTorch 2.13 bf16 autocast | 20,111 tokens/s | 6.58 → 3.020 | 3,854 MB |
+| **Apsi bf16, held at 77 °C** | **18,074 tokens/s** (18,418 · 18,284 by epoch) | 6.65 → 2.810 | 4,564 MB |
+| Apsi, the kernels of one step alone (204 ms) | 20,043 tokens/s | | |
+| PyTorch 2.13 bf16 autocast, no temperature control | 20,111 tokens/s | 6.58 → 3.020 | 3,854 MB |
 | PyTorch tf32 / fp32 | 11,236 / 8,011 tokens/s | 3.025 / 3.027 | 4,565 MB |
 
-At this size PyTorch's bf16 is still faster (cuBLAS gets more out of large products than Apsi's tiles do today);
-Apsi is 1.5× PyTorch's tf32 and 2.1× its fp32, with a lower held-out loss after the same two epochs. Without
-administrator rights the card is cooled by pauses instead: an earlier run of this model gave 10,332 tokens/s.
+Held at 77 °C, Apsi trains the 127 M model at 2.3× PyTorch's fp32 and 1.6× its tf32 speed, with a lower held-out
+loss after the same two epochs; its kernels run as fast as PyTorch's bfloat16 does with the card left to heat up.
+Without administrator rights (cooling by pauses) the same model ran at 10,332 tokens/s: see the box at the top.
 
 Why the numbers differ: Apsi's bf16 kernels (tiled tensor-core products with the bias, activation and residual
 fused in, fused attention, a warp per row for the norms, one AdamW kernel over all parameters, the data resident on
@@ -145,8 +168,8 @@ the card) are now faster than PyTorch's general kernels for this model. The RTX 
 (that starts with the RTX 40 / Ada generation), so fp8 and fp4 there are *simulated* (rounded weights): they cost a
 little speed and serve to train models meant to run in those formats. True float32 is bounded by the card's float32
 rate; PyTorch's cuBLAS float32 is still faster than Apsi's three-pass float32. PyTorch uses less memory (its
-activations are bfloat16; Apsi keeps float32 activations). The products come in two builds and the card times both
-for each shape the first time it sees it, keeping the faster (`APSI_GEMM_VARIANT=a|x` fixes one).
+activations are bfloat16; Apsi keeps float32 activations). The products come in four builds and the card times them
+for each shape the first time it sees it, keeping the fastest (`APSI_GEMM_VARIANT=a|x|w|h` fixes one).
 
 **Several cards** — `fit(…, backend="gpu", device="cuda:all")` (or `device="cuda:0,1,2,3"`): data-parallel
 training for any model the trainer supports. Every card holds the model and takes its share of each batch; then each
@@ -163,13 +186,14 @@ it so PyTorch and Apsi are measured under the same temperature.
 How big a model trains depends on the architecture: per card the weights and gradients (8 bytes per parameter) and
 its share of AdamW's state (8 / N bytes), plus activations that depend on the layers, the context and the batch.
 Nothing is refused in advance: when the parameters alone look larger than the card, a warning gives the numbers,
-and if the card really runs out, the error says what to change (batch size, layers, context, more cards). The architecture is yours to choose at any size: `transformer_lm(vocab, d=, heads=, layers=,
-context=)`, or your own `Sequential` of the layers in the table above.
+and if the card really runs out, the error says what to change (batch size, layers, context, more cards). The
+architecture is yours to choose at any size: `transformer_lm(vocab, d=, heads=, layers=, context=)`, or your own
+`Sequential` of the layers in the table above.
 
 Large products in four builds: the card times each one (8 warps of 64 × 32; the same loading first; 4 warps of
 64 × 64 over slices of 16; the operands rounded to bfloat16 once and copied into shared memory with cp.async four
-slices ahead) for every shape the first time, the rounding pass included, and keeps the fastest; the tiles are visited in groups of 8
-rows so a large weight matrix is read from memory far less often.
+slices ahead) for every shape the first time, the rounding pass included, and keeps the fastest; the tiles are
+visited in groups of 8 rows so a large weight matrix is read from memory far less often.
 
 Older and newer cards: on Turing (RTX 20) and GTX 16 the trainer runs on its float32 kernels (no bfloat16 tensor
 cores there); on Hopper and Blackwell (H100, H200, B200, RTX 50) the Ampere kernels run as they are (the driver
