@@ -157,6 +157,15 @@ the band instead of swinging; a card that stays cool is never slowed.
 | `APSI_GPU_TEMP=77` | the target in °C (default 77 → band 75–78); any value from 50 to 95 |
 | `APSI_GPU_TEMP=off` | no control (the card's own limits only) |
 
+**Steady speed: the power limit instead of pauses (administrator).** When Apsi runs as an administrator (Windows)
+or root (Linux), it holds the temperature by moving the card's power limit (between 55 % and 100 % of the default)
+rather than pausing: the card then runs at slightly lower clocks and voltage, where it does more work per watt, so the
+speed stays level (typically 95 % or more of full speed) and the temperature stays at the target. Without those
+rights Apsi cannot change the card's limits and paces the work instead: the temperature is just as steady, but the
+speed falls as far as the cooler needs (on the RTX 3060 in a small case: from 141,000 to about 100,000 tokens/s once
+the card is warm). `APSI_GPU_POWER_CONTROL=0` keeps pauses only. Better airflow or a higher fan curve gives the speed
+back in both cases.
+
 **Cooler without pauses: a lower power limit.** A card at its full power limit runs at its highest clocks and
 voltage, where each extra percent of speed costs several percent of power — that is the heat. `APSI_GPU_POWER=80`
 sets the limit to 80 % of the default while Apsi runs (and puts it back at exit): typically about 5 % slower and

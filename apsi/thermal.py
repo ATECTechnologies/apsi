@@ -88,6 +88,11 @@ class Governor:
         self.temp = t
         self.max_temp = t if self.max_temp is None else max(self.max_temp, t)
         err = t - self.target
+        power = getattr(self, "power", None)
+        if power is not None and not power.step(err, dt) and self.integral == 0.0:
+            self.fraction = 0.0                         # the power limit holds it: no pauses, steady speed
+            self.last_read = now
+            return
         if self.fraction > 0.0 or err > -1.0:           # cool and not pacing: nothing to wind up
             self.integral = min(0.85, max(0.0, self.integral + 0.012 * err * dt))
         self.fraction = min(0.85, max(0.0, self.integral + 0.035 * err))
@@ -117,6 +122,8 @@ class Governor:
                "paced_fraction": round(self.fraction, 3), "max_c": self.max_temp, "paced_s": round(self.paced, 1)}
         if getattr(self, "read_power", None):
             out["power_w"] = self.read_power()
+        if getattr(self, "power", None) is not None:
+            out["power_limit_w"] = round(self.power.limit / 1000.0, 1)
         if getattr(self, "power_note", None):
             out["power_limit"] = self.power_note
         return out
@@ -178,6 +185,10 @@ def governor(dev):
             return round(mw.value / 1000.0, 1) if lib.nvmlDeviceGetPowerUsage(h, ctypes.byref(mw)) == 0 else None
         g.read_power = watts
         g.power_note = _power_limit(lib, h)
+        if g.power_note is None:
+            g.power = _PowerControl.try_make(lib, h)       # administrator: steer the power limit, not pauses
+            if g.power is not None:
+                g.power_note = "temperature held by the power limit (no pauses)"
         return g
 
 
@@ -264,6 +275,46 @@ def cpu_governor():
         elif g is not NULL:
             g.target, g.low, g.high = target, target - 2.0, target + 1.0
         return g
+
+
+class _PowerControl:
+    """Holds the temperature by moving the card's power limit (between 55 % and 100 % of its default) instead of
+    pausing the work: a card at a lower limit runs at lower clocks and voltage, so it loses much less speed per
+    degree than pauses do, and the speed stays steady. Needs an administrator (Windows) or root (Linux); the
+    original limit is put back at exit."""
+
+    @staticmethod
+    def try_make(lib, h):
+        if os.environ.get("APSI_GPU_POWER_CONTROL", "1").strip().lower() in ("0", "off", "no", "false"):
+            return None
+        cur, dflt, lo, hi = ctypes.c_uint(), ctypes.c_uint(), ctypes.c_uint(), ctypes.c_uint()
+        try:
+            if lib.nvmlDeviceGetPowerManagementLimit(h, ctypes.byref(cur)) or \
+                    lib.nvmlDeviceGetPowerManagementDefaultLimit(h, ctypes.byref(dflt)) or \
+                    lib.nvmlDeviceGetPowerManagementLimitConstraints(h, ctypes.byref(lo), ctypes.byref(hi)):
+                return None
+            if lib.nvmlDeviceSetPowerManagementLimit(h, ctypes.c_uint(cur.value)) != 0:   # allowed at all?
+                return None
+        except AttributeError:
+            return None
+        pc = _PowerControl()
+        pc.lib, pc.h = lib, h
+        pc.orig = cur.value
+        pc.top = dflt.value
+        pc.floor = max(lo.value, int(dflt.value * 0.55))
+        pc.limit = float(cur.value)
+        import atexit
+        atexit.register(lambda: lib.nvmlDeviceSetPowerManagementLimit(h, ctypes.c_uint(pc.orig)))
+        return pc
+
+    def step(self, err, dt):
+        """PI on the temperature error: about 6 W per degree, and the limit keeps moving while the error lasts."""
+        new = min(self.top, max(self.floor, self.limit - (4000.0 * err * dt + 1500.0 * err * (err > 0))))
+        if abs(new - self.limit) >= 1000.0 or new in (self.top, self.floor):
+            if int(new) != int(self.limit):
+                self.lib.nvmlDeviceSetPowerManagementLimit(self.h, ctypes.c_uint(int(new)))
+        self.limit = new
+        return new <= self.floor + 1.0                 # at the floor: pauses may still be needed
 
 
 def _power_limit(lib, h):
