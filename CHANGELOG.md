@@ -34,6 +34,19 @@
   rounding; made once and memory-mapped afterwards) and a native thread team that starts a product on every core in
   about a microsecond. A Qwen2.5-0.5B-sized model: 96 → 52 ms per token on 2 cores. `APSI_CPU_WEIGHTS=bf16` for the
   exact weights.
+- **Large models whole on the GPU:** weights are quantized on the card itself to int8 or int4 (32 values per scale;
+  int4 as ggml's Q4_0) with new matrix-vector kernels that read them directly and a dequantize step for the
+  tensor-core prompt product. `gpu_weights="auto"` (`APSI_GPU_WEIGHTS`) keeps bfloat16 when the model fits, else
+  int8, else int4, and turns layers back into int8 where room is left — a 14B model on a 12 GB card runs all 48
+  layers on the GPU instead of 16.
+- **Split models done properly:** the processor's layers use the native int8 products (they fell back to float32
+  NumPy before), their int8 copy is cached on disk and memory-mapped (also for memory-mapped checkpoints, whose copy
+  stayed in RAM and could fill it), long prompts through them run on the GPU, and loading shows progress lines.
+  `lm.plan` tells what runs where, in which format, from RAM or SSD.
+- **`@gpu` calls reuse device buffers** instead of allocating and freeing them on every call (cuMemFree waits for
+  the GPU): faster video frames and loops.
+- **Benchmarks in four more languages:** Java, JavaScript (Node.js), C# (.NET) and Julia join C, C++, Rust and Go in
+  `benchmarks/heavy` (identical checksums); `benchmarks/tokens` and `benchmarks/gpu` added.
 - **Prompts on tensor cores** (RTX 30 series and newer): bfloat16 `mma.sync` with the activations split in two
   bfloat16 parts (matches float32 to about 1e-5), checked against the float32 kernel at start-up.
 - **`save_checkpoint` / `load_checkpoint`:** weights, optimizer state, step, config and files (tokenizer …) in one

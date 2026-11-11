@@ -75,7 +75,8 @@ class Int8Model(unittest.TestCase):
                "max_position_embeddings": 128, "eos_token_id": 1, "tie_word_embeddings": True,
                "hidden_act": "silu"}
         import json
-        with tempfile.TemporaryDirectory() as d, tempfile.TemporaryDirectory() as home:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as d, \
+                tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as home:   # Windows: mapped files stay open
             write_safetensors(os.path.join(d, "model.safetensors"), W, "BF16")
             with open(os.path.join(d, "config.json"), "w") as fh:
                 json.dump(cfg, fh)

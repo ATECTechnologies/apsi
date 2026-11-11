@@ -18,7 +18,7 @@ def tree(seed):
 
 class Checkpoint(unittest.TestCase):
     def roundtrip(self, shard):
-        with tempfile.TemporaryDirectory() as d:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as d:     # Windows: mapped files stay open
             p, g = tree(0), tree(1)
             opt = AdamW(1e-2)
             p = opt.step(p, g)
@@ -46,7 +46,7 @@ class Checkpoint(unittest.TestCase):
         self.assertTrue(out.endswith(".apsim"))
 
     def test_shards_load_from_any_name(self):
-        with tempfile.TemporaryDirectory() as d:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as d:     # Windows: mapped files stay open
             p = tree(2)
             idx = modelio.save_checkpoint(os.path.join(d, "big"), p, step=1, shard="2KB")
             self.assertTrue(idx.endswith(".index.json"))
@@ -56,7 +56,7 @@ class Checkpoint(unittest.TestCase):
                 np.testing.assert_array_equal(modelio.load_checkpoint(name).params.w, p.w)
 
     def test_plain_model_file(self):
-        with tempfile.TemporaryDirectory() as d:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as d:     # Windows: mapped files stay open
             p = tree(3)
             modelio.save_model(os.path.join(d, "m"), p)
             back = modelio.load_checkpoint(os.path.join(d, "m"))
