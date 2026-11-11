@@ -886,7 +886,7 @@ EPI_KERNELS = tuple([(f"gemm_tkn_e1a{j}", True, False, 1, j) for j in EPI_ACTS] 
                     [(f"gemm_tkk_e2a{j}", True, True, 2, j) for j in EPI_ACTS] + [("gemm_tkn_e3", True, False, 3, None)])
 
 
-def _tiled_module():
+def _tiled_module(early=False):
     """Matrix products on tensor cores with shared-memory tiles (sm_80+), the way fast GEMM libraries do them.
 
     A block of 8 warps computes 128 x 128 of C; each warp 64 x 32 (4 x 4 mma tiles of 16 x 8). The operands are read
@@ -900,7 +900,8 @@ def _tiled_module():
     blockIdx.z splits k (split-K): each part adds its share to C atomically (for gradients of weights: few output
     tiles, a long k). Requirements (checked by the caller): the contiguous dimension and the other strides are
     multiples of 4 and every operand starts on a 16-byte boundary."""
-    ir, m = _setup("apsi_train_tiled")
+    ir, m = _setup("apsi_train_tiled_x" if early else "apsi_train_tiled")
+    annotations = m.add_named_metadata("nvvm.annotations")
     g = _Gen(ir, m)
     i16, i32, i64, f32, C, F, G = ir.IntType(16), g.i32, g.i64, g.f32, g.C, g.F, g.G
     d = g.decl
@@ -941,6 +942,9 @@ def _tiled_module():
     def kernel(name, a_kc, b_kc, epi_mode=0, act_j=None, a_act=None):
         fn = ir.Function(m, ir.FunctionType(ir.VoidType(), [t for _, t in args]), name=name)
         fn.calling_convention = "ptx_kernel"
+        if early:                                 # 256 threads, two blocks per multiprocessor: at most 128 registers
+            for key, val in (("maxntidx", 256), ("minctasm", 2)):
+                annotations.add(m.add_metadata([fn, ir.MetaDataString(m, key), C(val)]))
         p = {n: a for (n, _), a in zip(args, fn.args)}
         allocas = fn.append_basic_block("allocas")
         top = fn.append_basic_block("top")
@@ -986,14 +990,31 @@ def _tiled_module():
             ci = umin(contig_idx, b.sub(contig_lim, C(4)))
             oi = umin(other_idx, b.sub(other_lim, C(1)))
             idx = b.add(base_off, b.add(b.mul(z64(oi), z64(s_other)), z64(ci)))
-            # an inline load with side effects: LLVM would otherwise sink it into the block that stores the next slice
-            # (after the products), and every slice would wait the full memory latency
-            addr = b.ptrtoint(b.gep(ptr, [idx], inbounds=True), i64)
-            return ("pending", b.call(ldg4, [addr]), ok, act, raw)
+            if early:
+                # an inline load with side effects: LLVM would otherwise sink it into the block that stores the next
+                # slice (after the products); with two blocks per multiprocessor the other block hides that wait,
+                # so this variant is chosen per product only where the card measures it faster
+                addr = b.ptrtoint(b.gep(ptr, [idx], inbounds=True), i64)
+                return ("pending", b.call(ldg4, [addr]), ok, act, raw)
+            vp = b.bitcast(b.gep(ptr, [idx], inbounds=True), ir.VectorType(f32, 4).as_pointer(1))
+            vec = b.load(vp, align=16)
+            hs = []
+            for j in range(4):                    # rounded to bfloat16 at once (round to nearest even)
+                x = b.extract_element(vec, C(j))
+                if act is not None:
+                    x = _act_one(b, x, act, F, ex2_f, False)
+                v = b.select(ok, x, F(0.0))
+                if raw is not None:
+                    raw.append(v)
+                u = b.bitcast(v, i32)
+                hs.append(b.lshr(b.add(b.add(u, C(0x7FFF)), b.and_(b.lshr(u, C(16)), C(1))), C(16)))
+            return ("now", [b.or_(hs[0], b.shl(hs[1], C(16))), b.or_(hs[2], b.shl(hs[3], C(16)))])
 
         def convert(pend):
             """The 4 values of a pending load as 2 words of 2 bfloat16 each (one cvt.rn.bf16x2 per pair: round to
             nearest even, the same as the emulator)."""
+            if pend[0] == "now":
+                return pend[1]
             _, vec, ok, act, raw = pend
             xs = []
             for j in range(4):
@@ -1178,6 +1199,8 @@ def _tiled_module():
     for j in EPI_ACTS:                            # dW = act(h)^T dy without keeping act(h)
         kernel(f"gemm_tmn_aa{j}", False, False, 0, None, j)
 
+    if early:
+        return _emit(m, "sm_80")
     # bf_lo: Y = X - bfloat16(X), the part bfloat16 drops. float32 products as three bfloat16 products on the
     # tensor cores: A B = hi(A) hi(B) + lo(A) hi(B) + hi(A) lo(B), with an error near float32's own
     fn = ir.Function(m, ir.FunctionType(ir.VoidType(), [G(f32), G(f32), i32]), name="bf_lo")
@@ -1253,6 +1276,9 @@ def _flash_module():
                     ("H", i32), ("scale2", f32), ("causal", i32)]
         fn = ir.Function(m, ir.FunctionType(ir.VoidType(), [t for _, t in args]), name=name)
         fn.calling_convention = "ptx_kernel"
+        if early:                                 # 256 threads, two blocks per multiprocessor: at most 128 registers
+            for key, val in (("maxntidx", 256), ("minctasm", 2)):
+                annotations.add(m.add_metadata([fn, ir.MetaDataString(m, key), C(val)]))
         p = {n: a for (n, _), a in zip(args, fn.args)}
         allocas = fn.append_basic_block("allocas")
         top = fn.append_basic_block("top")
@@ -1577,7 +1603,8 @@ def ptx(which):
                 return text
     except (OSError, ImportError):
         pass
-    text = {"main": _main_module, "tc": _tc_module, "tiled": _tiled_module, "flash": _flash_module}[which]()
+    text = {"main": _main_module, "tc": _tc_module, "tiled": _tiled_module, "tiled_x": lambda: _tiled_module(True),
+            "flash": _flash_module}[which]()
     if path:
         try:
             os.makedirs(os.path.dirname(path), exist_ok=True)

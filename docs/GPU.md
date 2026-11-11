@@ -93,27 +93,39 @@ let logits = predict(model, r.params, X_test, backend="gpu")
 | Losses | `cross_entropy` (negative labels left out), `mse` |
 | Optimizers | Adam, AdamW, SGD (momentum); `clip=` (global norm, computed on the card), `schedule=` |
 | Precision | `"auto"`/`"bf16"`: bfloat16 tensor cores, float32 sums; `"fp32"`: three tensor-core passes (about float32); `"fp8"`, `"fp6"`, `"fp6_e2m3"`, `"fp4"`, `"int8"`, `"int4"`: weights rounded to that format every forward pass, float32 master copy |
-| Not yet | convolutions, LSTM/GRU, graph layers, custom layers, losses other than the two — `backend="torch"` or `"numpy"` train those, and `fit` says so |
+| Not yet | convolutions, LSTM/GRU, graph layers, mixture of experts, custom layers, losses other than the two — `backend="torch"` or `"numpy"` train those, and `fit` says so |
 
 How it works: parameters, gradients and the AdamW state are three flat arrays updated by one kernel; the data set is
 copied to the card once and every batch is gathered there, so inside an epoch the processor never makes the card
 wait; the loss is read back once per epoch. Gradients equal Apsi's autodiff to 1e-5 and the loss curve equals the
 NumPy backend's (tests/test_gpu_train.py), on the Emulator and on the real card.
 
-**Measured** (the GPT above, 10.9 M parameters, 4,278 windows of 128 bytes, 3 epochs, RTX 3060):
+| Extras | `ema=0.999` keeps a moving average of the weights (`r.ema_params`); `ewc=(anchor_params, fisher, strength)` pulls each weight toward an earlier task's value in proportion to its importance (continual learning without forgetting) |
 
-| Run | Throughput | Held-out loss |
-|---|---:|---:|
-| Apsi `backend="gpu"`, bf16 | 64,398 tokens/s | 6.44 → 2.304 |
-| Apsi, fp32 (3 passes) | 59,903 tokens/s | 6.43 → 2.309 |
-| Apsi, fp8 / fp6_e2m3 / fp4 / int4 weights | 59,000–61,000 tokens/s | 2.266 / 2.317 / 2.351 / 2.298 |
-| PyTorch 2.14 bf16 autocast (cuBLAS, flash attention) | 142,287 tokens/s | 6.88 → 2.352 |
-| PyTorch fp32 | 76,434 tokens/s | 6.88 → 2.355 |
-| Apsi on the processor (autodiff, small model) | 3,776 tokens/s | — |
+**Measured** (the GPT above, 10.9 M parameters; the very same data.bin for both: 4,396 windows of 128 bytes to
+train on, 232 held out; batch 32, AdamW 1e-3, 3 epochs; RTX 3060 12 GB at an 80 % power limit, held at 77 °C):
 
-PyTorch is still about 2.2× faster at training this model (cuBLAS); Apsi needs nothing installed, reaches the same
-loss, and is 17× faster than the processor. The model trained in a low-bit format runs in that format afterwards
-with exactly the weights it learned (`APSI_GPU_WEIGHTS=fp4` uses the same rounding and the same blocks of 32).
+| Run | Throughput (steady, every epoch) | Held-out loss | GPU memory |
+|---|---:|---:|---:|
+| **Apsi `backend="gpu"`, bf16** | **141,475 tokens/s** (141,414 / 143,323 / 142,959) | 6.26 → 2.424 | 810 MB |
+| Apsi, fp8 / fp4 weights | 129,143 / 121,000 tokens/s | 2.441 / 2.414 | 851 MB |
+| Apsi, fp32 (3 bfloat16 passes) | 59,060 tokens/s | 2.422 | 1,001 MB |
+| PyTorch bf16 autocast (cuBLAS, flash attention) | 133,491 tokens/s | 2.355 | 610 MB |
+| PyTorch tf32 | 89,762 tokens/s | 2.348 | |
+| PyTorch fp32 | 76,506 tokens/s | 2.346 | |
+
+Why the numbers differ: Apsi's bf16 kernels (tiled tensor-core products with the bias, activation and residual
+fused in, fused attention, a warp per row for the norms, one AdamW kernel over all parameters, the data resident on
+the card) are now faster than PyTorch's general kernels for this model. The RTX 3060 has no fp8 or fp4 hardware
+(that starts with the RTX 40 / Ada generation), so fp8 and fp4 there are *simulated* (rounded weights): they cost a
+little speed and serve to train models meant to run in those formats. True float32 is bounded by the card's float32
+rate; PyTorch's cuBLAS float32 is still faster than Apsi's three-pass float32. PyTorch uses less memory (its
+activations are bfloat16; Apsi keeps float32 activations). The products come in two builds and the card times both
+for each shape the first time it sees it, keeping the faster (`APSI_GEMM_VARIANT=a|x` fixes one).
+
+Older and newer cards: on Turing (RTX 20) and GTX 16 the trainer runs on its float32 kernels (no bfloat16 tensor
+cores there); on Hopper and Blackwell (H100, H200, B200, RTX 50) the Ampere kernels run as they are (the driver
+compiles them for the card), without the newer cards' own instructions (wgmma, TMA, fp8 tensor cores) yet.
 
 ---
 

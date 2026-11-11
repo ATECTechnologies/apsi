@@ -1316,7 +1316,7 @@ def _gpu_supports(model):
 
 def fit(model, params, X, y=None, loss="mse", opt=None, epochs=10, batch_size=None, seed=0, verbose=True,
         clip=None, schedule=None, graph=None, mask=None, val=None, backend="numpy", device="auto",
-        precision="auto", compile=False, workers=1):
+        precision="auto", compile=False, workers=1, ema=None, ewc=None):
     """Train `model`. Returns record(params, history, val_history, device).
 
     loss: "mse", "cross_entropy", "mae", "bce", "vae" ("huber" on torch) or a function loss(prediction, target).
@@ -1338,9 +1338,11 @@ def fit(model, params, X, y=None, loss="mse", opt=None, epochs=10, batch_size=No
         dev = "cuda" if str(device).lower() in ("auto", "gpu", "cuda") else device
         try:
             return gpu_train.fit(model, params, X, y, loss, opt, epochs, batch_size, seed, verbose, clip, schedule, val,
-                                 device=dev, precision=precision)
+                                 device=dev, precision=precision, ema=ema, ewc=ewc)
         except gpu_train.TrainError as e:
             raise RuntimeErr(f"backend=\"gpu\": {e}")
+    if ema is not None or ewc is not None:
+        raise RuntimeErr("ema= and ewc= train on the GPU trainer: fit(..., backend=\"gpu\")")
     if which == "torch":
         from . import torch_backend
         return torch_backend.fit(model, params, X, y, loss, opt, epochs, batch_size, seed, verbose, clip, schedule,

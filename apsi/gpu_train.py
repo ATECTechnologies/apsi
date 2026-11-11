@@ -397,6 +397,18 @@ class Gpu(_Ops):
                 self.tiled = True
             except Exception as e:
                 self.tc_why = f"tiled products unavailable: {type(e).__name__}: {e}"
+        if self.tiled and os.environ.get("APSI_GEMM_VARIANT", "auto").strip().lower() != "a":
+            try:                                         # the second build (loads first, 2 blocks per SM)
+                xmod, first = dev.load("apsi-train-tiled-x", KS.ptx("tiled_x"))
+                xf = {"gemm_tkn#x": first}
+                for name in KS.TILED[1:] + tuple(e[0] for e in KS.EPI_KERNELS) + \
+                        tuple(f"gemm_tmn_aa{j}" for j in KS.EPI_ACTS):
+                    f = ctypes.c_void_p()
+                    dev.drv.check(lib.cuModuleGetFunction(ctypes.byref(f), xmod, name.encode()), "cuModuleGetFunction")
+                    xf[name + "#x"] = f
+                self.fn.update(xf)
+            except Exception:                            # noqa: BLE001  (the first build alone then)
+                pass
         self.sms = int(getattr(dev, "sms", 0) or 28)
         self.flash = False
         if self.tc and os.environ.get("APSI_FLASH", "1").strip() not in ("0", "false", "no"):
@@ -413,6 +425,8 @@ class Gpu(_Ops):
                 self.tc_why = f"fused attention unavailable: {type(e).__name__}: {e}"
         self._calls = {}
         self._scr = {}
+        self._occ = {}
+        self._choice = {}
         self.profile = None                              # {kernel: (seconds, launches)} while profiling
         self._pending = []
         self._lib = lib
@@ -420,6 +434,11 @@ class Gpu(_Ops):
         lib.cuEventElapsedTime.argtypes = [ctypes.POINTER(ctypes.c_float), ctypes.c_void_p, ctypes.c_void_p]
         lib.cuEventDestroy_v2.argtypes = [ctypes.c_void_p]
         lib.cuEventSynchronize.argtypes = [ctypes.c_void_p]
+        try:
+            lib.cuOccupancyMaxActiveBlocksPerMultiprocessor.argtypes = [ctypes.POINTER(ctypes.c_int), ctypes.c_void_p,
+                                                                         ctypes.c_int, ctypes.c_size_t]
+        except AttributeError:
+            pass
         lib.cuEventCreate.argtypes = [ctypes.POINTER(ctypes.c_void_p), ctypes.c_uint]
         lib.cuFuncGetAttribute.argtypes = [ctypes.POINTER(ctypes.c_int), ctypes.c_int, ctypes.c_void_p]
         self._launch = lib.cuLaunchKernel
@@ -637,6 +656,56 @@ class Gpu(_Ops):
             return None
         return f"gemm_t{ka}{kb}"
 
+    def _per_sm(self, name):
+        """Blocks of this kernel that fit on one multiprocessor at once (registers, shared memory)."""
+        n = self._occ.get(name)
+        if n is None:
+            v = ctypes.c_int()
+            try:
+                ok = self._lib.cuOccupancyMaxActiveBlocksPerMultiprocessor(ctypes.byref(v), self.fn[name], 256,
+                                                                          ctypes.c_size_t(0)) == 0
+            except AttributeError:
+                ok = False
+            n = self._occ[name] = max(1, v.value) if ok else 2
+        return n
+
+    def _variant(self, name, grid, args, M, N, ldc, nb):
+        """Which build of a tiled product runs: the one the card itself measured faster for this shape (each is
+        timed twice on scratch outputs the first time the shape comes; APSI_GEMM_VARIANT=a or x fixes it)."""
+        alt = name + "#x"
+        if alt not in self.fn or nb != 1:
+            return name
+        force = os.environ.get("APSI_GEMM_VARIANT", "auto").strip().lower()
+        if force in ("a", "x"):
+            return alt if force == "x" else name
+        key = (name, grid, tuple(a for a in args if a[0] != "p"))
+        pick = self._choice.get(key)
+        if pick is not None:
+            return pick
+        prof, self.profile = self.profile, None
+        targs = list(args)
+        targs[2] = self.p(self._scratch("tune_c", M * ldc + N))
+        if targs[23][1]:
+            targs[23] = self.p(self._scratch("tune_x", M * ldc + N))
+        if targs[26][1]:
+            targs[26] = self.p(self._scratch("tune_db", N))
+        best, best_t = name, None
+        ms = ctypes.c_float()
+        for cand in (name, alt, name, alt):
+            e0, e1 = self._event(), self._event()
+            self._lib.cuEventRecord(e0, None)
+            self._go(cand, grid, 256, *targs)
+            self._lib.cuEventRecord(e1, None)
+            self._lib.cuEventSynchronize(e1)
+            self._lib.cuEventElapsedTime(ctypes.byref(ms), e0, e1)
+            self._lib.cuEventDestroy_v2(e0)
+            self._lib.cuEventDestroy_v2(e1)
+            if best_t is None or ms.value < best_t:
+                best, best_t = cand, ms.value
+        self.profile = prof
+        self._choice[key] = best
+        return best
+
     def _scratch(self, key, n):
         bf = self._scr.get(key)
         if bf is None or bf.n < n:
@@ -667,7 +736,7 @@ class Gpu(_Ops):
     def _gemm(self, A, B, Cv, bias, M, N, K, sam, sak, sbk, sbn, ldc, nb1, nb2, sa, sb, sc, alpha, beta, passes,
               epi=0, X2=None, act=0, a_act=None):
         if passes == 3 and self.tiled and a_act is None and nb1 * nb2 == 1 and \
-                os.environ.get("APSI_FP32_TILED", "1").strip() not in ("0", "false", "no") and \
+                os.environ.get("APSI_FP32_TILED", "0").strip() in ("1", "true", "yes") and \
                 self._gemm3(A, B, Cv, bias, M, N, K, sam, sak, sbk, sbn, ldc, sa, sb, sc, alpha, beta, epi, X2, act):
             return True
         name = self._tiled_ok(A, B, M, N, K, sam, sak, sbk, sbn, sa, sb) if self.tiled and passes == 1 else None
@@ -688,18 +757,20 @@ class Gpu(_Ops):
             # card (2 blocks per multiprocessor): 9 tiles split 7 ways is 63 blocks = 2 waves of 56, the second
             # almost empty; split 6 ways it is one full wave
             if blocks < 4 * self.sms and nb1 * nb2 == 1 and K >= 512 and (beta or ldc == N) and not epi:
-                want = _split_k(blocks, K, 2 * self.sms)
+                want = _split_k(blocks, K, self._per_sm(name) * self.sms)
                 if want > 1:
                     kchunk = -(-(-(-K // want)) // KS.BK) * KS.BK
                     nz = -(-K // kchunk)
                     if nz > 1 and not beta:
                         self.fill(Cv, M * N, 0.0)
             db = self._db if name.startswith("gemm_tmn") and sbn == 1 else None
-            self._go(name, (tiles, nb1 * nb2, nz), 256, self.p(A), self.p(B), self.p(Cv), self.p(bias), ("u", M),
-                     ("u", N), ("u", K), ("u", sam), ("u", sak), ("u", sbk), ("u", sbn), ("u", ldc), ("u", nb2),
-                     ("u", sa[0]), ("u", sa[1]), ("u", sb[0]), ("u", sb[1]), ("u", sc[0]), ("u", sc[1]),
-                     ("f", alpha), ("u", 1 if beta else 0), ("u", 1 if bias is not None else 0), ("u", kchunk),
-                     self.p(X2), ("u", epi), ("u", act), self.p(db), ("u", 1 if db is not None else 0))
+            args = [self.p(A), self.p(B), self.p(Cv), self.p(bias), ("u", M),
+                    ("u", N), ("u", K), ("u", sam), ("u", sak), ("u", sbk), ("u", sbn), ("u", ldc), ("u", nb2),
+                    ("u", sa[0]), ("u", sa[1]), ("u", sb[0]), ("u", sb[1]), ("u", sc[0]), ("u", sc[1]),
+                    ("f", alpha), ("u", 1 if beta else 0), ("u", 1 if bias is not None else 0), ("u", kchunk),
+                    self.p(X2), ("u", epi), ("u", act), self.p(db), ("u", 1 if db is not None else 0)]
+            grid = (tiles, nb1 * nb2, nz)
+            self._go(self._variant(name, grid, args, M, N, ldc, nb1 * nb2), grid, 256, *args)
             if db is not None:
                 self._db = None                          # taken
             return True
@@ -1228,8 +1299,20 @@ class Net:
     def backward(self, dy):
         self.root.bwd(dy, False)
 
-    def params(self):
-        flat = self.ops.get(self.P, self.n)
+    def flat_like(self, tree):
+        """A tree shaped like the parameters, flattened to this network's layout (float32)."""
+        flat = np.zeros(self.n, np.float32)
+        mine, theirs = tree_leaves(self.params_tree), tree_leaves(tree)
+        if len(mine) != len(theirs):
+            raise TrainError("ewc: the anchor and fisher must have the shapes of the parameters")
+        for a, t in zip(mine, theirs):
+            if isinstance(a, np.ndarray) and id(a) in self.offsets:
+                o = self.offsets[id(a)]
+                flat[o:o + a.size] = np.asarray(t, np.float32).reshape(-1)
+        return flat
+
+    def params(self, buf=None):
+        flat = self.ops.get(buf if buf is not None else self.P, self.n)
 
         def back(a):
             if isinstance(a, np.ndarray) and id(a) in self.offsets:
@@ -1272,7 +1355,11 @@ def _inputs(X, ids):
 
 
 def fit(model, params, X, y=None, loss="mse", opt=None, epochs=10, batch_size=None, seed=0, verbose=True,
-        clip=None, schedule=None, val=None, device="cuda", precision="auto", ops=None):
+        clip=None, schedule=None, val=None, device="cuda", precision="auto", ops=None, ema=None, ewc=None):
+    """ema=0.999: also keeps an exponential moving average of the weights (record.ema_params), the smoother set
+    that often generalizes better. ewc=(anchor_params, fisher, strength): elastic weight consolidation, a pull of
+    every weight toward anchor_params in proportion to its importance (fisher, the same shapes; e.g. the mean
+    squared gradients on the old task), so a model learns a new task without forgetting the old one."""
     from . import layers as L, ops as aops
     from .stdlib import Adam, AdamW, SGD
     if ops is None:
@@ -1301,6 +1388,25 @@ def fit(model, params, X, y=None, loss="mse", opt=None, epochs=10, batch_size=No
     if st2 is not None:
         ops.fill((st2, 0), net.n, 0.0)
     SQ = ops.alloc(1)
+    EMA = EWC_A = EWC_F = EWC_T = None
+    if ema is not None:
+        ema = float(ema)
+        if not 0.0 < ema < 1.0:
+            raise TrainError(f"ema={ema}: give the decay, between 0 and 1 (0.999 is usual)")
+        EMA = ops.alloc(net.n)
+        ops.fill((EMA, 0), net.n, 0.0)
+        ops.axpy((EMA, 0), (net.P, 0), net.n, 1.0)
+        net.owned.append(EMA)
+    if ewc is not None:
+        try:
+            anchor, fisher, lam = ewc
+        except (TypeError, ValueError):
+            raise TrainError("ewc=(anchor_params, fisher, strength)") from None
+        EWC_A, EWC_F, EWC_T = ops.alloc(net.n), ops.alloc(net.n), ops.alloc(net.n)
+        ops.put(EWC_A, net.flat_like(anchor))
+        ops.put(EWC_F, net.flat_like(fisher))
+        net.owned += [EWC_A, EWC_F, EWC_T]
+        lam = float(lam)
     t_step = int(getattr(opt, "t", 0))
     bs = int(batch_size) if batch_size else n
     xw, yw = int(np.prod(Xa.shape[1:])), int(np.prod(Ya.shape[1:]))
@@ -1363,6 +1469,12 @@ def fit(model, params, X, y=None, loss="mse", opt=None, epochs=10, batch_size=No
                     m = rows * shape[-1]
                     ops.mse(out, Yd, dout, lossv, m, 1.0 / m, len(b) / (n * m))
                 net.backward(dout)
+                if EWC_A is not None:                       # g += strength * F * (w - anchor)
+                    ops.fill((EWC_T, 0), net.n, 0.0)
+                    ops.axpy((EWC_T, 0), (net.P, 0), net.n, 1.0)
+                    ops.axpy((EWC_T, 0), (EWC_A, 0), net.n, -1.0)
+                    ops.mul3((EWC_T, 0), (EWC_T, 0), (EWC_F, 0), net.n)
+                    ops.axpy((net.G, 0), (EWC_T, 0), net.n, lam)
                 if clip:
                     ops.fill((SQ, 0), 1, 0.0)
                     ops.sumsq((net.G, 0), net.n, (SQ, 0))
@@ -1375,6 +1487,9 @@ def fit(model, params, X, y=None, loss="mse", opt=None, epochs=10, batch_size=No
                     ops.sgd((net.P, 0), (net.G, 0), (st1, 0), (SQ, 0), net.n, lr, float(opt.momentum),
                             float(clip or 0.0))
                 step += 1
+                if EMA is not None:                         # ema <- d ema + (1 - d) w
+                    ops.axpy((EMA, 0), (EMA, 0), net.n, ema - 1.0)
+                    ops.axpy((EMA, 0), (net.P, 0), net.n, 1.0 - ema)
                 gov.tick(ops.sync)
             if can_mark:
                 ev = ops._event()
@@ -1406,6 +1521,7 @@ def fit(model, params, X, y=None, loss="mse", opt=None, epochs=10, batch_size=No
         opt.t = t_step
         peak = ops.used
         out_params = net.params()
+        ema_params = net.params(EMA) if EMA is not None else None
     finally:
         for bf in (st1, st2, SQ):
             if bf is not None:
@@ -1417,7 +1533,7 @@ def fit(model, params, X, y=None, loss="mse", opt=None, epochs=10, batch_size=No
     if verbose and temp and temp["paced_s"]:
         print(f"GPU kept near {temp['target_c']:.0f} C (highest {temp['max_c']:.0f} C, paced {temp['paced_s']} s)")
     return Record(params=out_params, history=history, val_history=val_hist, gpu_memory_mb=round(peak / 2 ** 20),
-                  gpu_temperature=temp, epoch_seconds=ep_seconds, epoch_temperature_c=ep_temp,
+                  gpu_temperature=temp, epoch_seconds=ep_seconds, epoch_temperature_c=ep_temp, ema_params=ema_params,
                   device=f"gpu ({getattr(ops, 'name', '?')}, Apsi kernels"
                          f"{', tensor cores' if ops.tc else ''})")
 

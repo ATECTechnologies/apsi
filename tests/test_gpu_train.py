@@ -65,6 +65,31 @@ class Trainer(unittest.TestCase):
                        verbose=False, precision="fp32", clip=1.0, ops=GT.Emulator())
             np.testing.assert_allclose(a.history, b.history, rtol=1e-4)
 
+    def test_ema_and_ewc(self):
+        """EMA of the weights (the GLA project's teacher weights) and EWC (keep what an earlier task needed)."""
+        from apsi.values import tree_leaves
+        rng = np.random.default_rng(3)
+        m = L.mlp([6, 16, 3], "gelu")
+        X, y = rng.normal(size=(32, 6)), rng.integers(0, 3, 32)
+        p0 = m.init(seed=0)
+        one = GT.fit(m, p0, X, y, loss="cross_entropy", opt=SGD(0.1), epochs=1, verbose=False, ema=0.9,
+                     precision="fp32", ops=GT.Emulator())                  # one full-batch step
+        for e, a, b in zip(tree_leaves(one.ema_params), tree_leaves(p0), tree_leaves(one.params)):
+            np.testing.assert_allclose(e, 0.9 * np.asarray(a) + 0.1 * np.asarray(b), rtol=1e-5, atol=1e-6)
+        fisher = [np.ones_like(np.asarray(a)) for a in tree_leaves(p0)]
+        from apsi.values import tree_map
+        it = iter(fisher)
+        fisher = tree_map(lambda a: next(it) if isinstance(a, np.ndarray) else a, p0)
+        free = GT.fit(m, p0, X, y, loss="cross_entropy", opt=SGD(0.1), epochs=20, verbose=False, precision="fp32",
+                      ops=GT.Emulator())
+        held = GT.fit(m, p0, X, y, loss="cross_entropy", opt=SGD(0.1), epochs=20, verbose=False, precision="fp32",
+                      ewc=(p0, fisher, 5.0), ops=GT.Emulator())
+        drift = lambda r: sum(float(np.abs(np.asarray(a) - np.asarray(b)).sum())
+                              for a, b in zip(tree_leaves(r.params), tree_leaves(p0)))
+        self.assertLess(drift(held), 0.5 * drift(free))
+        with self.assertRaises(GT.TrainError):
+            GT.fit(m, p0, X, y, loss="cross_entropy", epochs=1, verbose=False, ema=1.5, ops=GT.Emulator())
+
     def test_mixed_and_low_bit_precision_learn(self):
         rng = np.random.default_rng(1)
         lm = L.transformer_lm(23, d=32, heads=4, layers=2, context=12)
@@ -177,7 +202,17 @@ class RealGpu(unittest.TestCase):
             np.testing.assert_array_equal(g.get(WQ[0][0], 70 * 48), e.get(WQ[1][0], 70 * 48), f"fakeq {kind}")
 
     def test_tiled_products(self):
-        """The shared-memory tensor-core products: every layout, edges, batches of heads and split k."""
+        """The shared-memory tensor-core products: every layout, edges, batches of heads and split k; both builds
+        (the card picks the faster per shape, so both must be right)."""
+        import os
+        from unittest import mock
+        for variant in ("a", "x"):
+            if variant == "x" and "gemm_tkk#x" not in self.g.fn:
+                continue
+            with self.subTest(variant=variant), mock.patch.dict(os.environ, {"APSI_GEMM_VARIANT": variant}):
+                self._tiled_body()
+
+    def _tiled_body(self):
         g, e = self.g, GT.Emulator(tc=True)
         if not g.tiled:
             self.skipTest(f"no tiled products here: {g.tc_why}")

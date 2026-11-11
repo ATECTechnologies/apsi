@@ -102,7 +102,7 @@ class Governor:
             self.fraction = 0.0                         # the power limit holds it: no pauses, steady speed
             return
         if self.fraction > 0.0 or e > 0.0:              # a cool card that is not paced winds nothing up
-            gain = self.KI * (3.0 if e > 1.0 else 1.0)
+            gain = self.KI * (8.0 if e > 2.0 else 3.0 if e > 1.0 else 1.0)    # far above: catch up fast
             self.integral = min(0.85, max(0.0, self.integral + gain * e * dt))
         self.fraction = min(0.85, max(0.0, self.integral + self.KP * max(e, -5.0)))
 
@@ -123,11 +123,15 @@ class Governor:
         # each followed by a wait for the card, which by itself would leave the card idle while the next is queued
         self.debt = getattr(self, "debt", 0.0) + work * frac / (1.0 - frac)
         if self.debt >= 0.02:
+            t0 = time.monotonic()
             if sync is not None:
                 sync()
+            # the wait for the card is its queued work (several steps of a large model): work done, so it earns its
+            # share of pause too (counted into the next one), or the pauses fall short and the card runs hot
+            busy = min(time.monotonic() - t0, 2.0)
             time.sleep(self.debt)
             self.paced += self.debt
-            self.debt = 0.0
+            self.debt = busy * frac / (1.0 - frac)
             self.last_tick = time.monotonic()
 
     def status(self):
