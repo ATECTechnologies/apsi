@@ -734,9 +734,10 @@ class Decoder:
         from .hub_gpu import QBYTES
         W = self.W
         mode = str(getattr(self, "gpu_weights", None) or os.environ.get("APSI_GPU_WEIGHTS", "auto")).strip().lower()
-        mode = {"q8": "int8", "q4": "int4", "fp16": "bf16", "bfloat16": "bf16"}.get(mode, mode)
-        if mode not in ("auto", "bf16", "int8", "int4"):
-            raise ModelError(f"gpu_weights must be auto, bf16, int8 or int4 (got '{mode}')")
+        mode = {"q8": "int8", "q4": "int4", "fp16": "bf16", "bfloat16": "bf16", "e4m3": "fp8", "fp8_e4m3": "fp8",
+                "e2m1": "fp4", "mxfp4": "fp4"}.get(mode, mode)
+        if mode not in ("auto", "bf16", "int8", "int4", "fp8", "fp4"):
+            raise ModelError(f"gpu_weights must be auto, bf16, int8, int4, fp8 or fp4 (got '{mode}')")
         head_vals = int(np.prod(self._wshape(None)))
         free = r.free_memory()
 

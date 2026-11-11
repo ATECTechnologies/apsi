@@ -27,7 +27,8 @@ NT = 128                                # threads per block of the other kernels
 LOG2E = 1.4426950408889634
 KERNELS = ("apsi_kernel", "gemv2", "gemv8n", "gemv2n", "gemv16", "gemv16n", "gemm", "gemm32", "rms", "qkv_prep", "attention", "attn_merge", "qkv_prep_h", "attention_h",
            "act_mul", "lg_prep", "lg_sum", "lg_pick", "embed",
-           "quant8", "gemvq8", "gemvq8n", "deq8", "quant4", "gemvq4", "gemvq4n", "deq4")                           # apsi_kernel = gemv8 (the module's first entry)
+           "quant8", "gemvq8", "gemvq8n", "deq8", "quant4", "gemvq4", "gemvq4n", "deq4",
+           "quantf8", "gemvqf8", "gemvqf8n", "deqf8", "quantf4", "gemvqf4", "gemvqf4n", "deqf4")                           # apsi_kernel = gemv8 (the module's first entry)
 GEMM_ROWS = 8                           # from this many rows on, the tiled product
 QROWS = 4                               # int8 / int4 products: rows per warp (QR in the kernel)
 NTA = 256                               # threads per attention block (8 warps)
@@ -693,7 +694,35 @@ def _generate_ptx():
     rint_f = decl("llvm.rint.f32", f32, [f32])
     fabs_f = decl("llvm.fabs.f32", f32, [f32])
 
-    def quant(name, bits):
+    def fp_code(b, t, bits):
+        """Round t (already divided by the scale, |t| <= the format's largest value) to the nearest fp8 E4M3 or
+        fp4 E2M1 value and return its code."""
+        a = b.call(fabs_f, [t])
+        neg = b.fcmp_ordered("<", t, F(0.0))
+        if bits == 4:                                     # 0, 0.5, 1, 1.5, 2, 3, 4, 6: codes 0..7 in this order
+            idx = C(0)
+            for th, up in ((0.25, False), (0.75, True), (1.25, False), (1.75, True), (2.5, False), (3.5, True),
+                           (5.0, False)):                 # ties to the even code, as round-to-nearest-even
+                idx = b.add(idx, b.zext(b.fcmp_ordered(">=" if up else ">", a, F(th)), i32))
+            sign = b.select(b.and_(neg, b.icmp_unsigned("!=", idx, C(0))), C(8), C(0))
+            return b.or_(idx, sign)
+        u = b.bitcast(a, i32)
+        e = b.sub(b.lshr(u, C(23)), C(127))
+        e_eff = b.select(b.icmp_signed("<", e, C(-6)), C(-6), e)
+        step = b.bitcast(b.shl(b.add(e_eff, C(127 - 3)), C(23)), f32)
+        qm = b.fmul(b.call(rint_f, [b.fdiv(a, step)]), step)
+        u2 = b.bitcast(qm, i32)
+        e2 = b.sub(b.lshr(u2, C(23)), C(127))
+        is_sub = b.icmp_signed("<", e2, C(-6))
+        m_sub = b.fptoui(b.call(rint_f, [b.fmul(qm, F(512.0))]), i32)
+        E = b.add(e2, C(7))
+        m_norm = b.and_(b.lshr(u2, C(20)), C(7))
+        code = b.select(is_sub, m_sub, b.or_(b.shl(E, C(3)), m_norm))
+        code = b.select(b.fcmp_ordered("==", qm, F(0.0)), C(0), code)
+        sign = b.select(b.and_(neg, b.icmp_unsigned("!=", code, C(0))), C(128), C(0))
+        return b.or_(code, sign)
+
+    def quant(name, bits, fp=False):
         k = K(name, [("WB", G(i32)), ("Q", G(i32)), ("S", G(f32)), ("O", i32), ("I", i32)])
         b, p = k.b, k.p
         g = b.add(b.mul(k.cta, C(NT)), k.tid)
@@ -713,7 +742,9 @@ def _generate_ptx():
                 bigger = b.fcmp_ordered(">", av, amax)
                 mval = b.select(bigger, v, mval)
                 amax = b.select(bigger, av, amax)
-            if bits == 8:
+            if fp:
+                sc = b.fdiv(amax, F(448.0 if bits == 8 else 6.0))
+            elif bits == 8:
                 sc = b.fdiv(amax, F(127.0))
                 lo_q, hi_q = -127.0, 127.0
             else:                                         # 16 levels: the extreme value maps to -8 exactly
@@ -722,6 +753,11 @@ def _generate_ptx():
             inv = b.select(b.fcmp_ordered("!=", sc, F(0.0)), b.fdiv(F(1.0), sc), F(0.0))
             qs = []
             for v in vals:
+                if fp:
+                    top = F(448.0 if bits == 8 else 6.0)
+                    t = b.call(max_f, [b.fsub(F(0.0), top), b.call(decl_min, [top, b.fmul(v, inv)])])
+                    qs.append(fp_code(b, t, bits))
+                    continue
                 q = b.call(rint_f, [b.fmul(v, inv)])
                 q = b.call(max_f, [F(lo_q), b.call(decl_min, [F(hi_q), q])])
                 qs.append(b.fptosi(q, i32))
@@ -734,7 +770,7 @@ def _generate_ptx():
                     if bits == 8:
                         part = b.shl(b.and_(q, C(0xFF)), C(8 * j))
                     else:
-                        part = b.shl(b.and_(b.add(q, C(8)), C(0xF)), C(4 * j))
+                        part = b.shl(b.and_(q if fp else b.add(q, C(8)), C(0xF)), C(4 * j))
                     acc_w = b.or_(acc_w, part)
                 words.append(acc_w)
             dst = b.mul(b.zext(g, i64), ir.Constant(i64, len(words)))
@@ -743,21 +779,34 @@ def _generate_ptx():
             k.st(sc, p["S"], g)
         k.ret()
 
-    def qvals(b, words, bits):
+    def code_value(b, c, bits, fp):
+        """The value (before the scale) of one code: int8 / int4 (stored + 8), or fp8 E4M3 / fp4 E2M1."""
+        if not fp:
+            if bits == 8:
+                return b.sitofp(b.ashr(b.shl(c, C(24)), C(24)), f32)
+            return b.sitofp(b.sub(c, C(8)), f32)
+        if bits == 8:
+            sign, E, M, mb, bias, sub = b.lshr(c, C(7)), b.and_(b.lshr(c, C(3)), C(15)), b.and_(c, C(7)), 20, 7, 2.0 ** -9
+        else:
+            sign, E, M, mb, bias, sub = b.lshr(c, C(3)), b.and_(b.lshr(c, C(1)), C(3)), b.and_(c, C(1)), 22, 1, 0.5
+        normal = b.bitcast(b.or_(b.shl(b.add(E, C(127 - bias)), C(23)), b.shl(M, C(mb))), f32)
+        small = b.fmul(b.uitofp(M, f32), F(sub))
+        mag = b.select(b.icmp_unsigned("==", E, C(0)), small, normal)
+        return b.select(b.icmp_unsigned("!=", sign, C(0)), b.fsub(F(0.0), mag), mag)
+
+    def qvals(b, words, bits, fp=False):
         """32 float values (without the scale) of one block."""
         out = []
+        per = 32 // bits
         for w in words:
-            if bits == 8:
-                for j in range(4):
-                    out.append(b.sitofp(b.ashr(b.shl(w, C(24 - 8 * j)), C(24)), f32))
-            else:
-                for j in range(8):
-                    out.append(b.sitofp(b.sub(b.and_(b.lshr(w, C(4 * j)), C(0xF)), C(8)), f32))
+            for j in range(per):
+                c = b.and_(b.lshr(w, C(bits * j)), C((1 << bits) - 1))
+                out.append(code_value(b, c, bits, fp))
         return out
 
     QR = 4                                               # rows per warp: each x value read once for 4 rows
 
-    def gemvq(name, bits, norm=False):
+    def gemvq(name, bits, norm=False, fp=False):
         """One warp computes QR rows, so x (the larger stream per weight at 4 or 8 bits) is read once for all of
         them; the codes stream from memory 16 bytes per lane."""
         params = [("Q", G(i32)), ("S", G(f32)), ("X", G(f32)), ("Y", G(f32)), ("B", G(f32)), ("O", i32),
@@ -820,7 +869,7 @@ def _generate_ptx():
                             words += [b.extract_element(vec, C(j)) for j in range(4)]
                         sc = k.ld(p["S"], b.add(srow, bk64))
                         part = F(0.0)
-                        for qv, x in zip(qvals(b, words, bits), xs):
+                        for qv, x in zip(qvals(b, words, bits, fp), xs):
                             part = b.call(fma_f, [qv, x, part])
                         b.store(b.call(fma_f, [part, sc, b.load(acc)]), acc)
                 k.loop(lane, nb, C(32), step)
@@ -837,7 +886,7 @@ def _generate_ptx():
             k.loop(C(0), p["T"], C(1), per_t)
         k.ret()
 
-    def deq(name, bits):
+    def deq(name, bits, fp=False):
         k = K(name, [("Q", G(i32)), ("S", G(f32)), ("D", G(i32)), ("O", i32), ("I", i32)])
         b, p = k.b, k.p
         idx = b.add(b.mul(k.cta, C(256)), k.tid)
@@ -854,21 +903,20 @@ def _generate_ptx():
             outs = []
             for j in range(2):
                 s_ = b.add(sh, C(bits * j))
-                if bits == 8:
-                    q = b.ashr(b.shl(w, b.sub(C(24), s_)), C(24))
-                else:
-                    q = b.sub(b.and_(b.lshr(w, s_), C(0xF)), C(8))
-                v = b.bitcast(b.fmul(b.sitofp(q, f32), sc), i32)
+                c = b.and_(b.lshr(w, s_), C((1 << bits) - 1))
+                v = b.bitcast(b.fmul(code_value(b, c, bits, fp), sc), i32)
                 outs.append(b.lshr(b.add(b.add(v, C(0x7FFF)), b.and_(b.lshr(v, C(16)), C(1))), C(16)))
             k.st(b.or_(outs[0], b.shl(outs[1], C(16))), p["D"], idx)
         k.ret()
 
     decl_min = decl("llvm.minnum.f32", f32, [f32, f32])
     for bits in (8, 4):
-        quant(f"quant{bits}", bits)
-        gemvq(f"gemvq{bits}", bits)
-        gemvq(f"gemvq{bits}n", bits, norm=True)
-        deq(f"deq{bits}", bits)
+        for fp in (False, True):
+            tag = f"{'f' if fp else ''}{bits}"
+            quant(f"quant{tag}", bits, fp)
+            gemvq(f"gemvq{tag}", bits, fp=fp)
+            gemvq(f"gemvq{tag}n", bits, norm=True, fp=fp)
+            deq(f"deq{tag}", bits, fp)
 
     _eng.engine()                                   # initialises LLVM
     llvm.initialize_all_targets()
@@ -1079,17 +1127,46 @@ class Matrix:
 
     @property
     def bits(self):
-        return {"int8": 8, "int4": 4}.get(self.kind)
+        return {"int8": 8, "int4": 4, "fp8": 8, "fp4": 4}.get(self.kind)
+
+    @property
+    def tag(self):
+        """Kernel suffix: 8, 4 (integers) or f8, f4 (fp8 E4M3, fp4 E2M1)."""
+        return ("f" if self.kind.startswith("fp") else "") + str(self.bits)
 
 
-QBYTES = {"bf16": 2.0, "int8": 1.125, "int4": 0.625}    # bytes per weight on the device, scales included
+QBYTES = {"bf16": 2.0, "int8": 1.125, "int4": 0.625, "fp8": 1.125, "fp4": 0.625}
+FP4_VALUES = np.array([0, 0.5, 1, 1.5, 2, 3, 4, 6], np.float32)    # bytes per weight on the device, scales included
 
 
-def qnumpy(w, bits):
+def fp_round(t, bits):
+    """t (float32, within the format's range) rounded to the nearest fp8 E4M3 / fp4 E2M1 value, as the GPU does."""
+    t = np.asarray(t, np.float32)
+    a = np.abs(t)
+    if bits == 4:
+        idx = sum(((a >= np.float32(th)) if up else (a > np.float32(th))).astype(np.int32)
+                  for th, up in ((0.25, False), (0.75, True), (1.25, False), (1.75, True), (2.5, False), (3.5, True),
+                                 (5.0, False)))
+        mag = FP4_VALUES[idx]
+    else:
+        e = ((a.view(np.uint32) >> 23).astype(np.int32) - 127)
+        e = np.maximum(e, -6)
+        step = ((e - 3 + 127).astype(np.uint32) << 23).view(np.float32)
+        mag = (np.rint(a / step) * step).astype(np.float32)
+    return np.where(t < 0, -mag, mag).astype(np.float32)
+
+
+def qnumpy(w, bits, fp=False):
     """The GPU's quantization in NumPy (the emulator, and the tests): (codes as values, scales) per 32 values."""
     O, I = w.shape
     blk = np.asarray(w, np.float32).reshape(O, I // 32, 32)
     a = np.abs(blk)
+    if fp:
+        top = np.float32(448.0 if bits == 8 else 6.0)
+        sc = (a.max(axis=2) / top).astype(np.float32)
+        inv = np.where(sc != 0, np.float32(1.0) / np.where(sc != 0, sc, np.float32(1)), np.float32(0)).astype(np.float32)
+        t = np.clip((blk * inv[:, :, None]).astype(np.float32), -top, top)
+        return fp_round(t, bits).reshape(O, I), sc
     if bits == 8:
         sc = (a.max(axis=2) / np.float32(127.0)).astype(np.float32)
         lo, hi = -127, 127
@@ -1112,13 +1189,13 @@ class _Base:
         self._ws = {}
 
     def qmatrix(self, w, kind):
-        """A matrix in int8 or int4 (one scale per 32 values), quantized on the device from bfloat16: about 0.56
-        or 0.31 of the bfloat16 size, so a model twice or three times as large fits the card. Widths that are not
-        a multiple of 32 stay bfloat16."""
+        """A matrix in int8, int4, fp8 (E4M3) or fp4 (E2M1), one float32 scale per 32 values, quantized on the
+        device from bfloat16: about 0.56 (8-bit) or 0.31 (4-bit) of the bfloat16 size, so a model twice or three
+        times as large fits the card. Widths that are not a multiple of 32 stay bfloat16."""
         if kind == "bf16" or w.shape[1] % 32:
             return self.matrix(w)
         rows, cols = w.shape
-        bits = 8 if kind == "int8" else 4
+        bits = 8 if kind in ("int8", "fp8") else 4
         src = self.matrix(w)
         if src is None:
             return None
@@ -1126,7 +1203,7 @@ class _Base:
             q = self.alloc(rows * cols * bits // 32)
             sc = self.alloc(rows * cols // 32)
             self.begin()
-            self._quant(src, q, sc, bits)
+            self._quant(src, q, sc, bits, kind.startswith("fp"))
         finally:
             self.free(src.buf)
         return Matrix(q, rows, cols, kind, sc)
@@ -1329,16 +1406,16 @@ class Runner(_Base):
         self.dev.activate()
 
     # kernels
-    def _quant(self, src, q, sc, bits):
+    def _quant(self, src, q, sc, bits, fp=False):
         nblk = src.rows * src.cols // 32
-        self._go(f"quant{bits}", (nblk + NT - 1) // NT, NT, ("p", src.buf.ptr), ("p", q.ptr), ("p", sc.ptr),
+        self._go(f"quant{'f' if fp else ''}{bits}", (nblk + NT - 1) // NT, NT, ("p", src.buf.ptr), ("p", q.ptr), ("p", sc.ptr),
                  ("u", src.rows), ("u", src.cols))
 
     def _deq(self, m):
         """A bfloat16 copy of a quantized matrix in a scratch buffer, for the tiled product."""
         d = self.ws("deq", m.rows * m.cols // 2)
         n = m.rows * m.cols // 2
-        self._go(f"deq{m.bits}", (n + 255) // 256, 256, ("p", m.buf.ptr), ("p", m.scales.ptr), ("p", d.ptr),
+        self._go(f"deq{m.tag}", (n + 255) // 256, 256, ("p", m.buf.ptr), ("p", m.scales.ptr), ("p", d.ptr),
                  ("u", m.rows), ("u", m.cols))
         return Matrix(d, m.rows, m.cols)
 
@@ -1350,7 +1427,7 @@ class Runner(_Base):
             if ln is not None:
                 args += [("p", ln.ptr), ("f", eps), ("f", off)]
             per_block = ROWS_PER_BLOCK * QROWS
-            self._go(f"gemvq{m.bits}" + ("n" if ln is not None else ""), (m.rows + per_block - 1) // per_block,
+            self._go(f"gemvq{m.tag}" + ("n" if ln is not None else ""), (m.rows + per_block - 1) // per_block,
                      32 * ROWS_PER_BLOCK, *args)
             return
         width = 16 if m.cols % 16 == 0 else 8 if m.cols % 8 == 0 else 2
@@ -1496,9 +1573,9 @@ class Emulator(_Base):
     def begin(self):
         pass
 
-    def _quant(self, src, q, sc, bits):
+    def _quant(self, src, q, sc, bits, fp=False):
         w = from_bf16_pairs(src.buf.a.view(np.uint32)[:src.rows * src.cols // 2], (src.rows, src.cols))
-        codes, scales = qnumpy(w, bits)
+        codes, scales = qnumpy(w, bits, fp)
         q.a = codes.reshape(-1)                         # the emulator keeps the codes as values
         sc.a = scales.reshape(-1)
 

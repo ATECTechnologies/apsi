@@ -304,6 +304,33 @@ the first time (a few seconds) and kept in `~/.apsi/cache/cpu-int8`, memory-mapp
 team (about a microsecond, instead of tens of microseconds per thread from Python). Prompts of 24 tokens or more use
 NumPy's BLAS. Other checkpoints run in float32 with NumPy. `APSI_HUB_NATIVE=0` turns the native products off.
 
+**Models larger than the card.** The weights can be quantized on the GPU itself to int8 or int4 (32 values per scale;
+int4 as ggml's Q4_0), read directly by Apsi's matrix-vector kernels while answering and turned back into bfloat16
+for the tensor-core product of a prompt. `gpu_weights="auto"` (or `APSI_GPU_WEIGHTS`) keeps bfloat16 when the model
+fits, else int8, else int4, so that every layer stays on the card, and turns the first layers back into int8 while
+room is left. A Qwen2.5-14B model (27 GB in bfloat16) then runs all 48 layers on a 12 GB RTX 3060 instead of 16 —
+the rest would otherwise run on the processor, limited by the memory speed of the PC. `APSI_GPU_WEIGHTS=bf16`
+keeps the exact weights (and splits the model when it does not fit); `fp8` (E4M3) and `fp4` (E2M1) are the float
+formats of the same sizes, rounded exactly as ml_dtypes rounds them (tested bit for bit).
+
+| `gpu_weights` | bytes per weight | 14B model | notes |
+|---|---:|---:|---|
+| `bf16` | 2 | 27.5 GB | the checkpoint as stored |
+| `int8`, `fp8` | 1.125 | 15.5 GB | error below bfloat16's rounding of the activations (int8) |
+| `int4`, `fp4` | 0.625 | 8.6 GB | ggml Q4_0-like; small quality loss |
+| `auto` | — | — | bf16 → int8 → int4, the first in which every layer fits, int8 again where room is left |
+
+```apsi
+let lm = hub.model("path/to/Qwen2.5-14B-Instruct")
+print(lm.plan)        # e.g. {"gpu": {"layers": 48, "of": 48, "weights": "int8 (… layers) + int4 (… layers)", …}}
+```
+
+`lm.plan` says what runs where: on the GPU the layers, bytes, weight format, tensor cores and cache format; on the
+processor the layers, int8 or bfloat16, bytes and whether they are in RAM or memory-mapped from the SSD. When a
+model is split, long prompts (64 tokens or more) through the processor's layers also run on the GPU: their weights
+are sent over PCIe for that product (`APSI_PROMPT_ON_GPU=0` turns it off). Loading a large model prints progress
+lines (`APSI_PROGRESS=0` turns them off).
+
 On NVIDIA cards from the RTX 30 series (Ampere) on, prompts use the **tensor cores** (`mma.sync`, bfloat16 inputs,
 float32 sums); the activations are split into two bfloat16 parts, so the result matches the float32 product to about
 1e-5. The kernel is checked against the float32 one when the GPU starts and is used only if they agree;
