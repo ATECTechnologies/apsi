@@ -390,7 +390,7 @@ class Gpu(_Ops):
             try:                                         # shared-memory tiles: the fast products
                 tmod, self.fn["gemm_tkn"] = dev.load("apsi-train-tiled-1", KS.ptx("tiled"))
                 for name in KS.TILED[1:] + tuple(e[0] for e in KS.EPI_KERNELS) + \
-                        tuple(f"gemm_tmn_aa{j}" for j in KS.EPI_ACTS):
+                        tuple(f"gemm_tmn_aa{j}" for j in KS.EPI_ACTS) + ("bf_lo",):
                     f = ctypes.c_void_p()
                     dev.drv.check(lib.cuModuleGetFunction(ctypes.byref(f), tmod, name.encode()), "cuModuleGetFunction")
                     self.fn[name] = f
@@ -412,6 +412,7 @@ class Gpu(_Ops):
             except Exception as e:
                 self.tc_why = f"fused attention unavailable: {type(e).__name__}: {e}"
         self._calls = {}
+        self._scr = {}
         self.profile = None                              # {kernel: (seconds, launches)} while profiling
         self._pending = []
         self._lib = lib
@@ -478,7 +479,8 @@ class Gpu(_Ops):
         for name, f in self.fn.items():
             regs = self._lib.cuFuncGetAttribute(ctypes.byref(v), 4, f) == 0 and v.value
             smem = self._lib.cuFuncGetAttribute(ctypes.byref(v), 1, f) == 0 and v.value
-            info[name] = {"registers": regs, "shared_bytes": smem}
+            local = self._lib.cuFuncGetAttribute(ctypes.byref(v), 3, f) == 0 and v.value   # spilled registers
+            info[name] = {"registers": regs, "shared_bytes": smem, "local_bytes": local}
         return info
 
     def alloc(self, n):
@@ -635,8 +637,39 @@ class Gpu(_Ops):
             return None
         return f"gemm_t{ka}{kb}"
 
+    def _scratch(self, key, n):
+        bf = self._scr.get(key)
+        if bf is None or bf.n < n:
+            if bf is not None:
+                self.free(bf)
+            bf = self._scr[key] = self.alloc(n)
+        return (bf, 0)
+
+    def _gemm3(self, A, B, Cv, bias, M, N, K, sam, sak, sbk, sbn, ldc, sa, sb, sc, alpha, beta, epi, X2, act):
+        """float32 products on the shared-memory tensor-core kernels: hi(A) hi(B) + lo(A) hi(B) + hi(A) lo(B)."""
+        dense_a = (sak == 1 and sam == K) or (sam == 1 and sak == M)
+        dense_b = (sbn == 1 and sbk == N) or (sbk == 1 and sbn == K)
+        if not (dense_a and dense_b and "bf_lo" in self.fn) or \
+                self._tiled_ok(A, B, M, N, K, sam, sak, sbk, sbn, sa, sb) is None:
+            return False
+        if epi:
+            name = self._tiled_ok(A, B, M, N, K, sam, sak, sbk, sbn, sa, sb)
+            if ldc != N or f"{name}_e{epi}" + (f"a{act}" if epi in (1, 2) else "") not in self.fn:
+                return False
+        lo_a, lo_b = self._scratch("lo_a", M * K), self._scratch("lo_b", K * N)
+        self._go("bf_lo", self.blocks(M * K), 256, self.p(A), self.p(lo_a), ("u", M * K))
+        self._go("bf_lo", self.blocks(K * N), 256, self.p(B), self.p(lo_b), ("u", K * N))
+        common = (M, N, K, sam, sak, sbk, sbn, ldc, 1, 1, sa, sb, sc, alpha)
+        self._gemm(A, B, Cv, bias, *common, beta, 1)
+        self._gemm(lo_a, B, Cv, None, *common, True, 1)
+        return self._gemm(A, lo_b, Cv, None, *common, True, 1, epi=epi, X2=X2, act=act)
+
     def _gemm(self, A, B, Cv, bias, M, N, K, sam, sak, sbk, sbn, ldc, nb1, nb2, sa, sb, sc, alpha, beta, passes,
               epi=0, X2=None, act=0, a_act=None):
+        if passes == 3 and self.tiled and a_act is None and nb1 * nb2 == 1 and \
+                os.environ.get("APSI_FP32_TILED", "1").strip() not in ("0", "false", "no") and \
+                self._gemm3(A, B, Cv, bias, M, N, K, sam, sak, sbk, sbn, ldc, sa, sb, sc, alpha, beta, epi, X2, act):
+            return True
         name = self._tiled_ok(A, B, M, N, K, sam, sak, sbk, sbn, sa, sb) if self.tiled and passes == 1 else None
         if a_act is not None:
             if name != "gemm_tmn" or f"gemm_tmn_aa{a_act}" not in self.fn or epi:
@@ -651,9 +684,11 @@ class Gpu(_Ops):
             tiles = ((M + KS.BM - 1) // KS.BM) * ((N + KS.BN - 1) // KS.BN)
             nz, kchunk = 1, K
             blocks = tiles * nb1 * nb2
-            # few output tiles and a long k (gradients of weights): split k so every multiprocessor has work
-            if blocks < self.sms and nb1 * nb2 == 1 and K >= 512 and (beta or ldc == N) and not epi:
-                want = min(-(-2 * self.sms // blocks), K // 128, 16)
+            # few output tiles and a long k (gradients of weights): split k so the blocks fill whole waves of the
+            # card (2 blocks per multiprocessor): 9 tiles split 7 ways is 63 blocks = 2 waves of 56, the second
+            # almost empty; split 6 ways it is one full wave
+            if blocks < 4 * self.sms and nb1 * nb2 == 1 and K >= 512 and (beta or ldc == N) and not epi:
+                want = _split_k(blocks, K, 2 * self.sms)
                 if want > 1:
                     kchunk = -(-(-(-K // want)) // KS.BK) * KS.BK
                     nz = -(-K // kchunk)
@@ -677,6 +712,20 @@ class Gpu(_Ops):
             self._go("gemm_tc" if passes == 1 else "gemm_tc3", (tiles, nb1 * nb2), 128, *args)
         else:
             self._go("gemm_simt", (tiles, nb1 * nb2), 256, *args)
+
+
+def _split_k(blocks, K, slots):
+    """How many parts to split k into: the fewest waves times the k each block works through, with a small cost per
+    extra part (the atomic additions and zeroing C)."""
+    best, best_cost = 1, None
+    for w in range(1, 17):
+        if w > 1 and K // w < 128:
+            break
+        steps = -(-(-(-K // w)) // KS.BK)
+        cost = -(-blocks * w // slots) * steps * (1.0 + 0.02 * (w - 1))
+        if best_cost is None or cost < best_cost - 1e-9:
+            best, best_cost = w, cost
+    return best
 
 
 def device(name="cuda"):

@@ -923,6 +923,10 @@ def _tiled_module():
                         side_effect=True)
     red = ir.InlineAsm(ir.FunctionType(ir.VoidType(), [i64, f32]), "red.global.add.f32 [$0], $1;", "l,f",
                        side_effect=True)
+    ldg4 = ir.InlineAsm(ir.FunctionType(ir.LiteralStructType([f32] * 4), [i64]),
+                        "ld.global.v4.f32 {$0,$1,$2,$3}, [$4];", "=f,=f,=f,=f,l", side_effect=True)
+    cvt2 = ir.InlineAsm(ir.FunctionType(i32, [f32, f32]), "cvt.rn.bf16x2.f32 $0, $1, $2;", "=r,f,f",
+                        side_effect=False)
     ex2_f = d("llvm.nvvm.ex2.approx.f", f32, [f32])
     args = [("A", G(f32)), ("B", G(f32)), ("C", G(f32)), ("BIAS", G(f32)), ("M", i32), ("N", i32), ("K", i32),
             ("sam", i32), ("sak", i32), ("sbk", i32), ("sbn", i32), ("ldc", i32), ("nb2", i32), ("a1", i32),
@@ -974,41 +978,43 @@ def _tiled_module():
 
         def load4(base_off, ptr, contig_idx, contig_lim, other_idx, other_lim, contig_stride_is_1, s_other, act=None,
                   raw=None):
-            """4 float32 along the contiguous dimension (zeros outside), as 4 bfloat16 bit patterns; act: the
-            activation applied on the way (A is a pre-activation kept instead of its activation)."""
+            """Issues the load of 4 float32 along the contiguous dimension; the values are used (zeros outside,
+            the activation, the rounding to bfloat16) only after the products of the current slice, so the wait
+            for memory overlaps the tensor-core work instead of preceding it. act: the activation applied on the
+            way (A is a pre-activation kept instead of its activation); raw: collects the float32 values."""
             ok = b.and_(b.icmp_unsigned("<", contig_idx, contig_lim), b.icmp_unsigned("<", other_idx, other_lim))
             ci = umin(contig_idx, b.sub(contig_lim, C(4)))
             oi = umin(other_idx, b.sub(other_lim, C(1)))
             idx = b.add(base_off, b.add(b.mul(z64(oi), z64(s_other)), z64(ci)))
-            vp = b.bitcast(b.gep(ptr, [idx], inbounds=True), ir.VectorType(f32, 4).as_pointer(1))
-            vec = b.load(vp, align=16)
-            out = []
+            # an inline load with side effects: LLVM would otherwise sink it into the block that stores the next slice
+            # (after the products), and every slice would wait the full memory latency
+            addr = b.ptrtoint(b.gep(ptr, [idx], inbounds=True), i64)
+            return ("pending", b.call(ldg4, [addr]), ok, act, raw)
+
+        def convert(pend):
+            """The 4 values of a pending load as 2 words of 2 bfloat16 each (one cvt.rn.bf16x2 per pair: round to
+            nearest even, the same as the emulator)."""
+            _, vec, ok, act, raw = pend
+            xs = []
             for j in range(4):
-                x = b.extract_element(vec, C(j))
+                x = b.extract_value(vec, j)
                 if act is not None:
                     x = _act_one(b, x, act, F, ex2_f, False)
                 v = b.select(ok, x, F(0.0))
                 if raw is not None:
                     raw.append(v)
-                out.append(rne(v))
-            return out
+                xs.append(v)
+            return [b.call(cvt2, [xs[1], xs[0]]), b.call(cvt2, [xs[3], xs[2]])]
 
         def sh_ptr(half_index):
             return b.gep(smem, [C(0), half_index], inbounds=True)
 
-        def store_row4(half_index, hs):
-            """4 halves at consecutive k (8 bytes)."""
-            lo = b.or_(hs[0], b.shl(hs[1], C(16)))
-            hi = b.or_(hs[2], b.shl(hs[3], C(16)))
+        def store_row4(half_index, ws):
+            """4 halves at consecutive k (8 bytes), given as 2 packed words."""
             v = ir.Constant(ir.VectorType(i32, 2), None)
-            v = b.insert_element(v, lo, C(0))
-            v = b.insert_element(v, hi, C(1))
+            v = b.insert_element(v, ws[0], C(0))
+            v = b.insert_element(v, ws[1], C(1))
             b.store(v, b.bitcast(sh_ptr(half_index), ir.VectorType(i32, 2).as_pointer(3)), align=8)
-
-        def store_col4(half_index, hs):
-            """4 halves at consecutive rows (stride PAD), the same k."""
-            for j in range(4):
-                b.store(b.trunc(hs[j], i16), sh_ptr(b.add(half_index, C(j * PAD))), align=2)
 
         A_BASE = [C(0), C(BM * PAD)]
         B_BASE = [C(2 * BM * PAD), C(2 * BM * PAD + BN * PAD)]
@@ -1039,7 +1045,8 @@ def _tiled_module():
             return regs
 
         def put(regs, buf):
-            for kind, r, c, hs, *_ in regs:
+            for kind, r, c, pend, *_ in regs:
+                hs = convert(pend)
                 if kind in ("A", "At"):
                     base = b.select(b.icmp_unsigned("==", buf, C(0)), A_BASE[0], A_BASE[1])
                 else:
@@ -1060,8 +1067,8 @@ def _tiled_module():
                     for j in range(4):
                         b.store(b.fadd(b.load(dbs[j]), r_[4][j]), dbs[j])
         first_regs = fetch(C(0))
-        add_db(first_regs)
         put(first_regs, C(0))
+        add_db(first_regs)
         b.call(bar_f, [])
         it = var(C(0))
         head = fn.append_basic_block("head")
@@ -1114,8 +1121,8 @@ def _tiled_module():
                     for c in range(4):
                         b.store(b.extract_value(r, c), accs[mt][nt][c])
         with b.if_then(has_next):
-            add_db(regs)
             put(regs, b.and_(nxt, C(1)))
+            add_db(regs)
         b.call(bar_f, [])
         b.store(nxt, it)
         b.branch(head)
@@ -1170,6 +1177,21 @@ def _tiled_module():
         kernel(name, a_kc, b_kc, e, j)
     for j in EPI_ACTS:                            # dW = act(h)^T dy without keeping act(h)
         kernel(f"gemm_tmn_aa{j}", False, False, 0, None, j)
+
+    # bf_lo: Y = X - bfloat16(X), the part bfloat16 drops. float32 products as three bfloat16 products on the
+    # tensor cores: A B = hi(A) hi(B) + lo(A) hi(B) + hi(A) lo(B), with an error near float32's own
+    fn = ir.Function(m, ir.FunctionType(ir.VoidType(), [G(f32), G(f32), i32]), name="bf_lo")
+    fn.calling_convention = "ptx_kernel"
+    X_, Y_, n_ = fn.args
+    b = ir.IRBuilder(fn.append_basic_block("top"))
+    i = b.add(b.mul(b.call(g.ctax_f, []), C(256)), b.call(g.tid_f, []))
+    with b.if_then(b.icmp_unsigned("<", i, n_)):
+        ix = b.zext(i, i64)
+        x = b.load(b.gep(X_, [ix], inbounds=True), align=4)
+        w = b.call(cvt2, [F(0.0), x])                       # low half: bfloat16(x)
+        hi = b.bitcast(b.shl(w, C(16)), f32)
+        b.store(b.fsub(x, hi), b.gep(Y_, [ix], inbounds=True), align=4)
+    b.ret_void()
     return _emit(m, "sm_80")
 
 

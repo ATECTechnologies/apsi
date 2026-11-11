@@ -190,7 +190,7 @@ class RealGpu(unittest.TestCase):
             e.put(be, a.reshape(-1))
             return (bg, 0), (be, 0)
 
-        def check(M, N, K, ta, tb, beta=False, bias=False, alpha=1.0):
+        def check(M, N, K, ta, tb, beta=False, bias=False, alpha=1.0, passes=1):
             A = pair(rng.normal(size=(K, M) if ta else (M, K)))
             B = pair(rng.normal(size=(N, K) if tb else (K, N)))
             Cc = pair(rng.normal(size=(M, N)))
@@ -199,10 +199,11 @@ class RealGpu(unittest.TestCase):
             sbk, sbn = (1, K) if tb else (N, 1)
             self.assertIsNotNone(g._tiled_ok(A[0], B[0], M, N, K, sam, sak, sbk, sbn, (0, 0), (0, 0)))
             for dv, i in ((g, 0), (e, 1)):
-                dv.gemm(A[i], B[i], Cc[i], M, N, K, sam, sak, sbk, sbn, N, alpha=alpha, beta=beta, bias=bs[i])
+                dv.gemm(A[i], B[i], Cc[i], M, N, K, sam, sak, sbk, sbn, N, alpha=alpha, beta=beta, bias=bs[i],
+                        passes=passes)
             a, b_ = g.get(Cc[0][0], M * N), e.get(Cc[1][0], M * N)
             err = np.abs(a - b_).max() / (np.abs(b_).max() + 1e-9)
-            self.assertLess(err, 2e-3, (M, N, K, ta, tb, beta, bias, err))
+            self.assertLess(err, 2e-3 if passes == 1 else 5e-5, (M, N, K, ta, tb, beta, bias, passes, err))
         for ta in (False, True):
             for tb in (False, True):
                 check(200, 136, 96, ta, tb)
@@ -210,6 +211,8 @@ class RealGpu(unittest.TestCase):
                 check(4, 4, 4, ta, tb)
                 check(384, 1536, 4096, ta, tb, beta=True)          # split k
                 check(256, 384, 2048, ta, tb)                      # split k into a cleared C
+                check(200, 136, 96, ta, tb, beta=True, bias=True, alpha=0.5, passes=3)   # float32: 3 bfloat16 products
+                check(384, 384, 4096, ta, tb, passes=3)
         # the last step fused in: activation (and its pre-activation kept), its derivative, a residual
         M, N, K = 256, 384, 128
         A, Bm, Bt = pair(rng.normal(size=(M, K))), pair(rng.normal(size=(K, N))), pair(rng.normal(size=(N, K)))
@@ -226,6 +229,16 @@ class RealGpu(unittest.TestCase):
                     a, b_ = g.get(view[0][0], M * N), e.get(view[1][0], M * N)
                     err = np.abs(a - b_).max() / (np.abs(b_).max() + 1e-9)
                     self.assertLess(err, 3e-3, (epi, act, what, err))
+                for dv, i in ((g, 0), (e, 1)):            # the same in float32 (three products, the last fused)
+                    if epi == 2:
+                        dv.gemm(A[i], Bt[i], Cc[i], M, N, K, K, 1, 1, K, N, epi=epi, X2=X2[i], act=act, passes=3)
+                    else:
+                        dv.gemm(A[i], Bm[i], Cc[i], M, N, K, K, 1, N, 1, N, bias=bias[i], epi=epi, X2=X2[i], act=act,
+                                passes=3)
+                for view, what in ((Cc, "C"), (X2, "X2")):
+                    a, b_ = g.get(view[0][0], M * N), e.get(view[1][0], M * N)
+                    err = np.abs(a - b_).max() / (np.abs(b_).max() + 1e-9)
+                    self.assertLess(err, 1e-4, (epi, act, what, "float32", err))
         # A read through an activation (A holds pre-activations): act(h)^T dy for a weight gradient
         Hm, Dy, Wg, tmp = pair(rng.normal(size=(M, K))), pair(rng.normal(size=(M, N))), pair(np.zeros((K, N))), \
             pair(np.zeros(M * K))

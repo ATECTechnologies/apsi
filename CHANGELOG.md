@@ -16,6 +16,10 @@
 - **GPU temperature control:** long training, long answers and busy servers keep the card near 77 °C (75–78) by
   pacing the work while it is above the band (the driver's NVML gives the temperature); a cool card is never slowed.
   `APSI_GPU_TEMP=72` / `off`; `r.gpu_temperature`, `/metrics`, `hub.gpu_status()`.
+- **Faster matrix products on the card:** the loads of the next slice now overlap the tensor-core work (LLVM had
+  moved them after it, so every slice waited the full memory latency), the rounding to bfloat16 is one
+  cvt.rn.bf16x2 per pair, and split-k fills whole waves of the card; float32 training runs on the same tiled kernels
+  as three bfloat16 products (error near float32's own).
 - **Level pacing:** the temperature control follows the smoothed temperature and gathers its pauses (a card whose
   die jumps with each change of load was paced between none and most of the time: 62-77 C and half the speed).
 - **Apsi GPU Tuner** (tools/gpu-tuner, on the download page): Apply / Restore files for Windows and Linux that set
