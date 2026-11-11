@@ -226,6 +226,14 @@ class RealGpu(unittest.TestCase):
                     a, b_ = g.get(view[0][0], M * N), e.get(view[1][0], M * N)
                     err = np.abs(a - b_).max() / (np.abs(b_).max() + 1e-9)
                     self.assertLess(err, 3e-3, (epi, act, what, err))
+        # A read through an activation (A holds pre-activations): act(h)^T dy for a weight gradient
+        Hm, Dy, Wg, tmp = pair(rng.normal(size=(M, K))), pair(rng.normal(size=(M, N))), pair(np.zeros((K, N))), \
+            pair(np.zeros(M * K))
+        for act in (0, 1, 2):
+            for dv, i in ((g, 0), (e, 1)):
+                dv.gemm(Hm[i], Dy[i], Wg[i], K, N, M, 1, K, N, 1, N, a_act=act, tmp=(tmp[i][0], M * K))
+            a, b_ = g.get(Wg[0][0], K * N), e.get(Wg[1][0], K * N)
+            self.assertLess(np.abs(a - b_).max() / (np.abs(b_).max() + 1e-9), 3e-3, ("a_act", act))
         # attention heads: batched, offsets inside the rows
         Bh, T, hd, H = 2, 128, 64, 3
         D = H * hd

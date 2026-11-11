@@ -931,7 +931,7 @@ def _tiled_module():
     # epi (after alpha, bias and beta): 1 = X2 <- v, C <- act(v) (a linear layer and its activation in one pass);
     # 2 = C <- v * act'(X2) (the backward pass through that activation); 3 = C <- v + X2 (a residual connection)
 
-    def kernel(name, a_kc, b_kc, epi_mode=0, act_j=None):
+    def kernel(name, a_kc, b_kc, epi_mode=0, act_j=None, a_act=None):
         fn = ir.Function(m, ir.FunctionType(ir.VoidType(), [t for _, t in args]), name=name)
         fn.calling_convention = "ptx_kernel"
         p = {n: a for (n, _), a in zip(args, fn.args)}
@@ -969,8 +969,9 @@ def _tiled_module():
             u = b.bitcast(x, i32)
             return b.lshr(b.add(b.add(u, C(0x7FFF)), b.and_(b.lshr(u, C(16)), C(1))), C(16))
 
-        def load4(base_off, ptr, contig_idx, contig_lim, other_idx, other_lim, contig_stride_is_1, s_other):
-            """4 float32 along the contiguous dimension (zeros outside), as 4 bfloat16 bit patterns."""
+        def load4(base_off, ptr, contig_idx, contig_lim, other_idx, other_lim, contig_stride_is_1, s_other, act=None):
+            """4 float32 along the contiguous dimension (zeros outside), as 4 bfloat16 bit patterns; act: the
+            activation applied on the way (A is a pre-activation kept instead of its activation)."""
             ok = b.and_(b.icmp_unsigned("<", contig_idx, contig_lim), b.icmp_unsigned("<", other_idx, other_lim))
             ci = umin(contig_idx, b.sub(contig_lim, C(4)))
             oi = umin(other_idx, b.sub(other_lim, C(1)))
@@ -979,7 +980,10 @@ def _tiled_module():
             vec = b.load(vp, align=16)
             out = []
             for j in range(4):
-                v = b.select(ok, b.extract_element(vec, C(j)), F(0.0))
+                x = b.extract_element(vec, C(j))
+                if act is not None:
+                    x = _act_one(b, x, act, F, ex2_f, False)
+                v = b.select(ok, x, F(0.0))
                 out.append(rne(v))
             return out
 
@@ -1016,7 +1020,7 @@ def _tiled_module():
                 else:                                 # A(m, k) = A[k * sak + m]
                     kk, mq = b.lshr(idx, C(5)), b.mul(b.and_(idx, C(31)), C(4))
                     regs.append(("At", mq, kk, load4(offs[0], p["A"], b.add(bm, mq), p["M"], b.add(k0, kk), k_end,
-                                                     True, p["sak"])))
+                                                     True, p["sak"], a_act)))
                 if b_kc:                              # B(k, n) = B[n * sbn + k]
                     nrow, kq = b.lshr(idx, C(3)), b.mul(b.and_(idx, C(7)), C(4))
                     regs.append(("B", nrow, kq, load4(offs[1], p["B"], b.add(k0, kq), k_end, b.add(bn, nrow), p["N"],
@@ -1138,6 +1142,8 @@ def _tiled_module():
         kernel(name, a_kc, b_kc)
     for name, a_kc, b_kc, e, j in EPI_KERNELS:
         kernel(name, a_kc, b_kc, e, j)
+    for j in EPI_ACTS:                            # dW = act(h)^T dy without keeping act(h)
+        kernel(f"gemm_tmn_aa{j}", False, False, 0, None, j)
     return _emit(m, "sm_80")
 
 

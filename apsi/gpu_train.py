@@ -48,10 +48,16 @@ class _Ops:
     tc = False
 
     def gemm(self, A, B, Cv, M, N, K, sam, sak, sbk, sbn, ldc, alpha=1.0, beta=False, bias=None, batch=(1, 1),
-             sa=(0, 0), sb=(0, 0), sc=(0, 0), passes=1, epi=0, X2=None, act=0):
+             sa=(0, 0), sb=(0, 0), sc=(0, 0), passes=1, epi=0, X2=None, act=0, a_act=None, tmp=None):
         """C = alpha A B (+ bias) (+ C), then epi: 1 X2 <- C, C <- act(C); 2 C <- C * act'(X2); 3 C <- C + X2.
         A kernel that can do epi in its last step does (one pass over C); otherwise a second kernel does it."""
         nb1, nb2 = batch
+        if a_act is not None:                            # A holds pre-activations: act(A) B
+            if self._gemm(A, B, Cv, bias, M, N, K, sam, sak, sbk, sbn, ldc, nb1, nb2, sa, sb, sc, alpha, beta,
+                          passes, a_act=a_act):
+                return
+            self.act_f(A, tmp[0], tmp[1], a_act)                # (composite: act(A) into tmp first)
+            A = tmp[0]
         args = (A, B, Cv, bias, M, N, K, sam, sak, sbk, sbn, ldc, nb1, nb2, sa, sb, sc, alpha, beta, passes)
         if not epi:
             self._gemm(*args)
@@ -314,8 +320,8 @@ class Emulator(_Ops):
         self.v(WQ, K * N)[:] = round_weights(self.v(W, K * N).reshape(K, N), name).reshape(-1)
 
     def _gemm(self, A, B, Cv, bias, M, N, K, sam, sak, sbk, sbn, ldc, nb1, nb2, sa, sb, sc, alpha, beta, passes,
-              epi=0, X2=None, act=0):
-        if epi:
+              epi=0, X2=None, act=0, a_act=None):
+        if epi or a_act is not None:
             return False                                 # the composite path (the same numbers)
         ab, ao = A
         bb, bo = B
@@ -374,7 +380,8 @@ class Gpu(_Ops):
         if self.tc and os.environ.get("APSI_TILED", "1").strip() not in ("0", "false", "no"):
             try:                                         # shared-memory tiles: the fast products
                 tmod, self.fn["gemm_tkn"] = dev.load("apsi-train-tiled-1", KS.ptx("tiled"))
-                for name in KS.TILED[1:] + tuple(e[0] for e in KS.EPI_KERNELS):
+                for name in KS.TILED[1:] + tuple(e[0] for e in KS.EPI_KERNELS) + \
+                        tuple(f"gemm_tmn_aa{j}" for j in KS.EPI_ACTS):
                     f = ctypes.c_void_p()
                     dev.drv.check(lib.cuModuleGetFunction(ctypes.byref(f), tmod, name.encode()), "cuModuleGetFunction")
                     self.fn[name] = f
@@ -620,8 +627,12 @@ class Gpu(_Ops):
         return f"gemm_t{ka}{kb}"
 
     def _gemm(self, A, B, Cv, bias, M, N, K, sam, sak, sbk, sbn, ldc, nb1, nb2, sa, sb, sc, alpha, beta, passes,
-              epi=0, X2=None, act=0):
+              epi=0, X2=None, act=0, a_act=None):
         name = self._tiled_ok(A, B, M, N, K, sam, sak, sbk, sbn, sa, sb) if self.tiled and passes == 1 else None
+        if a_act is not None:
+            if name != "gemm_tmn" or f"gemm_tmn_aa{a_act}" not in self.fn or epi:
+                return False
+            name = f"gemm_tmn_aa{a_act}"
         if epi:
             ename = f"{name}_e{epi}" + (f"a{act}" if epi in (1, 2) else "") if name else None
             if name is None or ldc != N or nb1 * nb2 != 1 or ename not in self.fn:
@@ -720,6 +731,11 @@ class _Node:
     def __init__(self, net, key):
         self.net, self.key = net, key
 
+    def gbuf(self, name, n):
+        """A buffer of the backward pass: shared by the layers that are two apart in a sequence (a gradient lives
+        only until the layer before has used it), so the gradients take the memory of two layers, not of all."""
+        return self.net.arena.get(("g", getattr(self, "gkey", self.key), name), n)
+
     def buf(self, name, n):
         return self.net.arena.get((self.key, name), n)
 
@@ -736,6 +752,8 @@ class _Linear(_Node):
         self.b = net.param(p.b) if layer.bias else None
 
     act = None                                          # set when an activation follows (fused into this product)
+    share_out = False                                   # act(h) is only read by the next product: not kept
+    x_pre = None                                        # the layer before keeps h instead of my input act(h)
 
     @property
     def takes_residual(self):
@@ -744,7 +762,7 @@ class _Linear(_Node):
     def fwd(self, x, shape, residual=None):
         o, M = self.net.ops, _rows(shape)
         self.x, self.M = x, M
-        y = self.buf("y", M * self.N)
+        y = self.net.arena.get(("shared", "act"), M * self.N) if self.share_out else self.buf("y", M * self.N)
         if self.act is not None:                        # y = act(x W + b), the pre-activation kept for backward
             self.h = self.buf("h", M * self.N)
             o.gemm(x, self.W.w, y, M, self.N, self.K, self.K, 1, self.N, 1, self.N,
@@ -759,17 +777,22 @@ class _Linear(_Node):
         multiplied by act'(h) (that layer's dy) in the same pass."""
         o, M, K, N = self.net.ops, self.M, self.K, self.N
         if self.act is not None and not getattr(self, "dh_given", False):
-            dh = self.buf("dh", M * N)
+            dh = self.gbuf("dh", M * N)
             o.act_b(self.h, dy, dh, M * N, self.act)
             dy = dh
         self.dh_given = False
         # dW[K, N] += x^T dy: A(k, m) = x[m * K + k]
-        o.gemm(self.x, dy, self.W.g, K, N, M, 1, K, N, 1, N, beta=True, passes=self.net.passes)
+        if self.x_pre is not None:                      # x = act(h): applied while the product reads h
+            pre = self.x_pre
+            o.gemm(pre.h, dy, self.W.g, K, N, M, 1, K, N, 1, N, beta=True, passes=self.net.passes, a_act=pre.act,
+                   tmp=(self.net.arena.get(("shared", "act"), M * K), M * K))
+        else:
+            o.gemm(self.x, dy, self.W.g, K, N, M, 1, K, N, 1, N, beta=True, passes=self.net.passes)
         if self.b is not None:
             o.colsum(dy, None, None, None, None, self.b.g, M, N, 0)
         if not need_dx:
             return None
-        dx = self.buf("dx", M * K)
+        dx = self.gbuf("dx", M * K)
         if into_act is not None:
             o.gemm(dy, self.W.w, dx, M, K, N, N, 1, 1, N, K, passes=self.net.passes, epi=2, X2=into_act[1],
                    act=into_act[0])
@@ -791,7 +814,7 @@ class _Act(_Node):
         return y, shape
 
     def bwd(self, dy, need_dx=True):
-        dx = self.buf("dx", self.n)
+        dx = self.gbuf("dx", self.n)
         self.net.ops.act_b(self.x, dy, dx, self.n, self.kind)
         return dx
 
@@ -814,7 +837,7 @@ class _Dropout(_Node):
     def bwd(self, dy, need_dx=True):
         if not self.on:
             return dy
-        dx = self.buf("dx", self.n)
+        dx = self.gbuf("dx", self.n)
         self.net.ops.mul3(dx, dy, self.mask, self.n)
         return dx
 
@@ -840,7 +863,7 @@ class _Norm(_Node):
         o = self.net.ops
         o.colsum(dy, self.x, self.mean, self.rstd, self.gm.g, self.bt.g if self.bt else None, self.M, self.N,
                  2 if self.rms else 1)
-        dx = self.buf("dx", self.M * self.N)
+        dx = self.gbuf("dx", self.M * self.N)
         o.ln_b(self.x, self.gm.w, dy, self.mean, self.rstd, dx, self.M, self.N, self.rms, residual)
         return dx
 
@@ -942,7 +965,7 @@ class _Residual(_Node):
         dh = self.inner.bwd(dy, True)
         if self.norm:
             return self.norm.bwd(dh, True, residual=dy)  # dx = dy + the norm's gradient, one pass
-        dx = self.buf("dx", self.n)
+        dx = self.gbuf("dx", self.n)
         self.net.ops.add3(dx, dy, dh, self.n)
         return dx
 
@@ -1002,23 +1025,23 @@ class _Attention(_Node):
         sc = 1.0 / math.sqrt(hd)
         o.gemm(self.att, dy, self.Wo.g, D, D, M, 1, D, D, 1, D, beta=True, passes=ps)
         o.colsum(dy, None, None, None, None, self.bo.g, M, D, 0)
-        datt = self.buf("datt", M * D)
+        datt = self.gbuf("datt", M * D)
         o.gemm(dy, self.Wo.w, datt, M, D, D, D, 1, 1, D, D, passes=ps)
         if self.fused:
-            dd = self.buf("dd", B * h * T)
+            dd = self.gbuf("dd", B * h * T)
             o.flash_dot(datt, self.att, dd, B, T, h, hd)
-            dq, dk, dv = self.buf("dq", M * D), self.buf("dk", M * D), self.buf("dv", M * D)
+            dq, dk, dv = self.gbuf("dq", M * D), self.gbuf("dk", M * D), self.gbuf("dv", M * D)
             o.flash_bwd(self.q, self.k, self.v, datt, self.L, dd, dq, dk, dv, B, T, h, hd, self.causal, sc)
             return self._grads_in(dq, dk, dv, M, D, ps)
-        dP = self.buf("dp", B * h * T * T)               # dP = datt v^T
+        dP = self.gbuf("dp", B * h * T * T)               # dP = datt v^T
         o.gemm(datt, self.v, dP, T, T, hd, D, 1, 1, D, T, batch=(B, h), sa=(T * D, hd), sb=(T * D, hd),
                sc=(h * T * T, T * T), passes=ps)
-        dv = self.buf("dv", M * D)                       # dv = P^T datt
+        dv = self.gbuf("dv", M * D)                       # dv = P^T datt
         o.gemm(self.P, datt, dv, T, hd, T, 1, T, D, 1, D, batch=(B, h), sa=(h * T * T, T * T), sb=(T * D, hd),
                sc=(T * D, hd), passes=ps)
-        dS = self.buf("ds", B * h * T * T)
+        dS = self.gbuf("ds", B * h * T * T)
         o.softmax_b(self.P, dP, dS, B * h * T, T)
-        dq, dk = self.buf("dq", M * D), self.buf("dk", M * D)
+        dq, dk = self.gbuf("dq", M * D), self.gbuf("dk", M * D)
         o.gemm(dS, self.k, dq, T, hd, T, T, 1, D, 1, D, alpha=sc, batch=(B, h), sa=(h * T * T, T * T),
                sb=(T * D, hd), sc=(T * D, hd), passes=ps)                                   # dq = dS k
         o.gemm(dS, self.q, dk, T, hd, T, 1, T, D, 1, D, alpha=sc, batch=(B, h), sa=(h * T * T, T * T),
@@ -1027,7 +1050,7 @@ class _Attention(_Node):
 
     def _grads_in(self, dq, dk, dv, M, D, ps):
         o = self.net.ops
-        dx = self.buf("dx", M * D)
+        dx = self.gbuf("dx", M * D)
         first = True
         for W, d in ((self.Wq, dq), (self.Wk, dk), (self.Wv, dv)):
             o.gemm(self.x, d, W.g, D, D, M, 1, D, D, 1, D, beta=True, passes=ps)
@@ -1079,7 +1102,13 @@ class Net:
             raise TrainError("a parameter of the model is not an array")
         return _Param(self, a.shape, self.offsets[id(a)])
 
-    def compile(self, layer, p, key):
+    def compile(self, layer, p, key, gk=None):
+        nd = self._compile(layer, p, key, gk or key)
+        if getattr(nd, "gkey", None) is None:
+            nd.gkey = gk or key
+        return nd
+
+    def _compile(self, layer, p, key, gk):
         from . import layers as L
         kind = type(layer).__name__
         if isinstance(layer, L.Sequential):
@@ -1087,12 +1116,16 @@ class Net:
             for i, (l_, pp) in enumerate(zip(layer.layers, p)):
                 if isinstance(l_, L.Dropout) and not float(getattr(l_, "p", getattr(l_, "rate", 0.0)) or 0.0):
                     continue                            # dropout 0: nothing to do
-                nd = self.compile(l_, pp, f"{key}.{i}")
+                nd = self.compile(l_, pp, f"{key}.{i}", f"{gk}.s{i % 2}")
                 if isinstance(nd, _Act) and nodes and isinstance(nodes[-1], _Linear) and nodes[-1].act is None \
                         and self.fuse:
                     nodes[-1].act = nd.kind             # linear + activation: one product with the activation
                     continue
                 nodes.append(nd)
+            for a_, b_ in zip(nodes, nodes[1:]):        # linear + act, then linear: keep h only
+                if isinstance(a_, _Linear) and a_.act is not None and isinstance(b_, _Linear) and \
+                        b_.act is None and type(b_) is _Linear:
+                    a_.share_out, b_.x_pre = True, a_
             return _Seq(self, key, nodes)
         if isinstance(layer, L.Linear):
             return _Linear(self, key, layer, p)
@@ -1113,11 +1146,11 @@ class Net:
         if isinstance(layer, L.PositionalEncoding):
             return _PosEnc(self, key, layer, p)
         if isinstance(layer, L.Residual):
-            return _Residual(self, key, self.compile(layer.inner, p.inner, key + ".f"),
-                             self.compile(layer.norm, p.norm, key + ".n") if layer.norm else None)
+            return _Residual(self, key, self.compile(layer.inner, p.inner, key + ".f", gk + ".f"),
+                             self.compile(layer.norm, p.norm, key + ".n", gk + ".n") if layer.norm else None)
         if isinstance(layer, L.TransformerBlock):
-            return _Seq(self, key, [self.compile(layer.attn, p.attn, key + ".a"),
-                                    self.compile(layer.mlp, p.mlp, key + ".m")])
+            return _Seq(self, key, [self.compile(layer.attn, p.attn, key + ".a", gk + ".a"),
+                                    self.compile(layer.mlp, p.mlp, key + ".m", gk + ".m")])
         if isinstance(layer, L.MultiHeadAttention):
             return _Attention(self, key, layer, p)
         raise TrainError(f"layer '{getattr(layer, 'kind', kind)}' is not on the GPU trainer yet "
