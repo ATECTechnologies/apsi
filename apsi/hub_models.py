@@ -1244,7 +1244,7 @@ class Decoder:
             self.gpu.put(SEEN, seen.astype(np.float32) if repetition_penalty != 1.0 else np.zeros(V, np.float32))
         eos = set([eos] if isinstance(eos, int) else (eos or []))
         from . import thermal
-        gov = thermal.governor(getattr(self.gpu, "dev", None)) if self.gpu is not None else thermal.NULL
+        gov = thermal.governor(getattr(self.gpu, "dev", None)) if self.gpu is not None else thermal.cpu_governor()
         for step in range(int(max_new_tokens)):
             gov.tick()                                      # near APSI_GPU_TEMP (77 C) on long answers
             nxt = self._sample_gpu(SEEN, V, temperature, top_k, top_p, repetition_penalty, rng) if on_gpu else None

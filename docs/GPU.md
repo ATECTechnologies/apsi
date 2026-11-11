@@ -157,6 +157,12 @@ the band instead of swinging; a card that stays cool is never slowed.
 | `APSI_GPU_TEMP=77` | the target in °C (default 77 → band 75–78); any value from 50 to 95 |
 | `APSI_GPU_TEMP=off` | no control (the card's own limits only) |
 
+**The processor too.** `APSI_CPU_TEMP=77` (default; `off` for none) paces training and answering on the processor
+the same way. Linux reads the processor's own sensor (k10temp / zenpower on AMD, coretemp on Intel). Windows only
+shows a temperature to programs run as administrator (the ACPI thermal zone, which on some boards is the
+motherboard's sensor rather than the processor's); without it there is no processor control on Windows — the
+processor's own boost limits still apply.
+
 `r.gpu_temperature` after `fit`, `/metrics` of the server and `hub.gpu_status()` report the temperature, the highest
 seen, and how much time was spent pacing. Paced work is slower in proportion — that is the trade for a cooler card.
 Without NVML (very old drivers), there is no control and nothing else changes.
@@ -220,6 +226,7 @@ Raise `--max-queue`, use a smaller model or format, or run another server on ano
 | `APSI_NO_GPU=1` | | everything on the processor |
 | `APSI_GPU_WEIGHTS` | `auto` | `bf16`, `int8`, `fp8`, `fp6`, `fp6_e2m3`, `int4`, `fp4` |
 | `APSI_GPU_TEMP` | `77` | temperature target in °C; `off` for none |
+| `APSI_CPU_TEMP` | `77` | the processor's target in °C; `off` for none |
 | `APSI_TENSOR_CORES` | `1` | `0`: float32 kernels only |
 | `APSI_TC_PRECISE` | `1` | `0`: one tensor-core pass for bfloat16 weights too (faster, about 1e-2 instead of 1e-5) |
 | `APSI_KV_CACHE` | `fp16` | `fp32` for the old cache |

@@ -9,6 +9,8 @@ settles in the band rather than swinging. A cool card is never slowed.
 
     APSI_GPU_TEMP=77        the target in degrees Celsius (default 77: the band is 75-78)
     APSI_GPU_TEMP=off       no control (the card's own limits only)
+    APSI_CPU_TEMP=77        the same for the processor during training and answering on it (Linux sensors; on
+                            Windows the ACPI thermal zone, which needs an administrator)
 
 hub.gpu_status() (thermal.status()) -> {"temperature_c", "target_c", "paced_fraction", "max_c", "paced_s"} for each GPU in use.
 """
@@ -161,8 +163,94 @@ def governor(dev):
         return g
 
 
+# ---------------------------------------------------------------------------------------------------- processor
+def _cpu_reader():
+    """A function giving the processor's temperature in C, or None where it cannot be read.
+    Linux: the hwmon sensors (k10temp / zenpower for AMD, coretemp for Intel) or the package thermal zone.
+    Windows: the ACPI thermal zone through WMI, which Windows only shows to administrators (and on some boards it
+    is the motherboard's sensor); it is read in the background every 3 s."""
+    if sys.platform.startswith("linux"):
+        import glob
+        best = None
+        for d in glob.glob("/sys/class/hwmon/hwmon*"):
+            try:
+                name = open(os.path.join(d, "name")).read().strip()
+            except OSError:
+                continue
+            if name in ("k10temp", "zenpower", "coretemp", "cpu_thermal", "soc_thermal"):
+                f = os.path.join(d, "temp1_input")
+                if os.path.exists(f):
+                    best = f
+                    break
+        if best is None:
+            for z in glob.glob("/sys/class/thermal/thermal_zone*"):
+                try:
+                    if open(os.path.join(z, "type")).read().strip() in ("x86_pkg_temp", "cpu-thermal", "acpitz"):
+                        best = os.path.join(z, "temp")
+                        break
+                except OSError:
+                    continue
+        if best is None:
+            return None
+
+        def read():
+            try:
+                return int(open(best).read().strip()) / 1000.0
+            except (OSError, ValueError):
+                return None
+        return read if read() is not None else None
+    if sys.platform.startswith("win"):
+        import subprocess
+        cmd = ["powershell", "-NoProfile", "-NonInteractive", "-Command",
+               "(Get-CimInstance -Namespace root/WMI -ClassName MSAcpi_ThermalZoneTemperature -ErrorAction Stop | "
+               "Measure-Object CurrentTemperature -Maximum).Maximum"]
+
+        def once():
+            try:
+                out = subprocess.run(cmd, capture_output=True, text=True, timeout=8,
+                                     creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0)).stdout.strip()
+                v = float(out) / 10.0 - 273.15
+                return v if 0.0 < v < 125.0 else None
+            except (OSError, ValueError, subprocess.SubprocessError):
+                return None
+        first = once()
+        if first is None:
+            return None
+        box = {"t": first}
+
+        def poll():
+            while True:
+                time.sleep(3.0)
+                v = once()
+                if v is not None:
+                    box["t"] = v
+        threading.Thread(target=poll, daemon=True, name="apsi-cpu-temp").start()
+        return lambda: box["t"]
+    return None
+
+
+def cpu_governor():
+    """The processor's governor (APSI_CPU_TEMP, default 77 C), or NULL when its temperature cannot be read."""
+    v = os.environ.get("APSI_CPU_TEMP", "77").strip().lower()
+    if v in ("", "0", "off", "no", "false", "none"):
+        return NULL
+    try:
+        target = min(100.0, max(50.0, float(v)))
+    except ValueError:
+        target = 77.0
+    with _lock:
+        g = _govs.get("cpu")
+        if g is None:
+            read = _cpu_reader()
+            g = _govs["cpu"] = Governor(read, target) if read is not None else NULL
+        elif g is not NULL:
+            g.target, g.low, g.high = target, target - 2.0, target + 1.0
+        return g
+
+
 def status():
-    return {k: g.status() for k, g in _govs.items() if g is not NULL}
+    """{"gpu0": {...}, "cpu": {...}}: temperature, target, highest seen, time spent pacing."""
+    return {(f"gpu{k}" if k != "cpu" else k): g.status() for k, g in _govs.items() if g is not NULL}
 
 
 def temperature(dev=None):

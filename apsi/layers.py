@@ -1398,6 +1398,8 @@ def _fit_loop(env):
     from .stdlib import clip_grad_norm
     _f32 = env.get("_f32")
     step = 0
+    from . import thermal
+    cool = thermal.cpu_governor()                      # keeps the processor near APSI_CPU_TEMP (77 C)
     for ep in range(int(epochs)):
         if full:
             batches = [None]
@@ -1419,6 +1421,7 @@ def _fit_loop(env):
                 params = _f32(params)
             total += float(ops.raw(l)) * (1 if b is None else len(b))
             step += 1
+            cool.tick()
         history.append(total / (1 if full else n))
         extra = ""
         if val is not None:
