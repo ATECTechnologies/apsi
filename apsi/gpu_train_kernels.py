@@ -777,6 +777,237 @@ def _tc_module():
     return _emit(m, "sm_80")
 
 
+BM = BN = 128
+BK = 32
+PAD = 40                        # halves per shared-memory row: 80 bytes, so ldmatrix's 8 rows hit 8 different banks
+TILED = ("gemm_tkn", "gemm_tkk", "gemm_tmn", "gemm_tmk")
+
+
+def _tiled_module():
+    """Matrix products on tensor cores with shared-memory tiles (sm_80+), the way fast GEMM libraries do them.
+
+    A block of 8 warps computes 128 x 128 of C; each warp 64 x 32 (4 x 4 mma tiles of 16 x 8). The operands are read
+    from global memory as float32 vectors of 4, rounded to bfloat16 and stored in shared memory (both A and B with
+    k running along each row, rows padded to 40 halves so the reads have no bank conflicts), then read with ldmatrix
+    and multiplied with mma.sync m16n8k16 (bfloat16 in, float32 sums). Two shared buffers: while the warps multiply
+    one 32-wide slice of k, the next slice is already being read from memory into registers.
+
+    Four kernels by which dimension of A and of B is contiguous in memory (gemm_t{k|m}{n|k}): A(m, k) with k
+    contiguous (row-major) or m contiguous (transposed), B(k, n) with n contiguous or k contiguous (transposed).
+    blockIdx.z splits k (split-K): each part adds its share to C atomically (for gradients of weights: few output
+    tiles, a long k). Requirements (checked by the caller): the contiguous dimension and the other strides are
+    multiples of 4 and every operand starts on a 16-byte boundary."""
+    ir, m = _setup("apsi_train_tiled")
+    g = _Gen(ir, m)
+    i16, i32, i64, f32, C, F, G = ir.IntType(16), g.i32, g.i64, g.f32, g.C, g.F, g.G
+    d = g.decl
+    ctaz_f = d("llvm.nvvm.read.ptx.sreg.ctaid.z", i32, [])
+    nctaz_f = d("llvm.nvvm.read.ptx.sreg.nctaid.z", i32, [])
+    bar_f = d("llvm.nvvm.barrier0", ir.VoidType(), [])
+    HALVES = 2 * 2 * BM * PAD
+    smem = ir.GlobalVariable(m, ir.ArrayType(i16, HALVES), "apsi_tiles", addrspace=3)
+    smem.linkage = "internal"
+    smem.align = 16
+    smem.initializer = ir.Constant(ir.ArrayType(i16, HALVES), None)
+    mma = ir.InlineAsm(ir.FunctionType(ir.LiteralStructType([f32] * 4), [i32] * 6 + [f32] * 4),
+                       "mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {$0,$1,$2,$3}, {$4,$5,$6,$7}, "
+                       "{$8,$9}, {$10,$11,$12,$13};", "=f,=f,=f,=f,r,r,r,r,r,r,f,f,f,f", side_effect=False)
+    ldm = ir.InlineAsm(ir.FunctionType(ir.LiteralStructType([i32] * 4), [i64]),
+                       "ldmatrix.sync.aligned.m8n8.x4.shared.b16 {$0,$1,$2,$3}, [$4];", "=r,=r,=r,=r,l",
+                       side_effect=True)
+    red = ir.InlineAsm(ir.FunctionType(ir.VoidType(), [i64, f32]), "red.global.add.f32 [$0], $1;", "l,f",
+                       side_effect=True)
+    args = [("A", G(f32)), ("B", G(f32)), ("C", G(f32)), ("BIAS", G(f32)), ("M", i32), ("N", i32), ("K", i32),
+            ("sam", i32), ("sak", i32), ("sbk", i32), ("sbn", i32), ("ldc", i32), ("nb2", i32), ("a1", i32),
+            ("a2", i32), ("b1", i32), ("b2", i32), ("c1", i32), ("c2", i32), ("alpha", f32), ("beta", i32),
+            ("has_bias", i32), ("kchunk", i32)]
+
+    def kernel(name, a_kc, b_kc):
+        fn = ir.Function(m, ir.FunctionType(ir.VoidType(), [t for _, t in args]), name=name)
+        fn.calling_convention = "ptx_kernel"
+        p = {n: a for (n, _), a in zip(args, fn.args)}
+        allocas = fn.append_basic_block("allocas")
+        top = fn.append_basic_block("top")
+        ab = ir.IRBuilder(allocas)
+        b = ir.IRBuilder(top)
+
+        def var(init):
+            v = ab.alloca(init.type)
+            b.store(init, v)
+            return v
+
+        def z64(x):
+            return b.zext(x, i64)
+
+        def umin(x, y):
+            return b.select(b.icmp_unsigned("<", x, y), x, y)
+        tid, cta, ctay = b.call(g.tid_f, []), b.call(g.ctax_f, []), b.call(g.ctay_f, [])
+        ctaz, nz = b.call(ctaz_f, []), b.call(nctaz_f, [])
+        offs = _batch_offsets(b, ctay, p, i64)
+        lane, warp = b.and_(tid, C(31)), b.lshr(tid, C(5))
+        gq, tig = b.lshr(lane, C(2)), b.and_(lane, C(3))
+        wm, wn = b.lshr(warp, C(2)), b.and_(warp, C(3))
+        nbn = b.udiv(b.add(p["N"], C(BN - 1)), C(BN))
+        bm = b.mul(b.udiv(cta, nbn), C(BM))
+        bn = b.mul(b.urem(cta, nbn), C(BN))
+        k_beg = b.mul(ctaz, p["kchunk"])
+        k_end = umin(b.add(k_beg, p["kchunk"]), p["K"])
+        ntiles = b.udiv(b.add(b.sub(k_end, umin(k_beg, k_end)), C(BK - 1)), C(BK))
+        Mm1, Nm1 = b.sub(p["M"], C(1)), b.sub(p["N"], C(1))
+        Km4 = b.sub(p["K"], C(4))
+
+        def rne(x):
+            u = b.bitcast(x, i32)
+            return b.lshr(b.add(b.add(u, C(0x7FFF)), b.and_(b.lshr(u, C(16)), C(1))), C(16))
+
+        def load4(base_off, ptr, contig_idx, contig_lim, other_idx, other_lim, contig_stride_is_1, s_other):
+            """4 float32 along the contiguous dimension (zeros outside), as 4 bfloat16 bit patterns."""
+            ok = b.and_(b.icmp_unsigned("<", contig_idx, contig_lim), b.icmp_unsigned("<", other_idx, other_lim))
+            ci = umin(contig_idx, b.sub(contig_lim, C(4)))
+            oi = umin(other_idx, b.sub(other_lim, C(1)))
+            idx = b.add(base_off, b.add(b.mul(z64(oi), z64(s_other)), z64(ci)))
+            vp = b.bitcast(b.gep(ptr, [idx], inbounds=True), ir.VectorType(f32, 4).as_pointer(1))
+            vec = b.load(vp, align=16)
+            out = []
+            for j in range(4):
+                v = b.select(ok, b.extract_element(vec, C(j)), F(0.0))
+                out.append(rne(v))
+            return out
+
+        def sh_ptr(half_index):
+            return b.gep(smem, [C(0), half_index], inbounds=True)
+
+        def store_row4(half_index, hs):
+            """4 halves at consecutive k (8 bytes)."""
+            lo = b.or_(hs[0], b.shl(hs[1], C(16)))
+            hi = b.or_(hs[2], b.shl(hs[3], C(16)))
+            v = ir.Constant(ir.VectorType(i32, 2), None)
+            v = b.insert_element(v, lo, C(0))
+            v = b.insert_element(v, hi, C(1))
+            b.store(v, b.bitcast(sh_ptr(half_index), ir.VectorType(i32, 2).as_pointer(3)), align=8)
+
+        def store_col4(half_index, hs):
+            """4 halves at consecutive rows (stride PAD), the same k."""
+            for j in range(4):
+                b.store(b.trunc(hs[j], i16), sh_ptr(b.add(half_index, C(j * PAD))), align=2)
+
+        A_BASE = [C(0), C(BM * PAD)]
+        B_BASE = [C(2 * BM * PAD), C(2 * BM * PAD + BN * PAD)]
+
+        def fetch(kt):
+            """The registers of one k slice: 4 vectors of A and 4 of B per thread."""
+            k0 = b.add(k_beg, b.mul(kt, C(BK)))
+            regs = []
+            for i in range(4):
+                idx = b.add(tid, C(256 * i))
+                if a_kc:                              # A(m, k) = A[m * sam + k]
+                    row, kq = b.lshr(idx, C(3)), b.mul(b.and_(idx, C(7)), C(4))
+                    regs.append(("A", row, kq, load4(offs[0], p["A"], b.add(k0, kq), k_end, b.add(bm, row), p["M"],
+                                                     True, p["sam"])))
+                else:                                 # A(m, k) = A[k * sak + m]
+                    kk, mq = b.lshr(idx, C(5)), b.mul(b.and_(idx, C(31)), C(4))
+                    regs.append(("At", mq, kk, load4(offs[0], p["A"], b.add(bm, mq), p["M"], b.add(k0, kk), k_end,
+                                                     True, p["sak"])))
+                if b_kc:                              # B(k, n) = B[n * sbn + k]
+                    nrow, kq = b.lshr(idx, C(3)), b.mul(b.and_(idx, C(7)), C(4))
+                    regs.append(("B", nrow, kq, load4(offs[1], p["B"], b.add(k0, kq), k_end, b.add(bn, nrow), p["N"],
+                                                      True, p["sbn"])))
+                else:                                 # B(k, n) = B[k * sbk + n]
+                    kk, nq = b.lshr(idx, C(5)), b.mul(b.and_(idx, C(31)), C(4))
+                    regs.append(("Bt", nq, kk, load4(offs[1], p["B"], b.add(bn, nq), p["N"], b.add(k0, kk), k_end,
+                                                     True, p["sbk"])))
+            return regs
+
+        def put(regs, buf):
+            for kind, r, c, hs in regs:
+                if kind in ("A", "At"):
+                    base = b.select(b.icmp_unsigned("==", buf, C(0)), A_BASE[0], A_BASE[1])
+                else:
+                    base = b.select(b.icmp_unsigned("==", buf, C(0)), B_BASE[0], B_BASE[1])
+                h = b.add(base, b.add(b.mul(r, C(PAD)), c))
+                if kind in ("A", "B"):
+                    store_row4(h, hs)
+                else:
+                    store_col4(h, hs)
+
+        accs = [[[var(F(0.0)) for _ in range(4)] for _ in range(4)] for _ in range(4)]
+        put(fetch(C(0)), C(0))
+        b.call(bar_f, [])
+        it = var(C(0))
+        head = fn.append_basic_block("head")
+        body = fn.append_basic_block("body")
+        done = fn.append_basic_block("done")
+        b.branch(head)
+        b.position_at_end(head)
+        i = b.load(it)
+        b.cbranch(b.icmp_unsigned("<", i, ntiles), body, done)
+        b.position_at_end(body)
+        nxt = b.add(i, C(1))
+        has_next = b.icmp_unsigned("<", nxt, ntiles)
+        regs = fetch(umin(nxt, b.sub(ntiles, C(1))))
+        buf = b.and_(i, C(1))
+        abase = b.select(b.icmp_unsigned("==", buf, C(0)), A_BASE[0], A_BASE[1])
+        bbase = b.select(b.icmp_unsigned("==", buf, C(0)), B_BASE[0], B_BASE[1])
+        for ks in range(BK // 16):
+            afr = []
+            for mt in range(4):
+                row = b.add(b.add(b.mul(wm, C(64)), C(mt * 16)), b.and_(lane, C(15)))
+                col = b.add(C(ks * 16), b.mul(b.lshr(lane, C(4)), C(8)))
+                addr = b.ptrtoint(sh_ptr(b.add(abase, b.add(b.mul(row, C(PAD)), col))), i64)
+                r = b.call(ldm, [addr])
+                afr.append([b.extract_value(r, j) for j in range(4)])
+            bfr = []
+            for pr in range(2):
+                nrow = b.add(b.add(b.mul(wn, C(32)), C(pr * 16)),
+                             b.add(b.and_(lane, C(7)), b.mul(b.lshr(lane, C(4)), C(8))))
+                col = b.add(C(ks * 16), b.mul(b.and_(b.lshr(lane, C(3)), C(1)), C(8)))
+                addr = b.ptrtoint(sh_ptr(b.add(bbase, b.add(b.mul(nrow, C(PAD)), col))), i64)
+                r = b.call(ldm, [addr])
+                q = [b.extract_value(r, j) for j in range(4)]
+                bfr += [[q[0], q[1]], [q[2], q[3]]]
+            for mt in range(4):
+                for nt in range(4):
+                    acc = [b.load(a) for a in accs[mt][nt]]
+                    r = b.call(mma, afr[mt] + bfr[nt] + acc)
+                    for c in range(4):
+                        b.store(b.extract_value(r, c), accs[mt][nt][c])
+        with b.if_then(has_next):
+            put(regs, b.and_(nxt, C(1)))
+        b.call(bar_f, [])
+        b.store(nxt, it)
+        b.branch(head)
+        b.position_at_end(done)
+        split = b.icmp_unsigned(">", nz, C(1))
+        first = b.icmp_unsigned("==", ctaz, C(0))
+        for mt in range(4):
+            for nt in range(4):
+                for c in range(4):
+                    row = b.add(b.add(bm, b.add(b.mul(wm, C(64)), C(mt * 16 + (c // 2) * 8))), gq)
+                    col = b.add(b.add(bn, b.add(b.mul(wn, C(32)), C(nt * 8))), b.add(b.mul(tig, C(2)), C(c % 2)))
+                    with b.if_then(b.and_(b.icmp_unsigned("<", row, p["M"]), b.icmp_unsigned("<", col, p["N"]))):
+                        idx = b.add(offs[2], b.add(b.mul(z64(row), z64(p["ldc"])), z64(col)))
+                        ptr = b.gep(p["C"], [idx], inbounds=True)
+                        v = b.fmul(b.load(accs[mt][nt][c]), p["alpha"])
+                        tmp = var(v)
+                        with b.if_then(b.and_(b.icmp_unsigned("!=", p["has_bias"], C(0)), first)):
+                            bp = b.gep(p["BIAS"], [z64(col)], inbounds=True)
+                            b.store(b.fadd(b.load(tmp), b.load(bp, align=4)), tmp)
+                        with b.if_else(split) as (then, other):
+                            with then:                # each part of k adds its share (C holds the rest)
+                                b.call(red, [b.ptrtoint(ptr, i64), b.load(tmp)])
+                            with other:
+                                with b.if_then(b.icmp_unsigned("!=", p["beta"], C(0))):
+                                    b.store(b.fadd(b.load(tmp), b.load(ptr, align=4)), tmp)
+                                b.store(b.load(tmp), ptr, align=4)
+        b.ret_void()
+        ab.branch(top)
+
+    kernel("apsi_kernel", True, False)            # = gemm_tkn: x @ W
+    for name, a_kc, b_kc in (("gemm_tkk", True, True), ("gemm_tmn", False, False), ("gemm_tmk", False, True)):
+        kernel(name, a_kc, b_kc)
+    return _emit(m, "sm_80")
+
+
 _cache = {}
 
 
@@ -800,7 +1031,7 @@ def ptx(which):
                 return text
     except (OSError, ImportError):
         pass
-    text = _main_module() if which == "main" else _tc_module()
+    text = {"main": _main_module, "tc": _tc_module, "tiled": _tiled_module}[which]()
     if path:
         try:
             os.makedirs(os.path.dirname(path), exist_ok=True)

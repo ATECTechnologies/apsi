@@ -22,6 +22,7 @@ autodiff, and on any real GPU against the Emulator.
 import ctypes
 import math
 import os
+import time
 
 import numpy as np
 
@@ -308,14 +309,27 @@ class Gpu(_Ops):
                 self.tc_why = f"{type(e).__name__}: {e}"
         elif tuple(dev.cc) < (8, 0):
             self.tc_why = f"compute capability {dev.cc[0]}.{dev.cc[1]}: bfloat16 tensor cores need 8.0 (Ampere)"
+        self.tiled = False
+        if self.tc and os.environ.get("APSI_TILED", "1").strip() not in ("0", "false", "no"):
+            try:                                         # shared-memory tiles: the fast products
+                tmod, self.fn["gemm_tkn"] = dev.load("apsi-train-tiled-1", KS.ptx("tiled"))
+                for name in KS.TILED[1:]:
+                    f = ctypes.c_void_p()
+                    dev.drv.check(lib.cuModuleGetFunction(ctypes.byref(f), tmod, name.encode()), "cuModuleGetFunction")
+                    self.fn[name] = f
+                self.tiled = True
+            except Exception as e:
+                self.tc_why = f"tiled products unavailable: {type(e).__name__}: {e}"
+        self.sms = int(getattr(dev, "sms", 0) or 28)
         self._calls = {}
+        self.profile = None                              # {kernel: (seconds, launches)} while profiling
         self._launch = lib.cuLaunchKernel
 
     _CT = {"p": ctypes.c_uint64, "u": ctypes.c_uint32, "i": ctypes.c_int32, "f": ctypes.c_float}
 
     def _go(self, name, grid, block, *args):
-        gx, gy = grid if isinstance(grid, tuple) else (grid, 1)
-        key = (name, gx, gy, block, args)
+        gx, gy, gz = (tuple(grid) + (1, 1))[:3] if isinstance(grid, tuple) else (grid, 1, 1)
+        key = (name, gx, gy, gz, block, args)
         hit = self._calls.get(key)
         if hit is None:
             objs = [self._CT[k](v) for k, v in args]
@@ -324,7 +338,16 @@ class Gpu(_Ops):
                 self._calls.clear()
             hit = self._calls[key] = (objs, arr)
         self.dev.ensure()
-        r = self._launch(self.fn[name], max(1, gx), max(1, gy), 1, block, 1, 1, 0, None, hit[1], None)
+        if self.profile is not None:
+            self.sync()
+            t0 = time.perf_counter()
+        r = self._launch(self.fn[name], max(1, gx), max(1, gy), max(1, gz), block, 1, 1, 0, None, hit[1], None)
+        if self.profile is not None:
+            self.sync()
+            key2 = name if name not in ("gemm_tc", "gemm_tc3", "gemm_simt") and not name.startswith("gemm_t") else \
+                f"{name} {args[4][1]}x{args[5][1]}x{args[6][1]}" + (f" b{gy}" if gy > 1 else "") + (f" k/{gz}" if gz > 1 else "")
+            t, c = self.profile.get(key2, (0.0, 0))
+            self.profile[key2] = (t + time.perf_counter() - t0, c + 1)
         if r:
             self.dev.drv.check(r, f"launching {name}")
 
@@ -442,7 +465,50 @@ class Gpu(_Ops):
         self._go("fakeq", self.blocks(((K + 31) // 32) * N), 256, self.p(W), self.p(WQ), ("u", K), ("u", N),
                  ("u", kind))
 
+    def _tiled_ok(self, A, B, M, N, K, sam, sak, sbk, sbn, sa, sb):
+        def q(*v):
+            return all(int(x) % 4 == 0 for x in v)
+        if sak == 1:
+            if not q(K, sam, A[1], *sa):
+                return None
+            ka = "k"
+        elif sam == 1:
+            if not q(M, sak, A[1], *sa):
+                return None
+            ka = "m"
+        else:
+            return None
+        if sbn == 1:
+            if not q(N, sbk, B[1], *sb):
+                return None
+            kb = "n"
+        elif sbk == 1:
+            if not q(K, sbn, B[1], *sb):
+                return None
+            kb = "k"
+        else:
+            return None
+        return f"gemm_t{ka}{kb}"
+
     def _gemm(self, A, B, Cv, bias, M, N, K, sam, sak, sbk, sbn, ldc, nb1, nb2, sa, sb, sc, alpha, beta, passes):
+        name = self._tiled_ok(A, B, M, N, K, sam, sak, sbk, sbn, sa, sb) if self.tiled and passes == 1 else None
+        if name is not None:
+            tiles = ((M + KS.BM - 1) // KS.BM) * ((N + KS.BN - 1) // KS.BN)
+            nz, kchunk = 1, K
+            blocks = tiles * nb1 * nb2
+            # few output tiles and a long k (gradients of weights): split k so every multiprocessor has work
+            if blocks < self.sms and nb1 * nb2 == 1 and K >= 512 and (beta or ldc == N):
+                want = min(-(-2 * self.sms // blocks), K // 128, 16)
+                if want > 1:
+                    kchunk = -(-(-(-K // want)) // KS.BK) * KS.BK
+                    nz = -(-K // kchunk)
+                    if nz > 1 and not beta:
+                        self.fill(Cv, M * N, 0.0)
+            self._go(name, (tiles, nb1 * nb2, nz), 256, self.p(A), self.p(B), self.p(Cv), self.p(bias), ("u", M),
+                     ("u", N), ("u", K), ("u", sam), ("u", sak), ("u", sbk), ("u", sbn), ("u", ldc), ("u", nb2),
+                     ("u", sa[0]), ("u", sa[1]), ("u", sb[0]), ("u", sb[1]), ("u", sc[0]), ("u", sc[1]),
+                     ("f", alpha), ("u", 1 if beta else 0), ("u", 1 if bias is not None else 0), ("u", kchunk))
+            return
         tiles = ((M + KS.TILE - 1) // KS.TILE) * ((N + KS.TILE - 1) // KS.TILE)
         args = (self.p(A), self.p(B), self.p(Cv), self.p(bias), ("u", M), ("u", N), ("u", K), ("u", sam),
                 ("u", sak), ("u", sbk), ("u", sbn), ("u", ldc), ("u", nb2), ("u", sa[0]), ("u", sa[1]),

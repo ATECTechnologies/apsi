@@ -161,6 +161,50 @@ class RealGpu(unittest.TestCase):
             e.fakeq(W[1], WQ[1], 70, 48, kind)
             np.testing.assert_array_equal(g.get(WQ[0][0], 70 * 48), e.get(WQ[1][0], 70 * 48), f"fakeq {kind}")
 
+    def test_tiled_products(self):
+        """The shared-memory tensor-core products: every layout, edges, batches of heads and split k."""
+        g, e = self.g, GT.Emulator(tc=True)
+        if not g.tiled:
+            self.skipTest(f"no tiled products here: {g.tc_why}")
+        rng = np.random.default_rng(5)
+
+        def pair(a):
+            a = np.ascontiguousarray(a, np.float32)
+            bg, be = g.alloc(a.size), e.alloc(a.size)
+            g.put(bg, a.reshape(-1))
+            e.put(be, a.reshape(-1))
+            return (bg, 0), (be, 0)
+
+        def check(M, N, K, ta, tb, beta=False, bias=False, alpha=1.0):
+            A = pair(rng.normal(size=(K, M) if ta else (M, K)))
+            B = pair(rng.normal(size=(N, K) if tb else (K, N)))
+            Cc = pair(rng.normal(size=(M, N)))
+            bs = pair(rng.normal(size=N)) if bias else (None, None)
+            sam, sak = (1, M) if ta else (K, 1)
+            sbk, sbn = (1, K) if tb else (N, 1)
+            self.assertIsNotNone(g._tiled_ok(A[0], B[0], M, N, K, sam, sak, sbk, sbn, (0, 0), (0, 0)))
+            for dv, i in ((g, 0), (e, 1)):
+                dv.gemm(A[i], B[i], Cc[i], M, N, K, sam, sak, sbk, sbn, N, alpha=alpha, beta=beta, bias=bs[i])
+            a, b_ = g.get(Cc[0][0], M * N), e.get(Cc[1][0], M * N)
+            err = np.abs(a - b_).max() / (np.abs(b_).max() + 1e-9)
+            self.assertLess(err, 2e-3, (M, N, K, ta, tb, beta, bias, err))
+        for ta in (False, True):
+            for tb in (False, True):
+                check(200, 136, 96, ta, tb)
+                check(128, 128, 32, ta, tb, beta=True, bias=True, alpha=0.5)
+                check(4, 4, 4, ta, tb)
+                check(384, 1536, 4096, ta, tb, beta=True)          # split k
+                check(256, 384, 2048, ta, tb)                      # split k into a cleared C
+        # attention heads: batched, offsets inside the rows
+        Bh, T, hd, H = 2, 128, 64, 3
+        D = H * hd
+        q, k, S = pair(rng.normal(size=(Bh, T, D))), pair(rng.normal(size=(Bh, T, D))), pair(np.zeros(Bh * H * T * T))
+        for dv, i in ((g, 0), (e, 1)):
+            dv.gemm(q[i], k[i], S[i], T, T, hd, D, 1, 1, D, T, alpha=0.125, batch=(Bh, H), sa=(T * D, hd),
+                    sb=(T * D, hd), sc=(H * T * T, T * T))
+        a, b_ = g.get(S[0][0], Bh * H * T * T), e.get(S[1][0], Bh * H * T * T)
+        self.assertLess(np.abs(a - b_).max() / np.abs(b_).max(), 2e-3)
+
     def test_training_on_the_card_matches_the_emulator(self):
         rng = np.random.default_rng(3)
         lm = L.transformer_lm(40, d=64, heads=4, layers=2, context=32)
