@@ -2,6 +2,21 @@
 
 ## 2.4.4 — Python, exactly; real time; data, databases and the web
 
+### Training on the GPU with Apsi alone, low-bit formats, an AI server
+- **`fit(..., backend="gpu")`: Apsi's own GPU trainer** — CUDA kernels written in Apsi's code generator and loaded
+  through the driver: no PyTorch, no CUDA toolkit, nothing to download. Matrix products on the tensor cores (any
+  strides, so transposes and attention heads need no copies), layer/RMS norm, attention softmax, embeddings,
+  cross-entropy, AdamW / SGD over all parameters in one kernel, gradient clipping on the card, the data set on the
+  card. Gradients equal Apsi's autodiff (tested to 1e-5) and the training curve equals the NumPy backend's.
+  `backend="auto"` uses it whenever there is an NVIDIA card and the model fits its layers.
+- **Low-bit training:** `precision="fp8" | "fp6" | "fp6_e2m3" | "fp4" | "int8" | "int4"` on the GPU trainer, NumPy and
+  PyTorch; real fp8 products on Ada / Hopper / Blackwell tensor cores with PyTorch.
+- **fp6 on the card:** `APSI_GPU_WEIGHTS=fp6` (E3M2) and `fp6_e2m3` (E2M3: as close as fp8 at 6 bits), bit-exact
+  with ml_dtypes.
+- **`apsi serve-model` / `hub.serve(lm)`: the OpenAI API** (`/v1/chat/completions` with streaming, `/v1/completions`,
+  `/v1/models`, `/health`, `/metrics`), first-come-first-served queue with a limit and 429, a client that leaves frees
+  the model at once, time limits, API keys. `examples/31_ai_server.apsi` adds your own routes in Apsi.
+
 ### Long context, logs, training data, side-by-side installs
 - **Twice the context in the same GPU memory:** the key/value cache is float16 by default (`APSI_KV_CACHE=fp32` for
   the old one), read four values at a time; long prompts split attention over more blocks of the card.

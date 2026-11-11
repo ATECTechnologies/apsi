@@ -310,13 +310,17 @@ for the tensor-core product of a prompt. `gpu_weights="auto"` (or `APSI_GPU_WEIG
 fits, else int8, else int4, so that every layer stays on the card, and turns the first layers back into int8 while
 room is left. A Qwen2.5-14B model (27 GB in bfloat16) then runs all 48 layers on a 12 GB RTX 3060 instead of 16 —
 the rest would otherwise run on the processor, limited by the memory speed of the PC. `APSI_GPU_WEIGHTS=bf16`
-keeps the exact weights (and splits the model when it does not fit); `fp8` (E4M3) and `fp4` (E2M1) are the float
-formats of the same sizes, rounded exactly as ml_dtypes rounds them (tested bit for bit).
+keeps the exact weights (and splits the model when it does not fit); `fp8` (E4M3), `fp6` (E3M2), `fp6_e2m3` and
+`fp4` (E2M1) are the float formats, rounded exactly as ml_dtypes rounds them (tested bit for bit). A model trained with
+`fit(..., precision="fp4")` (or fp8, fp6, int8, int4) runs in that format afterwards with exactly the weights it was
+trained with: the training rounds them the same way, in the same blocks of 32.
 
 | `gpu_weights` | bytes per weight | 14B model | notes |
 |---|---:|---:|---|
 | `bf16` | 2 | 27.5 GB | the checkpoint as stored |
 | `int8`, `fp8` | 1.125 | 15.5 GB | error below bfloat16's rounding of the activations (int8) |
+| `fp6_e2m3` | 0.875 | 12.0 GB | OCP MX fp6 E2M3: about as close to bfloat16 as fp8 at three quarters of its size |
+| `fp6` (E3M2) | 0.875 | 12.0 GB | wider range, coarser steps than E2M3 |
 | `int4`, `fp4` | 0.625 | 8.6 GB | ggml Q4_0-like; small quality loss |
 | `auto` | — | — | bf16 → int8 → int4, the first in which every layer fits, int8 again where room is left |
 
@@ -347,3 +351,30 @@ float32 sums); the activations are split into two bfloat16 parts, so the result 
 For those, `hf_pipeline(task, model)` in `use models` runs Python's `transformers` (needs `--allow-python`).
 PyTorch `.bin` checkpoints are pickles and can run code when loaded; `hub.load` refuses them. Download them with
 `hub.download` and open them with `torch_load` under `--allow-python` only if you trust the publisher.
+
+
+## Serving a model: the OpenAI API
+
+```
+apsi serve-model Qwen/Qwen2.5-3B-Instruct --port 8000                 # or a local folder; --api-key KEY
+```
+```apsi
+let lm = hub.model("Qwen/Qwen2.5-3B-Instruct")
+hub.serve(lm, port=8000)                        # background=true returns the server (url, stop()) and goes on
+```
+
+| Endpoint | |
+|---|---|
+| `POST /v1/chat/completions` | `messages`, `max_tokens`, `temperature`, `top_p`, `top_k`, `seed`, `stop`, `repetition_penalty`, `stream` (server-sent events, as OpenAI) |
+| `POST /v1/completions` | `prompt` and the same options |
+| `GET /v1/models` | the model served |
+| `GET /health` | status, queue length, device (no key needed) |
+| `GET /metrics` | requests, errors, rejected, cancelled, tokens, busy fraction, waiting / first-token / latency percentiles |
+
+Any OpenAI client library works with `base_url="http://127.0.0.1:8000/v1"`. The model computes one request at a
+time in arrival order (first come, first served); up to `--max-queue` (64) wait, more get `429` with `Retry-After`.
+A client that disconnects stops its generation at the next token, so the next request starts at once. Each request
+has a time limit (`--timeout`, 600 s, waiting included); a failure inside the model answers `500` for that request
+and the server keeps going. With `--api-key` (or `APSI_API_KEY`) every request but `/health` needs
+`Authorization: Bearer KEY`; serve on `--host 0.0.0.0` only with a key. Your own routes in Apsi next to it:
+[`examples/31_ai_server.apsi`](../examples/31_ai_server.apsi).

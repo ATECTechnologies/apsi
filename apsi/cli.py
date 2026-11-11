@@ -873,6 +873,8 @@ def _parser(light=False):
     _scale.add_parser(sub)
     from . import modelio as _modelio
     _modelio.add_parser(sub)
+    from . import ai_server as _ai_server
+    _ai_server.add_parser(sub)
     _packages.add_parser(sub)
     from . import apsil as _apsil
     _apsil.add_parser(sub)

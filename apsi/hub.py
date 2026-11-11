@@ -734,6 +734,7 @@ class Model:
                 if len(text) > len(before) and not text.endswith("\ufffd"):   # not half of a character
                     at[0], at[1] = at[1], len(done)
                     stream(text[len(before):])
+        self.last_prompt_tokens = len(ids)             # the prompt's length, for usage reports
         out = self.net.generate(ids, max_new_tokens, temperature, top_k, top_p, eos, seed, repetition_penalty,
                                 emit if stream is not None else None)
         self.last_tokens = len(out)                    # how many tokens the last generate() produced
@@ -1449,12 +1450,23 @@ def module(interp=None):
             folder = check_path(interp, folder, "read", "hub.model_from_folder()")
         return Model(folder, device=device, gpu_layers=gpu_layers, memory=memory)
 
+    def serve(model, host="127.0.0.1", port=8000, api_key=None, name=None, max_queue=64, max_tokens=4096,
+              timeout=600.0, background=False, log=True):
+        """Serve a decoder with the OpenAI API (/v1/chat/completions, /v1/completions, /v1/models, /health,
+        /metrics). background=true returns the server (url, stop()) instead of serving until Ctrl+C."""
+        from . import ai_server
+        if interp is not None:
+            from .security import check_net
+            check_net(interp, str(host), int(port), "hub.serve()")
+        return ai_server.serve(model, host, int(port), api_key, name, int(max_queue), int(max_tokens),
+                               float(timeout.v if hasattr(timeout, "v") else timeout), bool(background), bool(log))
+
     def devices():
         """The NVIDIA GPUs the hub can use: [{"index", "name", "memory_gb", "compute_capability", ...}] (or [])."""
         from .native import cuda
         return cuda.devices()
 
-    return {"devices": devices, "model": hub.model, "pipeline": hub.pipeline, "model_from_folder": model_from_folder, "info": hub.info, "files": hub.files, "search": hub.search, "download": hub.download,
+    return {"devices": devices, "model": hub.model, "pipeline": hub.pipeline, "model_from_folder": model_from_folder, "serve": serve, "info": hub.info, "files": hub.files, "search": hub.search, "download": hub.download,
             "snapshot": hub.snapshot, "load": hub.load, "config": hub.config, "tokenizer": hub.tokenizer,
             "tokenizer_from_file": tokenizer_from_file, "login": login, "logout": logout, "offline": offline,
             "cache_dir": cache_dir, "clear_cache": clear_cache, "HubError": HubError}

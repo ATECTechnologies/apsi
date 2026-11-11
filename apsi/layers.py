@@ -1281,14 +1281,37 @@ def _take(x, rows):
     return [_take(v, rows) for v in x] if isinstance(x, (list, tuple)) else x[rows]
 
 
-def _backend(backend):
+def _backend(backend, model=None, loss=None, plain=True):
+    """numpy, torch or gpu. "auto": Apsi's own GPU trainer when there is an NVIDIA card and it takes the model,
+    else PyTorch when installed, else NumPy."""
     b = str(backend or "numpy").lower()
-    if b == "auto":
+    b = {"apsi-gpu": "gpu", "native-gpu": "gpu", "cuda": "gpu", "apsi": "numpy", "cpu": "numpy"}.get(b, b)
+    if b in ("auto", "auto-notorch"):
+        if model is not None and plain and loss in ("cross_entropy", "mse") and _gpu_ready() and \
+                _gpu_supports(model) is None:
+            return "gpu"
+        if b == "auto-notorch":
+            return "numpy"
         from . import torch_backend
         return "torch" if torch_backend.available() else "numpy"
-    if b not in ("numpy", "torch"):
-        raise RuntimeErr(f"backend must be \"numpy\", \"torch\" or \"auto\" (got '{backend}')")
+    if b not in ("numpy", "torch", "gpu"):
+        raise RuntimeErr(f"backend must be \"numpy\", \"gpu\" (Apsi's own GPU trainer), \"torch\" or \"auto\" "
+                         f"(got '{backend}')")
     return b
+
+
+def _gpu_ready():
+    try:
+        from .native import cuda
+        drv = cuda.driver()
+        return drv is not None and bool(drv.devices)
+    except Exception:
+        return False
+
+
+def _gpu_supports(model):
+    from . import gpu_train
+    return gpu_train.supports(model)
 
 
 def fit(model, params, X, y=None, loss="mse", opt=None, epochs=10, batch_size=None, seed=0, verbose=True,
@@ -1307,7 +1330,18 @@ def fit(model, params, X, y=None, loss="mse", opt=None, epochs=10, batch_size=No
     shards, the gradients of the shards are averaged (weighted by shard size, so the result is the gradient of the
     whole batch) and one optimizer step is taken. "auto" uses every core.
     """
-    if _backend(backend) == "torch":
+    which = _backend(backend, model, loss if isinstance(loss, str) else None, graph is None and mask is None)
+    if which == "gpu":
+        from . import gpu_train
+        if graph is not None or mask is not None:
+            raise RuntimeErr("backend=\"gpu\": graph tasks train with backend=\"torch\" or \"numpy\"")
+        dev = "cuda" if str(device).lower() in ("auto", "gpu", "cuda") else device
+        try:
+            return gpu_train.fit(model, params, X, y, loss, opt, epochs, batch_size, seed, verbose, clip, schedule, val,
+                                 device=dev, precision=precision)
+        except gpu_train.TrainError as e:
+            raise RuntimeErr(f"backend=\"gpu\": {e}")
+    if which == "torch":
         from . import torch_backend
         return torch_backend.fit(model, params, X, y, loss, opt, epochs, batch_size, seed, verbose, clip, schedule,
                                  graph, mask, val, device=device, precision=precision, compile=compile)
@@ -1323,9 +1357,17 @@ def fit(model, params, X, y=None, loss="mse", opt=None, epochs=10, batch_size=No
         if sel is not None:
             out, yb = out[np.nonzero(sel)[0]], yb[np.nonzero(sel)[0]]
         return lf(out, yb)
+    from . import lowbit
+    kind = lowbit.parse(precision)
     vg = value_and_grad(objective)
+    if kind:                                  # weights in the low-bit format forward, straight-through gradient
+        _vg_full = vg
+
+        def vg(p, *a):
+            return _vg_full(lowbit.round_tree(p, kind), *a)
+    vparams = (lambda p: lowbit.round_tree(p, kind)) if kind else (lambda p: p)
     Xr, Yr = X, target
-    low = str(precision).lower() in ("auto", "fp32", "float32", "f32", "tf32", "bf16", "fp16")
+    low = kind is not None or str(precision).lower() in ("auto", "fp32", "float32", "f32", "tf32", "bf16", "fp16")
     if low:                                   # half the memory of float64 for weights, data and activations
         def _f32(t):
             return tree_map(lambda a: a.astype(np.float32) if isinstance(a, np.ndarray) and a.dtype.kind == "f"
@@ -1348,6 +1390,7 @@ def fit(model, params, X, y=None, loss="mse", opt=None, epochs=10, batch_size=No
 
 
 def _fit_loop(env):
+    env.setdefault("vparams", (lambda p: p))
     (model, epochs, full, rng, n, batch_size, Xr, Yr, schedule, opt, vg, params, clip, low, history, val, lf, ctx,
      val_hist, verbose) = (env[k] for k in ("model", "epochs", "full", "rng", "n", "batch_size", "Xr", "Yr",
                                              "schedule", "opt", "vg", "params", "clip", "low", "history", "val",
@@ -1380,7 +1423,7 @@ def _fit_loop(env):
         extra = ""
         if val is not None:
             vx, vy = val
-            vl = float(ops.raw(lf(model(params, vx, **ctx), vy)))
+            vl = float(ops.raw(lf(model(env["vparams"](params), vx, **ctx), vy)))
             val_hist.append(vl)
             extra = f"  val {vl:.5f}"
         if verbose and (ep % max(1, int(epochs) // 10) == 0 or ep == int(epochs) - 1):
@@ -1477,9 +1520,18 @@ def _team_worker(pipe):
 
 
 def predict(model, params, X, backend="numpy", device="auto", precision="auto", **ctx):
-    if _backend(backend) == "torch":
+    which = _backend(backend)
+    if which == "gpu":
+        from . import gpu_train
+        dev = "cuda" if str(device).lower() in ("auto", "gpu", "cuda") else device
+        return gpu_train.predict(model, params, X, device=dev, precision=precision)
+    if which == "torch":
         from . import torch_backend
         return torch_backend.predict(model, params, X, device=device, precision=precision, **ctx)
+    from . import lowbit
+    kind = lowbit.parse(precision)
+    if kind:
+        params = lowbit.round_tree(params, kind)
     return model(params, X, train=False, **ctx)
 
 
@@ -1559,9 +1611,8 @@ def module(interp=None):
 
     def resolve(backend, what):
         b = str(backend or "numpy").lower()
-        if b == "auto":
-            from . import torch_backend
-            return "torch" if permitted() and torch_backend.available() else "numpy"
+        if b == "auto":                     # Apsi's GPU trainer first, then PyTorch when allowed, then NumPy
+            return "auto" if permitted() else "auto-notorch"
         if b == "torch" and interp is not None:
             need(interp, "python", what)
         return b

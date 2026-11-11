@@ -57,6 +57,14 @@ class AutoPrecision(unittest.TestCase):
         with self.assertRaises(RuntimeErr):
             self.run_with(True, "fp12", "cuda")
 
+    def test_low_bit_formats(self):
+        # fp8 / fp6 / fp4 / int8 / int4 weights train with a float32 master and 16-bit products on the GPU
+        for name in ("fp8", "fp6", "fp6_e2m3", "fp4", "int8", "int4", "mxfp4"):
+            self.assertEqual(self.run_with(True, name, "cuda"), ("float32", "bfloat16"), name)
+            self.assertEqual(self.run_with(False, name, "cuda"), ("float32", "float16"), name)
+            self.assertEqual(self.run_with(True, name, "cpu"), ("float32", None), name)
+        self.assertEqual(self.run_with(True, "auto", "cuda", env="fp4"), ("float32", "bfloat16"))
+
 
 if __name__ == "__main__":
     unittest.main()

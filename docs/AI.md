@@ -61,6 +61,27 @@ let r = fit(gnn, gnn.init(seed=0), features, labels, loss="cross_entropy", graph
 clip, schedule, graph, mask, val=(Xv, yv))` returns `record(params, history, val_history)`; `predict`, `summary`,
 `count_params`. Full example: `examples/28_any_architecture.apsi`.
 
+**On the GPU with Apsi alone** — `backend="gpu"` trains on an NVIDIA card with Apsi's own CUDA kernels (no PyTorch,
+no CUDA toolkit, nothing to download; the driver is enough). Matrix products run on the tensor cores (bfloat16 with
+float32 sums on Ampere and newer; three passes for `precision="fp32"`; a float32 kernel on older cards); parameters,
+gradients and the AdamW state sit in three flat arrays updated by one kernel; the data set stays on the card and each
+batch is gathered there, so the processor never makes the card wait inside an epoch. `backend="auto"` picks it when
+there is a card and the model is made of the layers it has: linear, activations, dropout, layer_norm, rms_norm,
+embedding, positional_encoding, residual, multi_head_attention, transformer_block (so `mlp`, `resnet_mlp`,
+`transformer_lm`, `transformer_encoder`), with `cross_entropy` or `mse`, Adam / AdamW / SGD, `clip=`, `schedule=`.
+
+```apsi
+let r = fit(model, params, X, y, loss="cross_entropy", opt=adamw(lr=1e-3), epochs=3, batch_size=32,
+            backend="gpu")                    # precision "auto" (bf16 tensor cores), "fp32", "fp8", "fp4", ...
+print(r.device, r.gpu_memory_mb)              # gpu (NVIDIA GeForce RTX 3060, Apsi kernels, tensor cores)
+```
+
+**Low-bit training** — `precision="fp8" | "fp6" | "fp6_e2m3" | "fp4" | "int8" | "int4"` on every backend: the
+weights are rounded to the format (one scale per 32 values, the layout the GPU runs models in) in each forward pass,
+the gradient goes straight through to a float32 master copy. The model then runs in that format with exactly the
+weights it learned. On cards with fp8 tensor cores (Ada, Hopper, Blackwell) `backend="torch"` with `"fp8"` also
+multiplies in fp8 there.
+
 **On GPUs with PyTorch** — the same model, trained by PyTorch on CUDA / ROCm / Apple MPS / Intel XPU with mixed
 precision and `torch.compile`; the result is a normal Apsi parameter tree again (details: [`BACKENDS.md`](BACKENDS.md)):
 
@@ -167,6 +188,10 @@ Any other Python library: `pyimport("module")`, then `to_torch` / `from_torch` t
 `apsi pkg install ai` installs ONNX Runtime, PyTorch and Transformers into Apsi's own runtime.
 
 ## 5. Serve it as an API
+
+A language model behind the OpenAI API: `apsi serve-model Qwen/Qwen2.5-3B-Instruct` or `hub.serve(lm, port=8000)`
+(streaming, a fair queue, API keys, `/metrics`; [`HUB.md`](HUB.md#serving-a-model-the-openai-api)). Your own model
+or your own routes with `use web`:
 
 ```apsi
 use web

@@ -1,4 +1,4 @@
-# 30_gpu_training.apsi — train on the GPU with PyTorch, then use the result in plain Apsi
+# 30_gpu_training.apsi — train on the GPU (Apsi's own kernels, or PyTorch), then use the result in plain Apsi
 #   apsi --allow-python examples\30_gpu_training.apsi      (GPU / PyTorch when installed)
 #   apsi examples\30_gpu_training.apsi                     (same program on NumPy)
 use layers

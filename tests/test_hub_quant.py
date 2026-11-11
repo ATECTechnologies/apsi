@@ -25,6 +25,12 @@ class Quantized(unittest.TestCase):
         if hasattr(ml_dtypes, "float4_e2m1fn"):
             t = np.concatenate([np.arange(-6, 6.001, 0.125), rng.uniform(-6, 6, 20000)]).astype(np.float32)
             np.testing.assert_array_equal(hub_gpu.fp_round(t, 4), t.astype(ml_dtypes.float4_e2m1fn).astype(np.float32))
+        for kind, name, top in (("fp6", "float6_e3m2fn", 28.0), ("fp6_e2m3", "float6_e2m3fn", 7.5)):
+            if hasattr(ml_dtypes, name):
+                t = np.concatenate([np.arange(-top, top + 1e-3, 1 / 64), rng.uniform(-top, top, 20000),
+                                    rng.uniform(-0.3, 0.3, 20000)]).astype(np.float32)
+                np.testing.assert_array_equal(hub_gpu.fp_round(t, kind),
+                                              t.astype(getattr(ml_dtypes, name)).astype(np.float32), err_msg=kind)
 
     def test_quantization_and_products(self):
         e = hub_gpu.Emulator()
@@ -32,7 +38,8 @@ class Quantized(unittest.TestCase):
         w = rng.standard_normal((96, 128)).astype(np.float32) * 0.05
         x = rng.standard_normal((3, 128)).astype(np.float32)
         ref = x @ hub_gpu.from_bf16_pairs(hub_gpu.to_bf16_pairs(w), w.shape).T
-        for kind, tol in (("int8", 0.01), ("int4", 0.12), ("fp8", 0.04), ("fp4", 0.15)):
+        for kind, tol in (("int8", 0.01), ("int4", 0.12), ("fp8", 0.04), ("fp6", 0.08), ("fp6_e2m3", 0.05),
+                          ("fp4", 0.15)):
             m = e.qmatrix(w, kind)
             self.assertEqual(m.kind, kind)
             X = e.alloc(x.size)
@@ -58,7 +65,7 @@ class Quantized(unittest.TestCase):
                 self.assertEqual(base.plan["gpu"]["weights"], "bf16")
                 # a tiny random network magnifies weight errors about 10x (int8: 0.4 % per weight -> ~4 % here);
                 # real language models are far less sensitive
-                for kind, tol in (("int8", 0.1), ("int4", 1.5), ("fp8", 0.4), ("fp4", 1.5)):
+                for kind, tol in (("int8", 0.1), ("int4", 1.5), ("fp8", 0.4), ("fp6_e2m3", 0.6), ("fp4", 1.5)):
                     with mock.patch.dict(os.environ, {"APSI_GPU_WEIGHTS": kind}):
                         q = H.Model(td)
                     self.assertEqual(q.plan["gpu"]["weights"], kind)
@@ -89,7 +96,7 @@ class Quantized(unittest.TestCase):
         try:
             for O, I in ((96, 128), (300, 896), (8, 4864)):
                 w = (rng.standard_normal((O, I)) * 0.05).astype(np.float32)
-                for kind in ("int8", "int4", "fp8", "fp4"):
+                for kind in hub_gpu.QKINDS:
                     mg, me = r.qmatrix(w, kind), e.qmatrix(w, kind)
                     np.testing.assert_array_equal(r.get(mg.scales, O * I // 32), me.scales.a[:O * I // 32])
                     for T in (1, 3, 40):

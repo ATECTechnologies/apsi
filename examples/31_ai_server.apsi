@@ -1,0 +1,45 @@
+# 31_ai_server.apsi — an AI server written in Apsi: a language model behind the OpenAI API, plus your own routes
+#   apsi run examples/31_ai_server.apsi --allow-net --allow-read           (downloads Qwen2.5-0.5B the first time)
+#   apsi run examples/31_ai_server.apsi --allow-net --allow-read -- Qwen/Qwen2.5-3B-Instruct 8000
+#
+# Any OpenAI client then works as is, e.g.  curl http://127.0.0.1:8000/v1/chat/completions \
+#   -H "Content-Type: application/json" -d '{"messages": [{"role": "user", "content": "Hello"}], "stream": true}'
+use hub
+use web
+
+let a = args()
+let name = a[0] if len(a) > 0 else "Qwen/Qwen2.5-0.5B-Instruct"
+let port = int(a[1]) if len(a) > 1 else 8000
+
+# the model runs on the GPU when there is one (int8 / int4 / fp8 / fp6 weights when it would not fit otherwise)
+let lm = hub.model(name)
+print(f"{name} on {lm.device}")
+
+# 1) the whole OpenAI API in one line: /v1/chat/completions (streaming too), /v1/completions, /v1/models,
+#    /health, /metrics; requests take turns in arrival order, a client that hangs up frees the model at once
+let ai = hub.serve(lm, port=port, background=true)
+print(f"OpenAI API: {ai.url}/v1")
+
+# 2) your own routes next to it, in plain Apsi, with the same model
+let app = server(name="my-ai-app", log=false)
+app.health()
+
+@app.post("/summarize")
+fn summarize(req):
+    let text = req.json()["text"]
+    if len(text) > 20000:
+        abort(413, "text over 20,000 characters")
+    let reply = lm.chat([{"role": "user", "content": "Summarize in three bullet points:\n\n" + text}],
+                        max_new_tokens=200, temperature=0.3)
+    return {"summary": reply, "tokens": lm.last_tokens}
+
+@app.post("/classify")
+fn classify(req):
+    let text = req.json()["text"]
+    let label = lm.chat([{"role": "system", "content": "Answer with one word: positive, negative or neutral."},
+                         {"role": "user", "content": text}], max_new_tokens=4, temperature=0.0)
+    return {"label": label.strip().lower()}
+
+if "net" in permissions() and not testing():
+    print(f"your routes: http://127.0.0.1:{port + 1}/summarize and /classify")
+    app.run(port=port + 1)

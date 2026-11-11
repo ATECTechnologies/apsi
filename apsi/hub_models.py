@@ -21,6 +21,10 @@ import numpy as np
 from .errors import RuntimeErr
 
 
+class StopGeneration(Exception):
+    """Raised by a stream callback to end a generation early; generate() returns the tokens produced so far."""
+
+
 class ModelError(RuntimeErr):
     kind = "HubError"
 
@@ -730,14 +734,15 @@ class Decoder:
         The weight format is chosen to keep the whole model on the card (APSI_GPU_WEIGHTS, or gpu_weights=):
         "auto" takes the first of bfloat16, int8 and int4 in which every layer fits, and int4 with as many
         layers as fit when none does (a 14B model on a 12 GB card: all 48 layers in int4 instead of 16 in bfloat16,
-        which makes it about 20x faster). "bf16", "int8", "int4" force one."""
+        which makes it about 20x faster). "bf16", "int8", "fp8", "fp6" (E3M2), "fp6_e2m3", "int4", "fp4" force one."""
         from .hub_gpu import QBYTES
         W = self.W
         mode = str(getattr(self, "gpu_weights", None) or os.environ.get("APSI_GPU_WEIGHTS", "auto")).strip().lower()
         mode = {"q8": "int8", "q4": "int4", "fp16": "bf16", "bfloat16": "bf16", "e4m3": "fp8", "fp8_e4m3": "fp8",
-                "e2m1": "fp4", "mxfp4": "fp4"}.get(mode, mode)
-        if mode not in ("auto", "bf16", "int8", "int4", "fp8", "fp4"):
-            raise ModelError(f"gpu_weights must be auto, bf16, int8, int4, fp8 or fp4 (got '{mode}')")
+                "e2m1": "fp4", "mxfp4": "fp4", "fp4_e2m1": "fp4", "e3m2": "fp6", "fp6_e3m2": "fp6",
+                "e2m3": "fp6_e2m3", "mxfp6": "fp6_e2m3"}.get(mode, mode)
+        if mode not in ("auto", "bf16") and mode not in QBYTES:
+            raise ModelError(f"gpu_weights must be auto, bf16, int8, fp8, fp6, fp6_e2m3, int4 or fp4 (got '{mode}')")
         head_vals = int(np.prod(self._wshape(None)))
         free = r.free_memory()
 
@@ -1193,6 +1198,9 @@ class Decoder:
                 try:
                     self._generate(ids + out, more, max_new_tokens - len(out), temperature, top_k, top_p, eos, seed,
                                    repetition_penalty, stream)
+                    out += more
+                    return out
+                except StopGeneration:                     # the caller has what it wants (a server's client left)
                     out += more
                     return out
                 except Exception as e:
