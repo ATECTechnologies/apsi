@@ -84,6 +84,7 @@ class Quantized(unittest.TestCase):
         if r is None:
             self.skipTest(why)
         e = hub_gpu.Emulator()
+        e.tc = r.tc                                     # prompts on tensor cores: the same input rounding
         rng = np.random.default_rng(5)
         try:
             for O, I in ((96, 128), (300, 896), (8, 4864)):

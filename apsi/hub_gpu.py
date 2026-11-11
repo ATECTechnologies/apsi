@@ -932,6 +932,7 @@ def _generate_ptx():
 
 # ---------------------------------------------------------------------------------------- tensor cores (sm_80+)
 TC_TILE = 64                            # rows and columns of Y per block: 4 warps, 32 x 32 each
+TC_FAST = os.environ.get("APSI_TC_PRECISE", "1").strip() in ("0", "false", "no")
 
 
 def _generate_tc_ptx():
@@ -952,99 +953,106 @@ def _generate_tc_ptx():
                        "mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {$0,$1,$2,$3}, {$4,$5,$6,$7}, "
                        "{$8,$9}, {$10,$11,$12,$13};",
                        "=f,=f,=f,=f,r,r,r,r,r,r,f,f,f,f", side_effect=False)
-    fn = ir.Function(m, ir.FunctionType(ir.VoidType(), [G(i32), G(f32), G(f32), G(f32), i32, i32, i32, i32, i32]),
-                     name="apsi_kernel")
-    fn.calling_convention = "ptx_kernel"
-    Wp, X, Y, B, O, I, T, has_b, accum = fn.args
-    top = fn.append_basic_block("top")
-    b = ir.IRBuilder(top)
-    tmp = b.alloca(f32)
-    tid, cta = b.call(tid_f, []), b.call(cta_f, [])
-    lane, warp = b.and_(tid, C(31)), b.lshr(tid, C(5))
-    g, tig = b.lshr(lane, C(2)), b.and_(lane, C(3))
-    nbn = b.udiv(b.add(O, C(TC_TILE - 1)), C(TC_TILE))
-    n0 = b.add(b.mul(b.urem(cta, nbn), C(TC_TILE)), b.mul(b.and_(warp, C(1)), C(32)))
-    m0 = b.add(b.mul(b.udiv(cta, nbn), C(TC_TILE)), b.mul(b.lshr(warp, C(1)), C(32)))
-    Tm1, Om1 = b.sub(T, C(1)), b.sub(O, C(1))
+    def kernel(kname, precise):
+        fn = ir.Function(m, ir.FunctionType(ir.VoidType(), [G(i32), G(f32), G(f32), G(f32), i32, i32, i32, i32, i32]),
+                         name=kname)
+        fn.calling_convention = "ptx_kernel"
+        Wp, X, Y, B, O, I, T, has_b, accum = fn.args
+        top = fn.append_basic_block("top")
+        b = ir.IRBuilder(top)
+        tmp = b.alloca(f32)
+        tid, cta = b.call(tid_f, []), b.call(cta_f, [])
+        lane, warp = b.and_(tid, C(31)), b.lshr(tid, C(5))
+        g, tig = b.lshr(lane, C(2)), b.and_(lane, C(3))
+        nbn = b.udiv(b.add(O, C(TC_TILE - 1)), C(TC_TILE))
+        n0 = b.add(b.mul(b.urem(cta, nbn), C(TC_TILE)), b.mul(b.and_(warp, C(1)), C(32)))
+        m0 = b.add(b.mul(b.udiv(cta, nbn), C(TC_TILE)), b.mul(b.lshr(warp, C(1)), C(32)))
+        Tm1, Om1 = b.sub(T, C(1)), b.sub(O, C(1))
 
-    def umin(x, y):
-        return b.select(b.icmp_unsigned("<", x, y), x, y)
-    # rows this lane reads, clamped: rows past the end are computed but never stored
-    xrow = [[b.mul(b.zext(umin(b.add(b.add(m0, C(mt * 16 + h * 8)), g), Tm1), i64), b.zext(I, i64))
-             for h in range(2)] for mt in range(2)]
-    half_i = b.zext(b.lshr(I, C(1)), i64)
-    wrow = [b.mul(b.zext(umin(b.add(b.add(n0, C(nt * 8)), g), Om1), i64), half_i) for nt in range(4)]
-    V2 = ir.VectorType(f32, 2)
+        def umin(x, y):
+            return b.select(b.icmp_unsigned("<", x, y), x, y)
+        # rows this lane reads, clamped: rows past the end are computed but never stored
+        xrow = [[b.mul(b.zext(umin(b.add(b.add(m0, C(mt * 16 + h * 8)), g), Tm1), i64), b.zext(I, i64))
+                 for h in range(2)] for mt in range(2)]
+        half_i = b.zext(b.lshr(I, C(1)), i64)
+        wrow = [b.mul(b.zext(umin(b.add(b.add(n0, C(nt * 8)), g), Om1), i64), half_i) for nt in range(4)]
+        V2 = ir.VectorType(f32, 2)
 
-    def rne(u):
-        return b.lshr(b.add(b.add(u, C(0x7FFF)), b.and_(b.lshr(u, C(16)), C(1))), C(16))
+        def rne(u):
+            return b.lshr(b.add(b.add(u, C(0x7FFF)), b.and_(b.lshr(u, C(16)), C(1))), C(16))
 
-    def bf16x2(v):
-        """two float32 -> (high, low) pairs of bfloat16 in i32s, the first value in the low half: x = high + low
-        to about 16 bits, so the product keeps nearly float32 accuracy (two passes on the tensor cores)."""
-        hi, lo = [], []
-        for j in range(2):
-            x = b.extract_element(v, C(j))
-            h = rne(b.bitcast(x, i32))
-            hi.append(h)
-            lo.append(rne(b.bitcast(b.fsub(x, b.bitcast(b.shl(h, C(16)), f32)), i32)))
-        return (b.or_(hi[0], b.shl(hi[1], C(16))), b.or_(lo[0], b.shl(lo[1], C(16))))
+        def bf16x2(v):
+            """two float32 -> (high, low) pairs of bfloat16 in i32s, the first value in the low half: x = high + low
+            to about 16 bits, so the product keeps nearly float32 accuracy (two passes on the tensor cores)."""
+            hi, lo = [], []
+            for j in range(2):
+                x = b.extract_element(v, C(j))
+                h = rne(b.bitcast(x, i32))
+                hi.append(h)
+                lo.append(rne(b.bitcast(b.fsub(x, b.bitcast(b.shl(h, C(16)), f32)), i32)))
+            return (b.or_(hi[0], b.shl(hi[1], C(16))), b.or_(lo[0], b.shl(lo[1], C(16))))
 
-    loop = fn.append_basic_block("loop")
-    body = fn.append_basic_block("body")
-    done = fn.append_basic_block("done")
-    b.branch(loop)
-    b.position_at_end(loop)
-    k0 = b.phi(i32)
-    k0.add_incoming(C(0), top)
-    accs = [[[b.phi(f32) for _ in range(4)] for _ in range(4)] for _ in range(2)]
-    for row in accs:
-        for frag in row:
-            for a in frag:
-                a.add_incoming(ir.Constant(f32, 0.0), top)
-    b.cbranch(b.icmp_unsigned("<", k0, I), body, done)
-    b.position_at_end(body)
-    kc = b.zext(b.add(k0, b.mul(tig, C(2))), i64)
-    afr, alo = [], []
-    for mt in range(2):
-        regs, lows = [], []
-        for kh in range(2):                         # registers: (g, k) (g+8, k) (g, k+8) (g+8, k+8)
-            for h in range(2):
-                idx = b.add(xrow[mt][h], b.add(kc, ir.Constant(i64, 8 * kh)))
-                hi, lo = bf16x2(b.load(b.bitcast(b.gep(X, [idx], inbounds=True), V2.as_pointer(1)), align=8))
-                regs.append(hi)
-                lows.append(lo)
-        afr.append(regs)
-        alo.append(lows)
-    kp = b.lshr(kc, ir.Constant(i64, 1))
-    bfr = []
-    for nt in range(4):
-        base = b.add(wrow[nt], kp)
-        bfr.append([b.load(b.gep(Wp, [base], inbounds=True), align=4),
-                    b.load(b.gep(Wp, [b.add(base, ir.Constant(i64, 4))], inbounds=True), align=4)])
-    for mt in range(2):
+        loop = fn.append_basic_block("loop")
+        body = fn.append_basic_block("body")
+        done = fn.append_basic_block("done")
+        b.branch(loop)
+        b.position_at_end(loop)
+        k0 = b.phi(i32)
+        k0.add_incoming(C(0), top)
+        accs = [[[b.phi(f32) for _ in range(4)] for _ in range(4)] for _ in range(2)]
+        for row in accs:
+            for frag in row:
+                for a in frag:
+                    a.add_incoming(ir.Constant(f32, 0.0), top)
+        b.cbranch(b.icmp_unsigned("<", k0, I), body, done)
+        b.position_at_end(body)
+        kc = b.zext(b.add(k0, b.mul(tig, C(2))), i64)
+        afr, alo = [], []
+        for mt in range(2):
+            regs, lows = [], []
+            for kh in range(2):                         # registers: (g, k) (g+8, k) (g, k+8) (g+8, k+8)
+                for h in range(2):
+                    idx = b.add(xrow[mt][h], b.add(kc, ir.Constant(i64, 8 * kh)))
+                    hi, lo = bf16x2(b.load(b.bitcast(b.gep(X, [idx], inbounds=True), V2.as_pointer(1)), align=8))
+                    regs.append(hi)
+                    lows.append(lo)
+            afr.append(regs)
+            alo.append(lows)
+        kp = b.lshr(kc, ir.Constant(i64, 1))
+        bfr = []
         for nt in range(4):
-            r0 = b.call(mma, alo[mt] + bfr[nt] + list(accs[mt][nt]))
-            r = b.call(mma, afr[mt] + bfr[nt] + [b.extract_value(r0, c) for c in range(4)])
-            for c in range(4):
-                accs[mt][nt][c].add_incoming(b.extract_value(r, c), body)
-    k0.add_incoming(b.add(k0, C(16)), body)
-    b.branch(loop)
-    b.position_at_end(done)
-    for mt in range(2):
-        for nt in range(4):
-            for c in range(4):
-                row = b.add(b.add(m0, C(mt * 16 + (c // 2) * 8)), g)
-                col = b.add(b.add(n0, C(nt * 8)), b.add(b.mul(tig, C(2)), C(c % 2)))
-                with b.if_then(b.and_(b.icmp_unsigned("<", row, T), b.icmp_unsigned("<", col, O))):
-                    yp = b.gep(Y, [b.add(b.mul(b.zext(row, i64), b.zext(O, i64)), b.zext(col, i64))], inbounds=True)
-                    b.store(accs[mt][nt][c], tmp)
-                    with b.if_then(b.icmp_unsigned("!=", has_b, C(0))):
-                        b.store(b.fadd(b.load(tmp), b.load(b.gep(B, [b.zext(col, i64)], inbounds=True))), tmp)
-                    with b.if_then(b.icmp_unsigned("!=", accum, C(0))):
-                        b.store(b.fadd(b.load(tmp), b.load(yp)), tmp)
-                    b.store(b.load(tmp), yp)
-    b.ret_void()
+            base = b.add(wrow[nt], kp)
+            bfr.append([b.load(b.gep(Wp, [base], inbounds=True), align=4),
+                        b.load(b.gep(Wp, [b.add(base, ir.Constant(i64, 4))], inbounds=True), align=4)])
+        for mt in range(2):
+            for nt in range(4):
+                if precise:
+                    r0 = b.call(mma, alo[mt] + bfr[nt] + list(accs[mt][nt]))
+                    r = b.call(mma, afr[mt] + bfr[nt] + [b.extract_value(r0, c) for c in range(4)])
+                else:                                       # activations rounded to bfloat16 once: twice as fast
+                    r = b.call(mma, afr[mt] + bfr[nt] + list(accs[mt][nt]))
+                for c in range(4):
+                    accs[mt][nt][c].add_incoming(b.extract_value(r, c), body)
+        k0.add_incoming(b.add(k0, C(16)), body)
+        b.branch(loop)
+        b.position_at_end(done)
+        for mt in range(2):
+            for nt in range(4):
+                for c in range(4):
+                    row = b.add(b.add(m0, C(mt * 16 + (c // 2) * 8)), g)
+                    col = b.add(b.add(n0, C(nt * 8)), b.add(b.mul(tig, C(2)), C(c % 2)))
+                    with b.if_then(b.and_(b.icmp_unsigned("<", row, T), b.icmp_unsigned("<", col, O))):
+                        yp = b.gep(Y, [b.add(b.mul(b.zext(row, i64), b.zext(O, i64)), b.zext(col, i64))], inbounds=True)
+                        b.store(accs[mt][nt][c], tmp)
+                        with b.if_then(b.icmp_unsigned("!=", has_b, C(0))):
+                            b.store(b.fadd(b.load(tmp), b.load(b.gep(B, [b.zext(col, i64)], inbounds=True))), tmp)
+                        with b.if_then(b.icmp_unsigned("!=", accum, C(0))):
+                            b.store(b.fadd(b.load(tmp), b.load(yp)), tmp)
+                        b.store(b.load(tmp), yp)
+        b.ret_void()
+
+    kernel("apsi_kernel", True)
+    kernel("gemm_tc1", False)
     _eng.engine()
     llvm.initialize_all_targets()
     llvm.initialize_all_asmprinters()
@@ -1321,7 +1329,11 @@ class Runner(_Base):
         if tuple(dev.cc) >= (8, 0) and os.environ.get("APSI_TENSOR_CORES", "1").strip() not in ("0", "false", "no"):
             try:
                 dev.activate()                      # this thread may not have the context yet
-                _, self.fn["gemm_tc"] = dev.load("apsi-hub-tc-2", _build_tc_ptx())
+                tcmod, self.fn["gemm_tc"] = dev.load("apsi-hub-tc-3", _build_tc_ptx())
+                f1 = ctypes.c_void_p()
+                dev.drv.check(dev.drv.lib.cuModuleGetFunction(ctypes.byref(f1), tcmod, b"gemm_tc1"),
+                              "cuModuleGetFunction(gemm_tc1)")
+                self.fn["gemm_tc1"] = f1
                 self.tc = self._check_tc()
             except Exception as e:                  # an older driver or PTX it does not take: the float32 kernel
                 self.tc_why = f"{type(e).__name__}: {e}"
@@ -1441,10 +1453,13 @@ class Runner(_Base):
         self._go(name, (m.rows + ROWS_PER_BLOCK - 1) // ROWS_PER_BLOCK, 32 * ROWS_PER_BLOCK, *args)
 
     def gemm(self, m, X, Y, T, xoff=0, bias=None, acc=False):
+        # quantized weights are approximate already: the activations go in as one bfloat16 part (twice as fast);
+        # bfloat16 weights keep the two-part split that matches float32 (APSI_TC_PRECISE=0 makes it one part too)
+        fast = m.kind != "bf16" or TC_FAST
         if m.kind != "bf16":
             m = self._deq(m)
         if self.tc and m.cols % 16 == 0 and T >= 16 and xoff % 2 == 0:
-            self._go("gemm_tc", ((m.rows + TC_TILE - 1) // TC_TILE) * ((T + TC_TILE - 1) // TC_TILE), 128,
+            self._go("gemm_tc1" if fast else "gemm_tc", ((m.rows + TC_TILE - 1) // TC_TILE) * ((T + TC_TILE - 1) // TC_TILE), 128,
                      ("p", m.buf.ptr), ("p", X.ptr + 4 * xoff), ("p", Y.ptr), ("p", bias.ptr if bias else 0),
                      ("u", m.rows), ("u", m.cols), ("u", T), ("u", 1 if bias else 0), ("u", 1 if acc else 0))
             return
@@ -1592,12 +1607,13 @@ class Emulator(_Base):
         return Matrix(d, m.rows, m.cols)
 
     def gemm(self, m, X, Y, T, xoff=0, bias=None, acc=False):
+        fast = m.kind != "bf16" or TC_FAST
         if m.kind != "bf16":
             m = self._deq(m)
-        if self.tc and m.cols % 16 == 0 and T >= 16 and xoff % 2 == 0:     # inputs as two bfloat16 parts
+        if self.tc and m.cols % 16 == 0 and T >= 16 and xoff % 2 == 0:     # inputs as one or two bfloat16 parts
             x = X.a[xoff:xoff + T * m.cols]
             hi = from_bf16_pairs(to_bf16_pairs(x.reshape(-1, 2)).reshape(-1), (x.size,))
-            lo = from_bf16_pairs(to_bf16_pairs((x - hi).reshape(-1, 2)).reshape(-1), (x.size,))
+            lo = 0 if fast else from_bf16_pairs(to_bf16_pairs((x - hi).reshape(-1, 2)).reshape(-1), (x.size,))
             X, xoff = Buf(0, x.size, hi + lo), 0
         self.gemv(m, X, Y, T, xoff=xoff, bias=bias, acc=acc)
 
