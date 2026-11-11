@@ -996,6 +996,7 @@ class Runner(_Base):
         self.tc_why = None
         if tuple(dev.cc) >= (8, 0) and os.environ.get("APSI_TENSOR_CORES", "1").strip() not in ("0", "false", "no"):
             try:
+                dev.activate()                      # this thread may not have the context yet
                 _, self.fn["gemm_tc"] = dev.load("apsi-hub-tc-2", _build_tc_ptx())
                 self.tc = self._check_tc()
             except Exception as e:                  # an older driver or PTX it does not take: the float32 kernel

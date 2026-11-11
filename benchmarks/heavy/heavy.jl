@@ -187,10 +187,12 @@ end
 fmt(r::Int) = string(r)
 fmt(r::Float64) = (t = @sprintf("%.12g", r); t)
 
+const SINK = Ref{Any}(nothing)        # every result is kept (like C's volatile), so no run can be removed
+
 function T(name, f)
     r = f(); best = 1e9
     for k in 1:3
-        t = time_ns(); f(); d = (time_ns() - t) * 1e-9
+        t = time_ns(); SINK[] = f(); d = (time_ns() - t) * 1e-9
         best = min(best, d)
     end
     @printf("%s: %.1f ms  [check %s]\n", name, best * 1000, fmt(r))

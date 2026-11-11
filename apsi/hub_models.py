@@ -137,6 +137,9 @@ class _Q8Store:
                     with open(path + ".tmp", "wb") as fh:
                         np.save(fh, arr)
                     os.replace(path + ".tmp", path)
+                # memory-mapped from now on: a model larger than the free RAM pages in and out instead of
+                # filling the memory (a 14B model's processor half is 10 GB in int8)
+                q = hub_cpu.Q8(np.load(c, mmap_mode="r"), np.load(sc, mmap_mode="r"))
             except OSError:
                 self.dir = None                             # read-only home: keep it in RAM only
         return q
@@ -648,13 +651,14 @@ class Decoder:
         W = self.W
         head_bytes = 2 * int(np.prod(self._wshape(None)))
         kv_tokens = min(self.ctx, 8192)
-        kv_bytes = 2 * (2 if self.kv_cache == "fp16" else 4) * self.kvh * self.dh * kv_tokens * self.L
+        kv_layer = 2 * (2 if self.kv_cache == "fp16" else 4) * self.kvh * self.dh * kv_tokens
+        kv_bytes = kv_layer * self.L
         free = r.free_memory()
-        budget = free - head_bytes - kv_bytes - (384 << 20)
+        budget = free - head_bytes - (384 << 20)               # the cache of a layer counts with that layer
         n = 0
         used = 0
         for i in range(self.L):
-            b = self._layer_bytes(i)
+            b = self._layer_bytes(i) + kv_layer
             if used + b > budget:
                 break
             used += b
