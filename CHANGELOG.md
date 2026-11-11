@@ -16,6 +16,8 @@
 - **GPU temperature control:** long training, long answers and busy servers keep the card near 77 °C (75–78) by
   pacing the work while it is above the band (the driver's NVML gives the temperature); a cool card is never slowed.
   `APSI_GPU_TEMP=72` / `off`; `r.gpu_temperature`, `/metrics`, `hub.gpu_status()`.
+- **Measured after the fix (RTX 3060): 151,008 tokens/s for the 10.9 M GPT (PyTorch bf16 133,491), 17,134 for
+  127 M parameters (PyTorch bf16 20,111).**
 - **Fused attention works again** (a build error had left the trainer on the slower separate kernels); every kernel
   module is now built by the test suite, without a card, so such a mistake fails there.
 - **The Linux release zip carries the Apsi GPU Tuner** (gpu-tuner/), built offline by packaging/make_release_zip.sh.

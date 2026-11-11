@@ -17,7 +17,7 @@ and the driver compiles them for whatever card is present.
 > **Important — for the full, steady speed of long training, give Apsi the right to set the card's power limit.**
 > Without it, the only way Apsi can keep a hot card at 77 °C is to *pause* the work, and a card that needs cooling
 > then loses a large share of its speed (measured on an RTX 3060: a 127 M-parameter model trained at 10,332 tokens/s
-> with pauses, **15,139 tokens/s** with the power limit — the same temperature, 47 % faster). Do one of these:
+> with pauses, **15,000–17,000 tokens/s** with the power limit, at the same temperature). Do one of these:
 >
 > 1. **Run Apsi as administrator** (Windows: right-click the terminal → *Run as administrator*; Linux: `sudo`), or
 > 2. **once**, run `apsi gpu setup` as administrator (or the *Apsi GPU Tuner — Apply* file from the download page):
@@ -114,30 +114,30 @@ NumPy backend's (tests/test_gpu_train.py), on the Emulator and on the real card.
 
 | Extras | `ema=0.999` keeps a moving average of the weights (`r.ema_params`); `ewc=(anchor_params, fisher, strength)` pulls each weight toward an earlier task's value in proportion to its importance (continual learning without forgetting) |
 
-**Measured** (the GPT above, 10.9 M parameters; the very same data.bin for both: 4,396 windows of 128 bytes to
-train on, 232 held out; batch 32, AdamW 1e-3, 3 epochs; RTX 3060 12 GB at an 80 % power limit, held at 77 °C):
+**Measured** (the GPT above, 10.9 M parameters; data.bin: windows of 128 bytes of Apsi's documentation, 4,396 to
+train on for PyTorch, 4,441 for Apsi after the documentation grew; batch 32, AdamW 1e-3, 3 epochs; RTX 3060 12 GB,
+Apsi run as administrator, the temperature held near 77 °C by the power limit):
 
 | Run | Throughput (steady, every epoch) | Held-out loss | GPU memory |
 |---|---:|---:|---:|
-| **Apsi `backend="gpu"`, bf16** | **141,475 tokens/s** (141,414 / 143,323 / 142,959) | 6.26 → 2.424 | 810 MB |
-| Apsi, fp8 / fp4 weights | 129,143 / 121,000 tokens/s | 2.441 / 2.414 | 851 MB |
-| Apsi, fp32 (3 bfloat16 passes) | 59,060 tokens/s | 2.422 | 1,001 MB |
+| **Apsi `backend="gpu"`, bf16** | **151,008 tokens/s** (149,434 / 153,801 / 153,055) | 6.25 → 2.373 | 858 MB |
+| Apsi, fp8 / fp4 weights | 142,218 / 141,584 tokens/s | 2.367 / 2.446 | 947 MB |
+| Apsi, fp32 (3 bfloat16 passes) | 58,889 tokens/s | 2.366 | 1,097 MB |
 | PyTorch bf16 autocast (cuBLAS, flash attention) | 133,491 tokens/s | 2.355 | 610 MB |
 | PyTorch tf32 | 89,762 tokens/s | 2.348 | |
 | PyTorch fp32 | 76,506 tokens/s | 2.346 | |
 
-**A larger model** (10 blocks, d=1024, 16 heads: 126.6 M parameters; the same data, batch 32, 2 epochs, same card):
+**A larger model** (10 blocks, d=1024, 16 heads: 126.6 M parameters; batch 32, 2 epochs, same card):
 
 | Run | Throughput | Held-out loss | GPU memory |
 |---|---:|---:|---:|
-| Apsi bf16, power limit held by Apsi (administrator) | 15,139 tokens/s | 6.65 → 2.809 | 5,289 MB |
-| Apsi bf16, without administrator (cooling pauses) | 10,332 tokens/s | 6.65 → 2.810 | 5,289 MB |
+| Apsi bf16 (administrator: power limit) | 17,134 tokens/s | 6.65 → 2.811 | 4,524 MB |
 | PyTorch 2.13 bf16 autocast | 20,111 tokens/s | 6.58 → 3.020 | 3,854 MB |
 | PyTorch tf32 / fp32 | 11,236 / 8,011 tokens/s | 3.025 / 3.027 | 4,565 MB |
 
-At this size PyTorch's bf16 is still about a third faster: the products are larger, and cuBLAS gets more out of
-large products than Apsi's tiles do today (Apsi's runs above were also measured while its fused attention was
-accidentally off). Apsi is faster than PyTorch's tf32 and fp32 and reaches a lower held-out loss in the same two epochs.
+At this size PyTorch's bf16 is still faster (cuBLAS gets more out of large products than Apsi's tiles do today);
+Apsi is 1.5× PyTorch's tf32 and 2.1× its fp32, with a lower held-out loss after the same two epochs. Without
+administrator rights the card is cooled by pauses instead: an earlier run of this model gave 10,332 tokens/s.
 
 Why the numbers differ: Apsi's bf16 kernels (tiled tensor-core products with the bias, activation and residual
 fused in, fused attention, a warp per row for the norms, one AdamW kernel over all parameters, the data resident on
