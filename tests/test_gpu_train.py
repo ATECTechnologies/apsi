@@ -341,5 +341,18 @@ class RealGpu(unittest.TestCase):
             np.testing.assert_allclose(a.history, b.history, rtol=2e-3 if prec == "fp32" else 2e-2, err_msg=prec)
 
 
+class Kernels(unittest.TestCase):
+    """Every kernel module builds (no GPU needed): a mistake in one of them must fail here, not on the card."""
+
+    def test_every_module_builds(self):
+        from apsi import gpu_train_kernels as KS
+        for which, build in (("main", KS._main_module), ("tc", KS._tc_module), ("tiled", KS._tiled_module),
+                             ("tiled_x", lambda: KS._tiled_module(True)), ("flash", KS._flash_module)):
+            text = build()
+            self.assertIn(".entry", text, which)
+        self.assertIn(".minnctapersm 2", KS._tiled_module(True))
+        self.assertIn(".entry flash_f64", KS._flash_module())
+
+
 if __name__ == "__main__":
     unittest.main()

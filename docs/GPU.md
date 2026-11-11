@@ -14,6 +14,18 @@ and the driver compiles them for whatever card is present.
 
 `apsi doctor` shows the card, the driver and what Apsi will use. `hub.devices()` from a program.
 
+> **Important — for the full, steady speed of long training, give Apsi the right to set the card's power limit.**
+> Without it, the only way Apsi can keep a hot card at 77 °C is to *pause* the work, and a card that needs cooling
+> then loses a large share of its speed (measured on an RTX 3060: a 127 M-parameter model trained at 10,332 tokens/s
+> with pauses, **15,139 tokens/s** with the power limit — the same temperature, 47 % faster). Do one of these:
+>
+> 1. **Run Apsi as administrator** (Windows: right-click the terminal → *Run as administrator*; Linux: `sudo`), or
+> 2. **once**, run `apsi gpu setup` as administrator (or the *Apsi GPU Tuner — Apply* file from the download page):
+>    a small helper then lets every Apsi program set the power limit without administrator rights, at every logon.
+>
+> The training report says which one is in use: `temperature held by the power limit, directly (no pauses)` or
+> `… through the GPU helper`. If it reports cooling pauses, neither is set up.
+
 ---
 
 ## 1. Language models (`use hub`)
@@ -113,6 +125,19 @@ train on, 232 held out; batch 32, AdamW 1e-3, 3 epochs; RTX 3060 12 GB at an 80 
 | PyTorch bf16 autocast (cuBLAS, flash attention) | 133,491 tokens/s | 2.355 | 610 MB |
 | PyTorch tf32 | 89,762 tokens/s | 2.348 | |
 | PyTorch fp32 | 76,506 tokens/s | 2.346 | |
+
+**A larger model** (10 blocks, d=1024, 16 heads: 126.6 M parameters; the same data, batch 32, 2 epochs, same card):
+
+| Run | Throughput | Held-out loss | GPU memory |
+|---|---:|---:|---:|
+| Apsi bf16, power limit held by Apsi (administrator) | 15,139 tokens/s | 6.65 → 2.809 | 5,289 MB |
+| Apsi bf16, without administrator (cooling pauses) | 10,332 tokens/s | 6.65 → 2.810 | 5,289 MB |
+| PyTorch 2.13 bf16 autocast | 20,111 tokens/s | 6.58 → 3.020 | 3,854 MB |
+| PyTorch tf32 / fp32 | 11,236 / 8,011 tokens/s | 3.025 / 3.027 | 4,565 MB |
+
+At this size PyTorch's bf16 is still about a third faster: the products are larger, and cuBLAS gets more out of
+large products than Apsi's tiles do today (Apsi's runs above were also measured while its fused attention was
+accidentally off). Apsi is faster than PyTorch's tf32 and fp32 and reaches a lower held-out loss in the same two epochs.
 
 Why the numbers differ: Apsi's bf16 kernels (tiled tensor-core products with the bias, activation and residual
 fused in, fused attention, a warp per row for the norms, one AdamW kernel over all parameters, the data resident on
@@ -251,6 +276,13 @@ hides these messages — do not set it while investigating.
 **Out of GPU memory.** Apsi retries in smaller pieces by itself; for a model, use a smaller format
 (`APSI_GPU_WEIGHTS=int4`), a shorter context, or `gpu_layers=`; for training, a smaller `batch_size`. Other programs
 on the card (games, browsers with hardware acceleration, another Apsi) use memory too: `nvidia-smi` lists them.
+
+**Training is slower than it should be, or its speed swings.** Look at the training report. *Cooling pauses* mean
+Apsi cannot set the power limit: run it as administrator, or set up the helper once (`apsi gpu setup` as
+administrator, or the GPU Tuner's Apply file) — see the box at the top of this page. *fused attention unavailable*
+next to the GPU line means the attention kernel could not be built (a bug: report it with that line); training
+still works, more slowly, on separate kernels. A card held at a lower power limit (the GPU Tuner's 80 %) trades about
+5 % of speed for 6–10 °C; `Apsi-GPU-Tuner-Restore` puts the default back.
 
 **The card is hot or loud.** Temperature control is on by default (77 °C). Lower it with `APSI_GPU_TEMP=72`; check the
 case airflow and fan curve. If the card still reaches 85 °C+, the control may be off (`APSI_GPU_TEMP=off`) or NVML

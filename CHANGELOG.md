@@ -16,6 +16,9 @@
 - **GPU temperature control:** long training, long answers and busy servers keep the card near 77 °C (75–78) by
   pacing the work while it is above the band (the driver's NVML gives the temperature); a cool card is never slowed.
   `APSI_GPU_TEMP=72` / `off`; `r.gpu_temperature`, `/metrics`, `hub.gpu_status()`.
+- **Fused attention works again** (a build error had left the trainer on the slower separate kernels); every kernel
+  module is now built by the test suite, without a card, so such a mistake fails there.
+- **The Linux release zip carries the Apsi GPU Tuner** (gpu-tuner/), built offline by packaging/make_release_zip.sh.
 - **GPU trainer:** `ema=` (moving average of the weights) and `ewc=` (elastic weight consolidation); each tiled
   product shape runs the faster of two builds, measured on the card; split-k sized from the real occupancy; the
   temperature pacing counts the card's queued work (large models were paced too little and ran hot).

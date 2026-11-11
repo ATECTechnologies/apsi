@@ -1276,9 +1276,6 @@ def _flash_module():
                     ("H", i32), ("scale2", f32), ("causal", i32)]
         fn = ir.Function(m, ir.FunctionType(ir.VoidType(), [t for _, t in args]), name=name)
         fn.calling_convention = "ptx_kernel"
-        if early:                                 # 256 threads, two blocks per multiprocessor: at most 128 registers
-            for key, val in (("maxntidx", 256), ("minctasm", 2)):
-                annotations.add(m.add_metadata([fn, ir.MetaDataString(m, key), C(val)]))
         p = {n: a for (n, _), a in zip(args, fn.args)}
         allocas = fn.append_basic_block("allocas")
         top = fn.append_basic_block("top")
