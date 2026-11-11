@@ -126,6 +126,9 @@
   ordinary functions in the interpreter engine instead of stopping it.
 - **Debugger**: `apsi debug` in the terminal and F5 in VS Code-family editors (`apsi dap`): breakpoints with
   conditions, hit counts and log points, stepping, the call stack, variables, tensor summaries, stop on errors.
+- **VS Code extension:** finds every installed Apsi version (the one chosen with `apsi use` first) and runs its
+  Python directly, so the language server and **Convert Python File to Apsi** work with current VS Code on Windows;
+  a failed conversion says why.
 - **Faster programs:** the main program starts with the loaded runtime frozen out of the cycle collector and a
   50,000-allocation first generation: object-heavy code runs about 8 % faster than on CPython (`APSI_GC=default`
   turns it off). Module attribute access (`math.sqrt`) is a plain attribute lookup.
