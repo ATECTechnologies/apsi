@@ -257,12 +257,14 @@ class Emulator(_Ops):
         m[:] = b1 * m + (1 - b1) * g
         v[:] = b2 * v + (1 - b2) * g * g
         p[:] = p - np.float32(lr) * (m / np.float32(c1)) / (np.sqrt(v / np.float32(c2)) + np.float32(eps))
+        self.v(Gr, n)[:] = 0.0                    # the kernel clears the gradient it used
 
     def sgd(self, Pm, Gr, VEL, SQ, n, lr, mom, clip):
         vel = self.v(VEL, n)
         vel[:] = np.float32(mom) * vel + self.v(Gr, n) * self._clip(SQ, clip)
         p = self.v(Pm, n)
         p[:] = p - np.float32(lr) * vel
+        self.v(Gr, n)[:] = 0.0
 
     def _clip(self, SQ, clip):
         if clip <= 0:
@@ -442,6 +444,7 @@ class Gpu(_Ops):
         self._scr = {}
         self._occ = {}
         self._choice = {}
+        self._wcache, self._wrange, self._wgen = {}, None, 0
         self.profile = None                              # {kernel: (seconds, launches)} while profiling
         self._pending = []
         self._lib = lib
@@ -570,6 +573,7 @@ class Gpu(_Ops):
         source must be finished (the caller syncs it)."""
         self.dev.ensure()
         dptr, sptr = self.p(dst)[1], src_ops.p(src)[1]
+        self._wgen += 1                                  # (the weights may be what changes)
         if src_ops is self or src_ops.dev is self.dev:
             self.dev.drv.check(self._lib.cuMemcpyDtoDAsync_v2(ctypes.c_uint64(dptr), ctypes.c_uint64(sptr),
                                                               ctypes.c_size_t(4 * n), None), "cuMemcpyDtoDAsync")
@@ -637,11 +641,13 @@ class Gpu(_Ops):
         self._go("sumsq", min(self.blocks(n), 1024), 256, self.p(X), ("u", n), self.p(ACC))
 
     def adam(self, Pm, Gr, Mm, Vm, SQ, n, n_decay, lr, b1, b2, eps, c1, c2, wd, clip):
+        self._wgen += 1
         self._go("adam", self.blocks(n), 256, self.p(Pm), self.p(Gr), self.p(Mm), self.p(Vm), self.p(SQ), ("u", n),
                  ("u", n_decay), ("f", lr), ("f", b1), ("f", b2), ("f", eps), ("f", c1), ("f", c2), ("f", wd),
                  ("f", clip))
 
     def sgd(self, Pm, Gr, VEL, SQ, n, lr, mom, clip):
+        self._wgen += 1
         self._go("sgd", self.blocks(n), 256, self.p(Pm), self.p(Gr), self.p(VEL), self.p(SQ), ("u", n), ("f", lr),
                  ("f", mom), ("f", clip))
 
@@ -724,10 +730,28 @@ class Gpu(_Ops):
         db = (sbn == 1 and sbk == N and N % 8 == 0) or (sbk == 1 and sbn == K and K % 8 == 0)
         return da and db and args[0][1] % 8 == 0 and args[1][1] % 8 == 0
 
+    def weights_are(self, buf, n):
+        """The network's weights (their bfloat16 copies are made once per update, not once per product)."""
+        for bf in self._wcache.values():
+            self.free(bf[1])
+        self._wcache = {}
+        self._wrange = (buf.ptr, buf.ptr + 4 * n) if buf is not None else None
+
     def _h_args(self, args, M, N, K):
-        """The operands rounded to bfloat16 into scratch memory (one pass each), and the arguments that point there."""
+        """The operands rounded to bfloat16 (one pass each), and the arguments that point there. A weight matrix is
+        rounded once after each update and reused by every product until the next one (forward and backward)."""
         out = list(args)
         for i, n, key in ((0, M * K, "h_a"), (1, K * N, "h_b")):
+            ptr = args[i][1]
+            wr = self._wrange
+            if wr is not None and wr[0] <= ptr < wr[1]:
+                hit = self._wcache.get((ptr, n))
+                if hit is None or hit[0] != self._wgen:
+                    dst = hit[1] if hit is not None else self.alloc((n + 1) // 2)
+                    self._go("to_bf16", self.blocks((n + 1) // 2), 256, args[i], self.p((dst, 0)), ("u", n))
+                    self._wcache[(ptr, n)] = hit = (self._wgen, dst)
+                out[i] = self.p((hit[1], 0))
+                continue
             dst = self._scratch(key, (n + 1) // 2)
             self._go("to_bf16", self.blocks((n + 1) // 2), 256, args[i], self.p(dst), ("u", n))
             out[i] = self.p(dst)
@@ -1301,6 +1325,8 @@ class Net:
         self.n_decay = sum(a.size for a in leaves if a.ndim >= 2)
         self.leaves, self.params_tree = leaves, params
         self.P, self.G = ops.alloc(self.n), ops.alloc(self.n)
+        if hasattr(ops, "weights_are"):
+            ops.weights_are(self.P, self.n)
         flat = np.zeros(self.n, np.float32)
         for a in leaves:
             o = self.offsets[id(a)]
@@ -1411,6 +1437,8 @@ class Net:
 
     def close(self):
         self.arena.close()
+        if hasattr(self.ops, "weights_are"):
+            self.ops.weights_are(None, 0)
         for b in [self.P, self.G, self.LOSS] + self.owned + ([self.WQ] if self.kind else []):
             self.ops.free(b)
 
@@ -1554,6 +1582,7 @@ def fit(model, params, X, y=None, loss="mse", opt=None, epochs=10, batch_size=No
         ops._lib.cuEventRecord(e0, None)
         marks.append(e0)
     history, val_hist, step = [], [], 0
+    ops.fill((net.G, 0), net.n, 0.0)
     from . import thermal
     gov = thermal.governor(getattr(ops, "dev", None))        # keeps the card near APSI_GPU_TEMP (77 C)
     paced0 = (gov.status() or {}).get("paced_s") or 0.0
@@ -1573,8 +1602,7 @@ def fit(model, params, X, y=None, loss="mse", opt=None, epochs=10, batch_size=No
                     ops.put(Xd[0], xb.reshape(-1))
                     ops.put(Yd[0], yb.reshape(-1))
                 lr = float(aops.raw(schedule(step))) if schedule is not None else float(opt.lr)
-                ops.fill((net.G, 0), net.n, 0.0)
-                net.round_weights()
+                net.round_weights()                         # (the optimizer kernel left the gradient cleared)
                 net.train = True
                 out, shape = net.forward(Xd, xb.shape)
                 rows = _rows(shape)

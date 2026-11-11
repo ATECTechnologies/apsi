@@ -495,6 +495,7 @@ def _main_module():
 
     def adam(i):
         gr = b.fmul(k.ld(p["G"], i), sc)
+        k.st(F(0.0), p["G"], i)                       # the gradient is used up: cleared for the next step here
         w = k.ld(p["P"], i)
         w = b.select(b.icmp_unsigned("<", i, p["n_decay"]), b.fmul(w, b.fsub(F(1.0), b.fmul(p["lr"], p["wd"]))), w)
         m_ = b.fadd(b.fmul(p["b1"], k.ld(p["M"], i)), b.fmul(b.fsub(F(1.0), p["b1"]), gr))
@@ -514,6 +515,7 @@ def _main_module():
 
     def sgd(i):
         v_ = b.call(fma_f, [p["mom"], k.ld(p["VEL"], i), b.fmul(k.ld(p["G"], i), sc)])
+        k.st(F(0.0), p["G"], i)
         k.st(v_, p["VEL"], i)
         k.st(b.fsub(k.ld(p["P"], i), b.fmul(p["lr"], v_)), p["P"], i)
     k.grid_loop(p["n"], sgd)

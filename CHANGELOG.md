@@ -16,6 +16,8 @@
 - **GPU temperature control:** long training, long answers and busy servers keep the card near 77 °C (75–78) by
   pacing the work while it is above the band (the driver's NVML gives the temperature); a cool card is never slowed.
   `APSI_GPU_TEMP=72` / `off`; `r.gpu_temperature`, `/metrics`, `hub.gpu_status()`.
+- **Less work per step:** the optimizer kernel clears the gradient it has used (no separate pass over all the
+  gradients each step), and each weight matrix is rounded to bfloat16 once per update instead of once per product.
 - **A fourth build of the products:** the operands rounded to bfloat16 once (one pass each), then copied into shared
   memory with cp.async four slices ahead (no registers, no conversion in the loop); the card times it against the
   others per shape, its rounding pass included, and keeps the fastest.
