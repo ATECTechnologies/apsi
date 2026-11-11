@@ -1461,12 +1461,17 @@ def module(interp=None):
         return ai_server.serve(model, host, int(port), api_key, name, int(max_queue), int(max_tokens),
                                float(timeout.v if hasattr(timeout, "v") else timeout), bool(background), bool(log))
 
+    def gpu_status():
+        """The temperature control of each GPU in use: {index: {temperature_c, target_c, max_c, paced_s, ...}}."""
+        from . import thermal
+        return thermal.status()
+
     def devices():
         """The NVIDIA GPUs the hub can use: [{"index", "name", "memory_gb", "compute_capability", ...}] (or [])."""
         from .native import cuda
         return cuda.devices()
 
-    return {"devices": devices, "model": hub.model, "pipeline": hub.pipeline, "model_from_folder": model_from_folder, "serve": serve, "info": hub.info, "files": hub.files, "search": hub.search, "download": hub.download,
+    return {"devices": devices, "model": hub.model, "pipeline": hub.pipeline, "model_from_folder": model_from_folder, "serve": serve, "gpu_status": gpu_status, "info": hub.info, "files": hub.files, "search": hub.search, "download": hub.download,
             "snapshot": hub.snapshot, "load": hub.load, "config": hub.config, "tokenizer": hub.tokenizer,
             "tokenizer_from_file": tokenizer_from_file, "login": login, "logout": logout, "offline": offline,
             "cache_dir": cache_dir, "clear_cache": clear_cache, "HubError": HubError}

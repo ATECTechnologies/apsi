@@ -361,6 +361,19 @@ removed or overwritten. `apsi` runs the newest (or the one chosen with `apsi use
 and `apsi versions` lists them. Removing one version keeps the others. The Windows/Linux setup app and the Linux `.sh`
 installer both work this way; an older install is moved into its own version folder.
 
+## 20. Training and serving on the GPU with Apsi alone
+
+* **`fit(…, backend="gpu")`** trains on an NVIDIA card with Apsi's own kernels: tensor cores, the whole optimizer in
+  one kernel, the data on the card. A 10.9 M-parameter GPT: 64,398 tokens/s on an RTX 3060 (PyTorch with cuBLAS:
+  142,287), the same held-out loss, nothing installed; 17× the processor.
+* **Low-bit training:** `precision="fp8" | "fp6" | "fp6_e2m3" | "fp4" | "int8" | "int4"` — and the model then runs in
+  that format with the weights it learned.
+* **fp6 weights on the card** (E3M2 and E2M3), next to bf16, int8, fp8, int4 and fp4: a 3B model in 3.0 GB.
+* **`apsi serve-model` / `hub.serve(lm)`:** the OpenAI API with streaming, a fair queue, API keys and metrics. Under
+  load on the RTX 3060 (0.5B, 3B, 14B): every request answered, 0 errors, the same answer for the same question.
+* **Temperature control:** the card stays near 77 °C (75–78) during long work instead of 85–90 °C.
+* Everything with the measurements and a troubleshooting guide: [`GPU.md`](GPU.md).
+
 ## How much faster than 2.0.0
 
 The same programs on both versions, on the same machine (an AMD EPYC 7763 GitHub Actions runner with the native

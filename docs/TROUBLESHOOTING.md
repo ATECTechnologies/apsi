@@ -8,6 +8,7 @@ This page covers the problems people most often hit right after installing Apsi,
 - [A function prints "runs on the bytecode engine"](#a-function-prints-runs-on-the-bytecode-engine)
 - [`Apsi 2.4.4 needs Python 3.12 or newer`](#apsi-244-needs-python-312-or-newer)
 - [A converted PyTorch program reports notes](#a-converted-pytorch-program-reports-notes)
+- [GPU: no card found, slow answers, out of memory, a hot card, training and serving](GPU.md#6-troubleshooting)
 
 ---
 

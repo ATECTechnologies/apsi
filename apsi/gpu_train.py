@@ -952,6 +952,8 @@ def fit(model, params, X, y=None, loss="mse", opt=None, epochs=10, batch_size=No
         ops.put(YA, Ya.reshape(-1))
         net.owned += [XA, YA, IDX]
     history, val_hist, step = [], [], 0
+    from . import thermal
+    gov = thermal.governor(getattr(ops, "dev", None))        # keeps the card near APSI_GPU_TEMP (77 C)
     wd = float(getattr(opt, "wd", 0.0)) if isinstance(opt, AdamW) else 0.0
     try:
         for ep in range(int(epochs)):
@@ -997,6 +999,7 @@ def fit(model, params, X, y=None, loss="mse", opt=None, epochs=10, batch_size=No
                     ops.sgd((net.P, 0), (net.G, 0), (st1, 0), (SQ, 0), net.n, lr, float(opt.momentum),
                             float(clip or 0.0))
                 step += 1
+                gov.tick(ops.sync)
             history.append(float(ops.get(net.LOSS, 1)[0]))          # the one wait of the epoch
             extra = ""
             if val is not None:
@@ -1013,7 +1016,11 @@ def fit(model, params, X, y=None, loss="mse", opt=None, epochs=10, batch_size=No
             if bf is not None:
                 ops.free(bf)
         net.close()
+    temp = gov.status()
+    if verbose and temp and temp["paced_s"]:
+        print(f"GPU kept near {temp['target_c']:.0f} C (highest {temp['max_c']:.0f} C, paced {temp['paced_s']} s)")
     return Record(params=out_params, history=history, val_history=val_hist, gpu_memory_mb=round(peak / 2 ** 20),
+                  gpu_temperature=temp,
                   device=f"gpu ({getattr(ops, 'name', '?')}, Apsi kernels"
                          f"{', tensor cores' if ops.tc else ''})")
 

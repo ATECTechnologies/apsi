@@ -13,6 +13,13 @@
   PyTorch; real fp8 products on Ada / Hopper / Blackwell tensor cores with PyTorch.
 - **fp6 on the card:** `APSI_GPU_WEIGHTS=fp6` (E3M2) and `fp6_e2m3` (E2M3: as close as fp8 at 6 bits), bit-exact
   with ml_dtypes.
+- **GPU temperature control:** long training, long answers and busy servers keep the card near 77 °C (75–78) by
+  pacing the work while it is above the band (the driver's NVML gives the temperature); a cool card is never slowed.
+  `APSI_GPU_TEMP=72` / `off`; `r.gpu_temperature`, `/metrics`, `hub.gpu_status()`.
+- **A model works from any thread:** every call to the card makes its context current on the calling thread first.
+  (Before, a server's request threads could not use the card and the model quietly moved to the processor.)
+- **`docs/GPU.md`:** everything on NVIDIA cards in one guide — formats, training, serving, temperature, measured
+  numbers, and troubleshooting.
 - **`apsi serve-model` / `hub.serve(lm)`: the OpenAI API** (`/v1/chat/completions` with streaming, `/v1/completions`,
   `/v1/models`, `/health`, `/metrics`), first-come-first-served queue with a limit and 429, a client that leaves frees
   the model at once, time limits, API keys. `examples/31_ai_server.apsi` adds your own routes in Apsi.

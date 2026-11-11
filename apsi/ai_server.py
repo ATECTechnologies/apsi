@@ -191,7 +191,9 @@ class Server:
                     return self._json(200, {"object": "list", "data": [
                         {"id": server.name, "object": "model", "created": server.created, "owned_by": "apsi"}]})
                 if path == "/metrics":
-                    return self._json(200, server.stats.snapshot())
+                    from . import thermal
+                    return self._json(200, dict(server.stats.snapshot(), device=server.device(),
+                                                gpu_temperature=thermal.status()))
                 if path == "/":
                     return self._json(200, {"model": server.name, "endpoints": [
                         "/v1/chat/completions", "/v1/completions", "/v1/models", "/health", "/metrics"]})
