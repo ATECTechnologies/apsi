@@ -350,6 +350,7 @@ class WholeNetworkOnGpu(unittest.TestCase):
                 gpu = H.Model(td, device="auto")
                 self.assertTrue(gpu.net.full, gpu.device_note)
                 gpu.net.kv_cache = "fp32"                            # exact comparison (fp16: test below)
+                t = tol                                              # tensor cores included: hi + lo parts
                 gpu.net.CHUNK = 128                                  # several passes over the prompt
                 gpu.net.SCRATCH = 4 * gpu.net.nh * 96 * 300          # and passes that shrink as the context grows
                 rng = np.random.default_rng(5)
@@ -357,7 +358,7 @@ class WholeNetworkOnGpu(unittest.TestCase):
                 # the whole sequence at once, in passes of 256 positions, against the processor
                 a = cpu.net.forward(np.array([ids]), cpu.net.new_cache(), 0)
                 b = gpu.net.forward(np.array([ids]), gpu.net.new_cache(), 0)
-                np.testing.assert_allclose(a, b, atol=tol)
+                np.testing.assert_allclose(a, b, atol=t)
                 # a prompt, then one token at a time: the cache grows from 256 to 512 positions on the way
                 cc, gc = cpu.net.new_cache(), gpu.net.new_cache()
                 cpu.net.forward(np.array([ids[:250]]), cc, 0)
@@ -365,7 +366,7 @@ class WholeNetworkOnGpu(unittest.TestCase):
                 for j in range(250, 262):
                     a = cpu.net.forward(np.array([[ids[j]]]), cc, j, last=True)
                     b = gpu.net.forward(np.array([[ids[j]]]), gc, j, last=True)
-                    np.testing.assert_allclose(a, b, atol=tol)
+                    np.testing.assert_allclose(a, b, atol=t)
                 self.assertEqual(gc.cap, 512)
                 # generation keeps working, also through a failing GPU
                 out = gpu.net.generate(ids[:10], max_new_tokens=6, eos=[])
@@ -597,6 +598,7 @@ class WholeNetworkOnGpu(unittest.TestCase):
         if g is None:
             self.skipTest(why)
         e = hub_gpu.Emulator()
+        e.tc = g.tc                                     # prompts on tensor cores: inputs rounded to bfloat16
         rng = np.random.default_rng(7)
 
         def pair(n, scale=1.0):
@@ -733,6 +735,7 @@ class WholeNetworkOnGpu(unittest.TestCase):
         r, why = hub_gpu.runner("auto")
         if r is None:
             self.skipTest(why)
+        tc = r.tc
         r.close()
         for kind, window in (("llama", None), ("qwen2", None), ("qwen3", None), ("llama", 40)):
             with self.subTest(kind=kind, window=window):
@@ -741,7 +744,9 @@ class WholeNetworkOnGpu(unittest.TestCase):
                 def both():
                     with tempfile.TemporaryDirectory() as td:
                         tiny_llama(td, kind, ctx=600, window=window)
-                        e = _on(hub_gpu.Emulator(), lambda: H.Model(td))
+                        emu = hub_gpu.Emulator()
+                        emu.tc = tc
+                        e = _on(emu, lambda: H.Model(td))
                         g = _on(hub_gpu.runner("auto")[0], lambda: H.Model(td))
                         ids = [3, 5, 7, 11, 2, 9, 4, 13] * 40
                         a = e.net.forward(np.array([ids]), e.net.new_cache(), 0)

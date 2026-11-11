@@ -279,6 +279,17 @@ for step in 0..1000:
 
 `predict(model, params, X, graph=…, backend="numpy")` applies the model with `train=false`.
 
+### Before a long run: `diagnose`
+
+```apsi
+let report = diagnose(model, model.init(seed=0), X, y, loss="cross_entropy", lr=1e-3)
+```
+
+It checks the data (NaN / inf, labels beyond the model's outputs, one class only, unscaled inputs), the output shape
+against the targets, the first loss against what an untrained model gives (log(classes) for cross_entropy),
+gradients (parameters that get none, NaN / inf, very large ones), and whether the model can fit a small batch at
+`lr`, lr/10 and 10·lr. It prints what to fix and returns `record(ok, problems, warnings, notes, suggested_lr, losses)`.
+
 ## 8. Inspection, saving and loading
 
 - `summary(model, params)` prints a table of every layer and its parameter count, and returns it as a string

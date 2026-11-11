@@ -75,6 +75,22 @@ data                tensors, back to back, in table order
 
 Tensor names are the parameter paths joined with dots (`layers.0.W`), so the tree is rebuilt from the names.
 
+### Everything to resume training, in one file
+
+```apsi
+use models
+save_checkpoint("run/step-12000", params, opt=opt, step=12000, config=record(d_model=512, layers=8),
+                files={"tokenizer.json": "tok/tokenizer.json", "notes": "after warm-up"})
+let ck = load_checkpoint("run/step-12000")       # record(params, optimizer, step, config, files, metadata)
+var opt2 = ck.optimizer                          # Adam / AdamW / SGD with their moments and step count
+```
+
+`save_checkpoint` keeps the weights, the optimizer state, the step, a config record and any files (bytes, text or
+a path) in one `.apsim` file; above `shard` (default 4 GB) it writes shards and an index instead. `load_checkpoint`
+takes the file, the index, the name without extension or any one shard's name, and also reads files written by
+`save_model` (then only `params` is set). Resuming continues exactly: the next optimizer step is bit for bit the one
+the original would have taken.
+
 ## 2. GGUF
 
 ```apsi

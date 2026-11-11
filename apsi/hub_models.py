@@ -90,6 +90,64 @@ class _Ref:
         return out
 
 
+
+class _Q8Store:
+    """int8 copies of the matrices for the processor, made once and kept on disk next to the GPU kernel cache
+    (memory-mapped afterwards: the next start reads them at disk speed and the OS shares the pages)."""
+
+    def __init__(self, net, groups):
+        import hashlib
+        from .security import config_dir
+        self.net = net
+        h = hashlib.sha256(b"apsi-q8-1")
+        for ns in groups.values():
+            for n in ns:
+                kind, ref = net.W._raw.get(n if n else net._head_name(), (None, None))
+                if isinstance(ref, _Ref):
+                    st = os.stat(ref.path)
+                    h.update(f"{os.path.abspath(ref.path)}|{st.st_size}|{int(st.st_mtime)}|{ref.offset}|{ref.shape}".encode())
+                else:
+                    h = None
+                    break
+            if h is None:
+                break
+        self.dir = os.path.join(config_dir(), "cache", "cpu-int8", h.hexdigest()[:24]) if h is not None else None
+        self.ok = self.dir is not None and os.path.exists(os.path.join(self.dir, "complete"))
+        self.made = 0
+
+    def _paths(self, key):
+        safe = key.replace("/", "_")
+        return os.path.join(self.dir, safe + ".codes.npy"), os.path.join(self.dir, safe + ".scales.npy")
+
+    def get(self, key, names):
+        from . import hub_cpu
+        if self.ok:
+            try:
+                c, sc = self._paths(key)
+                return hub_cpu.Q8(np.load(c, mmap_mode="r"), np.load(sc, mmap_mode="r"))
+            except (OSError, ValueError):
+                self.ok = False
+        q = hub_cpu.Q8.from_bf16(self.net._bf16(names))
+        self.made += 1
+        if self.dir is not None:
+            try:
+                os.makedirs(self.dir, exist_ok=True)
+                c, sc = self._paths(key)
+                for path, arr in ((c, q.codes), (sc, q.scales)):
+                    with open(path + ".tmp", "wb") as fh:
+                        np.save(fh, arr)
+                    os.replace(path + ".tmp", path)
+            except OSError:
+                self.dir = None                             # read-only home: keep it in RAM only
+        return q
+
+    def done(self):
+        if self.made and self.dir is not None:
+            try:
+                open(os.path.join(self.dir, "complete"), "w").close()
+            except OSError:
+                pass
+
 class Weights:
     """name -> float32 array, decoded from the checkpoint's own format the first time it is used.
 
@@ -648,9 +706,17 @@ class Decoder:
             return False
         if not hub_cpu.available():
             return False
+        mode = os.environ.get("APSI_CPU_WEIGHTS", "int8").strip().lower()
+        q8 = mode in ("int8", "q8", "auto") and hub_cpu.q8_available() and \
+            all(self._wshape(n if n else self._head_name())[1] % hub_cpu.QB == 0 for n in names)
+        self.cpu_weights = "int8" if q8 else "bf16"
+        store = _Q8Store(self, groups) if q8 else None
         for key, ns in groups.items():
             ns = [n if n else self._head_name() for n in ns]
-            self._cm[key] = (self._bf16(ns), list(np.cumsum([self._wshape(n)[0] for n in ns])[:-1]))
+            cuts = list(np.cumsum([self._wshape(n)[0] for n in ns])[:-1])
+            self._cm[key] = (store.get(key, ns) if q8 else self._bf16(ns), cuts)
+        if store is not None:
+            store.done()
         return True
 
     def _mm(self, x, key, names):

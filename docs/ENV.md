@@ -26,6 +26,26 @@ when the permission is missing, so a program still starts.
 constant time. Pass it to `db.postgres(...)`, `web` clients or `crypto` functions directly; call `.reveal()` only
 where the text itself is needed.
 
+## Settings files (`use config`)
+
+```apsi
+use config
+let cfg = config.load("config/default.toml", "config/local.toml?", env="APP", args=true,
+                      defaults=record(train=record(lr=3e-4, epochs=10)), required=["data.path"])
+print(cfg.train.lr, config.get(cfg, "server.port", 8080))
+config.save("runs/42/config.toml", cfg)          # exactly what this run used
+```
+
+- **Formats:** `.toml`, `.json`, `.yaml` / `.yml` (with PyYAML), `.ini` / `.cfg`, `.env`. A name ending in `?` is
+  optional (a local file only some machines have).
+- **Layers:** later files override earlier ones key by key; tables are merged, not replaced. Then the environment
+  (`env="APP"`: `APP_SERVER__PORT=9000` sets `server.port`; needs `--allow-env`), then the command line
+  (`args=true`: `--set train.lr=0.01` or `train.lr=0.01` after `--`).
+- **Checked:** the types of `defaults` are the schema; a file that gives text where a number belongs is an error
+  that names the file and the key. `required=[...]` lists keys that must be set.
+- **References:** `"${name}-run"` uses another setting, `"${ENV:HOME}"` an environment variable.
+- `config.sources(cfg)` says which file, variable or argument set each key; `config.parse(text, "toml")` reads text.
+
 ## Python virtual environments
 
 ```bash

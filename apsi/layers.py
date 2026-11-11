@@ -1599,7 +1599,7 @@ def module(interp=None):
         gcn=GCN, sage=SAGE, gat=GAT, gin=GIN, graph_pool=GraphPool,
         # composition
         sequential=sequential, residual=residual, parallel=parallel, dag=dag, add=add, multiply=multiply,
-        concatenate=concatenate, custom_layer=custom_layer, checkpoint=checkpoint, load_torch_weights=load_torch_weights,
+        concatenate=concatenate, custom_layer=custom_layer, checkpoint=checkpoint, diagnose=diagnose, load_torch_weights=load_torch_weights,
         # model zoo
         mlp=mlp, resnet_mlp=resnet_mlp, cnn=cnn, lstm_classifier=lstm_classifier, transformer_lm=transformer_lm,
         transformer_classifier=transformer_classifier, autoencoder=autoencoder, vae=vae, vae_loss=vae_loss,
@@ -1613,3 +1613,167 @@ def module(interp=None):
     from . import graphs                     # long-range graph layers (graph_transformer, global_attention, …)
     names.update(graphs.names())
     return names
+
+
+# =============================================================== diagnose: what is wrong with a model built from scratch
+def diagnose(model, params, X, y=None, loss="mse", lr=1e-3, steps=60, batch=16, seed=0, verbose=True):
+    """Checks a new model before a long training run, the way an experienced person would, and says what to fix:
+
+    1. data: NaN / inf in inputs or targets, labels outside the model's classes, one class only, unscaled inputs
+    2. forward: the output shape against the targets, NaN / inf in the output
+    3. the first loss against what an untrained model should give (log(classes) for cross_entropy)
+    4. gradients: parameters that get no gradient (unused or dead), NaN / inf, very large or vanishing ones
+    5. it can learn: a small batch is trained for `steps` steps and the loss must fall (otherwise: a bug or the
+       learning rate), and the learning rates 10x around `lr` are tried to suggest a better one.
+
+    Returns record(ok, problems, warnings, notes, suggested_lr, losses) and prints a report."""
+    from .stdlib import Adam, value_and_grad
+    from .values import tree_leaves
+    lf = _loss_fn(loss)
+    problems, warnings, notes = [], [], []
+    target = X if y is None else y
+    Xr = np.asarray(ops.raw(X)) if not isinstance(X, (list, tuple)) else None
+    Yr = np.asarray(ops.raw(target)) if not isinstance(target, (list, tuple)) else None
+
+    # 1. data
+    for name, a in (("inputs", Xr), ("targets", Yr)):
+        if a is not None and a.dtype.kind == "f":
+            bad = int((~np.isfinite(a)).sum())
+            if bad:
+                problems.append(f"{bad} NaN/inf value(s) in the {name}: clean them (e.g. where(isnan(x), 0, x))")
+    if Xr is not None and Xr.dtype.kind == "f" and np.isfinite(Xr).all() and Xr.size:
+        spread = float(np.abs(Xr).max())
+        if spread > 1e3:
+            warnings.append(f"inputs reach {spread:.3g}: scale them (standardize: (x - mean) / std) or training will "
+                            "be slow or unstable")
+    n = _rows(X)
+    k = min(int(batch), n)
+    rng = np.random.default_rng(int(seed))
+    idx = np.sort(rng.choice(n, size=k, replace=False))
+    xb, yb = _take(X, idx), _take(target, idx)
+
+    # 2. forward
+    try:
+        out = model(params, xb, train=False)
+    except Exception as e:
+        problems.append(f"the model cannot run on the inputs: {type(e).__name__}: {e}")
+        return _report(False, problems, warnings, notes, None, [], verbose)
+    o = np.asarray(ops.raw(out)) if not isinstance(out, (list, tuple)) else None
+    if o is not None:
+        if o.dtype.kind == "f" and not np.isfinite(o).all():
+            problems.append("the output has NaN/inf before any training: check the initialisation and operations "
+                            "such as log / sqrt / division of values that can be 0 or negative")
+        yb_a = np.asarray(ops.raw(yb)) if not isinstance(yb, (list, tuple)) else None
+        if loss == "cross_entropy" and yb_a is not None:
+            classes = o.shape[-1]
+            labels = np.asarray(ops.raw(target)).astype(int) if Yr is not None else yb_a.astype(int)
+            valid = labels[labels >= 0]
+            if valid.size and valid.max() >= classes:
+                problems.append(f"labels go up to {int(valid.max())} but the model has {classes} outputs: "
+                                f"the last layer needs {int(valid.max()) + 1} outputs")
+            if valid.size and len(np.unique(valid)) == 1:
+                warnings.append("every label is the same class: the model can only learn to predict it")
+            if o.shape[:-1] != yb_a.shape:
+                problems.append(f"output {tuple(o.shape)} does not fit labels {tuple(yb_a.shape)} "
+                                "(cross_entropy wants outputs [..., classes] and labels [...])")
+        elif yb_a is not None and loss in ("mse", "mae", "bce") and o.shape != yb_a.shape:
+            if o.size == yb_a.size:
+                warnings.append(f"output {tuple(o.shape)} and targets {tuple(yb_a.shape)} have the same values but "
+                                "different shapes: reshape the targets, or the loss may broadcast wrongly")
+            else:
+                problems.append(f"output {tuple(o.shape)} does not match targets {tuple(yb_a.shape)}")
+    if problems:
+        return _report(False, problems, warnings, notes, None, [], verbose)
+
+    # 3. first loss
+    try:
+        l0 = float(ops.raw(lf(model(params, xb, train=True), yb)))
+    except Exception as e:
+        problems.append(f"the loss cannot be computed: {type(e).__name__}: {e}")
+        return _report(False, problems, warnings, notes, None, [], verbose)
+    if not np.isfinite(l0):
+        problems.append("the first loss is NaN/inf")
+        return _report(False, problems, warnings, notes, None, [], verbose)
+    if loss == "cross_entropy" and o is not None:
+        expect = float(np.log(o.shape[-1]))
+        notes.append(f"first loss {l0:.4g} (an untrained model with {o.shape[-1]} classes gives about {expect:.4g})")
+        if l0 > 3 * expect + 1:
+            warnings.append("the first loss is far above log(classes): the last layer starts with too large weights "
+                            "(the model is confidently wrong); initialise it smaller")
+    else:
+        notes.append(f"first loss {l0:.4g}")
+
+    # 4. gradients
+    def obj(p):
+        return lf(model(p, xb, train=True), yb)
+    _, g = value_and_grad(obj)(params)
+    from .models import _flatten
+    flat_g = _flatten(g)
+    flat_p = _flatten(params)
+    dead, huge = [], []
+    for name, gv in flat_g.items():
+        a = np.asarray(ops.raw(gv), np.float64)
+        if not np.isfinite(a).all():
+            problems.append(f"gradient of '{name}' has NaN/inf")
+            continue
+        g_rms = float(np.sqrt((a * a).mean())) if a.size else 0.0
+        pv = np.asarray(ops.raw(flat_p.get(name, 0)), np.float64)
+        p_rms = float(np.sqrt((pv * pv).mean())) if pv.size else 0.0
+        if g_rms == 0.0:
+            dead.append(name)
+        elif g_rms / max(p_rms, 0.05) > 100:             # one step at lr 1e-3 would move it by over 10 %
+            huge.append(name)
+    if dead:
+        warnings.append(f"{len(dead)} parameter(s) get no gradient (not used by the output, or dead ReLUs): "
+                        + ", ".join(dead[:6]) + (" …" if len(dead) > 6 else ""))
+    if huge:
+        warnings.append("very large gradients for " + ", ".join(huge[:4]) + ": add normalisation or clip=1.0")
+    if problems:
+        return _report(False, problems, warnings, notes, None, [], verbose)
+
+    # 5. can it learn? a small batch, a few learning rates
+    def run(rate):
+        p, o_ = params, Adam(rate)
+        vg = value_and_grad(obj)
+        hist = []
+        for _ in range(int(steps)):
+            lv, gg = vg(p)
+            lv = float(ops.raw(lv))
+            hist.append(lv)
+            if not np.isfinite(lv):
+                break
+            p = o_.step(p, gg)
+        return hist
+    tried = {}
+    for rate in (lr / 10, lr, lr * 10):
+        h = run(rate)
+        tried[rate] = h
+    def score(h):
+        return h[-1] if h and np.isfinite(h[-1]) else np.inf
+    best = min(tried, key=lambda r: score(tried[r]))
+    h = tried[lr]
+    drop = (h[0] - min(h)) / (abs(h[0]) + 1e-12) if h and np.isfinite(min(h)) else 0.0
+    if not np.isfinite(score(h)):
+        problems.append(f"training diverges at lr={lr:g} (the loss became NaN/inf): lower the learning rate")
+    elif drop < 0.1 and score(tried[best]) > 0.9 * h[0]:
+        problems.append(f"the loss does not fall on {k} examples in {steps} steps at any learning rate "
+                        f"({h[0]:.4g} → {h[-1]:.4g}): the model cannot fit even a tiny batch — usually a bug (wrong "
+                        "targets, a detached part of the network, an activation at the output where none belongs)")
+    else:
+        notes.append(f"learns: loss {h[0]:.4g} → {h[-1]:.4g} on {k} examples in {steps} steps at lr={lr:g}")
+    if best != lr and score(tried[best]) < 0.7 * score(h):
+        notes.append(f"lr={best:g} learned faster ({score(tried[best]):.4g} vs {score(h):.4g}): try it")
+    return _report(not problems, problems, warnings, notes, best, h, verbose)
+
+
+def _report(ok, problems, warnings, notes, best, losses, verbose):
+    if verbose:
+        print("diagnose: " + ("no problems found" if ok and not warnings else
+                              f"{len(problems)} problem(s), {len(warnings)} warning(s)"))
+        for p in problems:
+            print("  ✗ " + p)
+        for w in warnings:
+            print("  ! " + w)
+        for n_ in notes:
+            print("  · " + n_)
+    return Record(ok=bool(ok), problems=problems, warnings=warnings, notes=notes, suggested_lr=best, losses=losses)

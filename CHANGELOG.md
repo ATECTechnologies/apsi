@@ -30,6 +30,20 @@
   one, `apsi versions` lists them. Removing a version keeps the others; an install from before 2.4.4 is moved into
   its own version folder. Both the Windows/Linux setup app and the Linux `.sh` installer do this.
 - Launchers start Python with `-P`, so a folder named `apsi` in the current directory can no longer replace Apsi.
+- **Models on the processor twice as fast and half the RAM:** int8 matrices (Q8_0 layout, error below bfloat16's
+  rounding; made once and memory-mapped afterwards) and a native thread team that starts a product on every core in
+  about a microsecond. A Qwen2.5-0.5B-sized model: 96 → 52 ms per token on 2 cores. `APSI_CPU_WEIGHTS=bf16` for the
+  exact weights.
+- **Prompts on tensor cores** (RTX 30 series and newer): bfloat16 `mma.sync` with the activations split in two
+  bfloat16 parts (matches float32 to about 1e-5), checked against the float32 kernel at start-up.
+- **`save_checkpoint` / `load_checkpoint`:** weights, optimizer state, step, config and files (tokenizer …) in one
+  `.apsim`, or shards above 4 GB; loads from the file, the index, the bare name or any shard; resuming is exact.
+- **`use config`:** settings in their own files (TOML, JSON, YAML, INI, .env), layered, overridden by environment
+  variables and `--set key=value`, types checked against defaults, `${other.key}` references, `config.save`.
+- **`diagnose(model, params, X, y)`:** checks a model built from scratch before a long run (data, shapes, first loss,
+  dead or exploding gradients, whether it can fit a small batch) and suggests a learning rate.
+- **`apsi cache`:** every cache and its size, downloaded models, and `apsi cache clean` for what can never be used
+  again (or one model, or everything).
 
 ### Language models on the GPU (`use hub`)
 - **Decoders run on an NVIDIA graphics card by themselves, with nothing to install but the display driver.** The

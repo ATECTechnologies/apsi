@@ -880,6 +880,8 @@ def _parser(light=False):
     _remote.add_parser(sub)
     _editors.add_parser(sub)
     _convert.add_parser(sub)
+    from . import cachectl as _cachectl
+    _cachectl.add_parser(sub)
 
     p = sub.add_parser("version", help="print the version")
     p.set_defaults(fn=cmd_version)

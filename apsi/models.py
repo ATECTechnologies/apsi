@@ -276,6 +276,10 @@ def install(interp):
             modelio.save_model(path, params, metadata, shard, sign, check=_wpath),
         "load_model": lambda path, verify=True, key=None: modelio.load_model(path, verify, key, check=_path),
         "model_info": lambda path: modelio.model_info(_path(path)),
+        "save_checkpoint": lambda path, params, opt=None, step=None, config=None, files=None, metadata=None,
+            shard="4GB", sign=False: modelio.save_checkpoint(path, params, opt, step, config, files, metadata, shard,
+                                                             sign, check=_wpath, read=_path),
+        "load_checkpoint": lambda path, verify=True, key=None: modelio.load_checkpoint(path, verify, key, check=_path),
     }
 
 

@@ -76,6 +76,9 @@ let w = hub.load("my-org/private-model")
 * An interrupted download continues where it stopped the next time you ask for the file.
 * Large files are checked against the SHA-256 the Hub publishes; a file that does not match is deleted, never used.
 * `hub.offline(true)` (or `APSI_HUB_OFFLINE=1`) answers from the cache only — for machines without internet.
+* `apsi cache` shows every cache and its size, `apsi cache models` the downloaded models, `apsi cache clean` removes
+  what can never be used again (kernels of other versions, downloads stopped long ago, unused int8 copies) and
+  `apsi cache clean models --model owner/name` one model.
 
 ## Tokenizers
 
@@ -292,10 +295,19 @@ lm.to("cpu")                                                   # move it later; 
 stays on the CPU and `lm.device_note` says why; `"cuda"` raises an error instead, also when the model does not fit
 the card. `APSI_NO_GPU=1` keeps everything on the CPU.
 
-On the processor, a bfloat16 checkpoint runs on all cores with a matrix product that reads bfloat16 directly
-(compiled by Apsi's native compiler): half the memory of float32 and about half the time per token (a 0.5B model
-needs about 1 GB of RAM, a 1.5B model 3 GB). Prompts of 24 tokens or more use NumPy's BLAS. Other checkpoints run in
-float32 with NumPy. `APSI_HUB_NATIVE=0` turns the native product off. For bigger models, use GGUF with llama.cpp, or PyTorch through `hf_pipeline`.
+On the processor, a bfloat16 checkpoint runs on all cores with matrix products compiled by Apsi's native compiler.
+By default the matrices are kept as **int8 with one scale per 32 values** (the Q8_0 layout of llama.cpp): a token reads
+half the bytes of bfloat16, so it is about twice as fast where memory is the limit, and the model needs half the RAM
+(a 0.5B model about 0.55 GB). The error is below bfloat16's own rounding of the activations. The int8 copy is made
+the first time (a few seconds) and kept in `~/.apsi/cache/cpu-int8`, memory-mapped on later starts.
+`APSI_CPU_WEIGHTS=bf16` keeps the exact bfloat16 weights. The products start on every core through a native thread
+team (about a microsecond, instead of tens of microseconds per thread from Python). Prompts of 24 tokens or more use
+NumPy's BLAS. Other checkpoints run in float32 with NumPy. `APSI_HUB_NATIVE=0` turns the native products off.
+
+On NVIDIA cards from the RTX 30 series (Ampere) on, prompts use the **tensor cores** (`mma.sync`, bfloat16 inputs,
+float32 sums); the activations are split into two bfloat16 parts, so the result matches the float32 product to about
+1e-5. The kernel is checked against the float32 one when the GPU starts and is used only if they agree;
+`APSI_TENSOR_CORES=0` turns it off. For bigger models, use GGUF with llama.cpp, or PyTorch through `hf_pipeline`.
 
 ### Not native yet
 

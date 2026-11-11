@@ -533,6 +533,10 @@ def load_model(path, verify=True, key=None, check=None):
             path = cand
             break
     path = str(check(path))                   # resolved (relative to the program) and permission-checked
+    import re as _re
+    m = _re.match(r"(.*)-\d{5}-of-\d{5}\.apsim$", path)
+    if m and os.path.exists(m.group(1) + ".apsim.index.json"):
+        path = m.group(1) + ".apsim.index.json"       # one shard named: the whole checkpoint it belongs to
     if not os.path.exists(path) and os.path.exists(path + ".apsim"):
         path += ".apsim"
     if not os.path.exists(path) and os.path.exists(path + ".index.json"):
@@ -618,8 +622,136 @@ def model_info(path):
                   metadata=Record(**json.loads(meta.get("metadata", "{}"))))
 
 
+# ============================================================================= whole training state in one checkpoint
+_OPT_FIELDS = ("lr", "b1", "b2", "eps", "wd", "momentum", "t", "weight_decay")
+
+
+def _opt_state(opt):
+    """(hyper-parameters + class, tensor trees) of an optimizer object."""
+    if opt is None:
+        return None, {}
+    hyper = {"class": type(opt).__name__}
+    trees = {}
+    for k, v in vars(opt).items():
+        if k in _OPT_FIELDS and isinstance(v, (int, float)):
+            hyper[k] = v
+        elif v is None or isinstance(v, (int, float, str, bool)):
+            hyper[k] = v
+        else:
+            try:
+                from .models import _flatten
+                if _flatten(v):
+                    trees[k] = v
+            except Exception:
+                pass
+    return hyper, trees
+
+
+def _opt_restore(hyper, trees):
+    from . import stdlib
+    cls = getattr(stdlib, hyper.get("class", ""), None)
+    if cls is None:
+        return None
+    opt = cls.__new__(cls)
+    for k, v in hyper.items():
+        if k != "class":
+            setattr(opt, k, v)
+    for k, v in trees.items():
+        setattr(opt, k, v)
+    return opt
+
+
+def save_checkpoint(path, params, opt=None, step=None, config=None, files=None, metadata=None, shard="4GB",
+                    sign=False, check=None, read=None):
+    """Everything needed to use or resume a model in one .apsim (or in shards when it is larger than `shard`):
+    the weights, the optimizer state (Adam/AdamW/SGD moments and step), the training step, a config record and any
+    files (tokenizer.json, vocab, notes) — load_checkpoint gives all of it back. Still a safetensors file."""
+    tree = {"params": params}
+    hyper, trees = _opt_state(opt)
+    if trees:
+        tree["optimizer"] = trees
+    blobs = {}
+    for name, f in (files.fields if isinstance(files, Record) else dict(files or {})).items():
+        if isinstance(f, (bytes, bytearray)):
+            data = bytes(f)
+        elif isinstance(f, str) and os.path.isfile(str((read or (lambda p: p))(f))):
+            with open(str((read or (lambda p: p))(f)), "rb") as fh:
+                data = fh.read()
+        else:
+            data = str(f).encode("utf-8")
+        blobs[str(name).replace(".", "\u2024")] = np.frombuffer(data, np.uint8).copy() if data else np.zeros(0, np.uint8)
+    if blobs:
+        tree["files"] = blobs
+    user = metadata.fields if isinstance(metadata, Record) else dict(metadata or {})
+    cfg = config.fields if isinstance(config, Record) else config
+    meta = dict(user, __checkpoint__=json.dumps({"step": step, "optimizer": hyper, "config": cfg}, default=_jsonable))
+    return save_model(path, tree, meta, shard, sign, check)
+
+
+def _jsonable(v):
+    if isinstance(v, Record):
+        return dict(v.fields)
+    if isinstance(v, np.ndarray):
+        return v.tolist()
+    if isinstance(v, (np.integer, np.floating)):
+        return v.item()
+    return str(v)
+
+
+def load_checkpoint(path, verify=True, key=None, check=None):
+    """record(params, optimizer, step, config, files, metadata) from save_checkpoint; plain save_model files give
+    record(params=…) with the rest empty, so any checkpoint loads the same way."""
+    tree = load_model(path, verify, key, check)
+    info = _meta_of(path, check)
+    ck = {}
+    try:
+        ck = json.loads(info.get("__checkpoint__", "{}"))
+    except ValueError:
+        ck = {}
+    fields = tree.fields if isinstance(tree, Record) else {}
+    if "__checkpoint__" not in info:
+        return Record(params=tree, optimizer=None, step=None, config=None, files=Record(),
+                      metadata=Record(**{k: v for k, v in info.items()}))
+    trees = fields.get("optimizer")
+    opt = _opt_restore(ck.get("optimizer") or {}, trees.fields if isinstance(trees, Record) else {}) \
+        if ck.get("optimizer") else None
+    files = fields.get("files")
+    fd = {}
+    if isinstance(files, Record):
+        for k, v in files.fields.items():
+            fd[k.replace("\u2024", ".")] = bytes(np.asarray(v, np.uint8).tobytes())
+    cfg = ck.get("config")
+    from .interop import from_py
+    return Record(params=fields.get("params"), optimizer=opt, step=ck.get("step"),
+                  config=(Record(**{k: from_py(v) for k, v in cfg.items()}) if isinstance(cfg, dict)
+                          else from_py(cfg) if cfg is not None else None), files=fd,
+                  metadata=Record(**{k: v for k, v in info.items() if k != "__checkpoint__"}))
+
+
+def _meta_of(path, check=None):
+    """The user metadata of a checkpoint (single file or index)."""
+    check = check or (lambda p: p)
+    path = str(path)
+    for cand in (path, path + ".apsim", path + ".apsim.index.json", path + ".index.json"):
+        if os.path.exists(check(cand)):
+            path = str(check(cand))
+            break
+    if path.endswith(".index.json"):
+        with open(path, encoding="utf-8") as fh:
+            m = json.load(fh)["metadata"]
+    else:
+        with open(path, "rb") as fh:
+            n = struct.unpack("<Q", fh.read(8))[0]
+            m = json.loads(fh.read(n)).get("__metadata__", {})
+    try:
+        user = json.loads(m.get("metadata", "{}"))
+    except ValueError:
+        user = {}
+    return user
+
+
 def module_functions():
-    return {"save_gguf": save_gguf, "load_gguf": load_gguf, "gguf_info": gguf_info, "save_model": save_model,
+    return {"save_checkpoint": save_checkpoint, "load_checkpoint": load_checkpoint, "save_gguf": save_gguf, "load_gguf": load_gguf, "gguf_info": gguf_info, "save_model": save_model,
             "load_model": load_model, "model_info": model_info}
 
 
