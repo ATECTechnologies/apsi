@@ -494,17 +494,19 @@ def _main_module():
     sc = clip_scale(k, p)
 
     def adam(i):
-        gr = b.fmul(k.ld(p["G"], i), sc)
-        k.st(F(0.0), p["G"], i)                       # the gradient is used up: cleared for the next step here
-        w = k.ld(p["P"], i)
+        # every load first, every store last: a store between them (to arrays the compiler must assume may overlap)
+        # would hold the later loads back, and this kernel is all memory traffic
+        g0, w, m0, v0 = k.ld(p["G"], i), k.ld(p["P"], i), k.ld(p["M"], i), k.ld(p["V"], i)
+        gr = b.fmul(g0, sc)
         w = b.select(b.icmp_unsigned("<", i, p["n_decay"]), b.fmul(w, b.fsub(F(1.0), b.fmul(p["lr"], p["wd"]))), w)
-        m_ = b.fadd(b.fmul(p["b1"], k.ld(p["M"], i)), b.fmul(b.fsub(F(1.0), p["b1"]), gr))
-        v_ = b.fadd(b.fmul(p["b2"], k.ld(p["V"], i)), b.fmul(b.fsub(F(1.0), p["b2"]), b.fmul(gr, gr)))
-        k.st(m_, p["M"], i)
-        k.st(v_, p["V"], i)
+        m_ = b.fadd(b.fmul(p["b1"], m0), b.fmul(b.fsub(F(1.0), p["b1"]), gr))
+        v_ = b.fadd(b.fmul(p["b2"], v0), b.fmul(b.fsub(F(1.0), p["b2"]), b.fmul(gr, gr)))
         upd = b.fdiv(b.fmul(p["lr"], b.fdiv(m_, p["c1"])),
                      b.fadd(b.call(sqrt_f, [b.fdiv(v_, p["c2"])]), p["eps"]))
+        k.st(m_, p["M"], i)
+        k.st(v_, p["V"], i)
         k.st(b.fsub(w, upd), p["P"], i)
+        k.st(F(0.0), p["G"], i)                       # the gradient is used up: cleared for the next step here
     k.grid_loop(p["n"], adam)
     k.ret()
 
@@ -514,10 +516,11 @@ def _main_module():
     sc = clip_scale(k, p)
 
     def sgd(i):
-        v_ = b.call(fma_f, [p["mom"], k.ld(p["VEL"], i), b.fmul(k.ld(p["G"], i), sc)])
-        k.st(F(0.0), p["G"], i)
+        g0, vel, w = k.ld(p["G"], i), k.ld(p["VEL"], i), k.ld(p["P"], i)
+        v_ = b.call(fma_f, [p["mom"], vel, b.fmul(g0, sc)])
         k.st(v_, p["VEL"], i)
-        k.st(b.fsub(k.ld(p["P"], i), b.fmul(p["lr"], v_)), p["P"], i)
+        k.st(b.fsub(w, b.fmul(p["lr"], v_)), p["P"], i)
+        k.st(F(0.0), p["G"], i)
     k.grid_loop(p["n"], sgd)
     k.ret()
 

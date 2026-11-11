@@ -17,8 +17,9 @@ and the driver compiles them for whatever card is present.
 ### Quick start: train on your card in three steps
 
 1. **Once**, give Apsi the right to set the card's power limit (it holds the temperature this way, at full and
-   steady speed): download **Apsi GPU Tuner → Apply** from the download page and double-click it (or run
-   `apsi gpu setup` from a terminal opened as administrator).
+   steady speed). The Windows and Linux installers do it for you: keep **Full GPU speed without administrator
+   rights** ticked and answer *Yes* once. Otherwise: **Apsi GPU Tuner → Apply** from the download page, or
+   `apsi gpu setup` from a terminal opened as administrator.
 2. Train with `backend="gpu"` (the example in section 2). Nothing else to install.
 3. Read the report: the speed of every epoch, the temperature, and how it was held. `apsi gpu` shows the card at any
    time, `apsi gpu watch` every second.

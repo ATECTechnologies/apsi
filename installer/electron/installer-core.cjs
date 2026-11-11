@@ -330,6 +330,7 @@ function defaultOptions(sys) {
       fileAssociation: true,
       startMenu: true,
       desktopShortcut: false,
+      gpuPower: (sys.gpus || []).length > 0,   // an NVIDIA card: the GPU helper (one administrator prompt)
     },
     packages: { gpu: false, onnx: false, torch: false, transformers: false },
     security: { profile: "standard", verify: true, scanOnRun: true, auditLog: true, guardLimit: 150 },
@@ -779,6 +780,23 @@ async function install(options, hooks = {}) {
       say("Registered .apsi files");
     }
     finish("assoc");
+
+    // 6b the GPU helper: training holds 77 C by the power limit without administrator rights (asks once)
+    if (c.gpuPower) {
+      const py = pythonIn(dir);
+      let r = null;
+      if (IS_WIN) {
+        const q = (x) => `'${String(x).replace(/'/g, "''")}'`;
+        const ps = `$p = Start-Process -FilePath ${q(py)} -ArgumentList '-I','-X','utf8','-m','apsi','gpu','setup' ` +
+                   `-Verb RunAs -WindowStyle Hidden -Wait -PassThru; exit $p.ExitCode`;
+        r = await run("powershell", ["-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", ps], { timeoutMs: 300000 });
+      } else if (which("pkexec")) {
+        r = await run("pkexec", ["env", `HOME=${HOME}`, py, "-I", "-X", "utf8", "-m", "apsi", "gpu", "setup"], { timeoutMs: 300000 });
+      }
+      say(r && r.code === 0
+        ? "GPU helper installed: training holds the card near 77 C by its power limit, no administrator needed"
+        : "GPU helper not installed (later: 'apsi gpu setup' from a terminal opened as administrator, or the GPU Tuner)");
+    }
 
     // 7 shortcuts
     step("shortcuts");

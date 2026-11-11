@@ -286,7 +286,10 @@ export default function App() {
         ))}
         <div className="group-title">Integration</div>
         {INTEGRATION.map((c) => (
-          <OptionRow key={c.id} title={c.title} text={c.text} checked={!!opts.components[c.id]}
+          <OptionRow key={c.id} title={c.title}
+            text={c.needsGPU && !(sys.gpus || []).length ? "Needs an NVIDIA graphics card — not detected." : c.text}
+            checked={!!opts.components[c.id] && !(c.needsGPU && !(sys.gpus || []).length)}
+            disabled={c.needsGPU && !(sys.gpus || []).length}
             onChange={(v) => set(`components.${c.id}`, v)} />
         ))}
       </div>

@@ -15,7 +15,7 @@ export function mockSetup() {
     detect: async () => { await new Promise((r) => setTimeout(r, 600)); return sys; },
     defaults: async (s) => ({
       mode: "install", dir: s.defaultDir, allUsers: false,
-      components: { runtime: true, examples: true, docs: true, editors: true, addToPath: true, fileAssociation: true, startMenu: true, desktopShortcut: false },
+      components: { runtime: true, examples: true, docs: true, editors: true, addToPath: true, fileAssociation: true, startMenu: true, desktopShortcut: false, gpuPower: true },
       packages: { gpu: false, onnx: false, torch: false, transformers: false },
       security: { profile: "standard", verify: true, scanOnRun: true, auditLog: true, guardLimit: 150 },
     }),

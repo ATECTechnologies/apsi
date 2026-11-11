@@ -30,6 +30,8 @@ export const INTEGRATION = [
   { id: "fileAssociation", title: "Associate .apsi files", text: "Double-click to run, right-click to edit or test, with the Apsi file icon." },
   { id: "startMenu", title: "Start menu / app launcher entries", text: "Apsi REPL, examples, documentation and uninstall." },
   { id: "desktopShortcut", title: "Desktop shortcut", text: "A shortcut to the Apsi REPL on your desktop." },
+  { id: "gpuPower", title: "Full GPU speed without administrator rights", needsGPU: true,
+    text: "Installs Apsi's small GPU helper (Windows asks once): training then holds the card near 77 °C by its power limit, at full and steady speed, instead of pausing. 'apsi gpu remove' takes it away." },
 ];
 
 export const PACKAGES = [
