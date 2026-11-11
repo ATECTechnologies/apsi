@@ -55,7 +55,7 @@ SECRET_HINTS = [
     r"Login Data", r"Cookies", r"Local State", r"Web Data", r"key[34]\.db", r"logins\.json",
     r"cookies\.sqlite", r"wallet\.dat", r"[/\\]Exodus", r"[/\\]Electrum", r"keystore", r"MetaMask",
     r"\.gnupg", r"secring", r"/etc/shadow", r"/etc/passwd", r"SAM$", r"NTDS\.dit", r"lsass",
-    r"\.env$", r"Telegram Desktop", r"tdata", r"discord[/\\]Local Storage", r"FileZilla",
+    r"\.env$", r"Telegram Desktop", r"[/\\]tdata\b", r"discord[/\\]Local Storage", r"FileZilla",
 ]
 PERSISTENCE_HINTS = [
     r"Start Menu[/\\]Programs[/\\]Startup", r"CurrentVersion[/\\]Run", r"CurrentVersion\\\\Run",
@@ -257,8 +257,13 @@ def scan_program(prog, src="", file=None):
             continue
         if len(s) < 160 and not any_hint.search(s) and "EICAR" not in s:
             continue                       # one combined search rules out almost every string
+        # prose (a docstring, a long message) is checked only in its path-like words, so a sentence that mentions
+        # "credentials" is not taken for code that reads them
+        text = s
+        if "\n" in s or len(s) >= 160:
+            text = "\n".join(w for w in re.findall(r"[^\s'\"`]+", s) if "/" in w or "\\" in w)
         for pat in SECRET_HINTS:
-            if re.search(pat, s, re.I):
+            if re.search(pat, text, re.I | re.M):
                 reads_secret.append(line)
                 out.append(Finding("high", "credential-access", line,
                                    f"refers to a credential or browser-data location ('{_short(s)}')", file))
@@ -316,7 +321,16 @@ def scan_program(prog, src="", file=None):
             out.append(Finding("critical", "ransomware-pattern", line,
                                "a loop reads files, encrypts them and writes them back", file))
             break
-    return out
+    # one finding per kind and line (a line that names .env four times is one finding)
+    seen = set()
+    unique = []
+    for f in out:
+        key = (f.severity, f.rule, f.line)
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append(f)
+    return unique
 
 
 def _short(s, n=60):
