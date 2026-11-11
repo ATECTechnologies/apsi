@@ -875,6 +875,8 @@ def _parser(light=False):
     _modelio.add_parser(sub)
     from . import ai_server as _ai_server
     _ai_server.add_parser(sub)
+    from . import thermal as _thermal
+    _thermal.add_parser(sub)
     _packages.add_parser(sub)
     from . import apsil as _apsil
     _apsil.add_parser(sub)

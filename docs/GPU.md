@@ -166,6 +166,11 @@ speed falls as far as the cooler needs (on the RTX 3060 in a small case: from 14
 the card is warm). `APSI_GPU_POWER_CONTROL=0` keeps pauses only. Better airflow or a higher fan curve gives the speed
 back in both cases.
 
+**Once per start of the computer: `apsi gpu power 80%`.** Run it once from a terminal opened as administrator (or
+with sudo): the card keeps that limit for every program until the computer or the driver restarts, so Apsi (and
+everything else) runs cooler at almost full speed without administrator rights afterwards. `apsi gpu power default`
+puts it back; `apsi gpu` (or `apsi gpu watch`) shows the temperature, power, limits, clocks, fan and load.
+
 **Cooler without pauses: a lower power limit.** A card at its full power limit runs at its highest clocks and
 voltage, where each extra percent of speed costs several percent of power — that is the heat. `APSI_GPU_POWER=80`
 sets the limit to 80 % of the default while Apsi runs (and puts it back at exit): typically about 5 % slower and

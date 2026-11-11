@@ -93,9 +93,15 @@ class Governor:
             self.fraction = 0.0                         # the power limit holds it: no pauses, steady speed
             self.last_read = now
             return
+        # the rate of change (smoothed): a card heating fast is paced before it passes the target (no overshoot)
+        prev = getattr(self, "prev_temp", None)
+        rate = 0.0 if prev is None else (t - prev) / dt
+        self.rate = 0.7 * getattr(self, "rate", 0.0) + 0.3 * rate
+        self.prev_temp = t
         if self.fraction > 0.0 or err > -1.0:           # cool and not pacing: nothing to wind up
             self.integral = min(0.85, max(0.0, self.integral + 0.012 * err * dt))
-        self.fraction = min(0.85, max(0.0, self.integral + 0.035 * err))
+        lead = 0.4 * max(0.0, self.rate) if err > -5.0 else 0.0
+        self.fraction = min(0.85, max(0.0, self.integral + 0.035 * err + lead))
         self.last_read = now
 
     def tick(self, sync=None):
@@ -357,3 +363,116 @@ def temperature(dev=None):
     if g is None or g is NULL:
         return None
     return g.read_temp()
+
+
+# ---------------------------------------------------------------------------------------------------- apsi gpu
+def _nvml_handles():
+    lib = _load_nvml()
+    if lib is None:
+        return None, []
+    n = ctypes.c_uint()
+    if lib.nvmlDeviceGetCount_v2(ctypes.byref(n)) != 0:
+        return lib, []
+    hs = []
+    for i in range(n.value):
+        h = ctypes.c_void_p()
+        if lib.nvmlDeviceGetHandleByIndex_v2(ctypes.c_uint(i), ctypes.byref(h)) == 0:
+            hs.append((i, h))
+    return lib, hs
+
+
+def gpu_report():
+    """Each card now: name, temperature, power draw and limits, clocks, fan, load."""
+    lib, hs = _nvml_handles()
+    out = []
+    for i, h in hs:
+        name = ctypes.create_string_buffer(96)
+        lib.nvmlDeviceGetName(h, name, 96)
+        u = ctypes.c_uint()
+        lo, hi = ctypes.c_uint(), ctypes.c_uint()
+
+        def get(fn, *a):
+            return u.value if fn(h, *a, ctypes.byref(u)) == 0 else None
+        r = {"index": i, "name": name.value.decode(errors="replace"),
+             "temperature_c": get(lib.nvmlDeviceGetTemperature, 0),
+             "power_w": (lambda v: v and round(v / 1000.0, 1))(get(lib.nvmlDeviceGetPowerUsage)),
+             "power_limit_w": (lambda v: v and round(v / 1000.0, 1))(get(lib.nvmlDeviceGetPowerManagementLimit)),
+             "default_limit_w": (lambda v: v and round(v / 1000.0, 1))(get(lib.nvmlDeviceGetPowerManagementDefaultLimit)),
+             "graphics_mhz": get(lib.nvmlDeviceGetClockInfo, 0), "memory_mhz": get(lib.nvmlDeviceGetClockInfo, 2),
+             "fan_percent": get(lib.nvmlDeviceGetFanSpeed)}
+        if lib.nvmlDeviceGetPowerManagementLimitConstraints(h, ctypes.byref(lo), ctypes.byref(hi)) == 0:
+            r["limit_range_w"] = [round(lo.value / 1000.0), round(hi.value / 1000.0)]
+
+        class Util(ctypes.Structure):
+            _fields_ = [("gpu", ctypes.c_uint), ("memory", ctypes.c_uint)]
+        ut = Util()
+        if lib.nvmlDeviceGetUtilizationRates(h, ctypes.byref(ut)) == 0:
+            r["load_percent"] = ut.gpu
+        out.append(r)
+    return out
+
+
+def set_power(spec, index=None):
+    """Sets the power limit of the card(s) until the next restart of the computer or the driver: '80%' (of the
+    default), '130W', or 'default'. Needs an administrator / root."""
+    lib, hs = _nvml_handles()
+    if lib is None or not hs:
+        return ["no NVIDIA card (or no NVML)"]
+    msgs = []
+    for i, h in hs:
+        if index is not None and i != index:
+            continue
+        dflt, lo, hi = ctypes.c_uint(), ctypes.c_uint(), ctypes.c_uint()
+        if lib.nvmlDeviceGetPowerManagementDefaultLimit(h, ctypes.byref(dflt)) or \
+                lib.nvmlDeviceGetPowerManagementLimitConstraints(h, ctypes.byref(lo), ctypes.byref(hi)):
+            msgs.append(f"GPU {i}: does not report its power limits")
+            continue
+        sp = str(spec).strip().lower()
+        if sp == "default":
+            mw = dflt.value
+        elif sp.endswith("w"):
+            mw = int(float(sp[:-1]) * 1000)
+        else:
+            mw = int(dflt.value * float(sp.rstrip("%")) / 100.0)
+        mw = max(lo.value, min(hi.value, mw))
+        r = lib.nvmlDeviceSetPowerManagementLimit(h, ctypes.c_uint(mw))
+        if r == 0:
+            msgs.append(f"GPU {i}: power limit {mw / 1000:.0f} W (default {dflt.value / 1000:.0f} W) until the next "
+                        "restart")
+        elif r == 4:
+            msgs.append(f"GPU {i}: needs an administrator — open a terminal with 'Run as administrator' (Windows) or "
+                        "use sudo (Linux), run this once; it then holds for every program until the computer restarts")
+        else:
+            msgs.append(f"GPU {i}: the driver refused (NVML error {r})")
+    return msgs
+
+
+def add_parser(sub):
+    p = sub.add_parser("gpu", help="the NVIDIA cards now: temperature, power, clocks; set a power limit")
+    p.add_argument("what", nargs="?", default="status", choices=["status", "power", "watch"])
+    p.add_argument("value", nargs="?", default=None, help="for power: 80%% (of the default), 130W or default")
+    p.add_argument("--gpu", type=int, default=None)
+    p.set_defaults(fn=_cmd)
+
+
+def _cmd(args):
+    if args.what == "power":
+        if not args.value:
+            print("apsi gpu power 80%   (or 130W, or default)")
+            return 2
+        for m in set_power(args.value, args.gpu):
+            print(m)
+        return 0
+    rounds = 10 ** 9 if args.what == "watch" else 1
+    for k in range(rounds):
+        rep = gpu_report()
+        if not rep:
+            print("no NVIDIA card found (or the driver's NVML library is missing)")
+            return 1
+        for r in rep:
+            print(f"GPU {r['index']} {r['name']}: {r['temperature_c']} C, {r['power_w']} W of {r['power_limit_w']} W "
+                  f"(default {r['default_limit_w']} W, range {r.get('limit_range_w')}), {r['graphics_mhz']} MHz, "
+                  f"memory {r['memory_mhz']} MHz, fan {r['fan_percent']} %, load {r.get('load_percent')} %")
+        if k + 1 < rounds:
+            time.sleep(1.0)
+    return 0
