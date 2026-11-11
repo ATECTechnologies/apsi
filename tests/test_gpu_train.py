@@ -76,6 +76,20 @@ class Trainer(unittest.TestCase):
             self.assertLess(r.history[-1], r.history[0] - 0.3, prec)
             self.assertEqual(len(r.val_history), 4)
 
+    def test_fused_attention_trains_like_the_separate_products(self):
+        rng = np.random.default_rng(7)
+        lm = L.transformer_lm(30, d=64, heads=2, layers=1, context=40)            # head size 32: the fused path
+        ids = rng.integers(0, 30, (24, 40))
+        lab = np.roll(ids, -1, 1)
+        runs = []
+        for flash in (True, False):
+            e = GT.Emulator()
+            e.flash = flash
+            runs.append(GT.fit(lm, lm.init(seed=0), ids, lab, loss="cross_entropy", opt=Adam(3e-3), epochs=3,
+                               batch_size=8, verbose=False, ops=e).history)
+        np.testing.assert_allclose(runs[0], runs[1], rtol=2e-2)
+        self.assertLess(runs[0][-1], runs[0][0])
+
     def test_unsupported_layers_say_so(self):
         self.assertIsNone(GT.supports(L.transformer_lm(30, d=16, heads=2, layers=1, context=8)))
         self.assertIn("conv", GT.supports(L.Sequential([L.Conv2D(1, 2)])))
@@ -132,10 +146,11 @@ class RealGpu(unittest.TestCase):
         X, Gm, Bt, Y2 = pair(rng.normal(size=(M, N))), pair(rng.normal(size=N)), pair(rng.normal(size=N)), pair(np.zeros(M * N))
         mean, rstd, dX = pair(np.zeros(M)), pair(np.zeros(M)), pair(np.zeros(M * N))
         dG, dB = pair(np.zeros(N)), pair(np.zeros(N))
+        res = pair(rng.normal(size=(M, N)))
         for rms in (False, True):
             for dv, i in ((g, 0), (e, 1)):
                 dv.ln_f(X[i], Gm[i], Bt[i], Y2[i], mean[i], rstd[i], M, N, 1e-5, rms)
-                dv.ln_b(X[i], Gm[i], Y2[i], mean[i], rstd[i], dX[i], M, N, rms)
+                dv.ln_b(X[i], Gm[i], Y2[i], mean[i], rstd[i], dX[i], M, N, rms, res[i] if rms else None)
                 dv.colsum(Y2[i], X[i], mean[i], rstd[i], dG[i], dB[i], M, N, 2 if rms else 1)
             for v, nn, w in ((Y2, M * N, "ln_f"), (dX, M * N, "ln_b"), (dG, N, "colsum g"), (dB, N, "colsum b")):
                 same(v[0], v[1], nn, 1e-4, f"{w} rms={rms}")
@@ -195,6 +210,19 @@ class RealGpu(unittest.TestCase):
                 check(4, 4, 4, ta, tb)
                 check(384, 1536, 4096, ta, tb, beta=True)          # split k
                 check(256, 384, 2048, ta, tb)                      # split k into a cleared C
+        # the last step fused in: activation (and its pre-activation kept), its derivative, a residual
+        M, N, K = 256, 384, 128
+        A, Bm = pair(rng.normal(size=(M, K))), pair(rng.normal(size=(K, N)))
+        X2, Cc = pair(rng.normal(size=(M, N))), pair(np.zeros((M, N)))
+        bias = pair(rng.normal(size=N))
+        for epi in (1, 2, 3):
+            for act in (0, 1, 2):
+                for dv, i in ((g, 0), (e, 1)):
+                    dv.gemm(A[i], Bm[i], Cc[i], M, N, K, K, 1, N, 1, N, bias=bias[i], epi=epi, X2=X2[i], act=act)
+                for view, what in ((Cc, "C"), (X2, "X2")):
+                    a, b_ = g.get(view[0][0], M * N), e.get(view[1][0], M * N)
+                    err = np.abs(a - b_).max() / (np.abs(b_).max() + 1e-9)
+                    self.assertLess(err, 3e-3, (epi, act, what, err))
         # attention heads: batched, offsets inside the rows
         Bh, T, hd, H = 2, 128, 64, 3
         D = H * hd
@@ -204,6 +232,33 @@ class RealGpu(unittest.TestCase):
                     sb=(T * D, hd), sc=(H * T * T, T * T))
         a, b_ = g.get(S[0][0], Bh * H * T * T), e.get(S[1][0], Bh * H * T * T)
         self.assertLess(np.abs(a - b_).max() / np.abs(b_).max(), 2e-3)
+
+    def test_fused_attention(self):
+        g, e = self.g, GT.Emulator(tc=True)
+        if not g.flash:
+            self.skipTest(f"no fused attention here: {g.tc_why}")
+        rng = np.random.default_rng(8)
+        for (B, T, H, hd, causal) in ((2, 128, 3, 64, True), (1, 100, 2, 32, False), (2, 64, 6, 64, False),
+                                      (1, 200, 1, 64, True)):
+            n = B * T * H * hd
+            views = {}
+            for name in ("q", "k", "v", "do"):
+                a = rng.normal(size=n).astype(np.float32)
+                views[name] = [(g.alloc(n), 0), (e.alloc(n), 0)]
+                g.put(views[name][0][0], a)
+                e.put(views[name][1][0], a)
+            for name, size in (("o", n), ("L", B * H * T), ("dd", B * H * T), ("dq", n), ("dk", n), ("dv", n)):
+                views[name] = [(g.alloc(size), 0), (e.alloc(size), 0)]
+            for i, dv_ in ((0, g), (1, e)):
+                V = {k_: v_[i] for k_, v_ in views.items()}
+                dv_.flash_fwd(V["q"], V["k"], V["v"], V["o"], V["L"], B, T, H, hd, causal, 0.125)
+                dv_.flash_dot(V["do"], V["o"], V["dd"], B, T, H, hd)
+                dv_.flash_bwd(V["q"], V["k"], V["v"], V["do"], V["L"], V["dd"], V["dq"], V["dk"], V["dv"], B, T, H,
+                              hd, causal, 0.125)
+            for name, size in (("o", n), ("L", B * H * T), ("dq", n), ("dk", n), ("dv", n)):
+                a, b_ = g.get(views[name][0][0], size), e.get(views[name][1][0], size)
+                err = np.abs(a - b_).max() / (np.abs(b_).max() + 1e-9)
+                self.assertLess(err, 2e-2, (name, B, T, H, hd, causal, err))
 
     def test_training_on_the_card_matches_the_emulator(self):
         rng = np.random.default_rng(3)

@@ -297,7 +297,7 @@ def _main_module():
     k.ret()
 
     k = K("ln_b", [("X", G(f32)), ("G", G(f32)), ("DY", G(f32)), ("MEAN", G(f32)), ("RSTD", G(f32)), ("DX", G(f32)),
-                   ("M", i32), ("N", i32), ("rms", i32)])
+                   ("M", i32), ("N", i32), ("rms", i32), ("RES", G(f32)), ("has_res", i32)])
     b, p = k.b, k.p
     base = b.mul(i64of(b, k.cta), i64of(b, p["N"]))
     isrms = b.icmp_unsigned("!=", p["rms"], C(0))
@@ -320,7 +320,11 @@ def _main_module():
         idx = b.add(base, i64of(b, i))
         gdy = b.fmul(k.ld(p["DY"], idx), k.ld(p["G"], i))
         xh = b.fmul(b.fsub(k.ld(p["X"], idx), mean), rstd)
-        k.st(b.fmul(rstd, b.fsub(b.fsub(gdy, m1), b.fmul(xh, m2))), p["DX"], idx)
+        v = b.fmul(rstd, b.fsub(b.fsub(gdy, m1), b.fmul(xh, m2)))
+        out = k.var(v)
+        with b.if_then(b.icmp_unsigned("!=", p["has_res"], C(0))):    # + the skip connection's gradient
+            b.store(b.fadd(v, k.ld(p["RES"], idx)), out)
+        k.st(b.load(out), p["DX"], idx)
     k.loop(k.tid, p["N"], C(256), dx)
     k.ret()
 
@@ -777,6 +781,33 @@ def _tc_module():
     return _emit(m, "sm_80")
 
 
+def _act_ir(b, x, kind, F, C, ex2_f):
+    """f(x) and f'(x) of the activation numbered `kind` (ACTS), selected at run time."""
+    def exp(v):
+        return b.call(ex2_f, [b.fmul(v, F(LOG2E))])
+
+    def tanh(v):
+        return b.fsub(F(1.0), b.fdiv(F(2.0), b.fadd(exp(b.fmul(F(2.0), v)), F(1.0))))
+    pos = b.fcmp_ordered(">", x, F(0.0))
+    relu, drelu = b.select(pos, x, F(0.0)), b.select(pos, F(1.0), F(0.0))
+    c = 0.7978845608028654
+    t = tanh(b.fmul(F(c), b.fadd(x, b.fmul(F(0.044715), b.fmul(x, b.fmul(x, x))))))
+    gelu = b.fmul(b.fmul(F(0.5), x), b.fadd(F(1.0), t))
+    dgelu = b.fadd(b.fmul(F(0.5), b.fadd(F(1.0), t)),
+                   b.fmul(b.fmul(b.fmul(F(0.5), x), b.fsub(F(1.0), b.fmul(t, t))),
+                          b.fmul(F(c), b.fadd(F(1.0), b.fmul(F(3 * 0.044715), b.fmul(x, x))))))
+    sg = b.fdiv(F(1.0), b.fadd(F(1.0), exp(b.fsub(F(0.0), x))))
+    th = tanh(x)
+    vals = [(relu, drelu), (gelu, dgelu), (b.fmul(x, sg), b.fadd(sg, b.fmul(x, b.fmul(sg, b.fsub(F(1.0), sg))))),
+            (th, b.fsub(F(1.0), b.fmul(th, th))), (sg, b.fmul(sg, b.fsub(F(1.0), sg))), (x, F(1.0)),
+            (b.select(pos, x, b.fmul(F(0.01), x)), b.select(pos, F(1.0), F(0.01)))]
+    f, d = vals[-1]
+    for j in range(len(vals) - 2, -1, -1):
+        sel = b.icmp_unsigned("==", kind, C(j))
+        f, d = b.select(sel, vals[j][0], f), b.select(sel, vals[j][1], d)
+    return f, d
+
+
 BM = BN = 128
 BK = 32
 PAD = 40                        # halves per shared-memory row: 80 bytes, so ldmatrix's 8 rows hit 8 different banks
@@ -821,10 +852,13 @@ def _tiled_module():
                         side_effect=True)
     red = ir.InlineAsm(ir.FunctionType(ir.VoidType(), [i64, f32]), "red.global.add.f32 [$0], $1;", "l,f",
                        side_effect=True)
+    ex2_f = d("llvm.nvvm.ex2.approx.f", f32, [f32])
     args = [("A", G(f32)), ("B", G(f32)), ("C", G(f32)), ("BIAS", G(f32)), ("M", i32), ("N", i32), ("K", i32),
             ("sam", i32), ("sak", i32), ("sbk", i32), ("sbn", i32), ("ldc", i32), ("nb2", i32), ("a1", i32),
             ("a2", i32), ("b1", i32), ("b2", i32), ("c1", i32), ("c2", i32), ("alpha", f32), ("beta", i32),
-            ("has_bias", i32), ("kchunk", i32)]
+            ("has_bias", i32), ("kchunk", i32), ("X2", G(f32)), ("epi", i32), ("act", i32)]
+    # epi (after alpha, bias and beta): 1 = X2 <- v, C <- act(v) (a linear layer and its activation in one pass);
+    # 2 = C <- v * act'(X2) (the backward pass through that activation); 3 = C <- v + X2 (a residual connection)
 
     def kernel(name, a_kc, b_kc):
         fn = ir.Function(m, ir.FunctionType(ir.VoidType(), [t for _, t in args]), name=name)
@@ -1013,6 +1047,18 @@ def _tiled_module():
                             with other:
                                 with b.if_then(b.icmp_unsigned("!=", p["beta"], C(0))):
                                     b.store(b.fadd(b.load(tmp), b.load(ptr, align=4)), tmp)
+                                with b.if_then(b.icmp_unsigned("!=", p["epi"], C(0))):
+                                    xp = b.gep(p["X2"], [idx], inbounds=True)
+                                    vv = b.load(tmp)
+                                    epi = p["epi"]
+                                    with b.if_then(b.icmp_unsigned("==", epi, C(1))):
+                                        b.store(vv, xp, align=4)
+                                    xin = b.select(b.icmp_unsigned("==", epi, C(1)), vv, b.load(xp, align=4))
+                                    fv, dv = _act_ir(b, xin, p["act"], F, C, ex2_f)
+                                    out = b.select(b.icmp_unsigned("==", epi, C(1)), fv,
+                                                   b.select(b.icmp_unsigned("==", epi, C(2)), b.fmul(vv, dv),
+                                                            b.fadd(vv, xin)))
+                                    b.store(out, tmp)
                                 b.store(b.load(tmp), ptr, align=4)
         b.ret_void()
         ab.branch(top)
@@ -1020,6 +1066,369 @@ def _tiled_module():
     kernel("apsi_kernel", True, False)            # = gemm_tkn: x @ W
     for name, a_kc, b_kc in (("gemm_tkk", True, True), ("gemm_tmn", False, False), ("gemm_tmk", False, True)):
         kernel(name, a_kc, b_kc)
+    return _emit(m, "sm_80")
+
+
+FLASH_HD = (32, 64)               # head sizes the fused attention takes (others: the separate products)
+BQ = 64                          # queries (forward) or keys (backward) per block of 4 warps
+
+
+def _flash_module():
+    """Attention fused into one kernel each way (the FlashAttention-2 idea, written for Apsi): scores, the softmax
+    and the weighted sum stay in registers and shared memory, so the T x T matrices are never written to memory.
+
+    Forward, per block of 64 queries of one (batch, head): Q in shared memory; for each tile of 64 keys, S = Q K^T
+    on the tensor cores, a running (online) softmax per row, O += P V with P taken straight from the registers that
+    hold S. It writes O and, per row, L = log2 of the softmax denominator (with the row's maximum folded in).
+    Backward, per block of 64 keys: for each tile of 64 queries it recomputes P from Q, K and L, then dV += P^T dO,
+    dP = dO V^T, dS = P (dP - D), dK += dS^T Q, and dQ += dS K added atomically (several key tiles add to one dQ).
+    D (one number per row: the dot product of dO and O) comes from attn_dot. Inputs and outputs are float32 in the
+    trainer's [batch, time, heads x head_size] layout; the products run in bfloat16 with float32 sums."""
+    ir, m = _setup("apsi_train_flash")
+    g = _Gen(ir, m)
+    i16, i32, i64, f32, C, F, G = ir.IntType(16), g.i32, g.i64, g.f32, g.C, g.F, g.G
+    d = g.decl
+    bar_f = d("llvm.nvvm.barrier0", ir.VoidType(), [])
+    shfl_f = d("llvm.nvvm.shfl.sync.bfly.f32", f32, [i32, f32, i32, i32])
+    ex2_f = d("llvm.nvvm.ex2.approx.f", f32, [f32])
+    lg2_f = d("llvm.nvvm.lg2.approx.f", f32, [f32])
+    max_f = d("llvm.maxnum.f32", f32, [f32, f32])
+    mma = ir.InlineAsm(ir.FunctionType(ir.LiteralStructType([f32] * 4), [i32] * 6 + [f32] * 4),
+                       "mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {$0,$1,$2,$3}, {$4,$5,$6,$7}, "
+                       "{$8,$9}, {$10,$11,$12,$13};", "=f,=f,=f,=f,r,r,r,r,r,r,f,f,f,f", side_effect=False)
+    ldm = ir.InlineAsm(ir.FunctionType(ir.LiteralStructType([i32] * 4), [i64]),
+                       "ldmatrix.sync.aligned.m8n8.x4.shared.b16 {$0,$1,$2,$3}, [$4];", "=r,=r,=r,=r,l", side_effect=True)
+    ldmt = ir.InlineAsm(ir.FunctionType(ir.LiteralStructType([i32] * 4), [i64]),
+                        "ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {$0,$1,$2,$3}, [$4];", "=r,=r,=r,=r,l",
+                        side_effect=True)
+    red = ir.InlineAsm(ir.FunctionType(ir.VoidType(), [i64, f32]), "red.global.add.f32 [$0], $1;", "l,f",
+                       side_effect=True)
+    NEG = -1.0e30
+
+    def build(name, hd, backward):
+        SP = hd + 8
+        TILE = BQ * SP
+        ntile = 5 if backward else 3
+        sm = ir.GlobalVariable(m, ir.ArrayType(i16, ntile * TILE), f"{name}_s", addrspace=3)
+        sm.linkage = "internal"
+        sm.align = 16
+        sm.initializer = ir.Constant(ir.ArrayType(i16, ntile * TILE), None)
+        smf = ir.GlobalVariable(m, ir.ArrayType(f32, 2 * BQ), f"{name}_f", addrspace=3)
+        smf.linkage = "internal"
+        smf.align = 16
+        smf.initializer = ir.Constant(ir.ArrayType(f32, 2 * BQ), None)
+        if backward:
+            args = [("Q", G(f32)), ("K", G(f32)), ("V", G(f32)), ("DO", G(f32)), ("L", G(f32)), ("DD", G(f32)),
+                    ("DQ", G(f32)), ("DK", G(f32)), ("DV", G(f32)), ("T", i32), ("D", i32), ("H", i32),
+                    ("scale", f32), ("scale2", f32), ("causal", i32)]
+        else:
+            args = [("Q", G(f32)), ("K", G(f32)), ("V", G(f32)), ("O", G(f32)), ("L", G(f32)), ("T", i32), ("D", i32),
+                    ("H", i32), ("scale2", f32), ("causal", i32)]
+        fn = ir.Function(m, ir.FunctionType(ir.VoidType(), [t for _, t in args]), name=name)
+        fn.calling_convention = "ptx_kernel"
+        p = {n: a for (n, _), a in zip(args, fn.args)}
+        allocas = fn.append_basic_block("allocas")
+        top = fn.append_basic_block("top")
+        ab = ir.IRBuilder(allocas)
+        b = ir.IRBuilder(top)
+
+        def var(init):
+            v = ab.alloca(init.type)
+            b.store(init, v)
+            return v
+
+        def z64(x):
+            return b.zext(x, i64)
+
+        def umin(x, y):
+            return b.select(b.icmp_unsigned("<", x, y), x, y)
+
+        def rne(x):
+            u = b.bitcast(x, i32)
+            return b.lshr(b.add(b.add(u, C(0x7FFF)), b.and_(b.lshr(u, C(16)), C(1))), C(16))
+
+        def pack(x0, x1):
+            return b.or_(rne(x0), b.shl(rne(x1), C(16)))
+
+        def shp(tile, row, col):
+            return b.gep(sm, [C(0), b.add(C(tile * TILE), b.add(b.mul(row, C(SP)), col))], inbounds=True)
+
+        def fp(i):
+            return b.gep(smf, [C(0), i], inbounds=True)
+
+        def quad(v, op):
+            for k in (1, 2):
+                o = b.call(shfl_f, [C(-1), v, C(k), C(31)])
+                v = b.call(max_f, [v, o]) if op == "max" else b.fadd(v, o)
+            return v
+
+        tid, cta, z = b.call(g.tid_f, []), b.call(g.ctax_f, []), b.call(g.ctay_f, [])
+        lane, w = b.and_(tid, C(31)), b.lshr(tid, C(5))
+        gq, tig = b.lshr(lane, C(2)), b.and_(lane, C(3))
+        l7, l8, l16 = b.and_(lane, C(7)), b.and_(b.lshr(lane, C(3)), C(1)), b.lshr(lane, C(4))
+        T, D = p["T"], p["D"]
+        base = b.add(b.mul(z64(b.udiv(z, p["H"])), b.mul(z64(T), z64(D))), z64(b.mul(b.urem(z, p["H"]), C(hd))))
+        causal = b.icmp_unsigned("!=", p["causal"], C(0))
+
+        def load_tile(tile, src, row0):
+            """64 rows x hd float32 of one head -> bfloat16 in shared memory (zeros past T)."""
+            per = hd // 4
+            for i in range(BQ * per // 128):
+                idx = b.add(tid, C(128 * i))
+                row, c4 = b.udiv(idx, C(per)), b.mul(b.urem(idx, C(per)), C(4))
+                r = b.add(row0, row)
+                ok = b.icmp_unsigned("<", r, T)
+                gi = b.add(base, b.add(b.mul(z64(umin(r, b.sub(T, C(1)))), z64(D)), z64(c4)))
+                vec = b.load(b.bitcast(b.gep(src, [gi], inbounds=True), ir.VectorType(f32, 4).as_pointer(1)), align=16)
+                hs = [rne(b.select(ok, b.extract_element(vec, C(j)), F(0.0))) for j in range(4)]
+                v2 = ir.Constant(ir.VectorType(i32, 2), None)
+                v2 = b.insert_element(v2, b.or_(hs[0], b.shl(hs[1], C(16))), C(0))
+                v2 = b.insert_element(v2, b.or_(hs[2], b.shl(hs[3], C(16))), C(1))
+                b.store(v2, b.bitcast(shp(tile, row, c4), ir.VectorType(i32, 2).as_pointer(3)), align=8)
+
+        def frag_rows(tile, row0, ks):
+            """A fragment (16 rows x 16 of k) from a [row][k] tile."""
+            a = b.ptrtoint(shp(tile, b.add(row0, b.and_(lane, C(15))), b.add(C(ks * 16), b.mul(l16, C(8)))), i64)
+            r = b.call(ldm, [a])
+            return [b.extract_value(r, j) for j in range(4)]
+
+        def frag_rows_t(tile, col0, kk):
+            """A fragment (16 rows x 16 of k) from a [k][row] tile (transposed while loading)."""
+            a = b.ptrtoint(shp(tile, b.add(C(kk * 16), b.add(l7, b.mul(l16, C(8)))), b.add(col0, b.mul(l8, C(8)))), i64)
+            r = b.call(ldmt, [a])
+            return [b.extract_value(r, j) for j in range(4)]
+
+        def bfrag_nk(tile, n0, ks):
+            """B fragments of two 8-wide n tiles from an [n][k] tile."""
+            a = b.ptrtoint(shp(tile, b.add(n0, b.add(l7, b.mul(l16, C(8)))), b.add(C(ks * 16), b.mul(l8, C(8)))), i64)
+            r = b.call(ldm, [a])
+            q = [b.extract_value(r, j) for j in range(4)]
+            return [q[0], q[1]], [q[2], q[3]]
+
+        def bfrag_kn(tile, n0, kk):
+            """B fragments of two 8-wide n tiles from a [k][n] tile (transposed while loading)."""
+            a = b.ptrtoint(shp(tile, b.add(C(kk * 16), b.add(l7, b.mul(l8, C(8)))), b.add(n0, b.mul(l16, C(8)))), i64)
+            r = b.call(ldmt, [a])
+            q = [b.extract_value(r, j) for j in range(4)]
+            return [q[0], q[1]], [q[2], q[3]]
+
+        def mma_acc(acc_vars, a, bb):
+            r = b.call(mma, a + bb + [b.load(v) for v in acc_vars])
+            for c in range(4):
+                b.store(b.extract_value(r, c), acc_vars[c])
+
+        def scores(a_frags, tile_nk):
+            """16 x 64 scores: A (16 x hd, in registers) times the [n][k] tile's rows."""
+            s = [[var(F(0.0)) for _ in range(4)] for _ in range(8)]
+            for ks in range(hd // 16):
+                for np_ in range(4):
+                    b0, b1 = bfrag_nk(tile_nk, C(np_ * 16), ks)
+                    mma_acc(s[2 * np_], a_frags[ks], b0)
+                    mma_acc(s[2 * np_ + 1], a_frags[ks], b1)
+            return [[b.load(v) for v in row] for row in s]
+
+        def a_from_c(vals, kk):
+            """The registers of a 16 x 64 result, as the A fragment of k step kk (16 of the 64)."""
+            x, y = vals[2 * kk], vals[2 * kk + 1]
+            return [pack(x[0], x[1]), pack(x[2], x[3]), pack(y[0], y[1]), pack(y[2], y[3])]
+
+        def loop(lo, hi, body):
+            iv = var(lo)
+            head = fn.append_basic_block("head")
+            bod = fn.append_basic_block("body")
+            end = fn.append_basic_block("end")
+            b.branch(head)
+            b.position_at_end(head)
+            i = b.load(iv)
+            b.cbranch(b.icmp_unsigned("<", i, hi), bod, end)
+            b.position_at_end(bod)
+            body(i)
+            b.store(b.add(b.load(iv), C(1)), iv)
+            b.branch(head)
+            b.position_at_end(end)
+
+        ntiles = b.udiv(b.add(T, C(BQ - 1)), C(BQ))
+        if not backward:
+            sQ, sK, sV = 0, 1, 2
+            q0 = b.mul(cta, C(BQ))
+            load_tile(sQ, p["Q"], q0)
+            b.call(bar_f, [])
+            qa = [frag_rows(sQ, b.mul(w, C(16)), ks) for ks in range(hd // 16)]
+            mrow = [var(F(NEG)), var(F(NEG))]
+            lrow = [var(F(0.0)), var(F(0.0))]
+            o = [[var(F(0.0)) for _ in range(4)] for _ in range(hd // 8)]
+            last = b.select(causal, umin(b.add(cta, C(1)), ntiles), ntiles)
+
+            def kv_tile(j):
+                b.call(bar_f, [])
+                k0 = b.mul(j, C(BQ))
+                load_tile(sK, p["K"], k0)
+                load_tile(sV, p["V"], k0)
+                b.call(bar_f, [])
+                s = scores(qa, sK)
+                for nt in range(8):
+                    for c in range(4):
+                        key = b.add(k0, C(nt * 8 + (c & 1)))
+                        key = b.add(key, b.mul(tig, C(2)))
+                        qrow = b.add(b.add(q0, b.mul(w, C(16))), b.add(gq, C((c >> 1) * 8)))
+                        bad = b.or_(b.icmp_unsigned(">=", key, T), b.and_(causal, b.icmp_unsigned(">", key, qrow)))
+                        s[nt][c] = b.select(bad, F(NEG), b.fmul(s[nt][c], p["scale2"]))
+                for r in range(2):
+                    mx = F(NEG)
+                    for nt in range(8):
+                        for c in (2 * r, 2 * r + 1):
+                            mx = b.call(max_f, [mx, s[nt][c]])
+                    mx = quad(mx, "max")
+                    mold = b.load(mrow[r])
+                    mnew = b.call(max_f, [mold, mx])
+                    corr = b.call(ex2_f, [b.fsub(mold, mnew)])
+                    tot = F(0.0)
+                    for nt in range(8):
+                        for c in (2 * r, 2 * r + 1):
+                            s[nt][c] = b.call(ex2_f, [b.fsub(s[nt][c], mnew)])
+                            tot = b.fadd(tot, s[nt][c])
+                    b.store(b.fadd(b.fmul(b.load(lrow[r]), corr), tot), lrow[r])
+                    b.store(mnew, mrow[r])
+                    for nt in range(hd // 8):
+                        for c in (2 * r, 2 * r + 1):
+                            b.store(b.fmul(b.load(o[nt][c]), corr), o[nt][c])
+                for kk in range(4):
+                    a = a_from_c(s, kk)
+                    for pr in range(hd // 16):
+                        b0, b1 = bfrag_kn(sV, C(pr * 16), kk)
+                        mma_acc(o[2 * pr], a, b0)
+                        mma_acc(o[2 * pr + 1], a, b1)
+            loop(C(0), last, kv_tile)
+            for r in range(2):
+                lt = quad(b.load(lrow[r]), "sum")
+                inv = b.fdiv(F(1.0), lt)
+                row = b.add(b.add(q0, b.mul(w, C(16))), b.add(gq, C(r * 8)))
+                with b.if_then(b.icmp_unsigned("<", row, T)):
+                    for nt in range(hd // 8):
+                        for c in (2 * r, 2 * r + 1):
+                            col = b.add(C(nt * 8 + (c & 1)), b.mul(tig, C(2)))
+                            gi = b.add(base, b.add(b.mul(z64(row), z64(D)), z64(col)))
+                            b.store(b.fmul(b.load(o[nt][c]), inv), b.gep(p["O"], [gi], inbounds=True), align=4)
+                    with b.if_then(b.icmp_unsigned("==", tig, C(0))):
+                        li = b.add(b.mul(z64(z), z64(T)), z64(row))
+                        b.store(b.fadd(b.load(mrow[r]), b.call(lg2_f, [lt])), b.gep(p["L"], [li], inbounds=True),
+                                align=4)
+        else:
+            sK, sV, sQ, sO, sS = 0, 1, 2, 3, 4
+            k0 = b.mul(cta, C(BQ))
+            load_tile(sK, p["K"], k0)
+            load_tile(sV, p["V"], k0)
+            b.call(bar_f, [])
+            ka = [frag_rows(sK, b.mul(w, C(16)), ks) for ks in range(hd // 16)]
+            va = [frag_rows(sV, b.mul(w, C(16)), ks) for ks in range(hd // 16)]
+            dv = [[var(F(0.0)) for _ in range(4)] for _ in range(hd // 8)]
+            dk = [[var(F(0.0)) for _ in range(4)] for _ in range(hd // 8)]
+            first = b.select(causal, cta, C(0))
+
+            def q_tile(i):
+                b.call(bar_f, [])
+                q0 = b.mul(i, C(BQ))
+                load_tile(sQ, p["Q"], q0)
+                load_tile(sO, p["DO"], q0)
+                with b.if_then(b.icmp_unsigned("<", tid, C(BQ))):
+                    r = b.add(q0, tid)
+                    ok = b.icmp_unsigned("<", r, T)
+                    li = b.add(b.mul(z64(z), z64(T)), z64(umin(r, b.sub(T, C(1)))))
+                    b.store(b.select(ok, b.load(b.gep(p["L"], [li], inbounds=True), align=4), F(0.0)), fp(tid))
+                    b.store(b.select(ok, b.load(b.gep(p["DD"], [li], inbounds=True), align=4), F(0.0)),
+                            fp(b.add(tid, C(BQ))))
+                b.call(bar_f, [])
+                s = scores(ka, sQ)                     # S^T: 16 keys x 64 queries
+                dp = scores(va, sO)                    # dP^T = V dO^T
+                pt = [[None] * 4 for _ in range(8)]
+                ds = [[None] * 4 for _ in range(8)]
+                for nt in range(8):
+                    for c in range(4):
+                        ql = b.add(C(nt * 8 + (c & 1)), b.mul(tig, C(2)))
+                        qg = b.add(q0, ql)
+                        key = b.add(b.add(k0, b.mul(w, C(16))), b.add(gq, C((c >> 1) * 8)))
+                        bad = b.or_(b.icmp_unsigned(">=", qg, T), b.and_(causal, b.icmp_unsigned(">", key, qg)))
+                        pv = b.call(ex2_f, [b.fsub(b.fmul(s[nt][c], p["scale2"]), b.load(fp(ql)))])
+                        pv = b.select(bad, F(0.0), pv)
+                        pt[nt][c] = pv
+                        ds[nt][c] = b.fmul(pv, b.fsub(dp[nt][c], b.load(fp(b.add(ql, C(BQ))))))
+                for kk in range(4):
+                    a_p, a_s = a_from_c(pt, kk), a_from_c(ds, kk)
+                    for pr in range(hd // 16):
+                        b0, b1 = bfrag_kn(sO, C(pr * 16), kk)
+                        mma_acc(dv[2 * pr], a_p, b0)
+                        mma_acc(dv[2 * pr + 1], a_p, b1)
+                        b0, b1 = bfrag_kn(sQ, C(pr * 16), kk)
+                        mma_acc(dk[2 * pr], a_s, b0)
+                        mma_acc(dk[2 * pr + 1], a_s, b1)
+                for nt in range(8):                    # dS^T to shared memory: [key][query] in bfloat16
+                    for r in range(2):
+                        kl = b.add(b.mul(w, C(16)), b.add(gq, C(r * 8)))
+                        ql = b.add(C(nt * 8), b.mul(tig, C(2)))
+                        b.store(pack(ds[nt][2 * r], ds[nt][2 * r + 1]),
+                                b.bitcast(shp(sS, kl, ql), i32.as_pointer(3)), align=4)
+                b.call(bar_f, [])
+                dq = [[var(F(0.0)) for _ in range(4)] for _ in range(hd // 8)]
+                for kk in range(4):                    # dQ (this warp's 16 queries) = dS K over the 64 keys
+                    a = frag_rows_t(sS, b.mul(w, C(16)), kk)
+                    for pr in range(hd // 16):
+                        b0, b1 = bfrag_kn(sK, C(pr * 16), kk)
+                        mma_acc(dq[2 * pr], a, b0)
+                        mma_acc(dq[2 * pr + 1], a, b1)
+                for nt in range(hd // 8):
+                    for c in range(4):
+                        row = b.add(b.add(q0, b.mul(w, C(16))), b.add(gq, C((c >> 1) * 8)))
+                        col = b.add(C(nt * 8 + (c & 1)), b.mul(tig, C(2)))
+                        with b.if_then(b.icmp_unsigned("<", row, T)):
+                            gi = b.add(base, b.add(b.mul(z64(row), z64(D)), z64(col)))
+                            b.call(red, [b.ptrtoint(b.gep(p["DQ"], [gi], inbounds=True), i64),
+                                         b.fmul(b.load(dq[nt][c]), p["scale"])])
+            loop(first, ntiles, q_tile)
+            for nt in range(hd // 8):
+                for c in range(4):
+                    row = b.add(b.add(k0, b.mul(w, C(16))), b.add(gq, C((c >> 1) * 8)))
+                    col = b.add(C(nt * 8 + (c & 1)), b.mul(tig, C(2)))
+                    with b.if_then(b.icmp_unsigned("<", row, T)):
+                        gi = b.add(base, b.add(b.mul(z64(row), z64(D)), z64(col)))
+                        b.store(b.fmul(b.load(dk[nt][c]), p["scale"]), b.gep(p["DK"], [gi], inbounds=True), align=4)
+                        b.store(b.load(dv[nt][c]), b.gep(p["DV"], [gi], inbounds=True), align=4)
+        b.ret_void()
+        ab.branch(top)
+
+    # D[z, t] = sum over the head of dO * O, one thread a row
+    fn = ir.Function(m, ir.FunctionType(ir.VoidType(), [G(f32), G(f32), G(f32), i32, i32, i32, i32, i32]),
+                     name="apsi_kernel")
+    fn.calling_convention = "ptx_kernel"
+    DO_, O_, DD_, T_, D_, H_, hd_, rows_ = fn.args
+    b = ir.IRBuilder(fn.append_basic_block("e"))
+    accv = b.alloca(f32)
+    jv = b.alloca(i32)
+    i = b.add(b.mul(b.call(g.ctax_f, []), C(128)), b.call(g.tid_f, []))
+    with b.if_then(b.icmp_unsigned("<", i, rows_)):
+        zz, t = b.udiv(i, T_), b.urem(i, T_)
+        bs = b.add(b.mul(b.zext(b.udiv(zz, H_), i64), b.mul(b.zext(T_, i64), b.zext(D_, i64))),
+                   b.zext(b.add(b.mul(b.urem(zz, H_), hd_), b.mul(t, D_)), i64))
+        b.store(F(0.0), accv)
+        b.store(C(0), jv)
+        head = fn.append_basic_block("h")
+        bod = fn.append_basic_block("b")
+        end = fn.append_basic_block("x")
+        b.branch(head)
+        b.position_at_end(head)
+        j = b.load(jv)
+        b.cbranch(b.icmp_unsigned("<", j, hd_), bod, end)
+        b.position_at_end(bod)
+        gi = b.add(bs, b.zext(j, i64))
+        b.store(b.fadd(b.load(accv), b.fmul(b.load(b.gep(DO_, [gi], inbounds=True), align=4),
+                                             b.load(b.gep(O_, [gi], inbounds=True), align=4))), accv)
+        b.store(b.add(j, C(1)), jv)
+        b.branch(head)
+        b.position_at_end(end)
+        b.store(b.load(accv), b.gep(DD_, [b.zext(i, i64)], inbounds=True), align=4)
+    b.ret_void()
+    for hd in FLASH_HD:
+        build(f"flash_f{hd}", hd, False)
+        build(f"flash_b{hd}", hd, True)
     return _emit(m, "sm_80")
 
 
@@ -1046,7 +1455,7 @@ def ptx(which):
                 return text
     except (OSError, ImportError):
         pass
-    text = {"main": _main_module, "tc": _tc_module, "tiled": _tiled_module}[which]()
+    text = {"main": _main_module, "tc": _tc_module, "tiled": _tiled_module, "flash": _flash_module}[which]()
     if path:
         try:
             os.makedirs(os.path.dirname(path), exist_ok=True)

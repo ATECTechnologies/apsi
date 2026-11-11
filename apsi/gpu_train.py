@@ -48,9 +48,26 @@ class _Ops:
     tc = False
 
     def gemm(self, A, B, Cv, M, N, K, sam, sak, sbk, sbn, ldc, alpha=1.0, beta=False, bias=None, batch=(1, 1),
-             sa=(0, 0), sb=(0, 0), sc=(0, 0), passes=1):
+             sa=(0, 0), sb=(0, 0), sc=(0, 0), passes=1, epi=0, X2=None, act=0):
+        """C = alpha A B (+ bias) (+ C), then epi: 1 X2 <- C, C <- act(C); 2 C <- C * act'(X2); 3 C <- C + X2.
+        A kernel that can do epi in its last step does (one pass over C); otherwise a second kernel does it."""
         nb1, nb2 = batch
-        self._gemm(A, B, Cv, bias, M, N, K, sam, sak, sbk, sbn, ldc, nb1, nb2, sa, sb, sc, alpha, beta, passes)
+        args = (A, B, Cv, bias, M, N, K, sam, sak, sbk, sbn, ldc, nb1, nb2, sa, sb, sc, alpha, beta, passes)
+        if not epi:
+            self._gemm(*args)
+            return
+        if self._gemm(*args, epi=epi, X2=X2, act=act):
+            return
+        n = M * N
+        if epi == 1:
+            self._gemm(A, B, X2, *args[3:])
+            self.act_f(X2, Cv, n, act)
+        elif epi == 2:
+            self._gemm(*args)
+            self.act_b(X2, Cv, Cv, n, act)
+        else:
+            self._gemm(*args)
+            self.axpy(Cv, X2, n)
 
 
 def _bf16(x):
@@ -151,7 +168,7 @@ class Emulator(_Ops):
         self.v(MEAN, M)[:] = mu[:, 0]
         self.v(RSTD, M)[:] = r[:, 0]
 
-    def ln_b(self, X, Gm, DY, MEAN, RSTD, DX, M, N, rms):
+    def ln_b(self, X, Gm, DY, MEAN, RSTD, DX, M, N, rms, RES=None):
         x = self.v(X, M * N).reshape(M, N)
         mu = 0.0 if rms else self.v(MEAN, M)[:, None]
         r = self.v(RSTD, M)[:, None]
@@ -159,7 +176,8 @@ class Emulator(_Ops):
         gdy = self.v(DY, M * N).reshape(M, N) * self.v(Gm, N)
         m1 = 0.0 if rms else gdy.mean(1, keepdims=True)
         m2 = (gdy * xh).mean(1, keepdims=True)
-        self.v(DX, M * N)[:] = (r * (gdy - m1 - xh * m2)).reshape(-1)
+        dx = (r * (gdy - m1 - xh * m2)).reshape(-1)
+        self.v(DX, M * N)[:] = dx + self.v(RES, M * N) if RES is not None else dx
 
     def embed_f(self, E, IDS, Y, M, D):
         ids = self.v(IDS, M).view(np.int32)
@@ -250,12 +268,55 @@ class Emulator(_Ops):
         self.v(MASK, n)[:] = keep
         self.v(Y, n)[:] = self.v(X, n) * keep
 
+    # fused attention: q, k, v, o in [B, T, H*hd]; L (log2 of each row's softmax denominator) [B*H, T]
+    flash = True
+
+    def _heads(self, view, B, T, H, hd):
+        return self.v(view, B * T * H * hd).reshape(B, T, H, hd).transpose(0, 2, 1, 3)
+
+    def _probs(self, q, k, T, causal, scale):
+        s = np.einsum("bhtd,bhsd->bhts", _bf16(q).astype(np.float64), _bf16(k).astype(np.float64)) * scale
+        s2 = (s * 1.4426950408889634).astype(np.float32)
+        if causal:
+            s2 = np.where(np.tril(np.ones((T, T), bool)), s2, -np.inf)
+        return s2
+
+    def flash_fwd(self, Q, K, V, O, L, B, T, H, hd, causal, scale):
+        q, k, v = (self._heads(x, B, T, H, hd) for x in (Q, K, V))
+        s2 = self._probs(q, k, T, causal, scale)
+        m = s2.max(-1, keepdims=True)
+        pu = np.exp2(s2 - m)
+        lsum = pu.sum(-1, keepdims=True)
+        o = np.einsum("bhts,bhsd->bhtd", _bf16(pu).astype(np.float64), _bf16(v).astype(np.float64)) / lsum
+        self.v(O, B * T * H * hd)[:] = o.transpose(0, 2, 1, 3).astype(np.float32).reshape(-1)
+        self.v(L, B * H * T)[:] = (m + np.log2(lsum)).astype(np.float32).reshape(-1)
+
+    def flash_dot(self, DO, O, DD, B, T, H, hd):
+        do, o = self._heads(DO, B, T, H, hd), self._heads(O, B, T, H, hd)
+        self.v(DD, B * H * T)[:] = (do * o).sum(-1).astype(np.float32).reshape(-1)
+
+    def flash_bwd(self, Q, K, V, DO, L, DD, DQ, DK, DV, B, T, H, hd, causal, scale):
+        q, k, v, do = (self._heads(x, B, T, H, hd) for x in (Q, K, V, DO))
+        s2 = self._probs(q, k, T, causal, scale)
+        p = np.exp2(s2 - self.v(L, B * H * T).reshape(B, H, T, 1))
+        f = lambda x: _bf16(x).astype(np.float64)                                      # noqa: E731
+        dv = np.einsum("bhts,bhtd->bhsd", f(p), f(do))
+        dp = np.einsum("bhtd,bhsd->bhts", f(do), f(v))
+        ds = p * (dp - self.v(DD, B * H * T).reshape(B, H, T, 1))
+        dq = scale * np.einsum("bhts,bhsd->bhtd", f(ds), f(k))
+        dk = scale * np.einsum("bhts,bhtd->bhsd", f(ds), f(q))
+        for view, val in ((DQ, dq), (DK, dk), (DV, dv)):
+            self.v(view, B * T * H * hd)[:] = val.transpose(0, 2, 1, 3).astype(np.float32).reshape(-1)
+
     def fakeq(self, W, WQ, K, N, kind):
         from .lowbit import round_weights
         name = {v: k for k, v in KS.FAKEQ.items()}[kind]
         self.v(WQ, K * N)[:] = round_weights(self.v(W, K * N).reshape(K, N), name).reshape(-1)
 
-    def _gemm(self, A, B, Cv, bias, M, N, K, sam, sak, sbk, sbn, ldc, nb1, nb2, sa, sb, sc, alpha, beta, passes):
+    def _gemm(self, A, B, Cv, bias, M, N, K, sam, sak, sbk, sbn, ldc, nb1, nb2, sa, sb, sc, alpha, beta, passes,
+              epi=0, X2=None, act=0):
+        if epi:
+            return False                                 # the composite path (the same numbers)
         ab, ao = A
         bb, bo = B
         cb, co = Cv
@@ -321,6 +382,19 @@ class Gpu(_Ops):
             except Exception as e:
                 self.tc_why = f"tiled products unavailable: {type(e).__name__}: {e}"
         self.sms = int(getattr(dev, "sms", 0) or 28)
+        self.flash = False
+        if self.tc and os.environ.get("APSI_FLASH", "1").strip() not in ("0", "false", "no"):
+            try:                                         # attention in one kernel each way
+                fmod, self.fn["flash_dot"] = dev.load("apsi-train-flash-1", KS.ptx("flash"))
+                for hd in KS.FLASH_HD:
+                    for kind in "fb":
+                        f = ctypes.c_void_p()
+                        dev.drv.check(lib.cuModuleGetFunction(ctypes.byref(f), fmod, f"flash_{kind}{hd}".encode()),
+                                      "cuModuleGetFunction")
+                        self.fn[f"flash_{kind}{hd}"] = f
+                self.flash = True
+            except Exception as e:
+                self.tc_why = f"fused attention unavailable: {type(e).__name__}: {e}"
         self._calls = {}
         self.profile = None                              # {kernel: (seconds, launches)} while profiling
         self._pending = []
@@ -443,7 +517,7 @@ class Gpu(_Ops):
         self._go("act_b", self.blocks(n), 256, self.p(X), self.p(DY), self.p(DX), ("u", n), ("u", kind))
 
     def colsum(self, DY, X, MEAN, RSTD, DG, DB, M, N, mode):
-        rows = 64
+        rows = 16
         self._go("colsum", ((N + 255) // 256, (M + rows - 1) // rows), 256, self.p(DY), self.p(X), self.p(MEAN),
                  self.p(RSTD), self.p(DG), self.p(DB), ("u", M), ("u", N), ("u", rows), ("u", mode))
 
@@ -451,9 +525,9 @@ class Gpu(_Ops):
         self._go("ln_f", M, 256, self.p(X), self.p(Gm), self.p(Bt), self.p(Y), self.p(MEAN), self.p(RSTD),
                  ("u", M), ("u", N), ("f", eps), ("u", 1 if rms else 0))
 
-    def ln_b(self, X, Gm, DY, MEAN, RSTD, DX, M, N, rms):
+    def ln_b(self, X, Gm, DY, MEAN, RSTD, DX, M, N, rms, RES=None):
         self._go("ln_b", M, 256, self.p(X), self.p(Gm), self.p(DY), self.p(MEAN), self.p(RSTD), self.p(DX),
-                 ("u", M), ("u", N), ("u", 1 if rms else 0))
+                 ("u", M), ("u", N), ("u", 1 if rms else 0), self.p(RES), ("u", 1 if RES is not None else 0))
 
     def embed_f(self, E, IDS, Y, M, D):
         self._go("embed_f", self.blocks(M * D), 256, self.p(E), self.p(IDS), self.p(Y), ("u", M), ("u", D))
@@ -501,6 +575,21 @@ class Gpu(_Ops):
         self._go("gather", self.blocks(rows * width), 256, self.p(SRC), self.p(IDX), self.p(DST), ("u", rows),
                  ("u", width), ("u", start))
 
+    def flash_fwd(self, Q, K, V, O, L, B, T, H, hd, causal, scale):
+        self._go(f"flash_f{hd}", (-(-T // KS.BQ), B * H), 128, self.p(Q), self.p(K), self.p(V), self.p(O), self.p(L),
+                 ("u", T), ("u", H * hd), ("u", H), ("f", scale * 1.4426950408889634), ("u", 1 if causal else 0))
+
+    def flash_dot(self, DO, O, DD, B, T, H, hd):
+        rows = B * H * T
+        self._go("flash_dot", -(-rows // 128), 128, self.p(DO), self.p(O), self.p(DD), ("u", T), ("u", H * hd),
+                 ("u", H), ("u", hd), ("u", rows))
+
+    def flash_bwd(self, Q, K, V, DO, L, DD, DQ, DK, DV, B, T, H, hd, causal, scale):
+        self.fill(DQ, B * T * H * hd, 0.0)
+        self._go(f"flash_b{hd}", (-(-T // KS.BQ), B * H), 128, self.p(Q), self.p(K), self.p(V), self.p(DO),
+                 self.p(L), self.p(DD), self.p(DQ), self.p(DK), self.p(DV), ("u", T), ("u", H * hd), ("u", H),
+                 ("f", scale), ("f", scale * 1.4426950408889634), ("u", 1 if causal else 0))
+
     def fakeq(self, W, WQ, K, N, kind):
         self._go("fakeq", self.blocks(((K + 31) // 32) * N), 256, self.p(W), self.p(WQ), ("u", K), ("u", N),
                  ("u", kind))
@@ -530,14 +619,17 @@ class Gpu(_Ops):
             return None
         return f"gemm_t{ka}{kb}"
 
-    def _gemm(self, A, B, Cv, bias, M, N, K, sam, sak, sbk, sbn, ldc, nb1, nb2, sa, sb, sc, alpha, beta, passes):
+    def _gemm(self, A, B, Cv, bias, M, N, K, sam, sak, sbk, sbn, ldc, nb1, nb2, sa, sb, sc, alpha, beta, passes,
+              epi=0, X2=None, act=0):
         name = self._tiled_ok(A, B, M, N, K, sam, sak, sbk, sbn, sa, sb) if self.tiled and passes == 1 else None
+        if epi and (name is None or ldc != N or nb1 * nb2 != 1):
+            return False
         if name is not None:
             tiles = ((M + KS.BM - 1) // KS.BM) * ((N + KS.BN - 1) // KS.BN)
             nz, kchunk = 1, K
             blocks = tiles * nb1 * nb2
             # few output tiles and a long k (gradients of weights): split k so every multiprocessor has work
-            if blocks < self.sms and nb1 * nb2 == 1 and K >= 512 and (beta or ldc == N):
+            if blocks < self.sms and nb1 * nb2 == 1 and K >= 512 and (beta or ldc == N) and not epi:
                 want = min(-(-2 * self.sms // blocks), K // 128, 16)
                 if want > 1:
                     kchunk = -(-(-(-K // want)) // KS.BK) * KS.BK
@@ -547,8 +639,9 @@ class Gpu(_Ops):
             self._go(name, (tiles, nb1 * nb2, nz), 256, self.p(A), self.p(B), self.p(Cv), self.p(bias), ("u", M),
                      ("u", N), ("u", K), ("u", sam), ("u", sak), ("u", sbk), ("u", sbn), ("u", ldc), ("u", nb2),
                      ("u", sa[0]), ("u", sa[1]), ("u", sb[0]), ("u", sb[1]), ("u", sc[0]), ("u", sc[1]),
-                     ("f", alpha), ("u", 1 if beta else 0), ("u", 1 if bias is not None else 0), ("u", kchunk))
-            return
+                     ("f", alpha), ("u", 1 if beta else 0), ("u", 1 if bias is not None else 0), ("u", kchunk),
+                     self.p(X2), ("u", epi), ("u", act))
+            return True
         tiles = ((M + KS.TILE - 1) // KS.TILE) * ((N + KS.TILE - 1) // KS.TILE)
         args = (self.p(A), self.p(B), self.p(Cv), self.p(bias), ("u", M), ("u", N), ("u", K), ("u", sam),
                 ("u", sak), ("u", sbk), ("u", sbn), ("u", ldc), ("u", nb2), ("u", sa[0]), ("u", sa[1]),
@@ -639,16 +732,34 @@ class _Linear(_Node):
         self.W = net.param(p.W)
         self.b = net.param(p.b) if layer.bias else None
 
-    def fwd(self, x, shape):
+    act = None                                          # set when an activation follows (fused into this product)
+
+    @property
+    def takes_residual(self):
+        return self.act is None
+
+    def fwd(self, x, shape, residual=None):
         o, M = self.net.ops, _rows(shape)
         self.x, self.M = x, M
         y = self.buf("y", M * self.N)
-        o.gemm(x, self.W.w, y, M, self.N, self.K, self.K, 1, self.N, 1, self.N, bias=self.b.w if self.b else None,
-               passes=self.net.passes)
+        if self.act is not None:                        # y = act(x W + b), the pre-activation kept for backward
+            self.h = self.buf("h", M * self.N)
+            o.gemm(x, self.W.w, y, M, self.N, self.K, self.K, 1, self.N, 1, self.N,
+                   bias=self.b.w if self.b else None, passes=self.net.passes, epi=1, X2=self.h, act=self.act)
+        else:                                           # y = x W + b (+ the residual input)
+            o.gemm(x, self.W.w, y, M, self.N, self.K, self.K, 1, self.N, 1, self.N,
+                   bias=self.b.w if self.b else None, passes=self.net.passes, epi=3 if residual else 0, X2=residual)
         return y, shape[:-1] + (self.N,)
 
-    def bwd(self, dy, need_dx=True):
+    def bwd(self, dy, need_dx=True, into_act=None):
+        """into_act=(kind, h): the layer before is a linear layer with that activation; dx comes out already
+        multiplied by act'(h) (that layer's dy) in the same pass."""
         o, M, K, N = self.net.ops, self.M, self.K, self.N
+        if self.act is not None and not getattr(self, "dh_given", False):
+            dh = self.buf("dh", M * N)
+            o.act_b(self.h, dy, dh, M * N, self.act)
+            dy = dh
+        self.dh_given = False
         # dW[K, N] += x^T dy: A(k, m) = x[m * K + k]
         o.gemm(self.x, dy, self.W.g, K, N, M, 1, K, N, 1, N, beta=True, passes=self.net.passes)
         if self.b is not None:
@@ -656,7 +767,11 @@ class _Linear(_Node):
         if not need_dx:
             return None
         dx = self.buf("dx", M * K)
-        o.gemm(dy, self.W.w, dx, M, K, N, N, 1, 1, N, K, passes=self.net.passes)       # dy W^T
+        if into_act is not None:
+            o.gemm(dy, self.W.w, dx, M, K, N, N, 1, 1, N, K, passes=self.net.passes, epi=2, X2=into_act[1],
+                   act=into_act[0])
+        else:
+            o.gemm(dy, self.W.w, dx, M, K, N, N, 1, 1, N, K, passes=self.net.passes)       # dy W^T
         return dx
 
 
@@ -717,12 +832,13 @@ class _Norm(_Node):
                           self.rms)
         return y, shape
 
-    def bwd(self, dy, need_dx=True):
+    def bwd(self, dy, need_dx=True, residual=None):
+        """residual: a gradient to add to dx (the skip connection around this norm), in the same pass."""
         o = self.net.ops
         o.colsum(dy, self.x, self.mean, self.rstd, self.gm.g, self.bt.g if self.bt else None, self.M, self.N,
                  2 if self.rms else 1)
         dx = self.buf("dx", self.M * self.N)
-        o.ln_b(self.x, self.gm.w, dy, self.mean, self.rstd, dx, self.M, self.N, self.rms)
+        o.ln_b(self.x, self.gm.w, dy, self.mean, self.rstd, dx, self.M, self.N, self.rms, residual)
         return dx
 
 
@@ -780,14 +896,24 @@ class _Seq(_Node):
         super().__init__(net, key)
         self.nodes = nodes
 
-    def fwd(self, x, shape):
-        for nd in self.nodes:
-            x, shape = nd.fwd(x, shape)
+    @property
+    def takes_residual(self):
+        return bool(self.nodes) and getattr(self.nodes[-1], "takes_residual", False)
+
+    def fwd(self, x, shape, residual=None):
+        last = len(self.nodes) - 1
+        for i, nd in enumerate(self.nodes):
+            x, shape = nd.fwd(x, shape, residual) if (i == last and residual is not None) else nd.fwd(x, shape)
         return x, shape
 
     def bwd(self, dy, need_dx=True):
         for i in range(len(self.nodes) - 1, -1, -1):
-            dy = self.nodes[i].bwd(dy, need_dx or i > 0)
+            nd, before = self.nodes[i], (self.nodes[i - 1] if i > 0 else None)
+            if isinstance(nd, _Linear) and isinstance(before, _Linear) and before.act is not None:
+                dy = nd.bwd(dy, True, into_act=(before.act, before.h))      # the activation's backward fused in
+                before.dh_given = True
+            else:
+                dy = nd.bwd(dy, need_dx or i > 0)
             if dy is None:
                 return None
         return dy
@@ -800,8 +926,11 @@ class _Residual(_Node):
 
     def fwd(self, x, shape):
         h, hs = self.norm.fwd(x, shape) if self.norm else (x, shape)
-        f, fs = self.inner.fwd(h, hs)
         self.n = int(np.prod(shape))
+        if getattr(self.inner, "takes_residual", False):  # the inner layer's last product adds x itself
+            y, _ = self.inner.fwd(h, hs, residual=x)
+            return y, shape
+        f, fs = self.inner.fwd(h, hs)
         y = self.buf("y", self.n)
         self.net.ops.add3(y, x, f, self.n)
         return y, shape
@@ -809,7 +938,7 @@ class _Residual(_Node):
     def bwd(self, dy, need_dx=True):
         dh = self.inner.bwd(dy, True)
         if self.norm:
-            dh = self.norm.bwd(dh, True)
+            return self.norm.bwd(dh, True, residual=dy)  # dx = dy + the norm's gradient, one pass
         dx = self.buf("dx", self.n)
         self.net.ops.add3(dx, dy, dh, self.n)
         return dx
@@ -825,7 +954,9 @@ class _Attention(_Node):
         self.Wq, self.Wk, self.Wv, self.Wo = (net.param(getattr(p, n)) for n in ("Wq", "Wk", "Wv", "Wo"))
         self.bo = net.param(p.bo)
 
-    def fwd(self, x, shape):
+    takes_residual = True
+
+    def fwd(self, x, shape, residual=None):
         if len(shape) != 3:
             raise TrainError("multi_head_attention on the GPU takes [batch, time, features]")
         o, (B, T, D), h = self.net.ops, shape, self.h
@@ -837,8 +968,17 @@ class _Attention(_Node):
         for W, out in ((self.Wq, q), (self.Wk, k), (self.Wv, v)):
             o.gemm(x, W.w, out, M, D, D, D, 1, D, 1, D, passes=ps)
         self.q, self.k, self.v = q, k, v
-        S, P = self.buf("s", B * h * T * T), self.buf("p", B * h * T * T)
         sc = 1.0 / math.sqrt(hd)
+        self.fused = ps == 1 and getattr(o, "flash", False) and hd in KS.FLASH_HD and D % 4 == 0
+        if self.fused:                                  # scores, softmax and the weighted sum in one kernel
+            att, self.L = self.buf("att", M * D), self.buf("lse", B * h * T)
+            o.flash_fwd(q, k, v, att, self.L, B, T, h, hd, self.causal, sc)
+            self.att = att
+            y = self.buf("y", M * D)
+            o.gemm(att, self.Wo.w, y, M, D, D, D, 1, D, 1, D, bias=self.bo.w, passes=ps, epi=3 if residual else 0,
+                   X2=residual)
+            return y, shape
+        S, P = self.buf("s", B * h * T * T), self.buf("p", B * h * T * T)
         # S[b, h](t, s) = q[b, t, h, :] . k[b, s, h, :] * sc
         o.gemm(q, k, S, T, T, hd, D, 1, 1, D, T, alpha=sc, batch=(B, h), sa=(T * D, hd), sb=(T * D, hd),
                sc=(h * T * T, T * T), passes=ps)
@@ -849,7 +989,8 @@ class _Attention(_Node):
                sc=(T * D, hd), passes=ps)
         self.att = att
         y = self.buf("y", M * D)
-        o.gemm(att, self.Wo.w, y, M, D, D, D, 1, D, 1, D, bias=self.bo.w, passes=ps)
+        o.gemm(att, self.Wo.w, y, M, D, D, D, 1, D, 1, D, bias=self.bo.w, passes=ps, epi=3 if residual else 0,
+               X2=residual)
         return y, shape
 
     def bwd(self, dy, need_dx=True):
@@ -860,6 +1001,12 @@ class _Attention(_Node):
         o.colsum(dy, None, None, None, None, self.bo.g, M, D, 0)
         datt = self.buf("datt", M * D)
         o.gemm(dy, self.Wo.w, datt, M, D, D, D, 1, 1, D, D, passes=ps)
+        if self.fused:
+            dd = self.buf("dd", B * h * T)
+            o.flash_dot(datt, self.att, dd, B, T, h, hd)
+            dq, dk, dv = self.buf("dq", M * D), self.buf("dk", M * D), self.buf("dv", M * D)
+            o.flash_bwd(self.q, self.k, self.v, datt, self.L, dd, dq, dk, dv, B, T, h, hd, self.causal, sc)
+            return self._grads_in(dq, dk, dv, M, D, ps)
         dP = self.buf("dp", B * h * T * T)               # dP = datt v^T
         o.gemm(datt, self.v, dP, T, T, hd, D, 1, 1, D, T, batch=(B, h), sa=(T * D, hd), sb=(T * D, hd),
                sc=(h * T * T, T * T), passes=ps)
@@ -873,6 +1020,10 @@ class _Attention(_Node):
                sb=(T * D, hd), sc=(T * D, hd), passes=ps)                                   # dq = dS k
         o.gemm(dS, self.q, dk, T, hd, T, 1, T, D, 1, D, alpha=sc, batch=(B, h), sa=(h * T * T, T * T),
                sb=(T * D, hd), sc=(T * D, hd), passes=ps)                                   # dk = dS^T q
+        return self._grads_in(dq, dk, dv, M, D, ps)
+
+    def _grads_in(self, dq, dk, dv, M, D, ps):
+        o = self.net.ops
         dx = self.buf("dx", M * D)
         first = True
         for W, d in ((self.Wq, dq), (self.Wk, dk), (self.Wv, dv)):
@@ -917,6 +1068,7 @@ class Net:
             self.WQ = ops.alloc(self.n_decay)
             self.qoff = {o: o for o, _ in self.mats}         # the matrices come first: same offsets in WQ
         self.LOSS = ops.alloc(4)
+        self.fuse = os.environ.get("APSI_FUSE", "1").strip() not in ("0", "false", "no")
         self.root = self.compile(model, params, "m")
 
     def param(self, a):
@@ -928,7 +1080,17 @@ class Net:
         from . import layers as L
         kind = type(layer).__name__
         if isinstance(layer, L.Sequential):
-            return _Seq(self, key, [self.compile(l_, pp, f"{key}.{i}") for i, (l_, pp) in enumerate(zip(layer.layers, p))])
+            nodes = []
+            for i, (l_, pp) in enumerate(zip(layer.layers, p)):
+                if isinstance(l_, L.Dropout) and not float(getattr(l_, "p", getattr(l_, "rate", 0.0)) or 0.0):
+                    continue                            # dropout 0: nothing to do
+                nd = self.compile(l_, pp, f"{key}.{i}")
+                if isinstance(nd, _Act) and nodes and isinstance(nodes[-1], _Linear) and nodes[-1].act is None \
+                        and self.fuse:
+                    nodes[-1].act = nd.kind             # linear + activation: one product with the activation
+                    continue
+                nodes.append(nd)
+            return _Seq(self, key, nodes)
         if isinstance(layer, L.Linear):
             return _Linear(self, key, layer, p)
         if isinstance(layer, L.Activation):
