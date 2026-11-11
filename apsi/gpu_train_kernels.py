@@ -886,7 +886,7 @@ EPI_KERNELS = tuple([(f"gemm_tkn_e1a{j}", True, False, 1, j) for j in EPI_ACTS] 
                     [(f"gemm_tkk_e2a{j}", True, True, 2, j) for j in EPI_ACTS] + [("gemm_tkn_e3", True, False, 3, None)])
 
 
-def _tiled_module(early=False):
+def _tiled_module(early=False, wide=False):
     """Matrix products on tensor cores with shared-memory tiles (sm_80+), the way fast GEMM libraries do them.
 
     A block of 8 warps computes 128 x 128 of C; each warp 64 x 32 (4 x 4 mma tiles of 16 x 8). The operands are read
@@ -900,7 +900,15 @@ def _tiled_module(early=False):
     blockIdx.z splits k (split-K): each part adds its share to C atomically (for gradients of weights: few output
     tiles, a long k). Requirements (checked by the caller): the contiguous dimension and the other strides are
     multiples of 4 and every operand starts on a 16-byte boundary."""
-    ir, m = _setup("apsi_train_tiled_x" if early else "apsi_train_tiled")
+    # wide: 4 warps of 64 x 64 (4 x 8 mma tiles) over slices of 16, the shape fast GEMM libraries use on Ampere:
+    # every value read from shared memory feeds twice as many products as a 64 x 32 warp tile
+    if wide:
+        early = True
+    BKv, NTH, WNW = (16, 128, 2) if wide else (BK, 256, 4)
+    NTL = BN // WNW // 8                          # n8 tiles per warp
+    PADv = BKv + 8
+    VPR = BKv // 4                                # float32 vectors of 4 per row of a k-contiguous slice
+    ir, m = _setup("apsi_train_tiled_w" if wide else "apsi_train_tiled_x" if early else "apsi_train_tiled")
     annotations = m.add_named_metadata("nvvm.annotations")
     g = _Gen(ir, m)
     i16, i32, i64, f32, C, F, G = ir.IntType(16), g.i32, g.i64, g.f32, g.C, g.F, g.G
@@ -908,7 +916,7 @@ def _tiled_module(early=False):
     ctaz_f = d("llvm.nvvm.read.ptx.sreg.ctaid.z", i32, [])
     nctaz_f = d("llvm.nvvm.read.ptx.sreg.nctaid.z", i32, [])
     bar_f = d("llvm.nvvm.barrier0", ir.VoidType(), [])
-    HALVES = 2 * 2 * BM * PAD
+    HALVES = 2 * 2 * max(BM * PADv, BKv * PADT)
     smem = ir.GlobalVariable(m, ir.ArrayType(i16, HALVES), "apsi_tiles", addrspace=3)
     smem.linkage = "internal"
     smem.align = 16
@@ -942,8 +950,8 @@ def _tiled_module(early=False):
     def kernel(name, a_kc, b_kc, epi_mode=0, act_j=None, a_act=None):
         fn = ir.Function(m, ir.FunctionType(ir.VoidType(), [t for _, t in args]), name=name)
         fn.calling_convention = "ptx_kernel"
-        if early:                                 # 256 threads, two blocks per multiprocessor: at most 128 registers
-            for key, val in (("maxntidx", 256), ("minctasm", 2)):
+        if early:                                 # two blocks per multiprocessor (at most 128 / 255 registers)
+            for key, val in (("maxntidx", NTH), ("minctasm", 2)):
                 annotations.add(m.add_metadata([fn, ir.MetaDataString(m, key), C(val)]))
         p = {n: a for (n, _), a in zip(args, fn.args)}
         allocas = fn.append_basic_block("allocas")
@@ -966,13 +974,21 @@ def _tiled_module(early=False):
         offs = _batch_offsets(b, ctay, p, i64)
         lane, warp = b.and_(tid, C(31)), b.lshr(tid, C(5))
         gq, tig = b.lshr(lane, C(2)), b.and_(lane, C(3))
-        wm, wn = b.lshr(warp, C(2)), b.and_(warp, C(3))
+        wm, wn = b.udiv(warp, C(WNW)), b.urem(warp, C(WNW))
+        # tiles in groups of 8 rows: the blocks running at the same time share 8 rows of A and a few columns of B, so
+        # a large B (weights of a big layer) is read from memory about 8 times less often (the rest hits the L2 cache)
         nbn = b.udiv(b.add(p["N"], C(BN - 1)), C(BN))
-        bm = b.mul(b.udiv(cta, nbn), C(BM))
-        bn = b.mul(b.urem(cta, nbn), C(BN))
+        nbm = b.udiv(b.add(p["M"], C(BM - 1)), C(BM))
+        per_group = b.mul(nbn, C(8))
+        first_m = b.mul(b.udiv(cta, per_group), C(8))
+        gsize = umin(b.sub(nbm, umin(first_m, nbm)), C(8))
+        gsize = b.select(b.icmp_unsigned("==", gsize, C(0)), C(1), gsize)
+        within = b.urem(cta, per_group)
+        bm = b.mul(b.add(first_m, b.urem(within, gsize)), C(BM))
+        bn = b.mul(b.udiv(within, gsize), C(BN))
         k_beg = b.mul(ctaz, p["kchunk"])
         k_end = umin(b.add(k_beg, p["kchunk"]), p["K"])
-        ntiles = b.udiv(b.add(b.sub(k_end, umin(k_beg, k_end)), C(BK - 1)), C(BK))
+        ntiles = b.udiv(b.add(b.sub(k_end, umin(k_beg, k_end)), C(BKv - 1)), C(BKv))
         Mm1, Nm1 = b.sub(p["M"], C(1)), b.sub(p["N"], C(1))
         Km4 = b.sub(p["K"], C(4))
 
@@ -1037,17 +1053,18 @@ def _tiled_module(early=False):
             v = b.insert_element(v, ws[1], C(1))
             b.store(v, b.bitcast(sh_ptr(half_index), ir.VectorType(i32, 2).as_pointer(3)), align=8)
 
-        A_BASE = [C(0), C(BM * PAD)]
-        B_BASE = [C(2 * BM * PAD), C(2 * BM * PAD + BN * PAD)]
+        REG = max(BM * PADv, BKv * PADT)
+        A_BASE = [C(0), C(REG)]
+        B_BASE = [C(2 * REG), C(3 * REG)]
 
         def fetch(kt):
             """The registers of one k slice: 4 vectors of A and 4 of B per thread."""
-            k0 = b.add(k_beg, b.mul(kt, C(BK)))
+            k0 = b.add(k_beg, b.mul(kt, C(BKv)))
             regs = []
-            for i in range(4):
-                idx = b.add(tid, C(256 * i))
+            for i in range(BM * BKv // 4 // NTH):
+                idx = b.add(tid, C(NTH * i))
                 if a_kc:                              # A(m, k) = A[m * sam + k]
-                    row, kq = b.lshr(idx, C(3)), b.mul(b.and_(idx, C(7)), C(4))
+                    row, kq = b.udiv(idx, C(VPR)), b.mul(b.urem(idx, C(VPR)), C(4))
                     regs.append(("A", row, kq, load4(offs[0], p["A"], b.add(k0, kq), k_end, b.add(bm, row), p["M"],
                                                      True, p["sam"])))
                 else:                                 # A(m, k) = A[k * sak + m]
@@ -1055,7 +1072,7 @@ def _tiled_module(early=False):
                     regs.append(("At", mq, kk, load4(offs[0], p["A"], b.add(bm, mq), p["M"], b.add(k0, kk), k_end,
                                                      True, p["sak"], a_act)))
                 if b_kc:                              # B(k, n) = B[n * sbn + k]
-                    nrow, kq = b.lshr(idx, C(3)), b.mul(b.and_(idx, C(7)), C(4))
+                    nrow, kq = b.udiv(idx, C(VPR)), b.mul(b.urem(idx, C(VPR)), C(4))
                     regs.append(("B", nrow, kq, load4(offs[1], p["B"], b.add(k0, kq), k_end, b.add(bn, nrow), p["N"],
                                                       True, p["sbn"])))
                 else:                                 # B(k, n) = B[k * sbk + n]
@@ -1073,11 +1090,11 @@ def _tiled_module(early=False):
                 else:
                     base = b.select(b.icmp_unsigned("==", buf, C(0)), B_BASE[0], B_BASE[1])
                 if kind in ("A", "B"):                # [m or n][k]: 4 consecutive k
-                    store_row4(b.add(base, b.add(b.mul(r, C(PAD)), c)), hs)
+                    store_row4(b.add(base, b.add(b.mul(r, C(PADv)), c)), hs)
                 else:                                 # [k][m or n]: 4 consecutive m or n, stored the same way
                     store_row4(b.add(base, b.add(b.mul(c, C(PADT)), r)), hs)
 
-        accs = [[[var(F(0.0)) for _ in range(4)] for _ in range(4)] for _ in range(4)]
+        accs = [[[var(F(0.0)) for _ in range(4)] for _ in range(NTL)] for _ in range(4)]
         dbs = [var(F(0.0)) for _ in range(4)] if (not a_kc and not b_kc and epi_mode == 0) else None
 
         def add_db(regs):
@@ -1106,14 +1123,14 @@ def _tiled_module(early=False):
         buf = b.and_(i, C(1))
         abase = b.select(b.icmp_unsigned("==", buf, C(0)), A_BASE[0], A_BASE[1])
         bbase = b.select(b.icmp_unsigned("==", buf, C(0)), B_BASE[0], B_BASE[1])
-        for ks in range(BK // 16):
+        for ks in range(BKv // 16):
             l7, l8, l16 = b.and_(lane, C(7)), b.and_(b.lshr(lane, C(3)), C(1)), b.lshr(lane, C(4))
             afr = []
             for mt in range(4):
                 if a_kc:                              # [m][k]: rows of A
                     row = b.add(b.add(b.mul(wm, C(64)), C(mt * 16)), b.and_(lane, C(15)))
                     col = b.add(C(ks * 16), b.mul(l16, C(8)))
-                    addr = b.ptrtoint(sh_ptr(b.add(abase, b.add(b.mul(row, C(PAD)), col))), i64)
+                    addr = b.ptrtoint(sh_ptr(b.add(abase, b.add(b.mul(row, C(PADv)), col))), i64)
                     r = b.call(ldm, [addr])
                 else:                                 # [k][m]: transposed while loading
                     krow = b.add(C(ks * 16), b.add(l7, b.mul(l16, C(8))))
@@ -1122,21 +1139,21 @@ def _tiled_module(early=False):
                     r = b.call(ldmt, [addr])
                 afr.append([b.extract_value(r, j) for j in range(4)])
             bfr = []
-            for pr in range(2):
+            for pr in range(NTL // 2):
                 if b_kc:                              # [n][k]
-                    nrow = b.add(b.add(b.mul(wn, C(32)), C(pr * 16)), b.add(l7, b.mul(l16, C(8))))
+                    nrow = b.add(b.add(b.mul(wn, C(NTL * 8)), C(pr * 16)), b.add(l7, b.mul(l16, C(8))))
                     col = b.add(C(ks * 16), b.mul(l8, C(8)))
-                    addr = b.ptrtoint(sh_ptr(b.add(bbase, b.add(b.mul(nrow, C(PAD)), col))), i64)
+                    addr = b.ptrtoint(sh_ptr(b.add(bbase, b.add(b.mul(nrow, C(PADv)), col))), i64)
                     r = b.call(ldm, [addr])
                 else:                                 # [k][n], transposed while loading
                     krow = b.add(C(ks * 16), b.add(l7, b.mul(l8, C(8))))
-                    ncol = b.add(b.add(b.mul(wn, C(32)), C(pr * 16)), b.mul(l16, C(8)))
+                    ncol = b.add(b.add(b.mul(wn, C(NTL * 8)), C(pr * 16)), b.mul(l16, C(8)))
                     addr = b.ptrtoint(sh_ptr(b.add(bbase, b.add(b.mul(krow, C(PADT)), ncol))), i64)
                     r = b.call(ldmt, [addr])
                 q = [b.extract_value(r, j) for j in range(4)]
                 bfr += [[q[0], q[1]], [q[2], q[3]]]
             for mt in range(4):
-                for nt in range(4):
+                for nt in range(NTL):
                     acc = [b.load(a) for a in accs[mt][nt]]
                     r = b.call(mma, afr[mt] + bfr[nt] + acc)
                     for c in range(4):
@@ -1158,10 +1175,10 @@ def _tiled_module(early=False):
         split = b.icmp_unsigned(">", nz, C(1))
         first = b.icmp_unsigned("==", ctaz, C(0))
         for mt in range(4):
-            for nt in range(4):
+            for nt in range(NTL):
                 for c in range(4):
                     row = b.add(b.add(bm, b.add(b.mul(wm, C(64)), C(mt * 16 + (c // 2) * 8))), gq)
-                    col = b.add(b.add(bn, b.add(b.mul(wn, C(32)), C(nt * 8))), b.add(b.mul(tig, C(2)), C(c % 2)))
+                    col = b.add(b.add(bn, b.add(b.mul(wn, C(NTL * 8)), C(nt * 8))), b.add(b.mul(tig, C(2)), C(c % 2)))
                     with b.if_then(b.and_(b.icmp_unsigned("<", row, p["M"]), b.icmp_unsigned("<", col, p["N"]))):
                         idx = b.add(offs[2], b.add(b.mul(z64(row), z64(p["ldc"])), z64(col)))
                         ptr = b.gep(p["C"], [idx], inbounds=True)
@@ -1601,6 +1618,7 @@ def ptx(which):
     except (OSError, ImportError):
         pass
     text = {"main": _main_module, "tc": _tc_module, "tiled": _tiled_module, "tiled_x": lambda: _tiled_module(True),
+            "tiled_w": lambda: _tiled_module(True, True),
             "flash": _flash_module}[which]()
     if path:
         try:

@@ -148,6 +148,18 @@ rate; PyTorch's cuBLAS float32 is still faster than Apsi's three-pass float32. P
 activations are bfloat16; Apsi keeps float32 activations). The products come in two builds and the card times both
 for each shape the first time it sees it, keeping the faster (`APSI_GEMM_VARIANT=a|x` fixes one).
 
+How big a model trains: training keeps four float32 numbers per parameter on the card (weights, gradients and
+AdamW's two moments, 16 bytes) plus the activations of a batch, so a 12 GB card trains up to roughly 500–600 M
+parameters, a 24 GB card about twice that, an 80 GB card a few billion. `fit` checks this first and says so with the
+numbers instead of failing half-way. Models of tens or hundreds of billions of parameters (21 B, 40 B, 100 B, 1 T)
+are trained on many large cards at once; on one consumer card such models *run* (`use hub`, int4 / int8: up to
+about 14 B on 12 GB) but cannot be trained. The architecture is yours to choose: `transformer_lm(vocab, d=, heads=,
+layers=, context=)` for any size, or your own `Sequential` of the layers in the table above.
+
+Large products in three builds: the card times each one (8 warps of 64 × 32; the same loading first; 4 warps of
+64 × 64 over slices of 16) for every shape the first time and keeps the fastest; the tiles are visited in groups of 8
+rows so a large weight matrix is read from memory far less often.
+
 Older and newer cards: on Turing (RTX 20) and GTX 16 the trainer runs on its float32 kernels (no bfloat16 tensor
 cores there); on Hopper and Blackwell (H100, H200, B200, RTX 50) the Ampere kernels run as they are (the driver
 compiles them for the card), without the newer cards' own instructions (wgmma, TMA, fp8 tensor cores) yet.

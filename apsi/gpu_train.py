@@ -398,17 +398,21 @@ class Gpu(_Ops):
             except Exception as e:
                 self.tc_why = f"tiled products unavailable: {type(e).__name__}: {e}"
         if self.tiled and os.environ.get("APSI_GEMM_VARIANT", "auto").strip().lower() != "a":
-            try:                                         # the second build (loads first, 2 blocks per SM)
-                xmod, first = dev.load("apsi-train-tiled-x", KS.ptx("tiled_x"))
-                xf = {"gemm_tkn#x": first}
-                for name in KS.TILED[1:] + tuple(e[0] for e in KS.EPI_KERNELS) + \
-                        tuple(f"gemm_tmn_aa{j}" for j in KS.EPI_ACTS):
-                    f = ctypes.c_void_p()
-                    dev.drv.check(lib.cuModuleGetFunction(ctypes.byref(f), xmod, name.encode()), "cuModuleGetFunction")
-                    xf[name + "#x"] = f
-                self.fn.update(xf)
-            except Exception:                            # noqa: BLE001  (the first build alone then)
-                pass
+            # more builds of the same products: "x" loads first (2 blocks of 8 warps per SM), "w" 4 warps of 64 x 64
+            # over slices of 16 (the shape of the fast GEMM libraries); the card times them per shape
+            for tag, which in (("x", "tiled_x"), ("w", "tiled_w")):
+                try:
+                    xmod, first = dev.load(f"apsi-train-tiled-{tag}", KS.ptx(which))
+                    xf = {f"gemm_tkn#{tag}": first}
+                    for name in KS.TILED[1:] + tuple(e[0] for e in KS.EPI_KERNELS) + \
+                            tuple(f"gemm_tmn_aa{j}" for j in KS.EPI_ACTS):
+                        f = ctypes.c_void_p()
+                        dev.drv.check(lib.cuModuleGetFunction(ctypes.byref(f), xmod, name.encode()),
+                                      "cuModuleGetFunction")
+                        xf[f"{name}#{tag}"] = f
+                    self.fn.update(xf)
+                except Exception as e:                   # noqa: BLE001  (the other builds then)
+                    self.variant_why = f"build {tag}: {type(e).__name__}: {e}"
         self.sms = int(getattr(dev, "sms", 0) or 28)
         self.flash = False
         if self.tc and os.environ.get("APSI_FLASH", "1").strip() not in ("0", "false", "no"):
@@ -656,13 +660,18 @@ class Gpu(_Ops):
             return None
         return f"gemm_t{ka}{kb}"
 
+    @staticmethod
+    def _threads(name):
+        return 128 if name.endswith("#w") else 256
+
     def _per_sm(self, name):
         """Blocks of this kernel that fit on one multiprocessor at once (registers, shared memory)."""
         n = self._occ.get(name)
         if n is None:
             v = ctypes.c_int()
             try:
-                ok = self._lib.cuOccupancyMaxActiveBlocksPerMultiprocessor(ctypes.byref(v), self.fn[name], 256,
+                ok = self._lib.cuOccupancyMaxActiveBlocksPerMultiprocessor(ctypes.byref(v), self.fn[name],
+                                                                          self._threads(name),
                                                                           ctypes.c_size_t(0)) == 0
             except AttributeError:
                 ok = False
@@ -672,12 +681,12 @@ class Gpu(_Ops):
     def _variant(self, name, grid, args, M, N, ldc, nb):
         """Which build of a tiled product runs: the one the card itself measured faster for this shape (each is
         timed twice on scratch outputs the first time the shape comes; APSI_GEMM_VARIANT=a or x fixes it)."""
-        alt = name + "#x"
-        if alt not in self.fn or nb != 1:
-            return name
+        cands = [name] + [f"{name}#{t}" for t in ("x", "w") if f"{name}#{t}" in self.fn]
         force = os.environ.get("APSI_GEMM_VARIANT", "auto").strip().lower()
-        if force in ("a", "x"):
-            return alt if force == "x" else name
+        if force in ("x", "w"):
+            return f"{name}#{force}" if f"{name}#{force}" in self.fn else name
+        if force == "a" or len(cands) == 1 or nb != 1:
+            return name
         key = (name, grid, tuple(a for a in args if a[0] != "p"))
         pick = self._choice.get(key)
         if pick is not None:
@@ -691,10 +700,10 @@ class Gpu(_Ops):
             targs[26] = self.p(self._scratch("tune_db", N))
         best, best_t = name, None
         ms = ctypes.c_float()
-        for cand in (name, alt, name, alt):
+        for cand in cands + cands:
             e0, e1 = self._event(), self._event()
             self._lib.cuEventRecord(e0, None)
-            self._go(cand, grid, 256, *targs)
+            self._go(cand, grid, self._threads(cand), *targs)
             self._lib.cuEventRecord(e1, None)
             self._lib.cuEventSynchronize(e1)
             self._lib.cuEventElapsedTime(ctypes.byref(ms), e0, e1)
@@ -770,7 +779,8 @@ class Gpu(_Ops):
                     ("f", alpha), ("u", 1 if beta else 0), ("u", 1 if bias is not None else 0), ("u", kchunk),
                     self.p(X2), ("u", epi), ("u", act), self.p(db), ("u", 1 if db is not None else 0)]
             grid = (tiles, nb1 * nb2, nz)
-            self._go(self._variant(name, grid, args, M, N, ldc, nb1 * nb2), grid, 256, *args)
+            use = self._variant(name, grid, args, M, N, ldc, nb1 * nb2)
+            self._go(use, grid, self._threads(use), *args)
             if db is not None:
                 self._db = None                          # taken
             return True
@@ -1354,6 +1364,26 @@ def _inputs(X, ids):
     return np.ascontiguousarray(a.astype(np.float32))
 
 
+def _check_size(ops, params, opt):
+    """Training keeps 4 float32 numbers per parameter on the card (weights, gradient, AdamW's two moments: 16 bytes);
+    a model that cannot fit is refused at once with the numbers, rather than failing half-way."""
+    from .stdlib import Adam
+    total = getattr(getattr(ops, "dev", None), "memory", None)
+    if not total:
+        return
+    count = sum(int(np.asarray(a).size) for a in tree_leaves(params) if isinstance(a, np.ndarray))
+    per = 16 if isinstance(opt, Adam) or opt is None else 12
+    need = count * per
+    if need > 0.92 * total:
+        fits = int(0.92 * total / per * 0.75)
+        raise TrainError(
+            f"{count / 1e9:.2f} B parameters need {need / 2 ** 30:.1f} GB on the card for training (weights, gradients "
+            f"and the optimizer's state, {per} bytes each) before any activations; this card has "
+            f"{total / 2 ** 30:.1f} GB. On it, models up to about {fits / 1e6:,.0f} M parameters train; larger ones "
+            f"need cards with more memory (or several), and run here with use hub in int4 / int8 (up to about 14 B "
+            f"on 12 GB)")
+
+
 def fit(model, params, X, y=None, loss="mse", opt=None, epochs=10, batch_size=None, seed=0, verbose=True,
         clip=None, schedule=None, val=None, device="cuda", precision="auto", ops=None, ema=None, ewc=None):
     """ema=0.999: also keeps an exponential moving average of the weights (record.ema_params), the smoother set
@@ -1379,6 +1409,7 @@ def fit(model, params, X, y=None, loss="mse", opt=None, epochs=10, batch_size=No
     ce = loss == "cross_entropy"
     Ya = np.ascontiguousarray(Ya.astype(np.int32) if ce else Ya.astype(np.float32))
     n = Xa.shape[0]
+    _check_size(ops, params, opt)
     net = Net(ops, model, params, precision)
     rng = np.random.default_rng(int(seed))
     net.seed = int(seed) * 7919 + 1

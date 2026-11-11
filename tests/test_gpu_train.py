@@ -206,8 +206,8 @@ class RealGpu(unittest.TestCase):
         (the card picks the faster per shape, so both must be right)."""
         import os
         from unittest import mock
-        for variant in ("a", "x"):
-            if variant == "x" and "gemm_tkk#x" not in self.g.fn:
+        for variant in ("a", "x", "w"):
+            if variant != "a" and f"gemm_tkk#{variant}" not in self.g.fn:
                 continue
             with self.subTest(variant=variant), mock.patch.dict(os.environ, {"APSI_GEMM_VARIANT": variant}):
                 self._tiled_body()
@@ -347,7 +347,8 @@ class Kernels(unittest.TestCase):
     def test_every_module_builds(self):
         from apsi import gpu_train_kernels as KS
         for which, build in (("main", KS._main_module), ("tc", KS._tc_module), ("tiled", KS._tiled_module),
-                             ("tiled_x", lambda: KS._tiled_module(True)), ("flash", KS._flash_module)):
+                             ("tiled_x", lambda: KS._tiled_module(True)),
+                             ("tiled_w", lambda: KS._tiled_module(True, True)), ("flash", KS._flash_module)):
             text = build()
             self.assertIn(".entry", text, which)
         self.assertIn(".minnctapersm 2", KS._tiled_module(True))
