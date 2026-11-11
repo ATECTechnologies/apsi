@@ -927,7 +927,10 @@ def _tiled_module():
     args = [("A", G(f32)), ("B", G(f32)), ("C", G(f32)), ("BIAS", G(f32)), ("M", i32), ("N", i32), ("K", i32),
             ("sam", i32), ("sak", i32), ("sbk", i32), ("sbn", i32), ("ldc", i32), ("nb2", i32), ("a1", i32),
             ("a2", i32), ("b1", i32), ("b2", i32), ("c1", i32), ("c2", i32), ("alpha", f32), ("beta", i32),
-            ("has_bias", i32), ("kchunk", i32), ("X2", G(f32)), ("epi", i32), ("act", i32)]
+            ("has_bias", i32), ("kchunk", i32), ("X2", G(f32)), ("epi", i32), ("act", i32), ("DB", G(f32)),
+            ("want_db", i32)]
+    # DB (kernels with B n-contiguous and A transposed: weight gradients x^T dy): also DB[n] += sum over k of B,
+    # the bias gradient, from the values already in registers (no second pass over dy)
     # epi (after alpha, bias and beta): 1 = X2 <- v, C <- act(v) (a linear layer and its activation in one pass);
     # 2 = C <- v * act'(X2) (the backward pass through that activation); 3 = C <- v + X2 (a residual connection)
 
@@ -969,7 +972,8 @@ def _tiled_module():
             u = b.bitcast(x, i32)
             return b.lshr(b.add(b.add(u, C(0x7FFF)), b.and_(b.lshr(u, C(16)), C(1))), C(16))
 
-        def load4(base_off, ptr, contig_idx, contig_lim, other_idx, other_lim, contig_stride_is_1, s_other, act=None):
+        def load4(base_off, ptr, contig_idx, contig_lim, other_idx, other_lim, contig_stride_is_1, s_other, act=None,
+                  raw=None):
             """4 float32 along the contiguous dimension (zeros outside), as 4 bfloat16 bit patterns; act: the
             activation applied on the way (A is a pre-activation kept instead of its activation)."""
             ok = b.and_(b.icmp_unsigned("<", contig_idx, contig_lim), b.icmp_unsigned("<", other_idx, other_lim))
@@ -984,6 +988,8 @@ def _tiled_module():
                 if act is not None:
                     x = _act_one(b, x, act, F, ex2_f, False)
                 v = b.select(ok, x, F(0.0))
+                if raw is not None:
+                    raw.append(v)
                 out.append(rne(v))
             return out
 
@@ -1027,12 +1033,13 @@ def _tiled_module():
                                                       True, p["sbn"])))
                 else:                                 # B(k, n) = B[k * sbk + n]
                     kk, nq = b.lshr(idx, C(5)), b.mul(b.and_(idx, C(31)), C(4))
+                    raw = [] if (not a_kc and epi_mode == 0) else None
                     regs.append(("Bt", nq, kk, load4(offs[1], p["B"], b.add(bn, nq), p["N"], b.add(k0, kk), k_end,
-                                                     True, p["sbk"])))
+                                                     True, p["sbk"], None, raw), raw))
             return regs
 
         def put(regs, buf):
-            for kind, r, c, hs in regs:
+            for kind, r, c, hs, *_ in regs:
                 if kind in ("A", "At"):
                     base = b.select(b.icmp_unsigned("==", buf, C(0)), A_BASE[0], A_BASE[1])
                 else:
@@ -1043,7 +1050,18 @@ def _tiled_module():
                     store_row4(b.add(base, b.add(b.mul(c, C(PADT)), r)), hs)
 
         accs = [[[var(F(0.0)) for _ in range(4)] for _ in range(4)] for _ in range(4)]
-        put(fetch(C(0)), C(0))
+        dbs = [var(F(0.0)) for _ in range(4)] if (not a_kc and not b_kc and epi_mode == 0) else None
+
+        def add_db(regs):
+            if dbs is None:
+                return
+            for r_ in regs:
+                if r_[0] == "Bt" and r_[4]:
+                    for j in range(4):
+                        b.store(b.fadd(b.load(dbs[j]), r_[4][j]), dbs[j])
+        first_regs = fetch(C(0))
+        add_db(first_regs)
+        put(first_regs, C(0))
         b.call(bar_f, [])
         it = var(C(0))
         head = fn.append_basic_block("head")
@@ -1096,11 +1114,19 @@ def _tiled_module():
                     for c in range(4):
                         b.store(b.extract_value(r, c), accs[mt][nt][c])
         with b.if_then(has_next):
+            add_db(regs)
             put(regs, b.and_(nxt, C(1)))
         b.call(bar_f, [])
         b.store(nxt, it)
         b.branch(head)
         b.position_at_end(done)
+        if dbs is not None:                           # the bias gradient: once per column, from the first row of tiles
+            nq = b.mul(b.and_(tid, C(31)), C(4))
+            with b.if_then(b.and_(b.icmp_unsigned("!=", p["want_db"], C(0)), b.icmp_unsigned("==", bm, C(0)))):
+                for j in range(4):
+                    col = b.add(bn, b.add(nq, C(j)))
+                    with b.if_then(b.icmp_unsigned("<", col, p["N"])):
+                        b.call(red, [b.ptrtoint(b.gep(p["DB"], [z64(col)], inbounds=True), i64), b.load(dbs[j])])
         split = b.icmp_unsigned(">", nz, C(1))
         first = b.icmp_unsigned("==", ctaz, C(0))
         for mt in range(4):

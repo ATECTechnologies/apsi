@@ -46,12 +46,21 @@ class _Ops:
     """Kernel launches in terms of (buffer, offset) views; sizes in float32 elements."""
 
     tc = False
+    _db = None
 
     def gemm(self, A, B, Cv, M, N, K, sam, sak, sbk, sbn, ldc, alpha=1.0, beta=False, bias=None, batch=(1, 1),
-             sa=(0, 0), sb=(0, 0), sc=(0, 0), passes=1, epi=0, X2=None, act=0, a_act=None, tmp=None):
+             sa=(0, 0), sb=(0, 0), sc=(0, 0), passes=1, epi=0, X2=None, act=0, a_act=None, tmp=None, db=None):
         """C = alpha A B (+ bias) (+ C), then epi: 1 X2 <- C, C <- act(C); 2 C <- C * act'(X2); 3 C <- C + X2.
         A kernel that can do epi in its last step does (one pass over C); otherwise a second kernel does it."""
         nb1, nb2 = batch
+        if db is not None:                               # + the column sums of B (dy) into db: the bias gradient
+            self._db = db
+            self.gemm(A, B, Cv, M, N, K, sam, sak, sbk, sbn, ldc, alpha, beta, bias, batch, sa, sb, sc, passes, epi,
+                      X2, act, a_act, tmp)
+            if self._db is not None:                     # the product did not take it: a pass of its own
+                self._db = None
+                self.colsum(B, None, None, None, None, db, K, N, 0)
+            return
         if a_act is not None:                            # A holds pre-activations: act(A) B
             if self._gemm(A, B, Cv, bias, M, N, K, sam, sak, sbk, sbn, ldc, nb1, nb2, sa, sb, sc, alpha, beta,
                           passes, a_act=a_act):
@@ -650,11 +659,14 @@ class Gpu(_Ops):
                     nz = -(-K // kchunk)
                     if nz > 1 and not beta:
                         self.fill(Cv, M * N, 0.0)
+            db = self._db if name.startswith("gemm_tmn") and sbn == 1 else None
             self._go(name, (tiles, nb1 * nb2, nz), 256, self.p(A), self.p(B), self.p(Cv), self.p(bias), ("u", M),
                      ("u", N), ("u", K), ("u", sam), ("u", sak), ("u", sbk), ("u", sbn), ("u", ldc), ("u", nb2),
                      ("u", sa[0]), ("u", sa[1]), ("u", sb[0]), ("u", sb[1]), ("u", sc[0]), ("u", sc[1]),
                      ("f", alpha), ("u", 1 if beta else 0), ("u", 1 if bias is not None else 0), ("u", kchunk),
-                     self.p(X2), ("u", epi), ("u", act))
+                     self.p(X2), ("u", epi), ("u", act), self.p(db), ("u", 1 if db is not None else 0))
+            if db is not None:
+                self._db = None                          # taken
             return True
         tiles = ((M + KS.TILE - 1) // KS.TILE) * ((N + KS.TILE - 1) // KS.TILE)
         args = (self.p(A), self.p(B), self.p(Cv), self.p(bias), ("u", M), ("u", N), ("u", K), ("u", sam),
@@ -782,14 +794,13 @@ class _Linear(_Node):
             dy = dh
         self.dh_given = False
         # dW[K, N] += x^T dy: A(k, m) = x[m * K + k]
+        db = self.b.g if self.b is not None else None   # the bias gradient comes with the weight gradient
         if self.x_pre is not None:                      # x = act(h): applied while the product reads h
             pre = self.x_pre
             o.gemm(pre.h, dy, self.W.g, K, N, M, 1, K, N, 1, N, beta=True, passes=self.net.passes, a_act=pre.act,
-                   tmp=(self.net.arena.get(("shared", "act"), M * K), M * K))
+                   tmp=(self.net.arena.get(("shared", "act"), M * K), M * K), db=db)
         else:
-            o.gemm(self.x, dy, self.W.g, K, N, M, 1, K, N, 1, N, beta=True, passes=self.net.passes)
-        if self.b is not None:
-            o.colsum(dy, None, None, None, None, self.b.g, M, N, 0)
+            o.gemm(self.x, dy, self.W.g, K, N, M, 1, K, N, 1, N, beta=True, passes=self.net.passes, db=db)
         if not need_dx:
             return None
         dx = self.gbuf("dx", M * K)
@@ -1023,8 +1034,7 @@ class _Attention(_Node):
         o, B, T, D, h = self.net.ops, self.B, self.T, self.D, self.h
         hd, M, ps = D // h, B * T, self.net.passes
         sc = 1.0 / math.sqrt(hd)
-        o.gemm(self.att, dy, self.Wo.g, D, D, M, 1, D, D, 1, D, beta=True, passes=ps)
-        o.colsum(dy, None, None, None, None, self.bo.g, M, D, 0)
+        o.gemm(self.att, dy, self.Wo.g, D, D, M, 1, D, D, 1, D, beta=True, passes=ps, db=self.bo.g)
         datt = self.gbuf("datt", M * D)
         o.gemm(dy, self.Wo.w, datt, M, D, D, D, 1, 1, D, D, passes=ps)
         if self.fused:
@@ -1249,12 +1259,25 @@ def fit(model, params, X, y=None, loss="mse", opt=None, epochs=10, batch_size=No
     Yd = net.arena.get("Y", min(bs, n) * yw)
     # the whole data set on the card when it is small next to the card (one copy, then each batch is gathered
     # there from a permutation uploaded once an epoch: no copy from the processor inside an epoch)
+    E = int(epochs)
+    orders = [rng.permutation(n) if batch_size else np.arange(n) for _ in range(E)]
     resident = (Xa.nbytes + Ya.nbytes) < min(1 << 30, getattr(ops, "budget", 1 << 30))
-    if resident:
-        XA, YA, IDX = ops.alloc(Xa.size), ops.alloc(Ya.size), ops.alloc(n)
+    if resident:                 # the data and every epoch's order go to the card once: nothing waits between epochs
+        XA, YA, IDX = ops.alloc(Xa.size), ops.alloc(Ya.size), ops.alloc(max(1, n * E))
         ops.put(XA, Xa.reshape(-1))
         ops.put(YA, Ya.reshape(-1))
+        if E:
+            ops.put(IDX, np.concatenate(orders).astype(np.int32))
         net.owned += [XA, YA, IDX]
+    LOSSE = ops.alloc(max(1, E))                             # one loss per epoch, read once at the end
+    ops.fill((LOSSE, 0), max(1, E), 0.0)
+    net.owned.append(LOSSE)
+    marks = []                                               # the end of each epoch on the card's own clock
+    can_mark = hasattr(ops, "_event") and not isinstance(ops, Emulator)
+    if can_mark:
+        e0 = ops._event()
+        ops._lib.cuEventRecord(e0, None)
+        marks.append(e0)
     history, val_hist, step = [], [], 0
     from . import thermal
     gov = thermal.governor(getattr(ops, "dev", None))        # keeps the card near APSI_GPU_TEMP (77 C)
@@ -1262,17 +1285,15 @@ def fit(model, params, X, y=None, loss="mse", opt=None, epochs=10, batch_size=No
     wd = float(getattr(opt, "wd", 0.0)) if isinstance(opt, AdamW) else 0.0
     ep_seconds, ep_temp, ep_t0 = [], [], time.perf_counter()
     try:
-        for ep in range(int(epochs)):
-            order = rng.permutation(n) if batch_size else np.arange(n)
-            ops.fill((net.LOSS, 0), 1, 0.0)
-            if resident:
-                ops.put(IDX, order.astype(np.int32))
+        for ep in range(E):
+            order = orders[ep]
+            lossv = (LOSSE, ep)
             for s in range(0, n, bs):
                 b = order[s:s + bs]
                 xb, yb = Xa[b], Ya[b]
                 if resident:
-                    ops.gather((XA, 0), (IDX, 0), Xd, len(b), xw, s)
-                    ops.gather((YA, 0), (IDX, 0), Yd, len(b), yw, s)
+                    ops.gather((XA, 0), (IDX, 0), Xd, len(b), xw, ep * n + s)
+                    ops.gather((YA, 0), (IDX, 0), Yd, len(b), yw, ep * n + s)
                 else:
                     ops.put(Xd[0], xb.reshape(-1))
                     ops.put(Yd[0], yb.reshape(-1))
@@ -1288,10 +1309,10 @@ def fit(model, params, X, y=None, loss="mse", opt=None, epochs=10, batch_size=No
                     w = 1.0 / max(valid, 1)
                     if yb.size != rows:
                         raise TrainError(f"cross_entropy: {yb.size} labels for {rows} rows of logits")
-                    ops.ce(out, Yd, dout, (net.LOSS, 0), rows, shape[-1], w, w * len(b) / n)
+                    ops.ce(out, Yd, dout, lossv, rows, shape[-1], w, w * len(b) / n)
                 else:
                     m = rows * shape[-1]
-                    ops.mse(out, Yd, dout, (net.LOSS, 0), m, 1.0 / m, len(b) / (n * m))
+                    ops.mse(out, Yd, dout, lossv, m, 1.0 / m, len(b) / (n * m))
                 net.backward(dout)
                 if clip:
                     ops.fill((SQ, 0), 1, 0.0)
@@ -1306,19 +1327,33 @@ def fit(model, params, X, y=None, loss="mse", opt=None, epochs=10, batch_size=No
                             float(clip or 0.0))
                 step += 1
                 gov.tick(ops.sync)
-            history.append(float(ops.get(net.LOSS, 1)[0]))          # the one wait of the epoch
-            now = time.perf_counter()
-            ep_seconds.append(round(now - ep_t0, 3))
-            ep_t0 = now
+            if can_mark:
+                ev = ops._event()
+                ops._lib.cuEventRecord(ev, None)
+                marks.append(ev)
+            else:
+                now = time.perf_counter()
+                ep_seconds.append(round(now - ep_t0, 3))
+                ep_t0 = now
             st = gov.status()
             ep_temp.append(st.get("temperature_c") if st else None)
+            show = verbose and (ep % max(1, E // 10) == 0 or ep == E - 1)
             extra = ""
-            if val is not None:
+            if val is not None:                             # (these wait for the card; without them nothing does)
                 vl = _eval_loss(net, ops, val, ids, ce, bs)
                 val_hist.append(vl)
                 extra = f"  val {vl:.5f}"
-            if verbose and (ep % max(1, int(epochs) // 10) == 0 or ep == int(epochs) - 1):
-                print(f"epoch {ep:4}  loss {history[-1]:.5f}{extra}")
+            if show:
+                print(f"epoch {ep:4}  loss {float(ops.get(LOSSE, 1, ep)[0]):.5f}{extra}")
+        history = [float(v) for v in ops.get(LOSSE, max(1, E))[:E]]
+        if can_mark:
+            ops.sync()
+            ms = ctypes.c_float()
+            for a_, b_ in zip(marks, marks[1:]):
+                ops._lib.cuEventElapsedTime(ctypes.byref(ms), a_, b_)
+                ep_seconds.append(round(ms.value / 1000.0, 3))
+            for e_ in marks:
+                ops._lib.cuEventDestroy_v2(e_)
         opt.t = t_step
         peak = ops.used
         out_params = net.params()

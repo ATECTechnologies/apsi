@@ -234,6 +234,15 @@ class RealGpu(unittest.TestCase):
                 dv.gemm(Hm[i], Dy[i], Wg[i], K, N, M, 1, K, N, 1, N, a_act=act, tmp=(tmp[i], M * K))
             a, b_ = g.get(Wg[0][0], K * N), e.get(Wg[1][0], K * N)
             self.assertLess(np.abs(a - b_).max() / (np.abs(b_).max() + 1e-9), 3e-3, ("a_act", act))
+        # the bias gradient taken by the weight-gradient product (and split k with it)
+        for Mx in (512, 4096):
+            Xm, Dy2 = pair(rng.normal(size=(Mx, K))), pair(rng.normal(size=(Mx, N)))
+            Wg2, db = pair(np.zeros((K, N))), pair(np.zeros(N))
+            for dv, i in ((g, 0), (e, 1)):
+                dv.gemm(Xm[i], Dy2[i], Wg2[i], K, N, Mx, 1, K, N, 1, N, beta=True, db=db[i])
+            for view, size, what in ((Wg2, K * N, "dW"), (db, N, "db")):
+                a, b_ = g.get(view[0][0], size), e.get(view[1][0], size)
+                self.assertLess(np.abs(a - b_).max() / (np.abs(b_).max() + 1e-9), 3e-3, (what, Mx))
         # attention heads: batched, offsets inside the rows
         Bh, T, hd, H = 2, 128, 64, 3
         D = H * hd
