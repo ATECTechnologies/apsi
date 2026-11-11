@@ -1821,9 +1821,11 @@ def cmd_convert(args):
     total_warn = 0
     done = set()
     written = []
-    queue = list(jobs)
+    queue = [(a, b, False) for a, b in jobs]
+    packages = {}                                   # program folder -> Packages (libraries converted with it)
+    convert_libs = not getattr(args, "no_packages", False) and not args.stdout
     while queue:
-        src, dst = queue.pop(0)
+        src, dst, vendored = queue.pop(0)
         key = os.path.abspath(src)
         if key in done:
             continue
@@ -1839,8 +1841,17 @@ def cmd_convert(args):
                 if gaps:                                   # never leave a line out: exact mode converts everything
                     exact_why = gaps
             if not idiomatic or exact_why:
-                from .pyconvert import convert_source as faithful
-                text, warns, deps = faithful(code, src)
+                from .pyconvert import convert_source as faithful, Packages
+                pk = None
+                if convert_libs:
+                    if vendored:
+                        pk = vendored
+                    else:
+                        out_dir0 = os.path.dirname(os.path.abspath(dst))
+                        pk = packages.setdefault(out_dir0, Packages(os.path.dirname(os.path.abspath(src)),
+                                                                    os.path.join(out_dir0, "apsi_packages")))
+                text, warns, deps = faithful(code, src, packages=pk, out_path=os.path.abspath(dst),
+                                             vendored=bool(vendored))
                 if exact_why:
                     first = ", ".join(f"line {ln}: {why}" for ln, why in exact_why[:3])
                     more = f" and {len(exact_why) - 3} more" if len(exact_why) > 3 else ""
@@ -1853,13 +1864,18 @@ def cmd_convert(args):
         # modules next to the program are converted with it (unless written already and newer)
         if not args.stdout:
             out_dir = os.path.dirname(os.path.abspath(dst))
-            for dep in sorted(deps):
-                rel = os.path.relpath(dep, os.path.dirname(os.path.abspath(src)))
-                ddst = os.path.splitext(os.path.join(out_dir, rel))[0] + ".apsi"
+            for dep in sorted(deps, key=lambda d: d if isinstance(d, str) else d[0]):
+                if isinstance(dep, tuple):                 # a module of a library, converted into apsi_packages/
+                    dep, ddst = dep
+                    lib = pk
+                else:
+                    rel = os.path.relpath(dep, os.path.dirname(os.path.abspath(src)))
+                    ddst = os.path.splitext(os.path.join(out_dir, rel))[0] + ".apsi"
+                    lib = vendored                         # a sibling inside a library stays a library module
                 if os.path.abspath(dep) not in done and not (
                         _up_to_date(ddst, dep)
                         and not any(os.path.abspath(j[0]) == os.path.abspath(dep) for j in jobs)):
-                    queue.append((dep, ddst))
+                    queue.append((dep, ddst, lib))
         total_warn += len(warns)
         if args.stdout:
             sys.stdout.write(text)
@@ -1873,10 +1889,19 @@ def cmd_convert(args):
             os.makedirs(os.path.dirname(os.path.abspath(dst)), exist_ok=True)
             with open(dst, "w", encoding="utf-8", newline="\n") as fh:
                 fh.write(text)
-        written.append((src, dst, text, warns))
+        written.append((src, dst, text, warns, bool(vendored)))
     out = sys.stderr if args.stdout else sys.stdout
-    for src, dst, text, warns in written:
+    libs = {}
+    for src, dst, text, warns, is_lib in written:
         problems = [] if args.no_check else _check(text, dst)
+        if is_lib:
+            top = os.path.relpath(dst, os.path.join(os.path.dirname(dst).split("apsi_packages")[0], "apsi_packages"))
+            name = top.replace(os.sep, "/").split("/")[0].removesuffix(".apsi")
+            libs.setdefault(name, [0, 0])
+            libs[name][0] += 1
+            libs[name][1] += len(problems)
+            if not problems:
+                continue                                   # libraries: one summary line each, below
         mark = "✓" if not problems else "!"
         notes = {}
         for line, msg in warns:
@@ -1896,13 +1921,33 @@ def cmd_convert(args):
         need = _permissions_needed(text)
         if need:
             print(f"    run with {need}", file=out)
+    for pk in packages.values():
+        pk.copy_data()
+    for name, (n, bad) in sorted(libs.items()):
+        print(f"{'✓' if not bad else '!'} library {name}: {n} module{'s' if n != 1 else ''} converted into "
+              f"apsi_packages/{name}{f' ({bad} with check errors)' if bad else ''}", file=out)
+    import re as _re
+    compiled = sorted({m.group(1) for w in written if not w[4] for _l, msg in w[3]
+                       for m in [_re.match(r"'([\w.]+)' is a compiled", msg)] if m})
+    missing = sorted({m.group(1) for w in written if not w[4] for _l, msg in w[3]
+                      for m in [_re.match(r"'([\w.]+)' is not installed", msg)] if m})
+    if compiled:
+        print(f"  compiled libraries kept as Python imports (C/C++ code cannot be converted): {', '.join(compiled)}",
+              file=out)
+    if missing:
+        print(f"  not installed where the conversion looked (program's .venv, this Python), kept as Python imports: "
+              f"{', '.join(missing)}", file=out)
     if args.run and status == 0 and len(jobs) == 1 and written:
         from .cli import main as apsi_main
         text = written[0][2]
         perms = ["--allow-python=all"] if "pyimport(" in text or "pyfrom(" in text else []
         return apsi_main(["run", written[0][1]] + perms)
+    progs = [w for w in written if not w[4]]
     if len(written) > 1:
-        print(f"\nconverted {len(written)} files, {total_warn} notes", file=out)
+        nlib = len(written) - len(progs)
+        print(f"\nconverted {len(progs)} file{'s' if len(progs) != 1 else ''}"
+              f"{f' and {nlib} library module' + ('s' if nlib != 1 else '') if nlib else ''}, "
+              f"{sum(len(w[3]) for w in progs)} notes", file=out)
     return status
 
 
@@ -1914,6 +1959,9 @@ def add_parser(sub):
     p.add_argument("--run", action="store_true", help="run the result (single file) when it checks cleanly")
     p.add_argument("--no-check", action="store_true", help="do not run the Apsi checker on the result")
     p.add_argument("--force", action="store_true", help="overwrite .apsi files that were not made by apsi convert")
+    p.add_argument("--no-packages", action="store_true",
+                   help="keep installed libraries as Python imports instead of converting the pure-Python ones "
+                        "into apsi_packages/ next to the program")
     p.add_argument("--idiomatic", action="store_true",
                    help="map numpy/math/torch onto Apsi's own built-ins and structs (small numeric scripts); the "
                         "default keeps Python's exact semantics with `use pycompat`")

@@ -60,7 +60,7 @@ fn energy(x, v, k: Float) -> Float:
 | Units (`9.81[m/s^2]`, `5km`) | a library, checked at run time | part of the language, checked before running |
 | Tensor shapes | found when the program crashes | `fn f[B, T](x: Tensor[B, T])` names the wrong dimension before running |
 | Speed of numeric loops | interpreter | `@native`: LLVM machine code, next to C and Rust on the [benchmarks](https://apsi.dev/benchmarks) |
-| Existing Python code | — | `apsi convert` turns it into Apsi that behaves byte for byte the same |
+| Existing Python code | — | `apsi convert` turns it, and the libraries written in Python it uses, into Apsi that behaves byte for byte the same |
 | Permissions | a script can read any file and open any socket | files, network and Python modules are off until you allow them |
 | Built in | — | autodiff, layers, RL, real-time loops, tables, PostgreSQL / MySQL / MongoDB / Redis, an HTTP and WebSocket server |
 

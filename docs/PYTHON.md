@@ -27,7 +27,56 @@ converted 5 files, 0 notes
 ```
 
 Modules that sit next to the program (`import GLA`, `from gla_brain_dual import X`, packages with `__init__.py`,
-`from . import x`) are converted with it and imported as Apsi files; everything else is loaded from Python.
+`from . import x`) are converted with it and imported as Apsi files, and so are the installed libraries it imports
+that are written in Python (next section).
+
+## Libraries: what converts and what does not
+
+Python is needed only while converting. What `apsi convert` produces runs on Apsi.
+
+**Converted completely — your code and every library written in Python.** The libraries a program imports are
+looked up in the program's virtual environment (`.venv` or `venv` next to it, made with **any** Python version:
+3.8 … 3.14, free-threaded too) and in the Python running the conversion. A library made only of Python files —
+`requests`, `urllib3`, `idna`, `certifi`, `pyyaml`'s pure part, most of PyPI — is converted into Apsi with the
+program, into `apsi_packages/` next to it, together with its data files (certificates, tables, templates) and its
+version information:
+
+```text
+✓ fetch.py → fetch.apsi  (0 notes)
+✓ library certifi: 2 modules converted into apsi_packages/certifi
+✓ library idna: 6 modules converted into apsi_packages/idna
+✓ library requests: 18 modules converted into apsi_packages/requests
+✓ library urllib3: 36 modules converted into apsi_packages/urllib3
+
+converted 1 file and 62 library modules, 0 notes
+```
+
+The converted program then runs without that environment and without `pip`: copy the folder (program plus
+`apsi_packages/`) to any computer with Apsi and `apsi run fetch.apsi`. Imports done at run time
+(`importlib.import_module`, `__import__`), `importlib.resources` and `importlib.metadata` find the converted
+libraries too. `--no-packages` keeps them as Python imports instead.
+
+**Not converted — libraries made of compiled code (C, C++, Rust).** `numpy`, `pyarrow`, `torch`, `pandas`,
+`tokenizers` and similar ship machine code (`.pyd` / `.so` files), not Python; there is nothing to translate. Such
+an import stays a Python import (`pyimport`), the conversion notes name it, and the program needs that library
+installed for Apsi's Python to use it. Where Apsi has its own tool for the same job, the note names it, so the part
+that matters can be rewritten on Apsi alone:
+
+| compiled library | Apsi's own tool |
+|---|---|
+| `numpy` | tensors (`apsi convert --idiomatic` maps small numeric scripts onto them) |
+| `torch`, `tensorflow`, `jax` | layers and `fit()`, GPU training without PyTorch ([AI](AI.md), [GPU](GPU.md)) |
+| `transformers` | `use hub`: models from Hugging Face without Python ([Hub](HUB.md)) |
+| `datasets`, `pyarrow` | `use hub` (`hub.download(repo, file, kind="dataset")`), `use data`, `use dataframe` (CSV, JSON, Parquet) |
+| `pandas`, `polars` | `use dataframe` ([DataFrame](DATAFRAME.md)) |
+| `scipy` | the `sci` built-ins (integrate, minimize, fft, curve_fit) ([Science](SCIENCE.md)) |
+| `requests` (when kept), `aiohttp` | `use web` (`http_get`, `http_post_json`) |
+| `safetensors` | `use models` ([model files](MODEL-FILES.md)) |
+
+**So, for data collection and AI training programs** — the ones that lean on `datasets`, `pyarrow`, `torch` and
+`transformers` — the conversion is complete for the program's own logic and its pure-Python libraries, and partial
+for the compiled ones: those keep running through Python until that part uses Apsi's tools above. `--idiomatic`
+does that rewrite automatically for numeric and PyTorch model code; for the rest the notes say which tool to use.
 
 ## How exact is exact?
 
@@ -95,7 +144,9 @@ Apsi's sandbox stays on. Without any flag a converted program can use:
   `array.tofile`) are not there
 * `open()` checked against `--allow-read` / `--allow-write`
 
-Other libraries need `--allow-python` (for example `torch`, `scipy`, `pandas`), and libraries that reach the operating
+Libraries converted into `apsi_packages/` are Apsi files and follow the same rules (a converted `requests` uses
+`socket` and `ssl`, so a program using it runs with `--allow-python=all`). Compiled
+libraries kept as Python imports need `--allow-python` (for example `torch`, `scipy`, `pandas`), and libraries that reach the operating
 system or the network (`subprocess`, `socket`, `http`, `ctypes`, `multiprocessing`, `shutil` …) need
 `--allow-python=all`; with `=all` every module is the real one and nothing is filtered. `apsi convert` prints the flag
 a file needs, and `apsi run` says so when one is missing:

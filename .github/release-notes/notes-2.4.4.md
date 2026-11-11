@@ -17,6 +17,10 @@
   a 12 GB card.
 
 ### Python conversion: exact, complete
+- **Libraries come along:** the installed libraries a program imports that are written in Python (`requests`,
+  `urllib3`, `idna`, `certifi` …) are converted with it into `apsi_packages/`, from the program's `.venv` of any
+  Python version. The result runs on Apsi alone: no venv, no `pip`. Compiled libraries (C/C++: `numpy`, `pyarrow`,
+  `torch` …) cannot be translated: they stay Python imports and the notes name Apsi's own tool for the job.
 - **`apsi convert` keeps Python's semantics byte for byte.** Converted files start with `use pycompat`, which gives
   them Python's object model, scoping and built-ins. Real classes (inheritance from any library class, metaclasses,
   descriptors, `__slots__`, `__init_subclass__`, `__class_getitem__`, name mangling of `__private` names),

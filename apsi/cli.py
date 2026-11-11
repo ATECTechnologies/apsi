@@ -187,13 +187,9 @@ def cmd_run(args):
             vals = _parse_env(fh.read())
         it.env_file_values = vals
         it.modules["env"]["values"].update(vals)
+    # a .venv next to the program is not used by itself: `apsi convert` turns the libraries written in Python into
+    # Apsi (apsi_packages/), so a converted program runs on Apsi alone; --venv DIR still adds one on request
     venv = getattr(args, "venv", None)
-    if venv is None and args.file and args.file != "-":
-        for cand in (".venv", "venv"):
-            d = os.path.join(os.path.dirname(os.path.abspath(args.file)), cand)
-            if os.path.isfile(os.path.join(d, "pyvenv.cfg")):
-                venv = d
-                break
     if venv:
         from .envfile import find_venv_site, venv_mismatch
         why = venv_mismatch(venv)

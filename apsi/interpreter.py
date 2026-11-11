@@ -534,8 +534,46 @@ class Interpreter:
             d = nd
         return ".".join(parts) or stem
 
+    def _library_finder(self, path):
+        """Python's own imports (__import__, importlib.import_module) of a library converted into apsi_packages/
+        load its .apsi modules, so code that imports by name at run time finds the converted library."""
+        parts = path.split(os.sep)
+        if "apsi_packages" not in parts:
+            return
+        root = os.sep.join(parts[:len(parts) - parts[::-1].index("apsi_packages")])
+        import sys as _sys
+        if any(getattr(f, "apsi_root", None) == root for f in _sys.meta_path):
+            return
+        interp = self
+
+        class _Finder:
+            apsi_root = root
+
+            def find_spec(self, name, target_path=None, target=None):
+                import importlib.machinery
+                base = os.path.join(root, *name.split("."))
+                for cand in (base + ".apsi", os.path.join(base, "__init__.apsi")):
+                    if os.path.isfile(cand):
+                        return importlib.machinery.ModuleSpec(name, _Loader(cand), origin=cand,
+                                                              is_package=cand.endswith("__init__.apsi"))
+                return None
+
+        class _Loader:
+            def __init__(self, file):
+                self.file = file
+
+            def create_module(self, spec):
+                interp.import_compiled(self.file)
+                return _sys.modules.get(spec.name)
+
+            def exec_module(self, module):
+                pass
+
+        _sys.meta_path.insert(0, _Finder())
+
     def import_compiled(self, path):
         path = os.path.normpath(path)
+        self._library_finder(os.path.abspath(path))
         if path not in self.module_cache:
             import sys as _sys
             stem = os.path.splitext(os.path.basename(path))[0]

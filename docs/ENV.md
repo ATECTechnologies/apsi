@@ -50,11 +50,11 @@ config.save("runs/42/config.toml", cfg)          # exactly what this run used
 
 ```bash
 apsi run app.apsi --venv .venv          # pyimport() uses the packages installed in that venv
-apsi run app.apsi                        # a .venv or venv folder next to the program is found automatically
 ```
 
-The venv's `site-packages` are put first on the import path for `pyimport`/`pyfrom` and converted programs. The
-venv's Python version must match the one Apsi runs on (Apsi says so when it does not).
+A venv is used only when `--venv` names it. A program made by `apsi convert` does not need one: the libraries it
+imports that are written in Python were converted to Apsi with it (`apsi_packages/` next to the program), so it
+runs on Apsi alone. The venv's Python version must match the one Apsi runs on (Apsi says so when it does not).
 
 ## Reference (`use env`)
 

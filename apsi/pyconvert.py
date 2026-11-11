@@ -252,7 +252,10 @@ def analyse(body, params=()):
 
 # ------------------------------------------------------------------------------------------------ converter
 class Converter:
-    def __init__(self, source, filename="<python>", base_dir=None):
+    def __init__(self, source, filename="<python>", base_dir=None, packages=None, out_path=None, vendored=False):
+        self.vendored = vendored            # a module of a converted library: absolute imports never mean a sibling
+        self.packages = packages            # a Packages: pure-Python libraries are converted with the program
+        self.out_path = out_path            # where this module's .apsi is written (paths to converted libraries)
         self.source = source
         self.filename = filename
         self.base_dir = base_dir or (os.path.dirname(os.path.abspath(filename)) if filename and
@@ -268,6 +271,7 @@ class Converter:
         self.needs_python = False
         self.in_loop = 0
         self.local_modules = set()
+        self.pkg_sources = {}               # .apsi path of a converted library -> its Python source
         self.renames = {}
 
     # -------------------------------------------------------------------------------- output helpers
@@ -740,6 +744,8 @@ class Converter:
         """The .apsi path of a module that sits next to the program (converted with it), or None."""
         if not module and not level:
             return None
+        if self.vendored and not level:
+            return None
         base = self.base_dir
         for _ in range(max(0, level - 1)):
             base = os.path.dirname(base)
@@ -751,6 +757,28 @@ class Converter:
                 return os.path.relpath(os.path.join(base, apsi), self.base_dir).replace(os.sep, "/")
         return None
 
+    def _package(self, module, node=None):
+        """The .apsi path (from this module) of an installed pure-Python library that is converted with the
+        program, or None (standard library, compiled libraries, not found)."""
+        if not module or self.packages is None or self.out_path is None:
+            return None
+        hit = self.packages.resolve(module)
+        if hit is None:
+            top = module.split(".")[0]
+            kind = self.packages.kind(top)
+            if kind == "compiled" and node is not None:
+                self.warn(node, f"'{top}' is a compiled (C/C++) library: used as is through "
+                                f"Python{self.packages.hint(top)}")
+            elif kind is None and node is not None and not self._local(top):
+                self.warn(node, f"'{top}' is not installed in the program's .venv or the converting Python, so it "
+                                f"was not converted; it stays a Python import{self.packages.hint(top)}")
+            return None
+        src, dst = hit
+        self.local_modules.add((src, dst))
+        rel = os.path.relpath(dst, os.path.dirname(os.path.abspath(self.out_path))).replace(os.sep, "/")
+        self.pkg_sources[rel] = src
+        return rel
+
     def _bind(self, name, value, ind):
         if self._binds_new(name):
             self.scope.declared.add(name)
@@ -761,6 +789,8 @@ class Converter:
     def s_Import(self, s, ind):
         for a in s.names:
             local = self._local(a.name)
+            if local is None and (a.asname or "." not in a.name):
+                local = self._package(a.name, s)
             if local is not None:
                 alias = a.asname or a.name.split(".")[0]
                 if a.asname or "." not in a.name:
@@ -785,6 +815,10 @@ class Converter:
         if s.module == "__future__":
             return
         local = self._local(s.module, s.level) if (s.level or s.module) else None
+        pkg_mode = False
+        if local is None and not s.level and s.module:
+            local = self._package(s.module, s)
+            pkg_mode = local is not None
         if s.level and local is None and s.module is None:
             # from . import x  → each x is a module next to this one
             for a in s.names:
@@ -803,7 +837,8 @@ class Converter:
                     for n in self._public_names_local(local):
                         self._bind(n, f"{tmp}.{n}", ind)
                     continue
-                sub = self._local(f"{s.module}.{a.name}") if s.module else None
+                sub = (self._package(f"{s.module}.{a.name}") if pkg_mode
+                       else self._local(f"{s.module}.{a.name}", s.level) if s.module else None)
                 if sub is not None and not self._defines(local, a.name):
                     self.emit(f'import "{sub}" as {self.name(a.asname or a.name)}', ind)
                     self.scope.declared.add(a.asname or a.name)
@@ -849,13 +884,15 @@ class Converter:
             self.emit(f"{targets} = pystar({q(module)}, {', '.join(q(n) for n in chunk)})", ind)
 
     def _public_names_local(self, apsi_rel):
+        if apsi_rel in self.pkg_sources:
+            return _public_names_file(self.pkg_sources[apsi_rel]) or []
         py = os.path.join(self.base_dir, apsi_rel[:-5] + ".py")
         if os.path.basename(py) == "__init__.py" or not os.path.exists(py):
             py = os.path.join(self.base_dir, apsi_rel[:-5], "__init__.py") if not os.path.exists(py) else py
         return _public_names_file(py) or []
 
     def _defines(self, apsi_rel, name):
-        py = os.path.join(self.base_dir, apsi_rel[:-5] + ".py")
+        py = self.pkg_sources.get(apsi_rel) or os.path.join(self.base_dir, apsi_rel[:-5] + ".py")
         try:
             tree = ast.parse(open(py, encoding="utf-8").read())
         except (OSError, SyntaxError):
@@ -1223,8 +1260,146 @@ def _pattern_names(p):
     return out
 
 
-def convert_source(source, filename="<python>", base_dir=None):
-    """Convert Python source; returns (apsi_text, warnings, local_modules)."""
-    c = Converter(source, filename, base_dir)
+def convert_source(source, filename="<python>", base_dir=None, packages=None, out_path=None, vendored=False):
+    """Convert Python source; returns (apsi_text, warnings, local_modules). local_modules holds the paths of
+    modules next to the program, and (source, destination) pairs for converted libraries."""
+    c = Converter(source, filename, base_dir, packages, out_path, vendored)
     text = c.convert()
     return text, c.warnings, c.local_modules
+
+
+# ------------------------------------------------------------------------------------------------ installed libraries
+# Libraries written in Python are converted to Apsi with the program (into apsi_packages/ next to it), so the result
+# runs without the Python environment it came from. Libraries with compiled code (C, C++, Rust: numpy, pyarrow,
+# torch …) cannot be converted; they stay pyimport() and the conversion notes say so, with Apsi's own tool for the
+# job when there is one.
+_EQUIVALENT = {
+    "numpy": "Apsi tensors (`apsi convert --idiomatic` maps small numeric scripts onto them)",
+    "torch": "Apsi layers and fit() (`apsi convert` turns torch.nn models into Apsi models)",
+    "tensorflow": "Apsi layers and fit()",
+    "jax": "Apsi tensors and grad()",
+    "pandas": "`use dataframe`",
+    "polars": "`use dataframe`",
+    "pyarrow": "`use dataframe` (CSV, JSON, Parquet)",
+    "datasets": "`use hub` (hub.download(repo, file, kind=\"dataset\")) and `use data`",
+    "transformers": "`use hub` (hub.model(...): models from Hugging Face without Python)",
+    "huggingface_hub": "`use hub` (hub.download, hub.model: Hugging Face without Python)",
+    "hf_transfer": "`use hub` (parallel, resumable downloads)",
+    "safetensors": "`use models` (safetensors files)",
+    "scipy": "Apsi's `sci` built-ins (integrate, minimize, fft, curve_fit)",
+    "sklearn": "Apsi layers and `use data`",
+    "requests": "`use web` (http_get / http_post_json)",
+    "aiohttp": "`use web`",
+    "PIL": "`use video` / image functions",
+    "cv2": "`use video`",
+}
+
+
+class Packages:
+    """Finds the installed libraries a program imports: in the program's virtual environment (any Python version)
+    and in the Python running the conversion."""
+
+    def __init__(self, program_dir, vendor_dir):
+        import sys
+        import sysconfig
+        self.vendor_dir = vendor_dir
+        roots = []
+        for cand in (".venv", "venv", "env"):
+            v = os.path.join(program_dir, cand)
+            if os.path.isfile(os.path.join(v, "pyvenv.cfg")):
+                import glob
+                roots += glob.glob(os.path.join(v, "Lib", "site-packages"))
+                roots += glob.glob(os.path.join(v, "lib", "python3*", "site-packages"))
+        roots += [p for p in sys.path if p.rstrip("\\/").endswith(("site-packages", "dist-packages"))]
+        self.roots = [r for i, r in enumerate(roots) if os.path.isdir(r) and r not in roots[:i]]
+        std = getattr(sys, "stdlib_module_names", None) or set()
+        # names of newer Python versions' standard library count as standard too (a 3.14 program on Apsi's 3.12)
+        self.stdlib = set(std) | {"__future__", "pycompat", "annotationlib", "compression", "_typeshed", "tomllib",
+                                  "zoneinfo", "graphlib"}
+        self.stdlib_dir = os.path.normcase(sysconfig.get_paths().get("stdlib", ""))
+        self._kind = {}
+        self.used = set()                   # top-level libraries converted
+
+    def copy_data(self):
+        """The data files of the converted libraries (certificates, tables, templates …) and their .dist-info
+        (versions for importlib.metadata) next to the converted modules."""
+        import shutil
+        n = 0
+        for top in sorted(self.used):
+            root, path = self._find(top)
+            if os.path.isdir(path):
+                for d, dirs, files in os.walk(path):
+                    dirs[:] = [x for x in dirs if x not in ("__pycache__", "tests", "test")]
+                    for f in files:
+                        if f.endswith((".py", ".pyc", ".pyo", ".pyi")):
+                            continue
+                        src = os.path.join(d, f)
+                        dst = os.path.join(self.vendor_dir, os.path.relpath(src, root))
+                        if not os.path.exists(dst) or os.path.getmtime(dst) < os.path.getmtime(src):
+                            os.makedirs(os.path.dirname(dst), exist_ok=True)
+                            shutil.copy2(src, dst)
+                            n += 1
+            for entry in os.listdir(root):
+                if entry.endswith(".dist-info") and entry.split("-")[0].lower().replace("_", "-") == \
+                        top.lower().replace("_", "-"):
+                    dst = os.path.join(self.vendor_dir, entry)
+                    if not os.path.exists(dst):
+                        shutil.copytree(os.path.join(root, entry), dst, ignore=shutil.ignore_patterns("RECORD"))
+        return n
+
+    def _find(self, top):
+        """(root, path of the package folder or module file) for an importable top-level name, or None."""
+        for r in self.roots:
+            d = os.path.join(r, top)
+            if os.path.isfile(os.path.join(d, "__init__.py")):
+                return r, d
+            f = os.path.join(r, top + ".py")
+            if os.path.isfile(f):
+                return r, f
+            if os.path.isdir(d) and any(n.endswith(".py") for n in os.listdir(d)):   # namespace package
+                return r, d
+        return None
+
+    def kind(self, top):
+        """'pure', 'compiled', 'stdlib' or None (not installed where the program's code could find it)."""
+        if top in self._kind:
+            return self._kind[top]
+        k = None
+        if top in self.stdlib:
+            k = "stdlib"
+        else:
+            hit = self._find(top)
+            if hit is None:
+                for r in self.roots:                                    # a compiled single module (top.pyd / .so)
+                    if any(n.startswith(top + ".") and n.endswith((".pyd", ".so")) for n in os.listdir(r)):
+                        k = "compiled"
+                        break
+            elif os.path.isfile(hit[1]):
+                k = "pure"
+            else:
+                k = "pure"
+                for _root, _dirs, files in os.walk(hit[1]):
+                    if any(f.endswith((".pyd", ".so", ".dll", ".dylib")) for f in files):
+                        k = "compiled"
+                        break
+        self._kind[top] = k
+        return k
+
+    def hint(self, top):
+        eq = _EQUIVALENT.get(top)
+        return f"; Apsi's own tool for this: {eq}" if eq else ""
+
+    def resolve(self, module):
+        """(source .py, destination .apsi) for a module of a pure-Python library, or None."""
+        top = module.split(".")[0]
+        if self.kind(top) != "pure":
+            return None
+        root, path = self._find(top)
+        self.used.add(top)
+        rest = module.split(".")[1:]
+        base = os.path.join(root, *([top] + rest))
+        for cand in (base + ".py", os.path.join(base, "__init__.py")):
+            if os.path.isfile(cand):
+                rel = os.path.relpath(cand, root)
+                return cand, os.path.join(self.vendor_dir, os.path.splitext(rel)[0] + ".apsi")
+        return None

@@ -620,6 +620,17 @@ Development started on **Sunday, 8 November 2026 at about 04:00** (Bangkok time,
 - **JetBrains** TextMate bundle, **Helix**, **Zed** and **Emacs** (`apsi-mode`) configurations
 - `tools/build_editors.py` keeps the Sublime/TextMate grammar and snippets identical to the VS Code ones
 
+### Python conversion: libraries come along
+- `apsi convert` converts the installed libraries a program imports that are written in Python (found in the
+  program's `.venv` of any Python version, or in the converting Python) into `apsi_packages/` next to it, with their
+  data files and `.dist-info`; the result runs on Apsi alone. Dynamic imports, `importlib.resources` and
+  `importlib.metadata` find the converted libraries. Verified with `requests` + `urllib3` + `idna` + `certifi`
+  (63 modules) against a local HTTP server with the real libraries blocked. `--no-packages` keeps Python imports.
+- Libraries of compiled code (C, C++, Rust) stay Python imports; the notes say so and name Apsi's own tool for the
+  job; libraries that are not installed are listed once
+- `apsi run` no longer uses a `.venv` next to the program by itself (only `--venv DIR`)
+- `from .pkg import submodule` inside a package converts to the submodule (relative level kept)
+
 ### VS Code extension
 - `apsi run` does not mix in a `.venv` of another Python version or build (for example a free-threaded 3.14 venv
   under Apsi's 3.12): its compiled packages cannot load there ("No module named 'pyarrow.lib'"); it says so and

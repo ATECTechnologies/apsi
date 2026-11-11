@@ -326,7 +326,14 @@ class Convert(TempDir):
         self.assertIn('pyimport("torch.nn")', a)
         self.assertIn("nn.Sequential(nn.Linear(2, 3), nn.ReLU())", a)
         with open(os.path.join(self.dir, "out", "b.apsi")) as fh:
-            self.assertIn('pyimport("requests")', fh.read())
+            b = fh.read()
+        try:
+            import requests  # noqa: F401
+            # requests is written in Python: converted into apsi_packages/ with the program
+            self.assertIn('import "apsi_packages/requests/__init__.apsi" as requests', b)
+            self.assertTrue(os.path.exists(os.path.join(self.dir, "out", "apsi_packages", "requests", "api.apsi")))
+        except ImportError:
+            self.assertIn('pyimport("requests")', b)
         self.assertIn("--allow-python", out)
         # --idiomatic maps libraries onto Apsi's own built-ins
         rc, out, err = apsi("convert", os.path.join(self.dir, "pkg"), "-o", os.path.join(self.dir, "out2"),

@@ -9,8 +9,8 @@
 
 `apsi run app.apsi --env-file .env` loads the file before the program starts. Values read from a .env file need
 only --allow-read for the file; reading the process environment needs --allow-env (or --allow-env=NAME,…).
-`apsi run --venv .venv` (or a .venv folder next to the program, found automatically) makes pyimport() use the
-packages installed in that virtual environment.
+`apsi run --venv .venv` makes pyimport() use the packages installed in that virtual environment (only when it is
+named: a converted program carries its libraries in apsi_packages/).
 """
 import os
 import re

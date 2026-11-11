@@ -41,6 +41,16 @@ apsi convert train.py            # train.apsi + the local modules it imports
 apsi run train.apsi --allow-python -- --epochs 3      # arguments after -- go to sys.argv
 ```
 
+### Libraries come along
+
+The installed libraries a program imports that are written in Python (`requests`, `urllib3`, `idna`, `certifi` …)
+are converted with it into `apsi_packages/`, with their data files, from the program's `.venv` of any Python
+version (3.8 … 3.14, free-threaded too) or the converting Python. The result runs on Apsi alone: no venv, no `pip`.
+Libraries of compiled code (C, C++, Rust: `numpy`, `pyarrow`, `torch` …) cannot be translated; they stay Python
+imports, and the notes name Apsi's own tool for the job (tensors, layers and `fit()`, `use hub`, `use dataframe`,
+`use web`). So data-collection and AI-training programs convert completely in their own logic and partially in
+those compiled parts. Details: [From Python to Apsi](PYTHON.md#libraries-what-converts-and-what-does-not).
+
 ### What "exactly" covers
 
 Everything in Python 3.13: classes with metaclasses, descriptors, `__slots__`, properties and every special method;

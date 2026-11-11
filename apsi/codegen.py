@@ -1794,6 +1794,8 @@ class Compiled:
         self.pyc = gen.pyc
         self.module = _types.ModuleType(modname)
         self.module.__file__ = os.path.abspath(filename) if not filename.startswith("<") else filename
+        if modname not in ("__main__", "__apsi__") and not filename.startswith("<"):
+            _give_spec(self.module)               # importlib.resources / metadata find a converted library's files
         g = self.module.__dict__
         g.update(builtins)
         g.update(gen.consts)
@@ -2002,3 +2004,55 @@ def _setidx(interp):
         else:
             set_index(obj, idx, v)
     return setidx
+
+
+class _FolderReader:
+    """importlib.resources for a module compiled from .apsi: the files next to it (a converted library's data)."""
+
+    def __init__(self, folder):
+        self.folder = folder
+
+    def files(self):
+        import pathlib
+        return pathlib.Path(self.folder)
+
+    def open_resource(self, resource):
+        return open(os.path.join(self.folder, resource), "rb")
+
+    def resource_path(self, resource):
+        return os.path.join(self.folder, resource)
+
+    def is_resource(self, name):
+        return os.path.isfile(os.path.join(self.folder, name))
+
+    def contents(self):
+        return iter(os.listdir(self.folder))
+
+
+class _ApsiLoader:
+    def __init__(self, folder):
+        self.folder = folder
+
+    def get_resource_reader(self, name=None):
+        return _FolderReader(self.folder)
+
+    def create_module(self, spec):
+        return None
+
+    def exec_module(self, module):
+        pass
+
+
+def _give_spec(module):
+    import importlib.machinery
+    path = module.__file__
+    folder = os.path.dirname(path)
+    pkg = os.path.splitext(os.path.basename(path))[0] == "__init__"
+    spec = importlib.machinery.ModuleSpec(module.__name__, _ApsiLoader(folder), origin=path, is_package=pkg)
+    if pkg:
+        spec.submodule_search_locations = [folder]
+        module.__path__ = [folder]
+    spec.has_location = True
+    module.__spec__ = spec
+    module.__loader__ = spec.loader
+    module.__package__ = module.__name__ if pkg else module.__name__.rpartition(".")[0]
