@@ -924,9 +924,21 @@ class Gpu(_Ops):
         self._go("act_b", self.blocks(n), 256, self.p(X), self.p(DY), self.p(DX), ("u", n), ("u", kind))
 
     def colsum(self, DY, X, MEAN, RSTD, DG, DB, M, N, mode):
-        rows = 64
-        self._go("colsum", ((N + 255) // 256, (M + rows - 1) // rows), 256, self.p(DY), self.p(X), self.p(MEAN),
-                 self.p(RSTD), self.p(DG), self.p(DB), ("u", M), ("u", N), ("u", rows), ("u", mode))
+        """Column sums with no atomic additions: chunks of rows write their sums, colsum_fin adds them in order, so
+        the result is the same every run (deterministic training)."""
+        rows = 64 if M <= 64 * 512 else -(-M // 512)
+        chunks = -(-M // rows)
+        part = chunks > 1
+        WB = self._scratch("colsum_wb", chunks * N) if part and mode != 2 else (None if not part else
+                                                                             self._scratch("colsum_wb", 1))
+        WG = self._scratch("colsum_wg", chunks * N) if part and mode != 0 else (None if not part else
+                                                                             self._scratch("colsum_wg", 1))
+        self._go("colsum", ((N + 255) // 256, chunks), 256, self.p(DY), self.p(X), self.p(MEAN),
+                 self.p(RSTD), self.p(DG), self.p(DB), ("u", M), ("u", N), ("u", rows), ("u", mode), self.p(WB),
+                 self.p(WG), ("u", 1 if part else 0))
+        if part:
+            self._go("colsum_fin", self.blocks(N), 256, self.p(WB), self.p(WG), self.p(DG), self.p(DB), ("u", N),
+                     ("u", chunks), ("u", mode))
 
     def ln_f(self, X, Gm, Bt, Y, MEAN, RSTD, M, N, eps, rms):
         self._go("ln_f", -(-M // 8), 256, self.p(X), self.p(Gm), self.p(Bt), self.p(Y), self.p(MEAN), self.p(RSTD),
@@ -940,7 +952,21 @@ class Gpu(_Ops):
         self._go("embed_f", self.blocks(M * D), 256, self.p(E), self.p(IDS), self.p(Y), ("u", M), ("u", D))
 
     def embed_b(self, DY, IDS, DE, M, D, V):
-        self._go("embed_b", self.blocks(M * D), 256, self.p(DY), self.p(IDS), self.p(DE), ("u", M), ("u", D))
+        """DE[IDS[i]] += DY[i] with no atomic additions: the positions of each row in order (made on the processor
+        from the M ids), one thread per (row, column) sums them: the same result every run."""
+        if M <= 0:
+            return
+        ids = np.ascontiguousarray(self.get(IDS[0], M, IDS[1])).view(np.int32).astype(np.int64)
+        order = np.argsort(ids, kind="stable")
+        rows, cnt = np.unique(ids[order], return_counts=True)
+        off = np.concatenate([[0], np.cumsum(cnt)]).astype(np.int32)
+        U = len(rows)
+        pos, offb, rowb = self._scratch("eb_pos", M), self._scratch("eb_off", U + 1), self._scratch("eb_rows", U)
+        self.put(pos[0], order.astype(np.int32), pos[1])
+        self.put(offb[0], off, offb[1])
+        self.put(rowb[0], rows.astype(np.int32), rowb[1])
+        self._go("embed_bs", self.blocks(U * D), 256, self.p(DY), self.p(pos), self.p(offb), self.p(rowb),
+                 self.p(DE), ("u", U), ("u", D))
 
     def pos_f(self, X, P, Y, M, D, T):
         self._go("pos_f", self.blocks(M * D), 256, self.p(X), self.p(P), self.p(Y), ("u", M), ("u", D), ("u", T))
@@ -955,19 +981,31 @@ class Gpu(_Ops):
         self._go("softmax_b", rows, 256, self.p(P), self.p(DP), self.p(DS), ("u", rows), ("u", n))
 
     def ce(self, L, LAB, DL, LOSS, M, V, wg, wl):
+        part = self._scratch("loss_part", max(1, M))
         self._go("ce", M, 256, self.p(L), self.p(LAB), self.p(DL), self.p(LOSS), ("u", M), ("u", V), ("f", wg),
-                 ("f", wl))
+                 ("f", wl), self.p(part))
+        self._go("parts_sum", 1, 256, self.p(part), ("u", M), self.p(LOSS))
 
     def loss_ew(self, Y, T, W, DY, LOSS, n, wg, wl, kind):
-        self._go("loss_ew", self.blocks(n), 256, self.p(Y), self.p(T), self.p(W if W is not None else Y), self.p(DY),
-                 self.p(LOSS), ("u", n), ("f", wg), ("f", wl), ("u", kind), ("u", 1 if W is not None else 0))
+        nb = self.blocks(n)
+        part = self._scratch("loss_part", nb)
+        self._go("loss_ew", nb, 256, self.p(Y), self.p(T), self.p(W if W is not None else Y), self.p(DY),
+                 self.p(LOSS), ("u", n), ("f", wg), ("f", wl), ("u", kind), ("u", 1 if W is not None else 0),
+                 self.p(part))
+        self._go("parts_sum", 1, 256, self.p(part), ("u", nb), self.p(LOSS))
 
     def mse(self, Y, T, DY, LOSS, n, wg, wl):
-        self._go("mse", self.blocks(n), 256, self.p(Y), self.p(T), self.p(DY), self.p(LOSS), ("u", n), ("f", wg),
-                 ("f", wl))
+        nb = self.blocks(n)
+        part = self._scratch("loss_part", nb)
+        self._go("mse", nb, 256, self.p(Y), self.p(T), self.p(DY), self.p(LOSS), ("u", n), ("f", wg),
+                 ("f", wl), self.p(part))
+        self._go("parts_sum", 1, 256, self.p(part), ("u", nb), self.p(LOSS))
 
     def sumsq(self, X, n, ACC):
-        self._go("sumsq", min(self.blocks(n), 1024), 256, self.p(X), ("u", n), self.p(ACC))
+        nb = min(self.blocks(n), 1024)
+        part = self._scratch("sumsq_part", nb)
+        self._go("sumsq", nb, 256, self.p(X), ("u", n), self.p(ACC), self.p(part))
+        self._go("parts_sum", 1, 256, self.p(part), ("u", nb), self.p(ACC))
 
     def adam(self, Pm, Gr, Mm, Vm, SQ, n, n_decay, lr, b1, b2, eps, c1, c2, wd, clip, COMP=None):
         self._wgen += 1
@@ -1003,7 +1041,10 @@ class Gpu(_Ops):
                  ("u", N), ("u", H), ("f", slope))
 
     def dot_acc(self, X, Y, n, ACC):
-        self._go("dot_acc", min(self.blocks(n), 1024), 256, self.p(X), self.p(Y), ("u", n), self.p(ACC))
+        nb = min(self.blocks(n), 1024)
+        part = self._scratch("dot_part", nb)
+        self._go("dot_acc", nb, 256, self.p(X), self.p(Y), ("u", n), self.p(ACC), self.p(part))
+        self._go("parts_sum", 1, 256, self.p(part), ("u", nb), self.p(ACC))
 
     def scale_add(self, Z, X, S, n, c):
         self._go("scale_add", self.blocks(n), 256, self.p(Z), self.p(X), self.p(S), ("u", n), ("f", c))
@@ -1211,7 +1252,7 @@ class Gpu(_Ops):
         targs = list(args)
         targs[2] = self.p(self._scratch("tune_c", M * ldc + N))
         if targs[23][1]:
-            targs[23] = self.p(self._scratch("tune_x", M * ldc + N))
+            targs[23] = self.p(self._scratch("tune_x", max(1, grid[2] if len(grid) > 2 else 1) * M * ldc + N))
         if targs[26][1]:
             targs[26] = self.p(self._scratch("tune_db", N))
         best, best_t = name, None
@@ -1288,7 +1329,9 @@ class Gpu(_Ops):
                     nz = -(-K // kchunk)
                     if nz > 1 and not beta:
                         self.fill(Cv, M * N, 0.0)
-            db = self._db if name.startswith("gemm_tmn") and sbn == 1 else None
+            db = self._db if name.startswith("gemm_tmn") and sbn == 1 and nz == 1 else None
+            if nz > 1:                                   # the parts of k into a workspace, added in order after
+                X2 = self._scratch("splitk", nz * M * ldc)
             args = [self.p(A), self.p(B), self.p(Cv), self.p(bias), ("u", M),
                     ("u", N), ("u", K), ("u", sam), ("u", sak), ("u", sbk), ("u", sbn), ("u", ldc), ("u", nb2),
                     ("u", sa[0]), ("u", sa[1]), ("u", sb[0]), ("u", sb[1]), ("u", sc[0]), ("u", sc[1]),
@@ -1299,6 +1342,9 @@ class Gpu(_Ops):
             if use.endswith("#h"):
                 args = self._h_args(args, M, N, K)
             self._go(use, grid, self._threads(use), *args)
+            if nz > 1:
+                self._go("ksum", self.blocks(M * N), 256, self.p(Cv), self.p(X2), ("u", M), ("u", N), ("u", ldc),
+                         ("u", nz))
             if db is not None:
                 self._db = None                          # taken
             return True

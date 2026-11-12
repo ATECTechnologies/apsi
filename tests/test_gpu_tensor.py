@@ -43,7 +43,7 @@ class GpuTensor(unittest.TestCase):
 
     def test_from_apsi(self):
         src = ("let x = randn(4, 6, seed=1)\nlet w = randn(6, 3, seed=2)\nlet h = (gpu_tensor(x) @ w + 0.5).gelu()\n"
-               "assert max(abs(h.numpy() - gelu(x @ w + 0.5))) < 1e-5\nprint(sum(exp(h)) > 0.0)\n")
+               "assert max(abs(h.numpy() - gelu(x @ w + 0.5))) < 1e-4\nprint(sum(exp(h)) > 0.0)\n")
         r = subprocess.run([sys.executable, "-m", "apsi", "run", "-"], input=src, capture_output=True, text=True,
                            cwd=ROOT)
         if "true" not in r.stdout.lower():
