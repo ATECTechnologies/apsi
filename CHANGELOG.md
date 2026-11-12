@@ -2,6 +2,12 @@
 
 ## 2.6.0 — in progress
 
+### Graph-and-language models
+- **`fit_batches`** (`use layers`, every backend): batches that each bring their own shape and graph; `dag` models
+  with several inputs (token ids and node features) on the GPU trainer; `graph_memory` on the card; cross-attention
+  from text to a graph's memory. A GLA-shaped model (graph transformer, graph memory, a writer with rotary positions,
+  grouped heads and SwiGLU) trains on the card exactly as on NumPy.
+
 ### Physics-informed networks
 - **`pinn_fit` and `pinn_derivatives`** (`use layers`): the loss is any formula of the points and the network's
   values, first and second derivatives along each input (`loss(x, u, du, d2u)`): equations, boundary and initial

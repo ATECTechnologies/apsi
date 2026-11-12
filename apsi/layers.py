@@ -1080,6 +1080,51 @@ class TransformerBlock(Layer):
         return f"transformer_block(d={self.d}, heads={self.heads}, ff={self.ff}{', causal' if self.causal else ''}{extra})"
 
 
+def fit_batches(model, params, batches, loss="cross_entropy", opt=None, epochs=1, backend="auto", device="cuda",
+                verbose=True, clip=None, schedule=None, precision="auto", compensated=None, every=None):
+    """Train on batches that each bring their own shapes and graph: a list of (inputs, targets[, graph]) or a function
+    epoch -> such a list. inputs may be a list (a dag with several inputs, e.g. token ids and node features). Each
+    step is one batch; the history is the mean loss of each epoch. backend: "auto" (the GPU trainer when there is a
+    card), "gpu" or "numpy"."""
+    from .stdlib import Adam, value_and_grad
+    opt = opt or Adam(1e-3)
+    which = str(backend or "auto").lower()
+    if which in ("auto", "gpu"):
+        from . import gpu_train as GT
+        if which == "gpu" or _gpu_ready():
+            try:
+                return GT.fit_batches(model, params, batches, loss, opt, epochs, verbose, clip, schedule, device,
+                                      precision, compensated=compensated, every=every)
+            except GT.TrainError as e:
+                raise RuntimeErr(f"backend=\"gpu\": {e}") from None
+    lf = loss if callable(loss) else _loss_fn(loss)
+    E = int(epochs)
+    every = int(every or max(1, E // 10))
+    history, step = [], 0
+    from .gpu_train import _batch_parts
+    for ep in range(E):
+        items = list(batches(ep) if callable(batches) else batches)
+        tot = 0.0
+        for item in items:
+            X, Y, g = _batch_parts(item)
+            ctx = {"graph": g} if g is not None else {}
+            Y = np.asarray(ops.raw(Y))
+            lv, gr = value_and_grad(lambda p: lf(model(p, X, train=True, **ctx), Y))(params)
+            if schedule is not None:
+                opt.lr = float(ops.raw(schedule(step)))
+            if clip:
+                norm = math.sqrt(sum(float(np.sum(np.asarray(ops.raw(a)) ** 2)) for a in tree_leaves(gr)))
+                if norm > clip:
+                    gr = tree_map(lambda a: a * (clip / norm), gr)
+            params = opt.step(params, gr)
+            tot += float(ops.raw(lv))
+            step += 1
+        history.append(tot / max(1, len(items)))
+        if verbose and (ep % every == 0 or ep == E - 1):
+            print(f"epoch {ep:4}  loss {history[-1]:.5f}  ({len(items)} batches)")
+    return Record(params=params, history=history, device="processor")
+
+
 def _pinn_fit(model, params, points, loss, epochs=2000, opt=None, backend="auto", device="cuda", verbose=True,
               schedule=None, clip=None, every=None, compensated=True, graph=None):
     """Train a physics-informed network: loss(x, u, du, d2u) with u [N, m], du / d2u [N, d, m] (see apsi.pinn)."""
@@ -1839,7 +1884,7 @@ def module(interp=None):
         conv2d_layer=Conv2D, max_pool=MaxPool, avg_pool=AvgPool, global_avg_pool=GlobalAvgPool,
         flatten_layer=Flatten, reshape_layer=Reshape, lstm_layer=LSTMLayer, gru_layer=GRULayer, last_step=LastStep,
         multi_head_attention=MultiHeadAttention, transformer_block=TransformerBlock, swiglu=SwiGLU,
-        apply_rope=apply_rope, moe=MoE, pinn_fit=_pinn_fit, pinn_derivatives=_pinn_derivatives,
+        apply_rope=apply_rope, moe=MoE, fit_batches=fit_batches, pinn_fit=_pinn_fit, pinn_derivatives=_pinn_derivatives,
         transformer_encoder=transformer_encoder, layer_norm_layer=LayerNorm, rms_norm_layer=RMSNorm,
         batch_norm_layer=BatchNorm, dropout_layer=Dropout, activation=activation, lambda_layer=LambdaLayer,
         scale=Scale, identity=Identity, select=Select, mean_pool=MeanPool,

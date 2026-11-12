@@ -121,7 +121,7 @@ let logits = predict(model, r.params, X_test, backend="gpu")
 | | |
 |---|---|
 | Layers | linear, activation (relu, gelu, silu/swish, tanh, sigmoid, leaky_relu, elu, softplus, mish, identity), dropout, layer_norm, rms_norm, embedding, positional_encoding (learned or fixed), residual (with pre_norm), multi_head_attention (causal or not; `kv_heads=` grouped-query, `rope=true` rotary positions, `qk_norm=true` per-head query / key norms), swiglu, moe (mixture of experts: `moe(d, experts=8, top_k=2)`; the router's top-k on the card, every expert on its own rows, no row dropped), transformer_block (`norm="rms"`, `ffn="swiglu"` or `"moe"`), dag (any graph of layers with one input and one output; cross-attention as a node with two inputs `["query", "memory"]`, any memory length), parallel, add / multiply / concatenate / mean, scale, identity, reshape, flatten, mean_pool, conv2d (any kernel, stride, padding), max_pool, avg_pool, global_avg_pool, lstm, gru, last_step — so `cnn`, `lstm_classifier`, `mlp`, `resnet_mlp`, `transformer_lm`, `transformer_encoder`, and LLaMA / Qwen3-style models |
-| Graphs | gcn, sage (mean, sum), gin, gat (heads concatenated or averaged), graph_transformer (keys and values by relation, biases by relation and hop; `k_hop` shortcuts), global_attention (every node over its graph, `max_keys`), mix_hop, graph_pool (mean, sum), `graph_transformer_net` on sparse graphs of any size — `fit(…, graph=g, mask=train_nodes)` for node tasks, `graph(…, batch=)` for one row per graph; `gcn_net`, `gat_net`, `gin_net`. The edges are kept in compressed rows on the card (CSR, made once per graph); every node sums its edges in a register: no atomic additions, the same result every run |
+| Graphs | gcn, sage (mean, sum), gin, gat (heads concatenated or averaged), graph_transformer (keys and values by relation, biases by relation and hop; `k_hop` shortcuts), graph_memory, global_attention (every node over its graph, `max_keys`), mix_hop, graph_pool (mean, sum), `graph_transformer_net` on sparse graphs of any size — `fit(…, graph=g, mask=train_nodes)` for node tasks, `graph(…, batch=)` for one row per graph; `gcn_net`, `gat_net`, `gin_net`. The edges are kept in compressed rows on the card (CSR, made once per graph); every node sums its edges in a register: no atomic additions, the same result every run |
 | Losses | `cross_entropy` (negative labels left out), `mse`, `mae`, `bce` (on logits); `mask=` for graph tasks |
 | Optimizers | Adam, AdamW, SGD (momentum); `clip=` (global norm, computed on the card), `schedule=`; compensated weight updates (the rounding error of every update carried to the next, so updates far below float32's step at a weight's size still add up: 300 steps of 1e-9 move a weight of 1 by 3e-7, a plain float32 update not at all), on by default below 2 B parameters, `compensated=false` / `APSI_GPU_COMPENSATED=0` saves its 4 bytes per parameter |
 | Precision | `"auto"`/`"bf16"`: bfloat16 tensor cores, float32 sums; `"fp32"`: three tensor-core passes (about float32); `"fp8"`, `"fp6"`, `"fp6_e2m3"`, `"fp4"`, `"int8"`, `"int4"`: weights rounded to that format every forward pass, float32 master copy |
@@ -176,6 +176,13 @@ little speed and serve to train models meant to run in those formats. True float
 rate; PyTorch's cuBLAS float32 is still faster than Apsi's three-pass float32. PyTorch uses less memory (its
 activations are bfloat16; Apsi keeps float32 activations). The products come in four builds and the card times them
 for each shape the first time it sees it, keeping the fastest (`APSI_GEMM_VARIANT=a|x|w|h` fixes one).
+
+**Batches of their own shape** — `fit_batches(model, params, batches, loss, opt, epochs)` trains on a list of
+`(inputs, targets)` or `(inputs, targets, graph)` (or a function `epoch -> list`): every batch may have its own
+number of rows, its own lengths and its own graph (a batch of graphs), and `inputs` may be a list for a `dag` with
+several inputs, e.g. token ids and the node features of the graphs they talk about. With `graph_memory` (the k best
+nodes of every graph) and cross-attention from the text to that memory, a graph-and-language model trains on the
+card; the tests check it against NumPy step by step. `backend="numpy"` runs the same on the processor.
 
 **Measure it on your card** — `apsi gpu bench` trains the 127 M GPT above on random tokens (nothing downloaded) and
 reports the tokens per second, what the card would do on its kernels alone, each kind of kernel's share of a step,

@@ -163,6 +163,42 @@ class Trainer(unittest.TestCase):
         self.assertEqual(moved[False], 0.0)
         self.assertAlmostEqual(moved[True], 3e-7, delta=3e-8)
 
+    def test_text_and_graph_models_in_batches(self):
+        """A graph-and-language model (GLA's shape): token ids and node features as two inputs of one dag, a different
+        batch of graphs every step (sizes, edges, relations), a graph transformer, graph_memory, cross-attention from
+        the text to the memory, rotary positions, grouped heads, SwiGLU: fit_batches on the card equals NumPy."""
+        from apsi import graphs as GR
+        rng = np.random.default_rng(0)
+        V, d, f, T, k = 20, 16, 6, 8, 4
+
+        def make(G):
+            sizes = rng.integers(3, 9, G)
+            N = int(sizes.sum())
+            src, dst, off = [], [], 0
+            for s_ in sizes:
+                e = rng.integers(0, s_, (2 * s_, 2)) + off
+                src += list(e[:, 0])
+                dst += list(e[:, 1])
+                off += s_
+            g = L.graph(edges=np.stack([src, dst], 1).tolist(), n=N, batch=np.repeat(np.arange(G), sizes),
+                        types=rng.integers(0, 2, len(src)))
+            toks = rng.integers(0, V, (G, T))
+            return [toks, rng.normal(size=(N, f))], np.roll(toks, -1, 1), g
+        batches = [make(G) for G in (3, 2, 4)]
+        m = L.DAG([["e", L.Embedding(V, d), "tok"],
+                   ["h", L.Residual(L.MultiHeadAttention(d, 4, causal=True, rope=True, kv_heads=2),
+                                    pre_norm=L.RMSNorm(d)), "e"],
+                   ["n0", L.Linear(f, d), "nodes"], ["n1", GR.GraphTransformer(d, 4, relations=2), "n0"],
+                   ["mem", GR.GraphMemory(d, k), "n1"], ["c", L.MultiHeadAttention(d, 4), ["h", "mem"]],
+                   ["r", L.add(), ["c", "h"]], ["f", L.Residual(L.SwiGLU(d, 32), pre_norm=L.RMSNorm(d)), "r"],
+                   ["out", L.Linear(d, V), "f"]], inputs=["tok", "nodes"], output="out")
+        a = L.fit_batches(m, m.init(seed=0), batches, "cross_entropy", opt=Adam(0.01), epochs=4, backend="numpy",
+                          verbose=False)
+        b = GT.fit_batches(m, m.init(seed=0), batches, "cross_entropy", opt=Adam(0.01), epochs=4, verbose=False,
+                           precision="fp32", ops=GT.Emulator())
+        np.testing.assert_allclose(a.history, b.history, rtol=1e-5)
+        self.assertLess(b.history[-1], b.history[0] - 1.0)
+
     def test_physics_informed_networks(self):
         """pinn: Taylor mode on the card (values, first and second derivatives along every input through the network
         in one stack, the gradient back through the same stack) equals Apsi's autodiff of any order, for every
