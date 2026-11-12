@@ -233,7 +233,7 @@ class Trainer(unittest.TestCase):
         ref = L.fit_batches(m, m.init(seed=0), batches, "cross_entropy", opt=Adam(0.01), backend="numpy",
                             accumulate=4, **kw).history
         for ops, acc, st in ((GT.Emulator(), 4, None), ([GT.Emulator() for _ in range(4)], 4, None),
-                             ([GT.Emulator() for _ in range(4)], 2, 2)):
+                             ([GT.Emulator() for _ in range(4)], 4, 2)):
             r = GT.fit_batches(m, m.init(seed=0), batches, "cross_entropy", opt=Adam(0.01), precision="fp32", ops=ops,
                                accumulate=acc, stages=st, **kw)
             np.testing.assert_allclose(ref, r.history, rtol=1e-5)
