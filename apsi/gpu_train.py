@@ -2771,12 +2771,12 @@ class _EdgeAttention:
     q[target] . k / sqrt(hd) (+ bias[e, head]); msg [N, d] = the weighted sum of the values."""
 
     @staticmethod
-    def fwd(node, f, q, KR, VR, kidx, N, H, hd, bias_parts=()):
+    def fwd(node, f, q, KR, VR, kidx, N, H, hd, bias_parts=(), vidx=None):
         o, E = node.net.ops, f["E"]
         d = H * hd
         KE, VE = node.buf("ke", E * d), node.buf("ve", E * d)
         o.gather(KR, kidx, KE, E, d, 0)
-        o.gather(VR, kidx, VE, E, d, 0)
+        o.gather(VR, kidx if vidx is None else vidx, VE, E, d, 0)
         sc = node.buf("sc", E * H)
         o.edge_dot(q, KE, f["row"], f["ids"], sc, E, H, hd)              # q[target] . k
         o.axpy(sc, sc, E * H, 1.0 / math.sqrt(hd) - 1.0)
@@ -2793,7 +2793,7 @@ class _EdgeAttention:
         return msg
 
     @staticmethod
-    def bwd(node, f, q, kidx, dmsg, N, H, hd, rows, bias_grads=()):
+    def bwd(node, f, q, kidx, dmsg, N, H, hd, rows, bias_grads=(), vidx=None, vrows=None):
         """(dq, dKR, dVR): dKR / dVR [rows, d] (rows of the key / value tables)."""
         o, E = node.net.ops, f["E"]
         d = H * hd
@@ -2811,11 +2811,12 @@ class _EdgeAttention:
         o.spmm(KE, f["ids"], ds, None, f["off"], dq, N, H, hd)
         dKE = node.gbuf("dke", E * d)
         o.spmm(q, f["row"], ds, None, f["eoff"], dKE, E, H, hd)
-        dKR, dVR = node.gbuf("dkr", rows * d), node.gbuf("dvr", rows * d)
+        vrows = rows if vrows is None else vrows
+        dKR, dVR = node.gbuf("dkr", rows * d), node.gbuf("dvr", vrows * d)
         o.fill(dKR, rows * d, 0.0)
-        o.fill(dVR, rows * d, 0.0)
+        o.fill(dVR, vrows * d, 0.0)
         o.embed_b(dKE, kidx, dKR, E, d, rows)
-        o.embed_b(dVE, kidx, dVR, E, d, rows)
+        o.embed_b(dVE, kidx if vidx is None else vidx, dVR, E, d, vrows)
         return dq, dKR, dVR
 
 
@@ -2900,6 +2901,240 @@ class _GraphTransformer(_Node):
                 o.gemm((dR[0], dR[1] + r * d), (W.w[0], W.w[1] + r * d * d), dh, N, d, d, R * d, 1, 1, d, d,
                        beta=True, passes=ps)
         return self.n1.bwd(dh, True, residual=dx1)
+
+
+class _TypeGroups:
+    """The nodes of a graph grouped by type on the card: perm (sorted by type), inv (back), rows of each type."""
+
+    def __init__(self, gd, T):
+        t = np.asarray(getattr(gd.g, "ntype", np.zeros(gd.N, np.int64)), np.int64)
+        perm = np.argsort(t, kind="stable")
+        inv = np.empty_like(perm)
+        inv[perm] = np.arange(len(perm))
+        self.counts = [int(c) for c in np.bincount(np.minimum(t, T), minlength=T + 1)[:T]]
+        self.perm, self.inv = gd._put(perm), gd._put(inv)
+        self.known = (t < T).astype(np.float32)
+        self.known_d = gd._put(self.known, np.float32)
+
+
+def _groups(net, T):
+    gd = _need_graph(net, "typed layers")
+    key = ("types", T)
+    if key not in gd.cache:
+        gd.cache[key] = _TypeGroups(gd, T)
+    return gd.cache[key]
+
+
+def _diag(node, name, x, vals, N, W, grad=False):
+    """rows of x scaled by vals[row] (a 0 / 1 mask): one sparse product with a diagonal"""
+    gd = node.net.gdev
+    if ("eye", N) not in gd.cache:
+        gd.cache[("eye", N)] = (gd._put(np.arange(N)), gd._put(np.arange(N + 1)))
+    col, off = gd.cache[("eye", N)]
+    y = (node.gbuf if grad else node.buf)(name, N * W)
+    node.net.ops.spmm(x, col, vals, None, off, y, N, 1, W)
+    return y
+
+
+class _TypedLin:
+    """typed_linear inside a node: rows sorted by type, one product per type, back in order."""
+
+    def __init__(self, node, tag, W, b, K, F, T):
+        self.node, self.tag, self.W, self.b, self.K, self.F, self.T = node, tag, W, b, K, F, T
+
+    def fwd(self, x, N, grp):
+        nd, o, K, F = self.node, self.node.net.ops, self.K, self.F
+        xs, ys = nd.buf(self.tag + "xs", N * K), nd.buf(self.tag + "ys", N * F)
+        o.gather(x, grp.perm, xs, N, K, 0)
+        o.fill(ys, N * F, 0.0)
+        r0 = 0
+        for t, c in enumerate(grp.counts):
+            if c:
+                o.gemm(_ofs(xs, r0 * K), _ofs(self.W.w, t * K * F), _ofs(ys, r0 * F), c, F, K, K, 1, F, 1, F,
+                       passes=nd.net.passes)
+                if self.b is not None:
+                    o.rowbias(_ofs(ys, r0 * F), _ofs(self.b.w, t * F), c, F)
+            r0 += c
+        self.xs, self.grp = xs, grp
+        y = nd.buf(self.tag + "y", N * F)
+        o.gather(ys, grp.inv, y, N, F, 0)
+        return y
+
+    def bwd(self, dy, N):
+        nd, o, K, F, grp = self.node, self.node.net.ops, self.K, self.F, self.grp
+        dys, dxs = nd.gbuf(self.tag + "dys", N * F), nd.gbuf(self.tag + "dxs", N * K)
+        o.gather(dy, grp.perm, dys, N, F, 0)
+        o.fill(dxs, N * K, 0.0)
+        r0 = 0
+        for t, c in enumerate(grp.counts):
+            if c:
+                o.gemm(_ofs(self.xs, r0 * K), _ofs(dys, r0 * F), _ofs(self.W.g, t * K * F), K, F, c, 1, K, F, 1, F,
+                       beta=True, passes=nd.net.passes)
+                if self.b is not None:
+                    o.colsum(_ofs(dys, r0 * F), None, None, None, None, _ofs(self.b.g, t * F), c, F, 0)
+                o.gemm(_ofs(dys, r0 * F), _ofs(self.W.w, t * K * F), _ofs(dxs, r0 * K), c, K, F, F, 1, 1, F, K,
+                       passes=nd.net.passes)
+            r0 += c
+        dx = nd.gbuf(self.tag + "dx", N * K)
+        o.gather(dxs, grp.inv, dx, N, K, 0)
+        return dx
+
+
+class _TypedNormOp:
+    """typed_norm inside a node: a layer norm per type on the rows of that type; other rows zero."""
+
+    def __init__(self, node, tag, g, b, D, T, eps):
+        self.node, self.tag, self.g, self.b, self.D, self.T, self.eps = node, tag, g, b, D, T, eps
+
+    def fwd(self, x, N, grp):
+        nd, o, D = self.node, self.node.net.ops, self.D
+        xs, ys = nd.buf(self.tag + "xs", N * D), nd.buf(self.tag + "ys", N * D)
+        mean, rstd = nd.buf(self.tag + "mu", N), nd.buf(self.tag + "rs", N)
+        o.gather(x, grp.perm, xs, N, D, 0)
+        o.fill(ys, N * D, 0.0)
+        r0 = 0
+        for t, c in enumerate(grp.counts):
+            if c:
+                o.ln_f(_ofs(xs, r0 * D), _ofs(self.g.w, t * D), _ofs(self.b.w, t * D), _ofs(ys, r0 * D),
+                       _ofs(mean, r0), _ofs(rstd, r0), c, D, self.eps, False)
+            r0 += c
+        self.xs, self.mean, self.rstd, self.grp = xs, mean, rstd, grp
+        y = nd.buf(self.tag + "y", N * D)
+        o.gather(ys, grp.inv, y, N, D, 0)
+        return y
+
+    def bwd(self, dy, N):
+        nd, o, D, grp = self.node, self.node.net.ops, self.D, self.grp
+        dys, dxs = nd.gbuf(self.tag + "dys", N * D), nd.gbuf(self.tag + "dxs", N * D)
+        o.gather(dy, grp.perm, dys, N, D, 0)
+        o.fill(dxs, N * D, 0.0)
+        r0 = 0
+        for t, c in enumerate(grp.counts):
+            if c:
+                a = lambda v, w: _ofs(v, r0 * w)         # noqa: E731
+                o.colsum(a(dys, D), a(self.xs, D), a(self.mean, 1), a(self.rstd, 1), _ofs(self.g.g, t * D),
+                         _ofs(self.b.g, t * D), c, D, 1)
+                o.ln_b(a(self.xs, D), _ofs(self.g.w, t * D), a(dys, D), a(self.mean, 1), a(self.rstd, 1),
+                       a(dxs, D), c, D, False, None)
+            r0 += c
+        dx = nd.gbuf(self.tag + "dx", N * D)
+        o.gather(dxs, grp.inv, dx, N, D, 0)
+        return dx
+
+
+class _TypedLinearNode(_Node):
+    def __init__(self, net, key, layer, p):
+        super().__init__(net, key)
+        self.op = _TypedLin(self, "", net.param(p.W), net.param(p.b) if layer.bias else None, layer.n_in,
+                            layer.n_out, layer.T)
+
+    def fwd(self, x, shape):
+        self.N = _rows(shape)
+        return self.op.fwd(x, self.N, _groups(self.net, self.op.T)), shape[:-1] + (self.op.F,)
+
+    def bwd(self, dy, need_dx=True):
+        return self.op.bwd(dy, self.N)
+
+
+class _TypedNormNode(_Node):
+    def __init__(self, net, key, layer, p):
+        super().__init__(net, key)
+        self.op = _TypedNormOp(self, "", net.param(p.gamma), net.param(p.beta), layer.d, layer.T, layer.eps)
+
+    def fwd(self, x, shape):
+        self.N = _rows(shape)
+        return self.op.fwd(x, self.N, _groups(self.net, self.op.T)), shape
+
+    def bwd(self, dy, need_dx=True):
+        return self.op.bwd(dy, self.N)
+
+
+class _HGT(_Node):
+    """hgt: typed norm, typed q / k / v / o, keys through each edge's relation (one batched product for every
+    relation and head), one softmax over a node's in-edges, residual for the nodes with in-edges, a shared feed-forward
+    block for the nodes of the layer's types."""
+
+    def __init__(self, net, key, layer, p, gk):
+        super().__init__(net, key)
+        self.d, self.H, self.T, self.R = layer.d, layer.h, layer.T, layer.R
+        T, d = self.T, self.d
+        self.norm = _TypedNormOp(self, "n.", net.param(p.norm.gamma), net.param(p.norm.beta), d, T, layer.norm.eps)
+        self.lin = {n: _TypedLin(self, n + ".", net.param(getattr(p, n).W), net.param(getattr(p, n).b), d, d, T)
+                    for n in ("q", "k", "v", "o")}
+        self.rel = net.param(p.rel)
+        self.ffn = net.compile(layer.ffn, p.ffn, key + ".f", gk + ".f")
+        self.ids = self.ids_for = None
+
+    def _ids(self, gd, f):
+        if self.ids_for is not gd:
+            if len(f["rel"]) and f["rel"].max() >= self.R:
+                raise TrainError(f"hgt(relations={self.R}) got a graph with relation {int(f['rel'].max())}")
+            has_in = (np.bincount(f["dst"], minlength=gd.N) > 0).astype(np.float32)
+            self.ids = (gd._put(f["src"] * self.R + f["rel"]), gd._put(f["src"]), gd._put(has_in, np.float32))
+            self.ids_for = gd
+        return self.ids
+
+    def fwd(self, x, shape):
+        gd = _need_graph(self.net, "hgt")
+        o, ps = self.net.ops, self.net.passes
+        N, d, H, R, T = _rows(shape), self.d, self.H, self.R, self.T
+        hd = d // H
+        grp = _groups(self.net, T)
+        f, _ = gd.csr("noself")
+        self.N, self.E, self.x, self.grp = N, f["E"], x, grp
+        xn = self.norm.fwd(x, N, grp)
+        q, k, v = (self.lin[n].fwd(xn, N, grp) for n in ("q", "k", "v"))
+        self.q, self.k = q, k
+        x1 = self.buf("x1", N * d)
+        if self.E:
+            kidx, vidx, hasin = self._ids(gd, f)
+            KR = self.buf("kr", N * R * d)
+            o.gemm(k, self.rel.w, KR, N, hd, hd, d, 1, hd, 1, R * d, batch=(R, H), sa=(0, hd),
+                   sb=(H * hd * hd, hd * hd), sc=(d, hd), passes=ps)
+            msg = _EdgeAttention.fwd(self, f, q, KR, v, kidx, N, H, hd, vidx=vidx)
+            om = _diag(self, "om", self.lin["o"].fwd(msg, N, grp), hasin, N, d)
+            o.add3(x1, x, om, N * d)
+        else:
+            o.pull(x1, o, x, N * d)
+        self.x1 = x1
+        fo, _ = self.ffn.fwd(x1, shape)
+        fm = _diag(self, "fm", fo, grp.known_d, N, d)
+        y = self.buf("y", N * d)
+        o.add3(y, x1, fm, N * d)
+        return y, shape
+
+    def bwd(self, dy, need_dx=True):
+        o, ps = self.net.ops, self.net.passes
+        N, d, H, R = self.N, self.d, self.H, self.R
+        hd = d // H
+        gd, grp = self.net.gdev, self.grp
+        dfm = _diag(self, "dfm", dy, grp.known_d, N, d, grad=True)
+        dx1 = self.gbuf("dx1", N * d)
+        o.add3(dx1, dy, self.ffn.bwd(dfm, True), N * d)
+        dx = self.gbuf("dx", N * d)
+        if not self.E:
+            dxn_parts = []
+        else:
+            f, _ = gd.csr("noself")
+            kidx, vidx, hasin = self._ids(gd, f)
+            dom = _diag(self, "dom", dx1, hasin, N, d, grad=True)
+            dmsg = self.lin["o"].bwd(dom, N)
+            dq, dKR, dv = _EdgeAttention.bwd(self, f, self.q, kidx, dmsg, N, H, hd, N * R, vidx=vidx, vrows=N)
+            dk = self.gbuf("dk", N * d)
+            for r in range(R):                             # back through the relation transforms
+                o.gemm(_ofs(dKR, r * d), _ofs(self.rel.w, r * H * hd * hd), dk, N, hd, hd, R * d, 1, 1, hd, d,
+                       beta=r > 0, batch=(1, H), sa=(0, hd), sb=(0, hd * hd), sc=(0, hd), passes=ps)
+            o.gemm(self.k, dKR, self.rel.g, hd, hd, N, 1, d, R * d, 1, hd, beta=True, batch=(R, H), sa=(0, hd),
+                   sb=(d, hd), sc=(H * hd * hd, hd * hd), passes=ps)
+            dxn_parts = [self.lin["q"].bwd(dq, N), self.lin["k"].bwd(dk, N), self.lin["v"].bwd(dv, N)]
+        if dxn_parts:
+            dxn = self.gbuf("dxn", N * d)
+            o.add3(dxn, dxn_parts[0], dxn_parts[1], N * d)
+            o.axpy(dxn, dxn_parts[2], N * d, 1.0)
+            o.add3(dx, dx1, self.norm.bwd(dxn, N), N * d)
+        else:
+            o.pull(dx, o, dx1, N * d)
+        return dx
 
 
 class _GlobalAttention(_Node):
@@ -3307,6 +3542,12 @@ class Net:
             return _MixHop(self, key, layer, p)
         if isinstance(layer, GR.GraphMemory):
             return _GraphMemory(self, key, layer, p)
+        if isinstance(layer, GR.HGT):
+            return _HGT(self, key, layer, p, gk)
+        if isinstance(layer, GR.TypedLinear):
+            return _TypedLinearNode(self, key, layer, p)
+        if isinstance(layer, GR.TypedNorm):
+            return _TypedNormNode(self, key, layer, p)
         if isinstance(layer, L.GCN):
             return _GCN(self, key, layer, p)
         if isinstance(layer, L.SAGE):

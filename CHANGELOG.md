@@ -3,6 +3,9 @@
 ## 2.6.0 — in progress
 
 ### Graph-and-language models
+- **Heterogeneous graphs:** `graph(…, node_types=)`, `typed_linear`, `typed_norm` and `hgt` (the layer of GLA's brains:
+  weights per node type, keys through each relation and head, one softmax over a node's in-edges) on NumPy and the
+  GPU trainer (rows grouped by type, one product per type; the relations in one batched product).
 - **`fit_batches`** (`use layers`, every backend): batches that each bring their own shape and graph; `dag` models
   with several inputs (token ids and node features) on the GPU trainer; `graph_memory` on the card; cross-attention
   from text to a graph's memory. A GLA-shaped model (graph transformer, graph memory, a writer with rotary positions,

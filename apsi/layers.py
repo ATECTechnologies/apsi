@@ -119,6 +119,7 @@ class Graph:
         self.edges = len(src)
         self.batch = np.zeros(self.n, dtype=np.int64)
         self.graphs = 1 if self.n else 0
+        self.ntype = np.zeros(self.n, dtype=np.int64)
 
     def __repr__(self):
         extra = f", {self.relations} relations" if self.relations > 1 else ""
@@ -136,7 +137,7 @@ class Graph:
 
 
 def graph(edges=None, n=None, src=None, dst=None, self_loops=True, undirected=False, batch=None, types=None,
-          reverse=False):
+          reverse=False, node_types=None):
     """graph(edges=[[0, 1], [1, 2]], n=3) or graph(src=tensor, dst=tensor, n=…). `batch` assigns nodes to
     separate graphs for graph-level tasks (used by graph_pool). `types` gives every edge a relation (0, 1, …) for
     graph_transformer layers; reverse=true adds each edge backwards as its own relation, so information flows both
@@ -156,6 +157,10 @@ def graph(edges=None, n=None, src=None, dst=None, self_loops=True, undirected=Fa
     g = Graph(src, dst, n, self_loops=self_loops, undirected=undirected, rel=rel)
     g.batch = _ids(batch) if batch is not None else np.zeros(g.n, dtype=np.int64)
     g.graphs = int(g.batch.max()) + 1 if g.n else 0
+    if node_types is not None:                       # a type per node (heterogeneous graphs: typed_linear, hgt)
+        g.ntype = _ids(node_types)
+        if len(g.ntype) != g.n:
+            raise ShapeError(f"graph(): node_types needs one entry per node ({g.n})")
     return g
 
 

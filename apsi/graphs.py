@@ -272,6 +272,116 @@ class GraphMemory(Layer):
         return f"graph_memory(d={self.d}, k={self.k})"
 
 
+# ============================================================== heterogeneous graphs (a type per node)
+def _type_masks(g, n, types):
+    t = np.asarray(g.ntype if g is not None and hasattr(g, "ntype") else np.zeros(n, np.int64))
+    return [(t == k)[:, None] for k in range(types)]
+
+
+class TypedLinear(Layer):
+    """A linear layer with its own weights for every node type: row i goes through W[type(i)] + b[type(i)]. Rows of
+    a type >= types give zeros. The types come from graph(..., node_types=)."""
+    kind = "typed_linear"
+
+    def __init__(self, n_in, n_out, types, bias=True, std=None):
+        self.n_in, self.n_out, self.T, self.bias = int(n_in), int(n_out), int(types), bool(bias)
+        self.std = std
+
+    def init(self, seed=0):
+        rng = _rng(seed)
+        s = self.std if self.std else 1.0 / math.sqrt(self.n_in)
+        W = rng.normal(size=(self.T, self.n_in, self.n_out)) * s
+        return Record(W=W, b=np.zeros((self.T, self.n_out))) if self.bias else Record(W=W)
+
+    def apply(self, p, x, train=False, **ctx):
+        masks = _type_masks(ctx.get("graph"), int(np.shape(ops.raw(x))[0]), self.T)
+        acc = None
+        for t, m in enumerate(masks):
+            y = x @ p.W[t] + (p.b[t] if self.bias else 0.0)
+            y = ops.where(m, y, 0.0)
+            acc = y if acc is None else acc + y
+        return acc
+
+    def describe(self):
+        return f"typed_linear({self.n_in} -> {self.n_out}, {self.T} types)"
+
+
+class TypedNorm(Layer):
+    """Layer norm with its own scale and shift for every node type; rows of a type >= types give zeros."""
+    kind = "typed_norm"
+
+    def __init__(self, d, types, eps=1e-5):
+        self.d, self.T, self.eps = int(d), int(types), float(eps)
+
+    def init(self, seed=0):
+        return Record(gamma=np.ones((self.T, self.d)), beta=np.zeros((self.T, self.d)))
+
+    def apply(self, p, x, train=False, **ctx):
+        from .stdlib import layer_norm
+        masks = _type_masks(ctx.get("graph"), int(np.shape(ops.raw(x))[0]), self.T)
+        acc = None
+        for t, m in enumerate(masks):
+            y = ops.where(m, layer_norm(x, p.gamma[t], p.beta[t], self.eps), 0.0)
+            acc = y if acc is None else acc + y
+        return acc
+
+    def describe(self):
+        return f"typed_norm({self.d}, {self.T} types)"
+
+
+class HGT(Layer):
+    """Heterogeneous graph transformer layer (as GLA's brains): a layer norm, query, key, value and output weights
+    per node type; the key of every edge seen through its relation (a d_head x d_head matrix per relation and head);
+    ONE softmax over all incoming edges of a node (self loops left out); a residual that leaves nodes without incoming
+    edges unchanged; then a shared pre-norm feed-forward block (gelu) for the nodes of the layer's types."""
+    kind = "hgt"
+
+    def __init__(self, d, heads=4, types=1, relations=1, ffn_mult=4):
+        self.d, self.h, self.T, self.R, self.fm = int(d), int(heads), int(types), int(relations), int(ffn_mult)
+        if self.d % self.h:
+            raise ShapeError(f"hgt: d={self.d} must be divisible by heads={self.h}")
+        self.hd = self.d // self.h
+        self.norm = TypedNorm(d, types)
+        self.q, self.k, self.v, self.o = (TypedLinear(d, d, types) for _ in range(4))
+        self.ffn = Sequential([LayerNorm(d), Linear(d, d * self.fm), Activation("gelu"), Linear(d * self.fm, d)])
+
+    def init(self, seed=0):
+        rng = _rng(seed)
+        return Record(norm=self.norm.init(_seed_of(seed, 0)), q=self.q.init(_seed_of(seed, 1)),
+                      k=self.k.init(_seed_of(seed, 2)), v=self.v.init(_seed_of(seed, 3)),
+                      o=self.o.init(_seed_of(seed, 4)),
+                      rel=rng.normal(size=(self.R, self.h, self.hd, self.hd)) * 0.02,
+                      ffn=self.ffn.init(_seed_of(seed, 5)))
+
+    def apply(self, p, x, train=False, **ctx):
+        g = _graph(ctx)
+        N, H, hd = int(np.shape(ops.raw(x))[0]), self.h, self.hd
+        keep = g.src != g.dst
+        src, dst, rel = g.src[keep], g.dst[keep], g.rel[keep]
+        if len(rel) and rel.max() >= self.R:
+            raise ShapeError(f"hgt(relations={self.R}) got a graph with relation {int(rel.max())}")
+        xn = self.norm(p.norm, x, **ctx)
+        q = ops.reshape(self.q(p.q, xn, **ctx), N, H, hd)
+        k = ops.reshape(self.k(p.k, xn, **ctx), N, H, hd)
+        v = ops.reshape(self.v(p.v, xn, **ctx), N, H, hd)
+        t = np.asarray(getattr(g, "ntype", np.zeros(N, np.int64)))
+        any_type = (t < self.T)[:, None]
+        if len(src):
+            E = len(src)                                                  # the key through the edge's relation
+            kr = ops.reshape(ops.reshape(k[src], E, H, 1, hd) @ p.rel[rel], E, H, hd)
+            score = ops.sum_(q[dst] * kr, axis=-1) / math.sqrt(hd)        # [E, H]
+            a = segment_softmax(score, dst, N)
+            msg = ops.reshape(ops.reshape(a, -1, H, 1) * v[src], -1, self.d)
+            agg = segment_sum(msg, dst, N)
+            has_in = (np.bincount(dst, minlength=N) > 0)[:, None]
+            x = x + ops.where(has_in, self.o(p.o, agg, **ctx), 0.0)
+        f = self.ffn(p.ffn, x, train=train)
+        return x + ops.where(any_type, f, 0.0)
+
+    def describe(self):
+        return f"hgt(d={self.d}, heads={self.h}, {self.T} node types, {self.R} relations)"
+
+
 def graph_transformer_net(n_in, d, out, layers=4, heads=4, relations=1, global_every=2, max_keys=4096,
                           task="node", pool="mean"):
     """Input projection, `layers` graph_transformer blocks with a global_attention block after every
@@ -293,6 +403,6 @@ def graph_transformer_net(n_in, d, out, layers=4, heads=4, relations=1, global_e
 
 def names():
     return dict(graph_transformer=GraphTransformer, global_attention=GlobalAttention, mix_hop=MixHop,
-                graph_memory=GraphMemory,
+                graph_memory=GraphMemory, hgt=HGT, typed_linear=TypedLinear, typed_norm=TypedNorm,
                 graph_transformer_net=graph_transformer_net, k_hop=k_hop, hop_distances=hop_distances,
                 eccentricity=eccentricity)

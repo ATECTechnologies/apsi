@@ -199,6 +199,29 @@ class Trainer(unittest.TestCase):
         np.testing.assert_allclose(a.history, b.history, rtol=1e-5)
         self.assertLess(b.history[-1], b.history[0] - 1.0)
 
+    def test_heterogeneous_graphs(self):
+        """typed_linear, typed_norm and hgt (a type per node, keys through each relation, one softmax over a node's
+        in-edges, GLA's brain layer): training on the card equals NumPy, with a different graph every batch."""
+        from apsi import graphs as GR
+        rng = np.random.default_rng(0)
+
+        def make():
+            N = int(rng.integers(15, 30))
+            E = 3 * N
+            g = L.graph(edges=rng.integers(0, N, (E, 2)).tolist(), n=N, types=rng.integers(0, 3, E),
+                        node_types=rng.integers(0, 4, N))
+            return rng.normal(size=(N, 8)), rng.integers(0, 3, N), g
+        batches = [make() for _ in range(3)]
+        for m in (L.Sequential([GR.TypedLinear(8, 16, 3), GR.TypedNorm(16, 3), L.Activation("tanh"),
+                                L.Linear(16, 3)]),
+                  L.Sequential([L.Linear(8, 16), GR.HGT(16, 4, types=3, relations=3), GR.HGT(16, 2, 4, 3),
+                                L.Linear(16, 3)])):
+            a = L.fit_batches(m, m.init(seed=0), batches, "cross_entropy", opt=Adam(0.01), epochs=3,
+                              backend="numpy", verbose=False)
+            b = GT.fit_batches(m, m.init(seed=0), batches, "cross_entropy", opt=Adam(0.01), epochs=3, verbose=False,
+                               precision="fp32", ops=GT.Emulator())
+            np.testing.assert_allclose(a.history, b.history, rtol=1e-5)
+
     def test_physics_informed_networks(self):
         """pinn: Taylor mode on the card (values, first and second derivatives along every input through the network
         in one stack, the gradient back through the same stack) equals Apsi's autodiff of any order, for every
