@@ -1131,14 +1131,79 @@ class TransformerBlock(Layer):
         return f"transformer_block(d={self.d}, heads={self.heads}, ff={self.ff}{', causal' if self.causal else ''}{extra})"
 
 
+def param_paths(params, prefix=""):
+    """[(path, array)] of every weight: "brain_a_l0.hgt.q.W", "w0_self.inner.Wq", "layers[2].W" …"""
+    out = []
+    if isinstance(params, Record):
+        for k, v in params.fields.items():
+            out += param_paths(v, f"{prefix}.{k}" if prefix else k)
+    elif isinstance(params, (list, tuple)):
+        for i, v in enumerate(params):
+            out += param_paths(v, f"{prefix}[{i}]")
+    elif isinstance(params, np.ndarray):
+        out.append((prefix, params))
+    return out
+
+
+def frozen_ids(params, freeze=None, train_only=None):
+    """The ids of the weights that stay as they are: freeze= names (a part of the model by its path: "enc",
+    "brain_a", "w0_self.inner") or a function path -> bool; train_only= the opposite (everything else is frozen)."""
+    def matches(path, pats):
+        if callable(pats):
+            return bool(pats(path))
+        pats = [pats] if isinstance(pats, str) else list(pats)
+        for q in pats:
+            q = str(q)
+            if path == q or path.startswith(q + ".") or path.startswith(q + "["):
+                return True
+            if q.endswith("*") and path.startswith(q[:-1]):
+                return True
+        return False
+    out = set()
+    for path, a in param_paths(params):
+        if (freeze is not None and matches(path, freeze)) or (train_only is not None and not matches(path, train_only)):
+            out.add(id(a))
+    return out
+
+
+def _map_paths(t, fn, prefix=""):
+    """t with every array replaced by fn(path, array)."""
+    if isinstance(t, Record):
+        return Record(**{k: _map_paths(v, fn, f"{prefix}.{k}" if prefix else k) for k, v in t.fields.items()})
+    if isinstance(t, (list, tuple)):
+        return type(t)(_map_paths(v, fn, f"{prefix}[{i}]") for i, v in enumerate(t))
+    return fn(prefix, t) if isinstance(t, np.ndarray) or hasattr(t, "shape") else t
+
+
+def frozen_paths(params, freeze=None, train_only=None):
+    if freeze is None and train_only is None:
+        return set()
+    ids = frozen_ids(params, freeze, train_only)
+    return {p for p, a in param_paths(params) if id(a) in ids}
+
+
+def _freeze_grads(g, paths):
+    return _map_paths(g, lambda p, a: a * 0.0 if p in paths else a) if paths else g
+
+
+def _freeze_keep(old, new, paths):
+    if not paths:
+        return new
+    olds = dict(param_paths(old))
+    return _map_paths(new, lambda p, a: olds[p] if p in paths and p in olds else a)
+
+
 def fit_batches(model, params, batches, loss="cross_entropy", opt=None, epochs=1, backend="auto", device="cuda",
                 verbose=True, clip=None, schedule=None, precision="auto", compensated=None, every=None, accumulate=1,
-                stages=None):
+                stages=None, freeze=None, train_only=None):
     """Train on batches that each bring their own shapes and graph: a list of (inputs, targets[, graph]) or a function
     epoch -> such a list. inputs may be a list (a dag with several inputs, e.g. token ids and node features). Each
     step is `accumulate` batches (their gradients averaged); the history is the mean loss of each epoch. backend: "auto"
     (the GPU trainer when there is a card), "gpu" or "numpy". device="cuda:all": the model (a dag or a sequence) split
-    across the cards (stages=N or a list of node counts), `accumulate` batches flowing through as micro-batches."""
+    across the cards (stages=N or a list of node counts), `accumulate` batches flowing through as micro-batches.
+    freeze= / train_only=: parts of the model by name ("brain_a", "w*", a function of the path) that stay as they
+    are / the only parts that learn. Any optimizer: adam, adamw and sgd have kernels of their own, the others step on
+    the processor."""
     from .stdlib import Adam, value_and_grad
     opt = opt or Adam(1e-3)
     which = str(backend or "auto").lower()
@@ -1148,13 +1213,14 @@ def fit_batches(model, params, batches, loss="cross_entropy", opt=None, epochs=1
             try:
                 return GT.fit_batches(model, params, batches, loss, opt, epochs, verbose, clip, schedule, device,
                                       precision, compensated=compensated, every=every, accumulate=accumulate,
-                                      stages=stages)
+                                      stages=stages, freeze=freeze, train_only=train_only)
             except GT.TrainError as e:
                 raise RuntimeErr(f"backend=\"gpu\": {e}") from None
     lf = loss if callable(loss) else _loss_fn(loss)
     E = int(epochs)
     every = int(every or max(1, E // 10))
     history, step = [], 0
+    still = frozen_paths(params, freeze, train_only)
     from .gpu_train import _batch_parts
     A = max(1, int(accumulate or 1))
     for ep in range(E):
@@ -1173,13 +1239,14 @@ def fit_batches(model, params, batches, loss="cross_entropy", opt=None, epochs=1
                 acc = gr if acc is None else tree_map(lambda a, b: a + b, acc, gr)
                 tot += float(ops.raw(lv))
             gr = acc
+            gr = _freeze_grads(gr, still)               # frozen weights: no gradient (and kept exactly below)
             if schedule is not None:
                 opt.lr = float(ops.raw(schedule(step)))
             if clip:
                 norm = math.sqrt(sum(float(np.sum(np.asarray(ops.raw(a)) ** 2)) for a in tree_leaves(gr)))
                 if norm > clip:
                     gr = tree_map(lambda a: a * (clip / norm), gr)
-            params = opt.step(params, gr)
+            params = _freeze_keep(params, opt.step(params, gr), still)
             step += 1
         history.append(tot / max(1, len(items)))
         if verbose and (ep % every == 0 or ep == E - 1):
@@ -1628,7 +1695,7 @@ def _gpu_supports(model):
 def fit(model, params, X, y=None, loss="mse", opt=None, epochs=10, batch_size=None, seed=0, verbose=True,
         clip=None, schedule=None, graph=None, mask=None, val=None, backend="numpy", device="auto",
         precision="auto", compile=False, workers=1, ema=None, ewc=None, parallel="auto", stages=None,
-        micro_batches=None, compensated=None):
+        micro_batches=None, compensated=None, freeze=None, train_only=None):
     """Train `model`. Returns record(params, history, val_history, device).
 
     loss: "mse", "cross_entropy", "mae", "bce", "vae" ("huber" on torch) or a function loss(prediction, target).
@@ -1644,6 +1711,8 @@ def fit(model, params, X, y=None, loss="mse", opt=None, epochs=10, batch_size=No
     backend="gpu" on several cards (device="cuda:all" or "cuda:0,1,2"): parallel="data" (a copy of the model on every
     card), "pipeline" (the model split across the cards; stages=N pieces or a list of the units in each;
     micro_batches=M) or "auto" (copies when the model fits one card, else the fewest pieces that fit).
+    freeze= / train_only=: parts of the model by name ("enc", "layers[0]", "w*", or a function of the path) that
+    stay as they are / the only parts that learn (fine-tuning, training one part of a model at a time).
     """
     which = _backend(backend, model, loss if isinstance(loss, str) else None, True)
     if which == "gpu":
@@ -1652,11 +1721,14 @@ def fit(model, params, X, y=None, loss="mse", opt=None, epochs=10, batch_size=No
         try:
             return gpu_train.fit(model, params, X, y, loss, opt, epochs, batch_size, seed, verbose, clip, schedule, val,
                                  device=dev, precision=precision, ema=ema, ewc=ewc, parallel=parallel, stages=stages,
-                                 micro_batches=micro_batches, graph=graph, mask=mask, compensated=compensated)
+                                 micro_batches=micro_batches, graph=graph, mask=mask, compensated=compensated,
+                                 freeze=freeze, train_only=train_only)
         except gpu_train.TrainError as e:
             raise RuntimeErr(f"backend=\"gpu\": {e}")
     if ema is not None or ewc is not None:
         raise RuntimeErr("ema= and ewc= train on the GPU trainer: fit(..., backend=\"gpu\")")
+    if which == "torch" and (freeze is not None or train_only is not None):
+        raise RuntimeErr("freeze= / train_only= train on backend=\"numpy\" or \"gpu\"")
     if which == "torch":
         from . import torch_backend
         return torch_backend.fit(model, params, X, y, loss, opt, epochs, batch_size, seed, verbose, clip, schedule,
@@ -1695,6 +1767,7 @@ def fit(model, params, X, y=None, loss="mse", opt=None, epochs=10, batch_size=No
     rng = np.random.default_rng(int(seed))
     np.random.seed(int(seed))
     history, val_hist, step = [], [], 0
+    still = frozen_paths(params, freeze, train_only)
     team = _Team(vg, Xr, Yr, workers) if not full and _want_workers(workers) > 1 else None
     if team is not None:
         vg = team.vg
@@ -1730,9 +1803,11 @@ def _fit_loop(env):
                 l, g = vg(params, b)
             else:
                 l, g = vg(params, Xr if b is None else _take(Xr, b), Yr if b is None else _take(Yr, b))
+            still = env.get("still")
+            g = _freeze_grads(g, still)
             if clip:
                 g = clip_grad_norm(g, clip)
-            params = opt.step(params, g)
+            params = _freeze_keep(params, opt.step(params, g), still)
             if low:
                 params = _f32(params)
             total += float(ops.raw(l)) * (1 if b is None else len(b))

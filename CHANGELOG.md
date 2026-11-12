@@ -2,6 +2,21 @@
 
 ## 2.6.0 — in progress
 
+### Training modes
+- **Any optimizer on the GPU trainer:** adam, adamw and sgd keep their kernels; rmsprop, adagrad or an optimizer of
+  your own (anything with `step(params, grads)`) steps on the processor with the weights as the model's tree, on one
+  card and across cards (one optimizer per stage). The same training as NumPy.
+- **Frozen parts:** `fit(…, freeze=["enc", "layers[0]"])`, `train_only="w*"` (names by path, `*` at the end, or a
+  function of the path) on NumPy, one card and many: the frozen weights get no gradient, do not count in `clip`,
+  at a time).
+- **Any loss name on the card:** a loss without a kernel (`"vae"`, …) is evaluated on the processor, like a loss
+  function.
+- **Variants without a kernel run inside the model on the card** instead of refusing (an activation such as mish,
+  `graph_pool("max")`, `sage(aggregate="max")`, `parallel(combine="list")`, …).
+- **`fit()` on many cards** trains a loss function, another optimizer or frozen parts through `fit_batches`' cards
+  instead of refusing. `fit_batches(…, accumulate=A)` on many cards takes A batches a step (default 1, as on one
+  card).
+
 ### Graph-and-language models
   `typed_norm`, `global_attention`; nodes of other types pass through, edges of other relations are not read, so
   context with one shared projection and a gate per layer, final norm), `typed_pool` (a learned weight per node type).

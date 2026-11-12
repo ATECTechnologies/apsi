@@ -413,9 +413,11 @@ class Trainer(unittest.TestCase):
             b = GT.fit(m, m.init(seed=0), X, yg, loss="mse", opt=Adam(0.01), epochs=4, verbose=False,
                        precision="fp32", graph=gb, ops=GT.Emulator())
             np.testing.assert_allclose(a.history, b.history, rtol=1e-5)
-        with self.assertRaises(GT.TrainError):
-            GT.fit(L.Sequential([L.SAGE(8, 3, "max")]), L.Sequential([L.SAGE(8, 3, "max")]).init(), X, y,
-                   loss="cross_entropy", epochs=1, verbose=False, graph=g, ops=GT.Emulator())
+        m = L.Sequential([L.SAGE(8, 3, "max")])             # no kernel for max: on the processor, the same training
+        a = L.fit(m, m.init(), X, y, loss="cross_entropy", epochs=2, verbose=False, graph=g, precision="fp32")
+        b = GT.fit(m, m.init(), X, y, loss="cross_entropy", epochs=2, verbose=False, graph=g, ops=GT.Emulator(),
+                   precision="fp32")
+        np.testing.assert_allclose(a.history, b.history, rtol=1e-5)
 
     def test_training_matches_the_numpy_backend(self):
         rng = np.random.default_rng(0)
