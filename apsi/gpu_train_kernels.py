@@ -25,7 +25,8 @@ MAIN = ("apsi_kernel", "axpy", "add3", "mul3", "act_f", "act_b", "colsum", "ln_f
         "pos_f", "pos_b", "softmax_f", "softmax_b", "ce", "mse", "sumsq", "adam", "sgd", "drop_f", "fakeq",
         "gemm_simt", "gather", "rope", "spmm", "edge_dot", "seg_softmax", "seg_softmax_b", "dot_acc", "scale_add",
         "cols", "colmul", "topk_gate", "topk_gate_b", "loss_ew", "im2col", "col2im", "perm_nc", "pool_f", "pool_b",
-        "lstm_f", "lstm_b", "gru_a", "gru_b", "gru_b1", "gru_b2", "taylor_f", "taylor_b", "rowbias")
+        "lstm_f", "lstm_b", "gru_a", "gru_b", "gru_b1", "gru_b2", "taylor_f", "taylor_b", "rowbias", "acc2",
+        "fin2")
 TC = ("apsi_kernel", "gemm_tc3")                     # apsi_kernel = the one-pass product
 
 
@@ -544,6 +545,34 @@ def _main_module():
     b, p = k.b, k.p
     k.grid_loop(p["n"], lambda i: k.st(b.call(fma_f, [k.ld(p["X"], i), b.fadd(k.ld(p["S"], C(0)), p["c"]),
                                                       k.ld(p["Z"], i)]), p["Z"], i))
+    k.ret()
+
+    # acc2: exact sums of gradients (double-float, TwoSum): HI + LO += G, error-free; clear=1 also sets G to 0. The
+    # sum of many micro-batches (or of the copies of a stage on several cards) then does not depend on their order.
+    k = K("acc2", [("HI", G(f32)), ("LO", G(f32)), ("G", G(f32)), ("n", i32), ("clear", i32)])
+    b, p = k.b, k.p
+
+    def acc2(i):
+        g, h = k.ld(p["G"], i), k.ld(p["HI"], i)
+        s_ = b.fadd(h, g)
+        bp = b.fsub(s_, h)
+        e = b.fadd(b.fsub(h, b.fsub(s_, bp)), b.fsub(g, bp))
+        k.st(s_, p["HI"], i)
+        k.st(b.fadd(k.ld(p["LO"], i), e), p["LO"], i)
+        with b.if_then(b.icmp_unsigned("!=", p["clear"], C(0))):
+            k.st(F(0.0), p["G"], i)
+    k.grid_loop(p["n"], acc2)
+    k.ret()
+
+    # fin2: G <- HI + LO (rounded once), HI = LO = 0
+    k = K("fin2", [("HI", G(f32)), ("LO", G(f32)), ("G", G(f32)), ("n", i32)])
+    b, p = k.b, k.p
+
+    def fin2(i):
+        k.st(b.fadd(k.ld(p["HI"], i), k.ld(p["LO"], i)), p["G"], i)
+        k.st(F(0.0), p["HI"], i)
+        k.st(F(0.0), p["LO"], i)
+    k.grid_loop(p["n"], fin2)
     k.ret()
 
     # cols: columns off..off+w of Y (row stride ld) <- X (rows of w); back=1: X <- those columns (concatenation)

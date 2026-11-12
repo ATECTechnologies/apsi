@@ -374,6 +374,21 @@ class Emulator(_Ops):
         z = self.v(Z, n)
         z[:] = z + self.v(X, n) * (self.v(S, 1)[0] + np.float32(c))
 
+    def acc2(self, HI, LO, Gr, n, clear=True):
+        g, h, lo = self.v(Gr, n), self.v(HI, n), self.v(LO, n)
+        s_ = (h + g).astype(np.float32)
+        bp = (s_ - h).astype(np.float32)
+        e = ((h - (s_ - bp)) + (g - bp)).astype(np.float32)
+        h[:] = s_
+        lo[:] = lo + e
+        if clear:
+            g[:] = 0.0
+
+    def fin2(self, HI, LO, Gr, n):
+        self.v(Gr, n)[:] = self.v(HI, n) + self.v(LO, n)
+        self.v(HI, n)[:] = 0.0
+        self.v(LO, n)[:] = 0.0
+
     def cols(self, X, Y, rows, w, ld, off, back):
         y = Y[0].a[Y[1]:Y[1] + rows * ld].reshape(rows, ld)
         x = self.v(X, rows * w).reshape(rows, w)
@@ -979,6 +994,12 @@ class Gpu(_Ops):
 
     def scale_add(self, Z, X, S, n, c):
         self._go("scale_add", self.blocks(n), 256, self.p(Z), self.p(X), self.p(S), ("u", n), ("f", c))
+
+    def acc2(self, HI, LO, Gr, n, clear=True):
+        self._go("acc2", self.blocks(n), 256, self.p(HI), self.p(LO), self.p(Gr), ("u", n), ("u", 1 if clear else 0))
+
+    def fin2(self, HI, LO, Gr, n):
+        self._go("fin2", self.blocks(n), 256, self.p(HI), self.p(LO), self.p(Gr), ("u", n))
 
     def cols(self, X, Y, rows, w, ld, off, back):
         self._go("cols", self.blocks(rows * w), 256, self.p(X), self.p(Y), ("u", rows), ("u", w), ("u", ld),
@@ -2006,8 +2027,11 @@ class _Grads:
 
     def __init__(self, node, shapes):
         self.node, self.shapes, self.g, self.own = node, shapes, {}, set()
+        self.lo = {}                                      # name -> the low part of an exact (double-float) sum
 
     def add(self, name, dx):
+        """Several contributions are summed exactly (double-float) and rounded once when read, so the gradient of a
+        value does not depend on the order its users' gradients arrive in (one card or many, any cut)."""
         if dx is None:
             return
         if name not in self.g:
@@ -2015,10 +2039,44 @@ class _Grads:
             return
         o, n = self.node.net.ops, int(np.prod(self.shapes[name]))
         if name not in self.own:
-            acc = self.node.gbuf(("acc", name), n)
-            o.pull(acc, o, self.g[name], n)
-            self.g[name], _ = acc, self.own.add(name)
-        o.axpy(self.g[name], dx, n, 1.0)
+            hi, lo = self.node.gbuf(("acc", name), n), self.node.gbuf(("acclo", name), n)
+            o.pull(hi, o, self.g[name], n)
+            o.fill(lo, n, 0.0)
+            self.g[name], self.lo[name], _ = hi, lo, self.own.add(name)
+        o.acc2(self.g[name], self.lo[name], dx, n, False)
+
+    def seed(self, name, hi, lo=None):
+        """A gradient that arrives as an exact sum (hi, lo) from another card: summed on exactly."""
+        if lo is None:
+            return self.add(name, hi)
+        o, n = self.node.net.ops, int(np.prod(self.shapes[name]))
+        if name in self.g:
+            self.add(name, hi)
+            o.acc2(self.g[name], self.lo[name], lo, n, False)
+            return
+        h2, l2 = self.node.gbuf(("acc", name), n), self.node.gbuf(("acclo", name), n)
+        o.pull(h2, o, hi, n)
+        o.pull(l2, o, lo, n)
+        self.g[name], self.lo[name], _ = h2, l2, self.own.add(name)
+
+    def raw(self):
+        """name -> (hi, lo or None): the gradients left, not rounded (to carry an exact sum to another card)."""
+        return {k: (v, self.lo.get(k)) for k, v in self.g.items()}
+
+    def take(self, name):
+        """The gradient of `name`, its exact sum rounded once."""
+        g = self.g.pop(name, None)
+        lo = self.lo.pop(name, None)
+        if g is not None and lo is not None:
+            o, n = self.node.net.ops, int(np.prod(self.shapes[name]))
+            o.axpy(g, lo, n, 1.0)                          # hi + lo, one rounding
+        return g
+
+    def done(self):
+        """Every gradient left (the inputs'), rounded."""
+        for name in list(self.lo):
+            self.g[name] = self.take(name)
+        return self.g
 
 
 def _fwd_multi(nd, ins):
@@ -2062,20 +2120,22 @@ class _DAG(_Node):
 
     def bwd_multi(self, dy):
         self._back(dy, True)
-        return [self.G.g.get(n) for n in self.inputs]
+        g = self.G.done()
+        return [g.get(n) for n in self.inputs]
 
     def run_all(self, vals):
         """Every node from the given values (name -> (view, shape)); all the values by name."""
         self._run(vals)
         return self.vals
 
-    def back_from(self, seeds):
-        """Gradients from the given ones (name -> view): the gradients of every value, by name."""
+    def back_from(self, seeds, seeds_lo=None, raw=False):
+        """Gradients from the given ones (name -> view; seeds_lo: the low parts of exact sums): the gradients of
+        every value, by name (raw: name -> (hi, lo or None), not rounded)."""
         G = self.G = _Grads(self, self.shapes)
         for k_, v in seeds.items():
-            G.add(k_, v)
+            G.seed(k_, v, (seeds_lo or {}).get(k_))
         self._walk_back(G, True)
-        return G.g
+        return G.raw() if raw else G.done()
 
     def _run(self, vals):
         self.vals = vals
@@ -2088,7 +2148,7 @@ class _DAG(_Node):
 
     def bwd(self, dy, need_dx=True):
         self._back(dy, need_dx)
-        return self.G.g.get(self.inp)
+        return self.G.done().get(self.inp)
 
     def _back(self, dy, need_dx):
         G = self.G = _Grads(self, self.shapes)
@@ -2101,7 +2161,7 @@ class _DAG(_Node):
 
     def _walk_back(self, G, need_dx):
         for name, nd, srcs, single in reversed(self.items):
-            g = G.g.pop(name, None)
+            g = G.take(name)
             if g is None:
                 continue
             if single:
@@ -2158,7 +2218,7 @@ class _Parallel(_Node):
         G = _Grads(self, {"x": self.shape})
         for b_, d in zip(self.branches, self.comb.bwd_multi(dy)):
             G.add("x", b_.bwd(d, need_dx))
-        return G.g.get("x")
+        return G.done().get("x")
 
 
 def _ofs(view, k):
@@ -4484,7 +4544,7 @@ def _raw_of(a):
 
 def fit_batches(model, params, batches, loss="cross_entropy", opt=None, epochs=1, verbose=True, clip=None,
                 schedule=None, device="cuda", precision="auto", ops=None, compensated=None, every=None,
-                accumulate=1, stages=None, freeze=None, train_only=None):
+                accumulate=1, stages=None, freeze=None, train_only=None, exact_sums=None):
     """Train on batches that each bring their own shapes: batches is a list of (inputs, targets[, graph]) or a
     function epoch -> such a list. inputs may be a list (a dag with several inputs: token ids, node features, ...);
     each batch may have its own graph (a batch of graphs), its own number of rows and its own lengths. One card."""
@@ -4503,7 +4563,8 @@ def fit_batches(model, params, batches, loss="cross_entropy", opt=None, epochs=1
             from .gpu_pipeline import fit_batches_pipeline
             return fit_batches_pipeline(list(ops), model, params, batches, loss, opt, epochs, verbose, clip, schedule,
                                         precision, stages, max(1, int(accumulate or 1)),
-                                        _want_comp(compensated, params), every, freeze, train_only)
+                                        _want_comp(compensated, params), every, freeze, train_only,
+                                        _want_exact(exact_sums, params))
         ops = ops[0]
     loss = _host_loss(loss)
     custom = callable(loss)
@@ -4524,6 +4585,12 @@ def fit_batches(model, params, batches, loss="cross_entropy", opt=None, epochs=1
     history, t, step = [], int(getattr(opt, "t", 0)), 0
     every = int(every or max(1, E // 10))
     net.freeze = _Freeze(ops, net, params, freeze, train_only)
+    EXACT = None
+    if max(1, int(accumulate or 1)) > 1 and _want_exact(exact_sums, params):
+        EXACT = (ops.alloc(n), ops.alloc(n))             # the gradients of a step summed in double-float
+        for b_ in EXACT:
+            ops.fill((b_, 0), n, 0.0)
+    net.exact = EXACT
     try:
         for ep in range(E):
             items = list(batches(ep) if callable(batches) else batches)
@@ -4554,6 +4621,8 @@ def fit_batches(model, params, batches, loss="cross_entropy", opt=None, epochs=1
                         raise TrainError("a model with several outputs trains with a loss function of your own")
                     lv, dout = _multi_loss(ops, net, out, shape, loss_fn, Yr, group)
                     net.backward(dout)
+                    if EXACT is not None:                         # this batch's gradients, summed exactly
+                        ops.acc2((EXACT[0], 0), (EXACT[1], 0), (net.G, 0), n)
                     tot += lv
                     rows_all += 1
                     if (bi + 1) % A and bi + 1 < len(items):
@@ -4585,6 +4654,8 @@ def fit_batches(model, params, batches, loss="cross_entropy", opt=None, epochs=1
                         _regress(ops, loss, out, yd, dout, (LOSS1, 0), m, 1.0 / (m * group), 1.0 / m)
                     lv = float(ops.get(LOSS1, 1)[0])
                 net.backward(dout)
+                if EXACT is not None:                         # this batch's gradients, summed exactly
+                    ops.acc2((EXACT[0], 0), (EXACT[1], 0), (net.G, 0), n)
                 tot += lv
                 rows_all += 1
                 if (bi + 1) % A and bi + 1 < len(items):
@@ -4600,6 +4671,8 @@ def fit_batches(model, params, batches, loss="cross_entropy", opt=None, epochs=1
             if b_ is not None:
                 ops.free(b_)
         net.freeze.close()
+        for b_ in (EXACT or ()):
+            ops.free(b_)
         net.close()
     return Record(params=out_params, history=history, device=getattr(ops, "name", "?"))
 
@@ -4686,7 +4759,10 @@ def _host_step(ops, net, opt, clip, lr):
     """Any optimizer with step(params, grads): the weights and gradients in the model's own tree on the processor,
     the new weights back to the card (the optimizer sees what it sees on NumPy)."""
     import math as _m
-    P, G = net.params(), net.params(net.G)
+    master = getattr(net, "master", None)
+    if master is None:                                   # float64 weights kept for the optimizer, as on NumPy
+        master = tree_map(lambda a: np.asarray(a, np.float64) if isinstance(a, np.ndarray) else a, net.params_tree)
+    P, G = master, net.params(net.G)
     if clip:
         nrm = _m.sqrt(sum(float(np.sum(np.asarray(a, np.float64) ** 2)) for a in tree_leaves(G)
                           if isinstance(a, np.ndarray)))
@@ -4697,8 +4773,20 @@ def _host_step(ops, net, opt, clip, lr):
     if hasattr(opt, "lr"):
         opt.lr = lr
     from . import ops as aops
-    new = opt.step(P, G)
-    ops.put(net.P, net.flat_like(tree_map(lambda a: np.asarray(aops.raw(a)), new)))
+    new = tree_map(lambda a: np.asarray(aops.raw(a), np.float64) if hasattr(a, "shape") or
+                   isinstance(a, np.ndarray) else a, opt.step(P, G))
+    fz = getattr(net, "freeze", None)
+    if fz is not None and fz.ranges:                     # frozen weights keep their values in the master copy too
+        spans = fz.ranges
+        old_l, new_l = tree_leaves(P), tree_leaves(new)
+        keep = []
+        for a, o_, n_ in zip(tree_leaves(net.params_tree), old_l, new_l):
+            off = net.offsets.get(id(a)) if isinstance(a, np.ndarray) else None
+            keep.append(o_ if off is not None and any(lo <= off < lo + k for lo, k in spans) else n_)
+        it = iter(keep)
+        new = tree_map(lambda a: next(it), new)
+    net.master = new
+    ops.put(net.P, net.flat_like(new))
     ops.fill((net.G, 0), net.n, 0.0)                    # as the kernels do: the next step's gradients start at 0
 
 
@@ -4706,6 +4794,9 @@ def _apply_step(ops, net, opt, adam, wd, clip, schedule, step, t, st1, st2, SQ, 
     from . import ops as aops
     t += 1
     lr = float(aops.raw(schedule(step))) if schedule is not None else float(opt.lr)
+    ex = getattr(net, "exact", None)
+    if ex is not None:                                   # the step's exact sum, rounded once
+        ops.fin2((ex[0], 0), (ex[1], 0), (net.G, 0), n)
     fz = getattr(net, "freeze", None)
     if fz is not None and fz.ranges:
         fz.zero_grads()
@@ -4733,6 +4824,19 @@ def _native_step(ops, net, opt, adam, wd, clip, lr, t, st1, st2, SQ, COMP, n):
     else:
         ops.sgd((net.P, 0), (net.G, 0), (st1, 0), (SQ, 0), n, lr, float(opt.momentum), float(clip or 0.0),
                 (COMP, 0) if COMP else None)
+
+
+def _want_exact(exact, params):
+    """Exact sums of the gradients of a step's batches (and of the cards that share a step): on by default below
+    2 B parameters (8 more bytes per parameter). APSI_GPU_EXACT_SUMS=0 / 1 overrides."""
+    if exact is not None:
+        return bool(exact)
+    env = os.environ.get("APSI_GPU_EXACT_SUMS", "").strip().lower()
+    if env in ("0", "off", "false", "no"):
+        return False
+    if env in ("1", "on", "true", "yes"):
+        return True
+    return sum(int(np.size(a)) for a in tree_leaves(params) if isinstance(a, np.ndarray)) < 2_000_000_000
 
 
 def _want_comp(compensated, params):
