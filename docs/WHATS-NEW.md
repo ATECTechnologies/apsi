@@ -19,6 +19,7 @@ guide.
 | Debugger | breakpoints and stepping in VS Code or the terminal | [Debugging](DEBUGGING.md) |
 | Number formats | f64, f32, f16, bf16, FP8 and int8 tensors in `@native` and `@gpu` code | [Number formats](NUMBERS.md) |
 | Long-range graphs | graph transformers, one-step global attention, k-hop and mixed-hop layers | [Graphs](GRAPHS.md) |
+| GLA 3.0 | the code-and-language model as a model of `use layers`, on one card or many | [GLA](GLA.md) |
 | GPU | one thread per element, automatic CPU/GPU choice, Tensor Cores through cuBLAS | [Native](NATIVE.md) |
 | Matrix products | loops written the textbook way run on BLAS: 4–11× faster than C loops | [Performance](PERFORMANCE.md#matrix-products-written-as-loops) |
 | Same speed everywhere | SIMD lanes written by Apsi itself; `@native("fma")` | [below](#16-the-same-speed-on-every-processor) |

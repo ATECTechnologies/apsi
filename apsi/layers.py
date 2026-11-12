@@ -442,8 +442,11 @@ class MultiHeadAttention(Layer):
     kind = "attention"
 
     def __init__(self, d, heads=4, causal=False, kv_heads=None, rope=False, rope_base=10000.0, qk_norm=False,
-                 eps=1e-6):
+                 eps=1e-6, bias=True, gate=None, memory_mask=False):
         self.d, self.h, self.causal = int(d), int(heads), bool(causal)
+        self.bias = bool(bias)
+        self.gate = None if gate is None else float(gate)       # output * tanh(g), g learned from `gate`
+        self.memory_mask = bool(memory_mask)                     # the memory's last column: 1 read, 0 never read
         if self.d % self.h:
             raise ShapeError(f"multi_head_attention: d={self.d} must be divisible by heads={self.h}")
         self.kvh = int(kv_heads) if kv_heads else self.h
@@ -458,9 +461,13 @@ class MultiHeadAttention(Layer):
         rng = _rng(seed)
         dkv = self.kvh * self.hd
         f = dict(Wq=_glorot(rng, self.d, self.d), Wk=_glorot(rng, self.d, dkv), Wv=_glorot(rng, self.d, dkv),
-                 Wo=_glorot(rng, self.d, self.d), bo=np.zeros(self.d))
+                 Wo=_glorot(rng, self.d, self.d))
+        if self.bias:
+            f["bo"] = np.zeros(self.d)
         if self.qk_norm:
             f.update(q_norm=np.ones(self.hd), k_norm=np.ones(self.hd))
+        if self.gate is not None:
+            f["gate"] = np.array([self.gate])
         return Record(**f)
 
     def apply(self, p, x, train=False, mask=None, **ctx):
@@ -468,6 +475,11 @@ class MultiHeadAttention(Layer):
         mem = src if not isinstance(x, (list, tuple)) else x[1]          # cross-attention: [query, memory]
         B, T, D = np.shape(ops.raw(src))
         S = np.shape(ops.raw(mem))[1]
+        if self.memory_mask:                                               # [B, S, d + 1]: the last column says
+            keep = np.asarray(ops.raw(mem))[:, :, -1]                      # which memory slots may be read
+            mem = mem[:, :, :-1]
+            extra = ((keep - 1.0) * 1e9).reshape(B, 1, 1, S)
+            mask = extra if mask is None else mask + extra
         hd, h, kvh = self.hd, self.h, self.kvh
 
         def split(t, L, n):
@@ -490,11 +502,15 @@ class MultiHeadAttention(Layer):
             s = s + mask
         o = ops.softmax(s, axis=-1) @ v
         o = ops.reshape(ops.transpose(o, (0, 2, 1, 3)), B, T, D)
-        return o @ p.Wo + p.bo
+        y = o @ p.Wo
+        if self.bias:
+            y = y + p.bo
+        return y * ops.tanh(p.gate[0]) if self.gate is not None else y
 
     def describe(self):
         extra = (f", kv_heads={self.kvh}" if self.kvh != self.h else "") + (", rope" if self.rope else "") + \
-            (", qk_norm" if self.qk_norm else "")
+            (", qk_norm" if self.qk_norm else "") + (", gated" if self.gate is not None else "") + \
+            (", masked memory" if self.memory_mask else "")
         return f"multi_head_attention(d={self.d}, heads={self.h}{', causal' if self.causal else ''}{extra})"
 
 
@@ -697,6 +713,36 @@ class Select(Layer):
 
     def describe(self):
         return f"select({self.i})"
+
+
+class Slice(Layer):
+    """Columns start..stop of the last axis (a part of a layer's output)."""
+    kind = "slice"
+
+    def __init__(self, start, stop):
+        self.start, self.stop = int(start), int(stop)
+
+    def apply(self, p, x, train=False, **ctx):
+        return x[..., self.start:self.stop]
+
+    def describe(self):
+        return f"slice({self.start}:{self.stop})"
+
+
+class TiedOutput(Layer):
+    """Logits with the weights of an embedding of the same dag (tied embeddings): x @ E^T, E the table of node
+    `owner`. No weights of its own."""
+    kind = "tied_output"
+
+    def __init__(self, owner):
+        self.owner = str(owner)
+
+    def apply(self, p, x, train=False, **ctx):
+        E = getattr(ctx["_dag_params"], self.owner).E
+        return x @ ops.transpose(E, (1, 0))
+
+    def describe(self):
+        return f"tied_output({self.owner})"
 
 
 class MoE(Layer):
@@ -1120,7 +1166,8 @@ def fit_batches(model, params, batches, loss="cross_entropy", opt=None, epochs=1
             for item in chunk:
                 X, Y, g = _batch_parts(item)
                 ctx = {"graph": g} if g is not None else {}
-                Y = np.asarray(ops.raw(Y))
+                if not callable(loss) or not isinstance(Y, Record):
+                    Y = np.asarray(ops.raw(Y))                  # a loss of your own may take a record of targets
                 lv, gr = value_and_grad(lambda p: lf(model(p, X, train=True, **ctx), Y))(params)
                 gr = tree_map(lambda a: a / len(chunk) if isinstance(a, np.ndarray) else a, gr)
                 acc = gr if acc is None else tree_map(lambda a, b: a + b, acc, gr)
@@ -1902,7 +1949,8 @@ def module(interp=None):
         apply_rope=apply_rope, moe=MoE, fit_batches=fit_batches, pinn_fit=_pinn_fit, pinn_derivatives=_pinn_derivatives,
         transformer_encoder=transformer_encoder, layer_norm_layer=LayerNorm, rms_norm_layer=RMSNorm,
         batch_norm_layer=BatchNorm, dropout_layer=Dropout, activation=activation, lambda_layer=LambdaLayer,
-        scale=Scale, identity=Identity, select=Select, mean_pool=MeanPool,
+        scale=Scale, identity=Identity, select=Select, mean_pool=MeanPool, slice_layer=Slice,
+        tied_output=TiedOutput,
         gcn=GCN, sage=SAGE, gat=GAT, gin=GIN, graph_pool=GraphPool,
         # composition
         sequential=sequential, residual=residual, parallel=parallel, dag=dag, add=add, multiply=multiply,
@@ -1917,8 +1965,9 @@ def module(interp=None):
         torch_module=guarded(torch_module, "torch_module()"), params_from_torch=guarded(params_from_torch, "params_from_torch()"),
         devices=devices_, check_torch=guarded(check_torch, "check_torch()"),
     )
-    from . import graphs                     # long-range graph layers (graph_transformer, global_attention, …)
+    from . import graphs, gla                # long-range graph layers (graph_transformer, global_attention, …), GLA
     names.update(graphs.names())
+    names.update(gla.names())
     return names
 
 

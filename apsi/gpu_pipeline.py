@@ -75,6 +75,57 @@ def unit_costs(us, sample_shape):
     return work, size
 
 
+def dag_costs(nodes, inputs, xs, g):
+    """(work, parameters) of each node of a dag for one batch: the rows each node sees are followed from the inputs
+    (a node table has the graph's nodes, token ids their tokens), pooling layers make one row per graph, a graph
+    memory k slots per graph; the work is 6 multiply-adds per weight and row (forward and backward), lookups for
+    embedding tables, and the attention's own work."""
+    from . import layers as L, graphs as GR, gla as GL
+    from . import ops as aops
+    rows, seq = {}, {}
+    G = int(g.graphs) if g is not None else None
+    for name, x in zip(inputs, xs):
+        a = np.asarray(aops.raw(x))
+        if g is not None and a.ndim >= 1 and a.shape[0] == g.n:
+            rows[name] = int(a.shape[0])
+        else:
+            rows[name] = int(np.prod(a.shape[:-1])) if a.dtype.kind == "f" and a.ndim >= 2 else int(a.size)
+            if G is None:
+                G = int(a.shape[0])
+        seq[name] = int(a.shape[1]) if a.ndim >= 2 and not (g is not None and a.shape[0] == g.n) else 1
+    G = G or 1
+    work, size = [], []
+    for name, layer, srcs, _, p in nodes:
+        r = max(rows.get(s_, 1) for s_ in srcs)
+        T = max(seq.get(s_, 1) for s_ in srcs)
+        inner = layer
+        while isinstance(inner, L.Residual):
+            inner = inner.inner
+        mats, vecs = _count(p)
+        if isinstance(layer, L.Embedding):
+            w = 3.0 * layer.d * r
+        elif isinstance(layer, GL.NodeEncoder):
+            w = 3.0 * layer.d * 11 * r + 6.0 * 3 * layer.d * layer.d * r
+        else:
+            w = 6.0 * mats * r + 10.0 * vecs * r
+        if isinstance(inner, L.MultiHeadAttention):
+            S = T if len(srcs) == 1 else max(1, rows.get(srcs[1], 1) // G)
+            w += 12.0 * r * S * inner.d
+        if isinstance(layer, (GR.HGTBrain, GR.GlobalAttention)):
+            per = max(1.0, r / G)
+            n_ga = len(layer.ga) if isinstance(layer, GR.HGTBrain) else 1
+            w += 12.0 * n_ga * r * min(per, 4096) * layer.d
+        out_rows = r
+        if isinstance(layer, (GR.TypedPool, L.GraphPool, L.MeanPool, L.LastStep)):
+            out_rows = G
+        elif isinstance(layer, GL.BrainMemory):
+            out_rows = G * (layer.ka + layer.kc + 3)
+        rows[name], seq[name] = out_rows, (layer.ka + layer.kc + 3 if isinstance(layer, GL.BrainMemory) else T)
+        work.append(max(w, 1.0))
+        size.append(mats + vecs)
+    return work, size
+
+
 def partition(work, size, stages, bytes_per_param=16.0, budget=None):
     """Cut the units into `stages` consecutive groups (each at least one unit) so that the largest group's work is
     the smallest possible, each group's parameters (weights, gradients, optimizer state) inside `budget` bytes when
@@ -180,7 +231,7 @@ def _all_nodes(nd):
     their attributes: the state of each micro-batch in flight is saved after its forward pass and put back for its
     backward pass."""
     from . import gpu_train as GT
-    kinds = (GT._Node, GT._TypedLin, GT._TypedNormOp)
+    kinds = (GT._Node, GT._TypedLin, GT._TypedNormOp, GT._Context)
     out, seen, todo = [], set(), [nd]
     while todo:
         x = todo.pop()
@@ -631,10 +682,8 @@ def dag_view(model, params):
     from . import layers as L
     from .gpu_train import TrainError
     if isinstance(model, L.DAG):
-        if not isinstance(model.output, str):
-            raise TrainError("a split dag has one output (output=\"name\")")
         return ([(n, l_, list(srcs), single, getattr(params, n)) for n, l_, srcs, single in model.nodes],
-                list(model.inputs), model.output)
+                list(model.inputs), model.output if isinstance(model.output, str) else list(model.output))
     nodes, prev = [], "x"
     for i, (l_, p) in enumerate(units(model, params)):
         nodes.append((f"u{i}", l_, [prev], True, p))
@@ -648,7 +697,8 @@ def live_sets(nodes, inputs, output, a, b):
     for i, (n, _, srcs, _, _) in enumerate(nodes):
         for s_ in srcs:
             last[s_] = max(last.get(s_, -1), i)
-    last[output] = len(nodes)
+    for o_ in ([output] if isinstance(output, str) else output):
+        last[o_] = len(nodes)                            # the outputs travel to the last stage (the loss)
 
     def before(k):
         return list(inputs) + [nodes[i][0] for i in range(k)]
@@ -658,7 +708,7 @@ def live_sets(nodes, inputs, output, a, b):
 class SegStage(Stage):
     """A stretch of a dag's nodes on one card: it receives several named values and hands several on."""
 
-    def __init__(self, ops, seg, live_in, live_out, precision, index, count, slots):
+    def __init__(self, ops, seg, live_in, live_out, precision, index, count, slots, all_params=None):
         from . import layers as L
         from .gpu_train import Net, _Arena
         self.ops, self.index, self.count = ops, index, count
@@ -666,7 +716,12 @@ class SegStage(Stage):
         self.live_in, self.live_out = live_in, live_out
         model = L.DAG([[n, l_, srcs[0] if single else srcs] for n, l_, srcs, single, _ in seg], inputs=live_in,
                       output=seg[-1][0])
-        self.net = Net(ops, model, Record(**{n: p for n, _, _, _, p in seg}), precision)
+        held = {n: p for n, _, _, _, p in seg}
+        for n, l_, _, _, _ in seg:                       # a tied output whose embedding is on another card: the
+            own = getattr(l_, "owner", None)             # weights on both cards, their gradients summed every step
+            if isinstance(l_, L.TiedOutput) and own not in held and all_params is not None:
+                held[own] = getattr(all_params, own)
+        self.net = Net(ops, model, Record(**held), precision)
         self.garena = self.net.arena
         self.net.garena = self.garena
         self.slots = [_Arena(ops) for _ in range(max(1, slots))]
@@ -709,9 +764,12 @@ def fit_batches_pipeline(ops_list, model, params, batches, loss, opt, epochs, ve
     first_items = list(batches(0) if callable(batches) else batches)
     if not first_items:
         raise TrainError("no batches")
-    X0, _, _ = _batch_parts(first_items[0])
-    x0 = np.asarray(aops.raw(X0[0] if isinstance(X0, (list, tuple)) else X0))
-    work, size = unit_costs([(l_, p) for _, l_, _, _, p in nodes], x0.shape[1:])
+    X0, _, g0 = _batch_parts(first_items[0])
+    if isinstance(X0, (list, tuple)) or g0 is not None:
+        work, size = dag_costs(nodes, inputs, list(X0) if isinstance(X0, (list, tuple)) else [X0], g0)
+    else:
+        x0 = np.asarray(aops.raw(X0))
+        work, size = unit_costs([(l_, p) for _, l_, _, _, p in nodes], x0.shape[1:])
     n_cards = len(ops_list)
     if isinstance(stages, (list, tuple)):
         sizes = [int(v) for v in stages]
@@ -734,7 +792,7 @@ def fit_batches_pipeline(ops_list, model, params, batches, loss, opt, epochs, ve
             for s in range(S):
                 li, lo_ = live_sets(nodes, inputs, output, cuts[s], cuts[s + 1])
                 st = SegStage(ops_list[r * S + s], nodes[cuts[s]:cuts[s + 1]], li, lo_, precision, s, S,
-                              min(S - s, M))
+                              min(S - s, M), params)
                 st.gov = thermal.governor(getattr(st.ops, "dev", None))
                 st.LOSSB = st.alloc(max(1, M))
                 row.append(st)
@@ -752,6 +810,7 @@ def fit_batches_pipeline(ops_list, model, params, batches, loss, opt, epochs, ve
                 for b_ in (st.st1, st.st2, st.COMP):
                     if b_ is not None:
                         o.fill((b_, 0), ln, 0.0)
+        shared = _shared_params(grid[0])
         t, step, history = int(getattr(opt, "t", 0)), 0, []
         E = int(epochs)
         every = int(every or max(1, E // 10))
@@ -764,6 +823,8 @@ def fit_batches_pipeline(ops_list, model, params, batches, loss, opt, epochs, ve
                 parts = [chunk[r::R] for r in range(R)]
                 lr = float(aops.raw(schedule_fn(step))) if schedule_fn is not None else float(opt.lr)
                 losses += _seg_step(grid, parts, inputs, output, loss, loss_fn, len(chunk))
+                for row in grid:
+                    _sum_shared(row, shared)
                 t += 1
                 _update(grid, opt, adam, wd, lr, t, clip, None)
                 step += 1
@@ -784,6 +845,36 @@ def fit_batches_pipeline(ops_list, model, params, batches, loss, opt, epochs, ve
     return Record(params=out, history=history, stages=list(sizes), replicas=R, micro_batches=M, gpu_temperatures=temps,
                   device=f"{S * R} GPUs, a {len(nodes)}-node model split into {S} stages"
                          + (f" x {R} replicas" if R > 1 else ""))
+
+
+def _shared_params(row):
+    """The weights held by two stages (a tied output and its embedding): (stage a, offset a, stage b, offset b, n)."""
+    seen, out = {}, []
+    for s, st in enumerate(row):
+        for a in st.net.leaves:
+            k = id(a)
+            if k in seen and seen[k][0] != s:
+                s0, off0 = seen[k]
+                out.append((s0, off0, s, st.net.offsets[k], a.size))
+            else:
+                seen.setdefault(k, (s, st.net.offsets[k]))
+    return out
+
+
+def _sum_shared(row, shared):
+    """Both holders of a shared weight get the sum of their gradients: the same update on both cards."""
+    for a, oa, b, ob, n in shared:
+        A, B = row[a], row[b]
+        A.ops.sync()
+        B.ops.sync()
+        tmp = A.alloc(n)
+        A.ops.pull((tmp, 0), B.ops, (B.net.G, ob), n)
+        A.ops.axpy((A.net.G, oa), (tmp, 0), n, 1.0)
+        A.ops.sync()
+        B.ops.pull((B.net.G, ob), A.ops, (A.net.G, oa), n)
+        B.ops.sync()
+        A.extra.remove(tmp)
+        A.ops.free(tmp)
 
 
 def _seg_step(grid, parts, inputs, output, loss, loss_fn, total):
@@ -869,6 +960,25 @@ def _seg_work(st, items, inputs, output, loss, loss_fn, total, fwd, bwd, sends, 
                 o.sync()
                 fwd[s + 1].put((m, [(n, vals[n][0], int(np.prod(vals[n][1])), vals[n][1], o) for n in st.live_out]))
                 continue
+            if not isinstance(output, str):              # several outputs: the loss of your own over all of them
+                if loss != "custom":
+                    raise TrainError("a model with several outputs trains with a loss function of your own")
+                hs = [o.get(vals[n_][0][0], int(np.prod(vals[n_][1])), vals[n_][0][1]).reshape(vals[n_][1])
+                      .astype(np.float64) for n_ in output]
+                Yr = Y if isinstance(Y, Record) else np.asarray(aops.raw(Y))
+                lv, gh = value_and_grad(lambda *os_: loss_fn(list(os_), Yr), wrt=tuple(range(len(hs))))(*hs)
+                gh = gh if isinstance(gh, (list, tuple)) else [gh]
+                seeds = {}
+                for i, (n_, g_) in enumerate(zip(output, gh)):
+                    a_ = np.asarray(aops.raw(g_), np.float32).reshape(-1) / total
+                    dv = st.garena.get(("dout", i), max(1, a_.size))
+                    o.put(dv[0], a_, dv[1])
+                    seeds[n_] = dv
+                host[(r, m)] = float(aops.raw(lv))
+                grads = st.backward_seg(m, seeds)
+                _send_back(st, grads, sends, bwd, s, m, o, ring)
+                ring ^= 1
+                continue
             out, shape = vals[output]
             rows, C = _rows(shape), shape[-1]
             mm = rows * C
@@ -907,23 +1017,29 @@ def _seg_work(st, items, inputs, output, loss, loss_fn, total, fwd, bwd, sends, 
             release = sem
         if kind == "B" or st.last:
             grads = st.backward_seg(m, seeds)
-            if st.first:
-                o.sync()
-            else:
-                sends[s].acquire()
-                msg = []
-                for name in st.live_in:
-                    gv = grads.get(name)
-                    if gv is None or name not in st.net.root.shapes:
-                        continue
-                    cnt = int(np.prod(st.net.root.shapes[name]))
-                    buf = st.garena.get(("send", ring, name), cnt)
-                    o.pull(buf, o, gv, cnt)
-                    msg.append((name, buf, cnt, o))
+            _send_back(st, grads, sends, bwd, s, m, o, ring)
+            if not st.first:
                 ring ^= 1
-                o.sync()
-                bwd[s - 1].put((m, msg, sends[s]))
             if release is not None:
                 release.release()
     o.sync()
     net.set_graph(None, keep=True)
+
+
+def _send_back(st, grads, sends, bwd, s, m, o, ring):
+    """The gradients of the values this stage received, to the stage before."""
+    if st.first:
+        o.sync()
+        return
+    sends[s].acquire()                                   # a free send buffer (the stage before has read it)
+    msg = []
+    for name in st.live_in:
+        gv = grads.get(name)
+        if gv is None or name not in st.net.root.shapes:
+            continue
+        cnt = int(np.prod(st.net.root.shapes[name]))
+        buf = st.garena.get(("send", ring, name), cnt)
+        o.pull(buf, o, gv, cnt)
+        msg.append((name, buf, cnt, o))
+    o.sync()
+    bwd[s - 1].put((m, msg, sends[s]))

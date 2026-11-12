@@ -1624,7 +1624,10 @@ class _Attention(_Node):
         self.qkn = bool(getattr(layer, "qk_norm", False))
         self.eps = float(getattr(layer, "eps", 1e-6))
         self.Wq, self.Wk, self.Wv, self.Wo = (net.param(getattr(p, n)) for n in ("Wq", "Wk", "Wv", "Wo"))
-        self.bo = net.param(p.bo)
+        self.bo = net.param(p.bo) if getattr(layer, "bias", True) else None
+        self.gated = getattr(layer, "gate", None) is not None       # output * tanh(gate) (no output bias)
+        self.g = net.param(p.gate) if self.gated else None
+        self.mmask = bool(getattr(layer, "memory_mask", False))      # the memory's last column: 1 read, 0 not
         if self.qkn:
             self.gq, self.gk = net.param(p.q_norm), net.param(p.k_norm)
         self.tabs, self.idx = {}, {}
@@ -1664,8 +1667,15 @@ class _Attention(_Node):
             raise TrainError("multi_head_attention on the GPU takes [batch, time, features]")
         o, (B, T, D), h, kvh = self.net.ops, shape, self.h, self.kvh
         xm, S = (x, T) if mem is None else (mem[0], int(mem[1][1]))
-        if mem is not None and (len(mem[1]) != 3 or mem[1][0] != B or mem[1][2] != D):
+        Dm = D + 1 if self.mmask else D
+        if mem is not None and (len(mem[1]) != 3 or mem[1][0] != B or mem[1][2] != Dm):
             raise TrainError(f"cross-attention: the memory is {tuple(mem[1])}, the query {tuple(shape)}")
+        self.mb = None
+        if self.mmask and mem is not None:              # split the memory: its features, and a bias row per batch
+            a = o.get(xm[0], B * S * Dm, xm[1]).reshape(B * S, Dm)
+            xm = _put_buf(self, "xmf", a[:, :D], np.float32)
+            self.mb = _put_buf(self, "mb", (a[:, D].astype(np.float64) - 1.0) * 1e9, np.float32)
+            self.ones = _put_buf(self, "ones", np.ones(T), np.float32)
         hd = D // h
         M, Mk, Dkv = B * T, B * S, kvh * hd
         self.x, self.xm, self.cross, self.B, self.T, self.S = x, xm, mem is not None, B, T, S
@@ -1695,19 +1705,23 @@ class _Attention(_Node):
             k, v = kf, vf
         self.q, self.k, self.v = q, k, v
         sc = 1.0 / math.sqrt(hd)
-        self.fused = ps == 1 and getattr(o, "flash", False) and hd in KS.FLASH_HD and D % 4 == 0 and not self.cross
+        self.fused = ps == 1 and getattr(o, "flash", False) and hd in KS.FLASH_HD and D % 4 == 0 and not self.cross \
+            and not self.gated
         if self.fused:                                  # scores, softmax and the weighted sum in one kernel
             att, self.L = self.buf("att", M * D), self.buf("lse", B * h * T)
             o.flash_fwd(q, k, v, att, self.L, B, T, h, hd, self.causal, sc)
             self.att = att
             y = self.buf("y", M * D)
-            o.gemm(att, self.Wo.w, y, M, D, D, D, 1, D, 1, D, bias=self.bo.w, passes=ps, epi=3 if residual else 0,
+            o.gemm(att, self.Wo.w, y, M, D, D, D, 1, D, 1, D, bias=self.bo.w if self.bo else None, passes=ps, epi=3 if residual else 0,
                    X2=residual)
             return y, shape
         Sc, P = self.buf("s", B * h * T * S), self.buf("p", B * h * T * S)
         # S[b, h](t, s) = q[b, t, h, :] . k[b, s, h, :] * sc
         o.gemm(q, k, Sc, T, S, hd, D, 1, 1, D, S, alpha=sc, batch=(B, h), sa=(T * D, hd), sb=(S * D, hd),
                sc=(h * T * S, T * S), passes=ps)
+        if self.mb is not None:                         # + the memory's bias (0 or -1e9) on every query row
+            o.gemm(self.ones, self.mb, Sc, T, S, 1, 1, 1, S, 1, S, beta=True, batch=(B, h), sa=(0, 0), sb=(S, 0),
+                   sc=(h * T * S, T * S), passes=3)
         o.softmax_f(Sc, P, B * h * T, S, T, self.causal)
         self.P = P
         att = self.buf("att", M * D)                    # [b, t, h, :] = P[b, h] @ v[b, :, h, :]
@@ -1715,16 +1729,46 @@ class _Attention(_Node):
                sc=(T * D, hd), passes=ps)
         self.att = att
         y = self.buf("y", M * D)
-        o.gemm(att, self.Wo.w, y, M, D, D, D, 1, D, 1, D, bias=self.bo.w, passes=ps, epi=3 if residual else 0,
+        if self.gated:                                  # y = tanh(gate) (att Wo) (+ residual)
+            z = self.buf("z", M * D)
+            o.gemm(att, self.Wo.w, z, M, D, D, D, 1, D, 1, D, passes=ps)
+            self.z, self.th = z, math.tanh(float(o.get(self.g.w[0], 1, self.g.w[1])[0]))
+            if residual is not None:
+                o.pull(y, o, residual, M * D)
+            else:
+                o.fill(y, M * D, 0.0)
+            o.axpy(y, z, M * D, self.th)
+            return y, shape
+        o.gemm(att, self.Wo.w, y, M, D, D, D, 1, D, 1, D, bias=self.bo.w if self.bo else None, passes=ps, epi=3 if residual else 0,
                X2=residual)
         return y, shape
 
     def bwd(self, dy, need_dx=True):
+        out = self._bwd(dy, need_dx)
+        if self.cross and self.mmask:                   # the memory's gradient: none for its last column
+            dx, dm = out
+            Mk, D = self.B * self.S, self.D
+            a = np.zeros((Mk, D + 1), np.float32)
+            a[:, :D] = self.net.ops.get(dm[0], Mk * D, dm[1]).reshape(Mk, D)
+            return dx, _put_buf(self, "dmem1", a, np.float32, grad=True)
+        return out
+
+    def _bwd(self, dy, need_dx=True):
         """The input's gradient; for cross-attention (the query's gradient, the memory's gradient)."""
         o, B, T, S, D, h = self.net.ops, self.B, self.T, self.S, self.D, self.h
         hd, M, Mk, ps = D // h, B * T, B * S, self.net.passes
         sc = 1.0 / math.sqrt(hd)
-        o.gemm(self.att, dy, self.Wo.g, D, D, M, 1, D, D, 1, D, beta=True, passes=ps, db=self.bo.g)
+        if self.gated:                                  # d gate = (1 - tanh^2) dy . z; the rest sees tanh(gate) dy
+            dg = self.gbuf("dg", 1)
+            o.edge_dot(dy, self.z, _put_buf(self, "zero1", [0]), _put_buf(self, "zero2", [0]), dg, 1, 1, M * D)
+            v_ = float(o.get(dg[0], 1, dg[1])[0]) * (1.0 - self.th * self.th)
+            o.put(dg[0], np.array([v_], np.float32), dg[1])
+            o.axpy(self.g.g, dg, 1, 1.0)
+            dz = self.gbuf("dz", M * D)
+            o.fill(dz, M * D, 0.0)
+            o.axpy(dz, dy, M * D, self.th)
+            dy = dz
+        o.gemm(self.att, dy, self.Wo.g, D, D, M, 1, D, D, 1, D, beta=True, passes=ps, db=self.bo.g if self.bo else None)
         datt = self.gbuf("datt", M * D)
         o.gemm(dy, self.Wo.w, datt, M, D, D, D, 1, 1, D, D, passes=ps)
         if self.fused:
@@ -1996,12 +2040,15 @@ class _DAG(_Node):
 
     def __init__(self, net, key, layer, p, gk):
         super().__init__(net, key)
-        if not isinstance(layer.output, str):
-            raise TrainError("dag on the GPU trainer: one output (output=\"name\")")
         self.inputs, self.out = list(layer.inputs), layer.output
+        self.multi_out = not isinstance(self.out, str)           # several outputs: the model's root only
         self.inp = self.inputs[0]
-        self.items = [(name, net.compile(l_, getattr(p, name), f"{key}.{name}", f"{gk}.{name}"), srcs, single)
-                      for name, l_, srcs, single in layer.nodes]
+        before, net.dag_params = getattr(net, "dag_params", None), p      # tied_output finds its owner's weights
+        try:
+            self.items = [(name, net.compile(l_, getattr(p, name), f"{key}.{name}", f"{gk}.{name}"), srcs, single)
+                          for name, l_, srcs, single in layer.nodes]
+        finally:
+            net.dag_params = before
 
     def fwd(self, x, shape):
         if len(self.inputs) != 1:
@@ -2035,6 +2082,8 @@ class _DAG(_Node):
         for name, nd, srcs, single in self.items:
             vals[name] = nd.fwd(*vals[srcs[0]]) if single else _fwd_multi(nd, [vals[s_] for s_ in srcs])
         self.shapes = {k_: v[1] for k_, v in vals.items()}
+        if self.multi_out:
+            return [vals[o][0] for o in self.out], [vals[o][1] for o in self.out]
         return vals[self.out]
 
     def bwd(self, dy, need_dx=True):
@@ -2043,7 +2092,11 @@ class _DAG(_Node):
 
     def _back(self, dy, need_dx):
         G = self.G = _Grads(self, self.shapes)
-        G.g[self.out] = dy
+        if self.multi_out:                                       # one gradient per output (None: not in the loss)
+            for o_, d_ in zip(self.out, dy):
+                G.add(o_, d_)
+        else:
+            G.g[self.out] = dy
         self._walk_back(G, need_dx)
 
     def _walk_back(self, G, need_dx):
@@ -2056,6 +2109,35 @@ class _DAG(_Node):
             else:
                 for s_, dx in zip(srcs, _bwd_multi(nd, g)):
                     G.add(s_, dx)
+
+
+class _TiedOutput(_Node):
+    """tied_output: x @ E^T with the table E of an embedding of the same dag (one parameter, two users: both add
+    their gradients into it)."""
+
+    def __init__(self, net, key, layer, dag_params):
+        super().__init__(net, key)
+        if dag_params is None or not hasattr(dag_params, layer.owner):
+            raise TrainError(f"tied_output('{layer.owner}'): no embedding of that name in the dag")
+        E = getattr(dag_params, layer.owner).E
+        self.V, self.D = E.shape
+        self.E = net.param(E)
+
+    def fwd(self, x, shape):
+        M, V, D = _rows(shape), self.V, self.D
+        self.x, self.M = x, M
+        y = self.buf("y", M * V)
+        self.net.ops.gemm(x, self.E.w, y, M, V, D, D, 1, 1, D, V, passes=self.net.passes)    # x E^T
+        return y, tuple(shape[:-1]) + (V,)
+
+    def bwd(self, dy, need_dx=True):
+        o, M, V, D, ps = self.net.ops, self.M, self.V, self.D, self.net.passes
+        o.gemm(dy, self.x, self.E.g, V, D, M, 1, V, D, 1, D, beta=True, passes=ps)        # dE += dy^T x
+        if not need_dx:
+            return None
+        dx = self.gbuf("dx", M * D)
+        o.gemm(dy, self.E.w, dx, M, D, V, V, 1, D, 1, D, passes=ps)                       # dx = dy E
+        return dx
 
 
 class _Parallel(_Node):
@@ -2252,8 +2334,12 @@ class _HostLayer(_Node):
     def _ctx(self):
         return {"graph": self.net.graph} if self.net.graph is not None else {}
 
-    def _get(self, x, shape):
-        return self.net.ops.get(x[0], int(np.prod(shape)), x[1]).reshape(shape).astype(np.float64)
+    def _get(self, x, shape, i=0):
+        a = self.net.ops.get(x[0], int(np.prod(shape)), x[1]).reshape(shape)
+        ids = getattr(self.layer, "takes_ids", False)          # integer inputs (ids) travel as their bits
+        if ids is True or (isinstance(ids, (list, tuple)) and i < len(ids) and ids[i]):
+            return np.ascontiguousarray(a).view(np.int32).astype(np.int64)
+        return a.astype(np.float64)
 
     def _run(self, xs):
         from . import ops as aops
@@ -2273,7 +2359,7 @@ class _HostLayer(_Node):
 
     def fwd_multi(self, ins):
         self.multi, self.shapes = True, [s_ for _, s_ in ins]
-        self.xs = [self._get(x, s_) for x, s_ in ins]
+        self.xs = [self._get(x, s_, i) for i, (x, s_) in enumerate(ins)]
         return self._run(self.xs)
 
     def _grads(self, dy):
@@ -2289,11 +2375,17 @@ class _HostLayer(_Node):
             return aops.sum_(y * dyh)
         g0 = aops._RNG[0].bit_generator.state
         aops._RNG[0].bit_generator.state = self.rng       # the same random numbers as the forward pass
+        ids = getattr(layer, "takes_ids", False)
+        isid = [ids is True or (isinstance(ids, (list, tuple)) and i < len(ids) and bool(ids[i]))
+                for i in range(len(self.xs))]
+        wrt = (0,) + tuple(1 + i for i in range(len(self.xs)) if not isid[i])
         try:
-            _, g = value_and_grad(f, wrt=tuple(range(1 + len(self.xs))))(p, *self.xs)
+            _, g = value_and_grad(f, wrt=wrt)(p, *self.xs)
         finally:
             aops._RNG[0].bit_generator.state = g0
-        gp, gxs = g[0], g[1:]
+        g = list(g) if isinstance(g, (list, tuple)) and len(wrt) > 1 else [g]
+        gp, rest = g[0], list(g[1:])
+        gxs = [None if isid[i] else rest.pop(0) for i in range(len(self.xs))]
         o, net = self.net.ops, self.net
         flat = {id(a): t for a, t in zip(tree_leaves(p), tree_leaves(gp))}
         orig = {id(b_): a for a, b_ in zip(tree_leaves(self.p), tree_leaves(p))}
@@ -2306,6 +2398,9 @@ class _HostLayer(_Node):
             o.axpy(net.param(a).g, tmp, a.size, 1.0)
         outs = []
         for i, (gx, s_) in enumerate(zip(gxs, self.shapes)):
+            if gx is None:
+                outs.append(None)
+                continue
             d = self.gbuf(("dx", i), int(np.prod(s_)))
             o.put(d[0], np.asarray(aops.raw(gx), np.float32).reshape(-1), d[1])
             outs.append(d)
@@ -2516,19 +2611,21 @@ class _GraphDev:
             return hit
         g = self.g
         src, dst = np.asarray(g.src, np.int64), np.asarray(g.dst, np.int64)
-        if which == "noself":
+        rel = np.asarray(g.rel, np.int64)
+        hop = np.asarray(g.hop, np.int64)
+        if isinstance(which, tuple):                     # ("noself", relation ids): the edges of those relations,
+            from .graphs import owned_edges              # renumbered (a layer that owns some relations)
+            src, dst, rel = owned_edges(g, 0, which[1])
+            hop = np.ones(len(src), np.int64)
+        elif which == "noself":
             keep = src != dst
-            src, dst = src[keep], dst[keep]
+            src, dst, rel, hop = src[keep], dst[keep], rel[keep], hop[keep]
         N, E = self.N, len(src)
         order = np.argsort(dst, kind="stable")
         s_, d_ = src[order], dst[order]
         off = np.concatenate([[0], np.cumsum(np.bincount(d_, minlength=N))])
         tperm = np.argsort(s_, kind="stable")              # edges (in target order) grouped by source
         toff = np.concatenate([[0], np.cumsum(np.bincount(s_, minlength=N))])
-        rel = np.asarray(g.rel, np.int64)
-        hop = np.asarray(g.hop, np.int64)
-        if which == "noself":
-            rel, hop = rel[keep], hop[keep]
         fwd = dict(col=self._put(s_), off=self._put(off), row=self._put(d_), ids=self._put(np.arange(E)), n=N, E=E,
                    src=s_, dst=d_, rel=rel[order], hop=hop[order], eoff=self._put(np.arange(E + 1)))
         bwd = dict(col=self._put(d_[tperm]), off=self._put(toff), vperm=self._put(tperm), n=N, E=E)
@@ -2923,8 +3020,9 @@ class _GraphTransformer(_Node):
 class _TypeGroups:
     """The nodes of a graph grouped by type on the card: perm (sorted by type), inv (back), rows of each type."""
 
-    def __init__(self, gd, T):
-        t = np.asarray(getattr(gd.g, "ntype", np.zeros(gd.N, np.int64)), np.int64)
+    def __init__(self, gd, T, ids=None):
+        from .graphs import local_types
+        t = local_types(gd.g, gd.N, T, ids)
         perm = np.argsort(t, kind="stable")
         inv = np.empty_like(perm)
         inv[perm] = np.arange(len(perm))
@@ -2934,11 +3032,11 @@ class _TypeGroups:
         self.known_d = gd._put(self.known, np.float32)
 
 
-def _groups(net, T):
+def _groups(net, T, ids=None):
     gd = _need_graph(net, "typed layers")
-    key = ("types", T)
+    key = ("types", T, ids)
     if key not in gd.cache:
-        gd.cache[key] = _TypeGroups(gd, T)
+        gd.cache[key] = _TypeGroups(gd, T, ids)
     return gd.cache[key]
 
 
@@ -3044,10 +3142,11 @@ class _TypedLinearNode(_Node):
         super().__init__(net, key)
         self.op = _TypedLin(self, "", net.param(p.W), net.param(p.b) if layer.bias else None, layer.n_in,
                             layer.n_out, layer.T)
+        self.ids = layer.type_ids
 
     def fwd(self, x, shape):
         self.N = _rows(shape)
-        return self.op.fwd(x, self.N, _groups(self.net, self.op.T)), shape[:-1] + (self.op.F,)
+        return self.op.fwd(x, self.N, _groups(self.net, self.op.T, self.ids)), shape[:-1] + (self.op.F,)
 
     def bwd(self, dy, need_dx=True):
         return self.op.bwd(dy, self.N)
@@ -3057,10 +3156,11 @@ class _TypedNormNode(_Node):
     def __init__(self, net, key, layer, p):
         super().__init__(net, key)
         self.op = _TypedNormOp(self, "", net.param(p.gamma), net.param(p.beta), layer.d, layer.T, layer.eps)
+        self.ids = layer.type_ids
 
     def fwd(self, x, shape):
         self.N = _rows(shape)
-        return self.op.fwd(x, self.N, _groups(self.net, self.op.T)), shape
+        return self.op.fwd(x, self.N, _groups(self.net, self.op.T, self.ids)), shape
 
     def bwd(self, dy, need_dx=True):
         return self.op.bwd(dy, self.N)
@@ -3079,11 +3179,13 @@ class _HGT(_Node):
         self.lin = {n: _TypedLin(self, n + ".", net.param(getattr(p, n).W), net.param(getattr(p, n).b), d, d, T)
                     for n in ("q", "k", "v", "o")}
         self.rel = net.param(p.rel)
-        self.ffn = net.compile(layer.ffn, p.ffn, key + ".f", gk + ".f")
+        self.ffn = net.compile(layer.ffn, p.ffn, key + ".f", gk + ".f") if layer.ffn is not None else None
         self.ids = self.ids_for = None
+        self.type_ids, self.rel_ids = layer.type_ids, layer.rel_ids
+        self.which = "noself" if self.rel_ids is None else ("noself", self.rel_ids)
 
     def _ids(self, gd, f):
-        key = ("hgt", id(self))
+        key = ("hgt", id(self), self.which)
         if key not in gd.cache:
             if len(f["rel"]) and f["rel"].max() >= self.R:
                 raise TrainError(f"hgt(relations={self.R}) got a graph with relation {int(f['rel'].max())}")
@@ -3096,8 +3198,8 @@ class _HGT(_Node):
         o, ps = self.net.ops, self.net.passes
         N, d, H, R, T = _rows(shape), self.d, self.H, self.R, self.T
         hd = d // H
-        grp = _groups(self.net, T)
-        f, _ = gd.csr("noself")
+        grp = _groups(self.net, T, self.type_ids)
+        f, _ = gd.csr(self.which)
         self.N, self.E, self.x, self.grp = N, f["E"], x, grp
         xn = self.norm.fwd(x, N, grp)
         q, k, v = (self.lin[n].fwd(xn, N, grp) for n in ("q", "k", "v"))
@@ -3114,6 +3216,8 @@ class _HGT(_Node):
         else:
             o.pull(x1, o, x, N * d)
         self.x1 = x1
+        if self.ffn is None:
+            return x1, shape
         fo, _ = self.ffn.fwd(x1, shape)
         fm = _diag(self, "fm", fo, grp.known_d, N, d)
         y = self.buf("y", N * d)
@@ -3125,14 +3229,17 @@ class _HGT(_Node):
         N, d, H, R = self.N, self.d, self.H, self.R
         hd = d // H
         gd, grp = self.net.gdev, self.grp
-        dfm = _diag(self, "dfm", dy, grp.known_d, N, d, grad=True)
-        dx1 = self.gbuf("dx1", N * d)
-        o.add3(dx1, dy, self.ffn.bwd(dfm, True), N * d)
+        if self.ffn is None:
+            dx1 = dy
+        else:
+            dfm = _diag(self, "dfm", dy, grp.known_d, N, d, grad=True)
+            dx1 = self.gbuf("dx1", N * d)
+            o.add3(dx1, dy, self.ffn.bwd(dfm, True), N * d)
         dx = self.gbuf("dx", N * d)
         if not self.E:
             dxn_parts = []
         else:
-            f, _ = gd.csr("noself")
+            f, _ = gd.csr(self.which)
             kidx, vidx, hasin = self._ids(gd, f)
             dom = _diag(self, "dom", dx1, hasin, N, d, grad=True)
             dmsg = self.lin["o"].bwd(dom, N)
@@ -3155,19 +3262,36 @@ class _HGT(_Node):
 
 
 class _GlobalAttention(_Node):
-    """global_attention: x + attention of every node over the nodes of its graph (at most max_keys keys a graph,
-    spread evenly), as edges on the card."""
+    """global_attention: x + attention of every node over the nodes of its graph, as edges on the card. Options as
+    the layer: fewer heads than the model (ratio), biases on q / k / v, learned keys (every value scaled by
+    2 sigmoid(score); above max_keys the best-scored keys), only the nodes of some types."""
 
     def __init__(self, net, key, layer, p, gk):
         from . import layers as L
         super().__init__(net, key)
-        self.d, self.H, self.max_keys = layer.d, layer.h, layer.max_keys
+        self.d, self.H, self.max_keys = layer.d, getattr(layer, "H", layer.h), layer.max_keys
+        self.hd = layer.d // layer.h
+        self.inner = self.H * self.hd
+        self.layer = layer
         self.n = _Norm(net, key + ".n", L.LayerNorm(layer.d), p.n, False)
         self.n.gkey = gk + ".n"
         self.Wq, self.Wk, self.Wv, self.Wo, self.bo = (net.param(getattr(p, n)) for n in ("Wq", "Wk", "Wv", "Wo",
                                                                                           "bo"))
+        self.bias = bool(getattr(layer, "bias", False))
+        self.bq, self.bk, self.bv = ((net.param(p.bq), net.param(p.bk), net.param(p.bv)) if self.bias else
+                                     (None, None, None))
+        self.learned = bool(getattr(layer, "learned", False))
+        if self.learned:
+            self.ksw, self.ksb = net.param(p.ks_w), net.param(p.ks_b)
+        self.T, self.type_ids = getattr(layer, "T", None), getattr(layer, "type_ids", None)
 
-    def _edges(self, N):
+    def _own(self, N):
+        if self.T is None:
+            return np.ones(N, bool)
+        from .graphs import _owned_mask
+        return _owned_mask(self.net.graph, N, self.T, self.type_ids).reshape(-1)
+
+    def _gd(self, N):
         g = self.net.graph
         if g is None:
             if self.net.gdev is None or self.net.gdev.N != N:
@@ -3175,56 +3299,320 @@ class _GlobalAttention(_Node):
                 if self.net.gdev is not None:
                     self.net.gdev.close()
                 self.net.gdev = _GraphDev(self.net, L.Graph(np.zeros(0, int), np.zeros(0, int), N, self_loops=False))
-            batch = np.zeros(N, np.int64)
-        else:
-            batch = np.asarray(g.batch, np.int64)
-        gd = _need_graph(self.net, "global_attention") if g is not None else self.net.gdev
-        src, dst = [], []
-        for b_ in np.unique(batch):
-            idx = np.nonzero(batch == b_)[0]
-            keys = idx if len(idx) <= self.max_keys else \
-                idx[np.linspace(0, len(idx) - 1, self.max_keys).astype(int)]
+            return self.net.gdev, np.zeros(N, np.int64)
+        return _need_graph(self.net, "global_attention"), np.asarray(g.batch, np.int64)
+
+    def _edges(self, N, score):
+        gd, batch = self._gd(N)
+        own = self._own(N)
+        src, dst, picked = [], [], False
+        for b_ in np.unique(batch[own]):
+            idx = np.nonzero((batch == b_) & own)[0]
+            keys = self.layer.keys_of(idx, score) if hasattr(self.layer, "keys_of") else (
+                idx if len(idx) <= self.max_keys else idx[np.linspace(0, len(idx) - 1, self.max_keys).astype(int)])
+            picked = picked or (self.learned and len(keys) < len(idx))
             src.append(np.tile(keys, len(idx)))
             dst.append(np.repeat(idx, len(keys)))
-        f = gd.custom(("global", self.max_keys), np.concatenate(src), np.concatenate(dst))
-        if ("ga", id(self)) not in gd.cache:
-            gd.cache[("ga", id(self))] = gd._put(f["src"])
-        self.kid = gd.cache[("ga", id(self))]
-        return gd, f
+        src = np.concatenate(src) if src else np.zeros(0, np.int64)
+        dst = np.concatenate(dst) if dst else np.zeros(0, np.int64)
+        if picked:                                         # keys chosen by this step's scores: edges of this pass
+            order = np.argsort(dst, kind="stable")
+            s_, d_ = src[order], dst[order]
+            E = len(s_)
+            put = lambda name, a: _put_buf(self, name, a)              # noqa: E731
+            f = dict(col=put("e_col", s_), off=put("e_off", np.concatenate([[0], np.cumsum(np.bincount(
+                d_, minlength=N))])), row=put("e_row", d_), ids=put("e_ids", np.arange(E)),
+                eoff=put("e_eoff", np.arange(E + 1)), n=N, E=E, src=s_, dst=d_)
+            return gd, f, put("e_kid", s_)
+        f = gd.custom(("global", self.max_keys, self.type_ids), src, dst)
+        ck = ("ga", self.max_keys, self.type_ids)
+        if ck not in gd.cache:
+            gd.cache[ck] = gd._put(f["src"])
+        return gd, f, gd.cache[ck]
 
     def fwd(self, x, shape):
         o, ps = self.net.ops, self.net.passes
-        N, d, H = _rows(shape), self.d, self.H
-        hd = d // H
-        gd, f = self._edges(N)
+        N, d, H, hd, I = _rows(shape), self.d, self.H, self.hd, self.inner
         self.x, self.N = x, N
+        self._gd(N)
         h, _ = self.n.fwd(x, shape)
         self.h = h
-        q, KR, VR = self.buf("q", N * d), self.buf("kr", N * d), self.buf("vr", N * d)
-        for W, out in ((self.Wq, q), (self.Wk, KR), (self.Wv, VR)):
-            o.gemm(h, W.w, out, N, d, d, d, 1, d, 1, d, passes=ps)
-        self.q = q
-        self.msg = _EdgeAttention.fwd(self, f, q, KR, VR, self.kid, N, H, hd)
+        q, KR, VR = self.buf("q", N * I), self.buf("kr", N * I), self.buf("vr", N * I)
+        for W, b, out in ((self.Wq, self.bq, q), (self.Wk, self.bk, KR), (self.Wv, self.bv, VR)):
+            o.gemm(h, W.w, out, N, I, d, d, 1, I, 1, I, bias=b.w if b is not None else None, passes=ps)
+        score = None
+        if self.learned:
+            sc = self.buf("ks", max(1, N))
+            o.gemm(h, self.ksw.w, sc, N, 1, d, d, 1, 1, 1, 1, bias=self.ksb.w, passes=3)
+            score = o.get(sc[0], N, sc[1]).astype(np.float64)
+            sig = 1.0 / (1.0 + np.exp(-score))
+            self.sig = sig
+            self.s2 = _put_buf(self, "s2", 2.0 * sig, np.float32)
+            self.VR = VR
+            VR = _diag(self, "vrs", VR, self.s2, N, I)
+        gd, f, kid = self._edges(N, score)
+        self.f, self.kid, self.q = f, kid, q
+        self.msg = _EdgeAttention.fwd(self, f, q, KR, VR, kid, N, H, hd)
         y = self.buf("y", N * d)
-        o.gemm(self.msg, self.Wo.w, y, N, d, d, d, 1, d, 1, d, bias=self.bo.w, passes=ps, epi=3, X2=x)
+        if self.T is None:
+            o.gemm(self.msg, self.Wo.w, y, N, d, I, I, 1, d, 1, d, bias=self.bo.w, passes=ps, epi=3, X2=x)
+        else:
+            self.own = _put_buf(self, "own", self._own(N), np.float32)
+            dl = self.buf("dl", N * d)
+            o.gemm(self.msg, self.Wo.w, dl, N, d, I, I, 1, d, 1, d, bias=self.bo.w, passes=ps)
+            o.add3(y, x, _diag(self, "dlm", dl, self.own, N, d), N * d)
         return y, shape
 
     def bwd(self, dy, need_dx=True):
         o, ps = self.net.ops, self.net.passes
-        N, d, H = self.N, self.d, self.H
-        hd = d // H
-        gd, f = self._edges(N)
-        o.gemm(self.msg, dy, self.Wo.g, d, d, N, 1, d, d, 1, d, beta=True, passes=ps, db=self.bo.g)
-        dmsg = self.gbuf("dmsg", N * d)
-        o.gemm(dy, self.Wo.w, dmsg, N, d, d, d, 1, 1, d, d, passes=ps)
-        dq, dK, dV = _EdgeAttention.bwd(self, f, self.q, self.kid, dmsg, N, H, hd, N)
+        N, d, H, hd, I = self.N, self.d, self.H, self.hd, self.inner
+        f, kid = self.f, self.kid
+        dd = dy if self.T is None else _diag(self, "ddl", dy, self.own, N, d, grad=True)
+        o.gemm(self.msg, dd, self.Wo.g, I, d, N, 1, I, d, 1, d, beta=True, passes=ps, db=self.bo.g)
+        dmsg = self.gbuf("dmsg", N * I)
+        o.gemm(dd, self.Wo.w, dmsg, N, I, d, d, 1, 1, d, I, passes=ps)
+        dq, dK, dV = _EdgeAttention.bwd(self, f, self.q, kid, dmsg, N, H, hd, N)
         dh = self.gbuf("dh", N * d)
+        if self.learned:                                   # v = v_raw 2 sigmoid(s): back to v_raw and to s
+            dvs = self.gbuf("dvs", max(1, N))
+            o.edge_dot(dV, self.VR, self.n_ids(N), self.n_ids(N), dvs, N, 1, I)
+            g_ = o.get(dvs[0], N, dvs[1]).astype(np.float64) * 2.0 * self.sig * (1.0 - self.sig)
+            dsc = _put_buf(self, "dsc", g_, np.float32, grad=True)
+            dV = _diag(self, "dvr", dV, self.s2, N, I, grad=True)
+            o.gemm(self.h, dsc, self.ksw.g, d, 1, N, 1, d, 1, 1, 1, beta=True, passes=3)
+            o.colsum(dsc, None, None, None, None, self.ksb.g, N, 1, 0)
         first = True
-        for W, dW in ((self.Wq, dq), (self.Wk, dK), (self.Wv, dV)):
-            o.gemm(self.h, dW, W.g, d, d, N, 1, d, d, 1, d, beta=True, passes=ps)
-            o.gemm(dW, W.w, dh, N, d, d, d, 1, 1, d, d, beta=not first, passes=ps)
+        for W, b, dW in ((self.Wq, self.bq, dq), (self.Wk, self.bk, dK), (self.Wv, self.bv, dV)):
+            o.gemm(self.h, dW, W.g, d, I, N, 1, d, I, 1, I, beta=True, passes=ps,
+                   db=b.g if b is not None else None)
+            o.gemm(dW, W.w, dh, N, d, I, I, 1, 1, I, d, beta=not first, passes=ps)
             first = False
+        if self.learned:
+            o.gemm(dsc, self.ksw.w, dh, N, d, 1, 1, 1, 1, 1, d, beta=True, passes=3)
         return self.n.bwd(dh, True, residual=dy)
+
+    def n_ids(self, N):
+        gd = self.net.gdev
+        if ("eye", N) not in gd.cache:
+            gd.cache[("eye", N)] = (gd._put(np.arange(N)), gd._put(np.arange(N + 1)))
+        return gd.cache[("eye", N)][0]
+
+
+class _Seg:
+    """Nodes grouped into segments on the card (a node in segment seg[i], or none: -1): the sum / mean of each
+    segment (rows = segments) and the way back (rows = nodes)."""
+
+    def __init__(self, gd, seg, S):
+        seg = np.asarray(seg, np.int64)
+        N = len(seg)
+        inn = seg >= 0
+        cnt = np.bincount(seg[inn], minlength=S).astype(np.float64)
+        order = np.nonzero(inn)[0][np.argsort(seg[inn], kind="stable")]
+        self.S, self.N, self.cnt = S, N, cnt
+        self.f_col, self.f_off = gd._put(order), gd._put(np.concatenate([[0], np.cumsum(cnt.astype(np.int64))]))
+        inv = 1.0 / np.maximum(cnt, 1.0)
+        self.f_mean = gd._put(inv[seg[order]] if len(order) else np.zeros(1), np.float32)
+        self.f_one = gd._put(np.ones(max(1, len(order))), np.float32)
+        self.b_col = gd._put(np.where(inn, seg, 0)[inn])
+        self.b_off = gd._put(np.concatenate([[0], np.cumsum(inn.astype(np.int64))]))
+        self.b_one = gd._put(np.ones(max(1, int(inn.sum()))), np.float32)
+        self.b_mean = gd._put(inv[seg[inn]] if inn.any() else np.zeros(1), np.float32)
+
+    def reduce(self, o, x, y, F, mean):
+        o.spmm(x, self.f_col, self.f_mean if mean else self.f_one, None, self.f_off, y, self.S, 1, F)
+
+    def spread(self, o, s, y, F, mean, add=False):
+        o.spmm(s, self.b_col, self.b_mean if mean else self.b_one, None, self.b_off, y, self.N, 1, F, add=add)
+
+
+def _seg(net, key, seg, S):
+    gd = net.gdev
+    k = ("seg", key)
+    if k not in gd.cache:
+        gd.cache[k] = _Seg(gd, seg, S)
+    return gd.cache[k]
+
+
+class _Context:
+    """GLA's graph context inside a brain: the mean of each graph's owned nodes (on the card), projected (on the
+    card), its component along the mean removed and scaled by tanh(gate) (on the processor: graphs x d numbers), added
+    back to the owned nodes (on the card)."""
+
+    def __init__(self, node, W, b, gate, li, d):
+        self.node, self.W, self.b, self.gate, self.li, self.d = node, W, b, gate, li, d
+
+    def fwd(self, x, N, seg):
+        nd, o, d, S = self.node, self.node.net.ops, self.d, seg.S
+        t = f"c{self.li}."
+        mu = nd.buf(t + "mu", S * d)
+        seg.reduce(o, x, mu, d, True)
+        gp = nd.buf(t + "gp", S * d)
+        o.gemm(mu, self.W.w, gp, S, d, d, d, 1, d, 1, d, bias=self.b.w, passes=nd.net.passes)
+        M = o.get(mu[0], S * d, mu[1]).reshape(S, d).astype(np.float64)
+        Gp = o.get(gp[0], S * d, gp[1]).reshape(S, d).astype(np.float64)
+        gam = float(o.get(self.gate.w[0], 1, self.gate.w[1] + self.li)[0])
+        n = np.sqrt((M * M).sum(-1, keepdims=True))
+        big = n > 1e-6
+        nn = np.where(big, n, 1e-6)
+        u = M / nn
+        gu = (Gp * u).sum(-1, keepdims=True)
+        gc = Gp - gu * u
+        th = math.tanh(gam)
+        self.st = (M, Gp, u, nn, big, gu, gc, th)
+        out = _put_buf(nd, t + "out", th * gc, np.float32)
+        y = nd.buf(t + "y", N * d)
+        nd.net.ops.pull(y, o, x, N * d)
+        seg.spread(o, out, y, d, False, add=True)
+        self.mu = mu
+        return y
+
+    def bwd(self, dy, N, seg):
+        nd, o, d, S = self.node, self.node.net.ops, self.d, seg.S
+        t = f"c{self.li}."
+        dsum = nd.gbuf(t + "ds", S * d)
+        seg.reduce(o, dy, dsum, d, False)
+        D = o.get(dsum[0], S * d, dsum[1]).reshape(S, d).astype(np.float64)
+        M, Gp, u, nn, big, gu, gc, th = self.st
+        dgam = (1.0 - th * th) * float((D * gc).sum())
+        tmp = nd.gbuf(t + "dg1", 1)
+        o.put(tmp[0], np.array([dgam], np.float32), tmp[1])
+        o.axpy((self.gate.g[0], self.gate.g[1] + self.li), tmp, 1, 1.0)
+        dgc = th * D
+        du_ = (dgc * u).sum(-1, keepdims=True)
+        dG = dgc - du_ * u
+        du = -(gu * dgc + du_ * Gp)
+        dM = np.where(big, (du - (du * u).sum(-1, keepdims=True) * u) / nn, du / nn)
+        dgp = _put_buf(nd, t + "dgp", dG, np.float32, grad=True)
+        o.gemm(self.mu, dgp, self.W.g, d, d, S, 1, d, d, 1, d, beta=True, passes=nd.net.passes, db=self.b.g)
+        dmu = _put_buf(nd, t + "dmu", dM, np.float32, grad=True)
+        o.gemm(dgp, self.W.w, dmu, S, d, d, d, 1, 1, d, d, beta=True, passes=nd.net.passes)       # + dgp W^T
+        dx = nd.gbuf(t + "dx", N * d)
+        nd.net.ops.pull(dx, o, dy, N * d)
+        seg.spread(o, dmu, dx, d, True, add=True)
+        return dx
+
+
+class _Brain(_Node):
+    """hgt_brain on the card: the typed input projection (gelu) of the owned nodes, the hgt layers, the global
+    attention layers, the graph context after every layer, the final norm of the owned nodes."""
+
+    def __init__(self, net, key, layer, p, gk):
+        from . import layers as L
+        super().__init__(net, key)
+        self.layer, self.d, self.T, self.ids = layer, layer.d, layer.T, layer.type_ids
+        d = self.d
+        self.inp = _TypedLin(self, "in.", net.param(p.input.W), net.param(p.input.b), d, d, self.T)
+        self.layers = [net.compile(l_, pp, f"{key}.l{i}", f"{gk}.l{i}") for i, (l_, pp) in
+                       enumerate(zip(layer.layers, p.layers))]
+        order = sorted(layer.ga)
+        self.ga = {li: net.compile(layer.ga[li], p.attend[order.index(li)], f"{key}.g{li}", f"{gk}.g{li}")
+                   for li in order}
+        self.ctx = [_Context(self, net.param(p.ctx_W), net.param(p.ctx_b), net.param(p.ctx_gate), li, d)
+                    for li in range(layer.L)] if layer.context else []
+        self.final = _Norm(net, key + ".fn", L.LayerNorm(d), p.final, False)
+        self.final.gkey = gk + ".fn"
+        self.nodes = self.layers + [self.ga[k] for k in order] + [self.final]
+
+    def _masks(self, N):
+        gd = _need_graph(self.net, "hgt_brain")
+        k = ("brain-own", self.T, self.ids)
+        if k not in gd.cache:
+            from .graphs import _owned_mask
+            own = _owned_mask(self.net.graph, N, self.T, self.ids).reshape(-1)
+            batch = np.asarray(self.net.graph.batch, np.int64)
+            G = max(int(self.net.graph.graphs), int(batch.max(initial=-1)) + 1)
+            gd.cache[k] = (gd._put(own, np.float32), gd._put(~own, np.float32), _Seg(gd, np.where(own, batch, -1), G))
+        return gd.cache[k]
+
+    def fwd(self, x, shape):
+        o = self.net.ops
+        N, d = _rows(shape), self.d
+        own, notown, seg = self._masks(N)
+        grp = _groups(self.net, self.T, self.ids)
+        self.N, self.x = N, x
+        y = self.inp.fwd(x, N, grp)
+        a = self.buf("a", N * d)
+        o.act_f(y, a, N * d, KS.ACTS["gelu"])
+        self.y = y
+        h = self.buf("h0", N * d)
+        o.add3(h, _diag(self, "ha", a, own, N, d), _diag(self, "hx", x, notown, N, d), N * d)
+        self.trace = []
+        for li, nd in enumerate(self.layers):
+            h, _ = nd.fwd(h, shape)
+            if li in self.ga:
+                h, _ = self.ga[li].fwd(h, shape)
+            if self.ctx:
+                h = self.ctx[li].fwd(h, N, seg)
+        self.hlast = h
+        f, _ = self.final.fwd(h, shape)
+        out = self.buf("out", N * d)
+        o.add3(out, _diag(self, "fo", f, own, N, d), _diag(self, "fx", h, notown, N, d), N * d)
+        return out, shape
+
+    def bwd(self, dy, need_dx=True):
+        o = self.net.ops
+        N, d = self.N, self.d
+        own, notown, seg = self._masks(N)
+        df = _diag(self, "dfo", dy, own, N, d, grad=True)
+        dh = self.final.bwd(df, True, residual=_diag(self, "dfx", dy, notown, N, d, grad=True))
+        for li in range(len(self.layers) - 1, -1, -1):
+            if self.ctx:
+                dh = self.ctx[li].bwd(dh, N, seg)
+            if li in self.ga:
+                dh = self.ga[li].bwd(dh, True)
+            dh = self.layers[li].bwd(dh, True)
+        da = _diag(self, "dha", dh, own, N, d, grad=True)
+        dyp = self.gbuf("dy", N * d)
+        o.act_b(self.y, da, dyp, N * d, KS.ACTS["gelu"])
+        dx = self.gbuf("dx", N * d)
+        o.add3(dx, self.inp.bwd(dyp, N), _diag(self, "dhx", dh, notown, N, d, grad=True), N * d)
+        return dx
+
+
+class _TypedPoolNode(_Node):
+    """typed_pool: the mean of every (graph, owned type) on the card; the mix with exp(log_weight) on the processor
+    (graphs x types x d numbers); the way back spread on the card."""
+
+    def __init__(self, net, key, layer, p):
+        super().__init__(net, key)
+        self.layer, self.lw, self.T = layer, net.param(p.log_weight), layer.T
+
+    def fwd(self, x, shape):
+        o = self.net.ops
+        N, d = _rows(shape), shape[-1]
+        gd = _need_graph(self.net, "typed_pool")
+        loc, batch, G, cnt, on = self.layer.plan(self.net.graph, N)
+        T = self.T
+        k = ("tpool", T, self.layer.type_ids, self.layer.presence)
+        if k not in gd.cache:
+            gd.cache[k] = _Seg(gd, np.where(loc < T, batch * T + loc, -1), G * T)
+        seg = gd.cache[k]
+        Mb = self.buf("M", G * T * d)
+        seg.reduce(o, x, Mb, d, True)
+        M = o.get(Mb[0], G * T * d, Mb[1]).reshape(G, T, d).astype(np.float64)
+        w = np.exp(o.get(self.lw.w[0], T, self.lw.w[1]).astype(np.float64))
+        wo = w[None, :] * on                                       # [G, T]
+        den = np.maximum(wo.sum(1, keepdims=True), 1e-8)
+        Y = (wo[:, :, None] * M).sum(1) / den
+        self.st, self.seg, self.N, self.d, self.G = (M, w, on, den, Y), seg, N, d, G
+        return _put_buf(self, "y", Y, np.float32), (G, d)
+
+    def bwd(self, dy, need_dx=True):
+        o = self.net.ops
+        G, d, T, N = self.G, self.d, self.T, self.N
+        M, w, on, den, Y = self.st
+        D = o.get(dy[0], G * d, dy[1]).reshape(G, d).astype(np.float64)
+        coef = (w[None, :] * on) / den                              # [G, T]
+        dM = coef[:, :, None] * D[:, None, :]
+        dlw = (coef * ((M - Y[:, None, :]) * D[:, None, :]).sum(-1)).sum(0)
+        tmp = self.gbuf("dlw", T)
+        o.put(tmp[0], dlw.astype(np.float32), tmp[1])
+        o.axpy(self.lw.g, tmp, T, 1.0)
+        dMb = _put_buf(self, "dM", dM, np.float32, grad=True)
+        dx = self.gbuf("dx", N * d)
+        o.fill(dx, N * d, 0.0)
+        self.seg.spread(o, dMb, dx, d, True, add=True)
+        return dx
 
 
 class _MixHop(_Node):
@@ -3517,8 +3905,11 @@ class Net:
         if isinstance(layer, L.TransformerBlock):
             return _Seq(self, key, [self.compile(layer.attn, p.attn, key + ".a", gk + ".a"),
                                     self.compile(layer.mlp, p.mlp, key + ".m", gk + ".m")])
-        if isinstance(layer, L.MultiHeadAttention):
+        if isinstance(layer, L.MultiHeadAttention) and (getattr(layer, "gate", None) is None or
+                                                        not getattr(layer, "bias", True)):
             return _Attention(self, key, layer, p)
+        if isinstance(layer, L.TiedOutput):
+            return _TiedOutput(self, key, layer, self.dag_params)
         if isinstance(layer, L.SwiGLU):
             return _SwiGLU(self, key, layer, p)
         if isinstance(layer, L.MoE):
@@ -3566,6 +3957,10 @@ class Net:
             return _TypedLinearNode(self, key, layer, p)
         if isinstance(layer, GR.TypedNorm):
             return _TypedNormNode(self, key, layer, p)
+        if isinstance(layer, GR.HGTBrain):
+            return _Brain(self, key, layer, p, gk)
+        if isinstance(layer, GR.TypedPool):
+            return _TypedPoolNode(self, key, layer, p)
         if isinstance(layer, L.GCN):
             return _GCN(self, key, layer, p)
         if isinstance(layer, L.SAGE):
@@ -3769,10 +4164,21 @@ def fit_batches(model, params, batches, loss="cross_entropy", opt=None, epochs=1
                     out, shape = net.forward(views, [a.shape for a in xs])
                 else:
                     out, shape = net.forward(views[0], xs[0].shape)
+                Yr = Y if custom and isinstance(Y, Record) else np.asarray(aops.raw(Y))
+                if isinstance(out, list):                    # a dag with several outputs: a loss of your own
+                    if not custom:
+                        raise TrainError("a model with several outputs trains with a loss function of your own")
+                    lv, dout = _multi_loss(ops, net, out, shape, loss_fn, Yr, group)
+                    net.backward(dout)
+                    tot += lv
+                    rows_all += 1
+                    if (bi + 1) % A and bi + 1 < len(items):
+                        continue
+                    t, step = _apply_step(ops, net, opt, adam, wd, clip, schedule, step, t, st1, st2, SQ, COMP, n)
+                    continue
                 rows, C = _rows(shape), shape[-1]
                 m = rows * C
                 dout = net.arena.get("dout", m)
-                Yr = np.asarray(aops.raw(Y))
                 if custom:
                     oh = ops.get(out[0], m, out[1]).reshape(shape).astype(np.float64)
                     lv, gh = value_and_grad(lambda o_: loss_fn(o_, Yr))(oh)
@@ -3823,6 +4229,38 @@ def fit_batches(model, params, batches, loss="cross_entropy", opt=None, epochs=1
                 ops.free(b_)
         net.close()
     return Record(params=out_params, history=history, device=getattr(ops, "name", "?"))
+
+
+def _multi_loss(ops, net, outs, shapes, loss_fn, Yr, group):
+    """The loss of several outputs on the processor: (value, [gradient view of each output])."""
+    from . import ops as aops
+    from .stdlib import value_and_grad
+    hs = [ops.get(o_[0], int(np.prod(s_)), o_[1]).reshape(s_).astype(np.float64) for o_, s_ in zip(outs, shapes)]
+    lv, gh = value_and_grad(lambda *os_: loss_fn(list(os_), Yr), wrt=tuple(range(len(hs))))(*hs)
+    gh = gh if isinstance(gh, (list, tuple)) else [gh]
+    douts = []
+    for i, (g_, s_) in enumerate(zip(gh, shapes)):
+        a = np.asarray(aops.raw(g_), np.float32).reshape(-1) / group
+        d = net.arena.get(("dout", i), max(1, a.size))
+        ops.put(d[0], a, d[1])
+        douts.append(d)
+    return float(aops.raw(lv)), douts
+
+
+def _apply_step(ops, net, opt, adam, wd, clip, schedule, step, t, st1, st2, SQ, COMP, n):
+    from . import ops as aops
+    t += 1
+    lr = float(aops.raw(schedule(step))) if schedule is not None else float(opt.lr)
+    ops.fill((SQ, 0), 1, 0.0)
+    if clip:
+        ops.sumsq((net.G, 0), n, (SQ, 0))
+    if adam:
+        ops.adam((net.P, 0), (net.G, 0), (st1, 0), (st2, 0), (SQ, 0), n, net.n_decay, lr, opt.b1, opt.b2,
+                 opt.eps, 1 - opt.b1 ** t, 1 - opt.b2 ** t, wd, float(clip or 0.0), (COMP, 0) if COMP else None)
+    else:
+        ops.sgd((net.P, 0), (net.G, 0), (st1, 0), (SQ, 0), n, lr, float(opt.momentum), float(clip or 0.0),
+                (COMP, 0) if COMP else None)
+    return t, step + 1
 
 
 def _want_comp(compensated, params):

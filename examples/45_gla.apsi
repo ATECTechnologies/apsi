@@ -1,0 +1,35 @@
+# 45_gla.apsi — GLA 3.0, the code-and-language model, as a model of `use layers`
+#
+# Three brains over one graph (code: Brain A and the editing Brain B; text: Brain C), the bridge, the FlyPrompt
+# router, the graph memory and the writer that reads it while it writes. The same model trains on NumPy, on Apsi's
+# GPU trainer and split across many cards (fit_batches(..., device="cuda:all")).
+use layers
+use nn
+
+# every part counted with GLA's own formula; the release (21b) and the model built here
+let big = gla_count("21b")
+var total = 0
+for k in big.keys():
+    total += big[k]
+let brain_a = big["brain_a"]
+let writer = big["writer"]
+print(f"GLA 3.0 (21b): {total:,} parameters; Brain A {brain_a:,}, the writer {writer:,}")
+assert total == 20480386836
+
+let model = gla("tiny")
+let params = model.init(seed=0)
+let parts = gla_parts(model, params)
+let formula = gla_count(model.config)
+for k in formula.keys():
+    assert parts[k] == formula[k]
+print(f"tiny: {count_params(params):,} parameters, every part as GLA counts it")
+
+# the task: a program graph and a text about it; the writer must write the names of the functions that are
+# called, in order - it can only find them in the graph memory
+let train = fn(epoch) => [gla_batch(gla_task("tiny", 8, seed=1000 * epoch + s)) for s in 0..10]
+let test = gla_batch(gla_task("tiny", 64, seed=999999))
+print("before:", gla_accuracy(model, params, test))
+let r = fit_batches(model, params, train, gla_loss, opt=adam(lr=0.01), epochs=12, backend="numpy", verbose=false)
+print(f"loss {r.history[0]:.3f} -> {r.history[len(r.history) - 1]:.3f}")
+assert r.history[len(r.history) - 1] < r.history[0]
+print("answers written exactly right on unseen programs:", gla_accuracy(model, r.params, test))

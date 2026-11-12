@@ -3,6 +3,27 @@
 ## 2.6.0 — in progress
 
 ### Graph-and-language models
+- **GLA 3.0 as a model of `use layers`:** `gla(size)` ("21b", "3b", "small", "tiny") builds the whole model of
+  GLA.py / gla_brain_dual.py — node encoder, Brain A, Brain B, Brain C, bridge, FlyPrompt router, graph memory, the
+  writer with gated cross-attention and tied embeddings — with exactly the parameters of GLA's own formula, part by
+  part (`gla_count`, `gla_parts`; 21b: 20,480,386,836). `gla_batch`, `gla_loss` (GLA 3.0's losses), `gla_task`,
+  `gla_accuracy`. It trains on NumPy, on one card and split across cards, the same training step for step.
+  `docs/GLA.md`, `examples/45_gla.apsi`.
+- **Brains that own node types and relations:** `types=[…]` and `relations=[…]` on `hgt`, `typed_linear`,
+  `typed_norm`, `global_attention`; nodes of other types pass through, edges of other relations are not read, so
+  several brains share one graph. `hgt_brain` (input projection, hgt layers, global attention, GLA's centred graph
+  context with one shared projection and a gate per layer, final norm), `typed_pool` (a learned weight per node type).
+- **`global_attention` as GLA's:** `ratio=` (fewer heads of the same size), `learned_keys=true` (values scaled by
+  2 sigmoid(score); above `max_keys` the best-scored keys), `bias=`, `zero_init=`, `types=`.
+- **Attention:** `multi_head_attention(…, bias=false, gate=0.25, memory_mask=true)` — no output bias, the output
+  scaled by tanh of a learned gate, a memory whose last column says which slots may be read; `tied_output(owner)`,
+  `slice_layer`. `node_encoder`, `brain_memory`, `expert_router`, `gated_fusion`, `param_bank`.
+- **GPU trainer:** kernels for all of the above (typed groups by owned types, edges by owned relations, learned keys,
+  graph context and typed pooling with the per-graph numbers on the processor, gated and masked cross-attention, the
+  tied output); a `dag` with several outputs and a loss of your own over all of them, targets given as a record, on
+  one card and across cards; a weight held by two stages (a tied output on another card than its embedding) gets the
+  sum of both gradients; the cut of a dag balances the work each node really does (rows followed from the inputs:
+  graph nodes, tokens, one row per graph after pooling).
 - **Heterogeneous graphs:** `graph(…, node_types=)`, `typed_linear`, `typed_norm` and `hgt` (the layer of GLA's brains:
   weights per node type, keys through each relation and head, one softmax over a node's in-edges) on NumPy and the
   GPU trainer (rows grouped by type, one product per type; the relations in one batched product).
