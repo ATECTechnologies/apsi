@@ -11,6 +11,11 @@
   (`fit_batches(…, exact_sums=)`, `APSI_GPU_EXACT_SUMS`).
 - **Order-free gradients inside the model:** a value used by several layers gets their gradients' exact sum,
   rounded once, whatever order they arrive in.
+- **Run-to-run determinism on the card:** reductions no longer use atomic additions, whose order changes every
+  run. Column sums (bias and norm gradients) write per-block parts added in a fixed order (`colsum_fin`); embedding
+  gradients use a sorted index (`embed_bs`, one thread per row, ids in order); sums of squares, dot products and
+  losses write per-block parts (`parts_sum`); split-k products write each slice to a workspace and add them in order
+  (`ksum`). The same training twice gives the same weights bit for bit.
 - **Optimizers on the processor keep float64 weights** (a master copy, as NumPy does); the card gets them rounded
   once. Frozen weights stay frozen in the master copy too.
 

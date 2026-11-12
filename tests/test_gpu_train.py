@@ -604,6 +604,39 @@ class RealGpu(unittest.TestCase):
     def setUpClass(cls):
         cls.g, _ = GT.device()
 
+    def test_reductions_are_the_same_every_run(self):
+        """Column sums, scatter-adds of rows, sums of squares, losses and split-k products: no atomic additions, so
+        the card gives the same bits every run, and the emulator's values."""
+        g, e = self.g, GT.Emulator(tc=self.g.tc)
+        rng = np.random.default_rng(5)
+
+        def run(dv):
+            def put(a, dt=np.float32):
+                a = np.ascontiguousarray(np.asarray(a, dt))
+                b_ = dv.alloc(a.size)
+                dv.put(b_, a.reshape(-1))
+                return (b_, 0)
+            M, N = 5000, 300
+            dy, x = put(rng_a), put(rng_x)
+            mean, rstd = put(np.zeros(M)), put(np.ones(M))
+            DB, DG = put(np.zeros(N)), put(np.zeros(N))
+            dv.colsum(dy, x, mean, rstd, DG, DB, M, N, 1)
+            ids = put(ids_a, np.int32)
+            DE = put(np.zeros(50 * 16))
+            dv.embed_b(put(rows_a), ids, DE, len(ids_a), 16, 50)
+            acc = put(np.zeros(1))
+            dv.sumsq(dy, M * N, acc)
+            A, B, Cm = put(big_a), put(big_b), put(np.zeros(64 * 48))
+            dv.gemm(A, B, Cm, 64, 48, 4096, 1, 64, 48, 1, 48, passes=1)        # A transposed, long k (split-k)
+            return [dv.get(v[0], n) for v, n in ((DB, N), (DG, N), (DE, 800), (acc, 1), (Cm, 64 * 48))]
+        rng_a, rng_x = rng.normal(size=(5000, 300)), rng.normal(size=(5000, 300))
+        ids_a, rows_a = rng.integers(0, 50, 3000), rng.normal(size=(3000, 16))
+        big_a, big_b = rng.normal(size=(4096, 64)), rng.normal(size=(4096, 48))
+        one, two, ref = run(g), run(g), run(e)
+        for a_, b_, r_ in zip(one, two, ref):
+            np.testing.assert_array_equal(a_, b_)
+            self.assertLess(np.abs(a_ - r_).max() / (np.abs(r_).max() + 1e-9), 1e-2)
+
     def test_every_kernel_matches_the_emulator(self):
         g, e = self.g, GT.Emulator(tc=self.g.tc)
         rng = np.random.default_rng(2)
@@ -771,7 +804,10 @@ class RealGpu(unittest.TestCase):
                         Co[i] if comp else None)
                 dv.sgd(Po[i], Mo[i], Vo[i], SQo[i], nO, 1e-2, 0.9, 0.0, Co[i] if comp else None)
             same(Po[0], Po[1], nO, 1e-6, f"adam + sgd, compensated={comp}")
-            same(Co[0], Co[1], nO, 1e-4, "compensation") if comp else None
+            if comp:                                    # weight + carried rounding error: the same exact value
+                exact = [g.get(Po[0][0], nO).astype(np.float64) + g.get(Co[0][0], nO),
+                         e.get(Po[1][0], nO).astype(np.float64) + e.get(Co[1][0], nO)]
+                self.assertLess(np.abs(exact[0] - exact[1]).max() / np.abs(exact[1]).max(), 1e-6, "compensation")
         W, WQ = pair(rng.normal(size=(70, 48))), pair(np.zeros(70 * 48))
         for kind in range(6):
             g.fakeq(W[0], WQ[0], 70, 48, kind)
