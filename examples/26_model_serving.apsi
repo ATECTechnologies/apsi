@@ -1,0 +1,45 @@
+# 26_model_serving.apsi — train → save (safetensors) → load compressed as INT8 → serve as an API
+# start the real server: apsi run examples/26_model_serving.apsi --allow-net
+use nn
+use models
+use web
+
+# 1) train a 3-class classifier
+let X, y = spiral_data(n_per_class=200, classes=3, noise=0.15, seed=1)
+fn net(p, x) = qlinear(relu(qlinear(relu(qlinear(x, p.l1.W, p.l1.b)), p.l2.W, p.l2.b)), p.l3.W, p.l3.b)
+let init = record(l1=dense(2, 128, seed=1), l2=dense(128, 128, seed=2), l3=dense(128, 3, seed=3))
+let trained = train(fn(p, xb, yb) => cross_entropy(net(p, xb), yb), init, (X, y), adam(lr=0.01),
+    epochs=150, batch_size=64, verbose=false).params
+print("f64 accuracy:", accuracy(net(trained, X), y))
+
+# 2) save as .safetensors (opens in PyTorch / Hugging Face / JAX)
+save_safetensors("model_store/spiral.safetensors", trained, metadata={"task": "spiral", "classes": 3})
+print("file contains:", safetensors_info("model_store/spiral.safetensors"))
+
+# 3) load it back as INT8 (memory-mapped) — much less RAM
+let small = load_safetensors("model_store/spiral.safetensors", dtype=int8)
+let full = load_safetensors("model_store/spiral.safetensors", dtype=f32)
+print(f"size f32: {model_size(full) / 1024:.1f} KB   INT8: {model_size(small) / 1024:.1f} KB")
+let acc_int8 = accuracy(net(small, X), y)
+print("INT8 accuracy:", acc_int8)
+
+# 4) serve it as an API
+let app = server(name="spiral-api", log=false)
+app.health()
+
+@app.post("/classify")
+fn classify(req):
+    let pts = tensor(req.json()["points"])
+    if ndim(pts) != 2 or shape(pts)[1] != 2 or shape(pts)[0] > 100000:
+        abort(422, "points must be a list of [x, y] pairs (at most 100000)")
+    let probs = softmax(net(small, pts))
+    return {"class": argmax(probs, axis=1), "confidence": max(probs, axis=1)}
+
+test "int8 model keeps accuracy and the API answers":
+    assert acc_int8 > 0.97
+    assert model_size(small) * 3 < model_size(full)
+    let r = app.handle("POST", "/classify", {"points": [[0.0, 0.5], [0.3, -0.2]]})
+    assert r.status == 200 and len(r.body["class"]) == 2
+
+if not testing() and "net" in permissions():
+    app.run(port=8081)

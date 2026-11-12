@@ -1,0 +1,53 @@
+# evolve: integrators and unit checking
+
+use physics.fields
+
+test "exponential decay matches exp(-t/tau)":
+    let tau = 2s
+    var n = 1000.0
+    evolve n over t in 0[s]..4[s] step 1[ms] using rk4:
+        n' = -n / tau
+    assert approx(n, 1000.0 * exp(-2.0), rel=1e-9)
+
+test "all integrators converge on a harmonic oscillator":
+    let k = 4[N/m]
+    let m = 1kg
+    for method in ["euler", "midpoint", "rk4", "symplectic", "verlet"]:
+        var x = 1m
+        var v = 0[m/s]
+        if method == "euler":
+            evolve x, v over t in 0[s]..1[s] step 0.1[ms] using euler:
+                x' = v
+                v' = -k / m * x
+        elif method == "midpoint":
+            evolve x, v over t in 0[s]..1[s] step 1[ms] using midpoint:
+                x' = v
+                v' = -k / m * x
+        elif method == "rk4":
+            evolve x, v over t in 0[s]..1[s] step 1[ms] using rk4:
+                x' = v
+                v' = -k / m * x
+        elif method == "symplectic":
+            evolve x, v over t in 0[s]..1[s] step 0.1[ms] using symplectic:
+                x' = v
+                v' = -k / m * x
+        else:
+            evolve x, v over t in 0[s]..1[s] step 1[ms] using verlet:
+                x' = v
+                v' = -k / m * x
+        assert approx(x, 1m * cos(2.0), rel=1e-3), f"{method}: {x}"
+
+test "record into gives trajectories with units":
+    var y = 0m
+    evolve y over t in 0[s]..1[s] step 0.1[s] using euler record into tr:
+        y' = 2[m/s]
+    assert len(tr.t) == 11
+    assert tr.y[-1] ~= 2m
+    assert dim(tr.t) == "Time"
+
+test "fields: laplacian of a quadratic is constant":
+    let dx = 0.1m
+    let xs = arange(0.0, 20.0) * dx
+    let f = xs * xs
+    let lap = laplacian(f, dx, boundary="fixed")
+    assert approx(lap[5], 2.0, rel=1e-9)

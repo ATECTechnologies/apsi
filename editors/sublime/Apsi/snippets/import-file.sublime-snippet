@@ -1,0 +1,8 @@
+<snippet>
+  <content><![CDATA[
+import "${1:lib.apsi}" as ${0:lib}
+]]></content>
+  <tabTrigger>import</tabTrigger>
+  <scope>source.apsi</scope>
+  <description>Import file</description>
+</snippet>

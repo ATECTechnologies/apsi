@@ -1,0 +1,16 @@
+{
+  "selector": "source.apsi",
+  "shell_cmd": "apsi run \"$file\"",
+  "working_dir": "$file_path",
+  "file_regex": "^(?:\\x1b\\[\\d+m)?(.+?\\.apsi):(\\d+):(\\d+): (.*?)(?:\\x1b\\[0m)?$",
+  "env": { "PYTHONUTF8": "1", "NO_COLOR": "1" },
+  "quiet": false,
+  "variants": [
+    { "name": "Test", "shell_cmd": "apsi test \"$file\"" },
+    { "name": "Check", "shell_cmd": "apsi check \"$file\"" },
+    { "name": "Format", "shell_cmd": "apsi fmt \"$file\"" },
+    { "name": "Benchmark", "shell_cmd": "apsi bench \"$file\"" },
+    { "name": "Run Project", "shell_cmd": "apsi run", "working_dir": "$folder" },
+    { "name": "Test Project", "shell_cmd": "apsi test", "working_dir": "$folder" }
+  ]
+}

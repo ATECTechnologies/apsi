@@ -1,0 +1,28 @@
+# 04_projectile.apsi — projectile with air drag, solved with evolve
+use physics.constants
+
+let mass = 0.145kg  # a baseball
+let Cd = 0.3
+let area = 0.0042[m^2]
+let rho = 1.225[kg/m^3]
+
+fn drag(v) = -0.5 * rho * Cd * area * norm(v) * v / mass
+
+# state: position (Length) and velocity (Velocity) — must be declared with var
+var pos = tensor([0.0, 1.0]) * u.m
+var vel = tensor([30.0, 30.0]) * u.m / u.s
+
+# x' = dx/dt   (the checker verifies that pos' is in m/s and vel' in m/s²)
+evolve pos, vel over t in 0[s]..4[s] step 1[ms] using rk4 record every 100 into path:
+    pos' = vel
+    vel' = tensor([0.0, -1.0]) * g0 + drag(vel)
+
+print("position at t = 4 s:", pos)
+print("velocity at t = 4 s:", vel)
+print("highest point:", max(path.pos[:, 1]))
+print("recorded", len(path.t), "points, last t =", path.t[-1])
+
+test "drag slows the ball":
+    # without drag the horizontal distance would be 30 m/s × 4 s = 120 m
+    assert pos[0] < 120m
+    assert pos[0] > 60m

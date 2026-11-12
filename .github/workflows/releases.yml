@@ -1,0 +1,51 @@
+# Creates a GitHub Release for every version in .github/releases.json that does not have one yet, from the branch
+# release/<version> (which holds exactly that version's source). When that branch has moved on (a fix to a
+# released version), the release and its tag are recreated from the branch, so the tag always matches it. Source code only: GitHub attaches the source
+# archives; installers are published on apsi.dev.
+#
+# If GitHub does not let this workflow create the tag (the built-in token may not create a tag on a commit whose
+# workflow files differ from the default branch), the release is created as a draft instead. Publish the drafts in
+# order on the Releases page (Edit -> Publish release): publishing creates the tag with your own account.
+name: Releases
+on:
+  push:
+    branches: [main]
+    paths: [".github/releases.json", ".github/release-notes/**", ".github/workflows/releases.yml"]
+  workflow_dispatch:
+permissions:
+  contents: write
+jobs:
+  releases:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v5
+      - name: Create missing releases
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -u
+          drafts=0
+          while read -r r; do
+            v=$(jq -r .version <<<"$r"); target=$(jq -r .target <<<"$r")
+            notes=$(jq -r .notes <<<"$r"); latest=$(jq -r .latest <<<"$r"); title=$(jq -r '.title // ("Apsi " + .version)' <<<"$r")
+            existing=$(gh release view "v$v" --json isDraft --jq .isDraft 2>/dev/null || true)
+            if [ "$existing" = "false" ]; then
+              head=$(gh api "repos/${GITHUB_REPOSITORY}/commits/$target" --jq .sha 2>/dev/null || true)
+              tagged=$(gh api "repos/${GITHUB_REPOSITORY}/commits/v$v" --jq .sha 2>/dev/null || true)
+              if [ -z "$head" ] || [ "$head" = "$tagged" ]; then echo "v$v: published, up to date"; continue; fi
+              echo "v$v: $target moved to ${head:0:7} (tag at ${tagged:0:7}); publishing it again from the branch"
+              gh release delete "v$v" --cleanup-tag --yes
+            fi
+            if [ "$existing" = "true" ]; then echo "v$v: draft waiting to be published"; drafts=$((drafts+1)); continue; fi
+            if gh release create "v$v" --target "$target" --title "$title" --notes-file "$notes" --latest="$latest"; then
+              echo "v$v: created"
+            elif gh release create "v$v" --draft --target "$target" --title "$title" --notes-file "$notes" --latest="$latest"; then
+              echo "::notice::v$v was created as a draft. Publish it on the Releases page (Edit -> Publish release)."
+              drafts=$((drafts+1))
+            else
+              echo "::error::could not create v$v"; exit 1
+            fi
+          done < <(jq -c '.[]' .github/releases.json)
+          if [ "$drafts" -gt 0 ]; then
+            echo "::notice::$drafts draft release(s) to publish, oldest first, at https://github.com/${GITHUB_REPOSITORY}/releases"
+          fi

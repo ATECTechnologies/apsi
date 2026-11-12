@@ -1,0 +1,23 @@
+[
+  {
+    "version": "1.10.0",
+    "notes": ".github/release-notes/notes-1.10.0.md",
+    "latest": false,
+    "title": "Apsi 1.10.0",
+    "target": "release/1.10.0"
+  },
+  {
+    "version": "2.0.0",
+    "notes": ".github/release-notes/notes-2.0.0.md",
+    "latest": false,
+    "title": "Apsi 2.0.0",
+    "target": "release/2.0.0"
+  },
+  {
+    "version": "2.4.4",
+    "notes": ".github/release-notes/notes-2.4.4.md",
+    "latest": true,
+    "title": "Apsi 2.4.4",
+    "target": "release/2.4.4"
+  }
+]

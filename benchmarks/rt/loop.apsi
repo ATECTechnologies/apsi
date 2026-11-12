@@ -1,0 +1,5 @@
+use rt
+fn f(t, x):
+    pass
+let s = rt.loop(2000, f, seconds=3)
+print(s)

@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>content</key>
+	<string>var ${1:x} = ${2:1m}
+var ${3:v} = ${4:0[m/s]}
+evolve ${1:x}, ${3:v} over t in 0[s]..${5:10[s]} step ${6:1[ms]} using ${7:rk4} record every ${8:10} into ${9:traj}:
+	${1:x}' = ${3:v}
+	${3:v}' = ${0:-${1:x} / 1[s^2]}</string>
+	<key>name</key>
+	<string>Differential equation solved over time</string>
+	<key>scope</key>
+	<string>source.apsi</string>
+	<key>tabTrigger</key>
+	<string>evolve</string>
+	<key>uuid</key>
+	<string>C92D875D-227D-530B-A694-16CC30AE3C41</string>
+</dict>
+</plist>

@@ -1,0 +1,27 @@
+# 29_stiff_chemistry.apsi — stiff differential equations with sci.solve_ivp (TR-BDF2, implicit and adaptive)
+use sci
+
+# Robertson's chemical kinetics: reaction rates differ by nine orders of magnitude (very stiff)
+fn robertson(t, y) = tensor([
+    -0.04 * y[0] + 1e4 * y[1] * y[2],
+    0.04 * y[0] - 1e4 * y[1] * y[2] - 3e7 * y[1] ** 2,
+    3e7 * y[1] ** 2,
+])
+
+let sol = solve_ivp(robertson, [0.0, 1e5], tensor([1.0, 0.0, 0.0]), method="bdf", rtol=1e-6, atol=1e-10,
+                    t_eval=[1.0, 100.0, 1e4, 1e5])
+for i, t in enumerate(sol.t):
+    print(f"t = {t:8.0f}   A = {sol.y[i][0]:.6f}   B = {sol.y[i][1]:.3e}   C = {sol.y[i][2]:.6f}")
+print(f"{sol.steps} steps ({sol.rejected} rejected, {sol.evaluations} evaluations)")
+print("mass is conserved:", fsum(sol.y[-1]) ~= 1.0)
+
+# the same solver works with physical units: a capacitor discharging through a resistor
+let R = 2[kohm]
+let C = 500[uF]
+let v = solve_ivp(fn(t, u) => -u / (R * C), [0s, 3s], 5V, method="bdf", rtol=1e-9, atol=1e-12, t_eval=[1s, 3s])
+print("capacitor voltage after 1 s and 3 s:", v.y)
+
+test "robertson reference values":
+    assert abs(sol.y[-1][0] - 0.017865) < 2e-4
+    assert abs(sol.y[-1][2] - 0.98213) < 2e-4
+    assert v.y[0] ~= 5V * exp(-1.0)

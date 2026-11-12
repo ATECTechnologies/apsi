@@ -1,0 +1,17 @@
+# Quantum mechanics: bound states, a moving wave packet and an entangled pair of qubits.
+use quantum
+
+let x = linspace(-10.0, 10.0, 1201)
+let ho = schrodinger1d(fn(x) => 0.5 * x * x, x, mass=1.0, n=4, hbar=1.0)
+print("harmonic oscillator energies (ħω):", ho.energies)
+
+let packet = gaussian_packet(x, -4.0, 0.7, 3.0)
+let w = evolve1d(packet, fn(x) => 0.0 * x, x, 0.005, 400, mass=1.0, hbar=1.0, every=100)
+print("<x>(t):", w.x_mean, " norm:", w.norm[4])
+
+var psi = ket("00")
+psi = apply(psi, gates.H, 0)
+psi = apply(psi, gates.CNOT, [0, 1])
+print("Bell state measured 1000 times:", measure(psi, shots=1000, seed=3))
+print("concurrence:", concurrence(psi), " entanglement entropy:", entropy(partial_trace(density(psi), [0])), "bit")
+print("hydrogen n=2:", hydrogen_energy(2), "eV")

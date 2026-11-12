@@ -1,0 +1,117 @@
+{
+ "old": "2.0.0",
+ "new": "2.4.4",
+ "machine": "2-core cloud VM (Intel Xeon @ 2.30 GHz), Linux, Python 3.13",
+ "native": false,
+ "rows": [
+  {
+   "name": "matmul 300, loops (compiled engine)",
+   "old": 23648.13,
+   "new": 3.71,
+   "unit": "ms",
+   "higher": false,
+   "speedup": 6374.16,
+   "note": ""
+  },
+  {
+   "name": "matmul 512, @native loops",
+   "old": 125377.35,
+   "new": 417.25,
+   "unit": "ms",
+   "higher": false,
+   "speedup": 300.48,
+   "note": "llvmlite not installed: both versions ran it without @native"
+  },
+  {
+   "name": "harmonic sum 50M, @native",
+   "old": 1704.12,
+   "new": 1650.48,
+   "unit": "ms",
+   "higher": false,
+   "speedup": 1.03,
+   "note": "llvmlite not installed: both versions ran it without @native"
+  },
+  {
+   "name": "fib(25), recursive calls",
+   "old": 55.02,
+   "new": 24.37,
+   "unit": "ms",
+   "higher": false,
+   "speedup": 2.26,
+   "note": ""
+  },
+  {
+   "name": "200k objects: create and sum",
+   "old": 2715.04,
+   "new": 293.33,
+   "unit": "ms",
+   "higher": false,
+   "speedup": 9.26,
+   "note": ""
+  },
+  {
+   "name": "word count, 260k words",
+   "old": 201.15,
+   "new": 142.77,
+   "unit": "ms",
+   "higher": false,
+   "speedup": 1.41,
+   "note": ""
+  },
+  {
+   "name": "200k f-strings and join",
+   "old": 162.7,
+   "new": 128.72,
+   "unit": "ms",
+   "higher": false,
+   "speedup": 1.26,
+   "note": ""
+  },
+  {
+   "name": "integer loop, 3M iterations",
+   "old": 111.04,
+   "new": 112.55,
+   "unit": "ms",
+   "higher": false,
+   "speedup": 0.99,
+   "note": ""
+  },
+  {
+   "name": "start-up: apsi run hello.apsi",
+   "old": 893.52,
+   "new": 133.49,
+   "unit": "ms",
+   "higher": false,
+   "speedup": 6.69,
+   "note": ""
+  },
+  {
+   "name": "apsi check, 41 example programs (1,520 lines), empty cache",
+   "old": 35868.52,
+   "new": 7318.53,
+   "unit": "ms",
+   "higher": false,
+   "speedup": 4.9,
+   "note": ""
+  },
+  {
+   "name": "web server, 64 connections",
+   "old": 6501,
+   "new": 19919,
+   "unit": "req/s",
+   "higher": true,
+   "speedup": 3.06,
+   "note": ""
+  },
+  {
+   "name": "web server, 256 connections",
+   "old": 6140,
+   "new": 19553,
+   "unit": "req/s",
+   "higher": true,
+   "speedup": 3.18,
+   "note": ""
+  }
+ ],
+ "geomean": 7.31
+}

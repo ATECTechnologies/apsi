@@ -1,0 +1,8 @@
+<snippet>
+  <content><![CDATA[
+fn(${1:x}) => ${0:x}
+]]></content>
+  <tabTrigger>lam</tabTrigger>
+  <scope>source.apsi</scope>
+  <description>Anonymous function</description>
+</snippet>

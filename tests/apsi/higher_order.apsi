@@ -1,0 +1,39 @@
+# Higher-order autodiff
+
+test "second and third derivatives of scalars":
+    let d2 = grad(grad(sin))
+    assert d2(0.7) ~= -sin(0.7)
+    let d3 = grad(grad(grad(fn(x) => x ** 4)))
+    assert d3(2.0) ~= 48.0
+    assert grad(grad(fn(x) => exp(2.0 * x) * x))(0.5) ~= exp(1.0) * (4.0 * 0.5 + 4.0)
+
+test "hessian of a quadratic form":
+    let A = tensor([[2.0, 1.0], [0.0, 3.0]])
+    let H = hessian(fn(x) => x @ (A @ x))(tensor([1.0, -2.0]))
+    assert approx(H, A + transpose(A))
+
+test "jacobian":
+    let J = jacobian(fn(x) => tensor([1.0, 2.0]) * x ** 2)(tensor([3.0, 4.0]))
+    assert approx(J, tensor([[6.0, 0.0], [0.0, 16.0]]))
+
+test "laplace of r^2 in 3D is 6":
+    assert laplace(fn(x) => sum(x * x))(tensor([0.3, -1.0, 2.0])) ~= 6.0
+
+test "units follow through second derivatives":
+    let k = 50[N/m]
+    fn U(x: Length) -> Energy = 0.5 * k * x ** 2
+    let stiffness = grad(grad(U))(3[cm])
+    assert stiffness == 50[N/m]
+    assert unit(stiffness) == "N/m"
+
+test "second derivative through a neural network matches finite differences":
+    use nn
+    let p = mlp_init([1, 16, 1], seed=3)
+    fn u(x) = sum(tanh(reshape(x, 1, 1) @ p[0].W + p[0].b) @ p[1].W + p[1].b)
+    let x0 = 0.4
+    let h = 1e-3
+    let fd = (u(x0 + h) - 2.0 * u(x0) + u(x0 - h)) / (h * h)
+    assert approx(grad(grad(u))(x0), fd, rel=1e-4)
+
+test "stop_gradient blocks the gradient":
+    assert grad(fn(x) => x * stop_gradient(x))(3.0) ~= 3.0

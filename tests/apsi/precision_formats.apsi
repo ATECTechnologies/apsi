@@ -1,0 +1,56 @@
+use precision
+
+test "format grids are exact":
+    assert format_info(fp8_e4m3).max == 448.0
+    assert format_info(fp8_e5m2).max == 57344.0
+    assert format_info(fp4_e2m1).max == 6.0
+    let r = round_to(tensor([0.2, 0.7, 2.6, 5.1, 100.0]), fp4_e2m1, scale=1.0)
+    assert approx(r, tensor([0.0, 0.5, 3.0, 6.0, 6.0]))
+    assert round_to(1.00390625, bf16) == 1.0
+    assert round_to(1.01171875, bf16) == 1.015625
+
+test "memory footprint":
+    let w = randn(512, 512, seed=1)
+    assert nbytes(w) == 512 * 512 * 8
+    assert nbytes(quantize(w, bf16)) == 512 * 512 * 2
+    assert nbytes(quantize(w, fp8_e4m3)) == 512 * 512
+    assert nbytes(quantize(w, fp4_e2m1)) == 512 * 512 / 2
+    assert nbytes(quantize(w, int4)) == 512 * 512 / 2
+
+test "accuracy ordering":
+    let x = randn(4096, seed=2)
+    assert quant_error(x, bf16) < quant_error(x, fp8_e4m3)
+    assert quant_error(x, fp8_e4m3) < quant_error(x, fp4_e2m1)
+    assert quant_error(x, int8) < quant_error(x, int4)
+    assert quant_error(x, f32) < 1e-7
+
+test "per-channel int8 quantisation and quantised matmul":
+    let W = randn(64, 32, seed=3) * tensor([0.01 * (k + 1) for k in 0..32])
+    let x = randn(8, 64, seed=4)
+    let exact = x @ W
+    let q_tensor = quantize(W, int8)
+    let q_channel = quantize(W, int8, axis=1)
+    let e1 = norm(qmatmul(x, q_tensor) - exact) / norm(exact)
+    let e2 = norm(qmatmul(x, q_channel) - exact) / norm(exact)
+    assert e2 < e1
+    assert e2 < 0.01
+
+test "units survive quantisation":
+    let v = tensor([1.0, 2.0, 3.0]) * u.m / u.s
+    let back = dequantize(quantize(v, bf16))
+    assert dim(back) == "Velocity"
+
+test "quantisation-aware training with straight-through gradients":
+    let X = randn(128, 4, seed=5)
+    let y = X @ tensor([1.0, -2.0, 0.5, 3.0])
+    fn loss(w) = mean((X @ round_to(w, fp8_e4m3) - y) ** 2)
+    var w = zeros(4)
+    for _ in 0..300:
+        w = w - 0.05 * grad(loss)(w)
+    assert loss(w) < 0.05
+
+test "precision decorator with low-precision formats":
+    @precision(bf16)
+    fn layer(x) = x * 1.0
+    let y = layer(tensor([1.00390625, 3.0]))
+    assert y[0] == 1.0

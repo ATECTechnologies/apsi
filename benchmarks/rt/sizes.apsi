@@ -1,0 +1,16 @@
+use rt
+let sizes = ["vga", "svga", "hd", "wxga", "hd+", "fhd", "qhd", "4k"]
+print("size        pixels    uncapped fps   p50 work ms   p99 work ms   capped(target) fps   latency ms   jitter ms")
+for s in sizes:
+    let wh = rt.size(s)
+    let src = rt.synthetic(s, fps=0)
+    fn work(f, info):
+        let g = rt.gray(f)
+        if info.prev_gray is not none:
+            rt.motion(info.prev_gray, g)
+        return g
+    let r = rt.video(src, work, seconds=2.0)
+    let target = 240 if wh[0] <= 800 else (120 if wh[0] <= 1366 else (90 if wh[0] <= 1920 else (60 if wh[0] <= 2560 else 30)))
+    let src2 = rt.synthetic(s, fps=target * 2)
+    let c = rt.video(src2, work, fps=target, seconds=2.0)
+    print(f"{s:<10} {wh[0]}x{wh[1]:<6} {r.fps:>10.0f} {r.work_p50_ms:>13.2f} {r.work_p99_ms:>13.2f} {c.fps:>14.1f} ({target}) {c.latency_p50_ms:>12.2f} {c.jitter_ms:>10.2f}")

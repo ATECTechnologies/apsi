@@ -1,0 +1,80 @@
+# 23_web_api.apsi — a secure API server that handles many concurrent requests
+# run: apsi run examples/23_web_api.apsi --allow-net
+# try:
+#   curl http://127.0.0.1:8080/health
+#   curl http://127.0.0.1:8080/orbit/365
+#   curl -X POST http://127.0.0.1:8080/predict -d '{"x": [0.1, 0.5, 0.9]}'
+#   curl -X POST http://127.0.0.1:8080/login -d '{"user": "nick", "password": "apsi"}'
+use web
+use nn
+use crypto
+use physics.constants
+
+let SECRET = random_token(32)  # in production, read the secret from the environment
+let USERS = {"nick": password_hash("apsi")}
+
+let app = server(name="apsi-api", max_body=64 * 1024)
+app.rate_limit(200, per=1[s], burst=400)  # per IP address
+app.cors(["http://localhost:3000"])  # allow a Next.js page during development
+app.health()
+app.expose_metrics()
+
+# --- a small AI model trained when the server starts (y = sin(2πx))
+let xs = reshape(linspace(0.0, 1.0, 256), 256, 1)
+let ys = sin(2.0 * pi * xs)
+fn net(p, x) = tanh(x @ p[0].W + p[0].b) @ p[1].W + p[1].b
+let trained = train(fn(p, x, y) => mse(net(p, x), y), mlp_init([1, 32, 1], seed=1), (xs, ys),
+    adam(lr=0.01), epochs=300, batch_size=32, verbose=false)
+let model = trained.params
+
+@app.post("/predict")
+fn predict(req):
+    let body = req.json()
+    let x = tensor(body["x"])
+    if ndim(x) != 1 or len(x) > 10000:
+        abort(422, "x must be a list of at most 10000 numbers")
+    return {"y": reshape(net(model, reshape(x, len(x), 1)), len(x))}
+
+# --- physics: simulate the orbit for the requested number of days
+@app.get("/orbit/{days:int}")
+fn orbit(req):
+    let days = req.params["days"]
+    if days < 1 or days > 3650:
+        abort(422, "days must be between 1 and 3650")
+    var r = tensor([1.0, 0.0]) * AU
+    var v = tensor([0.0, 29.78]) * u.km / u.s
+    evolve r, v over t in 0[day]..(days * 1[day]) step 6[h] using verlet:
+        r' = v
+        v' = -G * M_sun * r / norm(r) ** 3
+    return {"position": r as [au], "speed": norm(v) as [km/s]}
+
+# --- login and an endpoint that needs a token
+@app.post("/login")
+fn login(req):
+    let body = req.json()
+    let user = body["user"]
+    if user not in USERS or not password_verify(body["password"], USERS[user]):
+        abort(401, "wrong user or password")
+    return {"token": jwt_sign({"sub": user}, SECRET, expires_in=1[h])}
+
+let guard = require_jwt(SECRET)
+app.before(fn(req) => guard(req) if req.path == "/me" else none)
+
+@app.get("/me")
+fn me(req) = {"user": req.user["sub"]}
+
+test "endpoints work without a network":
+    assert app.handle("GET", "/health").status == 200
+    assert app.handle("GET", "/orbit/0").status == 422
+    assert app.handle("GET", "/me").status == 401
+    let token = app.handle("POST", "/login", {"user": "nick", "password": "apsi"}).body["token"]
+    assert app.handle("GET", "/me", headers={"Authorization": "Bearer " + token}).body["user"] == "nick"
+    let y = app.handle("POST", "/predict", {"x": [0.25]}).body["y"][0]
+    assert abs(y - 1.0) < 0.1
+
+if testing():
+    pass  # apsi test: do not start the real server
+elif "net" not in permissions():
+    print("run with --allow-net to start the server")
+else:
+    app.run(host="127.0.0.1", port=8080, workers=16)

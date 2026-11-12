@@ -1,0 +1,66 @@
+# 44_physics_networks.apsi — physics-informed networks with pinn_fit
+# the network learns the solution of an equation from the equation itself (no solution data):
+#   1) the heat equation  u_t = a u_xx  on x in [0, 1], t in [0, 0.5], u(x, 0) = sin(pi x), u(0, t) = u(1, t) = 0
+#      exact solution: exp(-a pi^2 t) sin(pi x)
+#   2) the damped oscillator  u'' + 2 z w u' + w^2 u = 0,  u(0) = 1,  u'(0) = 0
+# pinn_fit gives the loss u, du and d2u at the points: du[:, i, k] = du_k / dx_i, d2u[:, i, k] = d2u_k / dx_i^2.
+# On a GPU it runs in Taylor mode (values and derivatives through the network in one stack); without one, on the
+# processor with autodiff of any order. backend="numpy" or "gpu" chooses.
+use layers
+use nn
+
+let a = 0.1
+let pi = 3.141592653589793
+
+# collocation points: a grid inside, the initial line, the two walls
+var pts = []
+for i in 0..16:
+    for j in 0..9:
+        pts.append([i / 15.0, j / 16.0])
+let n_in = len(pts)
+for i in 0..21:
+    pts.append([i / 20.0, 0.0])
+let n_ic = 21
+for j in 0..11:
+    pts.append([0.0, j / 20.0])
+    pts.append([1.0, j / 20.0])
+let X = tensor(pts)
+
+fn heat_loss(x, u, du, d2u):
+    let res = du[:n_in, 1, 0] - a * d2u[:n_in, 0, 0]
+    let ic = u[n_in:n_in + n_ic, 0] - sin(pi * x[n_in:n_in + n_ic, 0])
+    let bc = u[n_in + n_ic:, 0]
+    return mean(res ** 2) + 10.0 * mean(ic ** 2) + 10.0 * mean(bc ** 2)
+
+let heat = mlp([2, 32, 32, 1], "tanh")
+let r = pinn_fit(heat, heat.init(seed=0), X, heat_loss, epochs=1500, opt=adam(lr=0.005), verbose=false)
+print(f"heat: loss {r.history[0]:.3f} -> {r.history[-1]:.5f} on the {r.backend}")
+
+let test_pts = tensor([[0.25, 0.2], [0.5, 0.3], [0.75, 0.45]])
+let pred = heat(r.params, test_pts)[:, 0]
+let exact = exp(-a * pi * pi * test_pts[:, 1]) * sin(pi * test_pts[:, 0])
+let heat_err = max(abs(pred - exact))
+print("largest error against the exact solution:", heat_err)
+
+# 2) the damped oscillator, with sin activations
+let w = 3.0
+let z = 0.1
+let ts = reshape(linspace(0.0, 3.0, 60), -1, 1)
+
+fn osc_loss(x, u, du, d2u):
+    let res = d2u[:, 0, 0] + 2.0 * z * w * du[:, 0, 0] + w * w * u[:, 0]
+    return mean(res ** 2) + 20.0 * ((u[0, 0] - 1.0) ** 2 + du[0, 0, 0] ** 2)
+
+let osc = mlp([1, 32, 32, 1], "sin")
+let r2 = pinn_fit(osc, osc.init(seed=1), ts, osc_loss, epochs=2500, opt=adam(lr=0.003), verbose=false)
+let wd = w * sqrt(1.0 - z * z)
+let t3 = tensor([[0.5], [1.0], [2.0]])
+let exact2 = exp(-z * w * t3[:, 0]) * (cos(wd * t3[:, 0]) + z * w / wd * sin(wd * t3[:, 0]))
+let osc_err = max(abs(osc(r2.params, t3)[:, 0] - exact2))
+print(f"oscillator: loss {r2.history[-1]:.5f}, largest error {osc_err:.4f}")
+
+test "the heat equation learned from the equation alone":
+    assert heat_err < 0.05
+
+test "the damped oscillator learned from the equation alone":
+    assert osc_err < 0.05

@@ -1,0 +1,1 @@
+require("http").createServer((q, r) => { const b = JSON.stringify({message: "hi", n: 1}); r.writeHead(200, {"Content-Type": "application/json", "Content-Length": Buffer.byteLength(b)}); r.end(b); }).listen(58092);

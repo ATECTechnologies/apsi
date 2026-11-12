@@ -1,0 +1,32 @@
+# 15_native_c.apsi — call your own compiled C/C++ without copying data
+# compile first (pick your system):
+#   Linux   : sh examples/native/build.sh
+#   Windows : examples\native\build.bat        (uses MSVC "cl" or MinGW "gcc", whichever is installed)
+# run      : apsi run examples/15_native_c.apsi --allow-ffi
+#
+# cload("native/vecmath") picks the right file for the system: vecmath.dll (Windows) / libvecmath.so (Linux)
+
+let LIB = "native/vecmath"
+
+fn demo():
+    let lib = cload(LIB)
+    let c_dot = lib.fn("dot", [ptr_f64, ptr_f64, i64], f64)
+    let c_axpy = lib.fn("axpy", [f64, ptr_f64, ptr_f64, i64], void)
+    let a = linspace(0.0, 1.0, 1000)
+    let b = ones(1000)
+    var y = zeros(1000)
+    c_axpy(2.0, a, y, 1000)  # C writes its result straight into tensor y
+    return c_dot(a, b, 1000), dot(a, b), y[999]
+
+if exists(library_path(LIB)):
+    let c_result, apsi_result, y_last = demo()
+    print("C dot =", c_result, "  Apsi dot =", apsi_result)
+    print("after axpy: y[999] =", y_last)
+else:
+    print("the C library is not compiled yet:", library_path(LIB), "— see the commands at the top of this file")
+
+test "C and Apsi agree":
+    if exists(library_path(LIB)):
+        let c_result, apsi_result, y_last = demo()
+        assert c_result ~= apsi_result
+        assert y_last ~= 2.0

@@ -1,0 +1,12 @@
+<snippet>
+  <content><![CDATA[
+fn main():
+	$0
+
+if not testing():
+	main()
+]]></content>
+  <tabTrigger>main</tabTrigger>
+  <scope>source.apsi</scope>
+  <description>Main guard</description>
+</snippet>

@@ -1,0 +1,74 @@
+# Tests for `use layers` (any architecture as a graph of layers), sci.solve_ivp, fsum and data windows.
+use layers
+use nn
+use sci
+use data
+
+test "an mlp learns the spiral":
+    let X, y = spiral_data(n_per_class=60, classes=3, noise=0.2, seed=0)
+    let model = mlp([2, 32, 32, 3])
+    let r = fit(model, model.init(seed=1), X, y, loss="cross_entropy", opt=adam(lr=0.02), epochs=150, verbose=false)
+    assert accuracy(predict(model, r.params, X), y) > 0.9
+    assert r.history[-1] < r.history[0]
+
+test "dag, residual and parallel compose":
+    let net = dag([["a", linear(3, 8), "x"], ["b", linear(3, 8), "x"], ["s", add(), ["a", "b"]],
+                   ["r", residual(sequential([linear(8, 8), activation("gelu")])), "s"],
+                   ["out", parallel([linear(8, 2), linear(8, 2)], combine="concat"), "r"]], inputs=["x"], output="out")
+    let p = net.init(seed=0)
+    assert shape(net(p, randn(5, 3))) == (5, 4)
+    assert count_params(p) == 2 * (3 * 8 + 8) + (8 * 8 + 8) + 2 * (8 * 2 + 2)
+
+test "transformer language model shapes and gradients":
+    let lm = transformer_lm(20, d=8, heads=2, layers=1, context=6)
+    let p = lm.init(seed=0)
+    let toks = randint(0, 20, 2, 6, seed=3)
+    assert shape(lm(p, toks)) == (2, 6, 20)
+    let l, g = value_and_grad(fn(q) => cross_entropy(reshape(lm(q, toks), 12, 20), reshape(toks, 12)))(p)
+    assert l > 0
+    assert count_params(g) == count_params(p)
+
+test "graph neural networks":
+    let g = graph(edges=[[0, 1], [1, 2], [2, 3], [3, 0]], n=4, undirected=true)
+    let x = randn(4, 3, seed=0)
+    for net in [gcn_net(3, 8, 2, dropout=0.0), gat_net(3, 4, 2, heads=2, dropout=0.0), gin_net(3, 8, 2, layers=1)]:
+        let out = net(net.init(seed=0), x, graph=g)
+        assert shape(out)[1] == 2
+    assert segment_sum(tensor([1.0, 2.0, 3.0]), tensor([0, 0, 1]), 2) == tensor([3.0, 3.0])
+
+test "stiff and non-stiff initial value problems":
+    let r = solve_ivp(fn(t, y) => -y, [0.0, 2.0], 1.0, method="rk45", rtol=1e-10, atol=1e-12)
+    assert abs(r.y[-1] - exp(-2.0)) < 1e-8
+    fn rob(t, y) = tensor([-0.04 * y[0] + 1e4 * y[1] * y[2], 0.04 * y[0] - 1e4 * y[1] * y[2] - 3e7 * y[1] ** 2,
+                           3e7 * y[1] ** 2])
+    let s = solve_ivp(rob, [0.0, 40.0], tensor([1.0, 0.0, 0.0]), method="bdf", rtol=1e-6, atol=1e-10)
+    assert s.success
+    assert abs(s.y[-1][0] - 0.7158) < 1e-3
+    let q = solve_ivp(fn(t, x) => -x / 2s, [0s, 2s], 1m, method="bdf", rtol=1e-9, atol=1e-12, t_eval=[0s, 2s])
+    assert q.y[-1] ~= exp(-1.0) * 1m
+
+test "exact sums and python-compatible built-ins":
+    assert fsum([0.1] * 10) == 1.0
+    assert any([false, true]) and not all([true, false])
+    assert divmod(7, 2) == (3, 1)
+
+test "sliding windows and shards":
+    assert [list(w) for w in (from_range(5) |> window(2)).to_list()] == [[0, 1], [1, 2], [2, 3], [3, 4]]
+    assert (from_range(6) |> shard(2, 0)).to_list() == [0, 2, 4]
+
+test "compute backends":
+    assert devices()[0].name == "numpy"
+    let m = mlp([2, 4, 2])
+    let X = randn(6, 2, seed=1)
+    let r = fit(m, m.init(seed=0), X, tensor([0, 1, 0, 1, 0, 1]), loss="cross_entropy", backend="auto", epochs=2,
+                verbose=false)
+    assert len(r.history) == 2
+    assert shape(predict(m, r.params, X, backend="auto")) == (6, 2)
+    assert shape(mean_pool(1)(none, randn(2, 3, 4, seed=2))) == (2, 4)
+
+test "models with several inputs train in mini-batches":
+    let net = dag([["a", linear(3, 2), "x"], ["b", linear(4, 2), "y"], ["s", add(), ["a", "b"]]], inputs=["x", "y"],
+                  output="s")
+    let r = fit(net, net.init(seed=0), [randn(10, 3, seed=1), randn(10, 4, seed=2)], randn(10, 2, seed=3), epochs=3,
+                batch_size=4, verbose=false)
+    assert len(r.history) == 3

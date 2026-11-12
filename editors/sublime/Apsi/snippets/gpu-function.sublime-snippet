@@ -1,0 +1,11 @@
+<snippet>
+  <content><![CDATA[
+@gpu
+fn ${1:kernel}(${2:x}, ${3:y}):
+	parallel for i in 0..len(${2:x}):
+		${3:y}[i] = $0
+]]></content>
+  <tabTrigger>gpu</tabTrigger>
+  <scope>source.apsi</scope>
+  <description>Run a parallel for on the NVIDIA GPU(s); all CPU cores when there is none</description>
+</snippet>
