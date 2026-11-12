@@ -23,7 +23,14 @@
   tied output); a `dag` with several outputs and a loss of your own over all of them, targets given as a record, on
   one card and across cards; a weight held by two stages (a tied output on another card than its embedding) gets the
   sum of both gradients; the cut of a dag balances the work each node really does (rows followed from the inputs:
-  graph nodes, tokens, one row per graph after pooling).
+  graph nodes, tokens, one row per graph after pooling). GLA's node encoder and graph memory have kernels of their
+  own; each brain is a node per layer, so a cut can fall inside a brain (its shared weights summed across the cards).
+- **`accumulate=A` across cards is A batches a step** whatever the number of cards and copies of the pipeline: the
+  training no longer depends on how many cards there are.
+- **Layers written in Apsi:** a `custom_layer`'s forward function gets only the keywords it takes (`train`, `graph`,
+  `mask`), never the dag's own context; such layers train inside a model on one card or split across cards.
+- **Fixed:** a lambda's parameter named like something outside it (`fn(p, x, train=true) => …` after `use nn`) could
+  not be passed by keyword.
 - **Heterogeneous graphs:** `graph(…, node_types=)`, `typed_linear`, `typed_norm` and `hgt` (the layer of GLA's brains:
   weights per node type, keys through each relation and head, one softmax over a node's in-edges) on NumPy and the
   GPU trainer (rows grouped by type, one product per type; the relations in one batched product).

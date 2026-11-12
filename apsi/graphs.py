@@ -638,6 +638,104 @@ class HGTBrain(Layer):
         return f"hgt_brain(d={self.d}, {self.L} layers, {self.T} node types, global every {self.every})"
 
 
+# ============================================================== a brain in pieces (to cut it across cards)
+class BrainInput(Layer):
+    """The first piece of a split hgt_brain: the typed input projection (gelu) of the owned nodes."""
+    kind = "brain_input"
+
+    def __init__(self, d, types):
+        self.d = int(d)
+        self.T, self.type_ids = _owned(types)
+        self.inp = TypedLinear(d, d, list(self.type_ids) if self.type_ids else self.T)
+
+    def init(self, seed=0):
+        return Record(input=self.inp.init(_seed_of(seed, 0)))
+
+    def apply(self, p, x, train=False, **ctx):
+        own = _owned_mask(ctx.get("graph"), int(np.shape(ops.raw(x))[0]), self.T, self.type_ids)
+        return ops.where(own, ops.gelu(self.inp(p.input, x, **ctx)), x)
+
+
+class BrainShared(Layer):
+    """The weights the layers of a split brain share (the graph context's projection, a gate per layer): passes its
+    input through; the brain_layer pieces read them by this node's name."""
+    kind = "brain_shared"
+
+    def __init__(self, d, layers):
+        self.d, self.L = int(d), int(layers)
+
+    def init(self, seed=0):
+        rng = _rng(_seed_of(seed, 99))
+        return Record(ctx_W=rng.normal(size=(self.d, self.d)) * 0.02, ctx_b=np.zeros(self.d), ctx_gate=np.zeros(self.L))
+
+    def apply(self, p, x, train=False, **ctx):
+        return x
+
+
+class BrainLayer(Layer):
+    """One layer of a split brain: hgt, the global attention when it has one, the graph context with the weights of
+    the brain_shared node `owner` (gate number `li`)."""
+    kind = "brain_layer"
+
+    def __init__(self, hgt, ga, li, owner, types, context=True):
+        self.hgt, self.ga, self.li, self.owner, self.context = hgt, ga, int(li), str(owner), bool(context)
+        self.T, self.type_ids = _owned(types)
+
+    def init(self, seed=0):
+        f = dict(hgt=self.hgt.init(_seed_of(seed, 0)))
+        if self.ga is not None:
+            f["attend"] = self.ga.init(_seed_of(seed, 1))
+        return Record(**f)
+
+    def apply(self, p, x, train=False, **ctx):
+        g = _graph(ctx)
+        N = int(np.shape(ops.raw(x))[0])
+        h = self.hgt(p.hgt, x, train=train, **ctx)
+        if self.ga is not None:
+            h = self.ga(p.attend, h, train=train, **ctx)
+        if not self.context:
+            return h
+        sp = getattr(ctx["_dag_params"], self.owner)
+        own = _owned_mask(g, N, self.T, self.type_ids)
+        batch, G = _graph_ids(g, N)
+        dlt = context_delta(h, own, batch, G, sp.ctx_W, sp.ctx_b, sp.ctx_gate[self.li])
+        return h + ops.where(own, dlt[batch], 0.0)
+
+    def children(self):
+        return [self.hgt] + ([self.ga] if self.ga is not None else [])
+
+
+class BrainOutput(Layer):
+    """The last piece of a split brain: the final layer norm of the owned nodes."""
+    kind = "brain_output"
+
+    def __init__(self, d, types):
+        self.d = int(d)
+        self.T, self.type_ids = _owned(types)
+        self.final = LayerNorm(d)
+
+    def init(self, seed=0):
+        return Record(final=self.final.init())
+
+    def apply(self, p, x, train=False, **ctx):
+        own = _owned_mask(ctx.get("graph"), int(np.shape(ops.raw(x))[0]), self.T, self.type_ids)
+        return ops.where(own, self.final(p.final, x), x)
+
+
+def split_brain(name, brain, src):
+    """An hgt_brain as dag nodes [name_in, name_shared, name_l0 … name_out] (the same computation and the same
+    weights; the pieces can go to different cards). Returns (nodes, the name of the brain's output)."""
+    b = brain
+    types = list(b.type_ids) if b.type_ids is not None else b.T
+    nodes = [[f"{name}_in", BrainInput(b.d, types), src], [f"{name}_shared", BrainShared(b.d, b.L), f"{name}_in"]]
+    prev = f"{name}_shared"
+    for li, l_ in enumerate(b.layers):
+        nodes.append([f"{name}_l{li}", BrainLayer(l_, b.ga.get(li), li, f"{name}_shared", types, b.context), prev])
+        prev = f"{name}_l{li}"
+    nodes.append([f"{name}_out", BrainOutput(b.d, types), prev])
+    return nodes, f"{name}_out"
+
+
 def graph_transformer_net(n_in, d, out, layers=4, heads=4, relations=1, global_every=2, max_keys=4096,
                           task="node", pool="mean"):
     """Input projection, `layers` graph_transformer blocks with a global_attention block after every
@@ -660,5 +758,6 @@ def graph_transformer_net(n_in, d, out, layers=4, heads=4, relations=1, global_e
 def names():
     return dict(graph_transformer=GraphTransformer, global_attention=GlobalAttention, mix_hop=MixHop,
                 graph_memory=GraphMemory, hgt=HGT, typed_linear=TypedLinear, typed_norm=TypedNorm,
+                hgt_brain=HGTBrain, typed_pool=TypedPool, graph_context=GraphContext, split_brain=split_brain,
                 graph_transformer_net=graph_transformer_net, k_hop=k_hop, hop_distances=hop_distances,
                 eccentricity=eccentricity)

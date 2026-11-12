@@ -719,7 +719,7 @@ class SegStage(Stage):
         held = {n: p for n, _, _, _, p in seg}
         for n, l_, _, _, _ in seg:                       # a tied output whose embedding is on another card: the
             own = getattr(l_, "owner", None)             # weights on both cards, their gradients summed every step
-            if isinstance(l_, L.TiedOutput) and own not in held and all_params is not None:
+            if isinstance(own, str) and own not in held and all_params is not None and hasattr(all_params, own):
                 held[own] = getattr(all_params, own)
         self.net = Net(ops, model, Record(**held), precision)
         self.garena = self.net.arena
@@ -783,7 +783,10 @@ def fit_batches_pipeline(ops_list, model, params, batches, loss, opt, epochs, ve
         sizes = partition(work, size, S, 16.0 if adam else 12.0, budget) or partition(work, size, S)
     S = len(sizes)
     R = max(1, n_cards // S)
-    M = max(1, int(micro) if micro else 2 * S)
+    # accumulate=A: A batches a step whatever the number of cards (the copies of the pipeline share them), so the
+    # training does not depend on how many cards there are; without it every copy takes 2 x stages batches a step
+    M = max(1, -(-int(micro) // R) if micro else 2 * S)
+    per_step = int(micro) if micro else R * M
     cuts = np.concatenate([[0], np.cumsum(sizes)]).astype(int)
     grid = []
     try:
@@ -817,7 +820,7 @@ def fit_batches_pipeline(ops_list, model, params, batches, loss, opt, epochs, ve
         for ep in range(E):
             items = first_items if ep == 0 else list(batches(ep) if callable(batches) else batches)
             losses = []
-            per = R * M
+            per = per_step
             for s0 in range(0, len(items), per):
                 chunk = items[s0:s0 + per]
                 parts = [chunk[r::R] for r in range(R)]

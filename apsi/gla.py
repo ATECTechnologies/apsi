@@ -108,6 +108,7 @@ def gla_config(size="tiny", **override):
     base.setdefault("name", "custom")
     base.setdefault("math_core", True)
     base.setdefault("tie", True)
+    base.setdefault("split", True)
     base.update(override)
     return Record(**base)
 
@@ -449,13 +450,21 @@ def gla(size="tiny", **override):
     ra = list(range(len(brain_relations(CODE_TYPES))))
     rc = list(range(len(ra), len(rels)))
     ta, tc = _type_ids(CODE_TYPES), _type_ids(LANG_TYPES)
+    from .graphs import split_brain
+    split = bool(getattr(c, "split", True))
     nodes = [["enc", NodeEncoder(d), "nodes"]]
+    outs = {}
     for name, layers, every, types, rr, tnames in (("a", c.a_layers, c.a_every, ta, ra, CODE_TYPES),
                                                   ("b", c.b_layers, c.b_every, ta, ra, CODE_TYPES),
                                                   ("c", c.c_layers, c.c_every, tc, rc, LANG_TYPES)):
-        nodes += [[f"brain_{name}", HGTBrain(d, c.heads, layers, types, rr, every, c.max_keys, c.ga_ratio, c.ffn_mult),
-                   "enc"],
-                  [f"pool_{name}", TypedPool(types, [POOL_WEIGHTS_INIT.get(t, 1.0) for t in tnames]), f"brain_{name}"],
+        brain = HGTBrain(d, c.heads, layers, types, rr, every, c.max_keys, c.ga_ratio, c.ffn_mult)
+        if split:                                  # a node per layer: the brain can be cut across cards
+            more, outs[name] = split_brain(f"brain_{name}", brain, "enc")
+            nodes += more
+        else:
+            nodes.append([f"brain_{name}", brain, "enc"])
+            outs[name] = f"brain_{name}"
+        nodes += [[f"pool_{name}", TypedPool(types, [POOL_WEIGHTS_INIT.get(t, 1.0) for t in tnames]), outs[name]],
                   [f"sem_{name}", Sequential([Linear(d, d), Activation("gelu"), LayerNorm(d), Linear(d, d)]),
                    f"pool_{name}"],
                   [f"valid_{name}", Linear(d, 1), f"sem_{name}"],
@@ -478,7 +487,7 @@ def gla(size="tiny", **override):
         ["fusion_1", Linear(2 * d, d), "both"],
         ["value", Sequential([Linear(d, d // 2), Activation("gelu"), Linear(d // 2, 1)]), "code_vec"],
         ["held", ParamBank(bank), "code_vec"],
-        ["memory", BrainMemory(d, dw, c.mem_a, c.mem_c, ta, tc), ["brain_a", "brain_c", "sem_a", "sem_c"]],
+        ["memory", BrainMemory(d, dw, c.mem_a, c.mem_c, ta, tc), [outs["a"], outs["c"], "sem_a", "sem_c"]],
         ["w_emb", Embedding(c.w_vocab, dw), "tokens"]]
     prev = "w_emb"
     for i in range(c.w_layers):

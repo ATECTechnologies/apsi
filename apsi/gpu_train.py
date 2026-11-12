@@ -2312,6 +2312,9 @@ class _Conv2D(_Node):
         return dx
 
 
+_HOST_LOCK = __import__("threading").RLock()      # the processor's part of a model: one card's thread at a time
+
+
 class _HostLayer(_Node):
     """Any other layer (a custom layer, a lambda, a layer the card has no kernel for): run on the processor with
     Apsi's autodiff, its input and the current weights brought from the card, the output and the gradients sent
@@ -2342,6 +2345,10 @@ class _HostLayer(_Node):
         return a.astype(np.float64)
 
     def _run(self, xs):
+        with _HOST_LOCK:
+            return self._run_locked(xs)
+
+    def _run_locked(self, xs):
         from . import ops as aops
         self.rng = aops._RNG[0].bit_generator.state
         p = self._params()
@@ -2363,6 +2370,10 @@ class _HostLayer(_Node):
         return self._run(self.xs)
 
     def _grads(self, dy):
+        with _HOST_LOCK:
+            return self._grads_locked(dy)
+
+    def _grads_locked(self, dy):
         from . import ops as aops
         from .stdlib import value_and_grad
         p = self.pnow
@@ -3569,6 +3580,103 @@ class _Brain(_Node):
         return dx
 
 
+def _brain_masks(node, N, T, ids):
+    gd = _need_graph(node.net, "a brain")
+    k = ("brain-own", T, ids)
+    if k not in gd.cache:
+        from .graphs import _owned_mask
+        own = _owned_mask(node.net.graph, N, T, ids).reshape(-1)
+        batch = np.asarray(node.net.graph.batch, np.int64)
+        G = max(int(node.net.graph.graphs), int(batch.max(initial=-1)) + 1)
+        gd.cache[k] = (gd._put(own, np.float32), gd._put(~own, np.float32), _Seg(gd, np.where(own, batch, -1), G))
+    return gd.cache[k]
+
+
+class _BrainInput(_Node):
+    def __init__(self, net, key, layer, p):
+        super().__init__(net, key)
+        self.T, self.ids, self.d = layer.T, layer.type_ids, layer.d
+        self.inp = _TypedLin(self, "in.", net.param(p.input.W), net.param(p.input.b), self.d, self.d, self.T)
+
+    def fwd(self, x, shape):
+        o, N, d = self.net.ops, _rows(shape), self.d
+        own, notown, _ = _brain_masks(self, N, self.T, self.ids)
+        self.N = N
+        self.y = self.inp.fwd(x, N, _groups(self.net, self.T, self.ids))
+        a = self.buf("a", N * d)
+        o.act_f(self.y, a, N * d, KS.ACTS["gelu"])
+        h = self.buf("h", N * d)
+        o.add3(h, _diag(self, "ha", a, own, N, d), _diag(self, "hx", x, notown, N, d), N * d)
+        return h, shape
+
+    def bwd(self, dh, need_dx=True):
+        o, N, d = self.net.ops, self.N, self.d
+        own, notown, _ = _brain_masks(self, N, self.T, self.ids)
+        da = _diag(self, "dha", dh, own, N, d, grad=True)
+        dyp = self.gbuf("dy", N * d)
+        o.act_b(self.y, da, dyp, N * d, KS.ACTS["gelu"])
+        dx = self.gbuf("dx", N * d)
+        o.add3(dx, self.inp.bwd(dyp, N), _diag(self, "dhx", dh, notown, N, d, grad=True), N * d)
+        return dx
+
+
+class _BrainLayer(_Node):
+    def __init__(self, net, key, layer, p, gk, dag_params):
+        super().__init__(net, key)
+        self.T, self.ids, self.d = layer.T, layer.type_ids, layer.hgt.d
+        self.hgt = net.compile(layer.hgt, p.hgt, key + ".h", gk + ".h")
+        self.ga = net.compile(layer.ga, p.attend, key + ".g", gk + ".g") if layer.ga is not None else None
+        self.ctx = None
+        if layer.context:
+            if dag_params is None or not hasattr(dag_params, layer.owner):
+                raise TrainError(f"brain_layer: no node '{layer.owner}' with the brain's shared weights")
+            sp = getattr(dag_params, layer.owner)
+            self.ctx = _Context(self, net.param(sp.ctx_W), net.param(sp.ctx_b), net.param(sp.ctx_gate), layer.li,
+                                self.d)
+        self.nodes = [self.hgt] + ([self.ga] if self.ga is not None else [])
+
+    def fwd(self, x, shape):
+        N = _rows(shape)
+        self.N = N
+        h, _ = self.hgt.fwd(x, shape)
+        if self.ga is not None:
+            h, _ = self.ga.fwd(h, shape)
+        if self.ctx is not None:
+            h = self.ctx.fwd(h, N, _brain_masks(self, N, self.T, self.ids)[2])
+        return h, shape
+
+    def bwd(self, dh, need_dx=True):
+        N = self.N
+        if self.ctx is not None:
+            dh = self.ctx.bwd(dh, N, _brain_masks(self, N, self.T, self.ids)[2])
+        if self.ga is not None:
+            dh = self.ga.bwd(dh, True)
+        return self.hgt.bwd(dh, True)
+
+
+class _BrainOutput(_Node):
+    def __init__(self, net, key, layer, p):
+        from . import layers as L
+        super().__init__(net, key)
+        self.T, self.ids, self.d = layer.T, layer.type_ids, layer.d
+        self.final = _Norm(net, key + ".fn", L.LayerNorm(layer.d), p.final, False)
+
+    def fwd(self, x, shape):
+        o, N, d = self.net.ops, _rows(shape), self.d
+        own, notown, _ = _brain_masks(self, N, self.T, self.ids)
+        self.N = N
+        f, _ = self.final.fwd(x, shape)
+        out = self.buf("out", N * d)
+        o.add3(out, _diag(self, "fo", f, own, N, d), _diag(self, "fx", x, notown, N, d), N * d)
+        return out, shape
+
+    def bwd(self, dy, need_dx=True):
+        N, d = self.N, self.d
+        own, notown, _ = _brain_masks(self, N, self.T, self.ids)
+        df = _diag(self, "dfo", dy, own, N, d, grad=True)
+        return self.final.bwd(df, True, residual=_diag(self, "dfx", dy, notown, N, d, grad=True))
+
+
 class _TypedPoolNode(_Node):
     """typed_pool: the mean of every (graph, owned type) on the card; the mix with exp(log_weight) on the processor
     (graphs x types x d numbers); the way back spread on the card."""
@@ -3613,6 +3721,260 @@ class _TypedPoolNode(_Node):
         o.fill(dx, N * d, 0.0)
         self.seg.spread(o, dMb, dx, d, True, add=True)
         return dx
+
+
+class _NodeEncoder(_Node):
+    """node_encoder on the card: eleven table lookups (the ids' columns split on the processor: nodes x 11 integers),
+    the gated sums, the mix (two products, gelu), the output product scaled per feature, plus the gated words."""
+
+    def __init__(self, net, key, layer, p):
+        super().__init__(net, key)
+        self.layer, self.d = layer, layer.d
+        self.tabs = [net.param(a) for a in (p.tok, p.sub, p.ntype, p.slot, p.fam, p.extra)] + \
+            [net.param(a) for a in p.struct]
+        self.sizes = list(layer.tables)
+        self.ss, self.lg, self.gain = net.param(p.struct_scale), net.param(p.lang_gate), net.param(p.out_gain)
+        self.mW, self.mb, self.oW, self.ob = (net.param(a) for a in (p.mix.W, p.mix.b, p.out.W, p.out.b))
+
+    def _scal(self, P, i):
+        return float(self.net.ops.get(P.w[0], 1, P.w[1] + i)[0])
+
+    def _dot(self, a, b, n, name):
+        o = self.net.ops
+        r = self.gbuf(name, 1)
+        z = _put_buf(self, "z0", [0])
+        o.edge_dot(a, b, z, z, r, 1, 1, n)
+        return float(o.get(r[0], 1, r[1])[0])
+
+    def _add_scalar_grad(self, P, i, v, name):
+        o = self.net.ops
+        t = self.gbuf(name, 1)
+        o.put(t[0], np.array([v], np.float32), t[1])
+        o.axpy((P.g[0], P.g[1] + i), t, 1, 1.0)
+
+    def fwd(self, x, shape):
+        o, d, ps = self.net.ops, self.d, self.net.passes
+        N = int(shape[0])
+        ids = np.ascontiguousarray(o.get(x[0], N * 11, x[1])).view(np.int32).reshape(N, 11).astype(np.int64)
+        self.cols = [_put_buf(self, ("c", i), np.clip(ids[:, i], 0, n - 1)) for i, n in enumerate(self.sizes)]
+        E = [self.buf(("e", i), N * d) for i in range(11)]
+        for i in range(11):
+            o.embed_f(self.tabs[i].w, self.cols[i], E[i], N, d)
+        self.E, self.N = E, N
+        g = [self._scal(self.lg, i) for i in range(4)]
+        ss = self._scal(self.ss, 0)
+        words = self.buf("words", N * d)
+        o.add3(words, E[0], E[1], N * d)
+        where = self.buf("where", N * d)
+        o.add3(where, E[6], E[7], N * d)
+        for i in (8, 9, 10):
+            o.axpy(where, E[i], N * d, 1.0)
+        what = self.buf("what", N * d)
+        o.pull(what, o, E[2], N * d)
+        for k, i in enumerate((3, 4, 5)):
+            o.axpy(what, E[i], N * d, g[k])
+        o.axpy(what, where, N * d, ss)
+        hp = self.buf("hp", N * d)
+        o.gemm(words, self.mW.w, hp, N, d, d, d, 1, d, 1, d, bias=self.mb.w, passes=ps)
+        o.gemm(what, _ofs(self.mW.w, d * d), hp, N, d, d, d, 1, d, 1, d, beta=True, passes=ps)
+        h = self.buf("h", N * d)
+        o.act_f(hp, h, N * d, KS.ACTS["gelu"])
+        ov = self.buf("ov", N * d)
+        o.gemm(h, self.oW.w, ov, N, d, d, d, 1, d, 1, d, bias=self.ob.w, passes=ps)
+        gt = self.buf("gt", N * d)
+        o.gather(self.gain.w, _put_buf(self, "zeros", np.zeros(N)), gt, N, d, 0)
+        y = self.buf("y", N * d)
+        o.mul3(y, ov, gt, N * d)
+        o.axpy(y, words, N * d, g[3])
+        self.st = (g, ss, words, where, what, hp, h, ov, gt)
+        return y, (N, d)
+
+    def bwd(self, dy, need_dx=True):
+        o, d, ps, N = self.net.ops, self.d, self.net.passes, self.N
+        g, ss, words, where, what, hp, h, ov, gt = self.st
+        n = N * d
+        self._add_scalar_grad(self.lg, 3, self._dot(dy, words, n, "d3"), "s3")
+        t = self.gbuf("t", n)
+        o.mul3(t, dy, ov, n)
+        o.colsum(t, None, None, None, None, self.gain.g, N, d, 0)          # d gain
+        do = self.gbuf("do", n)
+        o.mul3(do, dy, gt, n)
+        o.gemm(h, do, self.oW.g, d, d, N, 1, d, d, 1, d, beta=True, passes=ps, db=self.ob.g)
+        dh = self.gbuf("dh", n)
+        o.gemm(do, self.oW.w, dh, N, d, d, d, 1, 1, d, d, passes=ps)
+        dhp = self.gbuf("dhp", n)
+        o.act_b(hp, dh, dhp, n, KS.ACTS["gelu"])
+        o.gemm(words, dhp, self.mW.g, d, d, N, 1, d, d, 1, d, beta=True, passes=ps, db=self.mb.g)
+        o.gemm(what, dhp, _ofs(self.mW.g, d * d), d, d, N, 1, d, d, 1, d, beta=True, passes=ps)
+        dwords = self.gbuf("dwords", n)
+        o.gemm(dhp, self.mW.w, dwords, N, d, d, d, 1, 1, d, d, passes=ps)
+        o.axpy(dwords, dy, n, g[3])
+        dwhat = self.gbuf("dwhat", n)
+        o.gemm(dhp, _ofs(self.mW.w, d * d), dwhat, N, d, d, d, 1, 1, d, d, passes=ps)
+        for i in (0, 1):
+            o.embed_b(dwords, self.cols[i], self.tabs[i].g, N, d, self.sizes[i])
+        o.embed_b(dwhat, self.cols[2], self.tabs[2].g, N, d, self.sizes[2])
+        sc = self.gbuf("sc", n)
+        for k, i in enumerate((3, 4, 5)):
+            self._add_scalar_grad(self.lg, k, self._dot(dwhat, self.E[i], n, ("dg", k)), ("sg", k))
+            o.fill(sc, n, 0.0)
+            o.axpy(sc, dwhat, n, g[k])
+            o.embed_b(sc, self.cols[i], self.tabs[i].g, N, d, self.sizes[i])
+        self._add_scalar_grad(self.ss, 0, self._dot(dwhat, where, n, "dss"), "sss")
+        o.fill(sc, n, 0.0)
+        o.axpy(sc, dwhat, n, ss)
+        for i in range(6, 11):
+            o.embed_b(sc, self.cols[i], self.tabs[i].g, N, d, self.sizes[i])
+        return None
+
+
+class _BrainMemory(_Node):
+    """brain_memory on the card: the scores of every node (one product each brain), the k best of every graph chosen
+    on the processor from those N numbers, the chosen rows gathered, projected and scaled, the summaries and the null
+    slot, all placed by one gather and RMS-normed; the slot mask column added on the way out (graphs x slots)."""
+
+    def __init__(self, net, key, layer, p):
+        from . import layers as L
+        super().__init__(net, key)
+        self.layer, self.bd, self.d = layer, layer.bd, layer.d
+        P = lambda a: net.param(a)                                 # noqa: E731
+        self.sa_w, self.sa_b, self.sc_w, self.sc_b = P(p.score_a.W), P(p.score_a.b), P(p.score_c.W), P(p.score_c.b)
+        self.na, self.nc, self.ua, self.uc = P(p.node_a), P(p.node_c), P(p.sum_a), P(p.sum_c)
+        self.temb, self.semb, self.null = P(p.type_emb), P(p.slot_emb), P(p.null)
+        self.norm = _Norm(net, key + ".n", L.RMSNorm(layer.d), Record(gamma=p.norm), True)
+
+    def _pick(self, h, sw, sb, ids, T, K, batch, G, N, tag):
+        from .graphs import _owned_mask
+        o = self.net.ops
+        s = self.buf(tag + "s", max(1, N))
+        o.gemm(h, sw.w, s, N, 1, self.bd, self.bd, 1, 1, 1, 1, bias=sb.w, passes=3)
+        raw = o.get(s[0], N, s[1]).astype(np.float64)
+        own = _owned_mask(self.net.graph, N, T, ids).reshape(-1)
+        rows, pos = [], []
+        for b_ in range(G):
+            idx = np.nonzero((batch == b_) & own)[0]
+            top = idx[np.argsort(-raw[idx], kind="stable")[:K]]
+            rows.append(top)
+            pos.append(b_ * K + np.arange(len(top)))
+        rows = np.concatenate(rows).astype(np.int64) if rows else np.zeros(0, np.int64)
+        pos = np.concatenate(pos).astype(np.int64) if pos else np.zeros(0, np.int64)
+        return rows, pos, 1.0 / (1.0 + np.exp(-raw[rows])), s
+
+    def fwd_multi(self, ins):
+        o, ps, bd, d, L_ = self.net.ops, self.net.passes, self.bd, self.d, self.layer
+        (ha, sh), (hc, _), (sa, ssh), (sc, _) = ins
+        N, G = int(sh[0]), int(ssh[0])
+        g = self.net.graph
+        batch = np.asarray(g.batch, np.int64)
+        ntype = np.asarray(g.ntype, np.int64)
+        ka, kc = L_.ka, L_.kc
+        M = ka + kc + 3
+        ra, pa, siga, _ = self._pick(ha, self.sa_w, self.sa_b, L_.ids_a, L_.Ta, ka, batch, G, N, "a")
+        rc, pc, sigc, _ = self._pick(hc, self.sc_w, self.sc_b, L_.ids_c, L_.Tc, kc, batch, G, N, "c")
+        Ra, Rc = len(ra), len(rc)
+        P = Ra + Rc + 2 * G + 2                          # [vals a, vals c, summary a, summary c, null, zero]
+        pool = self.buf("pool", P * d)
+        o.fill(pool, P * d, 0.0)
+        st = {}
+        for tag, h, rows, sig, W, slot, off in (("a", ha, ra, siga, self.na, 0, 0), ("c", hc, rc, sigc, self.nc, 1, Ra)):
+            R = len(rows)
+            if not R:
+                st[tag] = None
+                continue
+            rid = _put_buf(self, tag + "rows", rows)
+            hr = self.buf(tag + "hr", R * bd)
+            o.gather(h, rid, hr, R, bd, 0)
+            pr = self.buf(tag + "pr", R * d)
+            o.gemm(hr, W.w, pr, R, d, bd, bd, 1, d, 1, d, passes=ps)
+            sv = _put_buf(self, tag + "sig", sig, np.float32)
+            dst = _ofs(pool, off * d)
+            o.spmm(pr, _put_buf(self, tag + "eye", np.arange(R)), sv, None, _put_buf(self, tag + "eo", np.arange(R + 1)),
+                   dst, R, 1, d)
+            tid = _put_buf(self, tag + "tid", np.minimum(ntype[rows], L_.NT - 1))
+            te = self.buf(tag + "te", R * d)
+            o.embed_f(self.temb.w, tid, te, R, d)
+            o.axpy(dst, te, R * d, 1.0)
+            o.rowbias(dst, _ofs(self.semb.w, slot * d), R, d)
+            st[tag] = (rows, rid, hr, pr, sv, sig, tid, h)
+        for k, (s_in, U, slot) in enumerate(((sa, self.ua, 2), (sc, self.uc, 3))):
+            dst = _ofs(pool, (Ra + Rc + k * G) * d)
+            o.gemm(s_in, U.w, dst, G, d, bd, bd, 1, d, 1, d, passes=ps)
+            o.rowbias(dst, _ofs(self.semb.w, slot * d), G, d)
+        nl = _ofs(pool, (Ra + Rc + 2 * G) * d)
+        o.axpy(nl, self.null.w, d, 1.0)
+        o.axpy(nl, _ofs(self.semb.w, 4 * d), d, 1.0)
+        zero_row = Ra + Rc + 2 * G + 1
+        idx = np.full((G, M), zero_row, np.int64)
+        keep = np.zeros((G, M))
+        idx.reshape(-1)[pa // ka * M + pa % ka if ka else []] = np.arange(Ra)
+        idx.reshape(-1)[pc // kc * M + ka + pc % kc if kc else []] = Ra + np.arange(Rc)
+        keep.reshape(-1)[pa // ka * M + pa % ka if ka else []] = 1.0
+        keep.reshape(-1)[pc // kc * M + ka + pc % kc if kc else []] = 1.0
+        idx[:, ka + kc] = Ra + Rc + np.arange(G)
+        idx[:, ka + kc + 1] = Ra + Rc + G + np.arange(G)
+        idx[:, ka + kc + 2] = Ra + Rc + 2 * G
+        keep[:, ka + kc:] = 1.0
+        self.idx = _put_buf(self, "idx", idx)
+        pre = self.buf("pre", G * M * d)
+        o.gather(pool, self.idx, pre, G * M, d, 0)
+        mem, _ = self.norm.fwd(pre, (G * M, d))
+        a = o.get(mem[0], G * M * d, mem[1]).reshape(G * M, d)
+        y = _put_buf(self, "y", np.concatenate([a, keep.reshape(-1, 1)], 1), np.float32)
+        self.st, self.dims = st, (N, G, M, P, Ra, Rc, sa, sc)
+        return y, (G, M, d + 1)
+
+    def bwd_multi(self, dy):
+        o, ps, bd, d = self.net.ops, self.net.passes, self.bd, self.d
+        N, G, M, P, Ra, Rc, sa, sc = self.dims
+        a = o.get(dy[0], G * M * (d + 1), dy[1]).reshape(G * M, d + 1)[:, :d]
+        dmem = _put_buf(self, "dmem", a, np.float32, grad=True)
+        dpre = self.norm.bwd(dmem, True)
+        dpool = self.gbuf("dpool", P * d)
+        o.fill(dpool, P * d, 0.0)
+        o.embed_b(dpre, self.idx, dpool, G * M, d, P)
+        nl = _ofs(dpool, (Ra + Rc + 2 * G) * d)
+        o.axpy(self.null.g, nl, d, 1.0)
+        o.axpy(_ofs(self.semb.g, 4 * d), nl, d, 1.0)
+        dsum = []
+        for k, (s_in, U, slot) in enumerate(((sa, self.ua, 2), (sc, self.uc, 3))):
+            src = _ofs(dpool, (Ra + Rc + k * G) * d)
+            o.gemm(s_in, src, U.g, bd, d, G, 1, bd, d, 1, d, beta=True, passes=ps)
+            o.colsum(src, None, None, None, None, _ofs(self.semb.g, slot * d), G, d, 0)
+            ds = self.gbuf(("dsum", k), G * bd)
+            o.gemm(src, U.w, ds, G, bd, d, d, 1, 1, d, bd, passes=ps)
+            dsum.append(ds)
+        dh = []
+        for tag, W, sw, sb, slot, off in (("a", self.na, self.sa_w, self.sa_b, 0, 0), ("c", self.nc, self.sc_w,
+                                                                                     self.sc_b, 1, Ra)):
+            dhx = self.gbuf(("dh", tag), N * bd)
+            o.fill(dhx, N * bd, 0.0)
+            dh.append(dhx)
+            s_ = self.st[tag]
+            if s_ is None:
+                continue
+            rows, rid, hr, pr, sv, sig, tid, h = s_
+            R = len(rows)
+            dv = _ofs(dpool, off * d)
+            o.embed_b(dv, tid, self.temb.g, R, d, self.layer.NT)
+            o.colsum(dv, None, None, None, None, _ofs(self.semb.g, slot * d), R, d, 0)
+            dsg = self.gbuf(tag + "dsg", R)
+            o.edge_dot(dv, pr, _put_buf(self, tag + "e1", np.arange(R)), _put_buf(self, tag + "e2", np.arange(R)),
+                       dsg, R, 1, d)
+            dscore = o.get(dsg[0], R, dsg[1]).astype(np.float64) * sig * (1.0 - sig)
+            dpr = self.gbuf(tag + "dpr", R * d)
+            o.spmm(dv, _put_buf(self, tag + "e3", np.arange(R)), sv, None, _put_buf(self, tag + "e4", np.arange(R + 1)),
+                   dpr, R, 1, d)
+            o.gemm(hr, dpr, W.g, bd, d, R, 1, bd, d, 1, d, beta=True, passes=ps)
+            dhr = self.gbuf(tag + "dhr", R * bd)
+            o.gemm(dpr, W.w, dhr, R, bd, d, d, 1, 1, d, bd, passes=ps)
+            o.embed_b(dhr, rid, dhx, R, bd, N)
+            dsN = np.zeros(N)
+            np.add.at(dsN, rows, dscore)
+            dsc = _put_buf(self, tag + "dsN", dsN, np.float32, grad=True)
+            o.gemm(h, dsc, sw.g, bd, 1, N, 1, bd, 1, 1, 1, beta=True, passes=3)
+            o.colsum(dsc, None, None, None, None, sb.g, N, 1, 0)
+            o.gemm(dsc, sw.w, dhx, N, bd, 1, 1, 1, 1, 1, bd, beta=True, passes=3)
+        return [dh[0], dh[1], dsum[0], dsum[1]]
 
 
 class _MixHop(_Node):
@@ -3957,6 +4319,21 @@ class Net:
             return _TypedLinearNode(self, key, layer, p)
         if isinstance(layer, GR.TypedNorm):
             return _TypedNormNode(self, key, layer, p)
+        from . import gla as GLA
+        if isinstance(layer, GLA.ParamBank):
+            return _Identity(self, key)                  # held weights: nothing to compute, no gradient
+        if isinstance(layer, GLA.BrainMemory):
+            return _BrainMemory(self, key, layer, p)
+        if isinstance(layer, GLA.NodeEncoder):
+            return _NodeEncoder(self, key, layer, p)
+        if isinstance(layer, GR.BrainInput):
+            return _BrainInput(self, key, layer, p)
+        if isinstance(layer, GR.BrainShared):
+            return _Identity(self, key)
+        if isinstance(layer, GR.BrainLayer):
+            return _BrainLayer(self, key, layer, p, gk, getattr(self, "dag_params", None))
+        if isinstance(layer, GR.BrainOutput):
+            return _BrainOutput(self, key, layer, p)
         if isinstance(layer, GR.HGTBrain):
             return _Brain(self, key, layer, p, gk)
         if isinstance(layer, GR.TypedPool):

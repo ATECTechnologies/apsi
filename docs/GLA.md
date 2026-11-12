@@ -69,10 +69,25 @@ about 330 GB over the cards.
 
 ## On the card
 
-The brains run on the GPU trainer's own kernels: typed products (rows grouped by type, one product per type),
-the relations' key transforms in one batched product, one softmax over each node's in-edges, global attention with
-learned keys (the scores made on the card; the choice above `max_keys` keys on the processor), the graph context
-(the means on the card, the centring of graphs x d numbers on the processor), typed pooling likewise. The writer's
-self-attention, gated and masked cross-attention, SwiGLU and tied output are kernels too. The node encoder, the
-router, the bridge and the memory run on the processor inside the model on the card (their inputs are one row per
-sample or the nodes' ids); see `docs/GPU.md`.
+Everything heavy runs on the GPU trainer's own kernels: the node encoder (eleven table lookups, the mix, the gated
+words), the brains (typed products with the rows grouped by type, the relations' key transforms in one batched
+product, one softmax over each node's in-edges, global attention with learned keys, the graph context and typed
+pooling with only graphs x d numbers on the processor), the graph memory (the scores on the card, the choice of the
+best nodes from N numbers on the processor, the gathers, projections and norm on the card), the writer's
+self-attention, gated and masked cross-attention, SwiGLU and tied output. What is left on the processor is one row
+per sample: the bridge and the router.
+
+Each brain is a node per layer (`gla(…, split=false)` keeps one node per brain): the cut can fall inside a brain, and
+the weights its layers share (the graph context's projection) are held by both cards with their gradients summed.
+
+## Layers of your own
+
+A layer the trainer has no kernel for — written in Apsi with `custom_layer(init, forward)`, or any other — runs on
+the processor inside the model on the card, on one card or many. `forward(p, x)` may take only what it needs of
+`train=`, `graph=`, `mask=`:
+
+```apsi
+let mix = custom_layer(fn(seed=0) => record(W=randn(32, 32, seed=seed) * 0.1, g=zeros(1)),
+                       fn(p, x, graph=none) => x + tanh(p.g[0]) * (segment_mean(x, graph.batch,
+                                                                    graph.graphs)[graph.batch] @ p.W))
+```

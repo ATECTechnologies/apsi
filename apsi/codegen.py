@@ -1263,7 +1263,8 @@ class CodeGen:
     def e_Lambda(self, e, scope):
         if self.pyc:
             ctx = FuncCtx(scope.ctx, "fn", erased=False, exact=scope.ctx.exact, name="<lambda>")
-            ctx.used = set(scope.ctx.used)
+            # a parameter shadows the outer name in Python too: keep its name, so it can be passed by keyword
+            ctx.used = set(scope.ctx.used) - {p.name for p in e.params if p.name}
             ls = Scope(scope, ctx)
             ps = []
             for p in e.params:
@@ -1277,7 +1278,7 @@ class CodeGen:
         def build(erased):
             ctx = FuncCtx(scope.ctx, "fn", erased=erased, exact=scope.ctx.exact, name="<lambda>")
             # lambdas share the enclosing python function's namespace for closures
-            ctx.used = set(scope.ctx.used)
+            ctx.used = set(scope.ctx.used) - {p.name for p in e.params if p.name}
             ls = Scope(scope, ctx)
             ps = []
             for p in e.params:

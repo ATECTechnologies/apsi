@@ -1232,7 +1232,24 @@ class CustomLayer(Layer):
         return self.init_fn(seed=0 if seed is None else int(seed))
 
     def __call__(self, params, *xs, train=None, **kw):
-        return self.forward_fn(params, *xs, train=self.training if train is None else bool(train), **kw)
+        kw = {k: v for k, v in kw.items() if not k.startswith("_")}          # the dag's own context stays inside
+        kw["train"] = self.training if train is None else bool(train)
+        acc = self._accepts()
+        if acc is not None:                         # pass what the function takes: forward(p, x) works as well as
+            kw = {k: v for k, v in kw.items() if k in acc}      # forward(p, x, train, graph, mask)
+        return self.forward_fn(params, *xs, **kw)
+
+    def _accepts(self):
+        """The keyword names the forward function takes, or None when it takes any."""
+        if not hasattr(self, "_acc"):
+            import inspect
+            try:
+                ps = inspect.signature(self.forward_fn).parameters.values()
+                self._acc = None if any(p.kind == p.VAR_KEYWORD for p in ps) else \
+                    {p.name for p in ps if p.kind in (p.POSITIONAL_OR_KEYWORD, p.KEYWORD_ONLY)}
+            except (TypeError, ValueError):
+                self._acc = None
+        return self._acc
 
     def train(self, mode=True):
         self.training = bool(mode)
