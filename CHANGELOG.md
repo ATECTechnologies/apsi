@@ -18,7 +18,12 @@
 - **`gpu_tensor(x)`:** a tensor on the card with Apsi's own kernels — products (batched, transposed views without
   copies), arithmetic with tensors, row vectors and numbers, activations, softmax, layer and RMS norms, sums and
   means, row lookups, reshape. Any other function sees an ordinary tensor, so code written for the processor runs
-  unchanged; without a card everything runs on the processor. `gpu_device()`.
+  unchanged; without a card everything runs on the processor. `gpu_device()`. Element-wise kernels of their own:
+  exp, log (Cody-Waite reduction, a Newton step: within a few units in the last place), IEEE division and square
+  roots, powers, maximum, minimum, abs.
+- **`apsi gpu bench check`** also checks GLA (graphs, exact gradient sums, the same weights twice) and gpu_tensor
+  against the reference; `apsi gpu bench cards` checks that every card gives one card's weights bit for bit.
+  `tools\gpu_check.bat`: the whole check on a Windows computer's card, written to gpu-check.txt.
 - **Faster record fields:** reading a record's field in the bytecode engine is 1.8x faster.
 
 ### Training modes

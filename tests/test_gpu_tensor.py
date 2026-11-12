@@ -33,6 +33,13 @@ class GpuTensor(unittest.TestCase):
             for got, ref in cases:
                 np.testing.assert_allclose(np.asarray(got), ref, rtol=1e-5, atol=1e-5)
             self.assertAlmostEqual(A.sum(), a.sum(), places=4)
+            pa = np.abs(a) + 0.1
+            P, B = gpu_tensor(pa, dev), gpu_tensor(a[::-1].copy(), dev)
+            for got, ref in ((A.exp(), np.exp(a)), (P.log(), np.log(pa)), (P.sqrt(), np.sqrt(pa)),
+                             (A / B, a / a[::-1]), (3.0 / P, 3.0 / pa), (P ** 1.7, pa ** 1.7), (P.rsqrt(), pa ** -0.5),
+                             (A.maximum(B), np.maximum(a, a[::-1])), (A.minimum(0.0), np.minimum(a, 0.0)),
+                             (-A, -a), (abs(A), np.abs(a)), (A ** 2, a * a)):
+                np.testing.assert_allclose(np.asarray(got), ref, rtol=2e-5, atol=1e-6)
 
     def test_from_apsi(self):
         src = ("let x = randn(4, 6, seed=1)\nlet w = randn(6, 3, seed=2)\nlet h = (gpu_tensor(x) @ w + 0.5).gelu()\n"

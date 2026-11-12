@@ -201,8 +201,53 @@ def check(out=sys.stdout):
         bad += not ok
         print(f"  {'ok  ' if ok else 'FAIL'} {name:<22} losses {runs[0][0]:.4f} -> {runs[0][-1]:.4f}  "
               f"(reference {runs[1][-1]:.4f}, difference {err:.1e})", file=out)
+    bad += _check_gla(ops, out)
+    bad += _check_tensors(ops, out)
     print("every kernel agrees on this card" if not bad else f"{bad} differ: send this output back", file=out)
     return 1 if bad else 0
+
+
+def _check_gla(ops, out):
+    """GLA (brains, typed layers, learned-key attention, graph memory, gated masked cross-attention, tied output)
+    with batches of graphs and exact gradient sums: this card against the Emulator, and the same weights twice."""
+    from . import gla as GL, gpu_train as GT, layers as L
+    from .stdlib import Adam
+    from .values import tree_leaves
+    m = GL.gla("tiny")
+    batches = [GL.gla_batch(GL.gla_task("tiny", int(b), seed=s)) for s, b in enumerate([3, 2, 4, 3, 2, 3, 2, 4])]
+    kw = dict(epochs=2, verbose=False, precision="fp32", accumulate=4)
+    runs = [GT.fit_batches(m, m.init(seed=0), batches, GL.gla_loss, opt=Adam(3e-3), ops=o, **kw)
+            for o in (ops, ops, GT.Emulator(tc=ops.tc))]
+    err = float(np.max(np.abs(np.asarray(runs[0].history) - runs[2].history) / (np.abs(runs[2].history) + 1e-6)))
+    same = all(np.array_equal(np.asarray(a), np.asarray(b))
+               for a, b in zip(tree_leaves(runs[0].params), tree_leaves(runs[1].params)))
+    ok = err < 1e-3 and same
+    print(f"  {'ok  ' if ok else 'FAIL'} {'gla (graphs, exact sums)':<22} losses {runs[0].history[0]:.4f} -> "
+          f"{runs[0].history[-1]:.4f}  (reference {runs[2].history[-1]:.4f}, difference {err:.1e}, "
+          f"{'the same weights twice' if same else 'NOT the same weights twice'})", file=out)
+    return 0 if ok else 1
+
+
+def _check_tensors(ops, out):
+    """gpu_tensor on this card against NumPy."""
+    from .gpu_tensor import gpu_tensor
+    rng = np.random.default_rng(1)
+    a, w, b = rng.normal(size=(64, 96)), rng.normal(size=(96, 32)), rng.normal(size=32)
+    A, W = gpu_tensor(a, "cuda"), gpu_tensor(w, "cuda")
+    z = a @ w + b
+    ref = [0.5 * z * (1 + np.tanh(np.sqrt(2 / np.pi) * (z + 0.044715 * z ** 3))), a.T @ a,
+           np.exp(z - z.max(-1, keepdims=True)) / np.exp(z - z.max(-1, keepdims=True)).sum(-1, keepdims=True),
+           a.sum(0)]
+    got = [(A @ W + b).gelu(), A.T @ A, (A @ W + b).softmax(), A.sum(0)]
+    pa = np.abs(a) + 0.1
+    P = gpu_tensor(pa, "cuda")
+    ref += [np.exp(np.clip(a, -20, 20)), np.log(pa), np.sqrt(pa), a / pa, pa ** 1.7]
+    got += [gpu_tensor(np.clip(a, -20, 20), "cuda").exp(), P.log(), P.sqrt(), A / P, P ** 1.7]
+    err = max(float(np.max(np.abs(np.asarray(g_) - r_)) / (np.max(np.abs(r_)) + 1e-12)) for g_, r_ in zip(got, ref))
+    ok = err < 1e-4
+    print(f"  {'ok  ' if ok else 'FAIL'} {'gpu_tensor':<22} products, activations, softmax, sums, exp, log, sqrt, / "
+          f"(difference {err:.1e})", file=out)
+    return 0 if ok else 1
 
 
 def cards(out=sys.stdout):
@@ -228,7 +273,20 @@ def cards(out=sys.stdout):
     print(f"  {split.device}: {split.history}  {t2 - t1:.1f} s", file=out)
     print(f"  stages {split.stages}, replicas {split.replicas}, micro-batches {split.micro_batches}; "
           f"difference {err:.1e} ({'ok' if err < 1e-3 else 'DIFFERENT'})", file=out)
-    return 0 if err < 1e-3 else 1
+    # batches of their own with exact gradient sums: one card and every card give the same weights, bit for bit
+    from .values import tree_leaves
+    batches = [(X[i:i + 4], Y[i:i + 4]) for i in range(0, min(len(X), 64), 4)]
+    kb = dict(epochs=1, verbose=False, precision="fp32", accumulate=4)
+    t3 = time.perf_counter()
+    a = GT.fit_batches(m, m.init(seed=0), batches, "cross_entropy", opt=Adam(1e-3), ops=many[0], **kb)
+    t4 = time.perf_counter()
+    b = GT.fit_batches(m, m.init(seed=0), batches, "cross_entropy", opt=Adam(1e-3), ops=many, **kb)
+    t5 = time.perf_counter()
+    same = all(np.array_equal(np.asarray(x), np.asarray(y)) for x, y in zip(tree_leaves(a.params),
+                                                                          tree_leaves(b.params)))
+    print(f"  fit_batches, exact sums: one card {t4 - t3:.1f} s, {b.device} {t5 - t4:.1f} s: "
+          f"{'the same weights, bit for bit' if same else 'DIFFERENT weights'}", file=out)
+    return 0 if err < 1e-3 and same else 1
 
 
 def main(what="127m", precision="auto", steps=40):

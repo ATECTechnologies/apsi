@@ -368,8 +368,10 @@ let z = h.T @ h                             # transposes without copies
 print(h.sum(axis=-1).numpy())
 ```
 
-On the card: `@` (2-D, batched 3-D, `[B, M, K] @ [K, N]`), `+ - *` with a tensor of the same shape, a row vector or
-a number, `/` by a number, `.relu() .gelu() .silu() .tanh() .sigmoid() .softplus() .mish() .elu() .leaky_relu()
+On the card: `@` (2-D, batched 3-D, `[B, M, K] @ [K, N]`), `+ - * / **` with a tensor of the same shape or a number
+(`+ -` with a row vector too), `-x`, `abs`, `.exp() .log() .sqrt() .rsqrt() .square() .reciprocal()`,
+`.maximum(y) .minimum(y)` (division and square roots IEEE-exact, exp and log within a few units in the last place),
+`.relu() .gelu() .silu() .tanh() .sigmoid() .softplus() .mish() .elu() .leaky_relu()
 .sin() .cos()`, `.softmax()`, `.layer_norm(gamma, beta)`, `.rms_norm(gamma)`, `.sum(axis)`, `.mean(axis)`,
 `.rows(ids)`, `.reshape(…)`. Any other function (`exp(h)`, `sort(h)`, your own) sees an ordinary tensor: the values
 come to the processor for it, so nothing has to be rewritten to run. `.numpy()` brings the values back.

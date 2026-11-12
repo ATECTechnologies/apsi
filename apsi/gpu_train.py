@@ -384,6 +384,19 @@ class Emulator(_Ops):
         if clear:
             g[:] = 0.0
 
+    def ew1(self, X, Y, n, kind):
+        x = self.v(X, n)
+        with np.errstate(all="ignore"):
+            f = [np.exp, np.log, np.sqrt, np.abs, np.square, lambda a: np.float32(1) / a, np.negative,
+                 lambda a: np.float32(1) / np.sqrt(a)][kind]
+            self.v(Y, n)[:] = f(x).astype(np.float32)
+
+    def ew2(self, Z, X, Y, n, kind):
+        x, y = self.v(X, n), self.v(Y, n)
+        with np.errstate(all="ignore"):
+            f = [np.divide, np.maximum, np.minimum, np.power][kind]
+            self.v(Z, n)[:] = f(x, y).astype(np.float32)
+
     def fin2(self, HI, LO, Gr, n):
         self.v(Gr, n)[:] = self.v(HI, n) + self.v(LO, n)
         self.v(HI, n)[:] = 0.0
@@ -997,6 +1010,12 @@ class Gpu(_Ops):
 
     def acc2(self, HI, LO, Gr, n, clear=True):
         self._go("acc2", self.blocks(n), 256, self.p(HI), self.p(LO), self.p(Gr), ("u", n), ("u", 1 if clear else 0))
+
+    def ew1(self, X, Y, n, kind):
+        self._go("ew1", self.blocks(n), 256, self.p(X), self.p(Y), ("u", n), ("u", kind))
+
+    def ew2(self, Z, X, Y, n, kind):
+        self._go("ew2", self.blocks(n), 256, self.p(Z), self.p(X), self.p(Y), ("u", n), ("u", kind))
 
     def fin2(self, HI, LO, Gr, n):
         self._go("fin2", self.blocks(n), 256, self.p(HI), self.p(LO), self.p(Gr), ("u", n))
