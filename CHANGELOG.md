@@ -2,6 +2,15 @@
 
 ## 2.6.0 — in progress
 
+### Physics-informed networks
+- **`pinn_fit` and `pinn_derivatives`** (`use layers`): the loss is any formula of the points and the network's
+  values, first and second derivatives along each input (`loss(x, u, du, d2u)`): equations, boundary and initial
+  conditions, measurements, systems of equations. On the GPU in Taylor mode (values and derivatives through the
+  network in one stack, new kernels with the activations' first three derivatives); on the processor with autodiff of
+  any order, for any model. The two give the same training. `docs/PINN.md`,
+  `examples/44_physics_networks.apsi` (the heat equation, error 0.001; a damped oscillator).
+- **`sin` and `cos` activations** on every backend and in the GPU trainer.
+
 ### One model across many cards
 - **Model parallelism on Apsi's own GPU trainer:** `fit(..., backend="gpu", device="cuda:all")` splits a model that
   does not fit one card across the cards (`parallel="auto"`), or on request (`parallel="pipeline"`). The model is cut

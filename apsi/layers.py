@@ -618,7 +618,7 @@ ACTIVATIONS = {
     "softplus": lambda x: ops.log(1 + ops.exp(x)), "silu": lambda x: x * ops.sigmoid(x),
     "swish": lambda x: x * ops.sigmoid(x), "leaky_relu": _leaky, "elu": _elu,
     "mish": lambda x: x * ops.tanh(ops.log(1 + ops.exp(x))), "linear": lambda x: x, "identity": lambda x: x,
-    "softmax": lambda x: ops.softmax(x, axis=-1),
+    "softmax": lambda x: ops.softmax(x, axis=-1), "sin": ops.sin, "cos": ops.cos,
 }
 
 
@@ -1078,6 +1078,23 @@ class TransformerBlock(Layer):
             (", qk_norm" if a.qk_norm else "") + (", rms" if self.norm_kind == "rms" else "") + \
             (f", {self.ffn_kind}" if self.ffn_kind != "mlp" else "")
         return f"transformer_block(d={self.d}, heads={self.heads}, ff={self.ff}{', causal' if self.causal else ''}{extra})"
+
+
+def _pinn_fit(model, params, points, loss, epochs=2000, opt=None, backend="auto", device="cuda", verbose=True,
+              schedule=None, clip=None, every=None, compensated=True, graph=None):
+    """Train a physics-informed network: loss(x, u, du, d2u) with u [N, m], du / d2u [N, d, m] (see apsi.pinn)."""
+    from . import pinn
+    try:
+        return pinn.fit(model, params, points, loss, epochs, opt, backend, device, verbose, schedule, clip, every,
+                        compensated=compensated, graph=graph)
+    except pinn.PinnError as e:
+        raise RuntimeErr(str(e)) from None
+
+
+def _pinn_derivatives(model, params, points, graph=None):
+    """Record(u, du, d2u): the network and its first and second derivatives along each input at the points."""
+    from . import pinn
+    return pinn.derivatives(model, params, points, graph)
 
 
 # =============================================================== constructors exposed to Apsi
@@ -1822,7 +1839,7 @@ def module(interp=None):
         conv2d_layer=Conv2D, max_pool=MaxPool, avg_pool=AvgPool, global_avg_pool=GlobalAvgPool,
         flatten_layer=Flatten, reshape_layer=Reshape, lstm_layer=LSTMLayer, gru_layer=GRULayer, last_step=LastStep,
         multi_head_attention=MultiHeadAttention, transformer_block=TransformerBlock, swiglu=SwiGLU,
-        apply_rope=apply_rope, moe=MoE,
+        apply_rope=apply_rope, moe=MoE, pinn_fit=_pinn_fit, pinn_derivatives=_pinn_derivatives,
         transformer_encoder=transformer_encoder, layer_norm_layer=LayerNorm, rms_norm_layer=RMSNorm,
         batch_norm_layer=BatchNorm, dropout_layer=Dropout, activation=activation, lambda_layer=LambdaLayer,
         scale=Scale, identity=Identity, select=Select, mean_pool=MeanPool,

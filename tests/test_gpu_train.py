@@ -163,6 +163,41 @@ class Trainer(unittest.TestCase):
         self.assertEqual(moved[False], 0.0)
         self.assertAlmostEqual(moved[True], 3e-7, delta=3e-8)
 
+    def test_physics_informed_networks(self):
+        """pinn: Taylor mode on the card (values, first and second derivatives along every input through the network
+        in one stack, the gradient back through the same stack) equals Apsi's autodiff of any order, for every
+        smooth activation, several inputs and outputs; training the oscillator u'' + w^2 u = 0 gives the same losses
+        on both paths."""
+        from apsi import pinn, ops as aops
+        rng = np.random.default_rng(0)
+        for act in ("tanh", "sin", "cos", "sigmoid", "silu", "softplus"):
+            m = L.mlp([3, 8, 8, 2], act)
+            p = m.init(seed=1)
+            X = rng.normal(size=(7, 3))
+            ref = pinn.derivatives(m, p, X)
+            net = pinn._Taylor(GT.Emulator(), m, p, X.astype(np.float32))
+            try:
+                u, du, d2u = net.forward()
+            finally:
+                net.close()
+            for got, want in ((u, ref.u), (du, ref.du), (d2u, ref.d2u)):
+                np.testing.assert_allclose(got, want, rtol=1e-4, atol=5e-6, err_msg=act)
+        T = np.linspace(0, 2, 40)[:, None]
+
+        def loss(x, u, du, d2u):
+            res = d2u[:, 0, 0] + 4.0 * u[:, 0]
+            return aops.mean(res * res) + 10 * ((u[0, 0] - 1) ** 2 + du[0, 0, 0] ** 2)
+        m = L.mlp([1, 24, 24, 1], "tanh")
+        a = pinn.fit(m, m.init(seed=0), T, loss, epochs=60, opt=Adam(0.01), backend="numpy", verbose=False)
+        b = pinn.fit(m, m.init(seed=0), T, loss, epochs=60, opt=Adam(0.01), backend="gpu", ops_=GT.Emulator(),
+                     verbose=False)
+        np.testing.assert_allclose(a.history, b.history, rtol=1e-4)
+        self.assertEqual(b.backend, "gpu")
+        with self.assertRaises(pinn.PinnError):                      # not a Taylor-mode network
+            pinn.fit(L.Sequential([L.Linear(1, 4), L.Activation("relu"), L.Linear(4, 1)]),
+                     L.Sequential([L.Linear(1, 4), L.Activation("relu"), L.Linear(4, 1)]).init(), T, loss, epochs=1,
+                     backend="gpu", ops_=GT.Emulator(), verbose=False)
+
     def test_mae_and_bce_losses(self):
         """mae and bce on the GPU trainer, one card, data parallel, a split model and a masked graph: the NumPy
         backend's losses."""
@@ -502,7 +537,7 @@ class RealGpu(unittest.TestCase):
         same(S[0], S[1], Bh * 2 * T * T, 1e-5, "batched attention product")
         n = 1000
         x, y, out = pair(rng.normal(size=n)), pair(rng.normal(size=n)), pair(np.zeros(n))
-        for kind in range(10):
+        for kind in range(12):
             g.act_f(x[0], out[0], n, kind)
             e.act_f(x[1], out[1], n, kind)
             same(out[0], out[1], n, 1e-4, f"act_f {kind}")

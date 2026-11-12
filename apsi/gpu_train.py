@@ -161,6 +161,10 @@ class Emulator(_Ops):
         if kind == 7:
             e = np.exp(np.minimum(x, 0))
             return np.where(x > 0, x, e - 1), np.where(x > 0, np.float32(1), e).astype(np.float32)
+        if kind in (10, 11):
+            red = x - np.float32(2 * np.pi) * np.rint(x / np.float32(2 * np.pi))
+            sn, cs = np.sin(red), np.cos(red)
+            return (sn, cs) if kind == 10 else (cs, -sn)
         if kind in (8, 9):
             s = 1 / (1 + np.exp(-x))
             sp = np.maximum(x, 0) + np.log1p(np.exp(-np.abs(x)))
@@ -377,6 +381,55 @@ class Emulator(_Ops):
             x[:] = y[:, off:off + w]
         else:
             y[:, off:off + w] = x
+
+    # ---------------------------------------------------------------- physics-informed networks (Taylor mode)
+    @staticmethod
+    def _derivs(z, kind):
+        if kind == 0:
+            t = np.tanh(z)
+            t1 = 1 - t * t
+            return t, t1, -2 * t * t1, t1 * (6 * t * t - 2)
+        if kind in (1, 6):
+            red = z - np.float32(2 * np.pi) * np.rint(z / np.float32(2 * np.pi))
+            sn, cs = np.sin(red), np.cos(red)
+            return (sn, cs, -sn, -cs) if kind == 1 else (cs, -sn, -cs, sn)
+        s = 1 / (1 + np.exp(-z))
+        s1 = s * (1 - s)
+        s2 = s1 * (1 - 2 * s)
+        s3 = s2 * (1 - 2 * s) - 2 * s1 * s1
+        if kind == 2:
+            return s, s1, s2, s3
+        if kind == 3:
+            return z * s, s + z * s1, 2 * s1 + z * s2, 3 * s2 + z * s3
+        if kind == 4:
+            return np.maximum(z, 0) + np.log1p(np.exp(-np.abs(z))), s, s1, s2
+        one, zero = np.ones_like(z), np.zeros_like(z)
+        return z, one, zero, zero
+
+    def taylor_f(self, Z, Y, N, F, d, kind):
+        z = self.v(Z, (1 + 2 * d) * N * F).reshape(1 + 2 * d, N * F)
+        y = self.v(Y, (1 + 2 * d) * N * F).reshape(1 + 2 * d, N * F)
+        f0, f1, f2, _ = self._derivs(z[0], kind)
+        j, h = z[1:1 + d], z[1 + d:]
+        y[0] = f0
+        y[1:1 + d] = f1 * j
+        y[1 + d:] = f2 * j * j + f1 * h
+
+    def taylor_b(self, Z, DY, DZ, N, F, d, kind):
+        z = self.v(Z, (1 + 2 * d) * N * F).reshape(1 + 2 * d, N * F)
+        dy = self.v(DY, (1 + 2 * d) * N * F).reshape(1 + 2 * d, N * F)
+        dz = self.v(DZ, (1 + 2 * d) * N * F).reshape(1 + 2 * d, N * F)
+        _, f1, f2, f3 = self._derivs(z[0], kind)
+        j, h = z[1:1 + d], z[1 + d:]
+        dj, dh = dy[1:1 + d], dy[1 + d:]
+        dz0 = dy[0] * f1 + (dj * f2 * j + dh * (f3 * j * j + f2 * h)).sum(0)
+        dz[1:1 + d] = dj * f1 + dh * 2 * f2 * j
+        dz[1 + d:] = dh * f1
+        dz[0] = dz0
+
+    def rowbias(self, Y, B, rows, F):
+        y = self.v(Y, rows * F).reshape(rows, F)
+        y += self.v(B, F)
 
     # ---------------------------------------------------------------- recurrent cells
     def _rv(self, X, B, T, w):
@@ -930,6 +983,16 @@ class Gpu(_Ops):
     def cols(self, X, Y, rows, w, ld, off, back):
         self._go("cols", self.blocks(rows * w), 256, self.p(X), self.p(Y), ("u", rows), ("u", w), ("u", ld),
                  ("u", off), ("u", 1 if back else 0))
+
+    def taylor_f(self, Z, Y, N, F, d, kind):
+        self._go("taylor_f", self.blocks(N * F), 256, self.p(Z), self.p(Y), ("u", N), ("u", F), ("u", d), ("u", kind))
+
+    def taylor_b(self, Z, DY, DZ, N, F, d, kind):
+        self._go("taylor_b", self.blocks(N * F), 256, self.p(Z), self.p(DY), self.p(DZ), ("u", N), ("u", F), ("u", d),
+                 ("u", kind))
+
+    def rowbias(self, Y, B, rows, F):
+        self._go("rowbias", self.blocks(rows * F), 256, self.p(Y), self.p(B), ("u", rows), ("u", F))
 
     def _rec(self, name, B, H, *bufs, T, t):
         self._go(name, self.blocks(B * H), 256, *[self.p(x) for x in bufs], ("u", B), ("u", H), ("u", T), ("u", t))

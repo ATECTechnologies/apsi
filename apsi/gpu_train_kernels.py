@@ -16,7 +16,7 @@ import os
 
 LOG2E = 1.4426950408889634
 ACTS = {"relu": 0, "gelu": 1, "silu": 2, "swish": 2, "tanh": 3, "sigmoid": 4, "linear": 5, "identity": 5,
-        "leaky_relu": 6, "elu": 7, "softplus": 8, "mish": 9}
+        "leaky_relu": 6, "elu": 7, "softplus": 8, "mish": 9, "sin": 10, "cos": 11}
 FAKEQ = {"fp8": 0, "fp6": 1, "fp6_e2m3": 2, "fp4": 3, "int8": 4, "int4": 5}
 MINIFLOAT = {0: (3, 7, 448.0), 1: (2, 3, 28.0), 2: (3, 1, 7.5), 3: (1, 1, 6.0)}     # mantissa bits, bias, top
 TILE = 64
@@ -25,7 +25,7 @@ MAIN = ("apsi_kernel", "axpy", "add3", "mul3", "act_f", "act_b", "colsum", "ln_f
         "pos_f", "pos_b", "softmax_f", "softmax_b", "ce", "mse", "sumsq", "adam", "sgd", "drop_f", "fakeq",
         "gemm_simt", "gather", "rope", "spmm", "edge_dot", "seg_softmax", "seg_softmax_b", "dot_acc", "scale_add",
         "cols", "colmul", "topk_gate", "topk_gate_b", "loss_ew", "im2col", "col2im", "perm_nc", "pool_f", "pool_b",
-        "lstm_f", "lstm_b", "gru_a", "gru_b", "gru_b1", "gru_b2")
+        "lstm_f", "lstm_b", "gru_a", "gru_b", "gru_b1", "gru_b2", "taylor_f", "taylor_b", "rowbias")
 TC = ("apsi_kernel", "gemm_tc3")                     # apsi_kernel = the one-pass product
 
 
@@ -87,6 +87,8 @@ def _main_module():
     min_f = decl("llvm.minnum.f32", f32, [f32, f32])
     fabs_f = decl("llvm.fabs.f32", f32, [f32])
     rint_f = decl("llvm.rint.f32", f32, [f32])
+    sin_f = decl("llvm.nvvm.sin.approx.f", f32, [f32])
+    cos_f = decl("llvm.nvvm.cos.approx.f", f32, [f32])
     bar_f = decl("llvm.nvvm.barrier0", ir.VoidType(), [])
     smem = ir.GlobalVariable(m, ir.ArrayType(f32, 32), "apsi_smem", addrspace=3)
     smem.linkage = "internal"
@@ -235,8 +237,10 @@ def _main_module():
         tsp = tanh(k, sp)
         mish = b.fmul(x, tsp)
         dmish = b.fadd(tsp, b.fmul(b.fmul(x, b.fsub(F(1.0), b.fmul(tsp, tsp))), s))
+        red = b.fsub(x, b.fmul(F(6.283185307179586), b.call(rint_f, [b.fmul(x, F(0.15915494309189535))])))
+        sn, cs = b.call(sin_f, [red]), b.call(cos_f, [red])
         vals = [(relu, drelu), (gelu, dgelu), (silu, dsilu), (th, dth), (s, dsig), (x, F(1.0)), (leaky, dleaky),
-                (elu, delu), (sp, s), (mish, dmish)]
+                (elu, delu), (sp, s), (mish, dmish), (sn, cs), (cs, b.fsub(F(0.0), sn))]
         f, d = vals[-1]
         for j in range(len(vals) - 2, -1, -1):
             sel = b.icmp_unsigned("==", kind, C(j))
@@ -879,6 +883,94 @@ def _main_module():
         k.st(b.fmul(b.fmul(d, hp), b.fmul(r, b.fsub(F(1.0), r))), p["DZR"], ir)
         k.st(b.fadd(k.ld(p["DHP"], i), b.fmul(d, r)), p["DHP"], i)
     k.grid_loop(b.mul(p["B"], p["H"]), grub2)
+    k.ret()
+
+    # ------------------------------------------------------------------------- physics-informed networks
+    # Taylor mode: a stack [(1 + 2 d) N, F] holds the values (block 0), their derivatives along each input (blocks
+    # 1..d) and their second derivatives along each input (blocks d+1..2d). An activation f maps value z, first j,
+    # second h to f(z), f'(z) j, f''(z) j^2 + f'(z) h. kind: 0 tanh, 1 sin, 2 sigmoid, 3 silu, 4 softplus,
+    # 5 identity, 6 cos
+    def derivs(k, z, kind):
+        """the function and its first three derivatives at z"""
+        b = k.b
+        red = b.fsub(z, b.fmul(F(6.283185307179586), b.call(rint_f, [b.fmul(z, F(0.15915494309189535))])))
+        sn, cs = b.call(sin_f, [red]), b.call(cos_f, [red])
+        t = tanh(k, z)
+        t1 = b.fsub(F(1.0), b.fmul(t, t))
+        s = sigmoid(k, z)
+        s1 = b.fmul(s, b.fsub(F(1.0), s))
+        s2 = b.fmul(s1, b.fsub(F(1.0), b.fmul(F(2.0), s)))
+        s3 = b.fsub(b.fmul(s2, b.fsub(F(1.0), b.fmul(F(2.0), s))), b.fmul(F(2.0), b.fmul(s1, s1)))
+        az = b.call(fabs_f, [z])
+        sp = b.fadd(b.call(max_f, [z, F(0.0)]),
+                    b.fdiv(b.call(lg2_f, [b.fadd(F(1.0), exp(k, b.fsub(F(0.0), az)))]), F(LOG2E)))
+
+        def neg(v):
+            return b.fsub(F(0.0), v)
+        table = [
+            (t, t1, b.fmul(F(-2.0), b.fmul(t, t1)), b.fmul(t1, b.fsub(b.fmul(F(6.0), b.fmul(t, t)), F(2.0)))),
+            (sn, cs, neg(sn), neg(cs)),
+            (s, s1, s2, s3),
+            (b.fmul(z, s), b.fadd(s, b.fmul(z, s1)), b.fadd(b.fmul(F(2.0), s1), b.fmul(z, s2)),
+             b.fadd(b.fmul(F(3.0), s2), b.fmul(z, s3))),
+            (sp, s, s1, s2),
+            (z, F(1.0), F(0.0), F(0.0)),
+            (cs, neg(sn), neg(cs), sn),
+        ]
+        out = list(table[-1])
+        for idx in range(len(table) - 2, -1, -1):
+            is_k = b.icmp_unsigned("==", kind, C(idx))
+            out = [b.select(is_k, table[idx][q], out[q]) for q in range(4)]
+        return out
+
+    tshape = [("N", i32), ("F", i32), ("d", i32), ("kind", i32)]
+    k = K("taylor_f", [("Z", G(f32)), ("Y", G(f32))] + tshape)
+    b, p = k.b, k.p
+    NF = b.mul(p["N"], p["F"])
+
+    def tf(i):
+        z = k.ld(p["Z"], i)
+        f0, f1, f2, _ = derivs(k, z, p["kind"])
+        k.st(f0, p["Y"], i)
+
+        def each(q):
+            ij = b.add(i64of(b, i), b.mul(i64of(b, b.add(q, C(1))), i64of(b, NF)))
+            ih = b.add(i64of(b, i), b.mul(i64of(b, b.add(b.add(q, C(1)), p["d"])), i64of(b, NF)))
+            j, h = k.ld(p["Z"], ij), k.ld(p["Z"], ih)
+            k.st(b.fmul(f1, j), p["Y"], ij)
+            k.st(b.fadd(b.fmul(f2, b.fmul(j, j)), b.fmul(f1, h)), p["Y"], ih)
+        k.loop(C(0), p["d"], C(1), each)
+    k.grid_loop(NF, tf)
+    k.ret()
+
+    k = K("taylor_b", [("Z", G(f32)), ("DY", G(f32)), ("DZ", G(f32))] + tshape)
+    b, p = k.b, k.p
+    NF = b.mul(p["N"], p["F"])
+
+    def tb(i):
+        z = k.ld(p["Z"], i)
+        _, f1, f2, f3 = derivs(k, z, p["kind"])
+        dz = k.var(b.fmul(k.ld(p["DY"], i), f1))
+
+        def each(q):
+            ij = b.add(i64of(b, i), b.mul(i64of(b, b.add(q, C(1))), i64of(b, NF)))
+            ih = b.add(i64of(b, i), b.mul(i64of(b, b.add(b.add(q, C(1)), p["d"])), i64of(b, NF)))
+            j, h = k.ld(p["Z"], ij), k.ld(p["Z"], ih)
+            dj_, dh_ = k.ld(p["DY"], ij), k.ld(p["DY"], ih)
+            acc = b.fadd(b.fmul(dj_, b.fmul(f2, j)), b.fmul(dh_, b.fadd(b.fmul(f3, b.fmul(j, j)), b.fmul(f2, h))))
+            b.store(b.fadd(b.load(dz), acc), dz)
+            k.st(b.fadd(b.fmul(dj_, f1), b.fmul(dh_, b.fmul(F(2.0), b.fmul(f2, j)))), p["DZ"], ij)
+            k.st(b.fmul(dh_, f1), p["DZ"], ih)
+        k.loop(C(0), p["d"], C(1), each)
+        k.st(b.load(dz), p["DZ"], i)
+    k.grid_loop(NF, tb)
+    k.ret()
+
+    # rowbias: Y[r, c] += B[c] for the first `rows` rows (the values block of a Taylor stack)
+    k = K("rowbias", [("Y", G(f32)), ("B", G(f32)), ("rows", i32), ("F", i32)])
+    b, p = k.b, k.p
+    k.grid_loop(b.mul(p["rows"], p["F"]), lambda i: k.st(b.fadd(k.ld(p["Y"], i), k.ld(p["B"], b.urem(i, p["F"]))),
+                                                         p["Y"], i))
     k.ret()
 
     # ------------------------------------------------------------------------- attention softmax, a block a row

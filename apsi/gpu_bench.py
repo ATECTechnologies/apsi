@@ -177,6 +177,19 @@ def check(out=sys.stdout):
          rng.normal(size=(16, 10, 8)), rng.integers(0, 3, 16), {}),
     ]
     bad = 0
+    from . import pinn, ops as aops
+    T = np.linspace(0, 2, 40)[:, None]
+
+    def osc(x, u, du, d2u):
+        r_ = d2u[:, 0, 0] + 4.0 * u[:, 0]
+        return aops.mean(r_ * r_) + 10 * ((u[0, 0] - 1) ** 2 + du[0, 0, 0] ** 2)
+    pm = L.mlp([1, 24, 24, 1], "tanh")
+    runs = [np.asarray(pinn.fit(pm, pm.init(seed=0), T, osc, epochs=30, opt=Adam(0.01), backend=be, ops_=o_,
+                                verbose=False).history) for be, o_ in (("gpu", ops), ("numpy", None))]
+    err = float(np.max(np.abs(runs[0] - runs[1]) / (np.abs(runs[1]) + 1e-6)))
+    bad += err >= 1e-3
+    print(f"  {'ok  ' if err < 1e-3 else 'FAIL'} {'physics-informed net':<22} losses {runs[0][0]:.4f} -> "
+          f"{runs[0][-1]:.4f}  (reference {runs[1][-1]:.4f}, difference {err:.1e})", file=out)
     for name, m, X, Y, kw in cases:
         runs = []
         for o in (ops, GT.Emulator(tc=ops.tc)):

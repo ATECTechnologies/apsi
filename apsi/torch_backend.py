@@ -273,6 +273,7 @@ def _act(name):
         "sigmoid": torch.sigmoid, "softplus": F.softplus, "silu": F.silu, "swish": F.silu,
         "leaky_relu": lambda x: F.leaky_relu(x, 0.01), "elu": F.elu, "mish": F.mish,
         "linear": lambda x: x, "identity": lambda x: x, "softmax": lambda x: torch.softmax(x, dim=-1),
+        "sin": torch.sin, "cos": torch.cos,
     }
     return table.get(name)
 
