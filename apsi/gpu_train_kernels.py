@@ -15,6 +15,8 @@ Every matrix product takes any strides, so transposed operands (the backward pas
 import os
 
 LOG2E = 1.4426950408889634
+EW1 = {"exp": 0, "log": 1, "sqrt": 2, "abs": 3, "square": 4, "recip": 5, "neg": 6, "rsqrt": 7}
+EW2 = {"div": 0, "max": 1, "min": 2, "pow": 3}
 ACTS = {"relu": 0, "gelu": 1, "silu": 2, "swish": 2, "tanh": 3, "sigmoid": 4, "linear": 5, "identity": 5,
         "leaky_relu": 6, "elu": 7, "softplus": 8, "mish": 9, "sin": 10, "cos": 11}
 FAKEQ = {"fp8": 0, "fp6": 1, "fp6_e2m3": 2, "fp4": 3, "int8": 4, "int4": 5}
@@ -26,7 +28,7 @@ MAIN = ("apsi_kernel", "axpy", "add3", "mul3", "act_f", "act_b", "colsum", "ln_f
         "gemm_simt", "gather", "rope", "spmm", "edge_dot", "seg_softmax", "seg_softmax_b", "dot_acc", "scale_add",
         "cols", "colmul", "topk_gate", "topk_gate_b", "loss_ew", "im2col", "col2im", "perm_nc", "pool_f", "pool_b",
         "lstm_f", "lstm_b", "gru_a", "gru_b", "gru_b1", "gru_b2", "taylor_f", "taylor_b", "rowbias", "acc2",
-        "fin2")
+        "fin2", "ew1", "ew2")
 TC = ("apsi_kernel", "gemm_tc3")                     # apsi_kernel = the one-pass product
 
 
@@ -562,6 +564,50 @@ def _main_module():
         with b.if_then(b.icmp_unsigned("!=", p["clear"], C(0))):
             k.st(F(0.0), p["G"], i)
     k.grid_loop(p["n"], acc2)
+    k.ret()
+
+    def exp_acc(b, x):
+        """exp with Cody-Waite reduction: 2^k exp(r), |r| <= ln2/2, k exact; ~2 ulp over the whole range."""
+        k = b.call(rint_f, [b.fmul(x, F(LOG2E))])
+        r = b.call(fma_f, [b.fsub(F(0.0), k), F(0.693145751953125), x])
+        r = b.call(fma_f, [b.fsub(F(0.0), k), F(1.428606765330187e-06), r])
+        er = b.call(ex2_f, [b.fmul(r, F(LOG2E))])
+        k1 = b.call(rint_f, [b.fmul(k, F(0.5))])          # 2^k as two halves (no overflow for large k)
+        return b.fmul(b.fmul(er, b.call(ex2_f, [k1])), b.call(ex2_f, [b.fsub(k, k1)]))
+
+    def log_acc(b, x):
+        """log: lg2 then one Newton step on exp(y) = x (accurate near 1 as well)."""
+        y = b.fmul(b.call(lg2_f, [x]), F(0.6931471805599453))
+        return b.fadd(y, b.fsub(b.fmul(x, exp_acc(b, b.fsub(F(0.0), y))), F(1.0)))
+
+    # ew1: Y = f(X), f by kind (EW1): exp, log, sqrt (IEEE), abs, square, 1/x (IEEE), -x, 1/sqrt(x) (IEEE)
+    k = K("ew1", [("X", G(f32)), ("Y", G(f32)), ("n", i32), ("kind", i32)])
+    b, p = k.b, k.p
+
+    def ew1(i):
+        x = k.ld(p["X"], i)
+        sq = b.call(sqrt_f, [x])
+        vals = [exp_acc(b, x), log_acc(b, x), sq, b.call(fabs_f, [x]), b.fmul(x, x), b.fdiv(F(1.0), x),
+                b.fsub(F(0.0), x), b.fdiv(F(1.0), sq)]
+        out = vals[-1]
+        for j in range(len(vals) - 2, -1, -1):
+            out = b.select(b.icmp_unsigned("==", p["kind"], C(j)), vals[j], out)
+        k.st(out, p["Y"], i)
+    k.grid_loop(p["n"], ew1)
+    k.ret()
+
+    # ew2: Z = X op Y (EW2): x / y (IEEE), max, min, x ** y (exp(y log x), x > 0)
+    k = K("ew2", [("Z", G(f32)), ("X", G(f32)), ("Y", G(f32)), ("n", i32), ("kind", i32)])
+    b, p = k.b, k.p
+
+    def ew2(i):
+        x, y = k.ld(p["X"], i), k.ld(p["Y"], i)
+        vals = [b.fdiv(x, y), b.call(max_f, [x, y]), b.call(min_f, [x, y]), exp_acc(b, b.fmul(y, log_acc(b, x)))]
+        out = vals[-1]
+        for j in range(len(vals) - 2, -1, -1):
+            out = b.select(b.icmp_unsigned("==", p["kind"], C(j)), vals[j], out)
+        k.st(out, p["Z"], i)
+    k.grid_loop(p["n"], ew2)
     k.ret()
 
     # fin2: G <- HI + LO (rounded once), HI = LO = 0

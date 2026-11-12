@@ -5,10 +5,11 @@
     let p = softmax(b)                 # any other function: computed on the processor, the program runs the same
     print(b.numpy())
 
-What has a kernel stays on the card: @ (2-D and batched 3-D, transposes without copies), + - * with a tensor of the
-same shape, a row vector or a number, unary minus, relu, gelu, silu, tanh, sigmoid, softplus, mish, elu, leaky_relu,
-sin, cos, softmax over the last axis, layer_norm / rms_norm over the last axis, sum and mean over an axis or all,
-rows by index (gather), reshape. Everything else - any Apsi function that takes a tensor - sees the values as an
+What has a kernel stays on the card: @ (2-D and batched 3-D, transposes without copies), + - * / ** with a tensor of
+the same shape or a number (+ - with a row vector too), unary minus, abs, exp, log, sqrt, rsqrt, square,
+reciprocal, maximum, minimum, relu, gelu, silu, tanh, sigmoid, softplus, mish, elu, leaky_relu, sin, cos, softmax over
+the last axis, layer_norm / rms_norm over the last axis, sum and mean over an axis or all, rows by index (gather),
+reshape. Division and square roots are IEEE-exact; exp and log are within a few units in the last place. Everything else - any Apsi function that takes a tensor - sees the values as an
 ordinary tensor (the copy to the processor is made for it), so code written for the processor runs unchanged.
 """
 import math
@@ -186,19 +187,27 @@ class GTensor:
 
     def __truediv__(self, o):
         if not isinstance(o, GTensor) and np.ndim(o) == 0:
-            return self * (1.0 / float(o))
-        return self._host(lambda a, b: a / b, o)
+            return self._ew2(o, "div", np.divide)              # x / s exactly as IEEE division (not x * (1/s))
+        return self._ew2(o, "div", np.divide)
 
     def __rtruediv__(self, o):
-        return self._host(lambda a, b: b / a, o)
+        return self._ew2(o, "div", np.divide, swap=True)
 
     def __neg__(self):
-        return self * -1.0
+        return self._ew1("neg", np.negative)
+
+    def __abs__(self):
+        return self.abs()
 
     def __pow__(self, p):
-        if p == 2:
-            return self * self
-        return self._host(lambda a: a ** p)
+        if not isinstance(p, GTensor) and np.ndim(p) == 0:
+            if float(p) == 2.0:
+                return self.square()
+            if float(p) == 0.5:
+                return self.sqrt()
+            if float(p) == -1.0:
+                return self.reciprocal()
+        return self._ew2(p, "pow", np.power)
 
     # ------------------------------------------------------------ products
     @property
@@ -300,14 +309,60 @@ class GTensor:
     def cos(self):
         return self._act("cos")
 
+    def _ew1(self, kind, ref):
+        if self.ops is None:
+            with np.errstate(all="ignore"):
+                return GTensor(None, None, self.shape, host=np.asarray(ref(self.host), np.float32))
+        from . import gpu_train_kernels as KS
+        x = self._plain()
+        out = x._new(x.shape)
+        x.ops.ew1(x._v(), out._v(), x.size, KS.EW1[kind])
+        return out
+
+    def _ew2(self, other, kind, ref, swap=False):
+        y = other if isinstance(other, GTensor) else GTensor.of(np.full(self.shape, float(other)) if np.ndim(other)
+                                                                == 0 else other, self.device)
+        if self.ops is None or y.shape != self.shape:
+            a, b = self.numpy(), y.numpy()
+            with np.errstate(all="ignore"):
+                r = ref(b, a) if swap else ref(a, b)
+            return GTensor.of(r, self.device) if self.ops is not None else \
+                GTensor(None, None, np.shape(r), host=np.asarray(r, np.float32))
+        from . import gpu_train_kernels as KS
+        x, y = self._plain(), y._plain()
+        if y.ops is not x.ops:
+            y = GTensor.of(y.numpy(), x.device)
+        out = x._new(x.shape)
+        a, b = (y, x) if swap else (x, y)
+        x.ops.ew2(out._v(), a._v(), b._v(), x.size, KS.EW2[kind])
+        return out
+
     def exp(self):
-        return self._host(np.exp)
+        return self._ew1("exp", np.exp)
 
     def log(self):
-        return self._host(np.log)
+        return self._ew1("log", np.log)
 
     def sqrt(self):
-        return self._host(np.sqrt)
+        return self._ew1("sqrt", np.sqrt)
+
+    def rsqrt(self):
+        return self._ew1("rsqrt", lambda a: 1.0 / np.sqrt(a))
+
+    def abs(self):
+        return self._ew1("abs", np.abs)
+
+    def square(self):
+        return self._ew1("square", np.square)
+
+    def reciprocal(self):
+        return self._ew1("recip", lambda a: 1.0 / a)
+
+    def maximum(self, other):
+        return self._ew2(other, "max", np.maximum)
+
+    def minimum(self, other):
+        return self._ew2(other, "min", np.minimum)
 
     def softmax(self, axis=-1):
         if axis not in (-1, self.ndim - 1) or self.ops is None:
