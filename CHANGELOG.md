@@ -2,6 +2,13 @@
 
 ## 2.6.0 — in progress
 
+### Tensors on the card
+- **`gpu_tensor(x)`:** a tensor on the card with Apsi's own kernels — products (batched, transposed views without
+  copies), arithmetic with tensors, row vectors and numbers, activations, softmax, layer and RMS norms, sums and
+  means, row lookups, reshape. Any other function sees an ordinary tensor, so code written for the processor runs
+  unchanged; without a card everything runs on the processor. `gpu_device()`.
+- **Faster record fields:** reading a record's field in the bytecode engine is 1.8x faster.
+
 ### Training modes
 - **Any optimizer on the GPU trainer:** adam, adamw and sgd keep their kernels; rmsprop, adagrad or an optimizer of
   your own (anything with `step(params, grads)`) steps on the processor with the weights as the model's tree, on one

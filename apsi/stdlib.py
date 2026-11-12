@@ -1200,6 +1200,19 @@ def _gpu(*args, **kwargs):
     return gpu(*args, **kwargs)
 
 
+def _gpu_tensor(x, device="cuda"):
+    """x on the card with Apsi's own kernels (products, arithmetic, activations, softmax, norms, sums stay there;
+    any other function sees an ordinary tensor). On the processor when there is no card."""
+    from .gpu_tensor import gpu_tensor
+    return gpu_tensor(x, device)
+
+
+def _gpu_device(device="cuda"):
+    """The card gpu_tensor uses, or "cpu"."""
+    from .gpu_tensor import gpu_device
+    return gpu_device(device)
+
+
 def _to_gpu(x, device=0):
     """Keep a tensor in GPU memory between @gpu calls: no copy per call. to_host(g) brings the values back."""
     from .native.gpu import to_gpu
@@ -1272,6 +1285,7 @@ def core_builtins():
         "len": _len, "range": _range, "type": type_name, "error": _error,
         "native": _native, "native_threads": _native_threads, "native_info": _native_info,
         "gpu": _gpu, "gpu_info": _gpu_info, "to_gpu": _to_gpu, "to_host": _to_host,
+        "gpu_tensor": _gpu_tensor, "gpu_device": _gpu_device,
         "list": _list, "pmap": _pmap, "unique": _unique, "chars": _chars, "join": _join, "map": _map, "filter": _filter, "enumerate": _enumerate, "zip": _zip,
         "sorted": _sorted, "reversed": _reversed, "keys": _keys, "record": _record,
         **_python_compat(),
