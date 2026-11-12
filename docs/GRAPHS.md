@@ -20,6 +20,7 @@ both are measurable:
 | `graph_memory(d, k)` | the `k` most salient node states of every graph, weighted by a learned score: `[graphs, k, d]` for a decoder to attend into | the whole graph, node by node |
 | `graph_transformer_net(n_in, d, out, layers, heads, relations, global_every, task)` | a complete model: input projection, local blocks with a global block every `global_every` layers, final norm, node or graph output | all of the above |
 | `hop_distances(g, node)`, `eccentricity(g)` | breadth-first hop counts; the longest shortest path | measuring how far information must go |
+| `hgt(d, heads, types, relations)`, `typed_linear`, `typed_norm` | heterogeneous graphs (`graph(…, node_types=)`): weights per node type, keys through each relation; `types` / `relations` as counts or lists of the ids a layer owns (the rest pass through) | one hop per layer |
 
 ## Relations and both directions
 

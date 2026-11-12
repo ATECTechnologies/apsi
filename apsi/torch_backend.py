@@ -392,6 +392,9 @@ def _register():
         mem = src if not isinstance(x, (list, tuple)) else x[1]
         B, T, D = src.shape
         S = mem.shape[1]
+        keep = None
+        if getattr(l, "memory_mask", False):                   # the memory's last column: 1 read, 0 never read
+            keep, mem = mem[:, :, -1], mem[:, :, :-1]
         h = l.h
         kvh = getattr(l, "kvh", h)
         hd = D // h
@@ -419,6 +422,9 @@ def _register():
             bias = torch.triu(torch.full((T, S), -1e9, device=src.device, dtype=q.dtype), diagonal=1)
         if mask is not None:
             bias = mask.to(q.dtype) if bias is None else bias + mask.to(q.dtype)
+        if keep is not None:
+            km = ((keep - 1.0) * 1e9).to(q.dtype).reshape(B, 1, 1, S)
+            bias = km if bias is None else bias + km
         sdpa = getattr(F, "scaled_dot_product_attention", None)
         if sdpa is not None:
             o = sdpa(q, k, v, attn_mask=bias)                     # fused / flash attention kernels
@@ -428,7 +434,10 @@ def _register():
                 s = s + bias
             o = torch.softmax(s, dim=-1) @ v
         o = o.permute(0, 2, 1, 3).reshape(B, T, D)
-        return _mm(o, p.Wo) + p.bo
+        y = _mm(o, p.Wo)
+        if getattr(l, "bias", True):
+            y = y + p.bo
+        return y * torch.tanh(p.gate[0]) if getattr(l, "gate", None) is not None else y
 
     @impl(L.MoE)
     def _moe(l, p, x, train, ctx):

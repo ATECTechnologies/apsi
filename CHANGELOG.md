@@ -3,6 +3,17 @@
 ## 2.6.0 — in progress
 
 ### Graph-and-language models
+  `typed_norm`, `global_attention`; nodes of other types pass through, edges of other relations are not read, so
+  context with one shared projection and a gate per layer, final norm), `typed_pool` (a learned weight per node type).
+  2 sigmoid(score); above `max_keys` the best-scored keys), `bias=`, `zero_init=`, `types=`.
+- **Attention:** `multi_head_attention(…, bias=false, gate=0.25, memory_mask=true)` — no output bias, the output
+  scaled by tanh of a learned gate, a memory whose last column says which slots may be read; `tied_output(owner)`,
+- **GPU trainer:** kernels for all of the above (typed groups by owned types, edges by owned relations, learned keys,
+  graph context and typed pooling with the per-graph numbers on the processor, gated and masked cross-attention, the
+  tied output); a `dag` with several outputs and a loss of your own over all of them, targets given as a record, on
+  one card and across cards; a weight held by two stages (a tied output on another card than its embedding) gets the
+  sum of both gradients; the cut of a dag balances the work each node really does (rows followed from the inputs:
+  graph nodes, tokens, one row per graph after pooling).
   weights per node type, keys through each relation and head, one softmax over a node's in-edges) on NumPy and the
   GPU trainer (rows grouped by type, one product per type; the relations in one batched product).
 - **Any model split across cards in batches:** `fit_batches(…, device="cuda:all", accumulate=M, stages=)` cuts a
