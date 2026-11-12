@@ -353,7 +353,25 @@ Without NVML (very old drivers), there is no control and nothing else changes.
 
 ---
 
-## 5. Images, video and your own kernels (`@gpu`)
+## 5. Tensors on the card (`gpu_tensor`)
+
+Programs run on the processor by default. `gpu_tensor(x)` puts a tensor on the card with the GPU trainer's own
+kernels (no CUDA toolkit, no CuPy, no PyTorch); without a card the same code runs on the processor:
+
+```apsi
+let a = gpu_tensor(x)                       # gpu_device() says where: the card's name, or "cpu"
+let h = (a @ w + bias).gelu()               # stays on the card
+let z = h.T @ h                             # transposes without copies
+print(h.sum(axis=-1).numpy())
+```
+
+On the card: `@` (2-D, batched 3-D, `[B, M, K] @ [K, N]`), `+ - *` with a tensor of the same shape, a row vector or
+a number, `/` by a number, `.relu() .gelu() .silu() .tanh() .sigmoid() .softplus() .mish() .elu() .leaky_relu()
+.sin() .cos()`, `.softmax()`, `.layer_norm(gamma, beta)`, `.rms_norm(gamma)`, `.sum(axis)`, `.mean(axis)`,
+`.rows(ids)`, `.reshape(…)`. Any other function (`exp(h)`, `sort(h)`, your own) sees an ordinary tensor: the values
+come to the processor for it, so nothing has to be rewritten to run. `.numpy()` brings the values back.
+
+## 6. Images, video and your own kernels (`@gpu`)
 
 A function written once compiles for the processor (`@native`) and the card (`@gpu`), one thread per element:
 luminance + Sobel edges on RGB frames ran at 69 fps in 4K and 34 fps in 8K on the RTX 3060 (9 and 2 fps on all 12
@@ -363,7 +381,7 @@ the copies. Several GPUs: `APSI_GPUS=0,2`. Small launches go to the processor by
 
 ---
 
-## 6. Troubleshooting
+## 7. Troubleshooting
 
 **"no NVIDIA GPU" / `lm.device` is `cpu`.** `lm.device_note` says why. Install or update the NVIDIA display driver
 (any driver from 2020 on); on Linux, `nvidia-smi` must work. `APSI_NO_GPU=1` is set? Remote desktops and some

@@ -1616,6 +1616,10 @@ class Interpreter:
 
     def get_attr(self, obj, name):
         c = obj.__class__
+        if c is Record:                                           # the commonest: a record's field
+            f = obj.fields
+            if name in f:
+                return f[name]
         if (c is str or c is list or c is dict or c in _PLAIN_GET) and name[0] != "_" and name not in _SLOW_NAMES:
             try:                                                  # text, lists, dicts, class instances …
                 return getattr(obj, name)
