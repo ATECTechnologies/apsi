@@ -82,6 +82,43 @@ class Trainer(unittest.TestCase):
         r = GT.fit(lm, lm.init(seed=0), ids, lab, ops=e, **dict(kw, opt=Adam(3e-3))).history
         np.testing.assert_allclose(ref, r, rtol=3e-3)
 
+    def test_graph_networks_are_exact(self):
+        """Sparse graphs on the GPU trainer (GCN, GraphSAGE, GIN, GAT, pooling per graph; CSR kernels with no
+        atomics): node and graph tasks, masks, validation and predict equal the NumPy backend."""
+        rng = np.random.default_rng(0)
+        N = 40
+        e = rng.integers(0, N, (120, 2)).tolist()
+        g = L.graph(edges=e, n=N)
+        X, y, yr = rng.normal(size=(N, 8)), rng.integers(0, 3, N), rng.normal(size=(N, 2))
+        mask = rng.random(N) < 0.5
+        cases = (("gat", L.gat_net(8, 8, 3, dropout=0.0), "cross_entropy", y),
+                 ("gcn", L.gcn_net(8, 16, 3, dropout=0.0), "cross_entropy", y),
+                 ("sage", L.Sequential([L.SAGE(8, 16), L.Activation("mish"), L.SAGE(16, 2, "sum")]), "mse", yr),
+                 ("gin", L.Sequential([L.GIN(8, 16), L.Activation("elu"), L.GIN(16, 3)]), "cross_entropy", y),
+                 ("gat mean", L.Sequential([L.GAT(8, 4, heads=3), L.Activation("softplus"),
+                                            L.GAT(12, 2, heads=2, concat=False)]), "mse", yr))
+        for name, m, loss, yy in cases:
+            kw = dict(loss=loss, epochs=4, verbose=False, precision="fp32", graph=g, mask=mask, val=(X, yy))
+            a = L.fit(m, m.init(seed=0), X, yy, opt=Adam(0.01), **kw)
+            b = GT.fit(m, m.init(seed=0), X, yy, opt=Adam(0.01), ops=GT.Emulator(), **kw)
+            np.testing.assert_allclose(a.history, b.history, rtol=1e-5, err_msg=name)
+            np.testing.assert_allclose(a.val_history, b.val_history, rtol=1e-5, err_msg=name)
+            np.testing.assert_allclose(np.asarray(L.predict(m, a.params, X, graph=g)),
+                                       GT.predict(m, a.params, X, ops=GT.Emulator(), graph=g, precision="fp32"),
+                                       rtol=1e-4, atol=1e-5, err_msg=name)
+        gb = L.graph(edges=e, n=N, batch=np.repeat(np.arange(8), 5))
+        for pool in ("sum", "mean"):
+            m = L.gin_net(8, 16, 2, pool=pool)
+            yg = rng.normal(size=(8, 2))
+            a = L.fit(m, m.init(seed=0), X, yg, loss="mse", opt=Adam(0.01), epochs=4, verbose=False,
+                      precision="fp32", graph=gb)
+            b = GT.fit(m, m.init(seed=0), X, yg, loss="mse", opt=Adam(0.01), epochs=4, verbose=False,
+                       precision="fp32", graph=gb, ops=GT.Emulator())
+            np.testing.assert_allclose(a.history, b.history, rtol=1e-5)
+        with self.assertRaises(GT.TrainError):
+            GT.fit(L.Sequential([L.SAGE(8, 3, "max")]), L.Sequential([L.SAGE(8, 3, "max")]).init(), X, y,
+                   loss="cross_entropy", epochs=1, verbose=False, graph=g, ops=GT.Emulator())
+
     def test_training_matches_the_numpy_backend(self):
         rng = np.random.default_rng(0)
         lm = L.transformer_lm(23, d=32, heads=4, layers=2, context=12)
@@ -299,7 +336,7 @@ class RealGpu(unittest.TestCase):
         same(S[0], S[1], Bh * 2 * T * T, 1e-5, "batched attention product")
         n = 1000
         x, y, out = pair(rng.normal(size=n)), pair(rng.normal(size=n)), pair(np.zeros(n))
-        for kind in range(7):
+        for kind in range(10):
             g.act_f(x[0], out[0], n, kind)
             e.act_f(x[1], out[1], n, kind)
             same(out[0], out[1], n, 1e-4, f"act_f {kind}")
@@ -334,6 +371,48 @@ class RealGpu(unittest.TestCase):
             dv.ce(Lg[i], Lb[i], dL[i], loss[i], Mr, V, 0.1, 0.2)
         same(dL[0], dL[1], Mr * V, 1e-5, "ce grad")
         same(loss[0], loss[1], 1, 1e-5, "ce loss")
+        # rotary positions (forward and inverse), sparse graph kernels, dot / scale / column copies
+        rows, hd, Hh, Tt = 2 * 12 * 3, 16, 3, 12
+        Xr, CS, SN = pair(rng.normal(size=rows * hd)), pair(rng.normal(size=Tt * hd // 2)), \
+            pair(rng.normal(size=Tt * hd // 2))
+        for sign in (1.0, -1.0):
+            for dv, i in ((g, 0), (e, 1)):
+                dv.rope(Xr[i], CS[i], SN[i], rows, hd, Hh, Tt, sign)
+            same(Xr[0], Xr[1], rows * hd, 1e-5, f"rope {sign}")
+        Nn, Ee, Hh, Ff = 37, 150, 3, 5
+        dst = np.sort(rng.integers(0, Nn, Ee))
+        off = np.concatenate([[0], np.cumsum(np.bincount(dst, minlength=Nn))]).astype(np.int32)
+        col = rng.integers(0, Nn, Ee).astype(np.int32)
+        perm = rng.permutation(Ee).astype(np.int32)
+        COL, OFF, PERM, ROW = pair(col), pair(off), pair(perm), pair(dst.astype(np.int32))
+        Xg, VAL = pair(rng.normal(size=(Nn, Hh * Ff))), pair(rng.normal(size=(Ee, Hh)))
+        Yg = pair(rng.normal(size=(Nn, Hh * Ff)))
+        for vals, vp, add in ((False, False, False), (True, False, False), (True, True, True)):
+            for dv, i in ((g, 0), (e, 1)):
+                dv.spmm(Xg[i], COL[i], VAL[i] if vals else None, PERM[i] if vp else None, OFF[i], Yg[i], Nn, Hh, Ff,
+                        add)
+            same(Yg[0], Yg[1], Nn * Hh * Ff, 1e-5, f"spmm {vals} {vp} {add}")
+        DA, Sg, Ag, DS = pair(np.zeros(Ee * Hh)), pair(rng.normal(size=Ee * Hh)), pair(np.zeros(Ee * Hh)), \
+            pair(np.zeros(Ee * Hh))
+        for dv, i in ((g, 0), (e, 1)):
+            dv.edge_dot(Yg[i], Xg[i], ROW[i], COL[i], DA[i], Ee, Hh, Ff)
+            dv.seg_softmax(Sg[i], OFF[i], Ag[i], Nn, Hh, 0.2)
+            dv.seg_softmax_b(Sg[i], Ag[i], DA[i], OFF[i], DS[i], Nn, Hh, 0.2)
+        same(DA[0], DA[1], Ee * Hh, 1e-5, "edge_dot")
+        same(Ag[0], Ag[1], Ee * Hh, 1e-5, "seg_softmax")
+        same(DS[0], DS[1], Ee * Hh, 1e-4, "seg_softmax_b")
+        acc, sc1 = pair(np.zeros(1)), pair(np.array([0.3]))
+        for dv, i in ((g, 0), (e, 1)):
+            dv.dot_acc(x[i], y[i], n, acc[i])
+            dv.scale_add(out[i], x[i], sc1[i], n, 1.0)
+        same(acc[0], acc[1], 1, 1e-5, "dot_acc")
+        same(out[0], out[1], n, 1e-5, "scale_add")
+        wide, part = pair(rng.normal(size=(20, 30))), pair(rng.normal(size=(20, 7)))
+        for back in (0, 1):
+            for dv, i in ((g, 0), (e, 1)):
+                dv.cols(part[i], wide[i], 20, 7, 30, 11, back)
+            same(wide[0], wide[1], 600, 1e-6, "cols")
+            same(part[0], part[1], 140, 1e-6, "cols back")
         W, WQ = pair(rng.normal(size=(70, 48))), pair(np.zeros(70 * 48))
         for kind in range(6):
             g.fakeq(W[0], WQ[0], 70, 48, kind)

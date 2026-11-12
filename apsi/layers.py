@@ -1445,16 +1445,14 @@ def fit(model, params, X, y=None, loss="mse", opt=None, epochs=10, batch_size=No
     card), "pipeline" (the model split across the cards; stages=N pieces or a list of the units in each;
     micro_batches=M) or "auto" (copies when the model fits one card, else the fewest pieces that fit).
     """
-    which = _backend(backend, model, loss if isinstance(loss, str) else None, graph is None and mask is None)
+    which = _backend(backend, model, loss if isinstance(loss, str) else None, True)
     if which == "gpu":
         from . import gpu_train
-        if graph is not None or mask is not None:
-            raise RuntimeErr("backend=\"gpu\": graph tasks train with backend=\"torch\" or \"numpy\"")
         dev = "cuda" if str(device).lower() in ("auto", "gpu", "cuda") else device
         try:
             return gpu_train.fit(model, params, X, y, loss, opt, epochs, batch_size, seed, verbose, clip, schedule, val,
                                  device=dev, precision=precision, ema=ema, ewc=ewc, parallel=parallel, stages=stages,
-                                 micro_batches=micro_batches)
+                                 micro_batches=micro_batches, graph=graph, mask=mask)
         except gpu_train.TrainError as e:
             raise RuntimeErr(f"backend=\"gpu\": {e}")
     if ema is not None or ewc is not None:

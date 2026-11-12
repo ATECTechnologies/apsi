@@ -16,14 +16,15 @@ import os
 
 LOG2E = 1.4426950408889634
 ACTS = {"relu": 0, "gelu": 1, "silu": 2, "swish": 2, "tanh": 3, "sigmoid": 4, "linear": 5, "identity": 5,
-        "leaky_relu": 6}
+        "leaky_relu": 6, "elu": 7, "softplus": 8, "mish": 9}
 FAKEQ = {"fp8": 0, "fp6": 1, "fp6_e2m3": 2, "fp4": 3, "int8": 4, "int4": 5}
 MINIFLOAT = {0: (3, 7, 448.0), 1: (2, 3, 28.0), 2: (3, 1, 7.5), 3: (1, 1, 6.0)}     # mantissa bits, bias, top
 TILE = 64
 
 MAIN = ("apsi_kernel", "axpy", "add3", "mul3", "act_f", "act_b", "colsum", "ln_f", "ln_b", "embed_f", "embed_b",
         "pos_f", "pos_b", "softmax_f", "softmax_b", "ce", "mse", "sumsq", "adam", "sgd", "drop_f", "fakeq",
-        "gemm_simt", "gather", "rope")
+        "gemm_simt", "gather", "rope", "spmm", "edge_dot", "seg_softmax", "seg_softmax_b", "dot_acc", "scale_add",
+        "cols")
 TC = ("apsi_kernel", "gemm_tc3")                     # apsi_kernel = the one-pass product
 
 
@@ -223,7 +224,18 @@ def _main_module():
         dsig = b.fmul(s, b.fsub(F(1.0), s))
         leaky = b.select(b.fcmp_ordered(">", x, F(0.0)), x, b.fmul(F(0.01), x))
         dleaky = b.select(b.fcmp_ordered(">", x, F(0.0)), F(1.0), F(0.01))
-        vals = [(relu, drelu), (gelu, dgelu), (silu, dsilu), (th, dth), (s, dsig), (x, F(1.0)), (leaky, dleaky)]
+        neg = b.fcmp_ordered(">", x, F(0.0))
+        ex = exp(k, b.call(min_f, [x, F(0.0)]))
+        elu = b.select(neg, x, b.fsub(ex, F(1.0)))
+        delu = b.select(neg, F(1.0), ex)
+        ax = b.call(fabs_f, [x])                      # softplus = max(x, 0) + log(1 + exp(-|x|))
+        sp = b.fadd(b.call(max_f, [x, F(0.0)]),
+                    b.fdiv(b.call(lg2_f, [b.fadd(F(1.0), exp(k, b.fsub(F(0.0), ax)))]), F(LOG2E)))
+        tsp = tanh(k, sp)
+        mish = b.fmul(x, tsp)
+        dmish = b.fadd(tsp, b.fmul(b.fmul(x, b.fsub(F(1.0), b.fmul(tsp, tsp))), s))
+        vals = [(relu, drelu), (gelu, dgelu), (silu, dsilu), (th, dth), (s, dsig), (x, F(1.0)), (leaky, dleaky),
+                (elu, delu), (sp, s), (mish, dmish)]
         f, d = vals[-1]
         for j in range(len(vals) - 2, -1, -1):
             sel = b.icmp_unsigned("==", kind, C(j))
@@ -410,6 +422,139 @@ def _main_module():
         k.st(b.fsub(b.fmul(x1, c), b.fmul(x2, sn)), p["X"], base)
         k.st(b.fadd(b.fmul(x2, c), b.fmul(x1, sn)), p["X"], i2)
     k.grid_loop(b.mul(p["rows"], half), rope)
+    k.ret()
+
+    # ------------------------------------------------------------------------- sparse graphs (rows in CSR order)
+    # spmm: Y[n, h, f] (+)= sum over e in OFF[n]..OFF[n+1] of v(e, h) * X[COL[e], h, f]; v = 1, or VAL[e' * H + h]
+    # with e' = e or VPERM[e]. mode: 1 values, 2 values through VPERM, 4 add to Y. A thread a (row, head, feature):
+    # the sum in a register, one write, no atomics (the same result every run).
+    k = K("spmm", [("X", G(f32)), ("COL", G(i32)), ("VAL", G(f32)), ("VPERM", G(i32)), ("OFF", G(i32)),
+                   ("Y", G(f32)), ("N", i32), ("H", i32), ("F", i32), ("mode", i32)])
+    b, p = k.b, k.p
+    HF = b.mul(p["H"], p["F"])
+
+    def spmm(i):
+        n, r = b.udiv(i, HF), b.urem(i, HF)
+        hh = b.udiv(r, p["F"])
+        acc = k.var(F(0.0))
+        hasv = b.icmp_unsigned("!=", b.and_(p["mode"], C(1)), C(0))
+        perm = b.icmp_unsigned("!=", b.and_(p["mode"], C(2)), C(0))
+
+        def edge(e):
+            c = k.ld(p["COL"], e)
+            x = k.ld(p["X"], b.add(b.mul(i64of(b, c), i64of(b, HF)), i64of(b, r)))
+            ve = b.select(perm, k.ld(p["VPERM"], b.select(perm, e, C(0))), e)
+            v = b.select(hasv, k.ld(p["VAL"], b.select(hasv, b.add(b.mul(i64of(b, ve), i64of(b, p["H"])),
+                                                                     i64of(b, hh)), b.zext(C(0), i64))), F(1.0))
+            b.store(b.call(fma_f, [v, x, b.load(acc)]), acc)
+        k.loop(k.ld(p["OFF"], n), k.ld(p["OFF"], b.add(n, C(1))), C(1), edge)
+        add = b.icmp_unsigned("!=", b.and_(p["mode"], C(4)), C(0))
+        tot = b.load(acc)
+        tot = b.select(add, b.fadd(tot, k.ld(p["Y"], i)), tot)
+        k.st(tot, p["Y"], i)
+    k.grid_loop(b.mul(p["N"], HF), spmm)
+    k.ret()
+
+    # edge_dot: DA[e, h] = sum_f DY[ROW[e], h, f] * X[COL[e], h, f]  (the gradient of an edge's weight)
+    k = K("edge_dot", [("DY", G(f32)), ("X", G(f32)), ("ROW", G(i32)), ("COL", G(i32)), ("DA", G(f32)),
+                       ("E", i32), ("H", i32), ("F", i32)])
+    b, p = k.b, k.p
+    HF = b.mul(p["H"], p["F"])
+
+    def edot(i):
+        e, hh = b.udiv(i, p["H"]), b.urem(i, p["H"])
+        r0 = b.add(b.mul(i64of(b, k.ld(p["ROW"], e)), i64of(b, HF)), i64of(b, b.mul(hh, p["F"])))
+        c0 = b.add(b.mul(i64of(b, k.ld(p["COL"], e)), i64of(b, HF)), i64of(b, b.mul(hh, p["F"])))
+        acc = k.var(F(0.0))
+        k.loop(C(0), p["F"], C(1), lambda f: b.store(b.call(fma_f, [k.ld(p["DY"], b.add(r0, i64of(b, f))),
+                                                                     k.ld(p["X"], b.add(c0, i64of(b, f))),
+                                                                     b.load(acc)]), acc))
+        k.st(b.load(acc), p["DA"], i)
+    k.grid_loop(b.mul(p["E"], p["H"]), edot)
+    k.ret()
+
+    # seg_softmax: per (row n, head h), over its edges: z = leaky(S, slope), A = exp(z - max) / (sum + 1e-16)
+    k = K("seg_softmax", [("S", G(f32)), ("OFF", G(i32)), ("A", G(f32)), ("N", i32), ("H", i32), ("slope", f32)])
+    b, p = k.b, k.p
+
+    def leaky(x):
+        return b.select(b.fcmp_ordered(">", x, F(0.0)), x, b.fmul(x, p["slope"]))
+
+    def ssm(i):
+        n, hh = b.udiv(i, p["H"]), b.urem(i, p["H"])
+        lo, hi = k.ld(p["OFF"], n), k.ld(p["OFF"], b.add(n, C(1)))
+
+        def at(e):
+            return b.add(b.mul(i64of(b, e), i64of(b, p["H"])), i64of(b, hh))
+        mx = k.var(F(-3.0e38))
+        k.loop(lo, hi, C(1), lambda e: b.store(b.call(max_f, [b.load(mx), leaky(k.ld(p["S"], at(e)))]), mx))
+        sm = k.var(F(0.0))
+
+        def ex(e):
+            v = exp(k, b.fsub(leaky(k.ld(p["S"], at(e))), b.load(mx)))
+            k.st(v, p["A"], at(e))
+            b.store(b.fadd(b.load(sm), v), sm)
+        k.loop(lo, hi, C(1), ex)
+        inv = b.fdiv(F(1.0), b.fadd(b.load(sm), F(1e-16)))
+        k.loop(lo, hi, C(1), lambda e: k.st(b.fmul(k.ld(p["A"], at(e)), inv), p["A"], at(e)))
+    k.grid_loop(b.mul(p["N"], p["H"]), ssm)
+    k.ret()
+
+    # seg_softmax_b: DS = A (DA - sum A DA) leaky'(S)
+    k = K("seg_softmax_b", [("S", G(f32)), ("A", G(f32)), ("DA", G(f32)), ("OFF", G(i32)), ("DS", G(f32)),
+                            ("N", i32), ("H", i32), ("slope", f32)])
+    b, p = k.b, k.p
+
+    def ssmb(i):
+        n, hh = b.udiv(i, p["H"]), b.urem(i, p["H"])
+        lo, hi = k.ld(p["OFF"], n), k.ld(p["OFF"], b.add(n, C(1)))
+
+        def at(e):
+            return b.add(b.mul(i64of(b, e), i64of(b, p["H"])), i64of(b, hh))
+        t = k.var(F(0.0))
+        k.loop(lo, hi, C(1), lambda e: b.store(b.call(fma_f, [k.ld(p["A"], at(e)), k.ld(p["DA"], at(e)),
+                                                               b.load(t)]), t))
+
+        def back(e):
+            a = k.ld(p["A"], at(e))
+            g = b.fmul(a, b.fsub(k.ld(p["DA"], at(e)), b.load(t)))
+            g = b.select(b.fcmp_ordered(">", k.ld(p["S"], at(e)), F(0.0)), g, b.fmul(g, p["slope"]))
+            k.st(g, p["DS"], at(e))
+        k.loop(lo, hi, C(1), back)
+    k.grid_loop(b.mul(p["N"], p["H"]), ssmb)
+    k.ret()
+
+    # dot_acc: ACC[0] += sum X * Y
+    k = K("dot_acc", [("X", G(f32)), ("Y", G(f32)), ("n", i32), ("ACC", G(f32))])
+    b, p = k.b, k.p
+    s_ = k.var(F(0.0))
+    k.grid_loop(p["n"], lambda i: b.store(b.call(fma_f, [k.ld(p["X"], i), k.ld(p["Y"], i), b.load(s_)]), s_))
+    tot = k.block_sum(b.load(s_))
+    with b.if_then(b.icmp_unsigned("==", k.tid, C(0))):
+        k.atomic_add(p["ACC"], C(0), tot)
+    k.ret()
+
+    # scale_add: Z += X * (S[0] + c)   (a scale that lives on the card, e.g. 1 + eps of a GIN layer)
+    k = K("scale_add", [("Z", G(f32)), ("X", G(f32)), ("S", G(f32)), ("n", i32), ("c", f32)])
+    b, p = k.b, k.p
+    k.grid_loop(p["n"], lambda i: k.st(b.call(fma_f, [k.ld(p["X"], i), b.fadd(k.ld(p["S"], C(0)), p["c"]),
+                                                      k.ld(p["Z"], i)]), p["Z"], i))
+    k.ret()
+
+    # cols: columns off..off+w of Y (row stride ld) <- X (rows of w); back=1: X <- those columns (concatenation)
+    k = K("cols", [("X", G(f32)), ("Y", G(f32)), ("rows", i32), ("w", i32), ("ld", i32), ("off", i32),
+                   ("back", i32)])
+    b, p = k.b, k.p
+
+    def cols(i):
+        r, c = b.udiv(i, p["w"]), b.urem(i, p["w"])
+        j = b.add(b.mul(i64of(b, r), i64of(b, p["ld"])), i64of(b, b.add(p["off"], c)))
+        with b.if_else(b.icmp_unsigned("!=", p["back"], C(0))) as (bk, fw):
+            with bk:
+                k.st(k.ld(p["Y"], j), p["X"], i)
+            with fw:
+                k.st(k.ld(p["X"], i), p["Y"], j)
+    k.grid_loop(b.mul(p["rows"], p["w"]), cols)
     k.ret()
 
     # ------------------------------------------------------------------------- attention softmax, a block a row

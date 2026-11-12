@@ -15,6 +15,15 @@
   sum their gradients and share the optimizer's work.
 - **Your own cut:** `stages=4`, or `stages=[6, 4, 4, 6]` (the units in each stage); `micro_batches=`. `r.stages`,
   `r.replicas`, `r.micro_batches`.
+- **Modern transformer blocks on the GPU trainer:** grouped-query attention (`kv_heads=`), rotary positions
+  (`rope=true`, a kernel of its own, in place), per-head query / key RMS norms (`qk_norm=true`), `swiglu` feed-forward
+  blocks, `transformer_block(…, norm="rms", ffn="swiglu")`; `transformer_lm(…)` takes them all. The same layers on
+  NumPy autodiff and PyTorch.
+- **Sparse graphs on the GPU trainer:** `gcn`, `sage`, `gin`, `gat`, `graph_pool` with `fit(…, graph=g, mask=…)`, node
+  and graph tasks. The edges are kept in compressed rows (CSR) and every node sums its edges in a register: no atomic
+  additions, the same result every run. New kernels: sparse products with per-edge, per-head weights, the edge
+  softmax and its gradient, edge dot products.
+- **More activations on the card:** elu, softplus, mish.
 - The same result as one card with the whole batch (tested with Adam, AdamW, SGD, clipping over the whole model, EMA,
   EWC, low-bit precision); a failure on any card stops all of them at once with that card's error.
 
