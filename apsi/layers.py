@@ -401,29 +401,83 @@ class LastStep(Layer):
         return x[:, -1, :]
 
 
+def rope_tables(T, hd, base=10000.0, offset=0):
+    """cos and sin of the rotary position angles, [T, hd] (the half-split layout: pairs (i, i + hd / 2))."""
+    half = hd // 2
+    inv = 1.0 / (float(base) ** (np.arange(half) * 2.0 / hd))
+    ang = (np.arange(int(offset), int(offset) + int(T))[:, None] * inv[None, :])
+    return np.concatenate([np.cos(ang)] * 2, 1), np.concatenate([np.sin(ang)] * 2, 1)
+
+
+def _rotate_half_matrix(hd):
+    """R with x @ R = rotate_half(x) = [-x2, x1]."""
+    half = hd // 2
+    R = np.zeros((hd, hd))
+    R[half:, :half] = -np.eye(half)
+    R[:half, half:] = np.eye(half)
+    return R
+
+
+def apply_rope(x, base=10000.0, offset=0):
+    """Rotary position embedding on [..., T, hd] (positions offset.., the half-split layout of LLaMA / Qwen)."""
+    sh = np.shape(ops.raw(x))
+    T, hd = sh[-2], sh[-1]
+    if hd % 2:
+        raise ShapeError(f"rope: the head size {hd} must be even")
+    cos, sin = rope_tables(T, hd, base, offset)
+    return x * cos + (x @ _rotate_half_matrix(hd)) * sin
+
+
 class MultiHeadAttention(Layer):
+    """Self-attention (or cross-attention when called on [query, memory]).
+
+    kv_heads: grouped-query attention (fewer key / value heads, each shared by heads / kv_heads query heads);
+    rope: rotary positions on the queries and keys (rope_base); qk_norm: an RMS norm of each head's query and key
+    (learned scale per head dimension) before the positions, as in Qwen3 / Gemma 3."""
     kind = "attention"
 
-    def __init__(self, d, heads=4, causal=False):
+    def __init__(self, d, heads=4, causal=False, kv_heads=None, rope=False, rope_base=10000.0, qk_norm=False,
+                 eps=1e-6):
         self.d, self.h, self.causal = int(d), int(heads), bool(causal)
         if self.d % self.h:
             raise ShapeError(f"multi_head_attention: d={self.d} must be divisible by heads={self.h}")
+        self.kvh = int(kv_heads) if kv_heads else self.h
+        if self.kvh < 1 or self.h % self.kvh:
+            raise ShapeError(f"multi_head_attention: heads={self.h} must be a multiple of kv_heads={self.kvh}")
+        self.hd = self.d // self.h
+        self.rope, self.rope_base, self.qk_norm, self.eps = bool(rope), float(rope_base), bool(qk_norm), float(eps)
+        if self.rope and self.hd % 2:
+            raise ShapeError(f"multi_head_attention: rope needs an even head size (d / heads = {self.hd})")
 
     def init(self, seed=0):
         rng = _rng(seed)
-        return Record(Wq=_glorot(rng, self.d, self.d), Wk=_glorot(rng, self.d, self.d),
-                      Wv=_glorot(rng, self.d, self.d), Wo=_glorot(rng, self.d, self.d), bo=np.zeros(self.d))
+        dkv = self.kvh * self.hd
+        f = dict(Wq=_glorot(rng, self.d, self.d), Wk=_glorot(rng, self.d, dkv), Wv=_glorot(rng, self.d, dkv),
+                 Wo=_glorot(rng, self.d, self.d), bo=np.zeros(self.d))
+        if self.qk_norm:
+            f.update(q_norm=np.ones(self.hd), k_norm=np.ones(self.hd))
+        return Record(**f)
 
     def apply(self, p, x, train=False, mask=None, **ctx):
         src = x if not isinstance(x, (list, tuple)) else x[0]
         mem = src if not isinstance(x, (list, tuple)) else x[1]          # cross-attention: [query, memory]
         B, T, D = np.shape(ops.raw(src))
         S = np.shape(ops.raw(mem))[1]
-        hd = D // self.h
+        hd, h, kvh = self.hd, self.h, self.kvh
 
-        def split(t, L):
-            return ops.transpose(ops.reshape(t, B, L, self.h, hd), (0, 2, 1, 3))
-        q, k, v = split(src @ p.Wq, T), split(mem @ p.Wk, S), split(mem @ p.Wv, S)
+        def split(t, L, n):
+            return ops.transpose(ops.reshape(t, B, L, n, hd), (0, 2, 1, 3))
+        q, k, v = split(src @ p.Wq, T, h), split(mem @ p.Wk, S, kvh), split(mem @ p.Wv, S, kvh)
+        if self.qk_norm:
+            q = q / ops.sqrt(ops.mean(q * q, axis=-1, keepdims=True) + self.eps) * p.q_norm
+            k = k / ops.sqrt(ops.mean(k * k, axis=-1, keepdims=True) + self.eps) * p.k_norm
+        if self.rope:
+            q, k = apply_rope(q, self.rope_base), apply_rope(k, self.rope_base)
+        if kvh != h:                                                       # each key / value head serves h / kvh
+            g = h // kvh
+            one = np.ones((1, 1, g, 1, 1))
+            k = ops.reshape(ops.reshape(k, B, kvh, 1, S, hd) * one, B, h, S, hd)
+            v = ops.reshape(ops.reshape(v, B, kvh, 1, S, hd) * one, B, h, S, hd)
         s = (q @ ops.transpose(k, (0, 1, 3, 2))) / math.sqrt(hd)
         if self.causal:
             s = s + np.triu(np.full((T, S), -1e9), k=1)
@@ -434,7 +488,35 @@ class MultiHeadAttention(Layer):
         return o @ p.Wo + p.bo
 
     def describe(self):
-        return f"multi_head_attention(d={self.d}, heads={self.h}{', causal' if self.causal else ''})"
+        extra = (f", kv_heads={self.kvh}" if self.kvh != self.h else "") + (", rope" if self.rope else "") + \
+            (", qk_norm" if self.qk_norm else "")
+        return f"multi_head_attention(d={self.d}, heads={self.h}{', causal' if self.causal else ''}{extra})"
+
+
+class SwiGLU(Layer):
+    """Gated feed-forward block: down(act(x gate) * (x up)), act "silu" (SwiGLU, LLaMA / Qwen) or "gelu" (GeGLU)."""
+    kind = "swiglu"
+
+    def __init__(self, d, ff=None, act="silu", d_out=None):
+        self.d, self.ff = int(d), int(ff or (8 * int(d)) // 3)
+        self.d_out = int(d_out or d)
+        self.act = str(act).lower()
+        if self.act not in ("silu", "swish", "gelu", "relu"):
+            raise ShapeError(f"swiglu: act '{act}' (silu, gelu, relu)")
+
+    def init(self, seed=0):
+        rng = _rng(seed)
+        return Record(Wg=_glorot(rng, self.d, self.ff), Wu=_glorot(rng, self.d, self.ff),
+                      Wd=_glorot(rng, self.ff, self.d_out))
+
+    def apply(self, p, x, train=False, **ctx):
+        g = x @ p.Wg
+        a = {"silu": lambda t: t * ops.sigmoid(t), "swish": lambda t: t * ops.sigmoid(t), "gelu": ops.gelu,
+             "relu": ops.relu}[self.act](g)
+        return (a * (x @ p.Wu)) @ p.Wd
+
+    def describe(self):
+        return f"swiglu({self.d} -> {self.ff} -> {self.d_out}, {self.act})"
 
 
 class LayerNorm(Layer):
@@ -894,15 +976,32 @@ class GraphPool(Layer):
 
 # ---------------------------------------------------------------- transformer
 class TransformerBlock(Layer):
-    """Pre-norm transformer block: x + attention(norm(x)), then x + MLP(norm(x))."""
+    """Pre-norm transformer block: x + attention(norm(x)), then x + MLP(norm(x)).
+
+    norm="layer" | "rms"; ffn="mlp" (Linear, activation, Linear) | "swiglu"; kv_heads / rope / qk_norm: see
+    multi_head_attention. transformer_block(d, heads, kv_heads=2, rope=true, qk_norm=true, norm="rms",
+    ffn="swiglu") is a LLaMA / Qwen3 block."""
     kind = "transformer_block"
 
-    def __init__(self, d, heads=4, ff=None, causal=False, dropout=0.0, activation="gelu"):
-        ff = int(ff or 4 * d)
+    def __init__(self, d, heads=4, ff=None, causal=False, dropout=0.0, activation="gelu", kv_heads=None, rope=False,
+                 rope_base=10000.0, qk_norm=False, norm="layer", ffn="mlp"):
         self.d = int(d)
-        self.attn = Residual(MultiHeadAttention(d, heads, causal), pre_norm=LayerNorm(d))
-        self.mlp = Residual(Sequential([Linear(d, ff), Activation(activation), Dropout(dropout), Linear(ff, d)]),
-                            pre_norm=LayerNorm(d))
+        self.norm_kind, self.ffn_kind = str(norm).lower(), str(ffn).lower()
+        if self.norm_kind not in ("layer", "rms"):
+            raise ShapeError(f"transformer_block: norm '{norm}' (layer, rms)")
+        if self.ffn_kind not in ("mlp", "swiglu"):
+            raise ShapeError(f"transformer_block: ffn '{ffn}' (mlp, swiglu)")
+        mk = (lambda: LayerNorm(d)) if self.norm_kind == "layer" else (lambda: RMSNorm(d))
+        self.attn = Residual(MultiHeadAttention(d, heads, causal, kv_heads, rope, rope_base, qk_norm), pre_norm=mk())
+        if self.ffn_kind == "swiglu":
+            ff = int(ff or (8 * int(d)) // 3)
+            body = SwiGLU(d, ff, "silu" if str(activation).lower() == "gelu" else activation)   # (gelu: the default)
+            if dropout:
+                body = Sequential([body, Dropout(dropout)])
+        else:
+            ff = int(ff or 4 * d)
+            body = Sequential([Linear(d, ff), Activation(activation), Dropout(dropout), Linear(ff, d)])
+        self.mlp = Residual(body, pre_norm=mk())
         self.heads, self.ff, self.causal = int(heads), ff, bool(causal)
 
     def init(self, seed=0):
@@ -915,7 +1014,11 @@ class TransformerBlock(Layer):
         return [self.attn, self.mlp]
 
     def describe(self):
-        return f"transformer_block(d={self.d}, heads={self.heads}, ff={self.ff}{', causal' if self.causal else ''})"
+        a = self.attn.inner
+        extra = (f", kv_heads={a.kvh}" if a.kvh != a.h else "") + (", rope" if a.rope else "") + \
+            (", qk_norm" if a.qk_norm else "") + (", rms" if self.norm_kind == "rms" else "") + \
+            (", swiglu" if self.ffn_kind == "swiglu" else "")
+        return f"transformer_block(d={self.d}, heads={self.heads}, ff={self.ff}{', causal' if self.causal else ''}{extra})"
 
 
 # =============================================================== constructors exposed to Apsi
@@ -1106,8 +1209,10 @@ def concatenate():
     return Combine("concat")
 
 
-def transformer_encoder(d, heads=4, layers=2, ff=None, causal=False, dropout=0.0):
-    return Sequential([TransformerBlock(d, heads, ff, causal, dropout) for _ in range(int(layers))] + [LayerNorm(d)])
+def transformer_encoder(d, heads=4, layers=2, ff=None, causal=False, dropout=0.0, **block):
+    """layers transformer blocks and a final norm; block: kv_heads, rope, rope_base, qk_norm, norm, ffn, activation."""
+    blocks = [TransformerBlock(d, heads, ff, causal, dropout, **block) for _ in range(int(layers))]
+    return Sequential(blocks + [RMSNorm(d) if str(block.get("norm", "layer")).lower() == "rms" else LayerNorm(d)])
 
 
 # ---------------------------------------------------------------- model zoo
@@ -1153,10 +1258,16 @@ def lstm_classifier(n_in, hidden, classes, layers=1):
     return Sequential(L + [Linear(d, classes)])
 
 
-def transformer_lm(vocab, d=64, heads=4, layers=2, context=128, dropout=0.0):
-    """Decoder-only (GPT-style) language model: token ids [B, T] -> logits [B, T, vocab]."""
-    return Sequential([Embedding(vocab, d), PositionalEncoding(context, d, learned=True),
-                       transformer_encoder(d, heads, layers, causal=True, dropout=dropout), Linear(d, vocab)])
+def transformer_lm(vocab, d=64, heads=4, layers=2, context=128, dropout=0.0, ff=None, **block):
+    """Decoder-only (GPT-style) language model: token ids [B, T] -> logits [B, T, vocab].
+
+    block options (kv_heads, rope, rope_base, qk_norm, norm, ffn, activation) shape every block; with rope=true the
+    model has no learned position table. transformer_lm(32000, d=768, heads=12, layers=12, kv_heads=4, rope=true,
+    qk_norm=true, norm="rms", ffn="swiglu") is a modern (LLaMA / Qwen3 style) model."""
+    pos = [] if block.get("rope") else [PositionalEncoding(context, d, learned=True)]
+    return Sequential([Embedding(vocab, d)] + pos +
+                      [transformer_encoder(d, heads, layers, ff=ff, causal=True, dropout=dropout, **block),
+                       Linear(d, vocab)])
 
 
 def transformer_classifier(vocab, classes, d=64, heads=4, layers=2, context=128):
@@ -1653,7 +1764,8 @@ def module(interp=None):
         linear=linear, dense=dense, bilinear=Bilinear, embedding=Embedding, positional_encoding=PositionalEncoding,
         conv2d_layer=Conv2D, max_pool=MaxPool, avg_pool=AvgPool, global_avg_pool=GlobalAvgPool,
         flatten_layer=Flatten, reshape_layer=Reshape, lstm_layer=LSTMLayer, gru_layer=GRULayer, last_step=LastStep,
-        multi_head_attention=MultiHeadAttention, transformer_block=TransformerBlock,
+        multi_head_attention=MultiHeadAttention, transformer_block=TransformerBlock, swiglu=SwiGLU,
+        apply_rope=apply_rope,
         transformer_encoder=transformer_encoder, layer_norm_layer=LayerNorm, rms_norm_layer=RMSNorm,
         batch_norm_layer=BatchNorm, dropout_layer=Dropout, activation=activation, lambda_layer=LambdaLayer,
         scale=Scale, identity=Identity, select=Select, mean_pool=MeanPool,

@@ -53,6 +53,35 @@ class Trainer(unittest.TestCase):
         grads_match(self, L.transformer_lm(23, d=32, heads=4, layers=2, context=12), rng.integers(0, 23, (3, 12)),
                     lab, "cross_entropy")
 
+    def test_modern_blocks_are_exact(self):
+        """Grouped-query attention, rotary positions, per-head query / key norms, RMS norm and SwiGLU: the gradients
+        on the GPU trainer equal Apsi's autodiff; training equals the NumPy backend, fused attention or not, on one
+        card or split across three."""
+        rng = np.random.default_rng(0)
+        for kw in (dict(kv_heads=2), dict(rope=True), dict(qk_norm=True), dict(norm="rms", ffn="swiglu"),
+                   dict(kv_heads=1, rope=True, qk_norm=True, norm="rms", ffn="swiglu"),
+                   dict(kv_heads=2, rope=True, qk_norm=True, ffn="swiglu", activation="relu")):
+            lab = rng.integers(0, 23, (3, 12))
+            lab[0, :3] = -100
+            grads_match(self, L.transformer_lm(23, d=32, heads=4, layers=2, context=12, **kw),
+                        rng.integers(0, 23, (3, 12)), lab, "cross_entropy")
+        grads_match(self, L.Sequential([L.Linear(10, 16), L.SwiGLU(16, 24, d_out=5)]), rng.normal(size=(16, 10)),
+                    rng.normal(size=(16, 5)), "mse")
+        lm = L.transformer_lm(30, d=128, heads=4, layers=2, context=40, kv_heads=2, rope=True, qk_norm=True,
+                              norm="rms", ffn="swiglu")
+        ids = rng.integers(0, 30, (24, 40))
+        lab = np.roll(ids, -1, 1)
+        kw = dict(loss="cross_entropy", opt=None, epochs=3, batch_size=8, verbose=False)
+        ref = L.fit(lm, lm.init(seed=0), ids, lab, precision="fp32", **dict(kw, opt=Adam(3e-3))).history
+        for ops in (GT.Emulator(), [GT.Emulator() for _ in range(3)]):
+            r = GT.fit(lm, lm.init(seed=0), ids, lab, precision="fp32", ops=ops, parallel="pipeline",
+                       **dict(kw, opt=Adam(3e-3))).history
+            np.testing.assert_allclose(ref, r, rtol=1e-5)
+        e = GT.Emulator()
+        e.flash = True                                              # the fused kernel's path (bfloat16 inputs)
+        r = GT.fit(lm, lm.init(seed=0), ids, lab, ops=e, **dict(kw, opt=Adam(3e-3))).history
+        np.testing.assert_allclose(ref, r, rtol=3e-3)
+
     def test_training_matches_the_numpy_backend(self):
         rng = np.random.default_rng(0)
         lm = L.transformer_lm(23, d=32, heads=4, layers=2, context=12)

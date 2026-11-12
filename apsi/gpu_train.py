@@ -271,6 +271,16 @@ class Emulator(_Ops):
             return np.float32(1)
         return np.float32(min(1.0, clip / math.sqrt(float(self.v(SQ, 1)[0]) + 1e-30)))
 
+    def rope(self, X, CS, SN, rows, hd, H, T, sign):
+        half = hd // 2
+        x = self.v(X, rows * hd).reshape(rows, hd)
+        t = (np.arange(rows) // H) % T
+        c = self.v(CS, T * half).reshape(T, half)[t]
+        sn = self.v(SN, T * half).reshape(T, half)[t] * np.float32(sign)
+        x1, x2 = x[:, :half].copy(), x[:, half:].copy()
+        x[:, :half] = x1 * c - x2 * sn
+        x[:, half:] = x2 * c + x1 * sn
+
     def gather(self, SRC, IDX, DST, rows, width, start):
         idx = self.v(IDX, start + rows).view(np.int32)[start:]
         src = SRC[0].a[SRC[1]:].view(np.float32)
@@ -654,6 +664,10 @@ class Gpu(_Ops):
     def drop_f(self, X, Y, MASK, n, p, seed):
         self._go("drop_f", self.blocks(n), 256, self.p(X), self.p(Y), self.p(MASK), ("u", n), ("f", p),
                  ("i", int(np.int32(np.uint32(seed & 0xFFFFFFFF)))))
+
+    def rope(self, X, CS, SN, rows, hd, H, T, sign):
+        self._go("rope", self.blocks(rows * (hd // 2)), 256, self.p(X), self.p(CS), self.p(SN), ("u", rows), ("u", hd),
+                 ("u", H), ("u", T), ("f", sign))
 
     def gather(self, SRC, IDX, DST, rows, width, start):
         self._go("gather", self.blocks(rows * width), 256, self.p(SRC), self.p(IDX), self.p(DST), ("u", rows),
@@ -1216,27 +1230,83 @@ class _Residual(_Node):
 
 class _Attention(_Node):
     """Self-attention: q k v projections, softmax(q k^T / sqrt(hd)) (causal or not) per head, the output
-    projection. Scores and probabilities are kept for the backward pass ([batch x heads, T, T])."""
+    projection. Scores and probabilities are kept for the backward pass ([batch x heads, T, T]) unless the fused
+    kernel runs. Grouped-query attention (kv_heads): each key / value head is copied to the query heads it serves
+    (one gather) and their gradients summed back (one scatter-add); qk_norm: an RMS norm over each head; rope:
+    rotary positions applied in place (the backward pass applies the inverse rotation)."""
 
     def __init__(self, net, key, layer, p):
         super().__init__(net, key)
         self.D, self.h, self.causal = layer.d, layer.h, layer.causal
+        self.kvh = int(getattr(layer, "kvh", layer.h))
+        self.rope = bool(getattr(layer, "rope", False))
+        self.rope_base = float(getattr(layer, "rope_base", 10000.0))
+        self.qkn = bool(getattr(layer, "qk_norm", False))
+        self.eps = float(getattr(layer, "eps", 1e-6))
         self.Wq, self.Wk, self.Wv, self.Wo = (net.param(getattr(p, n)) for n in ("Wq", "Wk", "Wv", "Wo"))
         self.bo = net.param(p.bo)
+        if self.qkn:
+            self.gq, self.gk = net.param(p.q_norm), net.param(p.k_norm)
+        self.tabs, self.idx = {}, {}
 
     takes_residual = True
+
+    def _tables(self, T):
+        """cos and sin of the rotary angles for positions 0..T-1, [T, hd / 2], on the card (made once per length)."""
+        t = self.tabs.get(T)
+        if t is None:
+            hd = self.D // self.h
+            inv = 1.0 / (self.rope_base ** (np.arange(hd // 2) * 2.0 / hd))
+            ang = np.arange(T)[:, None] * inv[None, :]
+            o = self.net.ops
+            cs, sn = o.alloc(ang.size), o.alloc(ang.size)
+            o.put(cs, np.cos(ang).astype(np.float32).reshape(-1))
+            o.put(sn, np.sin(ang).astype(np.float32).reshape(-1))
+            self.net.owned += [cs, sn]
+            t = self.tabs[T] = ((cs, 0), (sn, 0))
+        return t
+
+    def _kv_index(self, M):
+        """For each (token, query head): the row of its key / value head (rows of the head size)."""
+        ix = self.idx.get(M)
+        if ix is None:
+            g = self.h // self.kvh
+            rows = (np.arange(M)[:, None] * self.kvh + np.arange(self.h)[None, :] // g).reshape(-1).astype(np.int32)
+            b = self.net.ops.alloc(rows.size)
+            self.net.ops.put(b, rows)
+            self.net.owned.append(b)
+            ix = self.idx[M] = (b, 0)
+        return ix
 
     def fwd(self, x, shape, residual=None):
         if len(shape) != 3:
             raise TrainError("multi_head_attention on the GPU takes [batch, time, features]")
-        o, (B, T, D), h = self.net.ops, shape, self.h
+        o, (B, T, D), h, kvh = self.net.ops, shape, self.h, self.kvh
         hd = D // h
-        M = B * T
+        M, Dkv = B * T, kvh * hd
         self.x, self.B, self.T = x, B, T
         ps = self.net.passes
-        q, k, v = self.buf("q", M * D), self.buf("k", M * D), self.buf("v", M * D)
-        for W, out in ((self.Wq, q), (self.Wk, k), (self.Wv, v)):
-            o.gemm(x, W.w, out, M, D, D, D, 1, D, 1, D, passes=ps)
+        q, k, v = self.buf("q", M * D), self.buf("k", M * Dkv), self.buf("v", M * Dkv)
+        for W, out, N in ((self.Wq, q, D), (self.Wk, k, Dkv), (self.Wv, v, Dkv)):
+            o.gemm(x, W.w, out, M, N, D, D, 1, N, 1, N, passes=ps)
+        if self.qkn:                                    # an RMS norm of every head's query and key
+            self.qraw, self.kraw = q, k
+            self.qm, self.qr = self.buf("qm", M * h), self.buf("qr", M * h)
+            self.km, self.kr = self.buf("km", M * kvh), self.buf("kr", M * kvh)
+            qn, kn = self.buf("qn", M * D), self.buf("kn", M * Dkv)
+            o.ln_f(q, self.gq.w, None, qn, self.qm, self.qr, M * h, hd, self.eps, True)
+            o.ln_f(k, self.gk.w, None, kn, self.km, self.kr, M * kvh, hd, self.eps, True)
+            q, k = qn, kn
+        if self.rope:
+            cs, sn = self._tables(T)
+            o.rope(q, cs, sn, M * h, hd, h, T, 1.0)
+            o.rope(k, cs, sn, M * kvh, hd, kvh, T, 1.0)
+        if kvh != h:                                    # each key / value head to the query heads it serves
+            ix = self._kv_index(M)
+            kf, vf = self.buf("kf", M * D), self.buf("vf", M * D)
+            o.gather(k, ix, kf, M * h, hd, 0)
+            o.gather(v, ix, vf, M * h, hd, 0)
+            k, v = kf, vf
         self.q, self.k, self.v = q, k, v
         sc = 1.0 / math.sqrt(hd)
         self.fused = ps == 1 and getattr(o, "flash", False) and hd in KS.FLASH_HD and D % 4 == 0
@@ -1292,13 +1362,81 @@ class _Attention(_Node):
         return self._grads_in(dq, dk, dv, M, D, ps)
 
     def _grads_in(self, dq, dk, dv, M, D, ps):
-        o = self.net.ops
+        o, h, kvh = self.net.ops, self.h, self.kvh
+        hd = D // h
+        Dkv = kvh * hd
+        if kvh != h:                                    # the copies' gradients summed back into each kv head
+            ix = self._kv_index(M)
+            dks, dvs = self.gbuf("dks", M * Dkv), self.gbuf("dvs", M * Dkv)
+            o.fill(dks, M * Dkv, 0.0)
+            o.fill(dvs, M * Dkv, 0.0)
+            o.embed_b(dk, ix, dks, M * h, hd, M * kvh)
+            o.embed_b(dv, ix, dvs, M * h, hd, M * kvh)
+            dk, dv = dks, dvs
+        if self.rope:                                   # the inverse rotation
+            cs, sn = self._tables(self.T)
+            o.rope(dq, cs, sn, M * h, hd, h, self.T, -1.0)
+            o.rope(dk, cs, sn, M * kvh, hd, kvh, self.T, -1.0)
+        if self.qkn:
+            dq2, dk2 = self.gbuf("dqn", M * D), self.gbuf("dkn", M * Dkv)
+            o.colsum(dq, self.qraw, self.qm, self.qr, self.gq.g, None, M * h, hd, 2)
+            o.ln_b(self.qraw, self.gq.w, dq, self.qm, self.qr, dq2, M * h, hd, True, None)
+            o.colsum(dk, self.kraw, self.km, self.kr, self.gk.g, None, M * kvh, hd, 2)
+            o.ln_b(self.kraw, self.gk.w, dk, self.km, self.kr, dk2, M * kvh, hd, True, None)
+            dq, dk = dq2, dk2
         dx = self.gbuf("dx", M * D)
         first = True
-        for W, d in ((self.Wq, dq), (self.Wk, dk), (self.Wv, dv)):
-            o.gemm(self.x, d, W.g, D, D, M, 1, D, D, 1, D, beta=True, passes=ps)
-            o.gemm(d, W.w, dx, M, D, D, D, 1, 1, D, D, beta=not first, passes=ps)
+        for W, d, N in ((self.Wq, dq, D), (self.Wk, dk, Dkv), (self.Wv, dv, Dkv)):
+            o.gemm(self.x, d, W.g, D, N, M, 1, D, N, 1, N, beta=True, passes=ps)
+            o.gemm(d, W.w, dx, M, D, N, N, 1, 1, N, D, beta=not first, passes=ps)
             first = False
+        return dx
+
+
+class _SwiGLU(_Node):
+    """down(act(x Wg) * (x Wu)): the gate product keeps its pre-activation and writes the activation in the same
+    pass; the backward pass needs no other buffers than the gate, the up product and their product."""
+
+    def __init__(self, net, key, layer, p):
+        super().__init__(net, key)
+        self.K, self.F, self.N = layer.d, layer.ff, layer.d_out
+        self.act = KS.ACTS[layer.act]
+        self.Wg, self.Wu, self.Wd = net.param(p.Wg), net.param(p.Wu), net.param(p.Wd)
+
+    @property
+    def takes_residual(self):
+        return self.N == self.K
+
+    def fwd(self, x, shape, residual=None):
+        o, M, ps = self.net.ops, _rows(shape), self.net.passes
+        K, F, N = self.K, self.F, self.N
+        self.x, self.M = x, M
+        self.h, self.a, self.u = self.buf("h", M * F), self.buf("a", M * F), self.buf("u", M * F)
+        o.gemm(x, self.Wg.w, self.a, M, F, K, K, 1, F, 1, F, passes=ps, epi=1, X2=self.h, act=self.act)
+        o.gemm(x, self.Wu.w, self.u, M, F, K, K, 1, F, 1, F, passes=ps)
+        self.z = self.buf("z", M * F)
+        o.mul3(self.z, self.a, self.u, M * F)
+        y = self.buf("y", M * N)
+        o.gemm(self.z, self.Wd.w, y, M, N, F, F, 1, N, 1, N, passes=ps, epi=3 if residual else 0, X2=residual)
+        return y, shape[:-1] + (N,)
+
+    def bwd(self, dy, need_dx=True):
+        o, M, ps = self.net.ops, self.M, self.net.passes
+        K, F, N = self.K, self.F, self.N
+        o.gemm(self.z, dy, self.Wd.g, F, N, M, 1, F, N, 1, N, beta=True, passes=ps)      # dWd += z^T dy
+        dz = self.gbuf("dz", M * F)
+        o.gemm(dy, self.Wd.w, dz, M, F, N, N, 1, 1, N, F, passes=ps)                     # dz = dy Wd^T
+        du, dg = self.gbuf("du", M * F), self.gbuf("dg", M * F)
+        o.mul3(du, dz, self.a, M * F)                                                     # du = dz * act(h)
+        o.mul3(dz, dz, self.u, M * F)                                                     # da = dz * u
+        o.act_b(self.h, dz, dg, M * F, self.act)                                          # dg = da * act'(h)
+        o.gemm(self.x, dg, self.Wg.g, K, F, M, 1, K, F, 1, F, beta=True, passes=ps)
+        o.gemm(self.x, du, self.Wu.g, K, F, M, 1, K, F, 1, F, beta=True, passes=ps)
+        if not need_dx:
+            return None
+        dx = self.gbuf("dx", M * K)
+        o.gemm(dg, self.Wg.w, dx, M, K, F, F, 1, 1, F, K, passes=ps)
+        o.gemm(du, self.Wu.w, dx, M, K, F, F, 1, 1, F, K, beta=True, passes=ps)
         return dx
 
 
@@ -1399,6 +1537,8 @@ class Net:
                                     self.compile(layer.mlp, p.mlp, key + ".m", gk + ".m")])
         if isinstance(layer, L.MultiHeadAttention):
             return _Attention(self, key, layer, p)
+        if isinstance(layer, L.SwiGLU):
+            return _SwiGLU(self, key, layer, p)
         raise TrainError(f"layer '{getattr(layer, 'kind', kind)}' is not on the GPU trainer yet "
                          "(backend=\"torch\" or \"numpy\" trains it)")
 

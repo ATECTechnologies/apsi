@@ -23,7 +23,7 @@ TILE = 64
 
 MAIN = ("apsi_kernel", "axpy", "add3", "mul3", "act_f", "act_b", "colsum", "ln_f", "ln_b", "embed_f", "embed_b",
         "pos_f", "pos_b", "softmax_f", "softmax_b", "ce", "mse", "sumsq", "adam", "sgd", "drop_f", "fakeq",
-        "gemm_simt", "gather")
+        "gemm_simt", "gather", "rope")
 TC = ("apsi_kernel", "gemm_tc3")                     # apsi_kernel = the one-pass product
 
 
@@ -389,6 +389,27 @@ def _main_module():
                                                                                          i64of(b, d)))), s))
         k.atomic_add(p["DP"], i, b.load(s))
     k.grid_loop(b.mul(p["T"], p["D"]), posb)
+    k.ret()
+
+    # ------------------------------------------------------------------------- rotary positions, in place
+    # X: rows of hd (a head of a token); row r is token r / H, at position (r / H) % T; pairs (j, j + hd / 2):
+    # y1 = x1 cos - x2 sin, y2 = x2 cos + x1 sin (sign -1: the inverse rotation, the backward pass)
+    k = K("rope", [("X", G(f32)), ("CS", G(f32)), ("SN", G(f32)), ("rows", i32), ("hd", i32), ("H", i32),
+                   ("T", i32), ("sign", f32)])
+    b, p = k.b, k.p
+    half = b.lshr(p["hd"], C(1))
+
+    def rope(i):
+        r, j = b.udiv(i, half), b.urem(i, half)
+        t = b.urem(b.udiv(r, p["H"]), p["T"])
+        base = b.add(b.mul(i64of(b, r), i64of(b, p["hd"])), i64of(b, j))
+        tix = b.add(b.mul(i64of(b, t), i64of(b, half)), i64of(b, j))
+        c, sn = k.ld(p["CS"], tix), b.fmul(k.ld(p["SN"], tix), p["sign"])
+        i2 = b.add(base, i64of(b, half))
+        x1, x2 = k.ld(p["X"], base), k.ld(p["X"], i2)
+        k.st(b.fsub(b.fmul(x1, c), b.fmul(x2, sn)), p["X"], base)
+        k.st(b.fadd(b.fmul(x2, c), b.fmul(x1, sn)), p["X"], i2)
+    k.grid_loop(b.mul(p["rows"], half), rope)
     k.ret()
 
     # ------------------------------------------------------------------------- attention softmax, a block a row

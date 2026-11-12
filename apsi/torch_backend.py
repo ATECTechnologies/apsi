@@ -391,11 +391,27 @@ def _register():
         mem = src if not isinstance(x, (list, tuple)) else x[1]
         B, T, D = src.shape
         S = mem.shape[1]
-        hd = D // l.h
+        h = l.h
+        kvh = getattr(l, "kvh", h)
+        hd = D // h
 
-        def split(t, n):
-            return t.reshape(B, n, l.h, hd).permute(0, 2, 1, 3)
-        q, k, v = split(_mm(src, p.Wq), T), split(_mm(mem, p.Wk), S), split(_mm(mem, p.Wv), S)
+        def split(t, n, heads):
+            return t.reshape(B, n, heads, hd).permute(0, 2, 1, 3)
+        q, k, v = split(_mm(src, p.Wq), T, h), split(_mm(mem, p.Wk), S, kvh), split(_mm(mem, p.Wv), S, kvh)
+        if getattr(l, "qk_norm", False):
+            q = q * torch.rsqrt((q * q).mean(dim=-1, keepdim=True) + l.eps) * p.q_norm
+            k = k * torch.rsqrt((k * k).mean(dim=-1, keepdim=True) + l.eps) * p.k_norm
+        if getattr(l, "rope", False):
+            def rot(t, n):
+                cos, sin = L.rope_tables(n, hd, l.rope_base)
+                cos = torch.as_tensor(cos, dtype=t.dtype, device=t.device)
+                sin = torch.as_tensor(sin, dtype=t.dtype, device=t.device)
+                t1, t2 = t[..., :hd // 2], t[..., hd // 2:]
+                return t * cos + torch.cat([-t2, t1], dim=-1) * sin
+            q, k = rot(q, T), rot(k, S)
+        if kvh != h:
+            k = k.repeat_interleave(h // kvh, dim=1)
+            v = v.repeat_interleave(h // kvh, dim=1)
         mask = ctx.get("mask")
         bias = None
         if l.causal:
@@ -412,6 +428,10 @@ def _register():
             o = torch.softmax(s, dim=-1) @ v
         o = o.permute(0, 2, 1, 3).reshape(B, T, D)
         return _mm(o, p.Wo) + p.bo
+
+    @impl(L.SwiGLU)
+    def _swiglu(l, p, x, train, ctx):
+        return _mm(_act(l.act)(_mm(x, p.Wg)) * _mm(x, p.Wu), p.Wd)
 
     @impl(L.LayerNorm)
     def _ln(l, p, x, train, ctx):
