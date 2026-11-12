@@ -33,6 +33,9 @@
   per input value: no atomics), `max_pool` (ties share the gradient, as on NumPy), `avg_pool`, `global_avg_pool`;
   `cnn` trains on the card. **Recurrent layers:** `lstm`, `gru` (a kernel per cell, the input products of all the
   steps at once), `last_step`.
+- **Any layer and any loss with the GPU trainer:** a layer with no kernel of its own (a custom layer, a lambda,
+  batch_norm, bilinear, graph_memory) runs on the processor with Apsi's autodiff inside a model trained on the card,
+  and a loss written as a function is evaluated there; the rest stays on the card.
 - **More activations on the card:** elu, softplus, mish. **More losses:** `mae` and `bce` (one kernel, with a weight
   per element for masks), on one card, several cards and split models.
 - **`apsi gpu bench`:** tokens per second of the 127 M GPT (or `11m`, `modern`), the kernels' shares, temperature,

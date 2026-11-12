@@ -125,7 +125,7 @@ let logits = predict(model, r.params, X_test, backend="gpu")
 | Losses | `cross_entropy` (negative labels left out), `mse`, `mae`, `bce` (on logits); `mask=` for graph tasks |
 | Optimizers | Adam, AdamW, SGD (momentum); `clip=` (global norm, computed on the card), `schedule=` |
 | Precision | `"auto"`/`"bf16"`: bfloat16 tensor cores, float32 sums; `"fp32"`: three tensor-core passes (about float32); `"fp8"`, `"fp6"`, `"fp6_e2m3"`, `"fp4"`, `"int8"`, `"int4"`: weights rounded to that format every forward pass, float32 master copy |
-| Not yet | bilinear, batch_norm, sage / graph_pool with max, graph_memory, dags with several inputs or outputs, custom layers, losses written as functions — `backend="torch"` or `"numpy"` train those, and `fit` says so |
+| Any other layer, any loss | a layer with no kernel of its own (`custom_layer`, `lambda_layer`, bilinear, batch_norm, graph_memory, …) runs on the processor with Apsi's autodiff inside the model on the card (its input and weights copied over, its output and gradients copied back; the rest stays on the card); a loss written as a function (`fit(…, loss=my_loss)`) is evaluated on the processor the same way, on one card. `APSI_GPU_HOST_LAYERS=0` refuses them instead |
 
 How it works: parameters, gradients and the AdamW state are three flat arrays updated by one kernel; the data set is
 copied to the card once and every batch is gathered there, so inside an epoch the processor never makes the card

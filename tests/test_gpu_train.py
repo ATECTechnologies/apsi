@@ -118,6 +118,35 @@ class Trainer(unittest.TestCase):
             b = GT.fit(m, m.init(seed=0), X, y, opt=Adam(0.01), ops=GT.Emulator(), **kw)
             np.testing.assert_allclose(a.history, b.history, rtol=1e-5)
 
+    def test_any_layer_and_any_loss(self):
+        """Layers with no kernel of their own (custom layers, lambdas, batch_norm) run on the processor inside a model
+        trained on the card, and a loss written as a function is evaluated there: the gradients and the training
+        equal NumPy."""
+        from apsi import ops as aops
+        from apsi.values import Record
+        rng = np.random.default_rng(0)
+        X, Y = rng.normal(size=(16, 10)), rng.normal(size=(16, 4))
+        cl = L.CustomLayer(lambda seed=0: Record(A=np.random.default_rng(seed).normal(size=(8, 8)) * 0.3,
+                                                 c=np.zeros(8)),
+                           lambda p, x, train=False: aops.tanh(x @ p.A) + p.c * x, "mine")
+        for m in (L.Sequential([L.Linear(10, 8), L.LambdaLayer(lambda x: x * aops.sigmoid(2 * x)), L.Linear(8, 4)]),
+                  L.Sequential([L.Linear(10, 8), cl, L.Linear(8, 4)]),
+                  L.Sequential([L.Linear(10, 8, bias=False), L.BatchNorm(8), L.Activation("relu"), L.Linear(8, 4)])):
+            grads_match(self, m, X, Y, "mse")
+
+        def huber(p, y):
+            d = p - y
+            a = aops.abs_(d)
+            return aops.mean(aops.where(np.asarray(aops.raw(a)) < 1, 0.5 * d * d, a - 0.5))
+        m = L.Sequential([L.Linear(10, 16), L.LambdaLayer(lambda x: x * aops.sigmoid(x)), L.Linear(16, 4)])
+        kw = dict(loss=huber, epochs=3, batch_size=8, verbose=False, precision="fp32", val=(X, Y))
+        a = L.fit(m, m.init(seed=0), X, Y, opt=Adam(0.01), **kw)
+        b = GT.fit(m, m.init(seed=0), X, Y, opt=Adam(0.01), ops=GT.Emulator(), **kw)
+        np.testing.assert_allclose(a.history, b.history, rtol=1e-6)
+        np.testing.assert_allclose(a.val_history, b.val_history, rtol=1e-6)
+        with self.assertRaises(GT.TrainError):
+            GT.fit(m, m.init(seed=0), X, Y, opt=Adam(0.01), ops=[GT.Emulator(), GT.Emulator()], **kw)
+
     def test_mae_and_bce_losses(self):
         """mae and bce on the GPU trainer, one card, data parallel, a split model and a masked graph: the NumPy
         backend's losses."""
@@ -412,7 +441,7 @@ class Trainer(unittest.TestCase):
         self.assertIsNone(GT.supports(L.transformer_lm(30, d=16, heads=2, layers=1, context=8)))
         self.assertIsNone(GT.supports(L.Sequential([L.Conv2D(1, 2)])))
         self.assertIsNone(GT.supports(L.Sequential([L.LSTMLayer(4, 8)])))
-        self.assertIn("bilinear", GT.supports(L.Sequential([L.Bilinear(4, 4, 2)])))
+        self.assertIsNone(GT.supports(L.Sequential([L.Bilinear(4, 4, 2)])))         # (on the processor)
 
 
 @unittest.skipIf(GT.device()[0] is None, "no NVIDIA GPU")

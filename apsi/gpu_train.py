@@ -2120,6 +2120,94 @@ class _Conv2D(_Node):
         return dx
 
 
+class _HostLayer(_Node):
+    """Any other layer (a custom layer, a lambda, a layer the card has no kernel for): run on the processor with
+    Apsi's autodiff, its input and the current weights brought from the card, the output and the gradients sent
+    back. The rest of the model stays on the card; only this layer pays the copies."""
+
+    def __init__(self, net, key, layer, p):
+        super().__init__(net, key)
+        self.layer, self.p = layer, p
+        self.leaves = [a for a in tree_leaves(p) if isinstance(a, np.ndarray) and id(a) in net.offsets]
+        net.host_layers = getattr(net, "host_layers", 0) + 1
+
+    def _params(self):
+        o, net = self.net.ops, self.net
+        now = {}
+        for a in self.leaves:
+            w = net.param(a).w
+            now[id(a)] = o.get(w[0], a.size, w[1]).reshape(a.shape).astype(np.float64)
+        return tree_map(lambda a: now.get(id(a), a) if isinstance(a, np.ndarray) else a, self.p)
+
+    def _ctx(self):
+        return {"graph": self.net.graph} if self.net.graph is not None else {}
+
+    def _get(self, x, shape):
+        return self.net.ops.get(x[0], int(np.prod(shape)), x[1]).reshape(shape).astype(np.float64)
+
+    def _run(self, xs):
+        from . import ops as aops
+        self.rng = aops._RNG[0].bit_generator.state
+        p = self._params()
+        y = self.layer(p, xs if self.multi else xs[0], train=self.net.train, **self._ctx())
+        y = np.asarray(aops.raw(y), np.float32)
+        self.pnow, self.out_shape = p, tuple(y.shape)
+        out = self.buf("y", max(1, y.size))
+        self.net.ops.put(out[0], y.reshape(-1), out[1])
+        return out, tuple(y.shape)
+
+    def fwd(self, x, shape):
+        self.multi, self.shapes = False, [shape]
+        self.xs = [self._get(x, shape)]
+        return self._run(self.xs)
+
+    def fwd_multi(self, ins):
+        self.multi, self.shapes = True, [s_ for _, s_ in ins]
+        self.xs = [self._get(x, s_) for x, s_ in ins]
+        return self._run(self.xs)
+
+    def _grads(self, dy):
+        from . import ops as aops
+        from .stdlib import value_and_grad
+        p = self.pnow
+        layer, ctx, train, multi = self.layer, self._ctx(), self.net.train, self.multi
+        n = int(np.prod(self.out_shape))
+        dyh = self.net.ops.get(dy[0], n, dy[1]).reshape(self.out_shape).astype(np.float64)
+
+        def f(p_, *xs):
+            y = layer(p_, list(xs) if multi else xs[0], train=train, **ctx)
+            return aops.sum_(y * dyh)
+        g0 = aops._RNG[0].bit_generator.state
+        aops._RNG[0].bit_generator.state = self.rng       # the same random numbers as the forward pass
+        try:
+            _, g = value_and_grad(f, wrt=tuple(range(1 + len(self.xs))))(p, *self.xs)
+        finally:
+            aops._RNG[0].bit_generator.state = g0
+        gp, gxs = g[0], g[1:]
+        o, net = self.net.ops, self.net
+        flat = {id(a): t for a, t in zip(tree_leaves(p), tree_leaves(gp))}
+        orig = {id(b_): a for a, b_ in zip(tree_leaves(self.p), tree_leaves(p))}
+        for b_id, t in flat.items():
+            a = orig.get(b_id)
+            if a is None or not isinstance(a, np.ndarray) or id(a) not in net.offsets:
+                continue
+            tmp = self.gbuf(("pg", id(a)), a.size)
+            o.put(tmp[0], np.asarray(aops.raw(t), np.float32).reshape(-1), tmp[1])
+            o.axpy(net.param(a).g, tmp, a.size, 1.0)
+        outs = []
+        for i, (gx, s_) in enumerate(zip(gxs, self.shapes)):
+            d = self.gbuf(("dx", i), int(np.prod(s_)))
+            o.put(d[0], np.asarray(aops.raw(gx), np.float32).reshape(-1), d[1])
+            outs.append(d)
+        return outs
+
+    def bwd(self, dy, need_dx=True):
+        return self._grads(dy)[0]
+
+    def bwd_multi(self, dy):
+        return self._grads(dy)
+
+
 class _LastStep(_Node):
     def fwd(self, x, shape):
         B, T, D = shape
@@ -3057,8 +3145,10 @@ class Net:
             return _GAT(self, key, layer, p)
         if isinstance(layer, L.GraphPool):
             return _GraphPool(self, key, layer)
-        raise TrainError(f"layer '{getattr(layer, 'kind', kind)}' is not on the GPU trainer yet "
-                         "(backend=\"torch\" or \"numpy\" trains it)")
+        if os.environ.get("APSI_GPU_HOST_LAYERS", "1").strip() in ("0", "false", "no"):
+            raise TrainError(f"layer '{getattr(layer, 'kind', kind)}' is not on the GPU trainer yet "
+                             "(backend=\"torch\" or \"numpy\" trains it)")
+        return _HostLayer(self, key, layer, p)              # on the processor, the rest on the card
 
     def round_weights(self):
         if self.kind:
@@ -3200,6 +3290,10 @@ def fit(model, params, X, y=None, loss="mse", opt=None, epochs=10, batch_size=No
                 raise TrainError("a graph model trains on one card (its nodes depend on each other in every step)")
             ops = ops[0]
         batch_size = None
+    if isinstance(ops, (list, tuple)) and callable(loss):
+        if len(ops) > 1:
+            raise TrainError("a loss written as a function trains on one card (device=\"cuda\")")
+        ops = ops[0]
     if isinstance(ops, (list, tuple)):
         if len(ops) > 1 and (mode == "pipeline" or stages is not None or (mode == "auto" and _too_big(ops, params, opt))):
             from .gpu_pipeline import fit_pipeline
@@ -3220,8 +3314,13 @@ def fit(model, params, X, y=None, loss="mse", opt=None, epochs=10, batch_size=No
                 from .gpu_pipeline import fit_pipeline
                 return fit_pipeline(many, model, params, X, y, loss, opt, epochs, batch_size, seed, verbose, clip,
                                     schedule, val, precision, ema, ewc, stages, micro_batches)
+    custom = callable(loss)                              # a loss function: evaluated on the processor
+    if custom:
+        if isinstance(ops, (list, tuple)) and len(ops) > 1:
+            raise TrainError("a loss written as a function trains on one card (device=\"cuda\")")
+        loss_fn, loss = loss, "custom"
     loss = str(loss)
-    if loss not in LOSSES:
+    if loss not in LOSSES and not custom:
         raise TrainError(f"loss '{loss}' is not on the GPU trainer ({', '.join(LOSSES)})")
     opt = opt or Adam(1e-3)
     if not isinstance(opt, (Adam, SGD)):
@@ -3231,6 +3330,9 @@ def fit(model, params, X, y=None, loss="mse", opt=None, epochs=10, batch_size=No
     Xa = _inputs(aops.raw(X), ids)
     Ya = np.asarray(aops.raw(X if y is None else y))
     ce = loss == "cross_entropy"
+    Yorig = np.asarray(aops.raw(X if y is None else y)) if custom else None
+    if custom and Yorig.dtype.kind not in "fiub":
+        raise TrainError("a loss function on the GPU trainer takes numeric targets")
     Ya = np.ascontiguousarray(Ya.astype(np.int32) if ce else Ya.astype(np.float32))
     sel = None
     if mask is not None:                               # only these rows count in the loss
@@ -3295,6 +3397,7 @@ def fit(model, params, X, y=None, loss="mse", opt=None, epochs=10, batch_size=No
         ops._lib.cuEventRecord(e0, None)
         marks.append(e0)
     history, val_hist, step = [], [], 0
+    host_loss = [0.0] * max(1, E)
     INV = MT = None
     ops.fill((net.G, 0), net.n, 0.0)
     from . import thermal
@@ -3325,7 +3428,18 @@ def fit(model, params, X, y=None, loss="mse", opt=None, epochs=10, batch_size=No
                 out, shape = net.forward(Xd, xb.shape)
                 rows = _rows(shape)
                 dout = net.arena.get("dout", rows * shape[-1])
-                if ce:
+                if custom:                                  # the loss and its gradient on the processor
+                    from .stdlib import value_and_grad
+                    oh = ops.get(out[0], rows * shape[-1], out[1]).reshape(shape).astype(np.float64)
+                    yh = yb if Yorig is None else (Yorig[b] if graph is None else Yorig)
+                    pick = np.nonzero(sel)[0] if sel is not None else None
+
+                    def lf(o_):
+                        return loss_fn(o_[pick], yh[pick]) if pick is not None else loss_fn(o_, yh)
+                    lv, gh = value_and_grad(lf)(oh)
+                    ops.put(dout[0], np.asarray(aops.raw(gh), np.float32).reshape(-1), dout[1])
+                    host_loss[ep] += float(aops.raw(lv)) * (1.0 if graph is not None else len(b) / n)
+                elif ce:
                     valid = int((yb >= 0).sum())
                     w = 1.0 / max(valid, 1)
                     if yb.size != rows:
@@ -3391,12 +3505,17 @@ def fit(model, params, X, y=None, loss="mse", opt=None, epochs=10, batch_size=No
             show = verbose and (ep % max(1, E // 10) == 0 or ep == E - 1)
             extra = ""
             if val is not None:                             # (these wait for the card; without them nothing does)
-                vl = _eval_loss(net, ops, val, ids, loss, bs if graph is None else 1 << 62)
+                if custom:
+                    vx_, vy_ = val
+                    vo = _forward_batches(net, ops, _inputs(aops.raw(vx_), ids), bs if graph is None else 1 << 62)
+                    vl = float(aops.raw(loss_fn(vo.astype(np.float64), np.asarray(aops.raw(vy_)))))
+                else:
+                    vl = _eval_loss(net, ops, val, ids, loss, bs if graph is None else 1 << 62)
                 val_hist.append(vl)
                 extra = f"  val {vl:.5f}"
             if show:
                 print(f"epoch {ep:4}  loss {float(ops.get(LOSSE, 1, ep)[0]):.5f}{extra}")
-        history = [float(v) for v in ops.get(LOSSE, max(1, E))[:E]]
+        history = [float(v) for v in ops.get(LOSSE, max(1, E))[:E]] if not custom else list(host_loss)
         if can_mark:
             ops.sync()
             ms = ctypes.c_float()
