@@ -348,6 +348,9 @@ class Emulator(_Ops):
         else:
             y[:, off:off + w] = x
 
+    def colmul(self, X, S, Y, n, D):
+        self.v(Y, n)[:] = (self.v(X, n).reshape(-1, D) * self.v(S, D)).reshape(-1)
+
     def rope(self, X, CS, SN, rows, hd, H, T, sign):
         half = hd // 2
         x = self.v(X, rows * hd).reshape(rows, hd)
@@ -769,6 +772,9 @@ class Gpu(_Ops):
     def cols(self, X, Y, rows, w, ld, off, back):
         self._go("cols", self.blocks(rows * w), 256, self.p(X), self.p(Y), ("u", rows), ("u", w), ("u", ld),
                  ("u", off), ("u", 1 if back else 0))
+
+    def colmul(self, X, S, Y, n, D):
+        self._go("colmul", self.blocks(n), 256, self.p(X), self.p(S), self.p(Y), ("u", n), ("u", D))
 
     def rope(self, X, CS, SN, rows, hd, H, T, sign):
         self._go("rope", self.blocks(rows * (hd // 2)), 256, self.p(X), self.p(CS), self.p(SN), ("u", rows), ("u", hd),
@@ -1383,38 +1389,44 @@ class _Attention(_Node):
             ix = self.idx[M] = (b, 0)
         return ix
 
-    def fwd(self, x, shape, residual=None):
+    def fwd(self, x, shape, residual=None, mem=None):
+        """mem=(x_mem, shape_mem): cross-attention, the keys and values from x_mem ([batch, S, features])."""
         if len(shape) != 3:
             raise TrainError("multi_head_attention on the GPU takes [batch, time, features]")
         o, (B, T, D), h, kvh = self.net.ops, shape, self.h, self.kvh
+        xm, S = (x, T) if mem is None else (mem[0], int(mem[1][1]))
+        if mem is not None and (len(mem[1]) != 3 or mem[1][0] != B or mem[1][2] != D):
+            raise TrainError(f"cross-attention: the memory is {tuple(mem[1])}, the query {tuple(shape)}")
         hd = D // h
-        M, Dkv = B * T, kvh * hd
-        self.x, self.B, self.T = x, B, T
+        M, Mk, Dkv = B * T, B * S, kvh * hd
+        self.x, self.xm, self.cross, self.B, self.T, self.S = x, xm, mem is not None, B, T, S
         ps = self.net.passes
-        q, k, v = self.buf("q", M * D), self.buf("k", M * Dkv), self.buf("v", M * Dkv)
-        for W, out, N in ((self.Wq, q, D), (self.Wk, k, Dkv), (self.Wv, v, Dkv)):
-            o.gemm(x, W.w, out, M, N, D, D, 1, N, 1, N, passes=ps)
+        q, k, v = self.buf("q", M * D), self.buf("k", Mk * Dkv), self.buf("v", Mk * Dkv)
+        o.gemm(x, self.Wq.w, q, M, D, D, D, 1, D, 1, D, passes=ps)
+        for W, out in ((self.Wk, k), (self.Wv, v)):
+            o.gemm(xm, W.w, out, Mk, Dkv, D, D, 1, Dkv, 1, Dkv, passes=ps)
         if self.qkn:                                    # an RMS norm of every head's query and key
             self.qraw, self.kraw = q, k
             self.qm, self.qr = self.buf("qm", M * h), self.buf("qr", M * h)
-            self.km, self.kr = self.buf("km", M * kvh), self.buf("kr", M * kvh)
-            qn, kn = self.buf("qn", M * D), self.buf("kn", M * Dkv)
+            self.km, self.kr = self.buf("km", Mk * kvh), self.buf("kr", Mk * kvh)
+            qn, kn = self.buf("qn", M * D), self.buf("kn", Mk * Dkv)
             o.ln_f(q, self.gq.w, None, qn, self.qm, self.qr, M * h, hd, self.eps, True)
-            o.ln_f(k, self.gk.w, None, kn, self.km, self.kr, M * kvh, hd, self.eps, True)
+            o.ln_f(k, self.gk.w, None, kn, self.km, self.kr, Mk * kvh, hd, self.eps, True)
             q, k = qn, kn
         if self.rope:
             cs, sn = self._tables(T)
             o.rope(q, cs, sn, M * h, hd, h, T, 1.0)
-            o.rope(k, cs, sn, M * kvh, hd, kvh, T, 1.0)
+            cs, sn = self._tables(S)
+            o.rope(k, cs, sn, Mk * kvh, hd, kvh, S, 1.0)
         if kvh != h:                                    # each key / value head to the query heads it serves
-            ix = self._kv_index(M)
-            kf, vf = self.buf("kf", M * D), self.buf("vf", M * D)
-            o.gather(k, ix, kf, M * h, hd, 0)
-            o.gather(v, ix, vf, M * h, hd, 0)
+            ix = self._kv_index(Mk)
+            kf, vf = self.buf("kf", Mk * D), self.buf("vf", Mk * D)
+            o.gather(k, ix, kf, Mk * h, hd, 0)
+            o.gather(v, ix, vf, Mk * h, hd, 0)
             k, v = kf, vf
         self.q, self.k, self.v = q, k, v
         sc = 1.0 / math.sqrt(hd)
-        self.fused = ps == 1 and getattr(o, "flash", False) and hd in KS.FLASH_HD and D % 4 == 0
+        self.fused = ps == 1 and getattr(o, "flash", False) and hd in KS.FLASH_HD and D % 4 == 0 and not self.cross
         if self.fused:                                  # scores, softmax and the weighted sum in one kernel
             att, self.L = self.buf("att", M * D), self.buf("lse", B * h * T)
             o.flash_fwd(q, k, v, att, self.L, B, T, h, hd, self.causal, sc)
@@ -1423,14 +1435,14 @@ class _Attention(_Node):
             o.gemm(att, self.Wo.w, y, M, D, D, D, 1, D, 1, D, bias=self.bo.w, passes=ps, epi=3 if residual else 0,
                    X2=residual)
             return y, shape
-        S, P = self.buf("s", B * h * T * T), self.buf("p", B * h * T * T)
+        Sc, P = self.buf("s", B * h * T * S), self.buf("p", B * h * T * S)
         # S[b, h](t, s) = q[b, t, h, :] . k[b, s, h, :] * sc
-        o.gemm(q, k, S, T, T, hd, D, 1, 1, D, T, alpha=sc, batch=(B, h), sa=(T * D, hd), sb=(T * D, hd),
-               sc=(h * T * T, T * T), passes=ps)
-        o.softmax_f(S, P, B * h * T, T, T, self.causal)
+        o.gemm(q, k, Sc, T, S, hd, D, 1, 1, D, S, alpha=sc, batch=(B, h), sa=(T * D, hd), sb=(S * D, hd),
+               sc=(h * T * S, T * S), passes=ps)
+        o.softmax_f(Sc, P, B * h * T, S, T, self.causal)
         self.P = P
         att = self.buf("att", M * D)                    # [b, t, h, :] = P[b, h] @ v[b, :, h, :]
-        o.gemm(P, v, att, T, hd, T, T, 1, D, 1, D, batch=(B, h), sa=(h * T * T, T * T), sb=(T * D, hd),
+        o.gemm(P, v, att, T, hd, S, S, 1, D, 1, D, batch=(B, h), sa=(h * T * S, T * S), sb=(S * D, hd),
                sc=(T * D, hd), passes=ps)
         self.att = att
         y = self.buf("y", M * D)
@@ -1439,8 +1451,9 @@ class _Attention(_Node):
         return y, shape
 
     def bwd(self, dy, need_dx=True):
-        o, B, T, D, h = self.net.ops, self.B, self.T, self.D, self.h
-        hd, M, ps = D // h, B * T, self.net.passes
+        """The input's gradient; for cross-attention (the query's gradient, the memory's gradient)."""
+        o, B, T, S, D, h = self.net.ops, self.B, self.T, self.S, self.D, self.h
+        hd, M, Mk, ps = D // h, B * T, B * S, self.net.passes
         sc = 1.0 / math.sqrt(hd)
         o.gemm(self.att, dy, self.Wo.g, D, D, M, 1, D, D, 1, D, beta=True, passes=ps, db=self.bo.g)
         datt = self.gbuf("datt", M * D)
@@ -1451,51 +1464,318 @@ class _Attention(_Node):
             dq, dk, dv = self.gbuf("dq", M * D), self.gbuf("dk", M * D), self.gbuf("dv", M * D)
             o.flash_bwd(self.q, self.k, self.v, datt, self.L, dd, dq, dk, dv, B, T, h, hd, self.causal, sc)
             return self._grads_in(dq, dk, dv, M, D, ps)
-        dP = self.gbuf("dp", B * h * T * T)               # dP = datt v^T
-        o.gemm(datt, self.v, dP, T, T, hd, D, 1, 1, D, T, batch=(B, h), sa=(T * D, hd), sb=(T * D, hd),
-               sc=(h * T * T, T * T), passes=ps)
-        dv = self.gbuf("dv", M * D)                       # dv = P^T datt
-        o.gemm(self.P, datt, dv, T, hd, T, 1, T, D, 1, D, batch=(B, h), sa=(h * T * T, T * T), sb=(T * D, hd),
-               sc=(T * D, hd), passes=ps)
-        dS = self.gbuf("ds", B * h * T * T)
-        o.softmax_b(self.P, dP, dS, B * h * T, T)
-        dq, dk = self.gbuf("dq", M * D), self.gbuf("dk", M * D)
-        o.gemm(dS, self.k, dq, T, hd, T, T, 1, D, 1, D, alpha=sc, batch=(B, h), sa=(h * T * T, T * T),
-               sb=(T * D, hd), sc=(T * D, hd), passes=ps)                                   # dq = dS k
-        o.gemm(dS, self.q, dk, T, hd, T, 1, T, D, 1, D, alpha=sc, batch=(B, h), sa=(h * T * T, T * T),
-               sb=(T * D, hd), sc=(T * D, hd), passes=ps)                                   # dk = dS^T q
+        dP = self.gbuf("dp", B * h * T * S)               # dP = datt v^T
+        o.gemm(datt, self.v, dP, T, S, hd, D, 1, 1, D, S, batch=(B, h), sa=(T * D, hd), sb=(S * D, hd),
+               sc=(h * T * S, T * S), passes=ps)
+        dv = self.gbuf("dv", Mk * D)                      # dv = P^T datt
+        o.gemm(self.P, datt, dv, S, hd, T, 1, S, D, 1, D, batch=(B, h), sa=(h * T * S, T * S), sb=(T * D, hd),
+               sc=(S * D, hd), passes=ps)
+        dS = self.gbuf("ds", B * h * T * S)
+        o.softmax_b(self.P, dP, dS, B * h * T, S)
+        dq, dk = self.gbuf("dq", M * D), self.gbuf("dk", Mk * D)
+        o.gemm(dS, self.k, dq, T, hd, S, S, 1, D, 1, D, alpha=sc, batch=(B, h), sa=(h * T * S, T * S),
+               sb=(S * D, hd), sc=(T * D, hd), passes=ps)                                   # dq = dS k
+        o.gemm(dS, self.q, dk, S, hd, T, 1, S, D, 1, D, alpha=sc, batch=(B, h), sa=(h * T * S, T * S),
+               sb=(T * D, hd), sc=(S * D, hd), passes=ps)                                   # dk = dS^T q
         return self._grads_in(dq, dk, dv, M, D, ps)
 
     def _grads_in(self, dq, dk, dv, M, D, ps):
         o, h, kvh = self.net.ops, self.h, self.kvh
         hd = D // h
         Dkv = kvh * hd
+        Mk = self.B * self.S
         if kvh != h:                                    # the copies' gradients summed back into each kv head
-            ix = self._kv_index(M)
-            dks, dvs = self.gbuf("dks", M * Dkv), self.gbuf("dvs", M * Dkv)
-            o.fill(dks, M * Dkv, 0.0)
-            o.fill(dvs, M * Dkv, 0.0)
-            o.embed_b(dk, ix, dks, M * h, hd, M * kvh)
-            o.embed_b(dv, ix, dvs, M * h, hd, M * kvh)
+            ix = self._kv_index(Mk)
+            dks, dvs = self.gbuf("dks", Mk * Dkv), self.gbuf("dvs", Mk * Dkv)
+            o.fill(dks, Mk * Dkv, 0.0)
+            o.fill(dvs, Mk * Dkv, 0.0)
+            o.embed_b(dk, ix, dks, Mk * h, hd, Mk * kvh)
+            o.embed_b(dv, ix, dvs, Mk * h, hd, Mk * kvh)
             dk, dv = dks, dvs
         if self.rope:                                   # the inverse rotation
             cs, sn = self._tables(self.T)
             o.rope(dq, cs, sn, M * h, hd, h, self.T, -1.0)
-            o.rope(dk, cs, sn, M * kvh, hd, kvh, self.T, -1.0)
+            cs, sn = self._tables(self.S)
+            o.rope(dk, cs, sn, Mk * kvh, hd, kvh, self.S, -1.0)
         if self.qkn:
-            dq2, dk2 = self.gbuf("dqn", M * D), self.gbuf("dkn", M * Dkv)
+            dq2, dk2 = self.gbuf("dqn", M * D), self.gbuf("dkn", Mk * Dkv)
             o.colsum(dq, self.qraw, self.qm, self.qr, self.gq.g, None, M * h, hd, 2)
             o.ln_b(self.qraw, self.gq.w, dq, self.qm, self.qr, dq2, M * h, hd, True, None)
-            o.colsum(dk, self.kraw, self.km, self.kr, self.gk.g, None, M * kvh, hd, 2)
-            o.ln_b(self.kraw, self.gk.w, dk, self.km, self.kr, dk2, M * kvh, hd, True, None)
+            o.colsum(dk, self.kraw, self.km, self.kr, self.gk.g, None, Mk * kvh, hd, 2)
+            o.ln_b(self.kraw, self.gk.w, dk, self.km, self.kr, dk2, Mk * kvh, hd, True, None)
             dq, dk = dq2, dk2
+        o.gemm(self.x, dq, self.Wq.g, D, D, M, 1, D, D, 1, D, beta=True, passes=ps)
+        for W, d in ((self.Wk, dk), (self.Wv, dv)):
+            o.gemm(self.xm, d, W.g, D, Dkv, Mk, 1, D, Dkv, 1, Dkv, beta=True, passes=ps)
         dx = self.gbuf("dx", M * D)
-        first = True
-        for W, d, N in ((self.Wq, dq, D), (self.Wk, dk, Dkv), (self.Wv, dv, Dkv)):
-            o.gemm(self.x, d, W.g, D, N, M, 1, D, N, 1, N, beta=True, passes=ps)
-            o.gemm(d, W.w, dx, M, D, N, N, 1, 1, N, D, beta=not first, passes=ps)
+        o.gemm(dq, self.Wq.w, dx, M, D, D, D, 1, 1, D, D, passes=ps)
+        dm = dx if not self.cross else self.gbuf("dmem", Mk * D)
+        first = self.cross
+        for W, d in ((self.Wk, dk), (self.Wv, dv)):
+            o.gemm(d, W.w, dm, Mk, D, Dkv, Dkv, 1, 1, Dkv, D, beta=not first, passes=ps)
             first = False
+        return (dx, dm) if self.cross else dx
+
+
+class _Identity(_Node):
+    """Identity, flatten, reshape: the same values, another shape."""
+
+    def __init__(self, net, key, layer=None):
+        super().__init__(net, key)
+        self.layer = layer
+
+    def fwd(self, x, shape):
+        from . import layers as L
+        l_ = self.layer
+        if isinstance(l_, L.Flatten):
+            return x, (shape[0], int(np.prod(shape[1:])))
+        if isinstance(l_, L.Reshape):
+            if int(np.prod(l_.shape)) != int(np.prod(shape[1:])):
+                raise TrainError(f"reshape: {tuple(shape)} cannot become (N, {', '.join(map(str, l_.shape))})")
+            return x, (shape[0],) + tuple(l_.shape)
+        return x, shape
+
+    def bwd(self, dy, need_dx=True):
+        return dy
+
+
+class _MeanPool(_Node):
+    """[B, T, D] -> [B, D], the mean over time (one product with a column of 1 / T each way)."""
+
+    def __init__(self, net, key, layer):
+        super().__init__(net, key)
+        if int(layer.axis) not in (1, -2):
+            raise TrainError(f"mean_pool(axis={layer.axis}) is not on the GPU trainer yet (axis=1)")
+        self.ones = {}
+
+    def _ones(self, T):
+        b = self.ones.get(T)
+        if b is None:
+            b = self.net.ops.alloc(T)
+            self.net.ops.fill((b, 0), T, 1.0 / T)
+            self.net.owned.append(b)
+            b = self.ones[T] = (b, 0)
+        return b
+
+    def fwd(self, x, shape):
+        if len(shape) != 3:
+            raise TrainError("mean_pool on the GPU takes [batch, time, features]")
+        B, T, D = shape
+        self.B, self.T, self.D = B, T, D
+        y = self.buf("y", B * D)
+        self.net.ops.gemm(self._ones(T), x, y, 1, D, T, T, 1, D, 1, D, batch=(B, 1), sa=(0, 0), sb=(T * D, 0),
+                          sc=(D, 0), passes=3)
+        return y, (B, D)
+
+    def bwd(self, dy, need_dx=True):
+        B, T, D = self.B, self.T, self.D
+        dx = self.gbuf("dx", B * T * D)
+        self.net.ops.gemm(self._ones(T), dy, dx, T, D, 1, 1, 1, D, 1, D, batch=(B, 1), sa=(0, 0), sb=(D, 0),
+                          sc=(T * D, 0), passes=3)
         return dx
+
+
+class _Scale(_Node):
+    """x * s (+ t), per feature."""
+
+    def __init__(self, net, key, layer, p):
+        super().__init__(net, key)
+        self.D = layer.d
+        self.s = net.param(p.s)
+        self.t = net.param(p.t) if layer.shift else None
+        self.consts = {}
+
+    def _consts(self, M):
+        c = self.consts.get(M)
+        if c is None:
+            o = self.net.ops
+            z, one = o.alloc(M), o.alloc(M)
+            o.fill((z, 0), M, 0.0)
+            o.fill((one, 0), M, 1.0)
+            self.net.owned += [z, one]
+            c = self.consts[M] = ((z, 0), (one, 0))
+        return c
+
+    def fwd(self, x, shape):
+        o, M, D = self.net.ops, _rows(shape), self.D
+        self.x, self.M = x, M
+        y = self.buf("y", M * D)
+        o.colmul(x, self.s.w, y, M * D, D)
+        if self.t is not None:
+            o.pos_f(y, self.t.w, y, M, D, 1)
+        return y, shape
+
+    def bwd(self, dy, need_dx=True):
+        o, M, D = self.net.ops, self.M, self.D
+        z, one = self._consts(M)                        # sum dy * x (and sum dy): the column sums of a norm
+        o.colsum(dy, self.x, z, one, self.s.g, self.t.g if self.t is not None else None, M, D,
+                 1 if self.t is not None else 2)
+        dx = self.gbuf("dx", M * D)
+        o.colmul(dy, self.s.w, dx, M * D, D)
+        return dx
+
+
+class _Combine(_Node):
+    """add, mul, mean or concat (last axis) of several inputs."""
+
+    def __init__(self, net, key, how):
+        super().__init__(net, key)
+        if how not in ("add", "mul", "mean", "concat"):
+            raise TrainError(f"combine '{how}' is not on the GPU trainer (add, mul, mean, concat)")
+        self.how = how
+
+    def fwd_multi(self, ins):
+        o = self.net.ops
+        shapes = [s_ for _, s_ in ins]
+        self.ins, self.shapes = [x for x, _ in ins], shapes
+        if self.how == "concat":
+            M = _rows(shapes[0])
+            if any(_rows(s_) != M or tuple(s_[:-1]) != tuple(shapes[0][:-1]) for s_ in shapes):
+                raise TrainError(f"concatenate: the shapes {shapes} differ before the last axis")
+            W = sum(s_[-1] for s_ in shapes)
+            y = self.buf("y", M * W)
+            off = 0
+            for x, s_ in ins:
+                o.cols(x, y, M, s_[-1], W, off, 0)
+                off += s_[-1]
+            self.M, self.W = M, W
+            return y, tuple(shapes[0][:-1]) + (W,)
+        if any(tuple(s_) != tuple(shapes[0]) for s_ in shapes):
+            raise TrainError(f"{self.how}: the inputs' shapes differ: {shapes}")
+        n = self.n = int(np.prod(shapes[0]))
+        y = self.buf("y", n)
+        if self.how == "mean":
+            o.fill(y, n, 0.0)
+            for x in self.ins:
+                o.axpy(y, x, n, 1.0 / len(self.ins))
+        elif self.how == "add":
+            o.add3(y, self.ins[0], self.ins[1], n) if len(self.ins) > 1 else o.pull(y, o, self.ins[0], n)
+            for x in self.ins[2:]:
+                o.axpy(y, x, n, 1.0)
+        else:
+            o.pull(y, o, self.ins[0], n)
+            for x in self.ins[1:]:
+                o.mul3(y, y, x, n)
+        return y, shapes[0]
+
+    def bwd_multi(self, dy):
+        o = self.net.ops
+        if self.how == "concat":
+            outs, off = [], 0
+            for i, s_ in enumerate(self.shapes):
+                dx = self.gbuf(("dx", i), self.M * s_[-1])
+                o.cols(dx, dy, self.M, s_[-1], self.W, off, 1)
+                off += s_[-1]
+                outs.append(dx)
+            return outs
+        n = self.n
+        if self.how == "add":
+            return [dy] * len(self.ins)
+        if self.how == "mean":
+            dx = self.gbuf("dx", n)
+            o.fill(dx, n, 0.0)
+            o.axpy(dx, dy, n, 1.0 / len(self.ins))
+            return [dx] * len(self.ins)
+        outs = []
+        for i in range(len(self.ins)):
+            dx = self.gbuf(("dx", i), n)
+            o.pull(dx, o, dy, n)
+            for j, x in enumerate(self.ins):
+                if j != i:
+                    o.mul3(dx, dx, x, n)
+            outs.append(dx)
+        return outs
+
+
+class _Grads:
+    """The gradients of named values in a graph of layers: the first contribution kept as it is, later ones added
+    into a buffer of the owner's own (never into a buffer another layer gave)."""
+
+    def __init__(self, node, shapes):
+        self.node, self.shapes, self.g, self.own = node, shapes, {}, set()
+
+    def add(self, name, dx):
+        if dx is None:
+            return
+        if name not in self.g:
+            self.g[name] = dx
+            return
+        o, n = self.node.net.ops, int(np.prod(self.shapes[name]))
+        if name not in self.own:
+            acc = self.node.gbuf(("acc", name), n)
+            o.pull(acc, o, self.g[name], n)
+            self.g[name], _ = acc, self.own.add(name)
+        o.axpy(self.g[name], dx, n, 1.0)
+
+
+def _fwd_multi(nd, ins):
+    if hasattr(nd, "fwd_multi"):
+        return nd.fwd_multi(ins)
+    if isinstance(nd, _Attention) and len(ins) == 2:
+        return nd.fwd(ins[0][0], ins[0][1], mem=ins[1])
+    raise TrainError(f"a layer of the GPU trainer got {len(ins)} inputs (combine layers and cross-attention take "
+                     "several)")
+
+
+def _bwd_multi(nd, dy):
+    return nd.bwd_multi(dy) if hasattr(nd, "bwd_multi") else list(nd.bwd(dy, True))
+
+
+class _DAG(_Node):
+    """Any directed acyclic graph of layers (dag(...)): values by name, the gradients added where a value feeds
+    several layers."""
+
+    def __init__(self, net, key, layer, p, gk):
+        super().__init__(net, key)
+        if len(layer.inputs) != 1:
+            raise TrainError("dag on the GPU trainer: one input for now (inputs=[\"x\"])")
+        if not isinstance(layer.output, str):
+            raise TrainError("dag on the GPU trainer: one output (output=\"name\")")
+        self.inp, self.out = layer.inputs[0], layer.output
+        self.items = [(name, net.compile(l_, getattr(p, name), f"{key}.{name}", f"{gk}.{name}"), srcs, single)
+                      for name, l_, srcs, single in layer.nodes]
+
+    def fwd(self, x, shape):
+        vals = {self.inp: (x, shape)}
+        for name, nd, srcs, single in self.items:
+            vals[name] = nd.fwd(*vals[srcs[0]]) if single else _fwd_multi(nd, [vals[s_] for s_ in srcs])
+        self.shapes = {k_: v[1] for k_, v in vals.items()}
+        return vals[self.out]
+
+    def bwd(self, dy, need_dx=True):
+        G = _Grads(self, self.shapes)
+        G.g[self.out] = dy
+        for name, nd, srcs, single in reversed(self.items):
+            g = G.g.pop(name, None)
+            if g is None:
+                continue
+            if single:
+                G.add(srcs[0], nd.bwd(g, need_dx or srcs[0] != self.inp))
+            else:
+                for s_, dx in zip(srcs, _bwd_multi(nd, g)):
+                    G.add(s_, dx)
+        return G.g.get(self.inp)
+
+
+class _Parallel(_Node):
+    """Branches on the same input, combined (concat, add, mul, mean)."""
+
+    def __init__(self, net, key, layer, p, gk):
+        super().__init__(net, key)
+        self.branches = [net.compile(b_, pp, f"{key}.{i}", f"{gk}.{i}") for i, (b_, pp) in
+                         enumerate(zip(layer.branches, p))]
+        self.comb = _Combine(net, key + ".c", layer.combine)
+        self.comb.gkey = gk + ".c"
+
+    def fwd(self, x, shape):
+        self.shape = shape
+        return self.comb.fwd_multi([b_.fwd(x, shape) for b_ in self.branches])
+
+    def bwd(self, dy, need_dx=True):
+        G = _Grads(self, {"x": self.shape})
+        for b_, d in zip(self.branches, self.comb.bwd_multi(dy)):
+            G.add("x", b_.bwd(d, need_dx))
+        return G.g.get("x")
 
 
 class _GraphDev:
@@ -1943,6 +2223,20 @@ class Net:
             return _Attention(self, key, layer, p)
         if isinstance(layer, L.SwiGLU):
             return _SwiGLU(self, key, layer, p)
+        if isinstance(layer, L.DAG):
+            return _DAG(self, key, layer, p, gk)
+        if isinstance(layer, L.Parallel):
+            if layer.combine == "list":
+                raise TrainError("parallel(combine=\"list\") is not on the GPU trainer (concat, add, mul, mean)")
+            return _Parallel(self, key, layer, p, gk)
+        if isinstance(layer, L.Combine):
+            return _Combine(self, key, layer.how)
+        if isinstance(layer, (L.Identity, L.Flatten, L.Reshape)):
+            return _Identity(self, key, layer)
+        if isinstance(layer, L.MeanPool):
+            return _MeanPool(self, key, layer)
+        if isinstance(layer, L.Scale):
+            return _Scale(self, key, layer, p)
         if isinstance(layer, L.GCN):
             return _GCN(self, key, layer, p)
         if isinstance(layer, L.SAGE):

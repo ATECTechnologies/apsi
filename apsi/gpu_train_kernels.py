@@ -24,7 +24,7 @@ TILE = 64
 MAIN = ("apsi_kernel", "axpy", "add3", "mul3", "act_f", "act_b", "colsum", "ln_f", "ln_b", "embed_f", "embed_b",
         "pos_f", "pos_b", "softmax_f", "softmax_b", "ce", "mse", "sumsq", "adam", "sgd", "drop_f", "fakeq",
         "gemm_simt", "gather", "rope", "spmm", "edge_dot", "seg_softmax", "seg_softmax_b", "dot_acc", "scale_add",
-        "cols")
+        "cols", "colmul")
 TC = ("apsi_kernel", "gemm_tc3")                     # apsi_kernel = the one-pass product
 
 
@@ -555,6 +555,12 @@ def _main_module():
             with fw:
                 k.st(k.ld(p["X"], i), p["Y"], j)
     k.grid_loop(b.mul(p["rows"], p["w"]), cols)
+    k.ret()
+
+    # colmul: Y[i] = X[i] * S[i % D]   (a scale per feature)
+    k = K("colmul", [("X", G(f32)), ("S", G(f32)), ("Y", G(f32)), ("n", i32), ("D", i32)])
+    b, p = k.b, k.p
+    k.grid_loop(p["n"], lambda i: k.st(b.fmul(k.ld(p["X"], i), k.ld(p["S"], b.urem(i, p["D"]))), p["Y"], i))
     k.ret()
 
     # ------------------------------------------------------------------------- attention softmax, a block a row

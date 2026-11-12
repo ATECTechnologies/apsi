@@ -82,6 +82,32 @@ class Trainer(unittest.TestCase):
         r = GT.fit(lm, lm.init(seed=0), ids, lab, ops=e, **dict(kw, opt=Adam(3e-3))).history
         np.testing.assert_allclose(ref, r, rtol=3e-3)
 
+    def test_any_architecture_is_exact(self):
+        """dag / parallel / add / multiply / concatenate / mean, scale, identity, reshape, flatten, mean_pool and
+        cross-attention (queries from one value, keys and values from another of any length; grouped heads, rotary
+        positions and q/k norms too): the gradients equal autodiff."""
+        rng = np.random.default_rng(0)
+        X, Y = rng.normal(size=(16, 10)), rng.normal(size=(16, 4))
+        d = L.DAG([["h1", L.Linear(10, 16), "x"], ["h2", L.Sequential([L.Linear(10, 16), L.Activation("tanh")]), "x"],
+                   ["s", L.add(), ["h1", "h2"]], ["m", L.multiply(), ["s", "h2"]],
+                   ["c", L.concatenate(), ["m", "h1", "x"]], ["mean", L.Combine("mean"), ["h1", "h2"]],
+                   ["c2", L.concatenate(), ["c", "mean"]], ["sc", L.Scale(58), "c2"], ["out", L.Linear(58, 4), "sc"]],
+                  inputs=["x"], output="out")
+        grads_match(self, L.Sequential([d]), X, Y, "mse")
+        grads_match(self, L.Sequential([L.Linear(10, 8), L.Parallel([L.Linear(8, 6), L.Sequential(
+            [L.Linear(8, 6), L.Activation("relu")])], "concat"), L.Scale(12, shift=False), L.Linear(12, 4)]), X, Y, "mse")
+        grads_match(self, L.Sequential([L.Linear(10, 8), L.Parallel([L.Linear(8, 8), L.Identity()], "mul"),
+                                        L.Parallel([L.Linear(8, 8), L.Identity()], "mean"), L.Linear(8, 4)]), X, Y,
+                    "mse")
+        grads_match(self, L.Sequential([L.Reshape(2, 5), L.Linear(5, 6), L.Flatten(), L.Linear(12, 4)]), X, Y, "mse")
+        grads_match(self, L.transformer_classifier(23, 3, d=32, heads=4, layers=1, context=12),
+                    rng.integers(0, 23, (4, 12)), rng.integers(0, 3, 4), "cross_entropy")
+        for kw in (dict(), dict(kv_heads=2, rope=True, qk_norm=True), dict(causal=True, kv_heads=1)):
+            d = L.DAG([["m0", L.Linear(16, 32), "x"], ["mem", L.Reshape(14, 16), "m0"],
+                       ["ca", L.MultiHeadAttention(16, 4, **kw), ["x", "mem"]], ["r", L.add(), ["ca", "x"]],
+                       ["out", L.Linear(16, 5), "r"]], inputs=["x"], output="out")
+            grads_match(self, L.Sequential([d]), rng.normal(size=(3, 7, 16)), rng.normal(size=(3, 7, 5)), "mse")
+
     def test_graph_networks_are_exact(self):
         """Sparse graphs on the GPU trainer (GCN, GraphSAGE, GIN, GAT, pooling per graph; CSR kernels with no
         atomics): node and graph tasks, masks, validation and predict equal the NumPy backend."""

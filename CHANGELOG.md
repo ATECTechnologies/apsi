@@ -24,6 +24,10 @@
   additions, the same result every run. New kernels: sparse products with per-edge, per-head weights, the edge
   softmax and its gradient, edge dot products.
 - **More activations on the card:** elu, softplus, mish.
+- **Any architecture on the GPU trainer:** `dag(...)` (values by name, gradients added where a value feeds several
+  layers), `parallel`, `add` / `multiply` / `concatenate` / mean, `scale`, `identity`, `reshape`, `flatten`,
+  `mean_pool` (so `transformer_classifier`), and cross-attention: `multi_head_attention` on `["query", "memory"]` with
+  any memory length, grouped heads, rotary positions and q/k norms.
 - The same result as one card with the whole batch (tested with Adam, AdamW, SGD, clipping over the whole model, EMA,
   EWC, low-bit precision); a failure on any card stops all of them at once with that card's error.
 
