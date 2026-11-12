@@ -133,6 +133,24 @@ class WholeModel(unittest.TestCase):
         self.assertLess(r.history[-1], 0.6 * r.history[0])
 
 
+class FromCode(unittest.TestCase):
+    def test_code_graph_is_glas(self):
+        from apsi import gla_graph as GG
+        src = "def a():\n    i = 1\n    return i\n\ndef b():\n    print(i)\n\nx = a()\n"
+        n, e = GG.code_graph(src)
+        lab = [x["ntype"] + ":" + str(x["tok"]) for x in n]
+        flows = [(a_, z_) for a_, r_, z_ in e if r_ == "dataflow"]
+        self.assertEqual(len(flows), 1)                       # i in a() reaches its use; b()'s i is another name
+        self.assertTrue(any(r_ == "invokes" and n[z_]["ntype"] == "func" for _, r_, z_ in e))
+        rid = set(GL.relation_table())
+        self.assertTrue(all((n[a_]["ntype"], r_, n[z_]["ntype"]) in rid for a_, r_, z_ in e))
+        self.assertTrue(lab)
+        s1 = GG.sample(src, "call a then print", [10, 11])
+        X, Y, g = GL.gla_batch([s1, s1])
+        m = GL.gla("tiny")
+        self.assertEqual(np.shape(m(m.init(0), X, graph=g)[0]), (2, 3, 96))
+
+
 class WrittenInApsi(unittest.TestCase):
     def test_a_layer_written_in_apsi_trains_on_one_card_and_many(self):
         """A layer the GPU trainer has no kernel for, written in Apsi (its forward takes only what it needs: graph=,

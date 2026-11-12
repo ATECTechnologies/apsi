@@ -1982,9 +1982,10 @@ def module(interp=None):
         torch_module=guarded(torch_module, "torch_module()"), params_from_torch=guarded(params_from_torch, "params_from_torch()"),
         devices=devices_, check_torch=guarded(check_torch, "check_torch()"),
     )
-    from . import graphs, gla                # long-range graph layers (graph_transformer, global_attention, …), GLA
+    from . import graphs, gla, gla_graph     # long-range graph layers (graph_transformer, global_attention, …), GLA
     names.update(graphs.names())
     names.update(gla.names())
+    names.update(gla_graph.names())
     return names
 
 

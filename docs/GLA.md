@@ -46,6 +46,10 @@ through it unchanged, so three brains over one graph compute what GLA's per-type
 A sample (`gla_sample`) is a code graph and a text graph — each a list of `gla_node(type, token, depth, sibling,
 line, …)` and edges `(from, relation, to)` — the answer to write (token ids), and the validity and issue labels.
 
+From real code: `gla_from_code(source, text, answer)` makes a sample from Python source with GLA's own builder
+(`gla_code_graph`: the syntax tree, control flow, scope- and order-aware data flow, program dependences, calls and
+the system dependence graph, with GLA's structural codes and hashed text) and `gla_text_graph` for the text.
+
 ## The loss
 
 `gla_loss(outputs, targets)` is GLA 3.0's: the writer's next-token loss on the answer, `0.3` validity (BCE),

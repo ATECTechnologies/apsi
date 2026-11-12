@@ -9,6 +9,9 @@
   part (`gla_count`, `gla_parts`; 21b: 20,480,386,836). `gla_batch`, `gla_loss` (GLA 3.0's losses), `gla_task`,
   `gla_accuracy`. It trains on NumPy, on one card and split across cards, the same training step for step.
   `docs/GLA.md`, `examples/45_gla.apsi`.
+- **Real code as GLA input:** `gla_from_code(source, text, answer)`, `gla_code_graph(source)` (GLA's Python code
+  property graph builder: AST, CFG, scope- and order-aware DFG / PDG, calls, SDG; GLA's structural codes),
+  `gla_text_graph(text)`.
 - **Brains that own node types and relations:** `types=[…]` and `relations=[…]` on `hgt`, `typed_linear`,
   `typed_norm`, `global_attention`; nodes of other types pass through, edges of other relations are not read, so
   several brains share one graph. `hgt_brain` (input projection, hgt layers, global attention, GLA's centred graph
