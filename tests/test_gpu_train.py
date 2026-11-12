@@ -102,6 +102,22 @@ class Trainer(unittest.TestCase):
         b = GT.fit(m, m.init(seed=0), X[:, :, :12, :12], y, opt=Adam(0.01), ops=GT.Emulator(), **kw)
         np.testing.assert_allclose(a.history, b.history, rtol=1e-5)
 
+    def test_recurrent_layers_are_exact(self):
+        """lstm and gru (sequences or the last step), last_step: gradients equal autodiff; training equals NumPy."""
+        rng = np.random.default_rng(0)
+        X, y, ys = rng.normal(size=(5, 7, 6)), rng.integers(0, 3, 5), rng.normal(size=(5, 7, 4))
+        for m, Y, loss in ((L.lstm_classifier(6, 8, 3, layers=2), y, "cross_entropy"),
+                           (L.Sequential([L.GRULayer(6, 8), L.GRULayer(8, 4)]), ys, "mse"),
+                           (L.Sequential([L.LSTMLayer(6, 8), L.LastStep(), L.Linear(8, 3)]), y, "cross_entropy"),
+                           (L.Sequential([L.GRULayer(6, 8, return_sequences=False), L.Linear(8, 3)]), y,
+                            "cross_entropy")):
+            grads_match(self, m, X, Y, loss)
+        for m in (L.lstm_classifier(6, 8, 3), L.Sequential([L.GRULayer(6, 8, False), L.Linear(8, 3)])):
+            kw = dict(loss="cross_entropy", epochs=3, batch_size=2, verbose=False, precision="fp32")
+            a = L.fit(m, m.init(seed=0), X, y, opt=Adam(0.01), **kw)
+            b = GT.fit(m, m.init(seed=0), X, y, opt=Adam(0.01), ops=GT.Emulator(), **kw)
+            np.testing.assert_allclose(a.history, b.history, rtol=1e-5)
+
     def test_mae_and_bce_losses(self):
         """mae and bce on the GPU trainer, one card, data parallel, a split model and a masked graph: the NumPy
         backend's losses."""
@@ -395,7 +411,8 @@ class Trainer(unittest.TestCase):
     def test_unsupported_layers_say_so(self):
         self.assertIsNone(GT.supports(L.transformer_lm(30, d=16, heads=2, layers=1, context=8)))
         self.assertIsNone(GT.supports(L.Sequential([L.Conv2D(1, 2)])))
-        self.assertIn("lstm", GT.supports(L.Sequential([L.LSTMLayer(4, 8)])))
+        self.assertIsNone(GT.supports(L.Sequential([L.LSTMLayer(4, 8)])))
+        self.assertIn("bilinear", GT.supports(L.Sequential([L.Bilinear(4, 4, 2)])))
 
 
 @unittest.skipIf(GT.device()[0] is None, "no NVIDIA GPU")

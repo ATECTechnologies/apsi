@@ -31,7 +31,8 @@
   `graph_transformer_net`: the encoder of a graph-language model trains on the card.
 - **Convolutions on the GPU trainer:** `conv2d` (windows unfolded into rows, one product, folded back by a thread
   per input value: no atomics), `max_pool` (ties share the gradient, as on NumPy), `avg_pool`, `global_avg_pool`;
-  `cnn` trains on the card.
+  `cnn` trains on the card. **Recurrent layers:** `lstm`, `gru` (a kernel per cell, the input products of all the
+  steps at once), `last_step`.
 - **More activations on the card:** elu, softplus, mish. **More losses:** `mae` and `bce` (one kernel, with a weight
   per element for masks), on one card, several cards and split models.
 - **`apsi gpu bench`:** tokens per second of the 127 M GPT (or `11m`, `modern`), the kernels' shares, temperature,

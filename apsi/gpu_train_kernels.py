@@ -24,7 +24,8 @@ TILE = 64
 MAIN = ("apsi_kernel", "axpy", "add3", "mul3", "act_f", "act_b", "colsum", "ln_f", "ln_b", "embed_f", "embed_b",
         "pos_f", "pos_b", "softmax_f", "softmax_b", "ce", "mse", "sumsq", "adam", "sgd", "drop_f", "fakeq",
         "gemm_simt", "gather", "rope", "spmm", "edge_dot", "seg_softmax", "seg_softmax_b", "dot_acc", "scale_add",
-        "cols", "colmul", "topk_gate", "topk_gate_b", "loss_ew", "im2col", "col2im", "perm_nc", "pool_f", "pool_b")
+        "cols", "colmul", "topk_gate", "topk_gate_b", "loss_ew", "im2col", "col2im", "perm_nc", "pool_f", "pool_b",
+        "lstm_f", "lstm_b", "gru_a", "gru_b", "gru_b1", "gru_b2")
 TC = ("apsi_kernel", "gemm_tc3")                     # apsi_kernel = the one-pass product
 
 
@@ -759,6 +760,125 @@ def _main_module():
         g_ = b.select(b.icmp_unsigned("==", p["mode"], C(0)), mine, avg)
         k.st(b.select(inside, g_, F(0.0)), p["DX"], t)
     k.grid_loop(b.mul(p["NC"], b.mul(p["H"], p["W"])), poolb)
+    k.ret()
+
+    # ------------------------------------------------------------------------- recurrent cells, one time step
+    # [B, T, *] buffers; a thread a (b, j); t the step. LSTM gates i f g o from Z (pre-activations, x W_x + h W_h + b)
+    rshp = [("B", i32), ("H", i32), ("T", i32), ("t", i32)]
+
+    def rix(k, b_, w, j, p, step):
+        """index of [b, step, j] in a [B, T, w] buffer"""
+        bb = k.b
+        return bb.add(bb.mul(i64of(bb, bb.add(bb.mul(b_, p["T"]), step)), i64of(bb, w)), i64of(bb, j))
+
+    def prev_or_zero(k, buf, b_, j, p):
+        bb = k.b
+        has = bb.icmp_unsigned("!=", p["t"], C(0))
+        tp = bb.select(has, bb.sub(p["t"], C(1)), C(0))
+        return bb.select(has, k.ld(buf, rix(k, b_, p["H"], j, p, tp)), F(0.0))
+
+    k = K("lstm_f", [("Z", G(f32)), ("CS", G(f32)), ("HS", G(f32))] + rshp)
+    b, p = k.b, k.p
+
+    def lstmf(i):
+        bb, j = b.udiv(i, p["H"]), b.urem(i, p["H"])
+        H4 = b.mul(p["H"], C(4))
+        zi = k.ld(p["Z"], rix(k, bb, H4, j, p, p["t"]))
+        zf = k.ld(p["Z"], rix(k, bb, H4, b.add(j, p["H"]), p, p["t"]))
+        zg = k.ld(p["Z"], rix(k, bb, H4, b.add(j, b.mul(p["H"], C(2))), p, p["t"]))
+        zo = k.ld(p["Z"], rix(k, bb, H4, b.add(j, b.mul(p["H"], C(3))), p, p["t"]))
+        c = b.fadd(b.fmul(sigmoid(k, zf), prev_or_zero(k, p["CS"], bb, j, p)), b.fmul(sigmoid(k, zi), tanh(k, zg)))
+        k.st(c, p["CS"], rix(k, bb, p["H"], j, p, p["t"]))
+        k.st(b.fmul(sigmoid(k, zo), tanh(k, c)), p["HS"], rix(k, bb, p["H"], j, p, p["t"]))
+    k.grid_loop(b.mul(p["B"], p["H"]), lstmf)
+    k.ret()
+
+    # lstm_b: DZ[b, t] from dh = DY[b, t] + DHN[b] and dc = ... + DCN[b]; DCN[b] <- the cell gradient for t - 1
+    k = K("lstm_b", [("Z", G(f32)), ("CS", G(f32)), ("DY", G(f32)), ("DHN", G(f32)), ("DCN", G(f32)),
+                     ("DZ", G(f32))] + rshp)
+    b, p = k.b, k.p
+
+    def lstmb(i):
+        bb, j = b.udiv(i, p["H"]), b.urem(i, p["H"])
+        H4 = b.mul(p["H"], C(4))
+        idx = [rix(k, bb, H4, b.add(j, b.mul(p["H"], C(q))), p, p["t"]) for q in range(4)]
+        ig, fg, og = sigmoid(k, k.ld(p["Z"], idx[0])), sigmoid(k, k.ld(p["Z"], idx[1])), \
+            sigmoid(k, k.ld(p["Z"], idx[3]))
+        gg = tanh(k, k.ld(p["Z"], idx[2]))
+        c = k.ld(p["CS"], rix(k, bb, p["H"], j, p, p["t"]))
+        cp = prev_or_zero(k, p["CS"], bb, j, p)
+        dh = b.fadd(k.ld(p["DY"], rix(k, bb, p["H"], j, p, p["t"])), k.ld(p["DHN"], i))
+        tc = tanh(k, c)
+        dc = b.fadd(b.fmul(b.fmul(dh, og), b.fsub(F(1.0), b.fmul(tc, tc))), k.ld(p["DCN"], i))
+        one = F(1.0)
+        k.st(b.fmul(b.fmul(dc, gg), b.fmul(ig, b.fsub(one, ig))), p["DZ"], idx[0])
+        k.st(b.fmul(b.fmul(dc, cp), b.fmul(fg, b.fsub(one, fg))), p["DZ"], idx[1])
+        k.st(b.fmul(b.fmul(dc, ig), b.fsub(one, b.fmul(gg, gg))), p["DZ"], idx[2])
+        k.st(b.fmul(b.fmul(dh, tc), b.fmul(og, b.fsub(one, og))), p["DZ"], idx[3])
+        k.st(b.fmul(dc, fg), p["DCN"], i)
+    k.grid_loop(b.mul(p["B"], p["H"]), lstmb)
+    k.ret()
+
+    # GRU: ZR [B, T, 2H] (pre-activations in, z and r out), RH = r h_prev; CX [B, T, H] (pre-activation in, the
+    # candidate out), HS = (1 - z) h_prev + z cand
+    k = K("gru_a", [("ZR", G(f32)), ("HS", G(f32)), ("RH", G(f32))] + rshp)
+    b, p = k.b, k.p
+
+    def grua(i):
+        bb, j = b.udiv(i, p["H"]), b.urem(i, p["H"])
+        H2 = b.mul(p["H"], C(2))
+        iz, ir = rix(k, bb, H2, j, p, p["t"]), rix(k, bb, H2, b.add(j, p["H"]), p, p["t"])
+        z, r = sigmoid(k, k.ld(p["ZR"], iz)), sigmoid(k, k.ld(p["ZR"], ir))
+        k.st(z, p["ZR"], iz)
+        k.st(r, p["ZR"], ir)
+        k.st(b.fmul(r, prev_or_zero(k, p["HS"], bb, j, p)), p["RH"], rix(k, bb, p["H"], j, p, p["t"]))
+    k.grid_loop(b.mul(p["B"], p["H"]), grua)
+    k.ret()
+
+    k = K("gru_b", [("CX", G(f32)), ("ZR", G(f32)), ("HS", G(f32))] + rshp)
+    b, p = k.b, k.p
+
+    def grub(i):
+        bb, j = b.udiv(i, p["H"]), b.urem(i, p["H"])
+        ic = rix(k, bb, p["H"], j, p, p["t"])
+        cand = tanh(k, k.ld(p["CX"], ic))
+        k.st(cand, p["CX"], ic)
+        z = k.ld(p["ZR"], rix(k, bb, b.mul(p["H"], C(2)), j, p, p["t"]))
+        hp = prev_or_zero(k, p["HS"], bb, j, p)
+        k.st(b.fadd(b.fmul(b.fsub(F(1.0), z), hp), b.fmul(z, cand)), p["HS"], ic)
+    k.grid_loop(b.mul(p["B"], p["H"]), grub)
+    k.ret()
+
+    # gru_b1: dh = DY + DHN; DCX = dh z (1 - cand^2); DZR[z] = dh (cand - h_prev) z (1 - z); DHP = dh (1 - z)
+    k = K("gru_b1", [("CX", G(f32)), ("ZR", G(f32)), ("HS", G(f32)), ("DY", G(f32)), ("DHN", G(f32)),
+                     ("DCX", G(f32)), ("DZR", G(f32)), ("DHP", G(f32))] + rshp)
+    b, p = k.b, k.p
+
+    def grub1(i):
+        bb, j = b.udiv(i, p["H"]), b.urem(i, p["H"])
+        ic = rix(k, bb, p["H"], j, p, p["t"])
+        iz = rix(k, bb, b.mul(p["H"], C(2)), j, p, p["t"])
+        cand, z = k.ld(p["CX"], ic), k.ld(p["ZR"], iz)
+        hp = prev_or_zero(k, p["HS"], bb, j, p)
+        dh = b.fadd(k.ld(p["DY"], ic), k.ld(p["DHN"], i))
+        k.st(b.fmul(b.fmul(dh, z), b.fsub(F(1.0), b.fmul(cand, cand))), p["DCX"], ic)
+        k.st(b.fmul(b.fmul(dh, b.fsub(cand, hp)), b.fmul(z, b.fsub(F(1.0), z))), p["DZR"], iz)
+        k.st(b.fmul(dh, b.fsub(F(1.0), z)), p["DHP"], i)
+    k.grid_loop(b.mul(p["B"], p["H"]), grub1)
+    k.ret()
+
+    # gru_b2: DRH = dcx W_h,h^T given; DZR[r] = DRH h_prev r (1 - r); DHP += DRH r
+    k = K("gru_b2", [("DRH", G(f32)), ("ZR", G(f32)), ("HS", G(f32)), ("DZR", G(f32)), ("DHP", G(f32))] + rshp)
+    b, p = k.b, k.p
+
+    def grub2(i):
+        bb, j = b.udiv(i, p["H"]), b.urem(i, p["H"])
+        ir = rix(k, bb, b.mul(p["H"], C(2)), b.add(j, p["H"]), p, p["t"])
+        r, d = k.ld(p["ZR"], ir), k.ld(p["DRH"], i)
+        hp = prev_or_zero(k, p["HS"], bb, j, p)
+        k.st(b.fmul(b.fmul(d, hp), b.fmul(r, b.fsub(F(1.0), r))), p["DZR"], ir)
+        k.st(b.fadd(k.ld(p["DHP"], i), b.fmul(d, r)), p["DHP"], i)
+    k.grid_loop(b.mul(p["B"], p["H"]), grub2)
     k.ret()
 
     # ------------------------------------------------------------------------- attention softmax, a block a row

@@ -363,6 +363,67 @@ class Emulator(_Ops):
         else:
             y[:, off:off + w] = x
 
+    # ---------------------------------------------------------------- recurrent cells
+    def _rv(self, X, B, T, w):
+        return self.v(X, B * T * w).reshape(B, T, w)
+
+    @staticmethod
+    def _sg(x):
+        return 1 / (1 + np.exp(-x))
+
+    def lstm_f(self, Z, CS, HS, B, H, T, t):
+        z = self._rv(Z, B, T, 4 * H)[:, t]
+        cs, hs = self._rv(CS, B, T, H), self._rv(HS, B, T, H)
+        cp = cs[:, t - 1] if t else 0
+        c = self._sg(z[:, H:2 * H]) * cp + self._sg(z[:, :H]) * np.tanh(z[:, 2 * H:3 * H])
+        cs[:, t] = c
+        hs[:, t] = self._sg(z[:, 3 * H:]) * np.tanh(c)
+
+    def lstm_b(self, Z, CS, DY, DHN, DCN, DZ, B, H, T, t):
+        z = self._rv(Z, B, T, 4 * H)[:, t]
+        cs = self._rv(CS, B, T, H)
+        i_, f_, g_, o_ = self._sg(z[:, :H]), self._sg(z[:, H:2 * H]), np.tanh(z[:, 2 * H:3 * H]), self._sg(z[:, 3 * H:])
+        c, cp = cs[:, t], (cs[:, t - 1] if t else np.zeros_like(cs[:, t]))
+        dhn, dcn = self.v(DHN, B * H).reshape(B, H), self.v(DCN, B * H).reshape(B, H)
+        dh = self._rv(DY, B, T, H)[:, t] + dhn
+        tc = np.tanh(c)
+        dc = dh * o_ * (1 - tc * tc) + dcn
+        dz = self._rv(DZ, B, T, 4 * H)
+        dz[:, t] = np.concatenate([dc * g_ * i_ * (1 - i_), dc * cp * f_ * (1 - f_), dc * i_ * (1 - g_ * g_),
+                                   dh * tc * o_ * (1 - o_)], 1)
+        dcn[:] = dc * f_
+
+    def gru_a(self, ZR, HS, RH, B, H, T, t):
+        zr = self._rv(ZR, B, T, 2 * H)
+        zr[:, t] = self._sg(zr[:, t])
+        hp = self._rv(HS, B, T, H)[:, t - 1] if t else 0
+        self._rv(RH, B, T, H)[:, t] = zr[:, t, H:] * hp
+
+    def gru_b(self, CX, ZR, HS, B, H, T, t):
+        cx = self._rv(CX, B, T, H)
+        cx[:, t] = np.tanh(cx[:, t])
+        hs = self._rv(HS, B, T, H)
+        z = self._rv(ZR, B, T, 2 * H)[:, t, :H]
+        hp = hs[:, t - 1] if t else 0
+        hs[:, t] = (1 - z) * hp + z * cx[:, t]
+
+    def gru_b1(self, CX, ZR, HS, DY, DHN, DCX, DZR, DHP, B, H, T, t):
+        cand = self._rv(CX, B, T, H)[:, t]
+        z = self._rv(ZR, B, T, 2 * H)[:, t, :H]
+        hp = self._rv(HS, B, T, H)[:, t - 1] if t else 0
+        dh = self._rv(DY, B, T, H)[:, t] + self.v(DHN, B * H).reshape(B, H)
+        self._rv(DCX, B, T, H)[:, t] = dh * z * (1 - cand * cand)
+        self._rv(DZR, B, T, 2 * H)[:, t, :H] = dh * (cand - hp) * z * (1 - z)
+        self.v(DHP, B * H)[:] = (dh * (1 - z)).reshape(-1)
+
+    def gru_b2(self, DRH, ZR, HS, DZR, DHP, B, H, T, t):
+        r = self._rv(ZR, B, T, 2 * H)[:, t, H:]
+        d = self.v(DRH, B * H).reshape(B, H)
+        hp = self._rv(HS, B, T, H)[:, t - 1] if t else 0
+        self._rv(DZR, B, T, 2 * H)[:, t, H:] = d * hp * r * (1 - r)
+        dhp = self.v(DHP, B * H)
+        dhp[:] = dhp + (d * r).reshape(-1)
+
     # ---------------------------------------------------------------- images
     def im2col(self, X, COL, N, C, H, W, kh, kw, s, p, OH, OW):
         x = self.v(X, N * C * H * W).reshape(N, C, H, W)
@@ -854,6 +915,27 @@ class Gpu(_Ops):
     def cols(self, X, Y, rows, w, ld, off, back):
         self._go("cols", self.blocks(rows * w), 256, self.p(X), self.p(Y), ("u", rows), ("u", w), ("u", ld),
                  ("u", off), ("u", 1 if back else 0))
+
+    def _rec(self, name, B, H, *bufs, T, t):
+        self._go(name, self.blocks(B * H), 256, *[self.p(x) for x in bufs], ("u", B), ("u", H), ("u", T), ("u", t))
+
+    def lstm_f(self, Z, CS, HS, B, H, T, t):
+        self._rec("lstm_f", B, H, Z, CS, HS, T=T, t=t)
+
+    def lstm_b(self, Z, CS, DY, DHN, DCN, DZ, B, H, T, t):
+        self._rec("lstm_b", B, H, Z, CS, DY, DHN, DCN, DZ, T=T, t=t)
+
+    def gru_a(self, ZR, HS, RH, B, H, T, t):
+        self._rec("gru_a", B, H, ZR, HS, RH, T=T, t=t)
+
+    def gru_b(self, CX, ZR, HS, B, H, T, t):
+        self._rec("gru_b", B, H, CX, ZR, HS, T=T, t=t)
+
+    def gru_b1(self, CX, ZR, HS, DY, DHN, DCX, DZR, DHP, B, H, T, t):
+        self._rec("gru_b1", B, H, CX, ZR, HS, DY, DHN, DCX, DZR, DHP, T=T, t=t)
+
+    def gru_b2(self, DRH, ZR, HS, DZR, DHP, B, H, T, t):
+        self._rec("gru_b2", B, H, DRH, ZR, HS, DZR, DHP, T=T, t=t)
 
     def im2col(self, X, COL, N, C, H, W, kh, kw, s, p, OH, OW):
         self._go("im2col", self.blocks(N * OH * OW * C * kh * kw), 256, self.p(X), self.p(COL),
@@ -2038,6 +2120,130 @@ class _Conv2D(_Node):
         return dx
 
 
+class _LastStep(_Node):
+    def fwd(self, x, shape):
+        B, T, D = shape
+        self.shape = shape
+        y = self.buf("y", B * D)
+        self.net.ops.cols(y, x, B, D, T * D, (T - 1) * D, 1)
+        return y, (B, D)
+
+    def bwd(self, dy, need_dx=True):
+        B, T, D = self.shape
+        dx = self.gbuf("dx", B * T * D)
+        self.net.ops.fill(dx, B * T * D, 0.0)
+        self.net.ops.cols(dy, dx, B, D, T * D, (T - 1) * D, 0)
+        return dx
+
+
+class _Recurrent(_Node):
+    """lstm / gru over [B, T, n_in]: the input products for every step at once, then a step at a time the product
+    with the previous state and one kernel for the cell; backward the same in reverse, the weight gradients of the
+    inputs in one product."""
+
+    def __init__(self, net, key, layer, p, gru):
+        super().__init__(net, key)
+        self.n, self.H, self.seq, self.gru = layer.n_in, layer.n_hidden, layer.seq, gru
+        if gru:
+            self.Wzr, self.bzr, self.Wh, self.bh = (net.param(getattr(p, n)) for n in ("Wzr", "bzr", "Wh", "bh"))
+        else:
+            self.W, self.b = net.param(p.W), net.param(p.b)
+
+    def fwd(self, x, shape):
+        if len(shape) != 3 or shape[2] != self.n:
+            raise TrainError(f"{'gru' if self.gru else 'lstm'}({self.n}, {self.H}) got {tuple(shape)}")
+        o, ps = self.net.ops, self.net.passes
+        B, T, n = shape
+        H, M = self.H, B * T
+        self.x, self.B, self.T = x, B, T
+        HS = self.buf("hs", M * H)
+        if not self.gru:
+            Z, CS = self.buf("z", M * 4 * H), self.buf("cs", M * H)
+            o.gemm(x, self.W.w, Z, M, 4 * H, n, n, 1, 4 * H, 1, 4 * H, bias=self.b.w, passes=ps)
+            Wh = _ofs(self.W.w, n * 4 * H)
+            for t in range(T):
+                if t:
+                    o.gemm(_ofs(HS, (t - 1) * H), Wh, _ofs(Z, t * 4 * H), B, 4 * H, H, T * H, 1, 4 * H, 1, T * 4 * H,
+                           beta=True, passes=ps)
+                o.lstm_f(Z, CS, HS, B, H, T, t)
+            self.Z, self.CS = Z, CS
+        else:
+            ZR, RH, CX = self.buf("zr", M * 2 * H), self.buf("rh", M * H), self.buf("cx", M * H)
+            o.gemm(x, self.Wzr.w, ZR, M, 2 * H, n, n, 1, 2 * H, 1, 2 * H, bias=self.bzr.w, passes=ps)
+            o.gemm(x, self.Wh.w, CX, M, H, n, n, 1, H, 1, H, bias=self.bh.w, passes=ps)
+            for t in range(T):
+                if t:
+                    o.gemm(_ofs(HS, (t - 1) * H), _ofs(self.Wzr.w, n * 2 * H), _ofs(ZR, t * 2 * H), B, 2 * H, H,
+                           T * H, 1, 2 * H, 1, T * 2 * H, beta=True, passes=ps)
+                o.gru_a(ZR, HS, RH, B, H, T, t)
+                if t:
+                    o.gemm(_ofs(RH, t * H), _ofs(self.Wh.w, n * H), _ofs(CX, t * H), B, H, H, T * H, 1, H, 1, T * H,
+                           beta=True, passes=ps)
+                o.gru_b(CX, ZR, HS, B, H, T, t)
+            self.ZR, self.RH, self.CX = ZR, RH, CX
+        self.HS = HS
+        if self.seq:
+            return HS, (B, T, H)
+        y = self.buf("last", B * H)
+        o.cols(y, HS, B, H, T * H, (T - 1) * H, 1)
+        return y, (B, H)
+
+    def bwd(self, dy, need_dx=True):
+        o, ps = self.net.ops, self.net.passes
+        B, T, H, n = self.B, self.T, self.H, self.n
+        M = B * T
+        if not self.seq:                                # only the last step had a gradient
+            full = self.gbuf("dyfull", M * H)
+            o.fill(full, M * H, 0.0)
+            o.cols(dy, full, B, H, T * H, (T - 1) * H, 0)
+            dy = full
+        dhn = self.gbuf("dhn", B * H)
+        o.fill(dhn, B * H, 0.0)
+        HS = self.HS
+        if not self.gru:
+            DZ, dcn = self.gbuf("dz", M * 4 * H), self.gbuf("dcn", B * H)
+            o.fill(dcn, B * H, 0.0)
+            Wh = _ofs(self.W.w, n * 4 * H)
+            for t in range(T - 1, -1, -1):
+                o.lstm_b(self.Z, self.CS, dy, dhn, dcn, DZ, B, H, T, t)
+                if t:
+                    o.gemm(_ofs(DZ, t * 4 * H), Wh, dhn, B, H, 4 * H, T * 4 * H, 1, 1, 4 * H, H, passes=ps)
+            o.colsum(DZ, None, None, None, None, self.b.g, M, 4 * H, 0)
+            o.gemm(self.x, DZ, self.W.g, n, 4 * H, M, 1, n, 4 * H, 1, 4 * H, beta=True, passes=ps)
+            Wg_h = _ofs(self.W.g, n * 4 * H)
+            for t in range(1, T):
+                o.gemm(_ofs(HS, (t - 1) * H), _ofs(DZ, t * 4 * H), Wg_h, H, 4 * H, B, 1, T * H, T * 4 * H, 1, 4 * H,
+                       beta=True, passes=ps)
+            if not need_dx:
+                return None
+            dx = self.gbuf("dx", M * n)
+            o.gemm(DZ, self.W.w, dx, M, n, 4 * H, 4 * H, 1, 1, 4 * H, n, passes=ps)
+            return dx
+        DCX, DZR = self.gbuf("dcx", M * H), self.gbuf("dzr", M * 2 * H)
+        dhp, drh = self.gbuf("dhp", B * H), self.gbuf("drh", B * H)
+        for t in range(T - 1, -1, -1):
+            o.gru_b1(self.CX, self.ZR, HS, dy, dhn, DCX, DZR, dhp, B, H, T, t)
+            o.gemm(_ofs(DCX, t * H), _ofs(self.Wh.w, n * H), drh, B, H, H, T * H, 1, 1, H, H, passes=ps)
+            o.gru_b2(drh, self.ZR, HS, DZR, dhp, B, H, T, t)
+            o.gemm(_ofs(DZR, t * 2 * H), _ofs(self.Wzr.w, n * 2 * H), dhp, B, H, 2 * H, T * 2 * H, 1, 1, 2 * H, H,
+                   beta=True, passes=ps)
+            dhn, dhp = dhp, dhn
+        o.colsum(DZR, None, None, None, None, self.bzr.g, M, 2 * H, 0)
+        o.colsum(DCX, None, None, None, None, self.bh.g, M, H, 0)
+        o.gemm(self.x, DZR, self.Wzr.g, n, 2 * H, M, 1, n, 2 * H, 1, 2 * H, beta=True, passes=ps)
+        o.gemm(self.x, DCX, self.Wh.g, n, H, M, 1, n, H, 1, H, beta=True, passes=ps)
+        o.gemm(self.RH, DCX, _ofs(self.Wh.g, n * H), H, H, M, 1, H, H, 1, H, beta=True, passes=ps)
+        for t in range(1, T):
+            o.gemm(_ofs(HS, (t - 1) * H), _ofs(DZR, t * 2 * H), _ofs(self.Wzr.g, n * 2 * H), H, 2 * H, B, 1, T * H,
+                   T * 2 * H, 1, 2 * H, beta=True, passes=ps)
+        if not need_dx:
+            return None
+        dx = self.gbuf("dx", M * n)
+        o.gemm(DZR, self.Wzr.w, dx, M, n, 2 * H, 2 * H, 1, 1, 2 * H, n, passes=ps)
+        o.gemm(DCX, self.Wh.w, dx, M, n, H, H, 1, 1, H, n, beta=True, passes=ps)
+        return dx
+
+
 class _Pool(_Node):
     """max_pool / avg_pool (k x k windows, the rest of the rows and columns left out), global_avg_pool."""
 
@@ -2820,6 +3026,12 @@ class Net:
             return _MeanPool(self, key, layer)
         if isinstance(layer, L.Conv2D):
             return _Conv2D(self, key, layer, p)
+        if isinstance(layer, L.LSTMLayer):
+            return _Recurrent(self, key, layer, p, False)
+        if isinstance(layer, L.GRULayer):
+            return _Recurrent(self, key, layer, p, True)
+        if isinstance(layer, L.LastStep):
+            return _LastStep(self, key)
         if isinstance(layer, L.MaxPool):
             return _Pool(self, key, layer, 0)
         if isinstance(layer, L.AvgPool):

@@ -171,6 +171,10 @@ def check(out=sys.stdout):
          dict(graph=g, mask=mask)),
         ("graph transformer", GR.graph_transformer_net(16, 32, 3, layers=2, heads=4, relations=3, max_keys=8), Xg,
          yg, dict(graph=g, mask=mask)),
+        ("cnn", L.cnn(3, 4, image=12, channels=(8, 8), dense_width=16), rng.normal(size=(16, 3, 12, 12)),
+         rng.integers(0, 4, 16), {}),
+        ("lstm / gru", L.Sequential([L.LSTMLayer(8, 16), L.GRULayer(16, 16, False), L.Linear(16, 3)]),
+         rng.normal(size=(16, 10, 8)), rng.integers(0, 3, 16), {}),
     ]
     bad = 0
     for name, m, X, Y, kw in cases:
