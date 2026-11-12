@@ -4225,6 +4225,15 @@ class Net:
         return nd
 
     def _compile(self, layer, p, key, gk):
+        try:
+            return self._compile_native(layer, p, key, gk)
+        except TrainError as e:
+            if "not on the GPU trainer" not in str(e) or \
+                    os.environ.get("APSI_GPU_HOST_LAYERS", "1").strip() in ("0", "false", "no"):
+                raise
+            return _HostLayer(self, key, layer, p)       # a variant the card has no kernel for: on the processor
+
+    def _compile_native(self, layer, p, key, gk):
         from . import layers as L
         kind = type(layer).__name__
         if isinstance(layer, L.Sequential):
@@ -4475,7 +4484,7 @@ def _raw_of(a):
 
 def fit_batches(model, params, batches, loss="cross_entropy", opt=None, epochs=1, verbose=True, clip=None,
                 schedule=None, device="cuda", precision="auto", ops=None, compensated=None, every=None,
-                accumulate=1, stages=None):
+                accumulate=1, stages=None, freeze=None, train_only=None):
     """Train on batches that each bring their own shapes: batches is a list of (inputs, targets[, graph]) or a
     function epoch -> such a list. inputs may be a list (a dag with several inputs: token ids, node features, ...);
     each batch may have its own graph (a batch of graphs), its own number of rows and its own lengths. One card."""
@@ -4493,16 +4502,13 @@ def fit_batches(model, params, batches, loss="cross_entropy", opt=None, epochs=1
         if len(ops) > 1:                                 # the model split across the cards, copied over the rest
             from .gpu_pipeline import fit_batches_pipeline
             return fit_batches_pipeline(list(ops), model, params, batches, loss, opt, epochs, verbose, clip, schedule,
-                                        precision, stages, accumulate if accumulate and accumulate > 1 else None,
-                                        _want_comp(compensated, params), every)
+                                        precision, stages, max(1, int(accumulate or 1)),
+                                        _want_comp(compensated, params), every, freeze, train_only)
         ops = ops[0]
+    loss = _host_loss(loss)
     custom = callable(loss)
     loss_fn, loss = (loss, "custom") if custom else (None, str(loss))
-    if not custom and loss not in LOSSES:
-        raise TrainError(f"loss '{loss}' is not on the GPU trainer ({', '.join(LOSSES)})")
     opt = opt or Adam(1e-3)
-    if not isinstance(opt, (Adam, SGD)):
-        raise TrainError(f"optimizer {type(opt).__name__} is not on the GPU trainer (adam, adamw, sgd)")
     adam = isinstance(opt, Adam)
     wd = float(getattr(opt, "wd", 0.0)) if isinstance(opt, AdamW) else 0.0
     E = int(epochs)
@@ -4517,6 +4523,7 @@ def fit_batches(model, params, batches, loss="cross_entropy", opt=None, epochs=1
     ops.fill((net.G, 0), n, 0.0)
     history, t, step = [], int(getattr(opt, "t", 0)), 0
     every = int(every or max(1, E // 10))
+    net.freeze = _Freeze(ops, net, params, freeze, train_only)
     try:
         for ep in range(E):
             items = list(batches(ep) if callable(batches) else batches)
@@ -4582,19 +4589,7 @@ def fit_batches(model, params, batches, loss="cross_entropy", opt=None, epochs=1
                 rows_all += 1
                 if (bi + 1) % A and bi + 1 < len(items):
                     continue                                 # gradients add up until the step's last batch
-                t += 1
-                lr = float(aops.raw(schedule(step))) if schedule is not None else float(opt.lr)
-                ops.fill((SQ, 0), 1, 0.0)
-                if clip:
-                    ops.sumsq((net.G, 0), n, (SQ, 0))
-                if adam:
-                    ops.adam((net.P, 0), (net.G, 0), (st1, 0), (st2, 0), (SQ, 0), n, net.n_decay, lr, opt.b1, opt.b2,
-                             opt.eps, 1 - opt.b1 ** t, 1 - opt.b2 ** t, wd, float(clip or 0.0),
-                             (COMP, 0) if COMP else None)
-                else:
-                    ops.sgd((net.P, 0), (net.G, 0), (st1, 0), (SQ, 0), n, lr, float(opt.momentum), float(clip or 0.0),
-                            (COMP, 0) if COMP else None)
-                step += 1
+                t, step = _apply_step(ops, net, opt, adam, wd, clip, schedule, step, t, st1, st2, SQ, COMP, n)
             history.append(tot / rows_all)
             if verbose and (ep % every == 0 or ep == E - 1):
                 print(f"epoch {ep:4}  loss {history[-1]:.5f}  ({len(items)} batches, GPU)")
@@ -4604,6 +4599,7 @@ def fit_batches(model, params, batches, loss="cross_entropy", opt=None, epochs=1
         for b_ in (st1, st2, SQ, COMP, LOSS1):
             if b_ is not None:
                 ops.free(b_)
+        net.freeze.close()
         net.close()
     return Record(params=out_params, history=history, device=getattr(ops, "name", "?"))
 
@@ -4624,10 +4620,110 @@ def _multi_loss(ops, net, outs, shapes, loss_fn, Yr, group):
     return float(aops.raw(lv)), douts
 
 
+def _rows_of(X):
+    from . import ops as aops
+    return len(np.asarray(aops.raw(X[0] if isinstance(X, (list, tuple)) else X)))
+
+
+def _host_loss(loss):
+    """A loss the card has no kernel for (any name fit() knows, e.g. "vae", or a function): on the processor."""
+    if callable(loss) or str(loss) in LOSSES:
+        return loss
+    from . import layers as L
+    try:
+        return L._loss_fn(str(loss))
+    except Exception:                                   # noqa: BLE001
+        raise TrainError(f"loss '{loss}' is unknown ({', '.join(LOSSES)} on the card, or a function)") from None
+
+
+def native_opt(opt):
+    from .stdlib import Adam, SGD
+    return type(opt) in (Adam, SGD) or type(opt).__name__ == "AdamW" and isinstance(opt, Adam)
+
+
+class _Freeze:
+    """Weights that stay as they are (freeze= / train_only=): no gradient, and their values put back after every
+    update (weight decay or momentum cannot move them)."""
+
+    def __init__(self, ops, net, params, freeze=None, train_only=None):
+        self.ops, self.net, self.ranges, self.buf = ops, net, [], None
+        if freeze is None and train_only is None:
+            return
+        from .layers import frozen_ids
+        ids = frozen_ids(params, freeze, train_only)
+        spans = sorted((net.offsets[i], a.size) for i, a in ((id(a), a) for a in net.leaves) if i in ids)
+        for off, k in spans:
+            if self.ranges and self.ranges[-1][0] + self.ranges[-1][1] == off:
+                self.ranges[-1] = (self.ranges[-1][0], self.ranges[-1][1] + k)
+            else:
+                self.ranges.append((off, k))
+        total = sum(k for _, k in self.ranges)
+        self.buf = ops.alloc(max(1, total)) if total else None
+
+    def zero_grads(self):
+        for off, k in self.ranges:
+            self.ops.fill((self.net.G, off), k, 0.0)
+
+    def save(self):
+        o = 0
+        for off, k in self.ranges:
+            self.ops.pull((self.buf, o), self.ops, (self.net.P, off), k)
+            o += k
+
+    def restore(self):
+        o = 0
+        for off, k in self.ranges:
+            self.ops.pull((self.net.P, off), self.ops, (self.buf, o), k)
+            o += k
+
+    def close(self):
+        if self.buf is not None:
+            self.ops.free(self.buf)
+            self.buf = None
+
+
+def _host_step(ops, net, opt, clip, lr):
+    """Any optimizer with step(params, grads): the weights and gradients in the model's own tree on the processor,
+    the new weights back to the card (the optimizer sees what it sees on NumPy)."""
+    import math as _m
+    P, G = net.params(), net.params(net.G)
+    if clip:
+        nrm = _m.sqrt(sum(float(np.sum(np.asarray(a, np.float64) ** 2)) for a in tree_leaves(G)
+                          if isinstance(a, np.ndarray)))
+        if nrm > clip:
+            G = tree_map(lambda a: a * (clip / nrm) if isinstance(a, np.ndarray) else a, G)
+    P = tree_map(lambda a: a.astype(np.float64) if isinstance(a, np.ndarray) else a, P)
+    G = tree_map(lambda a: a.astype(np.float64) if isinstance(a, np.ndarray) else a, G)
+    if hasattr(opt, "lr"):
+        opt.lr = lr
+    from . import ops as aops
+    new = opt.step(P, G)
+    ops.put(net.P, net.flat_like(tree_map(lambda a: np.asarray(aops.raw(a)), new)))
+    ops.fill((net.G, 0), net.n, 0.0)                    # as the kernels do: the next step's gradients start at 0
+
+
 def _apply_step(ops, net, opt, adam, wd, clip, schedule, step, t, st1, st2, SQ, COMP, n):
     from . import ops as aops
     t += 1
     lr = float(aops.raw(schedule(step))) if schedule is not None else float(opt.lr)
+    fz = getattr(net, "freeze", None)
+    if fz is not None and fz.ranges:
+        fz.zero_grads()
+        fz.save()
+    if not native_opt(opt):
+        _host_step(ops, net, opt, clip, lr)
+        if COMP is not None:                             # the carried rounding error belongs to the kernels' updates
+            ops.fill((COMP, 0), n, 0.0)
+        if fz is not None and fz.ranges:
+            fz.restore()
+        return t, step + 1
+    _native_step(ops, net, opt, adam, wd, clip, lr, t, st1, st2, SQ, COMP, n)
+    if fz is not None and fz.ranges:
+        fz.restore()
+    return t, step + 1
+
+
+def _native_step(ops, net, opt, adam, wd, clip, lr, t, st1, st2, SQ, COMP, n):
     ops.fill((SQ, 0), 1, 0.0)
     if clip:
         ops.sumsq((net.G, 0), n, (SQ, 0))
@@ -4637,7 +4733,6 @@ def _apply_step(ops, net, opt, adam, wd, clip, schedule, step, t, st1, st2, SQ, 
     else:
         ops.sgd((net.P, 0), (net.G, 0), (st1, 0), (SQ, 0), n, lr, float(opt.momentum), float(clip or 0.0),
                 (COMP, 0) if COMP else None)
-    return t, step + 1
 
 
 def _want_comp(compensated, params):
@@ -4693,7 +4788,8 @@ def _check_size(ops, params, opt, shards=1):
 
 def fit(model, params, X, y=None, loss="mse", opt=None, epochs=10, batch_size=None, seed=0, verbose=True,
         clip=None, schedule=None, val=None, device="cuda", precision="auto", ops=None, ema=None, ewc=None,
-        parallel="auto", stages=None, micro_batches=None, graph=None, mask=None, compensated=None):
+        parallel="auto", stages=None, micro_batches=None, graph=None, mask=None, compensated=None, freeze=None,
+        train_only=None):
     """Several cards (device="cuda:all", "cuda:0,1,2"): parallel="data" copies the model to every card and shares
     the batch out; "pipeline" splits the model across the cards (stages: how many pieces, or a list with the units of
     each); "auto" (the default) copies it when it fits on one card, else splits it into the fewest pieces that fit and
@@ -4723,6 +4819,23 @@ def fit(model, params, X, y=None, loss="mse", opt=None, epochs=10, batch_size=No
                 raise TrainError("a graph model trains on one card (its nodes depend on each other in every step)")
             ops = ops[0]
         batch_size = None
+    loss = _host_loss(loss)
+    opt = opt or Adam(1e-3)
+    if isinstance(ops, (list, tuple)) and len(ops) > 1 and graph is None and mask is None and val is None and \
+            ema is None and ewc is None and (callable(loss) or not native_opt(opt) or freeze is not None or
+                                             train_only is not None):
+        # what the many-card kernels of fit() do not do (a loss function, another optimizer, frozen parts): the
+        # same training as batches, on the cards of fit_batches
+        bs = int(batch_size or _rows_of(X))
+        Xa, Ya = np.asarray(aops.raw(X)), np.asarray(aops.raw(X if y is None else y))
+        rng = np.random.default_rng(int(seed))
+
+        def epoch_batches(ep):
+            idx = rng.permutation(len(Xa)) if batch_size else np.arange(len(Xa))
+            return [(Xa[idx[i:i + bs]], Ya[idx[i:i + bs]]) for i in range(0, len(Xa), bs)]
+        return fit_batches(model, params, epoch_batches, loss, opt, epochs, verbose, clip, schedule, ops=ops,
+                           precision=precision, compensated=compensated, stages=stages, freeze=freeze,
+                           train_only=train_only, accumulate=micro_batches or 1)
     if isinstance(ops, (list, tuple)) and callable(loss):
         if len(ops) > 1:
             raise TrainError("a loss written as a function trains on one card (device=\"cuda\")")
@@ -4754,12 +4867,7 @@ def fit(model, params, X, y=None, loss="mse", opt=None, epochs=10, batch_size=No
         if isinstance(ops, (list, tuple)) and len(ops) > 1:
             raise TrainError("a loss written as a function trains on one card (device=\"cuda\")")
         loss_fn, loss = loss, "custom"
-    loss = str(loss)
-    if loss not in LOSSES and not custom:
-        raise TrainError(f"loss '{loss}' is not on the GPU trainer ({', '.join(LOSSES)})")
-    opt = opt or Adam(1e-3)
-    if not isinstance(opt, (Adam, SGD)):
-        raise TrainError(f"optimizer {type(opt).__name__} is not on the GPU trainer (adam, adamw, sgd)")
+    loss = str(loss) if not custom else loss
     first = model.layers[0] if isinstance(model, L.Sequential) and model.layers else model
     ids = isinstance(first, L.Embedding)
     Xa = _inputs(aops.raw(X), ids)
@@ -4778,6 +4886,9 @@ def fit(model, params, X, y=None, loss="mse", opt=None, epochs=10, batch_size=No
     n = Xa.shape[0]
     _check_size(ops, params, opt)
     net = Net(ops, model, params, precision, graph)
+    fz = net.freeze = _Freeze(ops, net, params, freeze, train_only)
+    if fz.buf is not None:
+        net.owned.append(fz.buf)                         # freed with the net
     rng = np.random.default_rng(int(seed))
     net.seed = int(seed) * 7919 + 1
     adam = isinstance(opt, Adam)
@@ -4920,13 +5031,25 @@ def fit(model, params, X, y=None, loss="mse", opt=None, epochs=10, batch_size=No
                     ops.fill((SQ, 0), 1, 0.0)
                     ops.sumsq((net.G, 0), net.n, (SQ, 0))
                 t_step += 1
-                if adam:
+                if fz.ranges:
+                    fz.zero_grads()
+                    fz.save()
+                    if clip:
+                        ops.fill((SQ, 0), 1, 0.0)
+                        ops.sumsq((net.G, 0), net.n, (SQ, 0))
+                if not native_opt(opt):
+                    _host_step(ops, net, opt, clip, lr)
+                    if COMP is not None:
+                        ops.fill((COMP, 0), net.n, 0.0)
+                elif adam:
                     c1, c2 = 1 - opt.b1 ** t_step, 1 - opt.b2 ** t_step
                     ops.adam((net.P, 0), (net.G, 0), (st1, 0), (st2, 0), (SQ, 0), net.n, net.n_decay, lr, opt.b1,
                              opt.b2, opt.eps, c1, c2, wd, float(clip or 0.0), (COMP, 0) if COMP else None)
                 else:
                     ops.sgd((net.P, 0), (net.G, 0), (st1, 0), (SQ, 0), net.n, lr, float(opt.momentum),
                             float(clip or 0.0), (COMP, 0) if COMP else None)
+                if fz.ranges:
+                    fz.restore()
                 step += 1
                 if EMA is not None:                         # ema <- d ema + (1 - d) w
                     ops.axpy((EMA, 0), (EMA, 0), net.n, ema - 1.0)

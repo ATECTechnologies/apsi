@@ -598,11 +598,70 @@ def _stage_work(st, row, mb, part, b, ep, n, s0, xw, yw, xshape, ce, valid, fwd,
 
 
 
+def _host_update(grid, opt, clip, lr):
+    """Any other optimizer: each stage's gradients summed over the copies into the first copy, one optimizer per
+    stage on the processor (the weights as the model's tree), the new weights to every copy."""
+    import copy
+    from .gpu_train import _host_step
+    R, S = len(grid), len(grid[0])
+    heads = [grid[0][s] for s in range(S)]
+    for s in range(S):
+        for r in range(R):
+            fz = getattr(grid[r][s].net, "freeze", None)
+            if fz is not None and fz.ranges:
+                fz.zero_grads()
+                fz.save()
+        if R > 1:
+            st = heads[s]
+            n = st.net.n
+            tmp = st.alloc(n)
+            for r in range(1, R):
+                q = grid[r][s]
+                q.ops.sync()
+                st.ops.pull((tmp, 0), q.ops, (q.net.G, 0), n)
+                st.ops.axpy((st.net.G, 0), (tmp, 0), n, 1.0)
+            st.extra.remove(tmp)
+            st.ops.free(tmp)
+    scale = None
+    if clip:
+        tot = 0.0
+        for st in heads:
+            g = st.ops.get(st.net.G, st.net.n).astype(np.float64)
+            tot += float((g * g).sum())
+            for off, k in getattr(st, "dups", ()):
+                tot -= float((g[off:off + k] ** 2).sum())
+        nrm = math.sqrt(tot)
+        scale = clip / nrm if nrm > clip else None
+    for s, st in enumerate(heads):
+        if scale is not None:
+            st.ops.axpy((st.net.G, 0), (st.net.G, 0), st.net.n, scale - 1.0)
+        if not hasattr(st, "host_opt"):
+            st.host_opt = copy.deepcopy(opt)
+        _host_step(st.ops, st.net, st.host_opt, None, lr)
+        for r in range(R):
+            q = grid[r][s]
+            if r:
+                q.ops.pull((q.net.P, 0), st.ops, (st.net.P, 0), st.net.n)
+                q.ops.fill((q.net.G, 0), q.net.n, 0.0)
+            fz = getattr(q.net, "freeze", None)
+            if fz is not None and fz.ranges:
+                fz.restore()
+    for row in grid:
+        for st in row:
+            st.ops.sync()
+
+
 def _update(grid, opt, adam, wd, lr, t_step, clip, lam):
     """The copies of each stage sum their gradients (each the slice it updates), then every slice is updated and
     the copies take the updated slices from each other. clip: the norm of the whole model's gradient."""
     R = len(grid)
     S = len(grid[0])
+    for row in grid:
+        for st in row:
+            fz = getattr(st.net, "freeze", None)
+            if fz is not None and fz.ranges:
+                fz.zero_grads()
+                fz.save()
     for s in range(S):
         group = [grid[r][s] for r in range(R)]
         if R > 1:
@@ -630,6 +689,10 @@ def _update(grid, opt, adam, wd, lr, t_step, clip, lam):
     everyone = [st for row in grid for st in row]
     if clip:
         total = sum(float(st.ops.get(st.SQ, 1)[0]) for st in everyone)
+        for st in grid[0]:                               # (the replicas hold summed copies: count row 0's once)
+            for off, k in getattr(st, "dups", ()):
+                g = st.ops.get(st.net.G, k, off).astype(np.float64)
+                total -= float((g * g).sum())
         for st in everyone:
             st.ops.fill((st.SQ, 0), 1, total)
     for st in everyone:
@@ -655,6 +718,10 @@ def _update(grid, opt, adam, wd, lr, t_step, clip, lam):
                         st.ops.pull((st.net.P, q.lo), q.ops, (q.net.P, q.lo), q.hi - q.lo)
         for st in everyone:
             st.ops.sync()
+    for st in everyone:
+        fz = getattr(st.net, "freeze", None)
+        if fz is not None and fz.ranges:
+            fz.restore()
 
 
 def pipe_forward(stages, xb):
@@ -743,21 +810,18 @@ class SegStage(Stage):
 
 
 def fit_batches_pipeline(ops_list, model, params, batches, loss, opt, epochs, verbose, clip, schedule_fn, precision,
-                         stages=None, micro=None, compensated=False, every=None):
+                         stages=None, micro=None, compensated=False, every=None, freeze=None, train_only=None):
     """fit_batches on several cards: the model (a dag or a sequence) cut into stages at the points that balance the
     work, `micro` batches of a step flowing through them in a one-forward-one-backward order, the pipeline copied
     over the cards left (replicas). Every batch may bring its own shapes and graph. One step averages the gradients
     of its batches."""
     from . import ops as aops, thermal
     from .stdlib import Adam, AdamW, SGD
-    from .gpu_train import TrainError, LOSSES, _batch_parts
+    from .gpu_train import TrainError, LOSSES, _batch_parts, _host_loss, native_opt, _Freeze
+    loss = _host_loss(loss)
     custom = callable(loss)
     loss_fn, loss = (loss, "custom") if custom else (None, str(loss))
-    if not custom and loss not in LOSSES:
-        raise TrainError(f"loss '{loss}' is not on the GPU trainer ({', '.join(LOSSES)})")
     opt = opt or Adam(1e-3)
-    if not isinstance(opt, (Adam, SGD)):
-        raise TrainError(f"optimizer {type(opt).__name__} is not on the GPU trainer (adam, adamw, sgd)")
     adam = isinstance(opt, Adam)
     wd = float(getattr(opt, "wd", 0.0)) if isinstance(opt, AdamW) else 0.0
     nodes, inputs, output = dag_view(model, params)
@@ -798,6 +862,8 @@ def fit_batches_pipeline(ops_list, model, params, batches, loss, opt, epochs, ve
                               min(S - s, M), params)
                 st.gov = thermal.governor(getattr(st.ops, "dev", None))
                 st.LOSSB = st.alloc(max(1, M))
+                st.net.freeze = _Freeze(st.ops, st.net, params, freeze, train_only)
+                st.extra += [st.net.freeze.buf] if st.net.freeze.buf is not None else []
                 row.append(st)
             grid.append(row)
         for s in range(S):
@@ -814,6 +880,11 @@ def fit_batches_pipeline(ops_list, model, params, batches, loss, opt, epochs, ve
                     if b_ is not None:
                         o.fill((b_, 0), ln, 0.0)
         shared = _shared_params(grid[0])
+        for row in grid:                                 # a shared weight counts once in the gradient's norm
+            for st in row:
+                st.dups = []
+            for a_, oa, b_, ob, n_ in shared:
+                row[b_].dups.append((ob, n_))
         t, step, history = int(getattr(opt, "t", 0)), 0, []
         E = int(epochs)
         every = int(every or max(1, E // 10))
@@ -829,7 +900,10 @@ def fit_batches_pipeline(ops_list, model, params, batches, loss, opt, epochs, ve
                 for row in grid:
                     _sum_shared(row, shared)
                 t += 1
-                _update(grid, opt, adam, wd, lr, t, clip, None)
+                if native_opt(opt):
+                    _update(grid, opt, adam, wd, lr, t, clip, None)
+                else:
+                    _host_update(grid, opt, clip, lr)
                 step += 1
                 for row in grid:
                     for st in row:
