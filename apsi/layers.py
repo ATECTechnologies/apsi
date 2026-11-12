@@ -1457,7 +1457,7 @@ def _backend(backend, model=None, loss=None, plain=True):
     b = str(backend or "numpy").lower()
     b = {"apsi-gpu": "gpu", "native-gpu": "gpu", "cuda": "gpu", "apsi": "numpy", "cpu": "numpy"}.get(b, b)
     if b in ("auto", "auto-notorch"):
-        if model is not None and plain and loss in ("cross_entropy", "mse") and _gpu_ready() and \
+        if model is not None and plain and loss in ("cross_entropy", "mse", "mae", "bce") and _gpu_ready() and \
                 _gpu_supports(model) is None:
             return "gpu"
         if b == "auto-notorch":

@@ -251,6 +251,21 @@ class Emulator(_Ops):
         lse = (mx + np.log(Z))[:, 0]
         self.v(LOSS, 1)[0] += np.float32(wl) * (lse[ok] - lg[np.arange(M)[ok], lab[ok]]).sum()
 
+    def loss_ew(self, Y, T, W, DY, LOSS, n, wg, wl, kind):
+        y, t = self.v(Y, n), self.v(T, n)
+        w = self.v(W, n) if W is not None else np.float32(1)
+        if kind == 0:
+            d = y - t
+            lv, gv = np.abs(d), np.sign(d)
+        else:
+            sg = 1 / (1 + np.exp(-y))
+            a, c = sg + np.float32(1e-12), 1 - sg + np.float32(1e-12)
+            lv = -(t * np.log(a) + (1 - t) * np.log(c))
+            ds = sg * (1 - sg)
+            gv = -(t * ds / a - (1 - t) * ds / c)
+        self.v(DY, n)[:] = gv * w * np.float32(wg)
+        self.v(LOSS, 1)[0] += np.float32(wl) * (lv * w).sum()
+
     def mse(self, Y, T, DY, LOSS, n, wg, wl):
         d = self.v(Y, n) - self.v(T, n)
         self.v(DY, n)[:] = 2 * d * np.float32(wg)
@@ -738,6 +753,10 @@ class Gpu(_Ops):
     def ce(self, L, LAB, DL, LOSS, M, V, wg, wl):
         self._go("ce", M, 256, self.p(L), self.p(LAB), self.p(DL), self.p(LOSS), ("u", M), ("u", V), ("f", wg),
                  ("f", wl))
+
+    def loss_ew(self, Y, T, W, DY, LOSS, n, wg, wl, kind):
+        self._go("loss_ew", self.blocks(n), 256, self.p(Y), self.p(T), self.p(W if W is not None else Y), self.p(DY),
+                 self.p(LOSS), ("u", n), ("f", wg), ("f", wl), ("u", kind), ("u", 1 if W is not None else 0))
 
     def mse(self, Y, T, DY, LOSS, n, wg, wl):
         self._go("mse", self.blocks(n), 256, self.p(Y), self.p(T), self.p(DY), self.p(LOSS), ("u", n), ("f", wg),
@@ -2735,6 +2754,17 @@ def _inputs(X, ids):
     return np.ascontiguousarray(a.astype(np.float32))
 
 
+LOSSES = ("cross_entropy", "mse", "mae", "bce")
+
+
+def _regress(o, loss, out, Yd, dout, lossv, m, wg, wl, W=None):
+    """The element-wise losses: mse, mae, bce (W: a weight per element, e.g. a mask)."""
+    if loss == "mse":
+        o.mse(out, Yd, dout, lossv, m, wg, wl)
+    else:
+        o.loss_ew(out, Yd, W, dout, lossv, m, wg, wl, {"mae": 0, "bce": 1}[loss])
+
+
 def _too_big(ops_list, params, opt):
     """True when the weights, gradients and optimizer state alone would take most of the smallest card."""
     from .stdlib import Adam
@@ -2815,8 +2845,8 @@ def fit(model, params, X, y=None, loss="mse", opt=None, epochs=10, batch_size=No
                 return fit_pipeline(many, model, params, X, y, loss, opt, epochs, batch_size, seed, verbose, clip,
                                     schedule, val, precision, ema, ewc, stages, micro_batches)
     loss = str(loss)
-    if loss not in ("cross_entropy", "mse"):
-        raise TrainError(f"loss '{loss}' is not on the GPU trainer (cross_entropy, mse)")
+    if loss not in LOSSES:
+        raise TrainError(f"loss '{loss}' is not on the GPU trainer ({', '.join(LOSSES)})")
     opt = opt or Adam(1e-3)
     if not isinstance(opt, (Adam, SGD)):
         raise TrainError(f"optimizer {type(opt).__name__} is not on the GPU trainer (adam, adamw, sgd)")
@@ -2925,6 +2955,14 @@ def fit(model, params, X, y=None, loss="mse", opt=None, epochs=10, batch_size=No
                     if yb.size != rows:
                         raise TrainError(f"cross_entropy: {yb.size} labels for {rows} rows of logits")
                     ops.ce(out, Yd, dout, lossv, rows, shape[-1], w, w * len(b) / n)
+                elif sel is not None and loss != "mse":     # the rows outside the mask weigh nothing
+                    m = rows * shape[-1]
+                    if INV is None:
+                        INV = ops.alloc(m)
+                        ops.put(INV, np.repeat(sel.astype(np.float32), m // max(1, len(sel))))
+                        net.owned.append(INV)
+                    me = max(1, int(sel.sum())) * (m // max(1, len(sel)))
+                    _regress(ops, loss, out, Yd, dout, lossv, m, 1.0 / me, 1.0 / me, (INV, 0))
                 elif sel is not None:                       # the rows outside the mask: target = output
                     m = rows * shape[-1]
                     if INV is None:
@@ -2940,7 +2978,7 @@ def fit(model, params, X, y=None, loss="mse", opt=None, epochs=10, batch_size=No
                     ops.mse(out, Yd, dout, lossv, m, 1.0 / me, 1.0 / me)
                 else:
                     m = rows * shape[-1]
-                    ops.mse(out, Yd, dout, lossv, m, 1.0 / m, len(b) / (n * m))
+                    _regress(ops, loss, out, Yd, dout, lossv, m, 1.0 / m, len(b) / (n * m))
                 net.backward(dout)
                 if EWC_A is not None:                       # g += strength * F * (w - anchor)
                     ops.fill((EWC_T, 0), net.n, 0.0)
@@ -2977,7 +3015,7 @@ def fit(model, params, X, y=None, loss="mse", opt=None, epochs=10, batch_size=No
             show = verbose and (ep % max(1, E // 10) == 0 or ep == E - 1)
             extra = ""
             if val is not None:                             # (these wait for the card; without them nothing does)
-                vl = _eval_loss(net, ops, val, ids, ce, bs if graph is None else 1 << 62)
+                vl = _eval_loss(net, ops, val, ids, loss, bs if graph is None else 1 << 62)
                 val_hist.append(vl)
                 extra = f"  val {vl:.5f}"
             if show:
@@ -3020,8 +3058,8 @@ def _fit_parallel(ops_list, model, params, X, y, loss, opt, epochs, batch_size, 
     from . import layers as L, ops as aops, thermal
     from .stdlib import Adam, AdamW, SGD
     loss = str(loss)
-    if loss not in ("cross_entropy", "mse"):
-        raise TrainError(f"loss '{loss}' is not on the GPU trainer (cross_entropy, mse)")
+    if loss not in LOSSES:
+        raise TrainError(f"loss '{loss}' is not on the GPU trainer ({', '.join(LOSSES)})")
     opt = opt or Adam(1e-3)
     if not isinstance(opt, (Adam, SGD)):
         raise TrainError(f"optimizer {type(opt).__name__} is not on the GPU trainer (adam, adamw, sgd)")
@@ -3114,7 +3152,8 @@ def _fit_parallel(ops_list, model, params, X, y, loss, opt, epochs, batch_size, 
                         o.ce(out, rep["Yd"], dout, lossv, rows, shape[-1], w, w * len(b) / n)
                     else:
                         m_all = len(b) * int(np.prod(shape[1:]))
-                        o.mse(out, rep["Yd"], dout, lossv, rows * shape[-1], 1.0 / m_all, len(b) / (n * m_all))
+                        _regress(o, loss, out, rep["Yd"], dout, lossv, rows * shape[-1], 1.0 / m_all,
+                                 len(b) / (n * m_all))
                     net.backward(dout)
                 o0 = r0["ops"]
                 for rep in R:                                # every card's gradient is complete
@@ -3185,7 +3224,7 @@ def _fit_parallel(ops_list, model, params, X, y, loss, opt, epochs, batch_size, 
                 rep["ops"].sync()
             ep_seconds.append(round(time.perf_counter() - t0, 3))
             if val is not None:
-                val_hist.append(_eval_loss(r0["net"], o0, val, ids, ce, bs))
+                val_hist.append(_eval_loss(r0["net"], o0, val, ids, loss, bs))
             if verbose and (ep % max(1, E // 10) == 0 or ep == E - 1):
                 lv = sum(float(rep["ops"].get(rep["LOSSE"], 1, ep)[0]) for rep in R)
                 print(f"epoch {ep:4}  loss {lv:.5f}  ({len(R)} cards)")
@@ -3236,13 +3275,19 @@ def _eval_loss_host(forward, val, ids, ce, bs):
     else:
         out = forward(Xa).astype(np.float64)
     vy = np.asarray(aops.raw(vy))
-    if ce:
+    if ce is True or ce == "cross_entropy":
         lg = out.reshape(-1, out.shape[-1])
         lab = vy.reshape(-1).astype(np.int64)
         ok = lab >= 0
         mx = lg.max(1, keepdims=True)
         lse = (mx + np.log(np.exp(lg - mx).sum(1, keepdims=True)))[:, 0]
         return float((lse[ok] - lg[np.arange(len(lab))[ok], lab[ok]]).mean())
+    vy = vy.astype(np.float64).reshape(out.shape)
+    if ce == "mae":
+        return float(np.abs(out - vy).mean())
+    if ce == "bce":
+        sg = 1 / (1 + np.exp(-out))
+        return float(-(vy * np.log(sg + 1e-12) + (1 - vy) * np.log(1 - sg + 1e-12)).mean())
     return float(((out - vy) ** 2).mean())
 
 

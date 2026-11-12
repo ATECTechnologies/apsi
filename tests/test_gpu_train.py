@@ -82,6 +82,30 @@ class Trainer(unittest.TestCase):
         r = GT.fit(lm, lm.init(seed=0), ids, lab, ops=e, **dict(kw, opt=Adam(3e-3))).history
         np.testing.assert_allclose(ref, r, rtol=3e-3)
 
+    def test_mae_and_bce_losses(self):
+        """mae and bce on the GPU trainer, one card, data parallel, a split model and a masked graph: the NumPy
+        backend's losses."""
+        rng = np.random.default_rng(1)
+        X = rng.normal(size=(48, 6))
+        for loss, yy in (("mae", rng.normal(size=(48, 3))), ("bce", (rng.random((48, 3)) < 0.4).astype(float))):
+            m = L.mlp([6, 16, 16, 3], "gelu")
+            kw = dict(loss=loss, epochs=3, batch_size=16, verbose=False, precision="fp32", val=(X, yy))
+            a = L.fit(m, m.init(seed=0), X, yy, opt=Adam(0.01), **kw)
+            for ops, par in ((GT.Emulator(), "auto"), ([GT.Emulator(), GT.Emulator()], "data"),
+                             ([GT.Emulator() for _ in range(3)], "pipeline")):
+                b = GT.fit(m, m.init(seed=0), X, yy, opt=Adam(0.01), ops=ops, parallel=par, **kw)
+                np.testing.assert_allclose(a.history, b.history, rtol=1e-5, err_msg=f"{loss} {par}")
+                np.testing.assert_allclose(a.val_history, b.val_history, rtol=1e-5)
+        N = 40
+        g = L.graph(edges=rng.integers(0, N, (100, 2)).tolist(), n=N)
+        Xg, mask = rng.normal(size=(N, 8)), rng.random(N) < 0.5
+        for loss, yy in (("mae", rng.normal(size=(N, 2))), ("bce", (rng.random((N, 2)) < 0.5).astype(float))):
+            m = L.gcn_net(8, 16, 2, dropout=0.0)
+            kw = dict(loss=loss, epochs=3, verbose=False, precision="fp32", graph=g, mask=mask)
+            a = L.fit(m, m.init(seed=0), Xg, yy, opt=Adam(0.01), **kw)
+            b = GT.fit(m, m.init(seed=0), Xg, yy, opt=Adam(0.01), ops=GT.Emulator(), **kw)
+            np.testing.assert_allclose(a.history, b.history, rtol=1e-5)
+
     def test_mixture_of_experts_is_exact(self):
         """moe: the router's top-k and its softmax on the card, the rows grouped by expert, every expert on its own
         rows, the outputs summed back by the gates: gradients equal autodiff; a moe language model trains like NumPy,
@@ -483,6 +507,15 @@ class RealGpu(unittest.TestCase):
         for dv, i in ((g, 0), (e, 1)):
             dv.colmul(x[i], cm[i], out[i], 996, 12)
         same(out[0], out[1], 996, 1e-6, "colmul")
+        T1, Wm, DY1, L1 = pair(rng.random(n)), pair((rng.random(n) < 0.5).astype(float)), pair(np.zeros(n)), \
+            pair(np.zeros(1))
+        for kind in (0, 1):
+            for wv in (None, Wm):
+                for dv, i in ((g, 0), (e, 1)):
+                    dv.fill(L1[i], 1, 0.0)
+                    dv.loss_ew(x[i], T1[i], wv[i] if wv is not None else None, DY1[i], L1[i], n, 0.01, 0.02, kind)
+                same(DY1[0], DY1[1], n, 1e-4, f"loss_ew {kind} grad")
+                same(L1[0], L1[1], 1, 1e-4, f"loss_ew {kind} loss")
         W, WQ = pair(rng.normal(size=(70, 48))), pair(np.zeros(70 * 48))
         for kind in range(6):
             g.fakeq(W[0], WQ[0], 70, 48, kind)

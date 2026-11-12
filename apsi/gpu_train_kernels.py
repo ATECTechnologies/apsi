@@ -24,7 +24,7 @@ TILE = 64
 MAIN = ("apsi_kernel", "axpy", "add3", "mul3", "act_f", "act_b", "colsum", "ln_f", "ln_b", "embed_f", "embed_b",
         "pos_f", "pos_b", "softmax_f", "softmax_b", "ce", "mse", "sumsq", "adam", "sgd", "drop_f", "fakeq",
         "gemm_simt", "gather", "rope", "spmm", "edge_dot", "seg_softmax", "seg_softmax_b", "dot_acc", "scale_add",
-        "cols", "colmul", "topk_gate", "topk_gate_b")
+        "cols", "colmul", "topk_gate", "topk_gate_b", "loss_ew")
 TC = ("apsi_kernel", "gemm_tc3")                     # apsi_kernel = the one-pass product
 
 
@@ -693,6 +693,37 @@ def _main_module():
     with b.if_then(b.and_(valid, b.icmp_unsigned("==", k.tid, C(0)))):
         lse = b.fadd(M_, b.fdiv(b.call(lg2_f, [Z]), F(LOG2E)))
         k.atomic_add(p["LOSS"], C(0), b.fmul(b.fsub(lse, k.ld(p["L"], b.add(base, i64of(b, lab)))), p["wl"]))
+    k.ret()
+
+    # loss_ew: element-wise losses with an optional weight per element (a mask). kind 0: mae |y - t|;
+    # kind 1: bce -(t log(s + 1e-12) + (1 - t) log(1 - s + 1e-12)), s = sigmoid(y) (the formula of the NumPy backend)
+    k = K("loss_ew", [("Y", G(f32)), ("T", G(f32)), ("W", G(f32)), ("DY", G(f32)), ("LOSS", G(f32)), ("n", i32),
+                      ("wg", f32), ("wl", f32), ("kind", i32), ("hasw", i32)])
+    b, p = k.b, k.p
+    s = k.var(F(0.0))
+
+    def lew(i):
+        y, t = k.ld(p["Y"], i), k.ld(p["T"], i)
+        w = b.select(b.icmp_unsigned("!=", p["hasw"], C(0)), k.ld(p["W"], b.select(
+            b.icmp_unsigned("!=", p["hasw"], C(0)), i, C(0))), F(1.0))
+        d = b.fsub(y, t)
+        l_mae = b.call(fabs_f, [d])
+        g_mae = b.select(b.fcmp_ordered(">", d, F(0.0)), F(1.0), b.select(b.fcmp_ordered("<", d, F(0.0)), F(-1.0),
+                                                                            F(0.0)))
+        sg = sigmoid(k, y)
+        a, c = b.fadd(sg, F(1e-12)), b.fadd(b.fsub(F(1.0), sg), F(1e-12))
+        ln = lambda v: b.fdiv(b.call(lg2_f, [v]), F(LOG2E))          # noqa: E731
+        l_bce = b.fsub(F(0.0), b.fadd(b.fmul(t, ln(a)), b.fmul(b.fsub(F(1.0), t), ln(c))))
+        ds = b.fmul(sg, b.fsub(F(1.0), sg))
+        g_bce = b.fsub(F(0.0), b.fsub(b.fdiv(b.fmul(t, ds), a), b.fdiv(b.fmul(b.fsub(F(1.0), t), ds), c)))
+        bce = b.icmp_unsigned("==", p["kind"], C(1))
+        lv, gv = b.select(bce, l_bce, l_mae), b.select(bce, g_bce, g_mae)
+        k.st(b.fmul(b.fmul(gv, w), p["wg"]), p["DY"], i)
+        b.store(b.call(fma_f, [lv, w, b.load(s)]), s)
+    k.grid_loop(p["n"], lew)
+    tot = k.block_sum(b.load(s))
+    with b.if_then(b.icmp_unsigned("==", k.tid, C(0))):
+        k.atomic_add(p["LOSS"], C(0), b.fmul(tot, p["wl"]))
     k.ret()
 
     k = K("mse", [("Y", G(f32)), ("T", G(f32)), ("DY", G(f32)), ("LOSS", G(f32)), ("n", i32), ("wg", f32),

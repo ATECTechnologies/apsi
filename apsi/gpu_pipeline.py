@@ -260,8 +260,9 @@ def fit_pipeline(ops_list, model, params, X, y, loss, opt, epochs, batch_size, s
     from .stdlib import Adam, AdamW, SGD
     from .gpu_train import TrainError, _inputs, _rows, _eval_loss_host
     loss = str(loss)
-    if loss not in ("cross_entropy", "mse"):
-        raise TrainError(f"loss '{loss}' is not on the GPU trainer (cross_entropy, mse)")
+    from .gpu_train import LOSSES
+    if loss not in LOSSES:
+        raise TrainError(f"loss '{loss}' is not on the GPU trainer ({', '.join(LOSSES)})")
     opt = opt or Adam(1e-3)
     if not isinstance(opt, (Adam, SGD)):
         raise TrainError(f"optimizer {type(opt).__name__} is not on the GPU trainer (adam, adamw, sgd)")
@@ -300,6 +301,7 @@ def fit_pipeline(ops_list, model, params, X, y, loss, opt, epochs, batch_size, s
                 st = Stage(o, lay, pl, precision, s, S, min(S - s, M))
                 st.net.seed = int(seed) * 7919 + 1 + 104729 * (r * S + s)
                 st.gov = thermal.governor(getattr(o, "dev", None))
+                st.loss_name = loss
                 row.append(st)
                 if st.first:
                     st.XA, st.IDX = st.alloc(Xa.size), st.alloc(max(1, n * E))
@@ -382,7 +384,7 @@ def fit_pipeline(ops_list, model, params, X, y, loss, opt, epochs, batch_size, s
                     st.ops.sync()
             ep_seconds.append(round(time.perf_counter() - t0, 3))
             if val is not None:
-                val_hist.append(_eval_loss_host(lambda xb: pipe_forward(grid[0], xb), val, ids, ce, bs))
+                val_hist.append(_eval_loss_host(lambda xb: pipe_forward(grid[0], xb), val, ids, loss, bs))
             if verbose and (ep % max(1, E // 10) == 0 or ep == E - 1):
                 lv = sum(float(row[-1].ops.get(row[-1].LOSSE, 1, ep)[0]) for row in grid)
                 print(f"epoch {ep:4}  loss {lv:.5f}  ({S} stages x {R} replicas)")
@@ -463,8 +465,9 @@ def _stage_main(args, stop, errors):
 
 
 def _stage_work(st, row, mb, part, b, ep, n, s0, xw, yw, xshape, ce, valid, fwd, bwd, sends, lossi):
-    from .gpu_train import _rows
+    from .gpu_train import _rows, _regress
     o, net, s, S = st.ops, st.net, st.index, st.count
+    loss_name = st.loss_name
     o.fill((net.G, 0), net.n, 0.0)
     net.round_weights()
     net.train = True
@@ -500,7 +503,7 @@ def _stage_work(st, row, mb, part, b, ep, n, s0, xw, yw, xshape, ce, valid, fwd,
                 o.ce(out, yb, dout, lossv, r_, shape[-1], w, w * len(b) / n)
             else:
                 m_all = len(b) * int(np.prod(shape[1:]))
-                o.mse(out, yb, dout, lossv, r_ * shape[-1], 1.0 / m_all, len(b) / (n * m_all))
+                _regress(o, loss_name, out, yb, dout, lossv, r_ * shape[-1], 1.0 / m_all, len(b) / (n * m_all))
             dy = dout
             release = None
         else:
