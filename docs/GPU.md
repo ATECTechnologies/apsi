@@ -188,7 +188,10 @@ card; the tests check it against NumPy step by step. `backend="numpy"` runs the 
 several inputs as well as a sequence — is cut into stages between its nodes (each stage receives the values it needs
 by name, several at once, and hands on the ones later stages need), the `accumulate` batches of a step flow through
 the stages as micro-batches, each with its own graph, and the cards left copy the pipeline (`stages=2` on 4 cards:
-2 stages x 2 replicas). The same training as one card, step for step. A `dag` with several outputs trains with a
+2 stages x 2 replicas). The same training as one card, step for step, and the same weights to the last bit: the
+gradients of a step's batches, of the copies of a stage and of the values that cross a cut are summed exactly
+(double-float) and rounded once, so neither the number of cards nor where the model is cut changes a single bit
+(`exact_sums=false` turns it off; on by default below 2 B parameters). A `dag` with several outputs trains with a
 loss of your own over all of them (the outputs travel to the last stage); a weight two stages hold (a tied output
 on another card than its embedding) gets the sum of both gradients. GLA 3.0 (`gla(…)`, `docs/GLA.md`) trains this
 way.

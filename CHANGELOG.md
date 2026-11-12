@@ -2,6 +2,18 @@
 
 ## 2.6.0 — in progress
 
+### Exact training on many cards
+- **The same weights on any number of cards, to the last bit:** the gradients of a step's batches, of the copies of
+  a stage and of the values that cross a cut are summed exactly (double-float, two new kernels: `acc2`, an
+  error-free TwoSum accumulation, and `fin2`, one rounding at the end), and an exact sum crosses a cut whole (its
+  high and low parts). Copies of the model and cuts between nodes give one card's training bit for bit; a weight two
+  stages share is summed more exactly than one card does. On by default below 2 B parameters
+  (`fit_batches(…, exact_sums=)`, `APSI_GPU_EXACT_SUMS`).
+- **Order-free gradients inside the model:** a value used by several layers gets their gradients' exact sum,
+  rounded once, whatever order they arrive in.
+- **Optimizers on the processor keep float64 weights** (a master copy, as NumPy does); the card gets them rounded
+  once. Frozen weights stay frozen in the master copy too.
+
 ### Tensors on the card
 - **`gpu_tensor(x)`:** a tensor on the card with Apsi's own kernels — products (batched, transposed views without
   copies), arithmetic with tensors, row vectors and numbers, activations, softmax, layer and RMS norms, sums and

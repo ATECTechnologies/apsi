@@ -88,6 +88,28 @@ class Modes(unittest.TestCase):
                                verbose=False, precision="fp32", ops=GT.Emulator())
             np.testing.assert_allclose(a.history, b.history, rtol=1e-5)
 
+    def test_more_cards_give_the_same_weights_to_the_last_bit(self):
+        """Exact (double-float) sums of the gradients of a step's batches, of the copies of a stage and of the
+        gradients that cross a cut: copies of the model and cuts between nodes give one card's weights bit for bit."""
+        from apsi.values import tree_leaves
+        m = GL.gla("tiny")
+        batches = [GL.gla_batch(GL.gla_task("tiny", int(b), seed=s)) for s, b in enumerate([3, 2, 4, 3, 2, 3, 2, 4])]
+        names = [n for n, *_ in m.nodes]
+
+        def run(ops, st=None, opt=lambda: Adam(0.003)):
+            return GT.fit_batches(m, m.init(seed=0), batches, GL.gla_loss, opt=opt(), epochs=2, verbose=False,
+                                  precision="fp32", ops=ops, accumulate=4, stages=st)
+        one = run(GT.Emulator())
+        for ops, st in (([GT.Emulator() for _ in range(2)], 1), ([GT.Emulator() for _ in range(4)], [12, 35])):
+            r = run(ops, st)
+            for a, b in zip(tree_leaves(one.params), tree_leaves(r.params)):
+                np.testing.assert_array_equal(np.asarray(a), np.asarray(b))
+        one = run(GT.Emulator(), None, lambda: SGD(0.1))
+        for cut in (12, 30):
+            r = run([GT.Emulator() for _ in range(2)], [cut, len(names) - cut], lambda: SGD(0.1))
+            for a, b in zip(tree_leaves(one.params), tree_leaves(r.params)):
+                np.testing.assert_array_equal(np.asarray(a), np.asarray(b))
+
 
 if __name__ == "__main__":
     unittest.main()

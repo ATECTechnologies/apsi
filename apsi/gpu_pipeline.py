@@ -605,13 +605,16 @@ def _host_update(grid, opt, clip, lr):
     from .gpu_train import _host_step
     R, S = len(grid), len(grid[0])
     heads = [grid[0][s] for s in range(S)]
+    exact = getattr(grid[0][0], "HI", None) is not None
+    if exact:
+        _exact_replica_sum(grid, full=True)
     for s in range(S):
         for r in range(R):
             fz = getattr(grid[r][s].net, "freeze", None)
             if fz is not None and fz.ranges:
                 fz.zero_grads()
                 fz.save()
-        if R > 1:
+        if R > 1 and not exact:
             st = heads[s]
             n = st.net.n
             tmp = st.alloc(n)
@@ -656,6 +659,9 @@ def _update(grid, opt, adam, wd, lr, t_step, clip, lam):
     the copies take the updated slices from each other. clip: the norm of the whole model's gradient."""
     R = len(grid)
     S = len(grid[0])
+    exact = getattr(grid[0][0], "HI", None) is not None
+    if exact:
+        _exact_replica_sum(grid)
     for row in grid:
         for st in row:
             fz = getattr(st.net, "freeze", None)
@@ -664,7 +670,7 @@ def _update(grid, opt, adam, wd, lr, t_step, clip, lam):
                 fz.save()
     for s in range(S):
         group = [grid[r][s] for r in range(R)]
-        if R > 1:
+        if R > 1 and not exact:
             for st in group:
                 st.ops.sync()
             for st in group:
@@ -689,10 +695,12 @@ def _update(grid, opt, adam, wd, lr, t_step, clip, lam):
     everyone = [st for row in grid for st in row]
     if clip:
         total = sum(float(st.ops.get(st.SQ, 1)[0]) for st in everyone)
-        for st in grid[0]:                               # (the replicas hold summed copies: count row 0's once)
+        for st in everyone:                              # a shared weight once (each copy: its own slice)
             for off, k in getattr(st, "dups", ()):
-                g = st.ops.get(st.net.G, k, off).astype(np.float64)
-                total -= float((g * g).sum())
+                a, b = max(off, st.lo), min(off + k, st.hi)
+                if b > a:
+                    g = st.ops.get(st.net.G, b - a, a).astype(np.float64)
+                    total -= float((g * g).sum())
         for st in everyone:
             st.ops.fill((st.SQ, 0), 1, total)
     for st in everyone:
@@ -802,15 +810,21 @@ class SegStage(Stage):
         self.saved[m] = [dict(vars(nd)) for nd in self.nodes]
         return vals
 
-    def backward_seg(self, m, seeds):
+    def backward_seg(self, m, seeds, seeds_lo=None):
+        """The gradients of the values this stage received: name -> (hi, lo or None), exact sums not yet rounded
+        (the stage before keeps summing them exactly)."""
         self.use_slot(m)
         for nd, st in zip(self.nodes, self.saved.pop(m)):
             nd.__dict__.update(st)
-        return self.net.root.back_from(seeds)
+        g = self.net.root.back_from(seeds, seeds_lo, raw=True)
+        if getattr(self, "HI", None) is not None:        # this micro-batch's gradients into the exact sum
+            self.ops.acc2((self.HI, 0), (self.LO, 0), (self.net.G, 0), self.net.n)
+        return g
 
 
 def fit_batches_pipeline(ops_list, model, params, batches, loss, opt, epochs, verbose, clip, schedule_fn, precision,
-                         stages=None, micro=None, compensated=False, every=None, freeze=None, train_only=None):
+                         stages=None, micro=None, compensated=False, every=None, freeze=None, train_only=None,
+                         exact=False):
     """fit_batches on several cards: the model (a dag or a sequence) cut into stages at the points that balance the
     work, `micro` batches of a step flowing through them in a one-forward-one-backward order, the pipeline copied
     over the cards left (replicas). Every batch may bring its own shapes and graph. One step averages the gradients
@@ -876,6 +890,10 @@ def fit_batches_pipeline(ops_list, model, params, batches, loss, opt, epochs, ve
                 st.st1, st.st2 = st.alloc(ln), (st.alloc(ln) if adam else None)
                 st.SQ, st.TMP = st.alloc(1), st.alloc(ln)
                 st.COMP = st.alloc(ln) if compensated else None
+                if exact:                                # the step's gradients summed in double-float
+                    st.HI, st.LO = st.alloc(nP), st.alloc(nP)
+                    o.fill((st.HI, 0), nP, 0.0)
+                    o.fill((st.LO, 0), nP, 0.0)
                 for b_ in (st.st1, st.st2, st.COMP):
                     if b_ is not None:
                         o.fill((b_, 0), ln, 0.0)
@@ -945,13 +963,51 @@ def _sum_shared(row, shared):
         A.ops.sync()
         B.ops.sync()
         tmp = A.alloc(n)
-        A.ops.pull((tmp, 0), B.ops, (B.net.G, ob), n)
-        A.ops.axpy((A.net.G, oa), (tmp, 0), n, 1.0)
-        A.ops.sync()
-        B.ops.pull((B.net.G, ob), A.ops, (A.net.G, oa), n)
+        if getattr(A, "HI", None) is not None:           # exact: both parts of B's sum into A's, then A's to B
+            for part in ("HI", "LO"):
+                A.ops.pull((tmp, 0), B.ops, (getattr(B, part), ob), n)
+                A.ops.acc2((A.HI, oa), (A.LO, oa), (tmp, 0), n)
+            A.ops.sync()
+            for part in ("HI", "LO"):
+                B.ops.pull((getattr(B, part), ob), A.ops, (getattr(A, part), oa), n)
+        else:
+            A.ops.pull((tmp, 0), B.ops, (B.net.G, ob), n)
+            A.ops.axpy((A.net.G, oa), (tmp, 0), n, 1.0)
+            A.ops.sync()
+            B.ops.pull((B.net.G, ob), A.ops, (A.net.G, oa), n)
         B.ops.sync()
         A.extra.remove(tmp)
         A.ops.free(tmp)
+
+
+def _exact_replica_sum(grid, full=False):
+    """The copies of each stage add their exact sums (each the slice it updates, or everything into the first copy
+    with full=True), then the sum is rounded once into the gradient."""
+    R, S = len(grid), len(grid[0])
+    for s in range(S):
+        group = [grid[r][s] for r in range(R)]
+        for st in group:
+            st.ops.sync()
+        targets = group[:1] if full else group
+        for st in targets:
+            lo, k = (0, st.net.n) if full else (st.lo, st.hi - st.lo)
+            if k <= 0:
+                continue
+            tmp = st.alloc(k)
+            for q in group:
+                if q is st:
+                    continue
+                for part in ("HI", "LO"):
+                    st.ops.pull((tmp, 0), q.ops, (getattr(q, part), lo), k)
+                    st.ops.acc2((st.HI, lo), (st.LO, lo), (tmp, 0), k)
+            st.extra.remove(tmp)
+            st.ops.free(tmp)
+        for st in group:
+            st.ops.sync()
+        for st in targets:
+            lo, k = (0, st.net.n) if full else (st.lo, st.hi - st.lo)
+            if k > 0:
+                st.ops.fin2((st.HI, lo), (st.LO, lo), (st.net.G, lo), k)
 
 
 def _seg_step(grid, parts, inputs, output, loss, loss_fn, total):
@@ -1003,6 +1059,9 @@ def _seg_work(st, items, inputs, output, loss, loss_fn, total, fwd, bwd, sends, 
     from .stdlib import value_and_grad
     o, net, s = st.ops, st.net, st.index
     o.fill((net.G, 0), net.n, 0.0)
+    if getattr(st, "HI", None) is not None:
+        o.fill((st.HI, 0), net.n, 0.0)
+        o.fill((st.LO, 0), net.n, 0.0)
     o.fill((st.LOSSB, 0), max(1, len(items)), 0.0)
     net.round_weights()
     net.train = True
@@ -1086,14 +1145,18 @@ def _seg_work(st, items, inputs, output, loss, loss_fn, total, fwd, bwd, sends, 
                 continue
             got, msg, sem = bwd[s].get()
             assert got == m
-            seeds = {}
-            for name, view, cnt, src in msg:
+            seeds, seeds_lo = {}, {}
+            for name, view, cnt, src, lov in msg:
                 v = st.garena.get(("din", name), cnt)
                 o.pull(v, src, view, cnt)
                 seeds[name] = v
+                if lov is not None:                      # the low part of an exact sum
+                    w = st.garena.get(("dinlo", name), cnt)
+                    o.pull(w, src, lov, cnt)
+                    seeds_lo[name] = w
             release = sem
         if kind == "B" or st.last:
-            grads = st.backward_seg(m, seeds)
+            grads = st.backward_seg(m, seeds, seeds_lo if kind == "B" and not st.last else None)
             _send_back(st, grads, sends, bwd, s, m, o, ring)
             if not st.first:
                 ring ^= 1
@@ -1111,12 +1174,17 @@ def _send_back(st, grads, sends, bwd, s, m, o, ring):
     sends[s].acquire()                                   # a free send buffer (the stage before has read it)
     msg = []
     for name in st.live_in:
-        gv = grads.get(name)
-        if gv is None or name not in st.net.root.shapes:
+        pair = grads.get(name)
+        if pair is None or pair[0] is None or name not in st.net.root.shapes:
             continue
+        gv, lo = pair
         cnt = int(np.prod(st.net.root.shapes[name]))
         buf = st.garena.get(("send", ring, name), cnt)
         o.pull(buf, o, gv, cnt)
-        msg.append((name, buf, cnt, o))
+        lob = None
+        if lo is not None:                               # an exact sum travels whole (high and low parts)
+            lob = st.garena.get(("sendlo", ring, name), cnt)
+            o.pull(lob, o, lo, cnt)
+        msg.append((name, buf, cnt, o, lob))
     o.sync()
     bwd[s - 1].put((m, msg, sends[s]))
