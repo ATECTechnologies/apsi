@@ -251,8 +251,10 @@ class Trainer(unittest.TestCase):
             kw = dict(loss=loss, epochs=4, verbose=False, precision="fp32", graph=g, mask=mask, val=(X, yy))
             a = L.fit(m, m.init(seed=0), X, yy, opt=Adam(0.01), **kw)
             b = GT.fit(m, m.init(seed=0), X, yy, opt=Adam(0.01), ops=GT.Emulator(), **kw)
-            np.testing.assert_allclose(a.history, b.history, rtol=1e-5, err_msg=name)
-            np.testing.assert_allclose(a.val_history, b.val_history, rtol=1e-5, err_msg=name)
+            # (the float32 sums of NumPy's BLAS differ by platform; a GAT's a_dst gradient is all but zero, which Adam
+            # turns into steps of its full size: 1e-4 leaves room for both)
+            np.testing.assert_allclose(a.history, b.history, rtol=1e-4, err_msg=name)
+            np.testing.assert_allclose(a.val_history, b.val_history, rtol=1e-4, err_msg=name)
             np.testing.assert_allclose(np.asarray(L.predict(m, a.params, X, graph=g)),
                                        GT.predict(m, a.params, X, ops=GT.Emulator(), graph=g, precision="fp32"),
                                        rtol=1e-4, atol=1e-5, err_msg=name)
