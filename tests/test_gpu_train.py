@@ -82,6 +82,26 @@ class Trainer(unittest.TestCase):
         r = GT.fit(lm, lm.init(seed=0), ids, lab, ops=e, **dict(kw, opt=Adam(3e-3))).history
         np.testing.assert_allclose(ref, r, rtol=3e-3)
 
+    def test_convolutions_and_pooling_are_exact(self):
+        """conv2d (any kernel, stride, padding), max_pool (ties share the gradient), avg_pool, global_avg_pool, odd
+        sizes that leave rows out of the windows: gradients equal autodiff; cnn trains like NumPy."""
+        rng = np.random.default_rng(0)
+        X, y = rng.normal(size=(6, 3, 13, 13)), rng.integers(0, 4, 6)
+        grads_match(self, L.cnn(3, 4, image=12, channels=(5, 6), dense_width=16), X[:, :, :12, :12], y,
+                    "cross_entropy")
+        grads_match(self, L.Sequential([L.Conv2D(3, 4, 3, stride=2, padding=1), L.Activation("relu"), L.AvgPool(2),
+                                        L.Conv2D(4, 5, 1, padding=0), L.GlobalAvgPool(), L.Linear(5, 4)]), X, y,
+                    "cross_entropy")
+        grads_match(self, L.Sequential([L.Conv2D(3, 4, 5, padding="same"), L.MaxPool(3), L.Flatten(),
+                                        L.Linear(64, 4)]), X, y, "cross_entropy")
+        grads_match(self, L.Sequential([L.MaxPool(2), L.Flatten(), L.Linear(32, 3)]),
+                    np.round(rng.normal(size=(4, 2, 8, 8))), rng.integers(0, 3, 4), "cross_entropy")
+        m = L.cnn(3, 4, image=12, channels=(5, 6), dense_width=16)
+        kw = dict(loss="cross_entropy", epochs=3, batch_size=3, verbose=False, precision="fp32")
+        a = L.fit(m, m.init(seed=0), X[:, :, :12, :12], y, opt=Adam(0.01), **kw)
+        b = GT.fit(m, m.init(seed=0), X[:, :, :12, :12], y, opt=Adam(0.01), ops=GT.Emulator(), **kw)
+        np.testing.assert_allclose(a.history, b.history, rtol=1e-5)
+
     def test_mae_and_bce_losses(self):
         """mae and bce on the GPU trainer, one card, data parallel, a split model and a masked graph: the NumPy
         backend's losses."""
@@ -374,7 +394,8 @@ class Trainer(unittest.TestCase):
 
     def test_unsupported_layers_say_so(self):
         self.assertIsNone(GT.supports(L.transformer_lm(30, d=16, heads=2, layers=1, context=8)))
-        self.assertIn("conv", GT.supports(L.Sequential([L.Conv2D(1, 2)])))
+        self.assertIsNone(GT.supports(L.Sequential([L.Conv2D(1, 2)])))
+        self.assertIn("lstm", GT.supports(L.Sequential([L.LSTMLayer(4, 8)])))
 
 
 @unittest.skipIf(GT.device()[0] is None, "no NVIDIA GPU")
@@ -516,6 +537,31 @@ class RealGpu(unittest.TestCase):
                     dv.loss_ew(x[i], T1[i], wv[i] if wv is not None else None, DY1[i], L1[i], n, 0.01, 0.02, kind)
                 same(DY1[0], DY1[1], n, 1e-4, f"loss_ew {kind} grad")
                 same(L1[0], L1[1], 1, 1e-4, f"loss_ew {kind} loss")
+        Ni, Ci, Hi, Wi, kk_, st_, pd_ = 2, 3, 9, 7, 3, 2, 1
+        OHi, OWi = (Hi + 2 * pd_ - kk_) // st_ + 1, (Wi + 2 * pd_ - kk_) // st_ + 1
+        Xi = pair(rng.normal(size=(Ni, Ci, Hi, Wi)))
+        COLi = pair(np.zeros(Ni * OHi * OWi * Ci * kk_ * kk_))
+        DXi = pair(np.zeros(Ni * Ci * Hi * Wi))
+        for dv, i in ((g, 0), (e, 1)):
+            dv.im2col(Xi[i], COLi[i], Ni, Ci, Hi, Wi, kk_, kk_, st_, pd_, OHi, OWi)
+            dv.col2im(COLi[i], DXi[i], Ni, Ci, Hi, Wi, kk_, kk_, st_, pd_, OHi, OWi)
+        same(COLi[0], COLi[1], Ni * OHi * OWi * Ci * kk_ * kk_, 1e-6, "im2col")
+        same(DXi[0], DXi[1], Ni * Ci * Hi * Wi, 1e-5, "col2im")
+        Zp, Yp, Bp = pair(rng.normal(size=(2, 15, 4))), pair(np.zeros(120)), pair(rng.normal(size=4))
+        for dv, i in ((g, 0), (e, 1)):
+            dv.perm_nc(Zp[i], Yp[i], Bp[i], 2, 4, 15, 0)
+        same(Yp[0], Yp[1], 120, 1e-6, "perm_nc")
+        for dv, i in ((g, 0), (e, 1)):
+            dv.perm_nc(Zp[i], Yp[i], None, 2, 4, 15, 1)
+        same(Zp[0], Zp[1], 120, 1e-6, "perm_nc back")
+        Xq = pair(np.round(rng.normal(size=(3, 9, 7))))
+        Yq, DYq, DXq = pair(np.zeros(3 * 12)), pair(rng.normal(size=3 * 12)), pair(np.zeros(3 * 63))
+        for mode in (0, 1):
+            for dv, i in ((g, 0), (e, 1)):
+                dv.pool_f(Xq[i], Yq[i], 3, 9, 7, 2, mode)
+                dv.pool_b(Xq[i], Yq[i], DYq[i], DXq[i], 3, 9, 7, 2, mode)
+            same(Yq[0], Yq[1], 3 * 12, 1e-6, f"pool_f {mode}")
+            same(DXq[0], DXq[1], 3 * 63, 1e-6, f"pool_b {mode}")
         W, WQ = pair(rng.normal(size=(70, 48))), pair(np.zeros(70 * 48))
         for kind in range(6):
             g.fakeq(W[0], WQ[0], 70, 48, kind)

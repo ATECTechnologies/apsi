@@ -24,7 +24,7 @@ TILE = 64
 MAIN = ("apsi_kernel", "axpy", "add3", "mul3", "act_f", "act_b", "colsum", "ln_f", "ln_b", "embed_f", "embed_b",
         "pos_f", "pos_b", "softmax_f", "softmax_b", "ce", "mse", "sumsq", "adam", "sgd", "drop_f", "fakeq",
         "gemm_simt", "gather", "rope", "spmm", "edge_dot", "seg_softmax", "seg_softmax_b", "dot_acc", "scale_add",
-        "cols", "colmul", "topk_gate", "topk_gate_b", "loss_ew")
+        "cols", "colmul", "topk_gate", "topk_gate_b", "loss_ew", "im2col", "col2im", "perm_nc", "pool_f", "pool_b")
 TC = ("apsi_kernel", "gemm_tc3")                     # apsi_kernel = the one-pass product
 
 
@@ -628,6 +628,137 @@ def _main_module():
             k.st(v, p["DL"], b.add(base, i64of(b, e)))
         k.loop(C(0), p["k"], C(1), put)
     k.grid_loop(p["M"], topkb)
+    k.ret()
+
+    # ------------------------------------------------------------------------- images (N, C, H, W)
+    # im2col: COL[(n, oh, ow), (c, i, j)] = X[n, c, oh s + i - p, ow s + j - p] (0 outside)
+    shp = [("N", i32), ("C", i32), ("H", i32), ("W", i32), ("kh", i32), ("kw", i32), ("s", i32), ("p", i32),
+           ("OH", i32), ("OW", i32)]
+    k = K("im2col", [("X", G(f32)), ("COL", G(f32))] + shp)
+    b, p = k.b, k.p
+    CK = b.mul(p["C"], b.mul(p["kh"], p["kw"]))
+
+    def i2c(t):
+        r, c = b.udiv(t, CK), b.urem(t, CK)
+        ow = b.urem(r, p["OW"])
+        oh = b.urem(b.udiv(r, p["OW"]), p["OH"])
+        n = b.udiv(r, b.mul(p["OW"], p["OH"]))
+        j = b.urem(c, p["kw"])
+        i = b.urem(b.udiv(c, p["kw"]), p["kh"])
+        ci = b.udiv(c, b.mul(p["kw"], p["kh"]))
+        ih = b.sub(b.add(b.mul(oh, p["s"]), i), p["p"])          # unsigned: below zero wraps above H
+        iw = b.sub(b.add(b.mul(ow, p["s"]), j), p["p"])
+        inside = b.and_(b.icmp_unsigned("<", ih, p["H"]), b.icmp_unsigned("<", iw, p["W"]))
+        src = b.add(b.mul(i64of(b, b.add(b.mul(n, p["C"]), ci)), i64of(b, b.mul(p["H"], p["W"]))),
+                    i64of(b, b.add(b.mul(b.select(inside, ih, C(0)), p["W"]), b.select(inside, iw, C(0)))))
+        k.st(b.select(inside, k.ld(p["X"], src), F(0.0)), p["COL"], t)
+    k.grid_loop(b.mul(b.mul(p["N"], b.mul(p["OH"], p["OW"])), CK), i2c)
+    k.ret()
+
+    # col2im: DX[n, c, h, w] = sum over the (oh, ow, i, j) that read it of DCOL (a thread an input value: no atomics)
+    k = K("col2im", [("DCOL", G(f32)), ("DX", G(f32))] + shp)
+    b, p = k.b, k.p
+    CK = b.mul(p["C"], b.mul(p["kh"], p["kw"]))
+
+    def c2i(t):
+        w = b.urem(t, p["W"])
+        h = b.urem(b.udiv(t, p["W"]), p["H"])
+        nc = b.udiv(t, b.mul(p["W"], p["H"]))
+        ci, n = b.urem(nc, p["C"]), b.udiv(nc, p["C"])
+        acc = k.var(F(0.0))
+
+        def over_i(i):
+            def over_j(j):
+                a, c_ = b.sub(b.add(h, p["p"]), i), b.sub(b.add(w, p["p"]), j)
+                ok = b.and_(b.icmp_signed(">=", a, C(0)), b.icmp_signed(">=", c_, C(0)))
+                a0, c0 = b.select(ok, a, C(0)), b.select(ok, c_, C(0))
+                ok = b.and_(ok, b.and_(b.icmp_unsigned("==", b.urem(a0, p["s"]), C(0)),
+                                       b.icmp_unsigned("==", b.urem(c0, p["s"]), C(0))))
+                oh, ow = b.udiv(a0, p["s"]), b.udiv(c0, p["s"])
+                ok = b.and_(ok, b.and_(b.icmp_unsigned("<", oh, p["OH"]), b.icmp_unsigned("<", ow, p["OW"])))
+                r = b.add(b.mul(b.add(b.mul(n, p["OH"]), b.select(ok, oh, C(0))), p["OW"]), b.select(ok, ow, C(0)))
+                c = b.add(b.mul(b.add(b.mul(ci, p["kh"]), i), p["kw"]), j)
+                v = k.ld(p["DCOL"], b.add(b.mul(i64of(b, r), i64of(b, CK)), i64of(b, c)))
+                b.store(b.fadd(b.load(acc), b.select(ok, v, F(0.0))), acc)
+            k.loop(C(0), p["kw"], C(1), over_j)
+        k.loop(C(0), p["kh"], C(1), over_i)
+        k.st(b.load(acc), p["DX"], t)
+    k.grid_loop(b.mul(b.mul(p["N"], p["C"]), b.mul(p["H"], p["W"])), c2i)
+    k.ret()
+
+    # perm_nc: back=0: Y[n, c, s] = Z[(n, s), c] (+ bias[c]); back=1: Z[(n, s), c] = Y[n, c, s]
+    k = K("perm_nc", [("Z", G(f32)), ("Y", G(f32)), ("BIAS", G(f32)), ("N", i32), ("Cc", i32), ("S", i32),
+                      ("back", i32), ("hasb", i32)])
+    b, p = k.b, k.p
+
+    def perm(t):
+        sp = b.urem(t, p["S"])
+        c = b.urem(b.udiv(t, p["S"]), p["Cc"])
+        n = b.udiv(t, b.mul(p["S"], p["Cc"]))
+        z = b.add(b.mul(i64of(b, b.add(b.mul(n, p["S"]), sp)), i64of(b, p["Cc"])), i64of(b, c))
+        with b.if_else(b.icmp_unsigned("!=", p["back"], C(0))) as (bk, fw):
+            with bk:
+                k.st(k.ld(p["Y"], t), p["Z"], z)
+            with fw:
+                hb = b.icmp_unsigned("!=", p["hasb"], C(0))
+                bias = b.select(hb, k.ld(p["BIAS"], b.select(hb, c, C(0))), F(0.0))
+                k.st(b.fadd(k.ld(p["Z"], z), bias), p["Y"], t)
+    k.grid_loop(b.mul(b.mul(p["N"], p["Cc"]), p["S"]), perm)
+    k.ret()
+
+    # pool_f: Y[n, c, a, b] = max (mode 0) or mean (mode 1) of the k x k window; pool_b: the gradient back, the max
+    # shared equally between ties (as the NumPy backend does); values past the last whole window get nothing
+    pshp = [("NC", i32), ("H", i32), ("W", i32), ("kk", i32), ("mode", i32)]
+    k = K("pool_f", [("X", G(f32)), ("Y", G(f32))] + pshp)
+    b, p = k.b, k.p
+    H2, W2 = b.udiv(p["H"], p["kk"]), b.udiv(p["W"], p["kk"])
+
+    def poolf(t):
+        bb, a = b.urem(t, W2), b.urem(b.udiv(t, W2), H2)
+        nc = b.udiv(t, b.mul(W2, H2))
+        base = b.mul(i64of(b, nc), i64of(b, b.mul(p["H"], p["W"])))
+        mx, sm = k.var(F(-3.4e38)), k.var(F(0.0))
+
+        def over(i):
+            def over_j(j):
+                v = k.ld(p["X"], b.add(base, i64of(b, b.add(b.mul(b.add(b.mul(a, p["kk"]), i), p["W"]),
+                                                             b.add(b.mul(bb, p["kk"]), j)))))
+                b.store(b.call(max_f, [b.load(mx), v]), mx)
+                b.store(b.fadd(b.load(sm), v), sm)
+            k.loop(C(0), p["kk"], C(1), over_j)
+        k.loop(C(0), p["kk"], C(1), over)
+        avg = b.fdiv(b.load(sm), b.uitofp(b.mul(p["kk"], p["kk"]), f32))
+        k.st(b.select(b.icmp_unsigned("==", p["mode"], C(0)), b.load(mx), avg), p["Y"], t)
+    k.grid_loop(b.mul(p["NC"], b.mul(H2, W2)), poolf)
+    k.ret()
+
+    k = K("pool_b", [("X", G(f32)), ("Y", G(f32)), ("DY", G(f32)), ("DX", G(f32))] + pshp)
+    b, p = k.b, k.p
+    H2, W2 = b.udiv(p["H"], p["kk"]), b.udiv(p["W"], p["kk"])
+
+    def poolb(t):
+        w, h = b.urem(t, p["W"]), b.urem(b.udiv(t, p["W"]), p["H"])
+        nc = b.udiv(t, b.mul(p["W"], p["H"]))
+        a, bb = b.udiv(h, p["kk"]), b.udiv(w, p["kk"])
+        inside = b.and_(b.icmp_unsigned("<", a, H2), b.icmp_unsigned("<", bb, W2))
+        yi = b.add(b.mul(i64of(b, nc), i64of(b, b.mul(H2, W2))),
+                   i64of(b, b.add(b.mul(b.select(inside, a, C(0)), W2), b.select(inside, bb, C(0)))))
+        dy, ym = k.ld(p["DY"], yi), k.ld(p["Y"], yi)
+        base = b.mul(i64of(b, nc), i64of(b, b.mul(p["H"], p["W"])))
+        ties = k.var(F(0.0))
+
+        def over(i):
+            def over_j(j):
+                v = k.ld(p["X"], b.add(base, i64of(b, b.add(b.mul(b.add(b.mul(a, p["kk"]), i), p["W"]),
+                                                             b.add(b.mul(bb, p["kk"]), j)))))
+                b.store(b.fadd(b.load(ties), b.select(b.fcmp_ordered("==", v, ym), F(1.0), F(0.0))), ties)
+            k.loop(C(0), p["kk"], C(1), over_j)
+        k.loop(C(0), p["kk"], C(1), over)
+        mine = b.select(b.fcmp_ordered("==", k.ld(p["X"], t), ym), b.fdiv(dy, b.load(ties)), F(0.0))
+        avg = b.fdiv(dy, b.uitofp(b.mul(p["kk"], p["kk"]), f32))
+        g_ = b.select(b.icmp_unsigned("==", p["mode"], C(0)), mine, avg)
+        k.st(b.select(inside, g_, F(0.0)), p["DX"], t)
+    k.grid_loop(b.mul(p["NC"], b.mul(p["H"], p["W"])), poolb)
     k.ret()
 
     # ------------------------------------------------------------------------- attention softmax, a block a row

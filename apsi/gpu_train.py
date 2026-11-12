@@ -363,6 +363,53 @@ class Emulator(_Ops):
         else:
             y[:, off:off + w] = x
 
+    # ---------------------------------------------------------------- images
+    def im2col(self, X, COL, N, C, H, W, kh, kw, s, p, OH, OW):
+        x = self.v(X, N * C * H * W).reshape(N, C, H, W)
+        xp = np.pad(x, ((0, 0), (0, 0), (p, p), (p, p)))
+        out = np.empty((N, OH, OW, C, kh, kw), np.float32)
+        for i in range(kh):
+            for j in range(kw):
+                out[:, :, :, :, i, j] = xp[:, :, i:i + s * OH:s, j:j + s * OW:s].transpose(0, 2, 3, 1)
+        self.v(COL, out.size)[:] = out.reshape(-1)
+
+    def col2im(self, DCOL, DX, N, C, H, W, kh, kw, s, p, OH, OW):
+        g = self.v(DCOL, N * OH * OW * C * kh * kw).reshape(N, OH, OW, C, kh, kw)
+        dxp = np.zeros((N, C, H + 2 * p, W + 2 * p), np.float64)
+        for i in range(kh):
+            for j in range(kw):
+                dxp[:, :, i:i + s * OH:s, j:j + s * OW:s] += g[:, :, :, :, i, j].transpose(0, 3, 1, 2)
+        self.v(DX, N * C * H * W)[:] = dxp[:, :, p:p + H, p:p + W].reshape(-1)
+
+    def perm_nc(self, Z, Y, BIAS, N, Cc, S, back):
+        if back:
+            self.v(Z, N * S * Cc)[:] = self.v(Y, N * Cc * S).reshape(N, Cc, S).transpose(0, 2, 1).reshape(-1)
+        else:
+            y = self.v(Z, N * S * Cc).reshape(N, S, Cc).transpose(0, 2, 1)
+            if BIAS is not None:
+                y = y + self.v(BIAS, Cc)[None, :, None]
+            self.v(Y, N * Cc * S)[:] = y.reshape(-1)
+
+    def pool_f(self, X, Y, NC, H, W, kk, mode):
+        H2, W2 = H // kk, W // kk
+        xr = self.v(X, NC * H * W).reshape(NC, H, W)[:, :H2 * kk, :W2 * kk].reshape(NC, H2, kk, W2, kk)
+        self.v(Y, NC * H2 * W2)[:] = (xr.max(axis=(2, 4)) if mode == 0 else xr.mean(axis=(2, 4))).reshape(-1)
+
+    def pool_b(self, X, Y, DY, DX, NC, H, W, kk, mode):
+        H2, W2 = H // kk, W // kk
+        x = self.v(X, NC * H * W).reshape(NC, H, W)
+        dy = self.v(DY, NC * H2 * W2).reshape(NC, H2, 1, W2, 1)
+        full = np.zeros((NC, H, W), np.float32)
+        if mode == 0:
+            xr = x[:, :H2 * kk, :W2 * kk].reshape(NC, H2, kk, W2, kk)
+            m = (xr == self.v(Y, NC * H2 * W2).reshape(NC, H2, 1, W2, 1)).astype(np.float32)
+            m = m / m.sum(axis=(2, 4), keepdims=True)
+            full[:, :H2 * kk, :W2 * kk] = (m * dy).reshape(NC, H2 * kk, W2 * kk)
+        else:
+            full[:, :H2 * kk, :W2 * kk] = np.broadcast_to(dy / (kk * kk), (NC, H2, kk, W2, kk)).reshape(
+                NC, H2 * kk, W2 * kk)
+        self.v(DX, NC * H * W)[:] = full.reshape(-1)
+
     def topk_gate(self, Lg, IDX, GATE, M, E, k):
         lg = self.v(Lg, M * E).reshape(M, E)
         idx = np.argsort(-lg, axis=1, kind="stable")[:, :k]
@@ -807,6 +854,26 @@ class Gpu(_Ops):
     def cols(self, X, Y, rows, w, ld, off, back):
         self._go("cols", self.blocks(rows * w), 256, self.p(X), self.p(Y), ("u", rows), ("u", w), ("u", ld),
                  ("u", off), ("u", 1 if back else 0))
+
+    def im2col(self, X, COL, N, C, H, W, kh, kw, s, p, OH, OW):
+        self._go("im2col", self.blocks(N * OH * OW * C * kh * kw), 256, self.p(X), self.p(COL),
+                 *[("u", v) for v in (N, C, H, W, kh, kw, s, p, OH, OW)])
+
+    def col2im(self, DCOL, DX, N, C, H, W, kh, kw, s, p, OH, OW):
+        self._go("col2im", self.blocks(N * C * H * W), 256, self.p(DCOL), self.p(DX),
+                 *[("u", v) for v in (N, C, H, W, kh, kw, s, p, OH, OW)])
+
+    def perm_nc(self, Z, Y, BIAS, N, Cc, S, back):
+        self._go("perm_nc", self.blocks(N * Cc * S), 256, self.p(Z), self.p(Y), self.p(BIAS if BIAS is not None else Z),
+                 ("u", N), ("u", Cc), ("u", S), ("u", 1 if back else 0), ("u", 1 if BIAS is not None else 0))
+
+    def pool_f(self, X, Y, NC, H, W, kk, mode):
+        self._go("pool_f", self.blocks(NC * (H // kk) * (W // kk)), 256, self.p(X), self.p(Y), ("u", NC), ("u", H),
+                 ("u", W), ("u", kk), ("u", mode))
+
+    def pool_b(self, X, Y, DY, DX, NC, H, W, kk, mode):
+        self._go("pool_b", self.blocks(NC * H * W), 256, self.p(X), self.p(Y), self.p(DY), self.p(DX), ("u", NC),
+                 ("u", H), ("u", W), ("u", kk), ("u", mode))
 
     def topk_gate(self, Lg, IDX, GATE, M, E, k):
         self._go("topk_gate", self.blocks(M), 256, self.p(Lg), self.p(IDX), self.p(GATE), ("u", M), ("u", E), ("u", k))
@@ -1926,6 +1993,95 @@ class _MoE(_Node):
         return dx
 
 
+class _Conv2D(_Node):
+    """[N, C, H, W] -> [N, O, OH, OW]: the windows unfolded into rows (im2col), one product with the weights, the
+    result put back in channel order with the bias; backward the same products and the rows folded back (col2im,
+    a thread an input value, no atomics)."""
+
+    def __init__(self, net, key, layer, p):
+        super().__init__(net, key)
+        self.C, self.O, self.k, self.s, self.p = layer.c_in, layer.c_out, layer.k, layer.stride, layer.padding
+        self.W, self.b = net.param(p.W), net.param(p.b)
+
+    def fwd(self, x, shape):
+        if len(shape) != 4 or shape[1] != self.C:
+            raise TrainError(f"conv2d({self.C} -> {self.O}) got {tuple(shape)} (want [N, {self.C}, H, W])")
+        o, ps = self.net.ops, self.net.passes
+        N, C, H, W = shape
+        k, s, p = self.k, self.s, self.p
+        OH, OW = (H + 2 * p - k) // s + 1, (W + 2 * p - k) // s + 1
+        R, CK, O = N * OH * OW, C * k * k, self.O
+        self.dims = (N, C, H, W, OH, OW, R, CK)
+        col = self.buf("col", R * CK)
+        o.im2col(x, col, N, C, H, W, k, k, s, p, OH, OW)
+        self.col = col
+        z = self.buf("z", R * O)                        # [rows, O] = col @ W^T
+        o.gemm(col, self.W.w, z, R, O, CK, CK, 1, 1, CK, O, passes=ps)
+        y = self.buf("y", R * O)
+        o.perm_nc(z, y, self.b.w, N, O, OH * OW, 0)
+        return y, (N, O, OH, OW)
+
+    def bwd(self, dy, need_dx=True):
+        o, ps = self.net.ops, self.net.passes
+        N, C, H, W, OH, OW, R, CK = self.dims
+        O, k = self.O, self.k
+        dz = self.gbuf("dz", R * O)
+        o.perm_nc(dz, dy, None, N, O, OH * OW, 1)
+        o.colsum(dz, None, None, None, None, self.b.g, R, O, 0)
+        o.gemm(dz, self.col, self.W.g, O, CK, R, 1, O, CK, 1, CK, beta=True, passes=ps)     # dW = dz^T col
+        if not need_dx:
+            return None
+        dcol = self.gbuf("dcol", R * CK)
+        o.gemm(dz, self.W.w, dcol, R, CK, O, O, 1, CK, 1, CK, passes=ps)
+        dx = self.gbuf("dx", N * C * H * W)
+        o.col2im(dcol, dx, N, C, H, W, k, k, self.s, self.p, OH, OW)
+        return dx
+
+
+class _Pool(_Node):
+    """max_pool / avg_pool (k x k windows, the rest of the rows and columns left out), global_avg_pool."""
+
+    def __init__(self, net, key, layer, mode, glob=False):
+        super().__init__(net, key)
+        self.kk, self.mode, self.glob = int(getattr(layer, "k", 0) or 0), mode, glob
+        self.ones = {}
+
+    def fwd(self, x, shape):
+        if len(shape) != 4:
+            raise TrainError(f"pooling on the GPU takes [N, C, H, W], got {tuple(shape)}")
+        o = self.net.ops
+        N, C, H, W = shape
+        self.x, self.shape = x, shape
+        if self.glob:
+            S = H * W
+            one = self.ones.get(S)
+            if one is None:
+                one = o.alloc(S)
+                o.fill((one, 0), S, 1.0 / S)
+                self.net.owned.append(one)
+                one = self.ones[S] = (one, 0)
+            self.one = one
+            y = self.buf("y", N * C)
+            o.gemm(x, one, y, N * C, 1, S, S, 1, 1, 1, 1, passes=3)
+            return y, (N, C)
+        kk = self.kk
+        y = self.buf("y", N * C * (H // kk) * (W // kk))
+        o.pool_f(x, y, N * C, H, W, kk, self.mode)
+        self.y = y
+        return y, (N, C, H // kk, W // kk)
+
+    def bwd(self, dy, need_dx=True):
+        o = self.net.ops
+        N, C, H, W = self.shape
+        dx = self.gbuf("dx", N * C * H * W)
+        if self.glob:
+            S = H * W
+            o.gemm(dy, self.one, dx, N * C, S, 1, 1, 1, 0, 1, S, passes=3)
+            return dx
+        o.pool_b(self.x, self.y, dy, dx, N * C, H, W, self.kk, self.mode)
+        return dx
+
+
 class _GraphDev:
     """A graph on the card, in the forms the layers need, each made once: the edges in the order of their target
     (CSR rows = targets) and in the order of their source (the transpose, for the backward pass), edge weights,
@@ -2662,6 +2818,14 @@ class Net:
             return _Identity(self, key, layer)
         if isinstance(layer, L.MeanPool):
             return _MeanPool(self, key, layer)
+        if isinstance(layer, L.Conv2D):
+            return _Conv2D(self, key, layer, p)
+        if isinstance(layer, L.MaxPool):
+            return _Pool(self, key, layer, 0)
+        if isinstance(layer, L.AvgPool):
+            return _Pool(self, key, layer, 1)
+        if isinstance(layer, L.GlobalAvgPool):
+            return _Pool(self, key, layer, 1, glob=True)
         if isinstance(layer, L.Scale):
             return _Scale(self, key, layer, p)
         from . import graphs as GR

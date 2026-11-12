@@ -29,6 +29,9 @@
 - **Long-range graph layers on the GPU trainer:** `graph_transformer` (attention along the edges, keys and values
   by relation, biases by relation and hop), `global_attention` (every node over the nodes of its graph), `mix_hop`,
   `graph_transformer_net`: the encoder of a graph-language model trains on the card.
+- **Convolutions on the GPU trainer:** `conv2d` (windows unfolded into rows, one product, folded back by a thread
+  per input value: no atomics), `max_pool` (ties share the gradient, as on NumPy), `avg_pool`, `global_avg_pool`;
+  `cnn` trains on the card.
 - **More activations on the card:** elu, softplus, mish. **More losses:** `mae` and `bce` (one kernel, with a weight
   per element for masks), on one card, several cards and split models.
 - **`apsi gpu bench`:** tokens per second of the 127 M GPT (or `11m`, `modern`), the kernels' shares, temperature,
