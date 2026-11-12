@@ -82,6 +82,25 @@ class Trainer(unittest.TestCase):
         r = GT.fit(lm, lm.init(seed=0), ids, lab, ops=e, **dict(kw, opt=Adam(3e-3))).history
         np.testing.assert_allclose(ref, r, rtol=3e-3)
 
+    def test_mixture_of_experts_is_exact(self):
+        """moe: the router's top-k and its softmax on the card, the rows grouped by expert, every expert on its own
+        rows, the outputs summed back by the gates: gradients equal autodiff; a moe language model trains like NumPy,
+        on one card and split across two."""
+        rng = np.random.default_rng(0)
+        X, Y = rng.normal(size=(20, 12)), rng.normal(size=(20, 12))
+        for E, k in ((4, 2), (8, 1), (3, 3)):
+            grads_match(self, L.Sequential([L.MoE(12, E, k, ff=16), L.Linear(12, 3)]), X, Y[:, :3], "mse")
+        lm = L.transformer_lm(23, d=32, heads=4, layers=2, context=12, ffn="moe", experts=4, top_k=2, norm="rms",
+                              rope=True, kv_heads=2)
+        ids = rng.integers(0, 23, (16, 12))
+        lab = np.roll(ids, -1, 1)
+        grads_match(self, lm, ids[:3], lab[:3], "cross_entropy")
+        kw = dict(loss="cross_entropy", epochs=3, batch_size=8, verbose=False, precision="fp32")
+        ref = L.fit(lm, lm.init(seed=0), ids, lab, opt=Adam(1e-2), **kw).history
+        for ops in (GT.Emulator(), [GT.Emulator(), GT.Emulator()]):
+            r = GT.fit(lm, lm.init(seed=0), ids, lab, opt=Adam(1e-2), ops=ops, parallel="pipeline", **kw).history
+            np.testing.assert_allclose(ref, r, rtol=1e-5)
+
     def test_any_architecture_is_exact(self):
         """dag / parallel / add / multiply / concatenate / mean, scale, identity, reshape, flatten, mean_pool and
         cross-attention (queries from one value, keys and values from another of any length; grouped heads, rotary
@@ -451,6 +470,19 @@ class RealGpu(unittest.TestCase):
                 dv.cols(part[i], wide[i], 20, 7, 30, 11, back)
             same(wide[0], wide[1], 600, 1e-6, "cols")
             same(part[0], part[1], 140, 1e-6, "cols back")
+        Mr2, Ex, kx = 50, 7, 3
+        LG, IX, GA = pair(rng.normal(size=(Mr2, Ex))), pair(np.zeros(Mr2 * kx, np.int32)), pair(np.zeros(Mr2 * kx))
+        DGa, DLg = pair(rng.normal(size=Mr2 * kx)), pair(np.zeros(Mr2 * Ex))
+        for dv, i in ((g, 0), (e, 1)):
+            dv.topk_gate(LG[i], IX[i], GA[i], Mr2, Ex, kx)
+            dv.topk_gate_b(GA[i], DGa[i], IX[i], DLg[i], Mr2, Ex, kx)
+        np.testing.assert_array_equal(g.get(IX[0][0], Mr2 * kx).view(np.int32), e.get(IX[1][0], Mr2 * kx).view(np.int32))
+        same(GA[0], GA[1], Mr2 * kx, 1e-5, "topk_gate")
+        same(DLg[0], DLg[1], Mr2 * Ex, 1e-5, "topk_gate_b")
+        cm = pair(rng.normal(size=12))
+        for dv, i in ((g, 0), (e, 1)):
+            dv.colmul(x[i], cm[i], out[i], 996, 12)
+        same(out[0], out[1], 996, 1e-6, "colmul")
         W, WQ = pair(rng.normal(size=(70, 48))), pair(np.zeros(70 * 48))
         for kind in range(6):
             g.fakeq(W[0], WQ[0], 70, 48, kind)

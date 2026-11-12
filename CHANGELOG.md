@@ -23,6 +23,9 @@
   and graph tasks. The edges are kept in compressed rows (CSR) and every node sums its edges in a register: no atomic
   additions, the same result every run. New kernels: sparse products with per-edge, per-head weights, the edge
   softmax and its gradient, edge dot products.
+- **Mixture of experts:** `moe(d, experts=8, top_k=2)` and `transformer_block(…, ffn="moe")` on NumPy, PyTorch and
+  the GPU trainer: the router's top-k choice and its softmax in one kernel, the rows grouped by expert, every expert
+  on its own rows (no padding, no row dropped), the outputs summed back by the gates without atomics.
 - **Long-range graph layers on the GPU trainer:** `graph_transformer` (attention along the edges, keys and values
   by relation, biases by relation and hop), `global_attention` (every node over the nodes of its graph), `mix_hop`,
   `graph_transformer_net`: the encoder of a graph-language model trains on the card.

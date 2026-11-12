@@ -348,6 +348,22 @@ class Emulator(_Ops):
         else:
             y[:, off:off + w] = x
 
+    def topk_gate(self, Lg, IDX, GATE, M, E, k):
+        lg = self.v(Lg, M * E).reshape(M, E)
+        idx = np.argsort(-lg, axis=1, kind="stable")[:, :k]
+        sel = np.take_along_axis(lg, idx, 1)
+        e = np.exp(sel - sel[:, :1])
+        self.v(IDX, M * k)[:] = idx.astype(np.int32).reshape(-1).view(np.float32)
+        self.v(GATE, M * k)[:] = (e / e.sum(1, keepdims=True)).reshape(-1)
+
+    def topk_gate_b(self, GATE, DG, IDX, DL, M, E, k):
+        g = self.v(GATE, M * k).reshape(M, k)
+        dg = self.v(DG, M * k).reshape(M, k)
+        idx = self.v(IDX, M * k).view(np.int32).reshape(M, k)
+        dl = np.zeros((M, E), np.float32)
+        np.put_along_axis(dl, idx.astype(np.int64), g * (dg - (g * dg).sum(1, keepdims=True)), 1)
+        self.v(DL, M * E)[:] = dl.reshape(-1)
+
     def colmul(self, X, S, Y, n, D):
         self.v(Y, n)[:] = (self.v(X, n).reshape(-1, D) * self.v(S, D)).reshape(-1)
 
@@ -772,6 +788,13 @@ class Gpu(_Ops):
     def cols(self, X, Y, rows, w, ld, off, back):
         self._go("cols", self.blocks(rows * w), 256, self.p(X), self.p(Y), ("u", rows), ("u", w), ("u", ld),
                  ("u", off), ("u", 1 if back else 0))
+
+    def topk_gate(self, Lg, IDX, GATE, M, E, k):
+        self._go("topk_gate", self.blocks(M), 256, self.p(Lg), self.p(IDX), self.p(GATE), ("u", M), ("u", E), ("u", k))
+
+    def topk_gate_b(self, GATE, DG, IDX, DL, M, E, k):
+        self._go("topk_gate_b", self.blocks(M), 256, self.p(GATE), self.p(DG), self.p(IDX), self.p(DL), ("u", M),
+                 ("u", E), ("u", k))
 
     def colmul(self, X, S, Y, n, D):
         self._go("colmul", self.blocks(n), 256, self.p(X), self.p(S), self.p(Y), ("u", n), ("u", D))
@@ -1778,6 +1801,112 @@ class _Parallel(_Node):
         return G.g.get("x")
 
 
+def _ofs(view, k):
+    return (view[0], view[1] + int(k))
+
+
+class _MoE(_Node):
+    """Mixture of experts. The router's scores and the top-k choice with its softmax are made on the card (one
+    kernel); the choice comes back to the processor (M x k integers) to group the rows by expert; every expert runs
+    its gated feed-forward block on its rows (products on slices, no padding, no row dropped); the outputs are
+    summed back into the rows weighted by the gates (a sparse product, no atomics)."""
+
+    def __init__(self, net, key, layer, p):
+        super().__init__(net, key)
+        self.K, self.F, self.E, self.k = layer.d, layer.ff, layer.E, layer.k
+        self.act = KS.ACTS[layer.act]
+        self.Wr, self.Wg, self.Wu, self.Wd = (net.param(getattr(p, n)) for n in ("Wr", "Wg", "Wu", "Wd"))
+
+    def _put(self, name, a):
+        a = np.ascontiguousarray(a.astype(np.int32))
+        b = self.buf(name, max(1, a.size))
+        if a.size:
+            self.net.ops.put(b[0], a, b[1])
+        return b
+
+    def fwd(self, x, shape):
+        o, ps = self.net.ops, self.net.passes
+        M, K, F, E, k = _rows(shape), self.K, self.F, self.E, self.k
+        self.x, self.M, self.shape = x, M, shape
+        lg, idx, gate = self.buf("lg", M * E), self.buf("idx", M * k), self.buf("gate", M * k)
+        o.gemm(x, self.Wr.w, lg, M, E, K, K, 1, E, 1, E, passes=ps)
+        o.topk_gate(lg, idx, gate, M, E, k)
+        self.lg, self.idx, self.gate = lg, idx, gate
+        choice = o.get(idx[0], M * k, idx[1]).view(np.int32).astype(np.int64)
+        order = np.argsort(choice, kind="stable")              # (row, slot) entries grouped by expert
+        counts = np.bincount(choice, minlength=E)
+        pos = np.empty(M * k, np.int64)
+        pos[order] = np.arange(M * k)
+        self.counts = counts
+        self.rows = self._put("rows", order // k)              # the token of each grouped entry
+        self.slot = self._put("slot", order)                    # its (row, slot) index
+        self.pos = self._put("pos", pos)                        # where each (row, slot) went
+        self.tok = self._put("tok", np.repeat(np.arange(M), k))
+        self.off = self._put("off", np.arange(M + 1) * k)
+        self.one = self._put("one", np.arange(M * k + 1))
+        n = M * k
+        xs = self.buf("xs", n * K)
+        o.gather(x, self.rows, xs, n, K, 0)
+        self.xs = xs
+        self.h, self.a, self.u, self.z = (self.buf(t, n * F) for t in ("h", "a", "u", "z"))
+        ys = self.buf("ys", n * K)
+        r0 = 0
+        for e in range(E):                                      # every expert on its rows
+            ne = int(counts[e])
+            if not ne:
+                continue
+            xe, he, ae, ue, ze = _ofs(xs, r0 * K), _ofs(self.h, r0 * F), _ofs(self.a, r0 * F), \
+                _ofs(self.u, r0 * F), _ofs(self.z, r0 * F)
+            o.gemm(xe, _ofs(self.Wg.w, e * K * F), ae, ne, F, K, K, 1, F, 1, F, passes=ps, epi=1, X2=he, act=self.act)
+            o.gemm(xe, _ofs(self.Wu.w, e * K * F), ue, ne, F, K, K, 1, F, 1, F, passes=ps)
+            o.mul3(ze, ae, ue, ne * F)
+            o.gemm(ze, _ofs(self.Wd.w, e * F * K), _ofs(ys, r0 * K), ne, K, F, F, 1, K, 1, K, passes=ps)
+            r0 += ne
+        self.ys = ys
+        y = self.buf("y", M * K)                                # sum over each row's experts, weighted by the gates
+        o.spmm(ys, self.pos, gate, None, self.off, y, M, 1, K)
+        return y, shape
+
+    def bwd(self, dy, need_dx=True):
+        o, ps = self.net.ops, self.net.passes
+        M, K, F, E, k = self.M, self.K, self.F, self.E, self.k
+        n = M * k
+        dys = self.gbuf("dys", n * K)                           # each grouped entry: gate * dy[its row]
+        o.spmm(dy, self.rows, self.gate, self.slot, self.one, dys, n, 1, K)
+        dg = self.gbuf("dg", n)                                 # each gate: dy[row] . ys[its entry]
+        o.edge_dot(dy, self.ys, self.tok, self.pos, dg, n, 1, K)
+        dl = self.gbuf("dl", M * E)
+        o.topk_gate_b(self.gate, dg, self.idx, dl, M, E, k)
+        o.gemm(self.x, dl, self.Wr.g, K, E, M, 1, K, E, 1, E, beta=True, passes=ps)
+        dxs = self.gbuf("dxs", n * K)
+        dz, du, dh = self.gbuf("dz", n * F), self.gbuf("du", n * F), self.gbuf("dh", n * F)
+        r0 = 0
+        for e in range(E):
+            ne = int(self.counts[e])
+            if not ne:
+                continue
+            xe, dye = _ofs(self.xs, r0 * K), _ofs(dys, r0 * K)
+            ae, ue, ze, he = _ofs(self.a, r0 * F), _ofs(self.u, r0 * F), _ofs(self.z, r0 * F), _ofs(self.h, r0 * F)
+            dze, due, dhe = _ofs(dz, r0 * F), _ofs(du, r0 * F), _ofs(dh, r0 * F)
+            o.gemm(ze, dye, _ofs(self.Wd.g, e * F * K), F, K, ne, 1, F, K, 1, K, beta=True, passes=ps)
+            o.gemm(dye, _ofs(self.Wd.w, e * F * K), dze, ne, F, K, K, 1, 1, K, F, passes=ps)
+            o.mul3(due, dze, ae, ne * F)
+            o.mul3(dze, dze, ue, ne * F)
+            o.act_b(he, dze, dhe, ne * F, self.act)
+            o.gemm(xe, dhe, _ofs(self.Wg.g, e * K * F), K, F, ne, 1, K, F, 1, F, beta=True, passes=ps)
+            o.gemm(xe, due, _ofs(self.Wu.g, e * K * F), K, F, ne, 1, K, F, 1, F, beta=True, passes=ps)
+            dxe = _ofs(dxs, r0 * K)
+            o.gemm(dhe, _ofs(self.Wg.w, e * K * F), dxe, ne, K, F, F, 1, 1, F, K, passes=ps)
+            o.gemm(due, _ofs(self.Wu.w, e * K * F), dxe, ne, K, F, F, 1, 1, F, K, beta=True, passes=ps)
+            r0 += ne
+        if not need_dx:
+            return None
+        dx = self.gbuf("dx", M * K)
+        o.gemm(dl, self.Wr.w, dx, M, K, E, E, 1, 1, E, K, passes=ps)
+        o.embed_b(dxs, self.rows, dx, n, K, M)
+        return dx
+
+
 class _GraphDev:
     """A graph on the card, in the forms the layers need, each made once: the edges in the order of their target
     (CSR rows = targets) and in the order of their source (the transpose, for the backward pass), edge weights,
@@ -2500,6 +2629,8 @@ class Net:
             return _Attention(self, key, layer, p)
         if isinstance(layer, L.SwiGLU):
             return _SwiGLU(self, key, layer, p)
+        if isinstance(layer, L.MoE):
+            return _MoE(self, key, layer, p)
         if isinstance(layer, L.DAG):
             return _DAG(self, key, layer, p, gk)
         if isinstance(layer, L.Parallel):

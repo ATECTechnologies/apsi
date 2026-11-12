@@ -429,6 +429,23 @@ def _register():
         o = o.permute(0, 2, 1, 3).reshape(B, T, D)
         return _mm(o, p.Wo) + p.bo
 
+    @impl(L.MoE)
+    def _moe(l, p, x, train, ctx):
+        sh = x.shape
+        xf = x.reshape(-1, l.d)
+        logits = _mm(xf, p.Wr)
+        sel, idx = torch.topk(logits, l.k, dim=-1)
+        gate = torch.softmax(sel, dim=-1)
+        out = torch.zeros_like(xf)
+        act = _act(l.act)
+        for e in range(l.E):
+            r, j = (idx == e).nonzero(as_tuple=True)
+            if r.numel():
+                xe = xf[r]
+                ye = _mm(act(_mm(xe, p.Wg[e])) * _mm(xe, p.Wu[e]), p.Wd[e])
+                out = out.index_add(0, r, ye * gate[r, j].unsqueeze(-1))
+        return out.reshape(sh)
+
     @impl(L.SwiGLU)
     def _swiglu(l, p, x, train, ctx):
         return _mm(_act(l.act)(_mm(x, p.Wg)) * _mm(x, p.Wu), p.Wd)

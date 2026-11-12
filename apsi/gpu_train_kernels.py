@@ -24,7 +24,7 @@ TILE = 64
 MAIN = ("apsi_kernel", "axpy", "add3", "mul3", "act_f", "act_b", "colsum", "ln_f", "ln_b", "embed_f", "embed_b",
         "pos_f", "pos_b", "softmax_f", "softmax_b", "ce", "mse", "sumsq", "adam", "sgd", "drop_f", "fakeq",
         "gemm_simt", "gather", "rope", "spmm", "edge_dot", "seg_softmax", "seg_softmax_b", "dot_acc", "scale_add",
-        "cols", "colmul")
+        "cols", "colmul", "topk_gate", "topk_gate_b")
 TC = ("apsi_kernel", "gemm_tc3")                     # apsi_kernel = the one-pass product
 
 
@@ -561,6 +561,73 @@ def _main_module():
     k = K("colmul", [("X", G(f32)), ("S", G(f32)), ("Y", G(f32)), ("n", i32), ("D", i32)])
     b, p = k.b, k.p
     k.grid_loop(p["n"], lambda i: k.st(b.fmul(k.ld(p["X"], i), k.ld(p["S"], b.urem(i, p["D"]))), p["Y"], i))
+    k.ret()
+
+    # topk_gate: per row of router scores L [M, E]: the top k (larger first, lower index on a tie) -> IDX [M, k],
+    # and the softmax of their scores -> GATE [M, k]. A thread a row (k and E are small).
+    k = K("topk_gate", [("L", G(f32)), ("IDX", G(i32)), ("GATE", G(f32)), ("M", i32), ("E", i32), ("k", i32)])
+    b, p = k.b, k.p
+
+    def topk(r):
+        base = b.mul(i64of(b, r), i64of(b, p["E"]))
+        obase = b.mul(i64of(b, r), i64of(b, p["k"]))
+
+        def pick(j):
+            best, bi = k.var(F(-3.4e38)), k.var(C(0))
+            found = k.var(C(0))
+
+            def scan(e):
+                v = k.ld(p["L"], b.add(base, i64of(b, e)))
+                taken = k.var(C(0))
+                k.loop(C(0), j, C(1), lambda jj: b.store(
+                    b.or_(b.load(taken), b.zext(b.icmp_unsigned("==", k.ld(p["IDX"], b.add(obase, i64of(b, jj))), e),
+                                                i32)), taken))
+                better = b.and_(b.icmp_unsigned("==", b.load(taken), C(0)),
+                                b.or_(b.fcmp_ordered(">", v, b.load(best)),
+                                      b.icmp_unsigned("==", b.load(found), C(0))))
+                with b.if_then(better):
+                    b.store(v, best)
+                    b.store(e, bi)
+                    b.store(C(1), found)
+            k.loop(C(0), p["E"], C(1), scan)
+            k.st(b.load(bi), p["IDX"], b.add(obase, i64of(b, j)))
+            k.st(b.load(best), p["GATE"], b.add(obase, i64of(b, j)))
+        k.loop(C(0), p["k"], C(1), pick)
+        mx = k.ld(p["GATE"], obase)                      # the first is the largest
+        sm = k.var(F(0.0))
+
+        def ex(j):
+            v = exp(k, b.fsub(k.ld(p["GATE"], b.add(obase, i64of(b, j))), mx))
+            k.st(v, p["GATE"], b.add(obase, i64of(b, j)))
+            b.store(b.fadd(b.load(sm), v), sm)
+        k.loop(C(0), p["k"], C(1), ex)
+        inv = b.fdiv(F(1.0), b.load(sm))
+        k.loop(C(0), p["k"], C(1), lambda j: k.st(b.fmul(k.ld(p["GATE"], b.add(obase, i64of(b, j))), inv), p["GATE"],
+                                                  b.add(obase, i64of(b, j))))
+    k.grid_loop(p["M"], topk)
+    k.ret()
+
+    # topk_gate_b: DL [M, E] = 0 except at the chosen experts: g_j (dg_j - sum g dg)
+    k = K("topk_gate_b", [("GATE", G(f32)), ("DG", G(f32)), ("IDX", G(i32)), ("DL", G(f32)), ("M", i32), ("E", i32),
+                          ("k", i32)])
+    b, p = k.b, k.p
+
+    def topkb(r):
+        base = b.mul(i64of(b, r), i64of(b, p["E"]))
+        obase = b.mul(i64of(b, r), i64of(b, p["k"]))
+        k.loop(C(0), p["E"], C(1), lambda e: k.st(F(0.0), p["DL"], b.add(base, i64of(b, e))))
+        t = k.var(F(0.0))
+        k.loop(C(0), p["k"], C(1), lambda j: b.store(b.call(fma_f, [k.ld(p["GATE"], b.add(obase, i64of(b, j))),
+                                                                     k.ld(p["DG"], b.add(obase, i64of(b, j))),
+                                                                     b.load(t)]), t))
+
+        def put(j):
+            g_ = k.ld(p["GATE"], b.add(obase, i64of(b, j)))
+            v = b.fmul(g_, b.fsub(k.ld(p["DG"], b.add(obase, i64of(b, j))), b.load(t)))
+            e = k.ld(p["IDX"], b.add(obase, i64of(b, j)))
+            k.st(v, p["DL"], b.add(base, i64of(b, e)))
+        k.loop(C(0), p["k"], C(1), put)
+    k.grid_loop(p["M"], topkb)
     k.ret()
 
     # ------------------------------------------------------------------------- attention softmax, a block a row

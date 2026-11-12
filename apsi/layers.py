@@ -694,6 +694,60 @@ class Select(Layer):
         return f"select({self.i})"
 
 
+class MoE(Layer):
+    """Mixture of experts: a router picks the top_k of `experts` gated feed-forward blocks (swiglu) for every row;
+    the output is their sum weighted by a softmax over the chosen router scores. Each row pays for top_k experts
+    while the layer holds `experts` of them. The choice is not differentiable; the weights are."""
+    kind = "moe"
+
+    def __init__(self, d, experts=8, top_k=2, ff=None, act="silu"):
+        self.d, self.E, self.k = int(d), int(experts), int(top_k)
+        if not 1 <= self.k <= self.E:
+            raise ShapeError(f"moe: top_k={self.k} must be between 1 and experts={self.E}")
+        self.ff = int(ff or (8 * self.d) // 3)
+        self.act = str(act).lower()
+        if self.act not in ("silu", "swish", "gelu", "relu"):
+            raise ShapeError(f"moe: act '{act}' (silu, gelu, relu)")
+
+    def init(self, seed=0):
+        rng = _rng(seed)
+        d, f, E = self.d, self.ff, self.E
+        return Record(Wr=_glorot(rng, d, E) * 0.1, Wg=np.stack([_glorot(rng, d, f) for _ in range(E)]),
+                      Wu=np.stack([_glorot(rng, d, f) for _ in range(E)]),
+                      Wd=np.stack([_glorot(rng, f, d) for _ in range(E)]))
+
+    def route(self, logits):
+        """The chosen experts of every row (top_k, the larger score first, the lower index on a tie)."""
+        return np.argsort(-np.asarray(ops.raw(logits)), axis=1, kind="stable")[:, :self.k]
+
+    def apply(self, p, x, train=False, **ctx):
+        sh = np.shape(ops.raw(x))
+        M = int(np.prod(sh[:-1]))
+        xf = ops.reshape(x, M, self.d)
+        logits = xf @ p.Wr
+        idx = self.route(logits)
+        rows = np.repeat(np.arange(M), self.k)
+        sel = ops.reshape(ops.reshape(logits, M * self.E)[rows * self.E + idx.reshape(-1)], M, self.k)
+        gate = ops.reshape(ops.softmax(sel, axis=-1), M * self.k)
+        act = {"silu": lambda t: t * ops.sigmoid(t), "swish": lambda t: t * ops.sigmoid(t), "gelu": ops.gelu,
+               "relu": ops.relu}[self.act]
+        parts, where = [], []
+        flat = idx.reshape(-1)
+        for e in range(self.E):
+            pos = np.nonzero(flat == e)[0]                     # (row, slot) pairs routed to expert e
+            if not len(pos):
+                continue
+            xe = xf[rows[pos]]
+            ye = (act(xe @ p.Wg[e]) * (xe @ p.Wu[e])) @ p.Wd[e]
+            parts.append(ye * ops.reshape(gate[pos], len(pos), 1))
+            where.append(rows[pos])
+        out = segment_sum(ops.concat(parts, 0), np.concatenate(where), M)
+        return ops.reshape(out, *sh)
+
+    def describe(self):
+        return f"moe(d={self.d}, {self.E} experts, top {self.k}, ff={self.ff})"
+
+
 # ---------------------------------------------------------------- composition
 class Sequential(Layer):
     kind = "sequential"
@@ -984,16 +1038,21 @@ class TransformerBlock(Layer):
     kind = "transformer_block"
 
     def __init__(self, d, heads=4, ff=None, causal=False, dropout=0.0, activation="gelu", kv_heads=None, rope=False,
-                 rope_base=10000.0, qk_norm=False, norm="layer", ffn="mlp"):
+                 rope_base=10000.0, qk_norm=False, norm="layer", ffn="mlp", experts=8, top_k=2):
         self.d = int(d)
         self.norm_kind, self.ffn_kind = str(norm).lower(), str(ffn).lower()
         if self.norm_kind not in ("layer", "rms"):
             raise ShapeError(f"transformer_block: norm '{norm}' (layer, rms)")
-        if self.ffn_kind not in ("mlp", "swiglu"):
-            raise ShapeError(f"transformer_block: ffn '{ffn}' (mlp, swiglu)")
+        if self.ffn_kind not in ("mlp", "swiglu", "moe"):
+            raise ShapeError(f"transformer_block: ffn '{ffn}' (mlp, swiglu, moe)")
         mk = (lambda: LayerNorm(d)) if self.norm_kind == "layer" else (lambda: RMSNorm(d))
         self.attn = Residual(MultiHeadAttention(d, heads, causal, kv_heads, rope, rope_base, qk_norm), pre_norm=mk())
-        if self.ffn_kind == "swiglu":
+        if self.ffn_kind == "moe":
+            ff = int(ff or (8 * int(d)) // 3)
+            body = MoE(d, experts, top_k, ff, "silu" if str(activation).lower() == "gelu" else activation)
+            if dropout:
+                body = Sequential([body, Dropout(dropout)])
+        elif self.ffn_kind == "swiglu":
             ff = int(ff or (8 * int(d)) // 3)
             body = SwiGLU(d, ff, "silu" if str(activation).lower() == "gelu" else activation)   # (gelu: the default)
             if dropout:
@@ -1017,7 +1076,7 @@ class TransformerBlock(Layer):
         a = self.attn.inner
         extra = (f", kv_heads={a.kvh}" if a.kvh != a.h else "") + (", rope" if a.rope else "") + \
             (", qk_norm" if a.qk_norm else "") + (", rms" if self.norm_kind == "rms" else "") + \
-            (", swiglu" if self.ffn_kind == "swiglu" else "")
+            (f", {self.ffn_kind}" if self.ffn_kind != "mlp" else "")
         return f"transformer_block(d={self.d}, heads={self.heads}, ff={self.ff}{', causal' if self.causal else ''}{extra})"
 
 
@@ -1763,7 +1822,7 @@ def module(interp=None):
         conv2d_layer=Conv2D, max_pool=MaxPool, avg_pool=AvgPool, global_avg_pool=GlobalAvgPool,
         flatten_layer=Flatten, reshape_layer=Reshape, lstm_layer=LSTMLayer, gru_layer=GRULayer, last_step=LastStep,
         multi_head_attention=MultiHeadAttention, transformer_block=TransformerBlock, swiglu=SwiGLU,
-        apply_rope=apply_rope,
+        apply_rope=apply_rope, moe=MoE,
         transformer_encoder=transformer_encoder, layer_norm_layer=LayerNorm, rms_norm_layer=RMSNorm,
         batch_norm_layer=BatchNorm, dropout_layer=Dropout, activation=activation, lambda_layer=LambdaLayer,
         scale=Scale, identity=Identity, select=Select, mean_pool=MeanPool,
