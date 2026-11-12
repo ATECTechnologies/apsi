@@ -132,6 +132,18 @@ class Trainer(unittest.TestCase):
             np.testing.assert_allclose(np.asarray(L.predict(m, a.params, X, graph=g)),
                                        GT.predict(m, a.params, X, ops=GT.Emulator(), graph=g, precision="fp32"),
                                        rtol=1e-4, atol=1e-5, err_msg=name)
+        from apsi import graphs as GR                               # long-range graph layers (GLA's encoder)
+        gt = L.graph(edges=e, n=N, types=rng.integers(0, 3, len(e)), batch=np.repeat(np.arange(4), 10))
+        for name, m, gg in (("graph_transformer", GR.graph_transformer_net(8, 16, 3, layers=2, heads=4, relations=3,
+                                                                          global_every=1, max_keys=6), gt),
+                            ("k_hop", L.Sequential([L.Linear(8, 16), GR.GraphTransformer(16, 4, 3, max_hop=1),
+                                                    L.Linear(16, 3)]), GR.k_hop(gt, 2)),
+                            ("mix_hop", L.Sequential([GR.MixHop(8, 8, (0, 1, 2)), L.Activation("relu"),
+                                                      GR.MixHop(24, 3, (1, 3))]), gt)):
+            kw = dict(loss="cross_entropy", epochs=3, verbose=False, precision="fp32", graph=gg, mask=mask)
+            a = L.fit(m, m.init(seed=0), X, y, opt=Adam(0.01), **kw)
+            b = GT.fit(m, m.init(seed=0), X, y, opt=Adam(0.01), ops=GT.Emulator(), **kw)
+            np.testing.assert_allclose(a.history, b.history, rtol=2e-5, err_msg=name)
         gb = L.graph(edges=e, n=N, batch=np.repeat(np.arange(8), 5))
         for pool in ("sum", "mean"):
             m = L.gin_net(8, 16, 2, pool=pool)

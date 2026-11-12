@@ -1812,24 +1812,42 @@ class _GraphDev:
         off = np.concatenate([[0], np.cumsum(np.bincount(d_, minlength=N))])
         tperm = np.argsort(s_, kind="stable")              # edges (in target order) grouped by source
         toff = np.concatenate([[0], np.cumsum(np.bincount(s_, minlength=N))])
+        rel = np.asarray(g.rel, np.int64)
+        hop = np.asarray(g.hop, np.int64)
+        if which == "noself":
+            rel, hop = rel[keep], hop[keep]
         fwd = dict(col=self._put(s_), off=self._put(off), row=self._put(d_), ids=self._put(np.arange(E)), n=N, E=E,
-                   src=s_, dst=d_)
+                   src=s_, dst=d_, rel=rel[order], hop=hop[order], eoff=self._put(np.arange(E + 1)))
         bwd = dict(col=self._put(d_[tperm]), off=self._put(toff), vperm=self._put(tperm), n=N, E=E)
         hit = self.cache[("csr", which)] = (fwd, bwd)
         return hit
 
-    def values(self, kind):
-        """Per edge (target order): "gcn" 1 / sqrt(deg(target) deg(source)); "mean" 1 / deg(target)."""
-        hit = self.cache.get(("val", kind))
+    def custom(self, key, src, dst):
+        """A CSR of my own edges (src -> dst), cached under key: e.g. every node to every node of its graph."""
+        hit = self.cache.get(("custom", key))
         if hit is None:
-            f, _ = self.csr()
+            src, dst = np.asarray(src, np.int64), np.asarray(dst, np.int64)
+            order = np.argsort(dst, kind="stable")
+            s_, d_ = src[order], dst[order]
+            E = len(s_)
+            off = np.concatenate([[0], np.cumsum(np.bincount(d_, minlength=self.N))])
+            hit = self.cache[("custom", key)] = dict(col=self._put(s_), off=self._put(off), row=self._put(d_),
+                                                      ids=self._put(np.arange(E)), eoff=self._put(np.arange(E + 1)),
+                                                      n=self.N, E=E, src=s_, dst=d_)
+        return hit
+
+    def values(self, kind, which="all"):
+        """Per edge (target order): "gcn" 1 / sqrt(deg(target) deg(source)); "mean" 1 / deg(target)."""
+        hit = self.cache.get(("val", kind, which))
+        if hit is None:
+            f, _ = self.csr(which)
             deg = np.asarray(self.g.in_degree, np.float64)
             if kind == "gcn":
                 v = 1.0 / np.sqrt(np.maximum(deg[f["dst"]] * deg[f["src"]], 1.0))
             else:
                 cnt = np.bincount(f["dst"], minlength=self.N).astype(np.float64)
                 v = 1.0 / np.maximum(cnt, 1.0)[f["dst"]]
-            hit = self.cache[("val", kind)] = self._put(v, np.float32)
+            hit = self.cache[("val", kind, which)] = self._put(v, np.float32)
         return hit
 
     def pool(self, how):
@@ -2050,6 +2068,265 @@ class _GAT(_Node):
         return dx
 
 
+class _EdgeAttention:
+    """Attention along given edges, a softmax over each node's in-edges: the core of graph_transformer (keys and
+    values by relation, a bias by relation and by hop) and global_attention (every node of a graph to every
+    other). q [N, d]; the keys / values of edge e are rows kidx[e] of KR / VR ([rows, d]); scores
+    q[target] . k / sqrt(hd) (+ bias[e, head]); msg [N, d] = the weighted sum of the values."""
+
+    @staticmethod
+    def fwd(node, f, q, KR, VR, kidx, N, H, hd, bias_parts=()):
+        o, E = node.net.ops, f["E"]
+        d = H * hd
+        KE, VE = node.buf("ke", E * d), node.buf("ve", E * d)
+        o.gather(KR, kidx, KE, E, d, 0)
+        o.gather(VR, kidx, VE, E, d, 0)
+        sc = node.buf("sc", E * H)
+        o.edge_dot(q, KE, f["row"], f["ids"], sc, E, H, hd)              # q[target] . k
+        o.axpy(sc, sc, E * H, 1.0 / math.sqrt(hd) - 1.0)
+        if bias_parts:
+            tmp = node.buf("sb", E * H)
+            for table, ids in bias_parts:                                 # + a bias per relation / hop and head
+                o.gather(table, ids, tmp, E, H, 0)
+                o.add3(sc, sc, tmp, E * H)
+        al = node.buf("al", E * H)
+        o.seg_softmax(sc, f["off"], al, N, H, 1.0)
+        msg = node.buf("msg", N * d)
+        o.spmm(VE, f["ids"], al, None, f["off"], msg, N, H, hd)
+        node.ea = (KE, VE, sc, al)
+        return msg
+
+    @staticmethod
+    def bwd(node, f, q, kidx, dmsg, N, H, hd, rows, bias_grads=()):
+        """(dq, dKR, dVR): dKR / dVR [rows, d] (rows of the key / value tables)."""
+        o, E = node.net.ops, f["E"]
+        d = H * hd
+        KE, VE, sc, al = node.ea
+        dVE = node.gbuf("dve", E * d)                                     # each edge's value: alpha dmsg[target]
+        o.spmm(dmsg, f["row"], al, None, f["eoff"], dVE, E, H, hd)
+        dal = node.gbuf("dal", E * H)
+        o.edge_dot(dmsg, VE, f["row"], f["ids"], dal, E, H, hd)
+        ds = node.gbuf("ds", E * H)
+        o.seg_softmax_b(sc, al, dal, f["off"], ds, N, H, 1.0)
+        for gtable, ids, rows_ in bias_grads:
+            o.embed_b(ds, ids, gtable, E, H, rows_)
+        o.axpy(ds, ds, E * H, 1.0 / math.sqrt(hd) - 1.0)
+        dq = node.gbuf("dq", N * d)
+        o.spmm(KE, f["ids"], ds, None, f["off"], dq, N, H, hd)
+        dKE = node.gbuf("dke", E * d)
+        o.spmm(q, f["row"], ds, None, f["eoff"], dKE, E, H, hd)
+        dKR, dVR = node.gbuf("dkr", rows * d), node.gbuf("dvr", rows * d)
+        o.fill(dKR, rows * d, 0.0)
+        o.fill(dVR, rows * d, 0.0)
+        o.embed_b(dKE, kidx, dKR, E, d, rows)
+        o.embed_b(dVE, kidx, dVR, E, d, rows)
+        return dq, dKR, dVR
+
+
+class _GraphTransformer(_Node):
+    """graph_transformer: x + attention over the in-edges (no self loops; keys and values by relation; a bias by
+    relation and by hop), then x + mlp(norm(x))."""
+
+    def __init__(self, net, key, layer, p, gk):
+        from . import layers as L
+        super().__init__(net, key)
+        self.d, self.H, self.R, self.max_hop = layer.d, layer.h, layer.R, layer.max_hop
+        self.n1 = _Norm(net, key + ".n1", L.LayerNorm(layer.d), p.n1, False)
+        self.n2 = _Norm(net, key + ".n2", L.LayerNorm(layer.d), p.n2, False)
+        self.n1.gkey, self.n2.gkey = gk + ".n1", gk + ".n2"
+        self.Wq, self.Wk, self.Wv, self.Wo, self.bo = (net.param(getattr(p, n)) for n in ("Wq", "Wk", "Wv", "Wo",
+                                                                                          "bo"))
+        self.rb, self.hb = net.param(p.rel_bias), net.param(p.hop_bias)
+        self.mlp = net.compile(layer.mlp, p.mlp, key + ".m", gk + ".m")
+        self.ids = None
+
+    def _ids(self, gd, f):
+        if self.ids is None:
+            if gd.g.relations > self.R:
+                raise TrainError(f"graph_transformer(relations={self.R}) got a graph with {gd.g.relations} relations")
+            self.ids = (gd._put(f["src"] * self.R + f["rel"]), gd._put(f["rel"]),
+                        gd._put(np.minimum(f["hop"], self.max_hop)))
+        return self.ids
+
+    def fwd(self, x, shape):
+        gd = _need_graph(self.net, "graph_transformer")
+        o, ps = self.net.ops, self.net.passes
+        N, d, H, R = _rows(shape), self.d, self.H, self.R
+        hd = d // H
+        self.x, self.N = x, N
+        f, _ = gd.csr("noself")
+        self.E = f["E"]
+        h, _ = self.n1.fwd(x, shape)
+        self.h = h
+        x1 = self.buf("x1", N * d)
+        if self.E:
+            kidx, rid, hid = self._ids(gd, f)
+            q = self.q = self.buf("q", N * d)
+            o.gemm(h, self.Wq.w, q, N, d, d, d, 1, d, 1, d, passes=ps)
+            KR, VR = self.buf("kr", N * R * d), self.buf("vr", N * R * d)
+            for W, out in ((self.Wk, KR), (self.Wv, VR)):               # every node's key / value in every relation
+                o.gemm(h, W.w, out, N, d, d, d, 1, d, 1, R * d, batch=(1, R), sa=(0, 0), sb=(0, d * d), sc=(0, d),
+                       passes=ps)
+            self.msg = _EdgeAttention.fwd(self, f, q, KR, VR, kidx, N, H, hd, ((self.rb.w, rid), (self.hb.w, hid)))
+            o.gemm(self.msg, self.Wo.w, x1, N, d, d, d, 1, d, 1, d, bias=self.bo.w, passes=ps, epi=3, X2=x)
+        else:
+            o.pull(x1, o, x, N * d)
+        self.x1 = x1
+        h2, _ = self.n2.fwd(x1, shape)
+        f2, _ = self.mlp.fwd(h2, shape)
+        y = self.buf("y", N * d)
+        o.add3(y, x1, f2, N * d)
+        return y, shape
+
+    def bwd(self, dy, need_dx=True):
+        o, ps = self.net.ops, self.net.passes
+        N, d, H, R = self.N, self.d, self.H, self.R
+        hd = d // H
+        dx1 = self.n2.bwd(self.mlp.bwd(dy, True), True, residual=dy)
+        if not self.E:
+            return dx1
+        gd = self.net.gdev
+        f, _ = gd.csr("noself")
+        kidx, rid, hid = self._ids(gd, f)
+        o.gemm(self.msg, dx1, self.Wo.g, d, d, N, 1, d, d, 1, d, beta=True, passes=ps, db=self.bo.g)
+        dmsg = self.gbuf("dmsg", N * d)
+        o.gemm(dx1, self.Wo.w, dmsg, N, d, d, d, 1, 1, d, d, passes=ps)
+        dq, dKR, dVR = _EdgeAttention.bwd(self, f, self.q, kidx, dmsg, N, H, hd, N * R,
+                                          ((self.rb.g, rid, R), (self.hb.g, hid, self.max_hop + 1)))
+        dh = self.gbuf("dh", N * d)
+        o.gemm(self.h, dq, self.Wq.g, d, d, N, 1, d, d, 1, d, beta=True, passes=ps)
+        o.gemm(dq, self.Wq.w, dh, N, d, d, d, 1, 1, d, d, passes=ps)
+        for W, dR in ((self.Wk, dKR), (self.Wv, dVR)):
+            for r in range(R):
+                o.gemm(self.h, (dR[0], dR[1] + r * d), (W.g[0], W.g[1] + r * d * d), d, d, N, 1, d, R * d, 1, d,
+                       beta=True, passes=ps)
+                o.gemm((dR[0], dR[1] + r * d), (W.w[0], W.w[1] + r * d * d), dh, N, d, d, R * d, 1, 1, d, d,
+                       beta=True, passes=ps)
+        return self.n1.bwd(dh, True, residual=dx1)
+
+
+class _GlobalAttention(_Node):
+    """global_attention: x + attention of every node over the nodes of its graph (at most max_keys keys a graph,
+    spread evenly), as edges on the card."""
+
+    def __init__(self, net, key, layer, p, gk):
+        from . import layers as L
+        super().__init__(net, key)
+        self.d, self.H, self.max_keys = layer.d, layer.h, layer.max_keys
+        self.n = _Norm(net, key + ".n", L.LayerNorm(layer.d), p.n, False)
+        self.n.gkey = gk + ".n"
+        self.Wq, self.Wk, self.Wv, self.Wo, self.bo = (net.param(getattr(p, n)) for n in ("Wq", "Wk", "Wv", "Wo",
+                                                                                          "bo"))
+
+    def _edges(self, N):
+        g = self.net.graph
+        if g is None:
+            if self.net.gdev is None or self.net.gdev.N != N:
+                from . import layers as L
+                self.net.gdev = _GraphDev(self.net, L.Graph(np.zeros(0, int), np.zeros(0, int), N, self_loops=False))
+            batch = np.zeros(N, np.int64)
+        else:
+            batch = np.asarray(g.batch, np.int64)
+        gd = _need_graph(self.net, "global_attention") if g is not None else self.net.gdev
+        src, dst = [], []
+        for b_ in np.unique(batch):
+            idx = np.nonzero(batch == b_)[0]
+            keys = idx if len(idx) <= self.max_keys else \
+                idx[np.linspace(0, len(idx) - 1, self.max_keys).astype(int)]
+            src.append(np.tile(keys, len(idx)))
+            dst.append(np.repeat(idx, len(keys)))
+        f = gd.custom(("global", self.max_keys), np.concatenate(src), np.concatenate(dst))
+        if not hasattr(self, "kid"):
+            self.kid = gd._put(f["src"])
+        return gd, f
+
+    def fwd(self, x, shape):
+        o, ps = self.net.ops, self.net.passes
+        N, d, H = _rows(shape), self.d, self.H
+        hd = d // H
+        gd, f = self._edges(N)
+        self.x, self.N = x, N
+        h, _ = self.n.fwd(x, shape)
+        self.h = h
+        q, KR, VR = self.buf("q", N * d), self.buf("kr", N * d), self.buf("vr", N * d)
+        for W, out in ((self.Wq, q), (self.Wk, KR), (self.Wv, VR)):
+            o.gemm(h, W.w, out, N, d, d, d, 1, d, 1, d, passes=ps)
+        self.q = q
+        self.msg = _EdgeAttention.fwd(self, f, q, KR, VR, self.kid, N, H, hd)
+        y = self.buf("y", N * d)
+        o.gemm(self.msg, self.Wo.w, y, N, d, d, d, 1, d, 1, d, bias=self.bo.w, passes=ps, epi=3, X2=x)
+        return y, shape
+
+    def bwd(self, dy, need_dx=True):
+        o, ps = self.net.ops, self.net.passes
+        N, d, H = self.N, self.d, self.H
+        hd = d // H
+        gd, f = self._edges(N)
+        o.gemm(self.msg, dy, self.Wo.g, d, d, N, 1, d, d, 1, d, beta=True, passes=ps, db=self.bo.g)
+        dmsg = self.gbuf("dmsg", N * d)
+        o.gemm(dy, self.Wo.w, dmsg, N, d, d, d, 1, 1, d, d, passes=ps)
+        dq, dK, dV = _EdgeAttention.bwd(self, f, self.q, self.kid, dmsg, N, H, hd, N)
+        dh = self.gbuf("dh", N * d)
+        first = True
+        for W, dW in ((self.Wq, dq), (self.Wk, dK), (self.Wv, dV)):
+            o.gemm(self.h, dW, W.g, d, d, N, 1, d, d, 1, d, beta=True, passes=ps)
+            o.gemm(dW, W.w, dh, N, d, d, d, 1, 1, d, d, beta=not first, passes=ps)
+            first = False
+        return self.n.bwd(dh, True, residual=dy)
+
+
+class _MixHop(_Node):
+    """concat_k (A^k x) W_k + b, A the mean over each node's in-neighbours (no self loops)."""
+
+    def __init__(self, net, key, layer, p):
+        super().__init__(net, key)
+        self.K, self.F, self.hops = layer.n_in, layer.n_out, layer.hops
+        self.W, self.b = net.param(p.W), net.param(p.b)
+
+    def fwd(self, x, shape):
+        gd = _need_graph(self.net, "mix_hop")
+        o, ps = self.net.ops, self.net.passes
+        N, K, F, J = _rows(shape), self.K, self.F, len(self.hops)
+        f, _ = gd.csr("noself")
+        self.x, self.N = x, N
+        self.pw = [x]
+        for k in range(1, max(self.hops) + 1):
+            nxt = self.buf(("p", k), N * K)
+            o.spmm(self.pw[-1], f["col"], gd.values("mean", "noself"), None, f["off"], nxt, N, 1, K)
+            self.pw.append(nxt)
+        y = self.buf("y", N * F * J)
+        for i, k in enumerate(self.hops):
+            o.gemm(self.pw[k], (self.W.w[0], self.W.w[1] + i * K * F), (y[0], y[1] + i * F), N, F, K, K, 1, F, 1,
+                   F * J, passes=ps)
+        o.pos_f(y, self.b.w, y, N, F * J, 1)
+        return y, shape[:-1] + (F * J,)
+
+    def bwd(self, dy, need_dx=True):
+        gd = self.net.gdev
+        o, ps = self.net.ops, self.net.passes
+        N, K, F, J = self.N, self.K, self.F, len(self.hops)
+        _, t = gd.csr("noself")
+        o.pos_b(dy, self.b.g, N, F * J, 1)
+        top = max(self.hops)
+        dp = [None] * (top + 1)
+        for i, k in enumerate(self.hops):
+            o.gemm(self.pw[k], (dy[0], dy[1] + i * F), (self.W.g[0], self.W.g[1] + i * K * F), K, F, N, 1, K, F * J,
+                   1, F, beta=True, passes=ps)
+            if dp[k] is None:
+                dp[k] = self.gbuf(("dp", k), N * K)
+                o.fill(dp[k], N * K, 0.0)
+            o.gemm((dy[0], dy[1] + i * F), (self.W.w[0], self.W.w[1] + i * K * F), dp[k], N, K, F, F * J, 1, 1, F,
+                   K, beta=True, passes=ps)
+        for k in range(top, 0, -1):                     # back along the powers: A^T
+            if dp[k] is None:
+                continue
+            if dp[k - 1] is None:
+                dp[k - 1] = self.gbuf(("dp", k - 1), N * K)
+                o.fill(dp[k - 1], N * K, 0.0)
+            o.spmm(dp[k], t["col"], gd.values("mean", "noself"), t["vperm"], t["off"], dp[k - 1], N, 1, K, add=True)
+        return dp[0]
+
+
 class _GraphPool(_Node):
     """One row per graph: the mean or the sum of its nodes."""
 
@@ -2237,6 +2514,13 @@ class Net:
             return _MeanPool(self, key, layer)
         if isinstance(layer, L.Scale):
             return _Scale(self, key, layer, p)
+        from . import graphs as GR
+        if isinstance(layer, GR.GraphTransformer):
+            return _GraphTransformer(self, key, layer, p, gk)
+        if isinstance(layer, GR.GlobalAttention):
+            return _GlobalAttention(self, key, layer, p, gk)
+        if isinstance(layer, GR.MixHop):
+            return _MixHop(self, key, layer, p)
         if isinstance(layer, L.GCN):
             return _GCN(self, key, layer, p)
         if isinstance(layer, L.SAGE):

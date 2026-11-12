@@ -23,6 +23,9 @@
   and graph tasks. The edges are kept in compressed rows (CSR) and every node sums its edges in a register: no atomic
   additions, the same result every run. New kernels: sparse products with per-edge, per-head weights, the edge
   softmax and its gradient, edge dot products.
+- **Long-range graph layers on the GPU trainer:** `graph_transformer` (attention along the edges, keys and values
+  by relation, biases by relation and hop), `global_attention` (every node over the nodes of its graph), `mix_hop`,
+  `graph_transformer_net`: the encoder of a graph-language model trains on the card.
 - **More activations on the card:** elu, softplus, mish.
 - **Any architecture on the GPU trainer:** `dag(...)` (values by name, gradients added where a value feeds several
   layers), `parallel`, `add` / `multiply` / `concatenate` / mean, `scale`, `identity`, `reshape`, `flatten`,
