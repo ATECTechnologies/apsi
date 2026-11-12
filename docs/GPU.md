@@ -183,6 +183,11 @@ number of rows, its own lengths and its own graph (a batch of graphs), and `inpu
 several inputs, e.g. token ids and the node features of the graphs they talk about. With `graph_memory` (the k best
 nodes of every graph) and cross-attention from the text to that memory, a graph-and-language model trains on the
 card; the tests check it against NumPy step by step. `backend="numpy"` runs the same on the processor.
+`accumulate=4` averages the gradients of 4 batches per step. With `device="cuda:all"` the model — a `dag` with
+several inputs as well as a sequence — is cut into stages between its nodes (each stage receives the values it needs
+by name, several at once, and hands on the ones later stages need), the `accumulate` batches of a step flow through
+the stages as micro-batches, each with its own graph, and the cards left copy the pipeline (`stages=2` on 4 cards:
+2 stages x 2 replicas). The same training as one card, step for step.
 
 **Measure it on your card** — `apsi gpu bench` trains the 127 M GPT above on random tokens (nothing downloaded) and
 reports the tokens per second, what the card would do on its kernels alone, each kind of kernel's share of a step,

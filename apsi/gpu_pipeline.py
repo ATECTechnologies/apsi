@@ -176,16 +176,29 @@ class _Link:
 
 
 def _all_nodes(nd):
-    out, todo = [], [nd]
+    """Every object of a compiled model that keeps per-batch state (the nodes and their helpers), found by walking
+    their attributes: the state of each micro-batch in flight is saved after its forward pass and put back for its
+    backward pass."""
+    from . import gpu_train as GT
+    kinds = (GT._Node, GT._TypedLin, GT._TypedNormOp)
+    out, seen, todo = [], set(), [nd]
     while todo:
         x = todo.pop()
-        out.append(x)
-        for k in ("nodes",):
-            todo.extend(getattr(x, k, None) or [])
-        for k in ("inner", "norm"):
-            c = getattr(x, k, None)
-            if c is not None and hasattr(c, "fwd"):
-                todo.append(c)
+        if id(x) in seen:
+            continue
+        seen.add(id(x))
+        if isinstance(x, kinds):
+            out.append(x)
+            vals = list(vars(x).values())
+        elif isinstance(x, (list, tuple)):
+            vals = list(x)
+        elif isinstance(x, dict):
+            vals = list(x.values())
+        else:
+            continue
+        for v in vals:
+            if isinstance(v, kinds + (list, tuple, dict)) and not isinstance(v, GT.Net):
+                todo.append(v)
     return out
 
 
@@ -610,3 +623,307 @@ def pipe_forward(stages, xb):
         x_host = out
         net.train = True
     return out
+
+
+# ============================================================================== batches of their own shape, any dag
+def dag_view(model, params):
+    """(nodes [(name, layer, srcs, single, params)], inputs, output): a dag as it is, a sequence as a chain."""
+    from . import layers as L
+    from .gpu_train import TrainError
+    if isinstance(model, L.DAG):
+        if not isinstance(model.output, str):
+            raise TrainError("a split dag has one output (output=\"name\")")
+        return ([(n, l_, list(srcs), single, getattr(params, n)) for n, l_, srcs, single in model.nodes],
+                list(model.inputs), model.output)
+    nodes, prev = [], "x"
+    for i, (l_, p) in enumerate(units(model, params)):
+        nodes.append((f"u{i}", l_, [prev], True, p))
+        prev = f"u{i}"
+    return nodes, ["x"], prev
+
+
+def live_sets(nodes, inputs, output, a, b):
+    """The values a stage over nodes[a:b] receives and the values it hands on."""
+    last = {}
+    for i, (n, _, srcs, _, _) in enumerate(nodes):
+        for s_ in srcs:
+            last[s_] = max(last.get(s_, -1), i)
+    last[output] = len(nodes)
+
+    def before(k):
+        return list(inputs) + [nodes[i][0] for i in range(k)]
+    return ([x for x in before(a) if last.get(x, -1) >= a], [x for x in before(b) if last.get(x, -1) >= b])
+
+
+class SegStage(Stage):
+    """A stretch of a dag's nodes on one card: it receives several named values and hands several on."""
+
+    def __init__(self, ops, seg, live_in, live_out, precision, index, count, slots):
+        from . import layers as L
+        from .gpu_train import Net, _Arena
+        self.ops, self.index, self.count = ops, index, count
+        self.first, self.last = index == 0, index == count - 1
+        self.live_in, self.live_out = live_in, live_out
+        model = L.DAG([[n, l_, srcs[0] if single else srcs] for n, l_, srcs, single, _ in seg], inputs=live_in,
+                      output=seg[-1][0])
+        self.net = Net(ops, model, Record(**{n: p for n, _, _, _, p in seg}), precision)
+        self.garena = self.net.arena
+        self.net.garena = self.garena
+        self.slots = [_Arena(ops) for _ in range(max(1, slots))]
+        self.nodes = _all_nodes(self.net.root)
+        self.saved, self.incount = {}, {}
+        self.extra = []
+
+    def forward_seg(self, m, ins):
+        self.use_slot(m)
+        vals = self.net.root.run_all(dict(ins))
+        self.saved[m] = [dict(vars(nd)) for nd in self.nodes]
+        return vals
+
+    def backward_seg(self, m, seeds):
+        self.use_slot(m)
+        for nd, st in zip(self.nodes, self.saved.pop(m)):
+            nd.__dict__.update(st)
+        return self.net.root.back_from(seeds)
+
+
+def fit_batches_pipeline(ops_list, model, params, batches, loss, opt, epochs, verbose, clip, schedule_fn, precision,
+                         stages=None, micro=None, compensated=False, every=None):
+    """fit_batches on several cards: the model (a dag or a sequence) cut into stages at the points that balance the
+    work, `micro` batches of a step flowing through them in a one-forward-one-backward order, the pipeline copied
+    over the cards left (replicas). Every batch may bring its own shapes and graph. One step averages the gradients
+    of its batches."""
+    from . import ops as aops, thermal
+    from .stdlib import Adam, AdamW, SGD
+    from .gpu_train import TrainError, LOSSES, _batch_parts
+    custom = callable(loss)
+    loss_fn, loss = (loss, "custom") if custom else (None, str(loss))
+    if not custom and loss not in LOSSES:
+        raise TrainError(f"loss '{loss}' is not on the GPU trainer ({', '.join(LOSSES)})")
+    opt = opt or Adam(1e-3)
+    if not isinstance(opt, (Adam, SGD)):
+        raise TrainError(f"optimizer {type(opt).__name__} is not on the GPU trainer (adam, adamw, sgd)")
+    adam = isinstance(opt, Adam)
+    wd = float(getattr(opt, "wd", 0.0)) if isinstance(opt, AdamW) else 0.0
+    nodes, inputs, output = dag_view(model, params)
+    first_items = list(batches(0) if callable(batches) else batches)
+    if not first_items:
+        raise TrainError("no batches")
+    X0, _, _ = _batch_parts(first_items[0])
+    x0 = np.asarray(aops.raw(X0[0] if isinstance(X0, (list, tuple)) else X0))
+    work, size = unit_costs([(l_, p) for _, l_, _, _, p in nodes], x0.shape[1:])
+    n_cards = len(ops_list)
+    if isinstance(stages, (list, tuple)):
+        sizes = [int(v) for v in stages]
+        if sum(sizes) != len(nodes) or any(v < 1 for v in sizes) or len(sizes) > n_cards:
+            raise TrainError(f"stages={list(stages)}: the nodes of each stage, {len(nodes)} in all, at most "
+                             f"{n_cards} stages")
+    else:
+        S = min(int(stages) if stages else n_cards, len(nodes), n_cards)
+        mems = [getattr(getattr(o, "dev", None), "memory", None) for o in ops_list]
+        budget = 0.8 * min(mems) if all(mems) else None
+        sizes = partition(work, size, S, 16.0 if adam else 12.0, budget) or partition(work, size, S)
+    S = len(sizes)
+    R = max(1, n_cards // S)
+    M = max(1, int(micro) if micro else 2 * S)
+    cuts = np.concatenate([[0], np.cumsum(sizes)]).astype(int)
+    grid = []
+    try:
+        for r in range(R):
+            row = []
+            for s in range(S):
+                li, lo_ = live_sets(nodes, inputs, output, cuts[s], cuts[s + 1])
+                st = SegStage(ops_list[r * S + s], nodes[cuts[s]:cuts[s + 1]], li, lo_, precision, s, S,
+                              min(S - s, M))
+                st.gov = thermal.governor(getattr(st.ops, "dev", None))
+                st.LOSSB = st.alloc(max(1, M))
+                row.append(st)
+            grid.append(row)
+        for s in range(S):
+            group = [grid[r][s] for r in range(R)]
+            nP = group[0].net.n
+            for k, st in enumerate(group):
+                o = st.ops
+                st.lo, st.hi = nP * k // R, nP * (k + 1) // R
+                ln = max(1, st.hi - st.lo)
+                st.st1, st.st2 = st.alloc(ln), (st.alloc(ln) if adam else None)
+                st.SQ, st.TMP = st.alloc(1), st.alloc(ln)
+                st.COMP = st.alloc(ln) if compensated else None
+                for b_ in (st.st1, st.st2, st.COMP):
+                    if b_ is not None:
+                        o.fill((b_, 0), ln, 0.0)
+        t, step, history = int(getattr(opt, "t", 0)), 0, []
+        E = int(epochs)
+        every = int(every or max(1, E // 10))
+        for ep in range(E):
+            items = first_items if ep == 0 else list(batches(ep) if callable(batches) else batches)
+            losses = []
+            per = R * M
+            for s0 in range(0, len(items), per):
+                chunk = items[s0:s0 + per]
+                parts = [chunk[r::R] for r in range(R)]
+                lr = float(aops.raw(schedule_fn(step))) if schedule_fn is not None else float(opt.lr)
+                losses += _seg_step(grid, parts, inputs, output, loss, loss_fn, len(chunk))
+                t += 1
+                _update(grid, opt, adam, wd, lr, t, clip, None)
+                step += 1
+                for row in grid:
+                    for st in row:
+                        st.gov.tick(st.ops.sync)
+            history.append(float(np.mean(losses)))
+            if verbose and (ep % every == 0 or ep == E - 1):
+                print(f"epoch {ep:4}  loss {history[-1]:.5f}  ({S} stages x {R} replicas, {len(items)} batches)")
+        opt.t = t
+        out = _gather_params(params, grid[0])
+        temps = [st.gov.status() for row in grid for st in row]
+    finally:
+        for row in grid:
+            for st in row:
+                st.net.clear_graphs()
+                st.close()
+    return Record(params=out, history=history, stages=list(sizes), replicas=R, micro_batches=M, gpu_temperatures=temps,
+                  device=f"{S * R} GPUs, a {len(nodes)}-node model split into {S} stages"
+                         + (f" x {R} replicas" if R > 1 else ""))
+
+
+def _seg_step(grid, parts, inputs, output, loss, loss_fn, total):
+    stop, errors, threads = threading.Event(), [], []
+    host = {}
+    for r, (row, items) in enumerate(zip(grid, parts)):
+        S = len(row)
+        if not items:
+            for st in row:
+                st.ops.fill((st.net.G, 0), st.net.n, 0.0)
+            continue
+        fwd = [_Link(stop) for _ in range(S + 1)]
+        bwd = [_Link(stop) for _ in range(S + 1)]
+        sends = [threading.Semaphore(2) for _ in range(S)]
+        for st in row:
+            args = (st, items, inputs, output, loss, loss_fn, total, fwd, bwd, sends, host, r)
+            threads.append(threading.Thread(target=_seg_main, args=(args, stop, errors), daemon=True))
+    for th in threads:
+        th.start()
+    for th in threads:
+        th.join()
+    for row in grid:
+        for st in row:
+            st.net.clear_graphs()
+    if errors:
+        raise errors[0]
+    out = []
+    for r, (row, items) in enumerate(zip(grid, parts)):
+        if items:
+            last = row[-1]
+            vals = last.ops.get(last.LOSSB, len(items))
+            out += [host[(r, m)] if (r, m) in host else float(vals[m]) for m in range(len(items))]
+    return out
+
+
+def _seg_main(args, stop, errors):
+    try:
+        _seg_work(*args)
+    except _Abort:
+        pass
+    except BaseException as e:                           # noqa: BLE001
+        errors.append(e)
+        stop.set()
+
+
+def _seg_work(st, items, inputs, output, loss, loss_fn, total, fwd, bwd, sends, host, r):
+    from . import ops as aops
+    from .gpu_train import _rows, _regress, _batch_parts, _as_input, TrainError
+    from .stdlib import value_and_grad
+    o, net, s = st.ops, st.net, st.index
+    o.fill((net.G, 0), net.n, 0.0)
+    o.fill((st.LOSSB, 0), max(1, len(items)), 0.0)
+    net.round_weights()
+    net.train = True
+    ring = 0
+    parts = [_batch_parts(it) for it in items]
+    for kind, m in schedule(s, st.count, len(items)):
+        X, Y, g = parts[m]
+        net.set_graph(g, keep=True)
+        release = None
+        if kind == "F":
+            a = st.use_slot(m)
+            ins = {}
+            if st.first:
+                xs = list(X) if isinstance(X, (list, tuple)) else [X]
+                if len(xs) != len(inputs):
+                    raise TrainError(f"the model takes {len(inputs)} inputs {inputs}, a batch gave {len(xs)}")
+                for name, arr in zip(inputs, xs):
+                    if name in st.live_in:
+                        arr = _as_input(arr)
+                        v = a.get(("in", name), arr.size)
+                        o.put(v[0], arr.reshape(-1), v[1])
+                        ins[name] = (v, arr.shape)
+            else:
+                got, msg = fwd[s].get()
+                assert got == m
+                for name, view, cnt, shape, src in msg:
+                    v = a.get(("recv", name), cnt)
+                    o.pull(v, src, view, cnt)
+                    ins[name] = (v, shape)
+            vals = st.forward_seg(m, ins)
+            if not st.last:
+                o.sync()
+                fwd[s + 1].put((m, [(n, vals[n][0], int(np.prod(vals[n][1])), vals[n][1], o) for n in st.live_out]))
+                continue
+            out, shape = vals[output]
+            rows, C = _rows(shape), shape[-1]
+            mm = rows * C
+            dout = st.garena.get("dout", mm)
+            Yr = np.asarray(aops.raw(Y))
+            if loss == "custom":
+                oh = o.get(out[0], mm, out[1]).reshape(shape).astype(np.float64)
+                lv, gh = value_and_grad(lambda o_: loss_fn(o_, Yr))(oh)
+                o.put(dout[0], (np.asarray(aops.raw(gh), np.float32) / total).reshape(-1), dout[1])
+                host[(r, m)] = float(aops.raw(lv))
+            else:
+                ya = np.ascontiguousarray(Yr.astype(np.int32) if loss == "cross_entropy" else
+                                          Yr.astype(np.float32)).reshape(-1)
+                yd = st.use_slot(m).get("Y", ya.size)
+                o.put(yd[0], ya, yd[1])
+                if loss == "cross_entropy":
+                    if ya.size != rows:
+                        raise TrainError(f"cross_entropy: {ya.size} labels for {rows} rows of output")
+                    w = 1.0 / max(int((ya >= 0).sum()), 1)
+                    o.ce(out, yd, dout, (st.LOSSB, m), rows, C, w / total, w)
+                else:
+                    if ya.size != mm:
+                        raise TrainError(f"{loss}: targets of {ya.size} values for an output of {mm}")
+                    _regress(o, loss, out, yd, dout, (st.LOSSB, m), mm, 1.0 / (mm * total), 1.0 / mm)
+            seeds = {output: dout}
+        else:
+            if st.last:
+                continue
+            got, msg, sem = bwd[s].get()
+            assert got == m
+            seeds = {}
+            for name, view, cnt, src in msg:
+                v = st.garena.get(("din", name), cnt)
+                o.pull(v, src, view, cnt)
+                seeds[name] = v
+            release = sem
+        if kind == "B" or st.last:
+            grads = st.backward_seg(m, seeds)
+            if st.first:
+                o.sync()
+            else:
+                sends[s].acquire()
+                msg = []
+                for name in st.live_in:
+                    gv = grads.get(name)
+                    if gv is None or name not in st.net.root.shapes:
+                        continue
+                    cnt = int(np.prod(st.net.root.shapes[name]))
+                    buf = st.garena.get(("send", ring, name), cnt)
+                    o.pull(buf, o, gv, cnt)
+                    msg.append((name, buf, cnt, o))
+                ring ^= 1
+                o.sync()
+                bwd[s - 1].put((m, msg, sends[s]))
+            if release is not None:
+                release.release()
+    o.sync()
+    net.set_graph(None, keep=True)

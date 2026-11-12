@@ -199,6 +199,46 @@ class Trainer(unittest.TestCase):
         np.testing.assert_allclose(a.history, b.history, rtol=1e-5)
         self.assertLess(b.history[-1], b.history[0] - 1.0)
 
+    def test_any_model_split_across_cards_in_batches(self):
+        """A two-input graph-and-language dag (hgt, global attention, graph memory, cross-attention, rotary positions,
+        grouped heads, SwiGLU), a different batch of graphs every step, gradients of 4 batches averaged per step:
+        NumPy, one card, the dag split into 4 stages, and 2 stages x 2 replicas all train the same."""
+        from apsi import graphs as GR
+        rng = np.random.default_rng(0)
+        V, d, f, T, k = 20, 16, 6, 8, 4
+
+        def make(G):
+            sizes = rng.integers(3, 9, G)
+            N = int(sizes.sum())
+            src, dst, off = [], [], 0
+            for s_ in sizes:
+                e = rng.integers(0, s_, (2 * s_, 2)) + off
+                src += list(e[:, 0])
+                dst += list(e[:, 1])
+                off += s_
+            g = L.graph(edges=np.stack([src, dst], 1).tolist(), n=N, batch=np.repeat(np.arange(G), sizes),
+                        types=rng.integers(0, 2, len(src)), node_types=rng.integers(0, 3, N))
+            toks = rng.integers(0, V, (G, T))
+            return [toks, rng.normal(size=(N, f))], np.roll(toks, -1, 1), g
+        batches = [make(G) for G in (3, 2, 4, 3, 2, 3, 2, 4)]
+        m = L.DAG([["e", L.Embedding(V, d), "tok"],
+                   ["h", L.Residual(L.MultiHeadAttention(d, 4, causal=True, rope=True, kv_heads=2),
+                                    pre_norm=L.RMSNorm(d)), "e"],
+                   ["n0", L.Linear(f, d), "nodes"], ["n1", GR.HGT(d, 4, types=3, relations=2), "n0"],
+                   ["n2", GR.GlobalAttention(d, 4), "n1"], ["mem", GR.GraphMemory(d, k), "n2"],
+                   ["c", L.MultiHeadAttention(d, 4), ["h", "mem"]], ["r", L.add(), ["c", "h"]],
+                   ["f", L.Residual(L.SwiGLU(d, 32), pre_norm=L.RMSNorm(d)), "r"], ["out", L.Linear(d, V), "f"]],
+                  inputs=["tok", "nodes"], output="out")
+        kw = dict(epochs=3, verbose=False)
+        ref = L.fit_batches(m, m.init(seed=0), batches, "cross_entropy", opt=Adam(0.01), backend="numpy",
+                            accumulate=4, **kw).history
+        for ops, acc, st in ((GT.Emulator(), 4, None), ([GT.Emulator() for _ in range(4)], 4, None),
+                             ([GT.Emulator() for _ in range(4)], 2, 2)):
+            r = GT.fit_batches(m, m.init(seed=0), batches, "cross_entropy", opt=Adam(0.01), precision="fp32", ops=ops,
+                               accumulate=acc, stages=st, **kw)
+            np.testing.assert_allclose(ref, r.history, rtol=1e-5)
+        self.assertEqual((len(r.stages), r.replicas), (2, 2))
+
     def test_heterogeneous_graphs(self):
         """typed_linear, typed_norm and hgt (a type per node, keys through each relation, one softmax over a node's
         in-edges, GLA's brain layer): training on the card equals NumPy, with a different graph every batch."""

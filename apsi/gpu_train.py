@@ -2017,7 +2017,21 @@ class _DAG(_Node):
         self._back(dy, True)
         return [self.G.g.get(n) for n in self.inputs]
 
+    def run_all(self, vals):
+        """Every node from the given values (name -> (view, shape)); all the values by name."""
+        self._run(vals)
+        return self.vals
+
+    def back_from(self, seeds):
+        """Gradients from the given ones (name -> view): the gradients of every value, by name."""
+        G = self.G = _Grads(self, self.shapes)
+        for k_, v in seeds.items():
+            G.add(k_, v)
+        self._walk_back(G, True)
+        return G.g
+
     def _run(self, vals):
+        self.vals = vals
         for name, nd, srcs, single in self.items:
             vals[name] = nd.fwd(*vals[srcs[0]]) if single else _fwd_multi(nd, [vals[s_] for s_ in srcs])
         self.shapes = {k_: v[1] for k_, v in vals.items()}
@@ -2030,6 +2044,9 @@ class _DAG(_Node):
     def _back(self, dy, need_dx):
         G = self.G = _Grads(self, self.shapes)
         G.g[self.out] = dy
+        self._walk_back(G, need_dx)
+
+    def _walk_back(self, G, need_dx):
         for name, nd, srcs, single in reversed(self.items):
             g = G.g.pop(name, None)
             if g is None:
@@ -2838,13 +2855,13 @@ class _GraphTransformer(_Node):
         self.ids = self.ids_for = None
 
     def _ids(self, gd, f):
-        if self.ids is None or self.ids_for is not gd:
-            self.ids_for = gd
+        hit = gd.cache.get(("gt", id(self)))
+        if hit is None:
             if gd.g.relations > self.R:
                 raise TrainError(f"graph_transformer(relations={self.R}) got a graph with {gd.g.relations} relations")
-            self.ids = (gd._put(f["src"] * self.R + f["rel"]), gd._put(f["rel"]),
-                        gd._put(np.minimum(f["hop"], self.max_hop)))
-        return self.ids
+            hit = gd.cache[("gt", id(self))] = (gd._put(f["src"] * self.R + f["rel"]), gd._put(f["rel"]),
+                                                 gd._put(np.minimum(f["hop"], self.max_hop)))
+        return hit
 
     def fwd(self, x, shape):
         gd = _need_graph(self.net, "graph_transformer")
@@ -3066,13 +3083,13 @@ class _HGT(_Node):
         self.ids = self.ids_for = None
 
     def _ids(self, gd, f):
-        if self.ids_for is not gd:
+        key = ("hgt", id(self))
+        if key not in gd.cache:
             if len(f["rel"]) and f["rel"].max() >= self.R:
                 raise TrainError(f"hgt(relations={self.R}) got a graph with relation {int(f['rel'].max())}")
             has_in = (np.bincount(f["dst"], minlength=gd.N) > 0).astype(np.float32)
-            self.ids = (gd._put(f["src"] * self.R + f["rel"]), gd._put(f["src"]), gd._put(has_in, np.float32))
-            self.ids_for = gd
-        return self.ids
+            gd.cache[key] = (gd._put(f["src"] * self.R + f["rel"]), gd._put(f["src"]), gd._put(has_in, np.float32))
+        return gd.cache[key]
 
     def fwd(self, x, shape):
         gd = _need_graph(self.net, "hgt")
@@ -3170,8 +3187,9 @@ class _GlobalAttention(_Node):
             src.append(np.tile(keys, len(idx)))
             dst.append(np.repeat(idx, len(keys)))
         f = gd.custom(("global", self.max_keys), np.concatenate(src), np.concatenate(dst))
-        if getattr(self, "kid_for", None) is not gd:
-            self.kid, self.kid_for = gd._put(f["src"]), gd
+        if ("ga", id(self)) not in gd.cache:
+            gd.cache[("ga", id(self))] = gd._put(f["src"])
+        self.kid = gd.cache[("ga", id(self))]
         return gd, f
 
     def fwd(self, x, shape):
@@ -3409,7 +3427,7 @@ class Net:
     def __init__(self, ops, model, params, precision="auto", graph=None):
         from . import lowbit
         self.ops = ops
-        self.graph, self.gdev = graph, None
+        self.graph, self.gdev, self.gkeep = graph, None, {}
         self.arena = _Arena(ops)
         self.garena = self.arena                        # the backward pass's buffers (the same arena on one card)
         self.owned = []
@@ -3578,13 +3596,26 @@ class Net:
     def backward(self, dy):
         self.root.bwd(dy, False)
 
-    def set_graph(self, g):
-        """Another graph for the next steps (a batch of graphs): its forms on the card are made when needed."""
+    def set_graph(self, g, keep=False):
+        """Another graph for the next steps (a batch of graphs): its forms on the card are made when needed. keep:
+        the forms of the graphs used since clear_graphs() stay on the card (micro-batches in flight)."""
         if g is self.graph:
+            return
+        if keep:
+            if self.gdev is not None:
+                self.gkeep[id(self.graph)] = (self.graph, self.gdev)
+            hit = self.gkeep.get(id(g))
+            self.graph, self.gdev = g, (hit[1] if hit else None)
             return
         if self.gdev is not None:
             self.gdev.close()
         self.graph, self.gdev = g, None
+
+    def clear_graphs(self):
+        for g_, gd in list(self.gkeep.values()):
+            if gd is not self.gdev:
+                gd.close()
+        self.gkeep = {}
 
     def flat_like(self, tree):
         """A tree shaped like the parameters, flattened to this network's layout (float32)."""
@@ -3610,6 +3641,7 @@ class Net:
 
     def close(self):
         self.arena.close()
+        self.clear_graphs()
         if self.gdev is not None:
             self.gdev.close()
         if hasattr(self.ops, "weights_are"):
@@ -3670,17 +3702,27 @@ def _raw_of(a):
 
 
 def fit_batches(model, params, batches, loss="cross_entropy", opt=None, epochs=1, verbose=True, clip=None,
-                schedule=None, device="cuda", precision="auto", ops=None, compensated=None, every=None):
+                schedule=None, device="cuda", precision="auto", ops=None, compensated=None, every=None,
+                accumulate=1, stages=None):
     """Train on batches that each bring their own shapes: batches is a list of (inputs, targets[, graph]) or a
     function epoch -> such a list. inputs may be a list (a dag with several inputs: token ids, node features, ...);
     each batch may have its own graph (a batch of graphs), its own number of rows and its own lengths. One card."""
     from . import ops as aops
     from .stdlib import Adam, AdamW, SGD, value_and_grad
     if ops is None:
-        ops, why = globals()["device"](device)
-        if ops is None:
-            raise TrainError(f"no GPU to train on: {why}")
+        many = devices_for(device) if str(device).lower().startswith("cuda:") else None
+        if many and len(many) > 1:
+            ops = many
+        else:
+            ops, why = globals()["device"](device)
+            if ops is None:
+                raise TrainError(f"no GPU to train on: {why}")
     if isinstance(ops, (list, tuple)):
+        if len(ops) > 1:                                 # the model split across the cards, copied over the rest
+            from .gpu_pipeline import fit_batches_pipeline
+            return fit_batches_pipeline(list(ops), model, params, batches, loss, opt, epochs, verbose, clip, schedule,
+                                        precision, stages, accumulate if accumulate and accumulate > 1 else None,
+                                        _want_comp(compensated, params), every)
         ops = ops[0]
     custom = callable(loss)
     loss_fn, loss = (loss, "custom") if custom else (None, str(loss))
@@ -3709,7 +3751,9 @@ def fit_batches(model, params, batches, loss="cross_entropy", opt=None, epochs=1
             if not items:
                 raise TrainError("no batches")
             tot, rows_all = 0.0, 0
-            for item in items:
+            A = max(1, int(accumulate or 1))
+            for bi, item in enumerate(items):
+                group = min(A, len(items) - (bi // A) * A)       # the batches of this step
                 X, Y, g = _batch_parts(item)
                 multi = isinstance(X, (list, tuple))
                 xs = [_as_input(a) for a in (X if multi else [X])]
@@ -3732,7 +3776,7 @@ def fit_batches(model, params, batches, loss="cross_entropy", opt=None, epochs=1
                 if custom:
                     oh = ops.get(out[0], m, out[1]).reshape(shape).astype(np.float64)
                     lv, gh = value_and_grad(lambda o_: loss_fn(o_, Yr))(oh)
-                    ops.put(dout[0], np.asarray(aops.raw(gh), np.float32).reshape(-1), dout[1])
+                    ops.put(dout[0], (np.asarray(aops.raw(gh), np.float32) / group).reshape(-1), dout[1])
                     lv = float(aops.raw(lv))
                 else:
                     ya = np.ascontiguousarray(Yr.astype(np.int32) if loss == "cross_entropy" else
@@ -3744,13 +3788,17 @@ def fit_batches(model, params, batches, loss="cross_entropy", opt=None, epochs=1
                         if ya.size != rows:
                             raise TrainError(f"cross_entropy: {ya.size} labels for {rows} rows of output")
                         w = 1.0 / max(int((ya >= 0).sum()), 1)
-                        ops.ce(out, yd, dout, (LOSS1, 0), rows, C, w, w)
+                        ops.ce(out, yd, dout, (LOSS1, 0), rows, C, w / group, w)
                     else:
                         if ya.size != m:
                             raise TrainError(f"{loss}: targets of {ya.size} values for an output of {m}")
-                        _regress(ops, loss, out, yd, dout, (LOSS1, 0), m, 1.0 / m, 1.0 / m)
+                        _regress(ops, loss, out, yd, dout, (LOSS1, 0), m, 1.0 / (m * group), 1.0 / m)
                     lv = float(ops.get(LOSS1, 1)[0])
                 net.backward(dout)
+                tot += lv
+                rows_all += 1
+                if (bi + 1) % A and bi + 1 < len(items):
+                    continue                                 # gradients add up until the step's last batch
                 t += 1
                 lr = float(aops.raw(schedule(step))) if schedule is not None else float(opt.lr)
                 ops.fill((SQ, 0), 1, 0.0)
@@ -3764,8 +3812,6 @@ def fit_batches(model, params, batches, loss="cross_entropy", opt=None, epochs=1
                     ops.sgd((net.P, 0), (net.G, 0), (st1, 0), (SQ, 0), n, lr, float(opt.momentum), float(clip or 0.0),
                             (COMP, 0) if COMP else None)
                 step += 1
-                tot += lv
-                rows_all += 1
             history.append(tot / rows_all)
             if verbose and (ep % every == 0 or ep == E - 1):
                 print(f"epoch {ep:4}  loss {history[-1]:.5f}  ({len(items)} batches, GPU)")

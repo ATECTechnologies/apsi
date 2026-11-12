@@ -1086,11 +1086,13 @@ class TransformerBlock(Layer):
 
 
 def fit_batches(model, params, batches, loss="cross_entropy", opt=None, epochs=1, backend="auto", device="cuda",
-                verbose=True, clip=None, schedule=None, precision="auto", compensated=None, every=None):
+                verbose=True, clip=None, schedule=None, precision="auto", compensated=None, every=None, accumulate=1,
+                stages=None):
     """Train on batches that each bring their own shapes and graph: a list of (inputs, targets[, graph]) or a function
     epoch -> such a list. inputs may be a list (a dag with several inputs, e.g. token ids and node features). Each
-    step is one batch; the history is the mean loss of each epoch. backend: "auto" (the GPU trainer when there is a
-    card), "gpu" or "numpy"."""
+    step is `accumulate` batches (their gradients averaged); the history is the mean loss of each epoch. backend: "auto"
+    (the GPU trainer when there is a card), "gpu" or "numpy". device="cuda:all": the model (a dag or a sequence) split
+    across the cards (stages=N or a list of node counts), `accumulate` batches flowing through as micro-batches."""
     from .stdlib import Adam, value_and_grad
     opt = opt or Adam(1e-3)
     which = str(backend or "auto").lower()
@@ -1099,7 +1101,8 @@ def fit_batches(model, params, batches, loss="cross_entropy", opt=None, epochs=1
         if which == "gpu" or _gpu_ready():
             try:
                 return GT.fit_batches(model, params, batches, loss, opt, epochs, verbose, clip, schedule, device,
-                                      precision, compensated=compensated, every=every)
+                                      precision, compensated=compensated, every=every, accumulate=accumulate,
+                                      stages=stages)
             except GT.TrainError as e:
                 raise RuntimeErr(f"backend=\"gpu\": {e}") from None
     lf = loss if callable(loss) else _loss_fn(loss)
@@ -1107,14 +1110,22 @@ def fit_batches(model, params, batches, loss="cross_entropy", opt=None, epochs=1
     every = int(every or max(1, E // 10))
     history, step = [], 0
     from .gpu_train import _batch_parts
+    A = max(1, int(accumulate or 1))
     for ep in range(E):
         items = list(batches(ep) if callable(batches) else batches)
         tot = 0.0
-        for item in items:
-            X, Y, g = _batch_parts(item)
-            ctx = {"graph": g} if g is not None else {}
-            Y = np.asarray(ops.raw(Y))
-            lv, gr = value_and_grad(lambda p: lf(model(p, X, train=True, **ctx), Y))(params)
+        for s0 in range(0, len(items), A):
+            chunk = items[s0:s0 + A]
+            acc = None
+            for item in chunk:
+                X, Y, g = _batch_parts(item)
+                ctx = {"graph": g} if g is not None else {}
+                Y = np.asarray(ops.raw(Y))
+                lv, gr = value_and_grad(lambda p: lf(model(p, X, train=True, **ctx), Y))(params)
+                gr = tree_map(lambda a: a / len(chunk) if isinstance(a, np.ndarray) else a, gr)
+                acc = gr if acc is None else tree_map(lambda a, b: a + b, acc, gr)
+                tot += float(ops.raw(lv))
+            gr = acc
             if schedule is not None:
                 opt.lr = float(ops.raw(schedule(step)))
             if clip:
@@ -1122,7 +1133,6 @@ def fit_batches(model, params, batches, loss="cross_entropy", opt=None, epochs=1
                 if norm > clip:
                     gr = tree_map(lambda a: a * (clip / norm), gr)
             params = opt.step(params, gr)
-            tot += float(ops.raw(lv))
             step += 1
         history.append(tot / max(1, len(items)))
         if verbose and (ep % every == 0 or ep == E - 1):
