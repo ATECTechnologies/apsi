@@ -529,7 +529,7 @@ class Gpu(_Ops):
             raise TrainError(f"the card ran out of memory ({self.used / 2 ** 30:.2f} GB in use, "
                              f"{4 * n / 2 ** 20:.0f} MB more asked, {self.dev.memory / 2 ** 30:.1f} GB on the card): "
                              "a smaller batch_size, fewer or narrower layers, a shorter context, or more cards "
-                             "(device=\"cuda:all\")") from None
+                             "(device=\"cuda:all\" splits the model across them)") from None
         self.used += 4 * n
         return Buf(p, n)
 
@@ -894,7 +894,8 @@ def _split_k(blocks, K, slots):
 
 
 def devices_for(name):
-    """The cards of "cuda:all" or "cuda:0,1,2" (several cards: data-parallel training), as a list of ops; or None."""
+    """The cards of "cuda:all" or "cuda:0,1,2" (several cards: data parallel, or the model split across them), as a
+    list of ops; or None."""
     d = str(name or "").lower().replace(" ", "")
     if not d.startswith("cuda:") or ("," not in d and d != "cuda:all"):
         return None
@@ -978,7 +979,7 @@ class _Node:
     def gbuf(self, name, n):
         """A buffer of the backward pass: shared by the layers that are two apart in a sequence (a gradient lives
         only until the layer before has used it), so the gradients take the memory of two layers, not of all."""
-        return self.net.arena.get(("g", getattr(self, "gkey", self.key), name), n)
+        return self.net.garena.get(("g", getattr(self, "gkey", self.key), name), n)
 
     def buf(self, name, n):
         return self.net.arena.get((self.key, name), n)
@@ -1308,6 +1309,7 @@ class Net:
         from . import lowbit
         self.ops = ops
         self.arena = _Arena(ops)
+        self.garena = self.arena                        # the backward pass's buffers (the same arena on one card)
         self.owned = []
         self.train = True
         self.seed = 12345
@@ -1470,6 +1472,16 @@ def _inputs(X, ids):
     return np.ascontiguousarray(a.astype(np.float32))
 
 
+def _too_big(ops_list, params, opt):
+    """True when the weights, gradients and optimizer state alone would take most of the smallest card."""
+    from .stdlib import Adam
+    mems = [getattr(getattr(o, "dev", None), "memory", None) for o in ops_list]
+    if not all(mems):
+        return False
+    count = sum(int(np.asarray(a).size) for a in tree_leaves(params) if isinstance(a, np.ndarray))
+    return count * (16 if isinstance(opt, Adam) or opt is None else 12) > 0.6 * min(mems)
+
+
 def _check_size(ops, params, opt, shards=1):
     """An estimate, not a limit: weights, gradients and the optimizer's state take about 8 + 8 / N bytes per parameter
     on each card; what the activations take depends on the architecture (an LLM's on the context and the batch, other
@@ -1486,13 +1498,19 @@ def _check_size(ops, params, opt, shards=1):
     if need > total:
         warnings.warn(f"{count / 1e9:.2f} B parameters take about {need / 2 ** 30:.1f} GB per card for training "
                       f"(weights, gradients, the optimizer's share) before activations; this card has "
-                      f"{total / 2 ** 30:.1f} GB: it may not fit (more cards: device=\"cuda:all\"; a smaller batch)",
+                      f"{total / 2 ** 30:.1f} GB: it may not fit (more cards: device=\"cuda:all\" splits the model across them; a smaller batch)",
                       RuntimeWarning, stacklevel=3)
 
 
 def fit(model, params, X, y=None, loss="mse", opt=None, epochs=10, batch_size=None, seed=0, verbose=True,
-        clip=None, schedule=None, val=None, device="cuda", precision="auto", ops=None, ema=None, ewc=None):
-    """ema=0.999: also keeps an exponential moving average of the weights (record.ema_params), the smoother set
+        clip=None, schedule=None, val=None, device="cuda", precision="auto", ops=None, ema=None, ewc=None,
+        parallel="auto", stages=None, micro_batches=None):
+    """Several cards (device="cuda:all", "cuda:0,1,2"): parallel="data" copies the model to every card and shares
+    the batch out; "pipeline" splits the model across the cards (stages: how many pieces, or a list with the units of
+    each); "auto" (the default) copies it when it fits on one card, else splits it into the fewest pieces that fit and
+    copies those over the cards left. micro_batches: the pieces of a batch that flow through a split model.
+
+    ema=0.999: also keeps an exponential moving average of the weights (record.ema_params), the smoother set
     that often generalizes better. ewc=(anchor_params, fisher, strength): elastic weight consolidation, a pull of
     every weight toward anchor_params in proportion to its importance (fisher, the same shapes; e.g. the mean
     squared gradients on the old task), so a model learns a new task without forgetting the old one."""
@@ -1504,7 +1522,15 @@ def fit(model, params, X, y=None, loss="mse", opt=None, epochs=10, batch_size=No
             if not many:
                 raise TrainError(f"no GPU to train on for device='{device}'")
             ops = many if len(many) > 1 else many[0]
+    mode = str(parallel or "auto").lower()
+    if mode not in ("auto", "data", "pipeline"):
+        raise TrainError(f"parallel='{parallel}': auto, data or pipeline")
     if isinstance(ops, (list, tuple)):
+        if len(ops) > 1 and (mode == "pipeline" or stages is not None or (mode == "auto" and _too_big(ops, params, opt))):
+            from .gpu_pipeline import fit_pipeline
+            return fit_pipeline(list(ops), model, params, X, y, loss, opt, epochs, batch_size, seed, verbose, clip,
+                                schedule, val, precision, ema, ewc,
+                                "all" if stages is None and mode == "pipeline" else stages, micro_batches)
         if len(ops) > 1:
             return _fit_parallel(list(ops), model, params, X, y, loss, opt, epochs, batch_size, seed, verbose, clip,
                                  schedule, val, precision, ema, ewc)
@@ -1513,6 +1539,12 @@ def fit(model, params, X, y=None, loss="mse", opt=None, epochs=10, batch_size=No
         ops, why = globals()["device"](device)
         if ops is None:
             raise TrainError(f"no GPU to train on: {why}")
+        if str(device or "cuda").lower() in ("cuda", "auto", "gpu") and mode != "data" and _too_big([ops], params, opt):
+            many = devices_for("cuda:all") or []          # too large for the first card: every card, the model split
+            if len(many) > 1:
+                from .gpu_pipeline import fit_pipeline
+                return fit_pipeline(many, model, params, X, y, loss, opt, epochs, batch_size, seed, verbose, clip,
+                                    schedule, val, precision, ema, ewc, stages, micro_batches)
     loss = str(loss)
     if loss not in ("cross_entropy", "mse"):
         raise TrainError(f"loss '{loss}' is not on the GPU trainer (cross_entropy, mse)")
@@ -1898,9 +1930,18 @@ def _forward_batches(net, ops, Xa, bs):
 
 
 def _eval_loss(net, ops, val, ids, ce, bs):
+    return _eval_loss_host(lambda Xa: _forward_batches(net, ops, Xa, bs), val, ids, ce, None)
+
+
+def _eval_loss_host(forward, val, ids, ce, bs):
+    """The loss on (inputs, targets): forward(inputs) gives the model's output (bs: in batches of bs here)."""
     from . import ops as aops
     vx, vy = val
-    out = _forward_batches(net, ops, _inputs(aops.raw(vx), ids), bs).astype(np.float64)
+    Xa = _inputs(aops.raw(vx), ids)
+    if bs:
+        out = np.concatenate([forward(Xa[s:s + bs]) for s in range(0, len(Xa), bs)], 0).astype(np.float64)
+    else:
+        out = forward(Xa).astype(np.float64)
     vy = np.asarray(aops.raw(vy))
     if ce:
         lg = out.reshape(-1, out.shape[-1])

@@ -1316,7 +1316,8 @@ def _gpu_supports(model):
 
 def fit(model, params, X, y=None, loss="mse", opt=None, epochs=10, batch_size=None, seed=0, verbose=True,
         clip=None, schedule=None, graph=None, mask=None, val=None, backend="numpy", device="auto",
-        precision="auto", compile=False, workers=1, ema=None, ewc=None):
+        precision="auto", compile=False, workers=1, ema=None, ewc=None, parallel="auto", stages=None,
+        micro_batches=None):
     """Train `model`. Returns record(params, history, val_history, device).
 
     loss: "mse", "cross_entropy", "mae", "bce", "vae" ("huber" on torch) or a function loss(prediction, target).
@@ -1329,6 +1330,9 @@ def fit(model, params, X, y=None, loss="mse", opt=None, epochs=10, batch_size=No
     workers=N (numpy backend, mini-batches): data-parallel training on N processes — every batch is split into N
     shards, the gradients of the shards are averaged (weighted by shard size, so the result is the gradient of the
     whole batch) and one optimizer step is taken. "auto" uses every core.
+    backend="gpu" on several cards (device="cuda:all" or "cuda:0,1,2"): parallel="data" (a copy of the model on every
+    card), "pipeline" (the model split across the cards; stages=N pieces or a list of the units in each;
+    micro_batches=M) or "auto" (copies when the model fits one card, else the fewest pieces that fit).
     """
     which = _backend(backend, model, loss if isinstance(loss, str) else None, graph is None and mask is None)
     if which == "gpu":
@@ -1338,7 +1342,8 @@ def fit(model, params, X, y=None, loss="mse", opt=None, epochs=10, batch_size=No
         dev = "cuda" if str(device).lower() in ("auto", "gpu", "cuda") else device
         try:
             return gpu_train.fit(model, params, X, y, loss, opt, epochs, batch_size, seed, verbose, clip, schedule, val,
-                                 device=dev, precision=precision, ema=ema, ewc=ewc)
+                                 device=dev, precision=precision, ema=ema, ewc=ewc, parallel=parallel, stages=stages,
+                                 micro_batches=micro_batches)
         except gpu_train.TrainError as e:
             raise RuntimeErr(f"backend=\"gpu\": {e}")
     if ema is not None or ewc is not None:

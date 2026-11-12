@@ -1,5 +1,5 @@
 """Apsi — a language for AI and physics with units, shapes and autodiff built in."""
-__version__ = "2.4.4"
+__version__ = "2.6.0"
 
 import sys as _sys
 

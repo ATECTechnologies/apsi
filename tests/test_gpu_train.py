@@ -88,6 +88,93 @@ class Trainer(unittest.TestCase):
             self.assertIn("3 GPUs", many.device)
             self.assertIsNotNone(many.ema_params)
 
+    def test_one_model_split_across_cards_trains_like_one_card(self):
+        """Model parallel: the model cut into stages on several (emulated) cards, micro-batches in a pipeline, and the
+        pipeline copied when there are more cards than stages: the same weights as one card with the whole batch."""
+        from apsi.values import tree_map
+        rng = np.random.default_rng(0)
+        lm = L.transformer_lm(23, d=32, heads=4, layers=3, context=12)
+        ids = rng.integers(0, 23, (40, 12))
+        lab = np.roll(ids, -1, 1)
+        kw = dict(loss="cross_entropy", epochs=3, batch_size=8, verbose=False, precision="fp32", clip=1.0)
+        one = GT.fit(lm, lm.init(seed=0), ids, lab, opt=Adam(1e-2), ops=GT.Emulator(), **kw)
+        for cards, stages, want in ((3, None, (3, 1)), (4, 2, (2, 2)), (3, [3, 4, 3], (3, 1))):
+            r = GT.fit(lm, lm.init(seed=0), ids, lab, opt=Adam(1e-2), ops=[GT.Emulator() for _ in range(cards)],
+                       parallel="pipeline", stages=stages, val=(ids, lab), **kw)
+            self.assertEqual((len(r.stages), r.replicas), want)
+            self.assertIn("split into", r.device)
+            np.testing.assert_allclose(one.history, r.history, rtol=1e-5)
+            for a, b in zip(tree_leaves(one.params), tree_leaves(r.params)):
+                np.testing.assert_allclose(np.asarray(a), np.asarray(b), rtol=1e-4, atol=2e-5)
+            self.assertEqual(len(r.val_history), 3)
+        rng = np.random.default_rng(5)
+        X, y = rng.normal(size=(50, 6)), rng.integers(0, 3, 50)
+        for lossname, yy, last, mk in (("mse", rng.normal(size=(50, 2)), 2, lambda: Adam(0.01)),
+                                       ("cross_entropy", y, 3, lambda: adamw(lr=0.01, weight_decay=0.1)),
+                                       ("cross_entropy", y, 3, lambda: SGD(0.1, momentum=0.9))):
+            m = L.mlp([6, 16, 16, 12, last], "gelu")
+            p0 = m.init(seed=1)
+            fisher = tree_map(lambda a: np.full_like(np.asarray(a), 0.5) if isinstance(a, np.ndarray) else a, p0)
+            kw = dict(loss=lossname, epochs=3, batch_size=16, verbose=False, precision="fp32", clip=0.05,
+                      ewc=(p0, fisher, 0.3), ema=0.9)
+            one = GT.fit(m, p0, X, yy, opt=mk(), ops=GT.Emulator(), **kw)
+            for cards, stages, micro in ((3, None, None), (4, 2, 3), (2, None, 16)):
+                r = GT.fit(m, p0, X, yy, opt=mk(), ops=[GT.Emulator() for _ in range(cards)], parallel="pipeline",
+                           stages=stages, micro_batches=micro, **kw)
+                for a, b in zip(tree_leaves(one.params) + tree_leaves(one.ema_params),
+                                tree_leaves(r.params) + tree_leaves(r.ema_params)):
+                    np.testing.assert_allclose(np.asarray(a), np.asarray(b), rtol=2e-4, atol=2e-6)
+
+    def test_split_model_details(self):
+        from apsi import gpu_pipeline as GP
+        self.assertEqual(GP.partition([1, 1, 1, 1, 8, 1, 1, 1, 1], [1] * 9, 3), [4, 1, 4])
+        self.assertEqual(GP.partition([1] * 4, [10, 10, 10, 10], 2, 1.0, budget=30), [2, 2])
+        self.assertIsNone(GP.partition([1] * 4, [10, 10, 10, 10], 2, 1.0, budget=15))
+        self.assertEqual(GP.schedule(0, 3, 4), [("F", 0), ("F", 1), ("F", 2), ("B", 0), ("F", 3), ("B", 1),
+                                                ("B", 2), ("B", 3)])
+        self.assertEqual(GP.schedule(2, 3, 2), [("F", 0), ("B", 0), ("F", 1), ("B", 1)])
+        lm = L.transformer_lm(23, d=32, heads=4, layers=2, context=12)
+        self.assertEqual(len(GP.units(lm, lm.init(seed=0))), 8)    # embedding, positions, 2 x (attention, MLP), ...
+        rng = np.random.default_rng(1)
+        ids = rng.integers(0, 23, (16, 12))
+        with self.assertRaises(GT.TrainError):
+            GT.fit(lm, lm.init(seed=0), ids, ids, loss="cross_entropy", epochs=1, verbose=False,
+                   ops=[GT.Emulator(), GT.Emulator()], stages=[1, 2])
+        for prec in ("auto", "int4"):                               # mixed / low bit and dropout on a split model
+            d = L.transformer_lm(23, d=32, heads=4, layers=2, context=12, dropout=0.1)
+            r = GT.fit(d, d.init(seed=0), ids, np.roll(ids, -1, 1), loss="cross_entropy", opt=Adam(1e-2), epochs=4,
+                       batch_size=8, verbose=False, precision=prec, ops=[GT.Emulator() for _ in range(3)],
+                       parallel="pipeline")
+            self.assertLess(r.history[-1], r.history[0] - 0.2, prec)
+
+        class Broken(GT.Emulator):
+            def ce(self, *a):
+                raise RuntimeError("the last card failed")
+        with self.assertRaisesRegex(RuntimeError, "the last card failed"):     # a failure stops every card at once
+            GT.fit(lm, lm.init(seed=0), ids, ids, loss="cross_entropy", epochs=1, batch_size=8, verbose=False,
+                   ops=[GT.Emulator(), GT.Emulator(), Broken()], parallel="pipeline")
+
+    def test_split_model_cards_work_at_the_same_time(self):
+        """With cards whose products take time (the processor free meanwhile, as with real cards), four stages
+        finish a step much sooner than one card doing all of it."""
+        import time
+
+        class Card(GT.Emulator):
+            def _gemm(self, A, B, Cv, bias, M, N, K, *a, **k):
+                time.sleep(M * N * K * a[5] * a[6] * 2e-8)
+                return super()._gemm(A, B, Cv, bias, M, N, K, *a, **k)
+        rng = np.random.default_rng(0)
+        lm = L.transformer_lm(23, d=32, heads=4, layers=4, context=12)
+        ids = rng.integers(0, 23, (32, 12))
+        kw = dict(loss="cross_entropy", epochs=1, verbose=False, opt=Adam(1e-2))
+        t = time.perf_counter()
+        GT.fit(lm, lm.init(seed=0), ids, np.roll(ids, -1, 1), ops=Card(), **kw)
+        one = time.perf_counter() - t
+        t = time.perf_counter()
+        GT.fit(lm, lm.init(seed=0), ids, np.roll(ids, -1, 1), ops=[Card() for _ in range(4)], parallel="pipeline",
+               micro_batches=8, **kw)
+        self.assertLess(time.perf_counter() - t, one / 1.5)
+
     def test_ema_and_ewc(self):
         """EMA of the weights (the GLA project's teacher weights) and EWC (keep what an earlier task needed)."""
         from apsi.values import tree_leaves

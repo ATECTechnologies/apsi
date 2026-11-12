@@ -184,6 +184,31 @@ optimizer's state, and the cards exchange the updated slices (all-gather). The g
 squared sums across the cards. The result equals one card with the whole batch (tested: Adam, AdamW, SGD, clip, EMA,
 EWC); per card the memory is 8 + 8 / N bytes per parameter plus that card's activations.
 
+**One model split across cards (2.6.0)** — when the model is too large for one card, Apsi splits it across the cards by itself
+(`fit(…, backend="gpu")`: the default `device="cuda"` takes every card when the first one cannot hold the model;
+`device="cuda:all"` likewise), or on request with `parallel="pipeline"`. The model is cut into *stages*, one per card, at the points that balance the work (matrix
+products, attention, the rest) and keep each stage's weights, gradients and optimizer state inside its card. Each
+card holds only its own stage, so the trainable size grows with the number of cards: 3, 8, 64 cards, no limit in the
+code. A batch is cut into micro-batches that flow through the stages in a one-forward-one-backward order: while card 2
+works on micro-batch 1, card 1 already works on micro-batch 2, so the cards run at the same time (the idle start and
+end of a step shrink as micro-batches grow: `(stages - 1) / (micro-batches + stages - 1)` of it). Only the activations
+at the cuts travel between cards (card to card where the driver allows), never the weights. With more cards than
+stages the pipeline is copied: 8 cards and 4 stages are 2 replicas, each takes half of the batch, and the copies of a
+stage sum their gradients and share the optimizer's work as in data-parallel training. The result equals one card
+with the whole batch (tested: Adam, AdamW, SGD, clip over the whole model, EMA, EWC, low-bit precision).
+
+| Option | Meaning |
+|---|---|
+| `parallel="auto"` | a copy per card when the model fits on one; else the fewest stages that fit, the rest of the cards as replicas |
+| `parallel="pipeline"` | split across every card (`stages=` fewer, the cards left as replicas) |
+| `parallel="data"` | a copy per card (the model must fit on one) |
+| `stages=4` | four stages, cut where the work balances |
+| `stages=[6, 4, 4, 6]` | your own cut: the units in each stage (a unit is a layer; a transformer block gives two, its attention and its MLP) |
+| `micro_batches=16` | pieces of a batch in the pipeline (default 4 x the stages, at most the rows) |
+
+`r.stages`, `r.replicas` and `r.micro_batches` show what was used. A single layer must fit on one card (a layer is not
+split inside itself yet), and the layers are those of the trainer (the table above).
+
 **Any program at your temperature** — `apsi gpu hold 77` keeps the card near 77 °C by its power limit for whatever
 runs on it (a PyTorch job, a renderer) until Ctrl+C, with the same control Apsi's training uses; the benchmark uses
 it so PyTorch and Apsi are measured under the same temperature.

@@ -2,7 +2,7 @@
   "name": "apsi-language",
   "displayName": "Apsi Language",
   "description": "Apsi for VS Code, Cursor, Windsurf and VSCodium: syntax colours, live unit/shape diagnostics, hover, go to definition, completion, formatting, run/test/REPL commands, apsi.toml tasks and snippets",
-  "version": "2.4.4",
+  "version": "2.6.0",
   "publisher": "apsi",
   "license": "MIT",
   "engines": {

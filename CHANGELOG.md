@@ -1,5 +1,23 @@
 # Changelog
 
+## 2.6.0 — in progress
+
+### One model across many cards
+- **Model parallelism on Apsi's own GPU trainer:** `fit(..., backend="gpu", device="cuda:all")` splits a model that
+  does not fit one card across the cards (`parallel="auto"`), or on request (`parallel="pipeline"`). The model is cut
+  into stages where the work balances and every stage's weights, gradients and optimizer state fit its card; each
+  card holds only its stage, so the trainable size grows with the cards, with no limit on their number. The default
+  `device="cuda"` takes every card by itself when the first one cannot hold the model.
+- **A pipeline, not a relay:** a batch flows through the stages as micro-batches in a one-forward-one-backward order,
+  every card on its own thread, so the cards work at the same time; only the activations at the cuts travel between
+  them (card to card where the driver allows).
+- **Split and copied at once:** more cards than stages copy the pipeline (stages x replicas); the copies of a stage
+  sum their gradients and share the optimizer's work.
+- **Your own cut:** `stages=4`, or `stages=[6, 4, 4, 6]` (the units in each stage); `micro_batches=`. `r.stages`,
+  `r.replicas`, `r.micro_batches`.
+- The same result as one card with the whole batch (tested with Adam, AdamW, SGD, clipping over the whole model, EMA,
+  EWC, low-bit precision); a failure on any card stops all of them at once with that card's error.
+
 ## 2.4.4 — Python, exactly; real time; data, databases and the web
 
 ### Training on the GPU with Apsi alone, low-bit formats, an AI server
