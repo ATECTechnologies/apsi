@@ -510,9 +510,13 @@ def hold(target=77.0, index=0, seconds=None, quiet=False):
 
 def add_parser(sub):
     p = sub.add_parser("gpu", help="the NVIDIA cards now: temperature, power, clocks; set a power limit")
-    p.add_argument("what", nargs="?", default="status", choices=["status", "power", "watch", "setup", "remove", "hold"])
+    p.add_argument("what", nargs="?", default="status",
+                   choices=["status", "power", "watch", "setup", "remove", "hold", "bench"])
     p.add_argument("value", nargs="?", default=None,
-                   help="for power: 80%% (of the default), 130W or default; for hold: the temperature (77)")
+                   help="for power: 80%% (of the default), 130W or default; for hold: the temperature (77); for bench: "
+                        "127m (default), 11m, modern, check (every kernel against the reference) or cards")
+    p.add_argument("--precision", default="auto", help="bench: auto (bf16), fp32, fp8, fp4, ...")
+    p.add_argument("--steps", type=int, default=40, help="bench: training steps to time")
     p.add_argument("--gpu", type=int, default=None)
     p.set_defaults(fn=_cmd)
 
@@ -525,6 +529,9 @@ def _cmd(args):
         return 0
     if args.what == "hold":
         return hold(float(args.value or 77), args.gpu or 0)
+    if args.what == "bench":
+        from . import gpu_bench
+        return gpu_bench.main(args.value or "127m", args.precision, args.steps)
     if args.what == "power":
         if not args.value:
             print("apsi gpu power 80%   (or 130W, or default)")

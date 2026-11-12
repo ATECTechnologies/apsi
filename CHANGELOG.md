@@ -30,6 +30,9 @@
   by relation, biases by relation and hop), `global_attention` (every node over the nodes of its graph), `mix_hop`,
   `graph_transformer_net`: the encoder of a graph-language model trains on the card.
 - **More activations on the card:** elu, softplus, mish.
+- **`apsi gpu bench`:** tokens per second of the 127 M GPT (or `11m`, `modern`), the kernels' shares, temperature,
+  power and energy per token, a JSON line to send back; `apsi gpu bench check` compares every new kernel on the card
+  with the exact reference; `apsi gpu bench cards` checks a model split across all cards against one card.
 - **Any architecture on the GPU trainer:** `dag(...)` (values by name, gradients added where a value feeds several
   layers), `parallel`, `add` / `multiply` / `concatenate` / mean, `scale`, `identity`, `reshape`, `flatten`,
   `mean_pool` (so `transformer_classifier`), and cross-attention: `multi_head_attention` on `["query", "memory"]` with

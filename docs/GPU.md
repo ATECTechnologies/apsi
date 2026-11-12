@@ -177,6 +177,13 @@ rate; PyTorch's cuBLAS float32 is still faster than Apsi's three-pass float32. P
 activations are bfloat16; Apsi keeps float32 activations). The products come in four builds and the card times them
 for each shape the first time it sees it, keeping the fastest (`APSI_GEMM_VARIANT=a|x|w|h` fixes one).
 
+**Measure it on your card** — `apsi gpu bench` trains the 127 M GPT above on random tokens (nothing downloaded) and
+reports the tokens per second, what the card would do on its kernels alone, each kind of kernel's share of a step,
+the temperature, the power and the energy per 1,000 tokens, then one JSON line to send back for tuning.
+`apsi gpu bench modern` does the same for a LLaMA / Qwen3-style model, `apsi gpu bench check` trains every new layer
+on the card and on the exact reference and compares, `apsi gpu bench cards` splits a model across all the cards and
+compares with one card.
+
 **Several cards** — `fit(…, backend="gpu", device="cuda:all")` (or `device="cuda:0,1,2,3"`): data-parallel
 training for any model the trainer supports. Every card holds the model and takes its share of each batch; then each
 card sums only *its slice* of the gradient, pulled from all the others at the same time (reduce-scatter; NVLink /
