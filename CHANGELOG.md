@@ -36,6 +36,10 @@
 - **Any layer and any loss with the GPU trainer:** a layer with no kernel of its own (a custom layer, a lambda,
   batch_norm, bilinear, graph_memory) runs on the processor with Apsi's autodiff inside a model trained on the card,
   and a loss written as a function is evaluated there; the rest stays on the card.
+- **More exact weights:** the optimizer kernels carry the rounding error of every update to the next
+  (compensated summation), so updates far below float32's step at a weight's size still add up (300 Adam steps of
+  1e-9 move a weight of 1 by 3e-7; a plain float32 update leaves it unchanged). On by default below 2 B parameters
+  (`compensated=`), on one card, several cards and split models.
 - **More activations on the card:** elu, softplus, mish. **More losses:** `mae` and `bce` (one kernel, with a weight
   per element for masks), on one card, several cards and split models.
 - **`apsi gpu bench`:** tokens per second of the 127 M GPT (or `11m`, `modern`), the kernels' shares, temperature,

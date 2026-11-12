@@ -255,7 +255,7 @@ def schedule(stage, count, micro):
 
 # ============================================================================== training
 def fit_pipeline(ops_list, model, params, X, y, loss, opt, epochs, batch_size, seed, verbose, clip, schedule_fn, val,
-                 precision, ema, ewc, stages=None, micro_batches=None):
+                 precision, ema, ewc, stages=None, micro_batches=None, comp=False):
     from . import layers as L, ops as aops, thermal
     from .stdlib import Adam, AdamW, SGD
     from .gpu_train import TrainError, _inputs, _rows, _eval_loss_host
@@ -329,6 +329,9 @@ def fit_pipeline(ops_list, model, params, X, y, loss, opt, epochs, batch_size, s
                 if st.st2 is not None:
                     o.fill((st.st2, 0), ln, 0.0)
                 st.SQ, st.TMP = st.alloc(1), st.alloc(ln)
+                st.COMP = st.alloc(ln) if comp else None
+                if st.COMP is not None:
+                    o.fill((st.COMP, 0), ln, 0.0)
         EMA = None
         if ema is not None:
             ema = float(ema)
@@ -573,9 +576,10 @@ def _update(grid, opt, adam, wd, lr, t_step, clip, lam):
             c1, c2 = 1 - opt.b1 ** t_step, 1 - opt.b2 ** t_step
             nd = min(max(net.n_decay - lo, 0), k)
             o.adam((net.P, lo), (net.G, lo), (st.st1, 0), (st.st2, 0), (st.SQ, 0), k, nd, lr, opt.b1, opt.b2,
-                   opt.eps, c1, c2, wd, float(clip or 0.0))
+                   opt.eps, c1, c2, wd, float(clip or 0.0), (st.COMP, 0) if st.COMP else None)
         else:
-            o.sgd((net.P, lo), (net.G, lo), (st.st1, 0), (st.SQ, 0), k, lr, float(opt.momentum), float(clip or 0.0))
+            o.sgd((net.P, lo), (net.G, lo), (st.st1, 0), (st.SQ, 0), k, lr, float(opt.momentum), float(clip or 0.0),
+                  (st.COMP, 0) if st.COMP else None)
     if R > 1:
         for st in everyone:
             st.ops.sync()

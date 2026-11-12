@@ -1008,9 +1008,23 @@ def _main_module():
         return b.select(b.fcmp_ordered(">", p["clip"], F(0.0)),
                         b.call(min_f, [F(1.0), b.fdiv(p["clip"], nrm)]), F(1.0))
 
+    def kahan(k, p, w_old, delta, w_new, i):
+        """With COMP: w_old + delta, the rounding error of every earlier update carried in COMP (compensated
+        summation), so the weights keep changes far below float32's step at their size (small learning rates, long
+        training); without: w_new as computed."""
+        b = k.b
+        hc = b.icmp_unsigned("!=", p["hasc"], C(0))
+        ci = b.select(hc, i, C(0))
+        c0 = b.select(hc, k.ld(p["COMP"], ci), F(0.0))
+        y = b.fsub(delta, c0)
+        t = b.fadd(w_old, y)
+        with b.if_then(hc):
+            k.st(b.fsub(b.fsub(t, w_old), y), p["COMP"], i)
+        return b.select(hc, t, w_new)
+
     k = K("adam", [("P", G(f32)), ("G", G(f32)), ("M", G(f32)), ("V", G(f32)), ("SQ", G(f32)), ("n", i32),
                    ("n_decay", i32), ("lr", f32), ("b1", f32), ("b2", f32), ("eps", f32), ("c1", f32), ("c2", f32),
-                   ("wd", f32), ("clip", f32)])
+                   ("wd", f32), ("clip", f32), ("COMP", G(f32)), ("hasc", i32)])
     b, p = k.b, k.p
     sc = clip_scale(k, p)
 
@@ -1018,6 +1032,7 @@ def _main_module():
         # every load first, every store last: a store between them (to arrays the compiler must assume may overlap)
         # would hold the later loads back, and this kernel is all memory traffic
         g0, w, m0, v0 = k.ld(p["G"], i), k.ld(p["P"], i), k.ld(p["M"], i), k.ld(p["V"], i)
+        w_old = w
         gr = b.fmul(g0, sc)
         w = b.select(b.icmp_unsigned("<", i, p["n_decay"]), b.fmul(w, b.fsub(F(1.0), b.fmul(p["lr"], p["wd"]))), w)
         m_ = b.fadd(b.fmul(p["b1"], m0), b.fmul(b.fsub(F(1.0), p["b1"]), gr))
@@ -1026,13 +1041,14 @@ def _main_module():
                      b.fadd(b.call(sqrt_f, [b.fdiv(v_, p["c2"])]), p["eps"]))
         k.st(m_, p["M"], i)
         k.st(v_, p["V"], i)
-        k.st(b.fsub(w, upd), p["P"], i)
+        dec = b.select(b.icmp_unsigned("<", i, p["n_decay"]), b.fmul(w_old, b.fmul(p["lr"], p["wd"])), F(0.0))
+        k.st(kahan(k, p, w_old, b.fsub(F(0.0), b.fadd(dec, upd)), b.fsub(w, upd), i), p["P"], i)
         k.st(F(0.0), p["G"], i)                       # the gradient is used up: cleared for the next step here
     k.grid_loop(p["n"], adam)
     k.ret()
 
     k = K("sgd", [("P", G(f32)), ("G", G(f32)), ("VEL", G(f32)), ("SQ", G(f32)), ("n", i32), ("lr", f32),
-                  ("mom", f32), ("clip", f32)])
+                  ("mom", f32), ("clip", f32), ("COMP", G(f32)), ("hasc", i32)])
     b, p = k.b, k.p
     sc = clip_scale(k, p)
 
@@ -1040,7 +1056,8 @@ def _main_module():
         g0, vel, w = k.ld(p["G"], i), k.ld(p["VEL"], i), k.ld(p["P"], i)
         v_ = b.call(fma_f, [p["mom"], vel, b.fmul(g0, sc)])
         k.st(v_, p["VEL"], i)
-        k.st(b.fsub(w, b.fmul(p["lr"], v_)), p["P"], i)
+        step = b.fmul(p["lr"], v_)
+        k.st(kahan(k, p, w, b.fsub(F(0.0), step), b.fsub(w, step), i), p["P"], i)
         k.st(F(0.0), p["G"], i)
     k.grid_loop(p["n"], sgd)
     k.ret()

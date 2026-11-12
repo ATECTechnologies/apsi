@@ -147,6 +147,22 @@ class Trainer(unittest.TestCase):
         with self.assertRaises(GT.TrainError):
             GT.fit(m, m.init(seed=0), X, Y, opt=Adam(0.01), ops=[GT.Emulator(), GT.Emulator()], **kw)
 
+    def test_compensated_weights_keep_tiny_updates(self):
+        """Updates far below float32's step at a weight's size are lost by a plain float32 update and kept by the
+        compensated one (the default): 300 Adam steps of 1e-9 move the weights near 1 by 3e-7."""
+        rng = np.random.default_rng(0)
+        X, Y = rng.normal(size=(64, 8)), rng.normal(size=(64, 4))
+        m = L.mlp([8, 16, 4], "tanh")
+        W0 = np.asarray(tree_leaves(m.init(seed=0))[0], np.float32)
+        big = np.abs(W0) > 0.5
+        moved = {}
+        for comp in (False, True):
+            r = GT.fit(m, m.init(seed=0), X, Y, loss="mse", opt=Adam(1e-9), epochs=300, verbose=False,
+                       precision="fp32", ops=GT.Emulator(), compensated=comp)
+            moved[comp] = float(np.abs(np.asarray(tree_leaves(r.params)[0]) - W0)[big].mean())
+        self.assertEqual(moved[False], 0.0)
+        self.assertAlmostEqual(moved[True], 3e-7, delta=3e-8)
+
     def test_mae_and_bce_losses(self):
         """mae and bce on the GPU trainer, one card, data parallel, a split model and a masked graph: the NumPy
         backend's losses."""
@@ -608,6 +624,16 @@ class RealGpu(unittest.TestCase):
                 dv.pool_b(Xq[i], Yq[i], DYq[i], DXq[i], 3, 9, 7, 2, mode)
             same(Yq[0], Yq[1], 3 * 12, 1e-6, f"pool_f {mode}")
             same(DXq[0], DXq[1], 3 * 63, 1e-6, f"pool_b {mode}")
+        nO = 777                                                    # the optimizers, plain and compensated
+        for comp in (False, True):
+            Po, Go, Mo, Vo, SQo, Co = (pair(rng.normal(size=nO)), pair(rng.normal(size=nO)), pair(np.zeros(nO)),
+                                       pair(np.zeros(nO)), pair(np.array([4.0])), pair(np.zeros(nO)))
+            for dv, i in ((g, 0), (e, 1)):
+                dv.adam(Po[i], Go[i], Mo[i], Vo[i], SQo[i], nO, 500, 1e-3, 0.9, 0.999, 1e-8, 0.1, 0.001, 0.01, 1.0,
+                        Co[i] if comp else None)
+                dv.sgd(Po[i], Mo[i], Vo[i], SQo[i], nO, 1e-2, 0.9, 0.0, Co[i] if comp else None)
+            same(Po[0], Po[1], nO, 1e-6, f"adam + sgd, compensated={comp}")
+            same(Co[0], Co[1], nO, 1e-4, "compensation") if comp else None
         W, WQ = pair(rng.normal(size=(70, 48))), pair(np.zeros(70 * 48))
         for kind in range(6):
             g.fakeq(W[0], WQ[0], 70, 48, kind)

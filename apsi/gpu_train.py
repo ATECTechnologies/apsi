@@ -275,20 +275,35 @@ class Emulator(_Ops):
         x = self.v(X, n)
         self.v(ACC, 1)[0] += (x * x).sum()
 
-    def adam(self, Pm, Gr, Mm, Vm, SQ, n, n_decay, lr, b1, b2, eps, c1, c2, wd, clip):
+    def _kahan(self, p, new, delta, COMP, n):
+        if COMP is None:
+            p[:] = new
+            return
+        c = self.v(COMP, n)
+        y = delta - c
+        t = p + y
+        c[:] = (t - p) - y
+        p[:] = t
+
+    def adam(self, Pm, Gr, Mm, Vm, SQ, n, n_decay, lr, b1, b2, eps, c1, c2, wd, clip, COMP=None):
         g = self.v(Gr, n) * self._clip(SQ, clip)
         p, m, v = self.v(Pm, n), self.v(Mm, n), self.v(Vm, n)
-        p[:n_decay] *= np.float32(1 - lr * wd)
+        w = p.copy()
+        w[:n_decay] *= np.float32(1 - lr * wd)
         m[:] = b1 * m + (1 - b1) * g
         v[:] = b2 * v + (1 - b2) * g * g
-        p[:] = p - np.float32(lr) * (m / np.float32(c1)) / (np.sqrt(v / np.float32(c2)) + np.float32(eps))
+        upd = np.float32(lr) * (m / np.float32(c1)) / (np.sqrt(v / np.float32(c2)) + np.float32(eps))
+        dec = np.zeros_like(p)
+        dec[:n_decay] = p[:n_decay] * np.float32(lr * wd)
+        self._kahan(p, w - upd, -(dec + upd), COMP, n)
         self.v(Gr, n)[:] = 0.0                    # the kernel clears the gradient it used
 
-    def sgd(self, Pm, Gr, VEL, SQ, n, lr, mom, clip):
+    def sgd(self, Pm, Gr, VEL, SQ, n, lr, mom, clip, COMP=None):
         vel = self.v(VEL, n)
         vel[:] = np.float32(mom) * vel + self.v(Gr, n) * self._clip(SQ, clip)
         p = self.v(Pm, n)
-        p[:] = p - np.float32(lr) * vel
+        step = np.float32(lr) * vel
+        self._kahan(p, p - step, -step, COMP, n)
         self.v(Gr, n)[:] = 0.0
 
     def _clip(self, SQ, clip):
@@ -873,16 +888,16 @@ class Gpu(_Ops):
     def sumsq(self, X, n, ACC):
         self._go("sumsq", min(self.blocks(n), 1024), 256, self.p(X), ("u", n), self.p(ACC))
 
-    def adam(self, Pm, Gr, Mm, Vm, SQ, n, n_decay, lr, b1, b2, eps, c1, c2, wd, clip):
+    def adam(self, Pm, Gr, Mm, Vm, SQ, n, n_decay, lr, b1, b2, eps, c1, c2, wd, clip, COMP=None):
         self._wgen += 1
         self._go("adam", self.blocks(n), 256, self.p(Pm), self.p(Gr), self.p(Mm), self.p(Vm), self.p(SQ), ("u", n),
                  ("u", n_decay), ("f", lr), ("f", b1), ("f", b2), ("f", eps), ("f", c1), ("f", c2), ("f", wd),
-                 ("f", clip))
+                 ("f", clip), self.p(COMP if COMP is not None else Pm), ("u", 1 if COMP is not None else 0))
 
-    def sgd(self, Pm, Gr, VEL, SQ, n, lr, mom, clip):
+    def sgd(self, Pm, Gr, VEL, SQ, n, lr, mom, clip, COMP=None):
         self._wgen += 1
         self._go("sgd", self.blocks(n), 256, self.p(Pm), self.p(Gr), self.p(VEL), self.p(SQ), ("u", n), ("f", lr),
-                 ("f", mom), ("f", clip))
+                 ("f", mom), ("f", clip), self.p(COMP if COMP is not None else Pm), ("u", 1 if COMP is not None else 0))
 
     def drop_f(self, X, Y, MASK, n, p, seed):
         self._go("drop_f", self.blocks(n), 256, self.p(X), self.p(Y), self.p(MASK), ("u", n), ("f", p),
@@ -3220,6 +3235,16 @@ def _inputs(X, ids):
     return np.ascontiguousarray(a.astype(np.float32))
 
 
+def _want_comp(compensated, params):
+    """Compensated weight updates: on by default below 2 B parameters (4 more bytes per parameter)."""
+    if compensated is not None:
+        return bool(compensated)
+    env = os.environ.get("APSI_GPU_COMPENSATED", "").strip().lower()
+    if env:
+        return env not in ("0", "false", "no", "off")
+    return sum(int(np.asarray(a).size) for a in tree_leaves(params) if isinstance(a, np.ndarray)) < 2_000_000_000
+
+
 LOSSES = ("cross_entropy", "mse", "mae", "bce")
 
 
@@ -3263,11 +3288,14 @@ def _check_size(ops, params, opt, shards=1):
 
 def fit(model, params, X, y=None, loss="mse", opt=None, epochs=10, batch_size=None, seed=0, verbose=True,
         clip=None, schedule=None, val=None, device="cuda", precision="auto", ops=None, ema=None, ewc=None,
-        parallel="auto", stages=None, micro_batches=None, graph=None, mask=None):
+        parallel="auto", stages=None, micro_batches=None, graph=None, mask=None, compensated=None):
     """Several cards (device="cuda:all", "cuda:0,1,2"): parallel="data" copies the model to every card and shares
     the batch out; "pipeline" splits the model across the cards (stages: how many pieces, or a list with the units of
     each); "auto" (the default) copies it when it fits on one card, else splits it into the fewest pieces that fit and
     copies those over the cards left. micro_batches: the pieces of a batch that flow through a split model.
+    compensated: the weights keep the rounding error of every update (compensated summation, 4 more bytes per
+    parameter): updates far smaller than float32's step at a weight's size still add up (default: on below 2 B
+    parameters).
 
     ema=0.999: also keeps an exponential moving average of the weights (record.ema_params), the smoother set
     that often generalizes better. ewc=(anchor_params, fisher, strength): elastic weight consolidation, a pull of
@@ -3299,10 +3327,11 @@ def fit(model, params, X, y=None, loss="mse", opt=None, epochs=10, batch_size=No
             from .gpu_pipeline import fit_pipeline
             return fit_pipeline(list(ops), model, params, X, y, loss, opt, epochs, batch_size, seed, verbose, clip,
                                 schedule, val, precision, ema, ewc,
-                                "all" if stages is None and mode == "pipeline" else stages, micro_batches)
+                                "all" if stages is None and mode == "pipeline" else stages, micro_batches,
+                                _want_comp(compensated, params))
         if len(ops) > 1:
             return _fit_parallel(list(ops), model, params, X, y, loss, opt, epochs, batch_size, seed, verbose, clip,
-                                 schedule, val, precision, ema, ewc)
+                                 schedule, val, precision, ema, ewc, _want_comp(compensated, params))
         ops = ops[0]
     if ops is None:
         ops, why = globals()["device"](device)
@@ -3313,7 +3342,8 @@ def fit(model, params, X, y=None, loss="mse", opt=None, epochs=10, batch_size=No
             if len(many) > 1:
                 from .gpu_pipeline import fit_pipeline
                 return fit_pipeline(many, model, params, X, y, loss, opt, epochs, batch_size, seed, verbose, clip,
-                                    schedule, val, precision, ema, ewc, stages, micro_batches)
+                                    schedule, val, precision, ema, ewc, stages, micro_batches,
+                                    _want_comp(compensated, params))
     custom = callable(loss)                              # a loss function: evaluated on the processor
     if custom:
         if isinstance(ops, (list, tuple)) and len(ops) > 1:
@@ -3351,6 +3381,11 @@ def fit(model, params, X, y=None, loss="mse", opt=None, epochs=10, batch_size=No
     if st2 is not None:
         ops.fill((st2, 0), net.n, 0.0)
     SQ = ops.alloc(1)
+    COMP = None
+    if _want_comp(compensated, params):
+        COMP = ops.alloc(net.n)
+        ops.fill((COMP, 0), net.n, 0.0)
+        net.owned.append(COMP)
     EMA = EWC_A = EWC_F = EWC_T = None
     if ema is not None:
         ema = float(ema)
@@ -3483,10 +3518,10 @@ def fit(model, params, X, y=None, loss="mse", opt=None, epochs=10, batch_size=No
                 if adam:
                     c1, c2 = 1 - opt.b1 ** t_step, 1 - opt.b2 ** t_step
                     ops.adam((net.P, 0), (net.G, 0), (st1, 0), (st2, 0), (SQ, 0), net.n, net.n_decay, lr, opt.b1,
-                             opt.b2, opt.eps, c1, c2, wd, float(clip or 0.0))
+                             opt.b2, opt.eps, c1, c2, wd, float(clip or 0.0), (COMP, 0) if COMP else None)
                 else:
                     ops.sgd((net.P, 0), (net.G, 0), (st1, 0), (SQ, 0), net.n, lr, float(opt.momentum),
-                            float(clip or 0.0))
+                            float(clip or 0.0), (COMP, 0) if COMP else None)
                 step += 1
                 if EMA is not None:                         # ema <- d ema + (1 - d) w
                     ops.axpy((EMA, 0), (EMA, 0), net.n, ema - 1.0)
@@ -3545,7 +3580,7 @@ def fit(model, params, X, y=None, loss="mse", opt=None, epochs=10, batch_size=No
 
 
 def _fit_parallel(ops_list, model, params, X, y, loss, opt, epochs, batch_size, seed, verbose, clip, schedule, val,
-                  precision, ema, ewc):
+                  precision, ema, ewc, comp=False):
     """Data-parallel training on several cards: every card keeps the whole model and its optimizer state, takes its
     share of each batch, and the gradients are summed across the cards (card to card where the driver allows it)
     before the identical update on each, so the result is that of one card with the whole batch. Throughput grows
@@ -3581,8 +3616,11 @@ def _fit_parallel(ops_list, model, params, X, y, loss, opt, epochs, batch_size, 
             lo, hi = net.n * r // len(ops_list), net.n * (r + 1) // len(ops_list)
             ln = max(1, hi - lo)
             rep = {"ops": o, "net": net, "lo": lo, "hi": hi, "st1": o.alloc(ln), "st2": o.alloc(ln) if adam else None,
+                   "COMP": o.alloc(ln) if comp else None,
                    "SQ": o.alloc(1), "LOSSE": o.alloc(max(1, E)), "gov": thermal.governor(getattr(o, "dev", None))}
             o.fill((rep["st1"], 0), ln, 0.0)
+            if rep["COMP"] is not None:
+                o.fill((rep["COMP"], 0), ln, 0.0)
             if rep["st2"] is not None:
                 o.fill((rep["st2"], 0), ln, 0.0)
             o.fill((rep["LOSSE"], 0), max(1, E), 0.0)
@@ -3697,10 +3735,11 @@ def _fit_parallel(ops_list, model, params, X, y, loss, opt, epochs, batch_size, 
                         c1, c2 = 1 - opt.b1 ** t_step, 1 - opt.b2 ** t_step
                         nd = min(max(net.n_decay - lo, 0), k)
                         o.adam((net.P, lo), (net.G, lo), (rep["st1"], 0), (rep["st2"], 0), sq, k,
-                               nd, lr, opt.b1, opt.b2, opt.eps, c1, c2, wd, float(clip or 0.0))
+                               nd, lr, opt.b1, opt.b2, opt.eps, c1, c2, wd, float(clip or 0.0),
+                               (rep["COMP"], 0) if rep["COMP"] else None)
                     else:
                         o.sgd((net.P, lo), (net.G, lo), (rep["st1"], 0), sq, k, lr, float(opt.momentum),
-                              float(clip or 0.0))
+                              float(clip or 0.0), (rep["COMP"], 0) if rep["COMP"] else None)
                     if clip:
                         o.fill((rep["SQ2"], 0), 1, 0.0)
                 for rep in R:                                # every card gets the slices the others updated
@@ -3732,7 +3771,7 @@ def _fit_parallel(ops_list, model, params, X, y, loss, opt, epochs, batch_size, 
     finally:
         for rep in R:
             o = rep["ops"]
-            for key in ("st1", "st2", "SQ", "LOSSE", "XA", "YA", "IDX", "EA", "EF", "ET", "TMP", "SQX", "SQ2"):
+            for key in ("st1", "st2", "SQ", "LOSSE", "XA", "YA", "IDX", "EA", "EF", "ET", "TMP", "SQX", "SQ2", "COMP"):
                 if rep.get(key) is not None:
                     o.free(rep[key])
             rep["net"].close()
