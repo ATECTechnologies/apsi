@@ -165,6 +165,16 @@ class Parser:
         if tok.type != NAME or tok.value != word:
             return False
         nxt = self.peek(1)
+        if word == "with" and nxt.type == OP and nxt.value == "(":
+            # `with (a / b).open() as f:` or `with (x as a, y as b):` against a call `with(x)`: a with statement
+            # ends its line with ':'
+            k, last = 1, None
+            while True:
+                t = self.peek(k)
+                if t.type in (NEWLINE, EOF):
+                    break
+                last, k = t, k + 1
+            return last is not None and last.type == OP and last.value == ":"
         if nxt.type == OP and nxt.value in _NOT_STMT_AFTER:
             return False
         return nxt.type not in (NEWLINE, EOF, DEDENT) or word in ("pass",)
