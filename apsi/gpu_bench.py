@@ -246,20 +246,22 @@ def _check_flow(ops, out):
     runs, secs = [], {"0": 1e9, "1": 1e9}
     for mode in ("1", "1", "0", "1", "0"):             # the first run builds and tunes; then the best of two each
         with mock.patch.dict(os.environ, {"APSI_GPU_ASYNC_COPY": mode}):
-            ops.__dict__.pop("_ring", None)
+            ops.drop_ring()
+            ring = ops._ring_ready() and ops._ring["made_s"]
             ops.sync()
             t0 = time.perf_counter()
             runs.append(GT.fit_batches(lm, lm.init(seed=0), batches, "cross_entropy", opt=Adam(1e-3), **kw))
             ops.sync()
             if len(runs) > 1:
                 secs[mode] = min(secs[mode], time.perf_counter() - t0)
-    ops.__dict__.pop("_ring", None)
+    ops.drop_ring()
     same = all(np.array_equal(np.asarray(a), np.asarray(b)) for r in runs[1:]
                for a, b in zip(tree_leaves(runs[0].params), tree_leaves(r.params)))
     steps = 2 * len(batches)
     print(f"  {'ok  ' if same else 'FAIL'} {'flow (fused attention)':<22} losses {runs[0].history[0]:.4f} -> "
           f"{runs[0].history[-1]:.4f}  ({'the same weights twice' if same else 'NOT the same weights twice'}; "
-          f"{1e3 * secs['1'] / steps:.2f} ms a step with queued copies, {1e3 * secs['0'] / steps:.2f} ms waiting)",
+          f"{1e3 * secs['1'] / steps:.2f} ms a step with queued copies, {1e3 * secs['0'] / steps:.2f} ms waiting; "
+          f"pinned memory in {1e3 * (ring or 0):.0f} ms)",
           file=out)
     return 0 if same else 1
 

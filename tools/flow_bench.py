@@ -9,6 +9,9 @@ from apsi.stdlib import Adam                             # noqa: E402
 
 ops, why = GT.device("cuda")
 print("device", getattr(ops, "name", ops), why)
+from apsi import gpu_bench as B                          # noqa: E402
+B._check_flow(ops, sys.stdout)
+sys.stdout.flush()
 rng = np.random.default_rng(4)
 lm = L.transformer_lm(256, d=128, heads=2, layers=2, context=128)
 batches = [(rng.integers(0, 256, (8, 128)), rng.integers(0, 256, (8, 128))) for _ in range(24)]
@@ -29,7 +32,7 @@ GT.Gpu.put = put
 def run(mode, label, fresh=True):
     os.environ["APSI_GPU_ASYNC_COPY"] = mode
     if fresh:
-        ops.__dict__.pop("_ring", None)
+        ops.drop_ring()
     stats.update(put=0.0, n=0)
     ops.sync()
     t0 = time.perf_counter()
