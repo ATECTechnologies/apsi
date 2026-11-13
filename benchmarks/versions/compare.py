@@ -167,6 +167,7 @@ def main():
                 row(f"web server, {c} connections", wo[c]["rps"], wn[c]["rps"], "req/s", higher=True)
     sp = [r["speedup"] for r in res["rows"]]
     res["geomean"] = round(math.exp(sum(math.log(x) for x in sp) / len(sp)), 2) if sp else None
+    os.makedirs(a.out, exist_ok=True)
     with open(os.path.join(a.out, "versions.json"), "w") as fh:
         json.dump(res, fh, indent=1)
     with open(os.path.join(a.out, "versions.md"), "w") as fh:

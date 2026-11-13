@@ -5,9 +5,10 @@
 # It uploads:
 #   Downloads\apsi-X.Y.Z\installer\release\ApsiSetup-X.Y.Z-x64.exe   -> Windows installer
 #   Downloads\apsi-X.Y.Z-linux.zip  (ApsiSetup-X.Y.Z-linux.sh and the .deb inside it)  -> Linux installer
+#   source\apsi-X.Y.Z-source.zip in that zip                                           -> Source code
 #   the Apsi GPU Tuner in that zip (gpu-tuner\: Apply / Restore for Windows and Linux) -> the Download page's
 #   "Apsi GPU Tuner" section
-# Versions: 2.4.4 and newer by default (-Version 2.4.4+); -Version 2.4.4 for one version only, -Version all for
+# Versions: 2.6.0 and newer by default (-Version 2.6.0+); -Version 2.4.4 for one version only, -Version all for
 # every version found. Files already on the site are skipped, so running it again is safe. Files are sent in 32 MB pieces, 4 at a time (Cloudflare accepts at most 100 MB per
 # request); a broken piece is sent again.
 #
@@ -16,7 +17,7 @@
 param(
   [string]$Root = (Join-Path $HOME 'Downloads'),
   [string]$Site = 'https://apsi.dev',
-  [string]$Version = '2.4.4+',
+  [string]$Version = '2.6.0+',
   [int]$Parallel = 4,
   [switch]$DryRun
 )
@@ -42,6 +43,7 @@ Get-ChildItem -LiteralPath $Root -File -Filter 'apsi-*-linux.zip' | ForEach-Obje
   $v = $Matches[1]
   $dir = Join-Path $tmp $v
   Expand-Archive -LiteralPath $_.FullName -DestinationPath $dir -Force
+  Get-ChildItem -LiteralPath $dir -Recurse -File -Filter 'apsi-*-source.zip' | ForEach-Object { Add-Build $_.FullName $v 'source' 'Source code' }
   Get-ChildItem -LiteralPath $dir -Recurse -File | Where-Object { -not $_.FullName.Contains('\source\') } | ForEach-Object {
     if ($_.Name -like 'ApsiSetup-*-linux.sh') { Add-Build $_.FullName $v 'linux' 'Linux installer' }
     elseif ($_.Name -like '*.deb') { Add-Build $_.FullName $v 'linux' 'Debian / Ubuntu package (.deb)' }
