@@ -73,6 +73,12 @@ missing credit or taking down a paid offer. The first time, your rights come bac
 Apsi 1.10.0 and 2.0.0 were released under the Apsi Non-Commercial License 1.0. You may use them under the Apsi License
 2.0 instead (section 13), which allows more.
 
+## Sponsorship
+
+Sponsoring ATEC through GitHub Sponsors is a voluntary gift handled by GitHub under its own terms. It does not change
+the licence: Apsi is free under the Apsi License 2.0 for sponsors and non-sponsors alike, and a sponsorship does not
+grant a commercial licence to sell Apsi itself.
+
 ## Why the licence looks like this
 
 The licence was written after comparing the approaches that source-available projects use:

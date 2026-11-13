@@ -177,5 +177,11 @@ versions with SHA-256 hashes, and `apsi pkg install -r apsi.lock` then requires 
 
 ## Reporting a vulnerability
 
-Do not open a public issue. Send the details and a proof of concept to the maintainers'
-security address on the official site. Fixes are released as `2.0.x` patch versions.
+Do not open a public issue. Use the report form on the official site (category **Security
+vulnerability**) or the contact in its `/.well-known/security.txt`, with the details and a proof of
+concept. Please allow up to 90 days for a fix before disclosing it. Good-faith research that does
+not touch other people's data or disrupt the service is welcome, and reporters are credited on
+request.
+
+Supported version: **2.6.0**. Fixes are released as `2.6.x` patch versions; older versions stay
+available but are not patched.
