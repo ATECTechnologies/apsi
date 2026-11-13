@@ -26,7 +26,8 @@
 - **One launch per reduction:** column sums, losses, sums of squares and dot products finish in the last block to
   finish (a counter per launch, reset by that block): the parts are still added in a fixed order, so the bits are
   the same every run, without the second kernel. Column sums are blocks of 32 columns x 8 lanes of rows (a warp
-  reads 32 adjacent values), with enough chunks of rows to fill the card.
+  reads 32 adjacent values), with enough chunks of rows to fill the card. Split-k products add their parts the same way: the
+  last part of each tile to finish sums the parts in order (no `ksum` launch).
 - **Cross-entropy on the card with accurate exp and log** (Cody-Waite exp, log with a Newton step) instead of the
   approximate hardware ones.
 - **A loss of your own can keep its large part on the card:** `loss.on_card = (output, labels_of, rest)` computes

@@ -9,6 +9,9 @@ from apsi.stdlib import Adam                             # noqa: E402
 
 ops, why = GT.device("cuda")
 print("device", getattr(ops, "name", ops), why)
+print("tiled:", getattr(ops, "tiled", None), "| builds:", sorted({k.split("#")[1] for k in ops.fn if "#" in k}),
+      "| variant_why:", getattr(ops, "variant_why", None), "| tc_why:", getattr(ops, "tc_why", None))
+sys.stdout.flush()
 from apsi import gpu_bench as B                          # noqa: E402
 B._check_flow(ops, sys.stdout)
 sys.stdout.flush()
