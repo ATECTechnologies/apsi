@@ -5,7 +5,7 @@
 `pip install numpy`, then `./apsi.sh` / `apsi.bat`. What's new, with examples: [docs/WHATS-NEW.md](https://github.com/ATECTechnologies/apsi/blob/main/docs/WHATS-NEW.md);
 everyday code runs 1.22× faster than in 2.4.4 (geometric mean); the training guide: [docs/TRAINING.md](https://github.com/ATECTechnologies/apsi/blob/main/docs/TRAINING.md).
 
-Tested: 413 tests on every push (Linux x64 / ARM64, macOS Apple silicon / Intel, Windows; Python 3.12–3.14) and 60
+Tested: 413 tests on every push (Linux x64 / ARM64, macOS Apple silicon / Intel, Windows; Python 3.12–3.14) and 81
 on a real NVIDIA RTX 3060 (every kernel against the exact reference; GLA and a transformer trained twice with
 identical weights; steps and resume bit for bit; the NaN guard).
 

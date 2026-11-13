@@ -167,8 +167,9 @@ safely it runs.
 
 - 413 tests on every push, on Linux (x64, ARM64), macOS (Apple silicon, Intel) and Windows, Python 3.12–3.14.
 - On a real NVIDIA RTX 3060: every kernel against the exact reference, GLA and a transformer trained twice with
-  identical weights, steps and resume bit for bit, the NaN guard, split products, the fused attention both ways — 60
-  tests (`tools\gpu_check.bat`).
+  identical weights, steps and resume bit for bit, the NaN guard, split products, the fused attention both ways,
+  products with sizes not multiples of 4 — 81 tests (`tools\bench_my_pc.bat`).
+- On the same desktop (Ryzen 5 5500, Windows 11): 2.6.0 against 2.4.4 at 1.35× on the geometric mean.
 - NumPy, one card and many cards compared on the same training, step for step.
 - CPU programs against C, C++, Rust, Go, Java, JavaScript, C# and Julia, and 2.6.0 against 2.4.4, on a GitHub
   runner and a 2-core VM: the eight heavy programs run at the same speed as 2.4.4 (0.99×; 0.83× the time of C), and
