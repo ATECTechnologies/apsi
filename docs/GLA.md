@@ -95,3 +95,18 @@ let mix = custom_layer(fn(seed=0) => record(W=randn(32, 32, seed=seed) * 0.1, g=
                        fn(p, x, graph=none) => x + tanh(p.g[0]) * (segment_mean(x, graph.batch,
                                                                     graph.graphs)[graph.batch] @ p.W))
 ```
+
+## Fewer tokens with GLA's graphs
+
+The code property graph GLA builds from Python (`gla_code_graph`) also decides what to send a language model when a
+context is too long: `tokens.focus(source, question, budget)` keeps the functions a question needs together with
+what they call and read, and marks the rest so it can be put back exactly. See
+[TOKENS.md](TOKENS.md#when-it-still-does-not-fit-focus-built-on-gla).
+
+## The writer's loss stays on the card
+
+`gla_loss` declares its writer cross-entropy with `gla_loss.on_card`: on the GPU trainer that term (the largest
+output, batch × answer length × vocabulary) is computed on the card and only the small heads (validity, issues,
+alignment, router, value) go to the processor. The result is the same loss; a mask that is not 0 / 1 falls back to the
+processor for the whole loss.
+

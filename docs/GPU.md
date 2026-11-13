@@ -435,6 +435,9 @@ Raise `--max-queue`, use a smaller model or format, or run another server on ano
 
 ## Settings for the GPU
 
+Every setting below is also in [`config/apsi-training.env`](../config/apsi-training.env) with its default; what each
+protection costs and what turning it off changes: [TRAINING.md](TRAINING.md#9-what-happens-if-you-turn-things-off).
+
 | Variable | Default | Effect |
 |---|---|---|
 | `APSI_NO_GPU=1` | | everything on the processor |
@@ -448,6 +451,9 @@ Raise `--max-queue`, use a smaller model or format, or run another server on ano
 | `APSI_PROMPT_ON_GPU` | `64` | prompts of this many tokens or more through processor layers stream to the card |
 | `APSI_CPU_WEIGHTS` | `int8` | processor layers in `bf16` instead |
 | `APSI_PRECISION` | `auto` | training precision for every program |
+| `APSI_GPU_GUARD` | `1` | a step whose gradient holds inf or NaN is skipped (weights and optimizer state unchanged); `0`: off |
+| `APSI_GPU_EXACT_SUMS` | (on below 2 B parameters) | exact double-float sums of accumulated batches, copies and cuts; `0` / `1` |
+| `APSI_GPU_COMPENSATED` | (on below 2 B parameters) | each weight carries its rounding error into the next update; `0` / `1` |
 | `APSI_GPU_DETERMINISTIC` | `1` | the same weights every run (no atomic additions anywhere); `0`: the fused attention's backward adds dQ atomically (one kernel instead of two) |
 | `APSI_GPU_ASYNC_COPY` | `1` | copies to the card queued behind the running kernels through pinned memory; `0`: each copy waits for the card |
 | `APSI_FP8_MATMUL` | `1` | `0`: no fp8 tensor-core products with `backend="torch"` |

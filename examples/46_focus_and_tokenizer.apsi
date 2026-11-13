@@ -1,0 +1,55 @@
+# 46_focus_and_tokenizer.apsi — send a model only what it needs, and train your own tokenizer
+#
+# tokens.focus keeps the parts of a long context that a question needs (chosen on GLA's code and text graphs) and
+# marks the rest, so any part can be put back exactly; data.train_tokenizer trains a byte-level BPE tokenizer.
+use tokens
+use data
+
+let source = """
+import math
+
+TAX = 0.07
+
+
+def price_with_tax(price):
+    \"\"\"The price a customer pays.\"\"\"
+    return round(price * (1 + TAX), 2)
+
+
+def shipping(weight):
+    \"\"\"Shipping by weight in kilograms.\"\"\"
+    if weight < 1:
+        return 4.0
+    return 4.0 + math.ceil(weight - 1) * 1.5
+
+
+def checkout(cart):
+    \"\"\"The total of a cart: every item with tax, plus shipping.\"\"\"
+    total = sum(price_with_tax(item["price"]) for item in cart)
+    return total + shipping(sum(item["kg"] for item in cart))
+
+
+def banner(text):
+    \"\"\"An ASCII banner for the shop front.\"\"\"
+    let_line = "*" * (len(text) + 4)
+    return let_line + "\\n* " + text + " *\\n" + let_line
+
+
+def palette():
+    \"\"\"The colours of the shop's website.\"\"\"
+    return ["#112233", "#445566", "#778899", "#aabbcc", "#ddeeff"] * 20
+"""
+
+let f = tokens.focus(source, "why is the checkout total wrong?", budget=150)
+print(f.saved)
+print(f.text)
+assert f.tokens <= 150
+assert tokens.unfold(f) == source               # nothing is lost: every part comes back exactly
+
+# a tokenizer of your own, from text you have
+let texts = ["Apsi trains tokenizers fast. " * 20, "Tokenizers turn text into numbers. " * 20,
+             "The same text always gives the same numbers. " * 20]
+let tok = data.train_tokenizer(texts, vocab_size=300, engine="apsi")
+let ids = tok.encode("Apsi turns text into numbers.")
+print(f"{tok.vocab_size} tokens in the vocabulary; the sentence is {len(ids)} tokens")
+assert tok.decode(ids) == "Apsi turns text into numbers."

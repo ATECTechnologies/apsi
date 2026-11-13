@@ -1,6 +1,6 @@
 # Changelog
 
-## 2.6.0 — in progress
+## 2.6.0 — exact training on any number of cards, GLA 3.0, training that finishes, fewer tokens (13 November 2026)
 
 ### Exact training on many cards
 - **The same weights on any number of cards, to the last bit:** the gradients of a step's batches, of the copies of
@@ -11,30 +11,55 @@
   (`fit_batches(…, exact_sums=)`, `APSI_GPU_EXACT_SUMS`).
 - **Order-free gradients inside the model:** a value used by several layers gets their gradients' exact sum,
   rounded once, whatever order they arrive in.
-- **Run-to-run determinism on the card:** reductions no longer use atomic additions, whose order changes every
-  run. Column sums (bias and norm gradients) write per-block parts added in a fixed order (`colsum_fin`); embedding
-  gradients use a sorted index (`embed_bs`, one thread per row, ids in order); sums of squares, dot products and
-  losses write per-block parts (`parts_sum`); split-k products write each slice to a workspace and add them in order
-  (`ksum`). The fused attention's backward computes dQ in a kernel of its own, a block per 64 queries summing
-  over the key tiles in registers, instead of adding it atomically. The same training twice gives the same weights
-  bit for bit. (`APSI_GPU_DETERMINISTIC=0` brings back the one-kernel attention backward with atomic dQ.)
+- **Run-to-run determinism on the card:** no atomic additions anywhere in training. Column sums (bias and norm
+  gradients) run as blocks of 32 columns x 8 lanes of rows; with several chunks of rows, the last chunk to finish adds
+  them in chunk order (a counter per launch, reset by that block). Embedding gradients use a sorted index
+  (`embed_bs`, one thread per row, ids in order). Losses, sums of squares and dot products write per-block parts that
+  the last block adds in order. Split-k products write each slice to a workspace and the last part of each tile adds
+  them in order. The fused attention's backward computes dQ in a kernel of its own (`flash_q`, a block per 64
+  queries summing over the key tiles in registers) next to dK / dV (`flash_k`). The same training twice gives the
+  same weights bit for bit, checked on an RTX 3060 (`APSI_GPU_DETERMINISTIC=0`: the one-kernel attention backward
+  with atomic dQ).
 - **The processor never waits for the card inside a step:** copies to the card go through pinned memory and are
-  queued behind the kernels already launched (`APSI_GPU_ASYNC_COPY=0` turns this off); `fit_batches` keeps each
-  batch's loss on the card and reads them once an epoch; tanh gates (gated attention) are computed, applied and
-  differentiated on the card (`tanh_s` in float64, rounded once; `axpy_s`; `gate_g`). The processor prepares the
-  next batch while the card runs the current one.
-- **One launch per reduction:** column sums, losses, sums of squares and dot products finish in the last block to
-  finish (a counter per launch, reset by that block): the parts are still added in a fixed order, so the bits are
-  the same every run, without the second kernel. Column sums are blocks of 32 columns x 8 lanes of rows (a warp
-  reads 32 adjacent values), with enough chunks of rows to fill the card. Split-k products add their parts the same way: the
-  last part of each tile to finish sums the parts in order (no `ksum` launch).
+  queued behind the kernels already launched (`APSI_GPU_ASYNC_COPY=0` turns this off; `drop_ring()` gives the memory
+  back); `fit_batches` keeps each batch's loss on the card and reads them once an epoch; tanh gates (gated attention)
+  are computed, applied and differentiated on the card (`tanh_s` in float64, rounded once; `axpy_s`; `gate_g`).
+  A small transformer's step on an RTX 3060: 5.5–6.0 ms before, 4.0–4.5 ms after.
 - **Cross-entropy on the card with accurate exp and log** (Cody-Waite exp, log with a Newton step) instead of the
-  approximate hardware ones.
+  approximate hardware instructions.
 - **A loss of your own can keep its large part on the card:** `loss.on_card = (output, labels_of, rest)` computes
-  that output's cross-entropy on the card and sends only the other outputs to the processor. `gla_loss` uses it:
-  the writer's logits never leave the card (one card and many).
+  that output's cross-entropy on the card and sends only the other outputs to the processor. `gla_loss` uses it: the
+  writer's logits never leave the card (one card and many).
 - **Optimizers on the processor keep float64 weights** (a master copy, as NumPy does); the card gets them rounded
   once. Frozen weights stay frozen in the master copy too.
+
+### Training that finishes
+- **`steps=N`** (`fit_batches`, GPU trainer and NumPy): N optimizer steps over as many epochs as it takes.
+- **Checkpoints that resume bit for bit:** `checkpoint="run.npz"`, `save_every=K`, `resume=true`. The weights, the
+  optimizer's moments and step, the carried rounding error, the float64 master copy and the position in the data
+  (epoch and batch), written atomically every K steps, at the end and **when training stops on any error or Ctrl+C**.
+  Running the same call again continues exactly: the result equals one uninterrupted run, with or without
+  `accumulate`. A checkpoint of another model is refused. `callback=` after every epoch.
+- **A guard against non-finite steps:** a step whose gradient holds inf or NaN is skipped inside the adam / sgd
+  kernels (weights, moments and the carried rounding error unchanged), on one card, copies and split models; the same
+  on NumPy and for optimizers on the processor (`APSI_GPU_GUARD=0` turns it off).
+- **Clearer out-of-memory message:** suggests `accumulate=` with a smaller batch.
+- `docs/TRAINING.md`: steps, checkpoints, crash protection, exactness, speed, the tokenizer, every setting and what
+  turning it off changes. `config/apsi-training.env`: every setting with its default.
+
+### Tokens and tokenizers
+- **`tokens.focus(context, query, budget)`** (`use tokens`): the parts of a long context a question needs, within a
+  token budget, chosen on GLA's graphs — Python cut along its syntax tree (long functions into their parts) and linked
+  by GLA's code property graph (calls, data flow), text cut into blocks and sentences and linked by shared rare words;
+  scores from the question's words (rarer words count more, identifiers split into their pieces) spread by a
+  personalised PageRank. Left-out parts become numbered markers; functions that do not fit may stay as outlines.
+  `unfold(f)` gives the original exactly, `unfold(f, [n])` one part. `fit_chat(messages, budget)`,
+  `outline(source)`. `examples/46_focus_and_tokenizer.apsi`.
+- **`data.train_tokenizer(source, vocab_size=…)`:** byte-level BPE (GPT-2 / Llama 3 / Qwen kind) trained in Apsi —
+  distinct pre-tokens counted once, merges that touch only the words with the pair, a heap with lazy deletion, ties by
+  text so the same corpus gives the same tokenizer — or in Hugging Face `tokenizers`' Rust trainer when installed
+  (`engine=`). Saved as tokenizer.json (loads in Apsi and Hugging Face); `text_dataset(tokenizer=tok)` takes it.
+- **Fixed:** a list of texts given to `text_dataset` that contained `*`, `?` or `[` could be taken for file patterns.
 
 ### Tensors on the card
 - **`gpu_tensor(x)`:** a tensor on the card with Apsi's own kernels — products (batched, transposed views without

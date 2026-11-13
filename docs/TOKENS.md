@@ -123,6 +123,102 @@ let text, method = tokens.best(payload)
 send(text)                                   # and keep method to restore: tokens.restore(text, method)
 ```
 
+## When it still does not fit: `focus` (built on GLA)
+
+The transforms above never lose anything, so they cannot shrink text that has no repetition — a large source file,
+a long manual. When such a context is longer than your budget, `tokens.focus` keeps **the parts the question needs**
+and replaces the rest by short numbered markers that say exactly what was left out. Nothing is lost for good:
+`unfold` puts any part back, byte for byte.
+
+```apsi
+use tokens
+let src = read_text("lexer.py")                                   # 3,886 tokens
+let f = tokens.focus(src, "how are string escapes handled?", budget=1500)
+print(f.saved)                    # 3,886 → 1,493 tokens: 61.6 % saved (2.60× fewer)
+send(f.text)                      # the parts that matter, in their original order, with markers for the rest
+let full = tokens.unfold(f)       # == src, exactly; tokens.unfold(f, [2]) writes out only part 2
+```
+
+What the model receives looks like this (a Python file; text gets the same markers without `#`):
+
+```text
+# [[map: 5 parts whole, 0 outlined; shortened parts 1, 2, 3 can be asked for by number]]
+"""Tokenizer for Apsi: indentation-sensitive, Unicode identifiers, unit literals."""
+import re
+…
+# [[omitted 1: lines 23-72: class Token, def _ident_char, def tokenize, def _tokenize, def _tokenize (part)]]
+…the start of _tokenize, whole…
+# [[omitted 2: lines 79-179: def _tokenize (part)]]
+        if c == '"' or (c in "fb" and i + 1 < n and src[i + 1] == '"'):
+            …the string and escape handling, whole…
+# [[omitted 3: lines 230-296]]
+```
+
+A function that does not fit whole can appear as its outline instead:
+
+```text
+# [[outline 4: lines 610-622]]
+def gla_loss(outs, y, d=None, experts=None, weights=None):
+    """GLA 3.0's training loss on the outputs of gla(): writer + 0.3 validity + 0.3 issues + 0.2 alignment + router"""
+    # calls: _gla_rest, arange, asarray, astype, int, len, log_softmax, raw, reshape, shape, sum, sum_
+    ...
+```
+
+### How it chooses
+
+It reads the context the way GLA reads code and text:
+
+1. **Units.** Python is cut along its syntax tree: top-level statements, functions, classes, methods; a function or
+   block longer than 60 lines is cut further into its header and the statements of its body, so a long function can
+   keep only the part that matters. Other code and text are cut into blocks between blank lines and at headings, and
+   long paragraphs into sentences. The units cover the context exactly once.
+2. **A graph.** For Python, GLA's code property graph (`gla_code_graph`): calls, data flow from definitions to uses,
+   dependences — so a function brings the functions it calls and the names it reads. For text, neighbouring units and
+   units that share rare words.
+3. **Scores.** Each unit scores by the question's words it contains — rarer words count more, `snake_case` and
+   `camelCase` names are split into their pieces, a unit whose name the question mentions scores high — and the
+   scores then spread over the graph (a personalised PageRank), so what the relevant part depends on scores too.
+4. **The budget.** Units are taken by score until the budget (in the model's own tokens, `tokens.count`) is full.
+   A function that does not fit whole may stay as its **outline**: its signature, the first line of its docstring
+   and the names it calls. The markers' own tokens are counted, so the result is always within the budget.
+
+A context that already fits is returned unchanged.
+
+### Conversations: `fit_chat`
+
+```apsi
+let msgs = tokens.fit_chat(history, budget=8000, keep_last=4)
+```
+
+The system messages and the last `keep_last` messages stay word for word; older messages are focused on the latest
+user message, each in proportion to its size; only if that is still too long are the oldest dropped. It works with any
+model: Apsi's own (`use hub`), a model behind an API, or a model you trained — it is plain text in and out.
+
+### Reference
+
+| Function | Returns | What it does |
+|---|---|---|
+| `focus(context, query="", budget=2000, model="gpt-4o", keep=[], kind="auto", map=true, outlines=true)` | `Focus` | The parts of `context` that matter for `query` within `budget` tokens. `keep`: line numbers or names (`"def parse"`) that must stay whole. `kind`: `"auto"`, `"python"` or `"text"`. `map`: a first line listing the shortened parts. `outlines`: allow outlines. |
+| `Focus` | | `.text` (what to send), `.tokens`, `.saved` (a `Savings`), `.kept`, `.outlined`, `.omitted` (unit numbers), `.units`, `.blocks` (number → what the text shows, the original lines) |
+| `unfold(f, which=none)` | `Str` | The focused text with the shortened parts written out again: all of them (= the original, exactly) or the numbers in `which`. |
+| `fit_chat(messages, budget=8000, model="gpt-4o", keep_last=4)` | list | A conversation within `budget` tokens (above). |
+| `outline(source)` | `Str` | Python source as its outline: every function's signature, first docstring line and the names it calls. |
+
+### When to use which
+
+| Situation | Use |
+|---|---|
+| records, logs, repeated lines, a document resent after edits | `pack`, `dedupe`, `diff` (exact, always safe) |
+| a long file or manual and one question about it | `focus` |
+| a long conversation | `fit_chat` |
+| the model should see the structure of a whole project | `outline` of each file, then `focus` on the file it asks for |
+
+`focus` is optional: if you never call it, nothing changes. When the model needs a part that was left out, it can ask
+for it by number (the map line tells it so) and you send `unfold(f, [n])`. Measured on Apsi's own sources: a
+15,137-token module focused on one question to 1,333 tokens (91 % fewer) with the relevant functions whole;
+`docs/GPU.md` (10,633 tokens) asked how to lower the card's temperature: 550 tokens, the right troubleshooting entry
+whole.
+
 ## Limits
 
 * Token counts without `tiktoken` are estimates; the savings percentage is reliable to a few points because both
@@ -130,3 +226,5 @@ send(text)                                   # and keep method to restore: token
 * Packing changes nothing for data with no repetition; `best()` then returns the smallest form, never a larger one.
 * A model must be told the format in one sentence (examples above). Without that sentence it may misread `§N` or
   `=N` lines.
+* `focus` chooses by words and structure, not by meaning: a question that uses none of the words of the part it
+  needs (a synonym, another language) may not find it. Name the function or the topic, or give `keep=`.

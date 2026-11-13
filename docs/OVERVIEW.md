@@ -198,7 +198,7 @@ is final: it is the first build of the project, completed with 2.4.4; later vers
 
 ## Documentation
 
-- [`WHATS-NEW.md`](WHATS-NEW.md) — **everything new in 2.4.4**, with examples, measurements and limits
+- [`WHATS-NEW.md`](WHATS-NEW.md) — **everything new in 2.6.0**, with examples, measurements and limits ([2.4.4](WHATS-NEW-2.4.4.md))
 - [`GETTING-STARTED.md`](GETTING-STARTED.md) — install, first program, first model, first library
 - [`NATIVE.md`](NATIVE.md) — **native code**: `@native`, `parallel for`, `@gpu`, benchmarks against C, C++, Rust, Go, Java, JavaScript, C#, Julia and Mojo
 - [`LIBRARIES.md`](LIBRARIES.md) — `.apsil` libraries: install, create, pack, publish, the registry API
