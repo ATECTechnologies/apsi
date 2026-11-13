@@ -23,6 +23,15 @@
   batch's loss on the card and reads them once an epoch; tanh gates (gated attention) are computed, applied and
   differentiated on the card (`tanh_s` in float64, rounded once; `axpy_s`; `gate_g`). The processor prepares the
   next batch while the card runs the current one.
+- **One launch per reduction:** column sums, losses, sums of squares and dot products finish in the last block to
+  finish (a counter per launch, reset by that block): the parts are still added in a fixed order, so the bits are
+  the same every run, without the second kernel. Column sums are blocks of 32 columns x 8 lanes of rows (a warp
+  reads 32 adjacent values), with enough chunks of rows to fill the card.
+- **Cross-entropy on the card with accurate exp and log** (Cody-Waite exp, log with a Newton step) instead of the
+  approximate hardware ones.
+- **A loss of your own can keep its large part on the card:** `loss.on_card = (output, labels_of, rest)` computes
+  that output's cross-entropy on the card and sends only the other outputs to the processor. `gla_loss` uses it:
+  the writer's logits never leave the card (one card and many).
 - **Optimizers on the processor keep float64 weights** (a master copy, as NumPy does); the card gets them rounded
   once. Frozen weights stay frozen in the master copy too.
 

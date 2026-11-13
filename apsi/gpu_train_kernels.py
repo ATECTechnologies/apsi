@@ -66,6 +66,7 @@ class _Gen:
         self.ctax_f = d("llvm.nvvm.read.ptx.sreg.ctaid.x", i32, [])
         self.ctay_f = d("llvm.nvvm.read.ptx.sreg.ctaid.y", i32, [])
         self.nctax_f = d("llvm.nvvm.read.ptx.sreg.nctaid.x", i32, [])
+        self.nctay_f = d("llvm.nvvm.read.ptx.sreg.nctaid.y", i32, [])
 
     def G(self, t):
         return t.as_pointer(1)
@@ -93,6 +94,8 @@ def _main_module():
     sin_f = decl("llvm.nvvm.sin.approx.f", f32, [f32])
     cos_f = decl("llvm.nvvm.cos.approx.f", f32, [f32])
     bar_f = decl("llvm.nvvm.barrier0", ir.VoidType(), [])
+    membar_f = decl("llvm.nvvm.membar.gl", ir.VoidType(), [])
+    ld_cg_f = ir.InlineAsm(ir.FunctionType(f32, [i64]), "ld.global.cg.f32 $0, [$1];", "=f,l", side_effect=True)
     smem = ir.GlobalVariable(m, ir.ArrayType(f32, 32), "apsi_smem", addrspace=3)
     smem.linkage = "internal"
     smem.initializer = ir.Constant(ir.ArrayType(f32, 32), None)
@@ -132,6 +135,28 @@ def _main_module():
 
         def atomic_add(self, ptr, idx, val):
             self.b.atomic_rmw("fadd", self.gep(ptr, idx), val, "monotonic")
+
+        def ld_cg(self, ptr, idx):
+            """A load that skips the multiprocessor's own cache (values other blocks of this launch wrote)."""
+            return self.b.call(ld_cg_f, [self.b.ptrtoint(self.gep(ptr, idx), i64)])
+
+        def when_last(self, CNT, slot, nblocks, body):
+            """body() in the last block to finish (of nblocks sharing counter CNT[slot]), after every block's
+            writes are visible; the counter is reset for the next launch. Which block runs it changes from run
+            to run, what it adds and in what order does not: the same bits every run, one launch instead of two."""
+            b = self.b
+            b.call(membar_f, [])
+            b.call(bar_f, [])
+            flag = b.gep(smem, [C(0), C(31)], inbounds=True)
+            with b.if_then(b.icmp_unsigned("==", self.tid, C(0))):
+                old = b.atomic_rmw("add", self.gep(CNT, slot), C(1), "acq_rel")
+                b.store(b.select(b.icmp_unsigned("==", old, b.sub(nblocks, C(1))), F(1.0), F(0.0)), flag)
+            b.call(bar_f, [])
+            with b.if_then(b.fcmp_ordered("==", b.load(flag), F(1.0))):
+                b.call(membar_f, [])
+                body()
+                with b.if_then(b.icmp_unsigned("==", self.tid, C(0))):
+                    b.store(C(0), self.gep(CNT, slot))
 
         def loop(self, lo, hi, step, body):
             b = self.b
@@ -192,6 +217,29 @@ def _main_module():
 
     def i64of(b, x):
         return b.zext(x, i64)
+
+    def sum_parts(k, PART, n, ACC):
+        """ACC[0] += PART[0..n) in a fixed order (parts_sum's order): run by one block."""
+        b = k.b
+        s_ = k.var(F(0.0))
+        k.loop(k.tid, n, C(256), lambda i: b.store(b.fadd(b.load(s_), k.ld_cg(PART, i)), s_))
+        tot = k.block_sum(b.load(s_))
+        with b.if_then(b.icmp_unsigned("==", k.tid, C(0))):
+            k.st(b.fadd(k.ld_cg(ACC, C(0)), tot), ACC, C(0))
+
+    def exp_acc(b, x):
+        """exp with Cody-Waite reduction: 2^k exp(r), |r| <= ln2/2, k exact; ~2 ulp over the whole range."""
+        k = b.call(rint_f, [b.fmul(x, F(LOG2E))])
+        r = b.call(fma_f, [b.fsub(F(0.0), k), F(0.693145751953125), x])
+        r = b.call(fma_f, [b.fsub(F(0.0), k), F(1.428606765330187e-06), r])
+        er = b.call(ex2_f, [b.fmul(r, F(LOG2E))])
+        k1 = b.call(rint_f, [b.fmul(k, F(0.5))])          # 2^k as two halves (no overflow for large k)
+        return b.fmul(b.fmul(er, b.call(ex2_f, [k1])), b.call(ex2_f, [b.fsub(k, k1)]))
+
+    def log_acc(b, x):
+        """log: lg2 then one Newton step on exp(y) = x (accurate near 1 as well)."""
+        y = b.fmul(b.call(lg2_f, [x]), F(0.6931471805599453))
+        return b.fadd(y, b.fsub(b.fmul(x, exp_acc(b, b.fsub(F(0.0), y))), F(1.0)))
 
     # ------------------------------------------------------------------------- element-wise
     k = K("apsi_kernel", [("X", G(f32)), ("n", i32), ("v", f32)])               # fill
@@ -260,52 +308,84 @@ def _main_module():
     k.ret()
 
     # ------------------------------------------------------------------------- column sums (bias / norm gradients)
-    # grid (ceil(N/256), ceil(M/rows)): DB[n] += sum dy; mode 1 (layer norm) DG[n] += sum dy * (x - mean) * rstd;
-    # mode 2 (RMS norm) DG[n] += sum dy * x * rstd and no DB
-    # part=1: each chunk of rows writes its sums to WB / WG [chunk, N] (colsum_fin adds them in order: the same
-    # result every run); part=0 (one chunk): added straight into DB / DG
+    # grid (ceil(N/32), chunks): a block is 32 columns x 8 lanes of rows (a warp reads 32 adjacent values of a row);
+    # DB[n] += sum dy; mode 1 (layer norm) DG[n] += sum dy * (x - mean) * rstd; mode 2 (RMS norm) DG[n] += sum
+    # dy * x * rstd and no DB. The 8 lanes are added in lane order in shared memory; with several chunks each
+    # writes its sums to WB / WG [chunk, N] and the last chunk to finish adds them in chunk order: the same result
+    # every run, one launch.
+    cs_sm = ir.GlobalVariable(m, ir.ArrayType(f32, 512), "apsi_colsum_s", addrspace=3)
+    cs_sm.linkage = "internal"
+    cs_sm.initializer = ir.Constant(ir.ArrayType(f32, 512), None)
     k = K("colsum", [("DY", G(f32)), ("X", G(f32)), ("MEAN", G(f32)), ("RSTD", G(f32)), ("DG", G(f32)),
                      ("DB", G(f32)), ("M", i32), ("N", i32), ("rows", i32), ("mode", i32), ("WB", G(f32)),
-                     ("WG", G(f32)), ("part", i32)])
+                     ("WG", G(f32)), ("part", i32), ("CNT", G(i32))])
     b, p = k.b, k.p
-    n = b.add(b.mul(k.cta, C(256)), k.tid)
-    with b.if_then(b.icmp_unsigned("<", n, p["N"])):
-        r0 = b.mul(k.ctay, p["rows"])
-        r1 = b.select(b.icmp_unsigned("<", b.add(r0, p["rows"]), p["M"]), b.add(r0, p["rows"]), p["M"])
-        sb, sg = k.var(F(0.0)), k.var(F(0.0))
-        Mm1 = b.sub(p["M"], C(1))
+    cl, rl = b.and_(k.tid, C(31)), b.lshr(k.tid, C(5))
+    n = b.add(b.mul(k.cta, C(32)), cl)
+    ncol = b.icmp_unsigned("<", n, p["N"])
+    nc = b.select(ncol, n, C(0))
+    r0 = b.mul(k.ctay, p["rows"])
+    r1 = b.select(b.icmp_unsigned("<", b.add(r0, p["rows"]), p["M"]), b.add(r0, p["rows"]), p["M"])
+    sb, sg = k.var(F(0.0)), k.var(F(0.0))
+    Mm1 = b.sub(p["M"], C(1))
+    is_ln = b.icmp_unsigned("==", p["mode"], C(1))
+    with_x = b.icmp_unsigned("!=", p["mode"], C(0))
 
-        def rows4(with_x):
-            def body(r):                              # 4 rows at a time: 4 independent loads in flight
-                for u in range(4):
-                    rr = b.add(r, C(u))
-                    ok = b.icmp_unsigned("<", rr, r1)
-                    rc = b.select(ok, rr, Mm1)
-                    idx = b.add(b.mul(i64of(b, rc), i64of(b, p["N"])), i64of(b, n))
-                    dy = b.select(ok, k.ld(p["DY"], idx), F(0.0))
-                    b.store(b.fadd(b.load(sb), dy), sb)
-                    if with_x:
-                        mu = b.select(b.icmp_unsigned("==", p["mode"], C(1)), k.ld(p["MEAN"], rc), F(0.0))
-                        xh = b.fmul(b.fsub(k.ld(p["X"], idx), mu), k.ld(p["RSTD"], rc))
-                        b.store(b.call(fma_f, [dy, xh, b.load(sg)]), sg)
-            return body
-        with b.if_else(b.icmp_unsigned("==", p["mode"], C(0))) as (plain, norm):
-            with plain:
-                k.loop(r0, r1, C(4), rows4(False))
-            with norm:
-                k.loop(r0, r1, C(4), rows4(True))
+    def rows4(r):                                     # rows r, r+8, r+16, r+24 of this lane: 4 loads in flight
+        dys, xs = [], []
+        for u in range(4):
+            rr = b.add(r, C(8 * u))
+            ok = b.and_(b.icmp_unsigned("<", rr, r1), ncol)
+            rc = b.select(ok, rr, Mm1)
+            idx = b.add(b.mul(i64of(b, rc), i64of(b, p["N"])), i64of(b, nc))
+            dys.append((ok, rc, idx, k.ld(p["DY"], idx)))
+        for ok, rc, idx, dy in dys:
+            dy = b.select(ok, dy, F(0.0))
+            b.store(b.fadd(b.load(sb), dy), sb)
+            with b.if_then(with_x):
+                mu = b.select(is_ln, k.ld(p["MEAN"], rc), F(0.0))
+                xh = b.fmul(b.fsub(k.ld(p["X"], idx), mu), k.ld(p["RSTD"], rc))
+                b.store(b.call(fma_f, [dy, xh, b.load(sg)]), sg)
+    k.loop(b.add(r0, rl), r1, C(32), rows4)
+    b.store(b.load(sb), b.gep(cs_sm, [C(0), k.tid], inbounds=True))
+    b.store(b.load(sg), b.gep(cs_sm, [C(0), b.add(k.tid, C(256))], inbounds=True))
+    b.call(bar_f, [])
+    tb, tg = k.var(F(0.0)), k.var(F(0.0))
+    with b.if_then(b.and_(b.icmp_unsigned("==", rl, C(0)), ncol)):
+        for lane in range(8):                         # the 8 lanes in order
+            b.store(b.fadd(b.load(tb), b.load(b.gep(cs_sm, [C(0), b.add(cl, C(32 * lane))], inbounds=True))), tb)
+            b.store(b.fadd(b.load(tg), b.load(b.gep(cs_sm, [C(0), b.add(cl, C(256 + 32 * lane))], inbounds=True))),
+                    tg)
         widx = b.add(b.mul(i64of(b, k.ctay), i64of(b, p["N"])), i64of(b, n))
         with b.if_else(b.icmp_unsigned("!=", p["part"], C(0))) as (parted, direct):
             with parted:
                 with b.if_then(b.icmp_unsigned("!=", p["mode"], C(2))):
-                    k.st(b.load(sb), p["WB"], widx)
-                with b.if_then(b.icmp_unsigned("!=", p["mode"], C(0))):
-                    k.st(b.load(sg), p["WG"], widx)
+                    k.st(b.load(tb), p["WB"], widx)
+                with b.if_then(with_x):
+                    k.st(b.load(tg), p["WG"], widx)
             with direct:
                 with b.if_then(b.icmp_unsigned("!=", p["mode"], C(2))):
-                    k.st(b.fadd(k.ld(p["DB"], n), b.load(sb)), p["DB"], n)
-                with b.if_then(b.icmp_unsigned("!=", p["mode"], C(0))):
-                    k.st(b.fadd(k.ld(p["DG"], n), b.load(sg)), p["DG"], n)
+                    k.st(b.fadd(k.ld(p["DB"], n), b.load(tb)), p["DB"], n)
+                with b.if_then(with_x):
+                    k.st(b.fadd(k.ld(p["DG"], n), b.load(tg)), p["DG"], n)
+
+    def colsum_last():                                # the chunks of these 32 columns, added in chunk order
+        with b.if_then(b.and_(b.icmp_unsigned("==", rl, C(0)), ncol)):
+            ub, ug = k.var(F(0.0)), k.var(F(0.0))
+
+            def body(c):
+                at = b.add(b.mul(i64of(b, c), i64of(b, p["N"])), i64of(b, n))
+                with b.if_then(b.icmp_unsigned("!=", p["mode"], C(2))):
+                    b.store(b.fadd(b.load(ub), k.ld_cg(p["WB"], at)), ub)
+                with b.if_then(with_x):
+                    b.store(b.fadd(b.load(ug), k.ld_cg(p["WG"], at)), ug)
+            k.loop(C(0), b.call(g.nctay_f, []), C(1), body)
+            with b.if_then(b.icmp_unsigned("!=", p["mode"], C(2))):
+                k.st(b.fadd(k.ld(p["DB"], n), b.load(ub)), p["DB"], n)
+            with b.if_then(with_x):
+                k.st(b.fadd(k.ld(p["DG"], n), b.load(ug)), p["DG"], n)
+    with b.if_then(b.icmp_unsigned("!=", p["part"], C(0))):
+        k.when_last(p["CNT"], k.cta, b.call(g.nctay_f, []), colsum_last)
     k.ret()
 
     # ksum: C[r, c] += sum over the parts z of W[z, r, c], in order of z (the parts of a split-k product)
@@ -598,13 +678,15 @@ def _main_module():
     k.ret()
 
     # dot_acc: ACC[0] += sum X * Y
-    k = K("dot_acc", [("X", G(f32)), ("Y", G(f32)), ("n", i32), ("ACC", G(f32)), ("PART", G(f32))])
+    k = K("dot_acc", [("X", G(f32)), ("Y", G(f32)), ("n", i32), ("ACC", G(f32)), ("PART", G(f32)),
+                      ("CNT", G(i32))])
     b, p = k.b, k.p
     s_ = k.var(F(0.0))
     k.grid_loop(p["n"], lambda i: b.store(b.call(fma_f, [k.ld(p["X"], i), k.ld(p["Y"], i), b.load(s_)]), s_))
     tot = k.block_sum(b.load(s_))
     with b.if_then(b.icmp_unsigned("==", k.tid, C(0))):
-        k.st(tot, p["PART"], k.cta)                   # one value a block; parts_sum adds them in order
+        k.st(tot, p["PART"], k.cta)                   # one value a block; the last block adds them in order
+    k.when_last(p["CNT"], C(0), k.ncta, lambda: sum_parts(k, p["PART"], k.ncta, p["ACC"]))
     k.ret()
 
     # parts_sum: ACC[0] += sum of PART[0..n) in a fixed order (one block): the same result every run
@@ -640,20 +722,6 @@ def _main_module():
             k.st(F(0.0), p["G"], i)
     k.grid_loop(p["n"], acc2)
     k.ret()
-
-    def exp_acc(b, x):
-        """exp with Cody-Waite reduction: 2^k exp(r), |r| <= ln2/2, k exact; ~2 ulp over the whole range."""
-        k = b.call(rint_f, [b.fmul(x, F(LOG2E))])
-        r = b.call(fma_f, [b.fsub(F(0.0), k), F(0.693145751953125), x])
-        r = b.call(fma_f, [b.fsub(F(0.0), k), F(1.428606765330187e-06), r])
-        er = b.call(ex2_f, [b.fmul(r, F(LOG2E))])
-        k1 = b.call(rint_f, [b.fmul(k, F(0.5))])          # 2^k as two halves (no overflow for large k)
-        return b.fmul(b.fmul(er, b.call(ex2_f, [k1])), b.call(ex2_f, [b.fsub(k, k1)]))
-
-    def log_acc(b, x):
-        """log: lg2 then one Newton step on exp(y) = x (accurate near 1 as well)."""
-        y = b.fmul(b.call(lg2_f, [x]), F(0.6931471805599453))
-        return b.fadd(y, b.fsub(b.fmul(x, exp_acc(b, b.fsub(F(0.0), y))), F(1.0)))
 
     # ew1: Y = f(X), f by kind (EW1): exp, log, sqrt (IEEE), abs, square, 1/x (IEEE), -x, 1/sqrt(x) (IEEE)
     k = K("ew1", [("X", G(f32)), ("Y", G(f32)), ("n", i32), ("kind", i32)])
@@ -1210,7 +1278,7 @@ def _main_module():
     # ------------------------------------------------------------------------- losses (value and gradient at once)
     # the loss values go to PART (one a row / a block); parts_sum adds them in order: the same loss every run
     k = K("ce", [("L", G(f32)), ("LAB", G(i32)), ("DL", G(f32)), ("LOSS", G(f32)), ("M", i32), ("V", i32),
-                 ("wg", f32), ("wl", f32), ("PART", G(f32))])
+                 ("wg", f32), ("wl", f32), ("PART", G(f32)), ("CNT", G(i32))])
     b, p = k.b, k.p
     base = b.mul(i64of(b, k.cta), i64of(b, p["V"]))
     lab = k.ld(p["LAB"], k.cta)
@@ -1219,28 +1287,30 @@ def _main_module():
     k.loop(k.tid, p["V"], C(256), lambda i: b.store(b.call(max_f, [b.load(mx), k.ld(p["L"], b.add(base, i64of(b, i)))]), mx))
     M_ = k.block_sum(b.load(mx), mx=True)
     sm = k.var(F(0.0))
-    k.loop(k.tid, p["V"], C(256), lambda i: b.store(b.fadd(b.load(sm), exp(k, b.fsub(k.ld(p["L"], b.add(base, i64of(b, i))),
-                                                                                     M_))), sm))
+    k.loop(k.tid, p["V"], C(256), lambda i: b.store(b.fadd(b.load(sm), exp_acc(b, b.fsub(
+        k.ld(p["L"], b.add(base, i64of(b, i))), M_))), sm))
     Z = k.block_sum(b.load(sm))
     inv = b.fdiv(F(1.0), Z)
 
     def grad(i):
         idx = b.add(base, i64of(b, i))
-        pr = b.fmul(exp(k, b.fsub(k.ld(p["L"], idx), M_)), inv)
+        pr = b.fmul(exp_acc(b, b.fsub(k.ld(p["L"], idx), M_)), inv)
         pr = b.fsub(pr, b.select(b.icmp_signed("==", i, lab), F(1.0), F(0.0)))
         k.st(b.select(valid, b.fmul(pr, p["wg"]), F(0.0)), p["DL"], idx)
     k.loop(k.tid, p["V"], C(256), grad)
     with b.if_then(b.icmp_unsigned("==", k.tid, C(0))):
-        lse = b.fadd(M_, b.fdiv(b.call(lg2_f, [Z]), F(LOG2E)))
+        lse = b.fadd(M_, log_acc(b, Z))
         safe = b.select(valid, lab, C(0))
         lv = b.fmul(b.fsub(lse, k.ld(p["L"], b.add(base, i64of(b, safe)))), p["wl"])
         k.st(b.select(valid, lv, F(0.0)), p["PART"], k.cta)
+    k.when_last(p["CNT"], C(0), k.ncta, lambda: sum_parts(k, p["PART"], k.ncta, p["LOSS"]))
     k.ret()
 
     # loss_ew: element-wise losses with an optional weight per element (a mask). kind 0: mae |y - t|;
     # kind 1: bce -(t log(s + 1e-12) + (1 - t) log(1 - s + 1e-12)), s = sigmoid(y) (the formula of the NumPy backend)
     k = K("loss_ew", [("Y", G(f32)), ("T", G(f32)), ("W", G(f32)), ("DY", G(f32)), ("LOSS", G(f32)), ("n", i32),
-                      ("wg", f32), ("wl", f32), ("kind", i32), ("hasw", i32), ("PART", G(f32))])
+                      ("wg", f32), ("wl", f32), ("kind", i32), ("hasw", i32), ("PART", G(f32)),
+                      ("CNT", G(i32))])
     b, p = k.b, k.p
     s = k.var(F(0.0))
 
@@ -1266,10 +1336,11 @@ def _main_module():
     tot = k.block_sum(b.load(s))
     with b.if_then(b.icmp_unsigned("==", k.tid, C(0))):
         k.st(b.fmul(tot, p["wl"]), p["PART"], k.cta)
+    k.when_last(p["CNT"], C(0), k.ncta, lambda: sum_parts(k, p["PART"], k.ncta, p["LOSS"]))
     k.ret()
 
     k = K("mse", [("Y", G(f32)), ("T", G(f32)), ("DY", G(f32)), ("LOSS", G(f32)), ("n", i32), ("wg", f32),
-                  ("wl", f32), ("PART", G(f32))])
+                  ("wl", f32), ("PART", G(f32)), ("CNT", G(i32))])
     b, p = k.b, k.p
     s = k.var(F(0.0))
 
@@ -1281,15 +1352,17 @@ def _main_module():
     tot = k.block_sum(b.load(s))
     with b.if_then(b.icmp_unsigned("==", k.tid, C(0))):
         k.st(b.fmul(tot, p["wl"]), p["PART"], k.cta)
+    k.when_last(p["CNT"], C(0), k.ncta, lambda: sum_parts(k, p["PART"], k.ncta, p["LOSS"]))
     k.ret()
 
-    k = K("sumsq", [("X", G(f32)), ("n", i32), ("ACC", G(f32)), ("PART", G(f32))])
+    k = K("sumsq", [("X", G(f32)), ("n", i32), ("ACC", G(f32)), ("PART", G(f32)), ("CNT", G(i32))])
     b, p = k.b, k.p
     s = k.var(F(0.0))
     k.grid_loop(p["n"], lambda i: b.store(b.call(fma_f, [k.ld(p["X"], i), k.ld(p["X"], i), b.load(s)]), s))
     tot = k.block_sum(b.load(s))
     with b.if_then(b.icmp_unsigned("==", k.tid, C(0))):
         k.st(tot, p["PART"], k.cta)
+    k.when_last(p["CNT"], C(0), k.ncta, lambda: sum_parts(k, p["PART"], k.ncta, p["ACC"]))
     k.ret()
 
     # ------------------------------------------------------------------------- optimizers, over all parameters at once

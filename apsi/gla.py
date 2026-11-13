@@ -609,18 +609,25 @@ def gla_batch(samples):
 
 def gla_loss(outs, y, d=None, experts=None, weights=None):
     """GLA 3.0's training loss on the outputs of gla(): writer + 0.3 validity + 0.3 issues + 0.2 alignment + router
-    balance + 0.1 value."""
-    logits, valid, issues, code_vec, sem_c, route, value = outs
-    w = dict(validity=0.3, issues=0.3, align=0.2, value=0.1)
-    w.update(weights or {})
+    balance + 0.1 value. On the card the writer's cross-entropy (the large output) stays on the card; the small heads
+    go to the processor (gla_loss.on_card)."""
+    logits = outs[0]
     V = int(np.shape(ops.raw(logits))[-1])
-    D = int(np.shape(ops.raw(code_vec))[-1]) if d is None else int(d)
-    E = int(np.shape(ops.raw(route))[-1]) - D if experts is None else int(experts)
     tgt = np.asarray(ops.raw(y.w_out)).reshape(-1).astype(np.int64)
     m = np.asarray(ops.raw(y.w_mask)).reshape(-1)
     lp = ops.log_softmax(ops.reshape(logits, -1, V), axis=-1)
     picked = lp[np.arange(len(tgt)), tgt]
     writer = -ops.sum_(picked * m) / (m.sum() + 1e-9)
+    return writer + _gla_rest(outs, y, d, experts, weights)
+
+
+def _gla_rest(outs, y, d=None, experts=None, weights=None):
+    """Every term of gla_loss but the writer's cross-entropy (outs[0] is not read)."""
+    _, valid, issues, code_vec, sem_c, route, value = outs
+    w = dict(validity=0.3, issues=0.3, align=0.2, value=0.1)
+    w.update(weights or {})
+    D = int(np.shape(ops.raw(code_vec))[-1]) if d is None else int(d)
+    E = int(np.shape(ops.raw(route))[-1]) - D if experts is None else int(experts)
     vy = np.asarray(ops.raw(y.valid)).reshape(-1)
     vl = ops.reshape(valid, -1)
     sp = lambda z: ops.log(1.0 + ops.exp(-ops.abs_(z))) + ops.relu(z)            # noqa: E731  softplus
@@ -630,7 +637,20 @@ def gla_loss(outs, y, d=None, experts=None, weights=None):
     align = _info_nce(code_vec, sem_c, 0.07)
     router = router_balance(route[:, D:D + E], E)
     value_l = ops.mean((ops.reshape(value, -1) - vy) ** 2)
-    return writer + w["validity"] * validity + w["issues"] * iss + w["align"] * align + router + w["value"] * value_l
+    return w["validity"] * validity + w["issues"] * iss + w["align"] * align + router + w["value"] * value_l
+
+
+def _writer_labels(y):
+    """The writer's targets for the card's cross-entropy (-1 where the mask is 0), or None for a mask that is not
+    0 / 1 (then the whole loss runs on the processor)."""
+    m = np.asarray(ops.raw(y.w_mask)).reshape(-1)
+    if not np.all((m == 0) | (m == 1)):
+        return None
+    tgt = np.asarray(ops.raw(y.w_out)).reshape(-1).astype(np.int64)
+    return np.where(m > 0, tgt, -1)
+
+
+gla_loss.on_card = (0, _writer_labels, _gla_rest)        # (output, labels of the targets, the rest of the loss)
 
 
 def gla_accuracy(model, params, batch):

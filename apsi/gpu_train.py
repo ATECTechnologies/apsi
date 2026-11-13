@@ -907,6 +907,7 @@ class Gpu(_Ops):
                     lib.cuMemcpyHtoDAsync_v2.argtypes = [ctypes.c_uint64, ctypes.c_void_p, ctypes.c_size_t,
                                                          ctypes.c_void_p]
                     lib.cuMemFreeHost.argtypes = [ctypes.c_void_p]
+                    lib.cuEventQuery.argtypes = [ctypes.c_void_p]
                     self.dev.ensure()
                     ptr = ctypes.c_void_p()
                     self.dev.drv.check(lib.cuMemHostAlloc(ctypes.byref(ptr), self.RING, 1), "cuMemHostAlloc")
@@ -930,6 +931,8 @@ class Gpu(_Ops):
             self.dev.drv.check(lib.cuEventSynchronize(q[last][2]), "cuEventSynchronize")
             r["free"].extend(ev for _, _, ev in q[:last + 1])
             del q[:last + 1]
+        while len(q) > 64 and lib.cuEventQuery(q[0][2]) == 0:     # finished copies leave the queue
+            r["free"].append(q.pop(0)[2])
         ctypes.memmove(r["ptr"] + start, a.ctypes.data, n)
         self.dev.ensure()
         self.dev.drv.check(lib.cuMemcpyHtoDAsync_v2(ctypes.c_uint64(dptr), ctypes.c_void_p(r["ptr"] + start),
@@ -999,21 +1002,20 @@ class Gpu(_Ops):
         self._go("act_b", self.blocks(n), 256, self.p(X), self.p(DY), self.p(DX), ("u", n), ("u", kind))
 
     def colsum(self, DY, X, MEAN, RSTD, DG, DB, M, N, mode):
-        """Column sums with no atomic additions: chunks of rows write their sums, colsum_fin adds them in order, so
-        the result is the same every run (deterministic training)."""
-        rows = 64 if M <= 64 * 512 else -(-M // 512)
+        """Column sums with no atomic additions: blocks of 32 columns x 8 lanes of rows; enough chunks of rows to
+        fill the card (at most 64 rows a lane), each chunk's sums added in order by the last chunk to finish, so the
+        result is the same every run (deterministic training) in one launch."""
+        cb = -(-N // 32)
+        chunks = max(-(-M // 512), min(-(-4 * self.sms // cb), -(-M // 32)), 1)
+        chunks = min(chunks, 65535)
+        rows = -(-M // chunks)
         chunks = -(-M // rows)
         part = chunks > 1
-        WB = self._scratch("colsum_wb", chunks * N) if part and mode != 2 else (None if not part else
-                                                                             self._scratch("colsum_wb", 1))
-        WG = self._scratch("colsum_wg", chunks * N) if part and mode != 0 else (None if not part else
-                                                                             self._scratch("colsum_wg", 1))
-        self._go("colsum", ((N + 255) // 256, chunks), 256, self.p(DY), self.p(X), self.p(MEAN),
+        WB = self._scratch("colsum_wb", chunks * N if part and mode != 2 else 1)
+        WG = self._scratch("colsum_wg", chunks * N if part and mode != 0 else 1)
+        self._go("colsum", (cb, chunks), 256, self.p(DY), self.p(X), self.p(MEAN),
                  self.p(RSTD), self.p(DG), self.p(DB), ("u", M), ("u", N), ("u", rows), ("u", mode), self.p(WB),
-                 self.p(WG), ("u", 1 if part else 0))
-        if part:
-            self._go("colsum_fin", self.blocks(N), 256, self.p(WB), self.p(WG), self.p(DG), self.p(DB), ("u", N),
-                     ("u", chunks), ("u", mode))
+                 self.p(WG), ("u", 1 if part else 0), self._cnt())
 
     def ln_f(self, X, Gm, Bt, Y, MEAN, RSTD, M, N, eps, rms):
         self._go("ln_f", -(-M // 8), 256, self.p(X), self.p(Gm), self.p(Bt), self.p(Y), self.p(MEAN), self.p(RSTD),
@@ -1058,29 +1060,25 @@ class Gpu(_Ops):
     def ce(self, L, LAB, DL, LOSS, M, V, wg, wl):
         part = self._scratch("loss_part", max(1, M))
         self._go("ce", M, 256, self.p(L), self.p(LAB), self.p(DL), self.p(LOSS), ("u", M), ("u", V), ("f", wg),
-                 ("f", wl), self.p(part))
-        self._go("parts_sum", 1, 256, self.p(part), ("u", M), self.p(LOSS))
+                 ("f", wl), self.p(part), self._cnt())
 
     def loss_ew(self, Y, T, W, DY, LOSS, n, wg, wl, kind):
         nb = self.blocks(n)
         part = self._scratch("loss_part", nb)
         self._go("loss_ew", nb, 256, self.p(Y), self.p(T), self.p(W if W is not None else Y), self.p(DY),
                  self.p(LOSS), ("u", n), ("f", wg), ("f", wl), ("u", kind), ("u", 1 if W is not None else 0),
-                 self.p(part))
-        self._go("parts_sum", 1, 256, self.p(part), ("u", nb), self.p(LOSS))
+                 self.p(part), self._cnt())
 
     def mse(self, Y, T, DY, LOSS, n, wg, wl):
         nb = self.blocks(n)
         part = self._scratch("loss_part", nb)
         self._go("mse", nb, 256, self.p(Y), self.p(T), self.p(DY), self.p(LOSS), ("u", n), ("f", wg),
-                 ("f", wl), self.p(part))
-        self._go("parts_sum", 1, 256, self.p(part), ("u", nb), self.p(LOSS))
+                 ("f", wl), self.p(part), self._cnt())
 
     def sumsq(self, X, n, ACC):
         nb = min(self.blocks(n), 1024)
         part = self._scratch("sumsq_part", nb)
-        self._go("sumsq", nb, 256, self.p(X), ("u", n), self.p(ACC), self.p(part))
-        self._go("parts_sum", 1, 256, self.p(part), ("u", nb), self.p(ACC))
+        self._go("sumsq", nb, 256, self.p(X), ("u", n), self.p(ACC), self.p(part), self._cnt())
 
     def adam(self, Pm, Gr, Mm, Vm, SQ, n, n_decay, lr, b1, b2, eps, c1, c2, wd, clip, COMP=None):
         self._wgen += 1
@@ -1118,8 +1116,7 @@ class Gpu(_Ops):
     def dot_acc(self, X, Y, n, ACC):
         nb = min(self.blocks(n), 1024)
         part = self._scratch("dot_part", nb)
-        self._go("dot_acc", nb, 256, self.p(X), self.p(Y), ("u", n), self.p(ACC), self.p(part))
-        self._go("parts_sum", 1, 256, self.p(part), ("u", nb), self.p(ACC))
+        self._go("dot_acc", nb, 256, self.p(X), self.p(Y), ("u", n), self.p(ACC), self.p(part), self._cnt())
 
     def scale_add(self, Z, X, S, n, c):
         self._go("scale_add", self.blocks(n), 256, self.p(Z), self.p(X), self.p(S), ("u", n), ("f", c))
@@ -1364,6 +1361,15 @@ class Gpu(_Ops):
         self.profile = prof
         self._choice[key] = best
         return best
+
+    def _cnt(self):
+        """Counters of the kernels whose last block finishes the sum (zero between launches: that block resets its
+        own), one per column block: 65536 of them, made once."""
+        c = self.__dict__.get("_counters")
+        if c is None:
+            c = self._counters = (self.alloc(65536), 0)
+            self.fill(c, 65536, 0.0)
+        return self.p(c)
 
     def _scratch(self, key, n):
         bf = self._scr.get(key)
@@ -4846,20 +4852,52 @@ def fit_batches(model, params, batches, loss="cross_entropy", opt=None, epochs=1
     return Record(params=out_params, history=history, device=getattr(ops, "name", "?"))
 
 
-def _multi_loss(ops, net, outs, shapes, loss_fn, Yr, group):
-    """The loss of several outputs on the processor: (value, [gradient view of each output])."""
+def _multi_loss(ops, net, outs, shapes, loss_fn, Yr, group, arena=None):
+    """The loss of several outputs: (value, [gradient view of each output]). A loss with `on_card = (i, labels_of,
+    rest)` keeps output i's cross-entropy on the card (labels_of(targets): class ids, -1 ignored; or None for the
+    processor) and sends only the other outputs to the processor, where rest(outputs, targets) adds the rest of
+    the loss; any other loss runs on the processor over every output."""
     from . import ops as aops
     from .stdlib import value_and_grad
-    hs = [ops.get(o_[0], int(np.prod(s_)), o_[1]).reshape(s_).astype(np.float64) for o_, s_ in zip(outs, shapes)]
-    lv, gh = value_and_grad(lambda *os_: loss_fn(list(os_), Yr), wrt=tuple(range(len(hs))))(*hs)
+    arena = arena if arena is not None else net.arena
+    douts, fn, card, lossv = [None] * len(outs), loss_fn, set(), None
+    spec = getattr(loss_fn, "on_card", None)
+    if spec is not None:
+        i_ce, labels_of, rest = spec
+        lab = labels_of(Yr)
+        if lab is not None:
+            lab = np.ascontiguousarray(np.asarray(lab).reshape(-1).astype(np.int32))
+            rows, V = _rows(shapes[i_ce]), int(shapes[i_ce][-1])
+            if lab.size != rows:
+                raise TrainError(f"cross_entropy on the card: {lab.size} labels for {rows} rows of output {i_ce}")
+            yd = arena.get("ce_labels", lab.size)
+            ops.put(yd[0], lab, yd[1])
+            d = arena.get(("dout", i_ce), rows * V)
+            lossv = arena.get("ce_loss", 1)
+            ops.fill(lossv, 1, 0.0)
+            w = 1.0 / max(int((lab >= 0).sum()), 1)
+            ops.ce(outs[i_ce], yd, d, lossv, rows, V, w / group, w)
+            douts[i_ce], fn, card = d, rest, {i_ce}
+    keep = [i for i in range(len(outs)) if i not in card]
+    hs = [ops.get(outs[i][0], int(np.prod(shapes[i])), outs[i][1]).reshape(shapes[i]).astype(np.float64)
+          for i in keep]
+
+    def f(*os_):
+        full = [None] * len(outs)
+        for j, i in enumerate(keep):
+            full[i] = os_[j]
+        return fn(full, Yr)
+    lv, gh = value_and_grad(f, wrt=tuple(range(len(hs))))(*hs)
     gh = gh if isinstance(gh, (list, tuple)) else [gh]
-    douts = []
-    for i, (g_, s_) in enumerate(zip(gh, shapes)):
+    for i, g_ in zip(keep, gh):
         a = np.asarray(aops.raw(g_), np.float32).reshape(-1) / group
-        d = net.arena.get(("dout", i), max(1, a.size))
+        d = arena.get(("dout", i), max(1, a.size))
         ops.put(d[0], a, d[1])
-        douts.append(d)
-    return float(aops.raw(lv)), douts
+        douts[i] = d
+    total = float(aops.raw(lv))
+    if lossv is not None:
+        total += float(ops.get(lossv[0], 1, lossv[1])[0])
+    return total, douts
 
 
 def _rows_of(X):

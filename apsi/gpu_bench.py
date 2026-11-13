@@ -243,18 +243,19 @@ def _check_flow(ops, out):
     lm = L.transformer_lm(256, d=128, heads=2, layers=2, context=128)
     batches = [(rng.integers(0, 256, (8, 128)), rng.integers(0, 256, (8, 128))) for _ in range(24)]
     kw = dict(epochs=2, verbose=False, precision="auto", ops=ops)
-    runs, secs = [], {}
-    for mode in ("1", "1", "0"):
+    runs, secs = [], {"0": 1e9, "1": 1e9}
+    for mode in ("1", "1", "0", "1", "0"):             # the first run builds and tunes; then the best of two each
         with mock.patch.dict(os.environ, {"APSI_GPU_ASYNC_COPY": mode}):
-            if mode == "0":
-                ops.__dict__.pop("_ring", None)
+            ops.__dict__.pop("_ring", None)
+            ops.sync()
             t0 = time.perf_counter()
             runs.append(GT.fit_batches(lm, lm.init(seed=0), batches, "cross_entropy", opt=Adam(1e-3), **kw))
             ops.sync()
-            secs[mode] = time.perf_counter() - t0
+            if len(runs) > 1:
+                secs[mode] = min(secs[mode], time.perf_counter() - t0)
     ops.__dict__.pop("_ring", None)
-    same = all(np.array_equal(np.asarray(a), np.asarray(b))
-               for a, b in zip(tree_leaves(runs[0].params), tree_leaves(runs[1].params)))
+    same = all(np.array_equal(np.asarray(a), np.asarray(b)) for r in runs[1:]
+               for a, b in zip(tree_leaves(runs[0].params), tree_leaves(r.params)))
     steps = 2 * len(batches)
     print(f"  {'ok  ' if same else 'FAIL'} {'flow (fused attention)':<22} losses {runs[0].history[0]:.4f} -> "
           f"{runs[0].history[-1]:.4f}  ({'the same weights twice' if same else 'NOT the same weights twice'}; "
