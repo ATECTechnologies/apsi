@@ -28,7 +28,7 @@ MAIN = ("apsi_kernel", "axpy", "add3", "mul3", "act_f", "act_b", "colsum", "ln_f
         "gemm_simt", "gather", "rope", "spmm", "edge_dot", "seg_softmax", "seg_softmax_b", "dot_acc", "scale_add",
         "cols", "colmul", "topk_gate", "topk_gate_b", "loss_ew", "im2col", "col2im", "perm_nc", "pool_f", "pool_b",
         "lstm_f", "lstm_b", "gru_a", "gru_b", "gru_b1", "gru_b2", "taylor_f", "taylor_b", "rowbias", "acc2",
-        "fin2", "ew1", "ew2", "colsum_fin", "embed_bs", "parts_sum", "ksum", "tanh_s", "axpy_s", "gate_g")
+        "fin2", "ew1", "ew2", "colsum_fin", "embed_bs", "parts_sum", "ksum", "tanh_s", "axpy_s", "gate_g", "pad2")
 TC = ("apsi_kernel", "gemm_tc3")                     # apsi_kernel = the one-pass product
 
 
@@ -824,6 +824,23 @@ def _main_module():
             with fw:
                 k.st(k.ld(p["X"], i), p["Y"], j)
     k.grid_loop(b.mul(p["rows"], p["w"]), cols)
+    k.ret()
+
+    # pad2: Y (rows_p x cols_p) <- X (rows x cols, dense), zeros outside: one pass, no separate fill (operands of
+    # products whose sizes are not multiples of 4, made tile-friendly)
+    k = K("pad2", [("X", G(f32)), ("Y", G(f32)), ("rows", i32), ("cols", i32), ("rows_p", i32), ("cols_p", i32)])
+    b, p = k.b, k.p
+
+    def pad2(i):
+        r, c = b.udiv(i, p["cols_p"]), b.urem(i, p["cols_p"])
+        inside = b.and_(b.icmp_unsigned("<", r, p["rows"]), b.icmp_unsigned("<", c, p["cols"]))
+        with b.if_else(inside) as (yes, no):
+            with yes:
+                j = b.add(b.mul(i64of(b, r), i64of(b, p["cols"])), i64of(b, c))
+                k.st(k.ld(p["X"], j), p["Y"], i)
+            with no:
+                k.st(F(0.0), p["Y"], i)
+    k.grid_loop(b.mul(p["rows_p"], p["cols_p"]), pad2)
     k.ret()
 
     # colmul: Y[i] = X[i] * S[i % D]   (a scale per feature)

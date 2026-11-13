@@ -1511,11 +1511,18 @@ def _r4(n):
 
 
 def _pad_into(ops, key, src, rows, cols, rows_p, cols_p):
-    """src (rows x cols, dense) into a zeroed scratch buffer of rows_p x cols_p: the tiled kernels read 16 bytes at a
-    time and need sizes that are multiples of 4; zeros add nothing to a product."""
+    """src (rows x cols, dense) as rows_p x cols_p with zeros around it, in one pass (the tiled kernels read 16 bytes
+    at a time and need sizes that are multiples of 4; zeros add nothing to a product). Already the right size: src
+    itself, no copy."""
+    if rows_p == rows and cols_p == cols:
+        return src
     dst = ops._scratch(key, rows_p * cols_p)
-    ops.fill(dst, rows_p * cols_p, 0.0)
-    ops.cols(src, dst, rows, cols, cols_p, 0, False)
+    if "pad2" in ops.fn:
+        ops._go("pad2", ops.blocks(rows_p * cols_p), 256, ops.p(src), ops.p(dst), ("u", rows), ("u", cols),
+                ("u", rows_p), ("u", cols_p))
+    else:
+        ops.fill(dst, rows_p * cols_p, 0.0)
+        ops.cols(src, dst, rows, cols, cols_p, 0, False)
     return dst
 
 
@@ -1538,7 +1545,10 @@ def _gemm_padded_impl(ops, A, B, Cv, bias, M, N, K, sam, sak, sbk, sbn, alpha, b
     else:                                              # B stored N x K
         Bp = _pad_into(ops, "pad_b", B, N, K, Np, Kp)
         b_str = (1, Kp)
-    if beta:
+    direct = (Mp, Np) == (M, N)                         # only k was padded: C is written in place
+    if direct:
+        Cp = Cv
+    elif beta:
         Cp = _pad_into(ops, "pad_c", Cv, M, N, Mp, Np)
     else:
         Cp = ops._scratch("pad_c", Mp * Np)
@@ -1547,7 +1557,8 @@ def _gemm_padded_impl(ops, A, B, Cv, bias, M, N, K, sam, sak, sbk, sbn, alpha, b
         return False
     ops._gemm(Ap, Bp, Cp, biasp, Mp, Np, Kp, a_str[0], a_str[1], b_str[0], b_str[1], Np, 1, 1, (0, 0), (0, 0),
               (0, 0), alpha, beta, 1)
-    ops.cols(Cv, Cp, M, N, Np, 0, True)                 # the M x N corner back into C
+    if not direct:
+        ops.cols(Cv, Cp, M, N, Np, 0, True)             # the M x N corner back into C
     return True
 
 
