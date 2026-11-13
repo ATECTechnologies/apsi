@@ -15,7 +15,14 @@
   run. Column sums (bias and norm gradients) write per-block parts added in a fixed order (`colsum_fin`); embedding
   gradients use a sorted index (`embed_bs`, one thread per row, ids in order); sums of squares, dot products and
   losses write per-block parts (`parts_sum`); split-k products write each slice to a workspace and add them in order
-  (`ksum`). The same training twice gives the same weights bit for bit.
+  (`ksum`). The fused attention's backward computes dQ in a kernel of its own, a block per 64 queries summing
+  over the key tiles in registers, instead of adding it atomically. The same training twice gives the same weights
+  bit for bit. (`APSI_GPU_DETERMINISTIC=0` brings back the one-kernel attention backward with atomic dQ.)
+- **The processor never waits for the card inside a step:** copies to the card go through pinned memory and are
+  queued behind the kernels already launched (`APSI_GPU_ASYNC_COPY=0` turns this off); `fit_batches` keeps each
+  batch's loss on the card and reads them once an epoch; tanh gates (gated attention) are computed, applied and
+  differentiated on the card (`tanh_s` in float64, rounded once; `axpy_s`; `gate_g`). The processor prepares the
+  next batch while the card runs the current one.
 - **Optimizers on the processor keep float64 weights** (a master copy, as NumPy does); the card gets them rounded
   once. Frozen weights stay frozen in the master copy too.
 

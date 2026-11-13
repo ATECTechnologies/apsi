@@ -85,6 +85,12 @@ class _Ops:
             self.axpy(Cv, X2, n)
 
 
+def _deterministic():
+    """The same bits every run (the default): kernels add in a fixed order, never atomically. APSI_GPU_DETERMINISTIC=0
+    lets the fused attention's backward add dQ atomically (one kernel instead of two)."""
+    return os.environ.get("APSI_GPU_DETERMINISTIC", "1").strip().lower() not in ("0", "false", "no", "off")
+
+
 def _bf16(x):
     u = np.ascontiguousarray(x, np.float32).view(np.uint32).astype(np.uint64)
     r = ((u + 0x7FFF + ((u >> 16) & 1)) >> 16) << 16
@@ -131,6 +137,18 @@ class Emulator(_Ops):
     def pull(self, dst, src_ops, src, n):
         """dst (on this device) <- src (on src_ops' device): n float32."""
         self.v(dst, n)[:] = src_ops.v(src, n)
+
+    def tanh_s(self, OUT, W):
+        self.v(OUT, 1)[0] = np.float32(math.tanh(float(self.v(W, 1)[0])))
+
+    def axpy_s(self, Y, X, n, S):
+        y = self.v(Y, n)
+        y[:] = (np.float64(self.v(S, 1)[0]) * self.v(X, n).astype(np.float64) + y).astype(np.float32)
+
+    def gate_g(self, G, DG, TH):
+        th = float(self.v(TH, 1)[0])
+        g = self.v(G, 1)
+        g[0] = g[0] + np.float32(float(self.v(DG, 1)[0]) * (1.0 - th * th))
 
     def add3(self, Z, X, Y, n):
         self.v(Z, n)[:] = self.v(X, n) + self.v(Y, n)
@@ -757,7 +775,7 @@ class Gpu(_Ops):
             try:                                         # attention in one kernel each way
                 fmod, self.fn["flash_dot"] = dev.load("apsi-train-flash-1", KS.ptx("flash"))
                 for hd in KS.FLASH_HD:
-                    for kind in "fb":
+                    for kind in "fbkq":
                         f = ctypes.c_void_p()
                         dev.drv.check(lib.cuModuleGetFunction(ctypes.byref(f), fmod, f"flash_{kind}{hd}".encode()),
                                       "cuModuleGetFunction")
@@ -863,11 +881,68 @@ class Gpu(_Ops):
         self.dev.free(b.ptr)
         self._calls.clear()
 
+    RING = 64 << 20                                      # pinned staging memory for copies to the card
+
     def put(self, b, a, off=0):
+        """Host -> card without waiting: the values go through pinned memory and a copy queued behind the kernels
+        already launched, so the processor prepares the next batch while the card works (the order on the card is
+        the order of the calls, as before). Large arrays (over a quarter of the ring) copy directly."""
         a = np.ascontiguousarray(a)
         if a.dtype not in (np.float32, np.int32, np.uint32):
             a = a.astype(np.float32)
-        self.dev.to_device(b.ptr + 4 * off, a.ctypes.data, a.nbytes)
+        n = a.nbytes
+        if n and n <= self.RING // 4 and self._ring_ready():
+            self._put_async(b.ptr + 4 * off, a, n)
+            return
+        self.dev.to_device(b.ptr + 4 * off, a.ctypes.data, n)
+
+    def _ring_ready(self):
+        r = self.__dict__.get("_ring")
+        if r is None:
+            r = False
+            if os.environ.get("APSI_GPU_ASYNC_COPY", "1").strip().lower() not in ("0", "false", "no", "off"):
+                try:
+                    lib = self._lib
+                    lib.cuMemHostAlloc.argtypes = [ctypes.POINTER(ctypes.c_void_p), ctypes.c_size_t, ctypes.c_uint]
+                    lib.cuMemcpyHtoDAsync_v2.argtypes = [ctypes.c_uint64, ctypes.c_void_p, ctypes.c_size_t,
+                                                         ctypes.c_void_p]
+                    lib.cuMemFreeHost.argtypes = [ctypes.c_void_p]
+                    self.dev.ensure()
+                    ptr = ctypes.c_void_p()
+                    self.dev.drv.check(lib.cuMemHostAlloc(ctypes.byref(ptr), self.RING, 1), "cuMemHostAlloc")
+                    r = {"ptr": ptr.value, "head": 0, "q": [], "free": []}
+                except Exception:                        # noqa: BLE001  (no pinned memory: plain copies)
+                    r = False
+            self._ring = r
+        return bool(r)
+
+    def _put_async(self, dptr, a, n):
+        r, lib = self._ring, self._lib
+        size = (n + 255) & ~255
+        start = r["head"] if r["head"] + size <= self.RING else 0
+        end = start + size
+        q = r["q"]
+        last = -1                                        # the newest copy still using any of [start, end)
+        for i, (s0, e0, _) in enumerate(q):
+            if s0 < end and start < e0:
+                last = i
+        if last >= 0:                                    # copies run in order: waiting for it covers the older ones
+            self.dev.drv.check(lib.cuEventSynchronize(q[last][2]), "cuEventSynchronize")
+            r["free"].extend(ev for _, _, ev in q[:last + 1])
+            del q[:last + 1]
+        ctypes.memmove(r["ptr"] + start, a.ctypes.data, n)
+        self.dev.ensure()
+        self.dev.drv.check(lib.cuMemcpyHtoDAsync_v2(ctypes.c_uint64(dptr), ctypes.c_void_p(r["ptr"] + start),
+                                                    ctypes.c_size_t(n), None), "cuMemcpyHtoDAsync")
+        ev = r["free"].pop() if r["free"] else self._event_light()
+        self.dev.drv.check(lib.cuEventRecord(ev, None), "cuEventRecord")
+        q.append((start, end, ev))
+        r["head"] = end
+
+    def _event_light(self):
+        e = ctypes.c_void_p()
+        self.dev.drv.check(self._lib.cuEventCreate(ctypes.byref(e), 2), "cuEventCreate")     # no timing
+        return e
 
     def get(self, b, n, off=0):
         out = np.empty(n, np.float32)
@@ -1052,6 +1127,15 @@ class Gpu(_Ops):
     def acc2(self, HI, LO, Gr, n, clear=True):
         self._go("acc2", self.blocks(n), 256, self.p(HI), self.p(LO), self.p(Gr), ("u", n), ("u", 1 if clear else 0))
 
+    def tanh_s(self, OUT, W):
+        self._go("tanh_s", 1, 32, self.p(OUT), self.p(W))
+
+    def axpy_s(self, Y, X, n, S):
+        self._go("axpy_s", self.blocks(n), 256, self.p(Y), self.p(X), ("u", n), self.p(S))
+
+    def gate_g(self, G, DG, TH):
+        self._go("gate_g", 1, 32, self.p(G), self.p(DG), self.p(TH))
+
     def ew1(self, X, Y, n, kind):
         self._go("ew1", self.blocks(n), 256, self.p(X), self.p(Y), ("u", n), ("u", kind))
 
@@ -1144,6 +1228,15 @@ class Gpu(_Ops):
                  ("u", H), ("u", hd), ("u", rows))
 
     def flash_bwd(self, Q, K, V, DO, L, DD, DQ, DK, DV, B, T, H, hd, causal, scale):
+        if _deterministic():                             # dK, dV per key block; dQ per query block: no atomics
+            grid, s2 = (-(-T // KS.BQ), B * H), scale * 1.4426950408889634
+            c = 1 if causal else 0
+            self._go(f"flash_k{hd}", grid, 128, self.p(Q), self.p(K), self.p(V), self.p(DO), self.p(L), self.p(DD),
+                     self.p(DQ), self.p(DK), self.p(DV), ("u", T), ("u", H * hd), ("u", H), ("f", scale), ("f", s2),
+                     ("u", c))
+            self._go(f"flash_q{hd}", grid, 128, self.p(Q), self.p(K), self.p(V), self.p(DO), self.p(L), self.p(DD),
+                     self.p(DQ), ("u", T), ("u", H * hd), ("u", H), ("f", scale), ("f", s2), ("u", c))
+            return
         self.fill(DQ, B * T * H * hd, 0.0)
         self._go(f"flash_b{hd}", (-(-T // KS.BQ), B * H), 128, self.p(Q), self.p(K), self.p(V), self.p(DO),
                  self.p(L), self.p(DD), self.p(DQ), self.p(DK), self.p(DV), ("u", T), ("u", H * hd), ("u", H),
@@ -1818,12 +1911,13 @@ class _Attention(_Node):
         if self.gated:                                  # y = tanh(gate) (att Wo) (+ residual)
             z = self.buf("z", M * D)
             o.gemm(att, self.Wo.w, z, M, D, D, D, 1, D, 1, D, passes=ps)
-            self.z, self.th = z, math.tanh(float(o.get(self.g.w[0], 1, self.g.w[1])[0]))
+            self.z, self.th = z, self.buf("th", 1)      # tanh(gate) on the card: no wait for the card here
+            o.tanh_s(self.th, self.g.w)
             if residual is not None:
                 o.pull(y, o, residual, M * D)
             else:
                 o.fill(y, M * D, 0.0)
-            o.axpy(y, z, M * D, self.th)
+            o.axpy_s(y, z, M * D, self.th)
             return y, shape
         o.gemm(att, self.Wo.w, y, M, D, D, D, 1, D, 1, D, bias=self.bo.w if self.bo else None, passes=ps, epi=3 if residual else 0,
                X2=residual)
@@ -1847,12 +1941,10 @@ class _Attention(_Node):
         if self.gated:                                  # d gate = (1 - tanh^2) dy . z; the rest sees tanh(gate) dy
             dg = self.gbuf("dg", 1)
             o.edge_dot(dy, self.z, _put_buf(self, "zero1", [0]), _put_buf(self, "zero2", [0]), dg, 1, 1, M * D)
-            v_ = float(o.get(dg[0], 1, dg[1])[0]) * (1.0 - self.th * self.th)
-            o.put(dg[0], np.array([v_], np.float32), dg[1])
-            o.axpy(self.g.g, dg, 1, 1.0)
+            o.gate_g(self.g.g, dg, self.th)
             dz = self.gbuf("dz", M * D)
             o.fill(dz, M * D, 0.0)
-            o.axpy(dz, dy, M * D, self.th)
+            o.axpy_s(dz, dy, M * D, self.th)
             dy = dz
         o.gemm(self.att, dy, self.Wo.g, D, D, M, 1, D, D, 1, D, beta=True, passes=ps, db=self.bo.g if self.bo else None)
         datt = self.gbuf("datt", M * D)
@@ -4643,6 +4735,7 @@ def fit_batches(model, params, batches, loss="cross_entropy", opt=None, epochs=1
     st1, st2, SQ = ops.alloc(n), (ops.alloc(n) if adam else None), ops.alloc(1)
     COMP = ops.alloc(n) if _want_comp(compensated, params) else None
     LOSS1 = ops.alloc(1)
+    LOSSB = None                                         # each batch's loss, read once an epoch (no wait a batch)
     for b_ in (st1, st2, COMP):
         if b_ is not None:
             ops.fill((b_, 0), n, 0.0)
@@ -4662,6 +4755,12 @@ def fit_batches(model, params, batches, loss="cross_entropy", opt=None, epochs=1
             if not items:
                 raise TrainError("no batches")
             tot, rows_all = 0.0, 0
+            if LOSSB is None or LOSSB.n < len(items):
+                if LOSSB is not None:
+                    ops.free(LOSSB)
+                LOSSB = ops.alloc(len(items))
+            ops.fill((LOSSB, 0), len(items), 0.0)
+            on_card = []                                 # the batches whose loss is in LOSSB
             A = max(1, int(accumulate or 1))
             for bi, item in enumerate(items):
                 group = min(A, len(items) - (bi // A) * A)       # the batches of this step
@@ -4707,32 +4806,37 @@ def fit_batches(model, params, batches, loss="cross_entropy", opt=None, epochs=1
                                               Yr.astype(np.float32)).reshape(-1)
                     yd = net.arena.get("Y", ya.size)
                     ops.put(yd[0], ya, yd[1])
-                    ops.fill((LOSS1, 0), 1, 0.0)
                     if loss == "cross_entropy":
                         if ya.size != rows:
                             raise TrainError(f"cross_entropy: {ya.size} labels for {rows} rows of output")
                         w = 1.0 / max(int((ya >= 0).sum()), 1)
-                        ops.ce(out, yd, dout, (LOSS1, 0), rows, C, w / group, w)
+                        ops.ce(out, yd, dout, (LOSSB, bi), rows, C, w / group, w)
                     else:
                         if ya.size != m:
                             raise TrainError(f"{loss}: targets of {ya.size} values for an output of {m}")
-                        _regress(ops, loss, out, yd, dout, (LOSS1, 0), m, 1.0 / (m * group), 1.0 / m)
-                    lv = float(ops.get(LOSS1, 1)[0])
+                        _regress(ops, loss, out, yd, dout, (LOSSB, bi), m, 1.0 / (m * group), 1.0 / m)
+                    on_card.append(bi)
+                    lv = None
                 net.backward(dout)
                 if EXACT is not None:                         # this batch's gradients, summed exactly
                     ops.acc2((EXACT[0], 0), (EXACT[1], 0), (net.G, 0), n)
-                tot += lv
+                if lv is not None:
+                    tot += lv
                 rows_all += 1
                 if (bi + 1) % A and bi + 1 < len(items):
                     continue                                 # gradients add up until the step's last batch
                 t, step = _apply_step(ops, net, opt, adam, wd, clip, schedule, step, t, st1, st2, SQ, COMP, n)
+            if on_card:
+                lb = ops.get(LOSSB, len(items))
+                for i in on_card:
+                    tot += float(lb[i])
             history.append(tot / rows_all)
             if verbose and (ep % every == 0 or ep == E - 1):
                 print(f"epoch {ep:4}  loss {history[-1]:.5f}  ({len(items)} batches, GPU)")
         opt.t = t
         out_params = net.params()
     finally:
-        for b_ in (st1, st2, SQ, COMP, LOSS1):
+        for b_ in (st1, st2, SQ, COMP, LOSS1, LOSSB):
             if b_ is not None:
                 ops.free(b_)
         net.freeze.close()

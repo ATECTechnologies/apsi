@@ -1,6 +1,8 @@
 """Apsi's own GPU trainer: gradients against Apsi's autodiff (on the Emulator), training curves against the NumPy
 backend, and - when there is an NVIDIA card - every kernel and a whole training run against the Emulator."""
+import os
 import unittest
+from unittest import mock
 
 import numpy as np
 
@@ -930,16 +932,22 @@ class RealGpu(unittest.TestCase):
                 e.put(views[name][1][0], a)
             for name, size in (("o", n), ("L", B * H * T), ("dd", B * H * T), ("dq", n), ("dk", n), ("dv", n)):
                 views[name] = [(g.alloc(size), 0), (e.alloc(size), 0)]
-            for i, dv_ in ((0, g), (1, e)):
-                V = {k_: v_[i] for k_, v_ in views.items()}
-                dv_.flash_fwd(V["q"], V["k"], V["v"], V["o"], V["L"], B, T, H, hd, causal, 0.125)
-                dv_.flash_dot(V["do"], V["o"], V["dd"], B, T, H, hd)
-                dv_.flash_bwd(V["q"], V["k"], V["v"], V["do"], V["L"], V["dd"], V["dq"], V["dk"], V["dv"], B, T, H,
-                              hd, causal, 0.125)
-            for name, size in (("o", n), ("L", B * H * T), ("dq", n), ("dk", n), ("dv", n)):
-                a, b_ = g.get(views[name][0][0], size), e.get(views[name][1][0], size)
-                err = np.abs(a - b_).max() / (np.abs(b_).max() + 1e-9)
-                self.assertLess(err, 2e-2, (name, B, T, H, hd, causal, err))
+            runs = []
+            for det in ("0", "1", "1"):                         # atomic dQ, then the deterministic pair twice
+                with mock.patch.dict(os.environ, {"APSI_GPU_DETERMINISTIC": det}):
+                    for i, dv_ in ((0, g), (1, e)):
+                        V = {k_: v_[i] for k_, v_ in views.items()}
+                        dv_.flash_fwd(V["q"], V["k"], V["v"], V["o"], V["L"], B, T, H, hd, causal, 0.125)
+                        dv_.flash_dot(V["do"], V["o"], V["dd"], B, T, H, hd)
+                        dv_.flash_bwd(V["q"], V["k"], V["v"], V["do"], V["L"], V["dd"], V["dq"], V["dk"], V["dv"],
+                                      B, T, H, hd, causal, 0.125)
+                for name, size in (("o", n), ("L", B * H * T), ("dq", n), ("dk", n), ("dv", n)):
+                    a, b_ = g.get(views[name][0][0], size), e.get(views[name][1][0], size)
+                    err = np.abs(a - b_).max() / (np.abs(b_).max() + 1e-9)
+                    self.assertLess(err, 2e-2, (det, name, B, T, H, hd, causal, err))
+                runs.append([g.get(views[k_][0][0], n) for k_ in ("dq", "dk", "dv")])
+            for a, b_ in zip(runs[1], runs[2]):
+                np.testing.assert_array_equal(a, b_)
 
     def test_training_on_the_card_matches_the_emulator(self):
         rng = np.random.default_rng(3)

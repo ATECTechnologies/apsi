@@ -28,7 +28,7 @@ MAIN = ("apsi_kernel", "axpy", "add3", "mul3", "act_f", "act_b", "colsum", "ln_f
         "gemm_simt", "gather", "rope", "spmm", "edge_dot", "seg_softmax", "seg_softmax_b", "dot_acc", "scale_add",
         "cols", "colmul", "topk_gate", "topk_gate_b", "loss_ew", "im2col", "col2im", "perm_nc", "pool_f", "pool_b",
         "lstm_f", "lstm_b", "gru_a", "gru_b", "gru_b1", "gru_b2", "taylor_f", "taylor_b", "rowbias", "acc2",
-        "fin2", "ew1", "ew2", "colsum_fin", "embed_bs", "parts_sum", "ksum")
+        "fin2", "ew1", "ew2", "colsum_fin", "embed_bs", "parts_sum", "ksum", "tanh_s", "axpy_s", "gate_g")
 TC = ("apsi_kernel", "gemm_tc3")                     # apsi_kernel = the one-pass product
 
 
@@ -683,6 +683,52 @@ def _main_module():
             out = b.select(b.icmp_unsigned("==", p["kind"], C(j)), vals[j], out)
         k.st(out, p["Z"], i)
     k.grid_loop(p["n"], ew2)
+    k.ret()
+
+    # Scalars that stay on the card (a gate read on the host would make the processor wait for the card):
+    # tanh_s: OUT[0] = tanh(W[0]) in float64, rounded once (math.tanh's value); axpy_s: Y += S[0] X;
+    # gate_g: G[0] += float32(DG[0] (1 - TH[0]^2)) (the gradient of a tanh gate, the product in float64)
+    f64 = ir.DoubleType()
+
+    def tanh64(b, x):
+        a = b.call(decl("llvm.fabs.f64", f64, [f64]), [x])
+        a = b.select(b.fcmp_ordered(">", a, ir.Constant(f64, 20.0)), ir.Constant(f64, 20.0), a)
+        y = b.fmul(a, ir.Constant(f64, 2.0))                      # tanh(a) = expm1(2a) / (expm1(2a) + 2)
+        poly = ir.Constant(f64, 0.0)                              # expm1(y), |y| < 1: Taylor to y^21
+        import math as _m
+        for n_ in range(21, 0, -1):
+            poly = b.fmul(b.fadd(poly, ir.Constant(f64, 1.0 / _m.factorial(n_))), y)
+        kf = b.call(decl("llvm.floor.f64", f64, [f64]), [b.fadd(b.fmul(y, ir.Constant(f64, 1.4426950408889634)),
+                                                                 ir.Constant(f64, 0.5))])
+        r = b.fsub(b.fsub(y, b.fmul(kf, ir.Constant(f64, 0.6931471803691238))),
+                   b.fmul(kf, ir.Constant(f64, 1.9082149292705877e-10)))         # y - k ln 2 (Cody-Waite)
+        er = ir.Constant(f64, 0.0)                                # exp(r), |r| <= ln2 / 2: Taylor to r^16
+        for n_ in range(16, 0, -1):
+            er = b.fmul(b.fadd(er, ir.Constant(f64, 1.0 / _m.factorial(n_))), r)
+        er = b.fadd(er, ir.Constant(f64, 1.0))
+        two_k = b.bitcast(b.shl(b.add(b.fptosi(kf, i64), ir.Constant(i64, 1023)), ir.Constant(i64, 52)), f64)
+        big = b.fsub(b.fmul(er, two_k), ir.Constant(f64, 1.0))
+        t = b.select(b.fcmp_ordered("<", y, ir.Constant(f64, 1.0)), poly, big)
+        th = b.fdiv(t, b.fadd(t, ir.Constant(f64, 2.0)))
+        return b.select(b.fcmp_ordered("<", x, ir.Constant(f64, 0.0)), b.fsub(ir.Constant(f64, 0.0), th), th)
+
+    k = K("tanh_s", [("OUT", G(f32)), ("W", G(f32))])
+    b, p = k.b, k.p
+    with b.if_then(b.icmp_unsigned("==", b.add(k.tid, k.cta), C(0))):
+        k.st(b.fptrunc(tanh64(b, b.fpext(k.ld(p["W"], C(0)), f64)), f32), p["OUT"], C(0))
+    k.ret()
+
+    k = K("axpy_s", [("Y", G(f32)), ("X", G(f32)), ("n", i32), ("S", G(f32))])
+    k.grid_loop(k.p["n"], lambda i: k.st(k.b.call(fma_f, [k.ld(k.p["S"], C(0)), k.ld(k.p["X"], i),
+                                                          k.ld(k.p["Y"], i)]), k.p["Y"], i))
+    k.ret()
+
+    k = K("gate_g", [("G", G(f32)), ("DG", G(f32)), ("TH", G(f32))])
+    b, p = k.b, k.p
+    with b.if_then(b.icmp_unsigned("==", b.add(k.tid, k.cta), C(0))):
+        th = b.fpext(k.ld(p["TH"], C(0)), f64)
+        v = b.fmul(b.fpext(k.ld(p["DG"], C(0)), f64), b.fsub(ir.Constant(f64, 1.0), b.fmul(th, th)))
+        k.st(b.fadd(k.ld(p["G"], C(0)), b.fptrunc(v, f32)), p["G"], C(0))
     k.ret()
 
     # fin2: G <- HI + LO (rounded once), HI = LO = 0
@@ -2127,11 +2173,15 @@ def _flash_module():
                        side_effect=True)
     NEG = -1.0e30
 
-    def build(name, hd, backward):
+    def build(name, hd, kind):
+        """kind "f": forward; "b": backward with dQ added atomically; "k": backward without dQ (dK, dV only);
+        "q": dQ alone, a block per 64 queries summing over the key tiles in registers (no atomics, so the same bits
+        every run: "k" and "q" together are the deterministic backward)."""
+        backward = kind in "bk"
         SP = hd + 8
         TILE = BQ * SP
         SPS = BQ + 8                  # rows of dS^T: 64 queries (+8), whatever the head size
-        halves = 4 * TILE + BQ * SPS if backward else 3 * TILE
+        halves = {"b": 4 * TILE + BQ * SPS, "k": 4 * TILE}.get(kind, 3 * TILE)
         sm = ir.GlobalVariable(m, ir.ArrayType(i16, halves), f"{name}_s", addrspace=3)
         sm.linkage = "internal"
         sm.align = 16
@@ -2144,6 +2194,10 @@ def _flash_module():
             args = [("Q", G(f32)), ("K", G(f32)), ("V", G(f32)), ("DO", G(f32)), ("L", G(f32)), ("DD", G(f32)),
                     ("DQ", G(f32)), ("DK", G(f32)), ("DV", G(f32)), ("T", i32), ("D", i32), ("H", i32),
                     ("scale", f32), ("scale2", f32), ("causal", i32)]
+        elif kind == "q":
+            args = [("Q", G(f32)), ("K", G(f32)), ("V", G(f32)), ("DO", G(f32)), ("L", G(f32)), ("DD", G(f32)),
+                    ("DQ", G(f32)), ("T", i32), ("D", i32), ("H", i32), ("scale", f32), ("scale2", f32),
+                    ("causal", i32)]
         else:
             args = [("Q", G(f32)), ("K", G(f32)), ("V", G(f32)), ("O", G(f32)), ("L", G(f32)), ("T", i32), ("D", i32),
                     ("H", i32), ("scale2", f32), ("causal", i32)]
@@ -2272,7 +2326,60 @@ def _flash_module():
             b.position_at_end(end)
 
         ntiles = b.udiv(b.add(T, C(BQ - 1)), C(BQ))
-        if not backward:
+        if kind == "q":
+            sQ, sK, sV = 0, 1, 2
+            q0 = b.mul(cta, C(BQ))
+            load_tile(sQ, p["Q"], q0)
+            b.call(bar_f, [])
+            qa = [frag_rows(sQ, b.mul(w, C(16)), ks) for ks in range(hd // 16)]
+            b.call(bar_f, [])
+            load_tile(sQ, p["DO"], q0)
+            b.call(bar_f, [])
+            doa = [frag_rows(sQ, b.mul(w, C(16)), ks) for ks in range(hd // 16)]
+            lr, dr = [], []
+            for r in range(2):
+                row = b.add(b.add(q0, b.mul(w, C(16))), b.add(gq, C(r * 8)))
+                ok = b.icmp_unsigned("<", row, T)
+                li = b.add(b.mul(z64(z), z64(T)), z64(umin(row, b.sub(T, C(1)))))
+                lr.append(b.select(ok, b.load(b.gep(p["L"], [li], inbounds=True), align=4), F(0.0)))
+                dr.append(b.select(ok, b.load(b.gep(p["DD"], [li], inbounds=True), align=4), F(0.0)))
+            dq = [[var(F(0.0)) for _ in range(4)] for _ in range(hd // 8)]
+            last = b.select(causal, umin(b.add(cta, C(1)), ntiles), ntiles)
+
+            def kv_tile_q(j):
+                b.call(bar_f, [])
+                k0 = b.mul(j, C(BQ))
+                load_tile(sK, p["K"], k0)
+                load_tile(sV, p["V"], k0)
+                b.call(bar_f, [])
+                s = scores(qa, sK)                     # S = Q K^T: 16 queries x 64 keys
+                dp = scores(doa, sV)                   # dP = dO V^T
+                ds = [[None] * 4 for _ in range(8)]
+                for nt in range(8):
+                    for c in range(4):
+                        key = b.add(b.add(k0, C(nt * 8 + (c & 1))), b.mul(tig, C(2)))
+                        qrow = b.add(b.add(q0, b.mul(w, C(16))), b.add(gq, C((c >> 1) * 8)))
+                        bad = b.or_(b.icmp_unsigned(">=", key, T), b.and_(causal, b.icmp_unsigned(">", key, qrow)))
+                        pv = b.call(ex2_f, [b.fsub(b.fmul(s[nt][c], p["scale2"]), lr[c >> 1])])
+                        pv = b.select(bad, F(0.0), pv)
+                        ds[nt][c] = b.fmul(pv, b.fsub(dp[nt][c], dr[c >> 1]))
+                for kk in range(4):                    # dQ += dS K over this tile's 64 keys
+                    a = a_from_c(ds, kk)
+                    for pr in range(hd // 16):
+                        b0, b1 = bfrag_kn(sK, C(pr * 16), kk)
+                        mma_acc(dq[2 * pr], a, b0)
+                        mma_acc(dq[2 * pr + 1], a, b1)
+            loop(C(0), last, kv_tile_q)
+            for r in range(2):
+                row = b.add(b.add(q0, b.mul(w, C(16))), b.add(gq, C(r * 8)))
+                with b.if_then(b.icmp_unsigned("<", row, T)):
+                    for nt in range(hd // 8):
+                        for c in (2 * r, 2 * r + 1):
+                            col = b.add(C(nt * 8 + (c & 1)), b.mul(tig, C(2)))
+                            gi = b.add(base, b.add(b.mul(z64(row), z64(D)), z64(col)))
+                            b.store(b.fmul(b.load(dq[nt][c]), p["scale"]), b.gep(p["DQ"], [gi], inbounds=True),
+                                    align=4)
+        elif not backward:
             sQ, sK, sV = 0, 1, 2
             q0 = b.mul(cta, C(BQ))
             load_tile(sQ, p["Q"], q0)
@@ -2385,6 +2492,8 @@ def _flash_module():
                         b0, b1 = bfrag_kn(sQ, C(pr * 16), kk)
                         mma_acc(dk[2 * pr], a_s, b0)
                         mma_acc(dk[2 * pr + 1], a_s, b1)
+                if kind == "k":
+                    return
                 for nt in range(8):                    # dS^T to shared memory: [key][query] in bfloat16
                     for r in range(2):
                         kl = b.add(b.mul(w, C(16)), b.add(gq, C(r * 8)))
@@ -2445,8 +2554,8 @@ def _flash_module():
             b.store(acc, b.gep(DD_, [b.zext(i, i64)], inbounds=True), align=4)
     b.ret_void()
     for hd in FLASH_HD:
-        build(f"flash_f{hd}", hd, False)
-        build(f"flash_b{hd}", hd, True)
+        for kind in "fbkq":
+            build(f"flash_{kind}{hd}", hd, kind)
     return _emit(m, "sm_80")
 
 
