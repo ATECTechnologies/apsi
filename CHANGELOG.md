@@ -10,9 +10,10 @@
   methods, iterates and stores directly. Same results, same errors.
 - **Structs are built directly:** a struct whose fields are untyped, `Int` or `Float` gets a constructor of its own
   (no general plan per call): creating 200,000 structs is 1.8× faster.
-- Measured against 2.4.4 on the same machine (the lower end of several runs): recursive calls (fib 25) 1.4×
-  faster, a word count 2.3×, 200k f-strings 2.8×, 200k structs 1.7×, an integer loop 1.1×; the eight heavy
-  `@native` programs are unchanged (the native code generator was already at C's speed).
+- Measured against 2.4.4 on the same machine (GitHub runner): recursive calls (fib 25) 1.5×
+  faster, a word count 2.1×, 200k f-strings 2.3×, 200k structs 1.7× (GitHub runner, geometric mean of the 12
+  measurements 1.22×); the eight heavy `@native` programs are unchanged (the native code generator was already at
+  C's speed).
 - **Products whose sizes are not multiples of 4** (a SwiGLU width of 2730, an odd vocabulary) run on the tiled
   tensor-core kernels through zero-padded copies instead of the general kernel (`APSI_GEMM_PAD=0` turns it off).
 

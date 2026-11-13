@@ -172,7 +172,7 @@ safely it runs.
 - NumPy, one card and many cards compared on the same training, step for step.
 - CPU programs against C, C++, Rust, Go, Java, JavaScript, C# and Julia, and 2.6.0 against 2.4.4, on a GitHub
   runner and a 2-core VM: the eight heavy programs run at the same speed as 2.4.4 (0.99×; 0.83× the time of C), and
-  everyday code is faster (section 13: fib 1.4×, a word count 2.3×, f-strings 2.8×, structs 1.7×).
+  everyday code is faster (section 13: fib 1.5×, a word count 2.1×, f-strings 2.3×, structs 1.7×; geometric mean 1.22×).
 - Every benchmark category of the website (Python, matrix products, tables against pandas, the web server, real-time
   video, models that learn, WebSocket) run again for 2.6.0 and 2.4.4 on the same machine.
 
@@ -196,9 +196,9 @@ so ordinary code — functions, loops, strings, structs — runs faster with the
 - On the card, products whose sizes are not multiples of 4 (a SwiGLU width of 2730) use the fast tiled tensor-core
   kernels through zero-padded copies.
 
-Measured against 2.4.4 on the same machine (the lower end of several runs): recursive calls (fib 25) 1.4× faster, a
-word count 2.3×, 200k f-strings 2.8×, 200k structs 1.7×. The eight heavy `@native` programs were already at C's speed
-(0.83× the time of C) and are unchanged. The website's benchmark page has every measurement.
+Measured against 2.4.4 on the same machine (a GitHub runner): recursive calls (fib 25) 1.5× faster, a word count
+2.1×, 200k f-strings 2.3×, 200k structs 1.7×; the geometric mean of the 12 version measurements is 1.22×. The
+eight heavy `@native` programs were already at C's speed (0.83× the time of C) and are unchanged. The website's benchmark page has every measurement.
 
 ## 14. Converting Python: one file or the whole project
 
