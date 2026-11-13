@@ -1,0 +1,16 @@
+# Converted from strs.py by `apsi convert` 2.6.0 (Python's exact semantics).
+use pycompat
+let time = pyimport("time")
+let re = pyimport("re")
+let json = pyimport("json")
+let t = time.perf_counter()
+let text = "\n".join(f"user{i}@example.com visited /page/{i % 50} at 2026-11-{i % 28 + 1:02d}" for i in range(100000))
+let emails = re.findall("[\\w.]+@[\\w.]+", text)
+let pages = {}
+for line in text.splitlines():
+    var p = line.split()[2]
+    pages[p] = pages.get(p, 0) + 1
+let blob = json.dumps([{"i": i, "s": str(i) * 3} for i in range(50000)])
+let back = json.loads(blob)
+let out = "".join(sorted(set(w[::-1].upper() for w in text.split()[:50000])))[:20]
+print("strs", len(emails), len(pages), len(back), out, f"{time.perf_counter() - t:.3f}s")

@@ -1,7 +1,7 @@
 @echo off
 rem Uploads Apsi 2.6.0 (installers, the source code and the GPU Tuner) from your Downloads folder to apsi.dev.
 rem One file: the PowerShell below this header does the work. Asks for an API token (Settings -> Developer,
-rem "release"). Files already on the site are skipped, so running it again is safe.
+rem "release"). The same file already on the site is skipped; a rebuilt file replaces it. Never duplicates.
 set "APSI_UPLOAD_SELF=%~f0"
 powershell -NoProfile -ExecutionPolicy Bypass -Command "$s = (Get-Content -LiteralPath $env:APSI_UPLOAD_SELF -Raw) -split '##[ ]PS[ ]##'; & ([scriptblock]::Create($s[1]))"
 echo.
@@ -19,7 +19,8 @@ exit /b
 #   the Apsi GPU Tuner in that zip (gpu-tuner\: Apply / Restore for Windows and Linux) -> the Download page's
 #   "Apsi GPU Tuner" section
 # Versions: 2.6.0 and newer by default (-Version 2.6.0+); -Version 2.4.4 for one version only, -Version all for
-# every version found. Files already on the site are skipped, so running it again is safe. Files are sent in 32 MB pieces, 4 at a time (Cloudflare accepts at most 100 MB per
+# every version found. A file already on the site is skipped when it is the same file (same SHA-256) and replaced
+# when it is a newer build with the same name, so running it again is safe and never makes duplicates. Files are sent in 32 MB pieces, 4 at a time (Cloudflare accepts at most 100 MB per
 # request); a broken piece is sent again.
 #
 # It asks for an API token once. Create it on the site: Settings -> Developer, tick "release", 30 days.
@@ -45,7 +46,8 @@ $tmp = Join-Path $env:TEMP ('apsi-upload-' + [guid]::NewGuid().ToString('N').Sub
 Get-ChildItem -LiteralPath $Root -Directory | ForEach-Object {
   if ($_.Name -notmatch '^apsi-(\d+\.\d+\.\d+)$') { return }
   $v = $Matches[1]
-  Get-ChildItem -LiteralPath (Join-Path $_.FullName 'installer\release') -Filter 'ApsiSetup-*-x64.exe' -ErrorAction SilentlyContinue |
+  # only this version's installer: an older ApsiSetup left in the same folder is never sent as this version
+  Get-ChildItem -LiteralPath (Join-Path $_.FullName 'installer\release') -Filter "ApsiSetup-$v-x64.exe" -ErrorAction SilentlyContinue |
     ForEach-Object { Add-Build $_.FullName $v 'windows' 'Windows installer' }
 }
 Get-ChildItem -LiteralPath $Root -File -Filter 'apsi-*-linux.zip' | ForEach-Object {
@@ -100,15 +102,22 @@ function Fail($r, $what) {
 $r = Call 'GET' '/api/v1/releases?all=1' $null
 if ($r.Status -ne 200) { Fail $r 'Checking the token' }
 $have = @{}
-foreach ($x in $r.Data.releases) { $have["$($x.version)|$($x.filename)"] = $true }
+foreach ($x in $r.Data.releases) { $have["$($x.version)|$($x.filename)"] = $x }
 
 $done = 0; $skipped = 0; $failed = 0
 foreach ($it in ($items | Sort-Object Version, Platform)) {
-  if ($have["$($it.Version)|$($it.Name)"]) { Write-Host "skip  $($it.Version) $($it.Name) (already on the site)" -ForegroundColor DarkGray; $skipped++; continue }
+  $old = $have["$($it.Version)|$($it.Name)"]
   try {
     $size = (Get-Item -LiteralPath $it.Path).Length
-    Write-Host "send  $($it.Version) $($it.Name)  (checking the file)" -NoNewline
     $sha = (Get-FileHash -LiteralPath $it.Path -Algorithm SHA256).Hash.ToLower()
+    if ($old -and $old.sha256 -eq $sha) { Write-Host "skip  $($it.Version) $($it.Name) (the same file is already on the site)" -ForegroundColor DarkGray; $skipped++; continue }
+    if ($old) {
+      # a rebuilt file with the same name: the one on the site is replaced (removed, then this one is sent)
+      Write-Host "replace  $($it.Version) $($it.Name) (the site has an older build of it)" -ForegroundColor Yellow
+      $d = Call 'DELETE' "/api/v1/releases/$($old.id)" $null
+      if ($d.Status -ne 200) { Fail $d 'Removing the older build' }
+    }
+    Write-Host "send  $($it.Version) $($it.Name)" -NoNewline
     $r = Call 'POST' '/api/v1/uploads' (Json @{ purpose = 'release'; size = $size; sha256 = $sha; filename = $it.Name })
     if ($r.Status -ne 201) { Fail $r 'Starting the upload' }
     $id = $r.Data.id; $chunk = [int64]$r.Data.chunk_size

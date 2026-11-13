@@ -241,7 +241,7 @@
       },
       {
         "command": "apsi.convertPython",
-        "title": "Convert Python File to Apsi",
+        "title": "Convert Python to Apsi (file, imports or whole project)",
         "category": "Apsi",
         "icon": "$(arrow-swap)"
       }

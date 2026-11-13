@@ -50,3 +50,22 @@ a damped oscillator with `sin` activations.
 Both give the same training: the tests compare them step by step (to float32 precision).
 
 Mixed second derivatives (∂²u/∂x∂y) are not in `d2u`; write that loss with `grad` on the processor.
+
+## Getting a good solution
+
+- **Weigh the conditions.** Boundary and initial conditions usually need a larger weight than the residual (10 in
+  the example): without it the network satisfies the equation with the wrong boundary values.
+- **Scale the inputs** to about [-1, 1] or [0, 1]. The derivatives are taken with respect to what the network sees;
+  if you scale `x` by `s`, multiply `du` by `s` and `d2u` by `s²` in the loss.
+- **Smooth activations.** `tanh` for most problems, `sin` for oscillating solutions (the damped oscillator in the
+  example). ReLU's second derivative is zero almost everywhere, so it cannot learn second-order equations.
+- **Enough points where the solution changes fast**: more collocation points near steep fronts and boundaries.
+- **Learning rate:** `adam(lr=5e-3)` to start, lower (1e-3 → 1e-4, or `schedule=`) once the loss flattens.
+- **Check against what you know**: an exact solution, a conserved quantity or measurements, at points that were not
+  in the training set.
+
+## How it was checked
+
+The tests train the same network on the GPU (Taylor mode) and on the processor (autodiff) and compare every step to
+float32 precision; the heat equation of the example reaches an error of about 0.001 against the exact solution.
+`apsi gpu bench check` runs the physics-informed network on your card against the reference.
