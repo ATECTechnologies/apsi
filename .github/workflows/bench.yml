@@ -1,5 +1,5 @@
 # Benchmarks on a GitHub runner (run by hand: Actions -> bench -> Run workflow):
-# the heavy CPU programs in Apsi, C, C++, Rust and Go, the same programs on Apsi 2.0.0 (branch release/2.0.0),
+# the heavy CPU programs in Apsi, C, C++, Rust, Go, Java and JavaScript, the same programs on Apsi 2.4.4 (branch release/2.4.4),
 # and benchmarks/versions/compare.py between the two versions. The results are printed at the end of the log and
 # kept as an artifact.
 name: bench
@@ -16,17 +16,17 @@ jobs:
       - uses: actions/checkout@v5
         with: { path: apsi }
       - uses: actions/checkout@v5
-        with: { path: old, ref: release/2.0.0 }
+        with: { path: old, ref: release/2.4.4 }
       - uses: actions/setup-python@v6
         with: { python-version: "3.13" }
       - uses: actions/setup-go@v5
         with: { go-version: "1.23", cache: false }
       - name: Install
         run: python -m pip install numpy llvmlite
-      - name: Heavy benchmarks, Apsi 2.4.4 and the other languages
+      - name: Heavy benchmarks, Apsi 2.6.0 and the other languages
         run: python apsi/benchmarks/heavy/run.py --skip Mojo --out out/new
-      - name: Heavy benchmarks, Apsi 2.0.0
-        run: python apsi/benchmarks/heavy/run.py --apsi-root old --only Apsi --label "Apsi 2.0.0" --out out/old
+      - name: Heavy benchmarks, Apsi 2.4.4
+        run: python apsi/benchmarks/heavy/run.py --apsi-root old --only Apsi --label "Apsi 2.4.4" --out out/old
       - name: ode-rk4 with @native("fma")
         run: mkdir -p out && python -m apsi run apsi/benchmarks/heavy/fma.apsi | tee out/fma.txt
         env: { PYTHONPATH: apsi }
