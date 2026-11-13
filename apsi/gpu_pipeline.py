@@ -1099,18 +1099,11 @@ def _seg_work(st, items, inputs, output, loss, loss_fn, total, fwd, bwd, sends, 
             if not isinstance(output, str):              # several outputs: the loss of your own over all of them
                 if loss != "custom":
                     raise TrainError("a model with several outputs trains with a loss function of your own")
-                hs = [o.get(vals[n_][0][0], int(np.prod(vals[n_][1])), vals[n_][0][1]).reshape(vals[n_][1])
-                      .astype(np.float64) for n_ in output]
                 Yr = Y if isinstance(Y, Record) else np.asarray(aops.raw(Y))
-                lv, gh = value_and_grad(lambda *os_: loss_fn(list(os_), Yr), wrt=tuple(range(len(hs))))(*hs)
-                gh = gh if isinstance(gh, (list, tuple)) else [gh]
-                seeds = {}
-                for i, (n_, g_) in enumerate(zip(output, gh)):
-                    a_ = np.asarray(aops.raw(g_), np.float32).reshape(-1) / total
-                    dv = st.garena.get(("dout", i), max(1, a_.size))
-                    o.put(dv[0], a_, dv[1])
-                    seeds[n_] = dv
-                host[(r, m)] = float(aops.raw(lv))
+                lv, dvs = _GT()._multi_loss(o, None, [vals[n_][0] for n_ in output], [vals[n_][1] for n_ in output],
+                                            loss_fn, Yr, total, arena=st.garena)
+                seeds = dict(zip(output, dvs))
+                host[(r, m)] = lv
                 grads = st.backward_seg(m, seeds)
                 _send_back(st, grads, sends, bwd, s, m, o, ring)
                 ring ^= 1
@@ -1188,3 +1181,8 @@ def _send_back(st, grads, sends, bwd, s, m, o, ring):
         msg.append((name, buf, cnt, o, lob))
     o.sync()
     bwd[s - 1].put((m, msg, sends[s]))
+
+
+def _GT():
+    from . import gpu_train
+    return gpu_train
