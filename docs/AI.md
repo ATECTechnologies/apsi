@@ -121,6 +121,10 @@ no window is padding; `pack=false` gives one window per record. `eos=` the id pu
 tokenizer by itself; `eos=false` for none), `stride=` overlapping windows, `text_split="line"`/`"paragraph"` for
 text files with one example per line or paragraph. `data.detect_format(record)` shows how a record will be read.
 
+**Your own tokenizer** — `data.train_tokenizer("corpus/", vocab_size=32000)` trains a byte-level BPE tokenizer on
+the same sources (`tok.save("tokenizer.json")`; `text_dataset(tokenizer=tok)`). **Long runs** —
+`fit_batches(…, steps=, checkpoint=, save_every=)` resumes exactly after any stop. Both: [`TRAINING.md`](TRAINING.md).
+
 ## 2. Design your own, function by function
 
 ```apsi

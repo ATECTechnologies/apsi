@@ -5,12 +5,12 @@
     apsi unpublish NAME VERSION       delete a version for good (allowed in the first 72 hours, or while nobody
                                       downloaded it; administrators always)
 
-    apsi release upload FILE... --version 2.4.4 [--platform auto|windows|linux|macos|source|any]
+    apsi release upload FILE... --version 2.6.0 [--platform auto|windows|linux|macos|source|any]
                         [--title T] [--notes NOTES.md] [--channel stable|beta|nightly] [--date ISO]
     apsi release list [--version V] [--all]
     apsi release delete ID... [--yes]
     apsi release hide ID / apsi release unhide ID
-    apsi release bench results.json --version 2.4.4     publish benchmark results (shown on /benchmarks)
+    apsi release bench results.json --version 2.6.0     publish benchmark results (shown on /benchmarks)
     apsi release bench --delete 1.10.0                  remove a version's benchmark results
 
 The release commands need an API token with the `release` permission. Only administrators can create one

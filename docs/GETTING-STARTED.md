@@ -118,7 +118,6 @@ See [Libraries](LIBRARIES.md).
 
 ## 6. Where to go next
 
-- [What's new in 2.4.4](WHATS-NEW.md) — exact Python conversion, real time, memory, tokens, tables, databases.
 - [From Python](PYTHON.md) — `apsi convert` an existing program and run it unchanged.
 - [Language reference](LANGUAGE.md) — syntax, types, units, modules.
 - [AI and machine learning](AI.md) and [Reinforcement learning](RL.md).
