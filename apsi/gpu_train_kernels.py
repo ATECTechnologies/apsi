@@ -1857,7 +1857,10 @@ def _tiled_module(early=False, wide=False, h=False):
             ("sam", i32), ("sak", i32), ("sbk", i32), ("sbn", i32), ("ldc", i32), ("nb2", i32), ("a1", i32),
             ("a2", i32), ("b1", i32), ("b2", i32), ("c1", i32), ("c2", i32), ("alpha", f32), ("beta", i32),
             ("has_bias", i32), ("kchunk", i32), ("X2", G(f32)), ("epi", i32), ("act", i32), ("DB", G(f32)),
-            ("want_db", i32)]
+            ("want_db", i32), ("CNT", G(i32))]
+    membar_t = d("llvm.nvvm.membar.gl", ir.VoidType(), [])
+    ld_cg_t = ir.InlineAsm(ir.FunctionType(f32, [i64]), "ld.global.cg.f32 $0, [$1];", "=f,l", side_effect=True)
+
     # DB (kernels with B n-contiguous and A transposed: weight gradients x^T dy): also DB[n] += sum over k of B,
     # the bias gradient, from the values already in registers (no second pass over dy)
     # epi (after alpha, bias and beta): 1 = X2 <- v, C <- act(v) (a linear layer and its activation in one pass);
@@ -2167,6 +2170,54 @@ def _tiled_module(early=False, wide=False, h=False):
                                         out = b.fadd(vv, b.load(xp, align=4))
                                     b.store(out, tmp)
                                 b.store(b.load(tmp), ptr, align=4)
+        # split k: the last part of this tile to finish adds the parts in order (what ksum did, in the same order,
+        # without a second launch); the counter of the tile is reset for the next product. The flag lives in the
+        # tiles' shared memory (free by now): no shared memory of its own.
+        with b.if_then(split):
+            b.call(membar_t, [])
+            b.call(bar_f, [])
+            flag = b.bitcast(b.gep(smem, [C(0), C(0)], inbounds=True), i32.as_pointer(3))
+            with b.if_then(b.icmp_unsigned("==", tid, C(0))):
+                old = b.atomic_rmw("add", b.gep(p["CNT"], [z64(cta)], inbounds=True), C(1), "acq_rel")
+                b.store(b.zext(b.icmp_unsigned("==", old, b.sub(nz, C(1))), i32), flag)
+            b.call(bar_f, [])
+            with b.if_then(b.icmp_unsigned("!=", b.load(flag), C(0))):
+                b.call(membar_t, [])
+                plane = b.mul(z64(p["M"]), z64(p["ldc"]))
+                els = []
+                for mt in range(4):
+                    for nt in range(NTL):
+                        for c in range(4):
+                            row = b.add(b.add(bm, b.add(b.mul(wm, C(64)), C(mt * 16 + (c // 2) * 8))), gq)
+                            col = b.add(b.add(bn, b.add(b.mul(wn, C(NTL * 8)), C(nt * 8))),
+                                        b.add(b.mul(tig, C(2)), C(c % 2)))
+                            ok = b.and_(b.icmp_unsigned("<", row, p["M"]), b.icmp_unsigned("<", col, p["N"]))
+                            at = b.add(b.mul(z64(b.select(ok, row, C(0))), z64(p["ldc"])),
+                                       z64(b.select(ok, col, C(0))))
+                            els.append((ok, at, var(F(0.0))))
+                zv = var(C(0))
+                head = fn.append_basic_block("ks_head")
+                body = fn.append_basic_block("ks_body")
+                end = fn.append_basic_block("ks_end")
+                b.branch(head)
+                b.position_at_end(head)
+                zi = b.load(zv)
+                b.cbranch(b.icmp_unsigned("<", zi, nz), body, end)
+                b.position_at_end(body)
+                zo = b.mul(z64(zi), plane)                # every element's part z: independent loads in flight
+                vals = [b.call(ld_cg_t, [b.ptrtoint(b.gep(p["X2"], [b.add(zo, at)], inbounds=True), i64)])
+                        for _, at, _ in els]
+                for (_, _, sv), v in zip(els, vals):
+                    b.store(b.fadd(b.load(sv), v), sv)
+                b.store(b.add(zi, C(1)), zv)
+                b.branch(head)
+                b.position_at_end(end)
+                for ok, at, sv in els:
+                    with b.if_then(ok):
+                        cp = b.gep(p["C"], [at], inbounds=True)
+                        b.store(b.fadd(b.load(cp, align=4), b.load(sv)), cp, align=4)
+                with b.if_then(b.icmp_unsigned("==", tid, C(0))):
+                    b.store(C(0), b.gep(p["CNT"], [z64(cta)], inbounds=True))
         b.ret_void()
         ab.branch(top)
 

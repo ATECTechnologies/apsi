@@ -1453,15 +1453,12 @@ class Gpu(_Ops):
                     ("u", N), ("u", K), ("u", sam), ("u", sak), ("u", sbk), ("u", sbn), ("u", ldc), ("u", nb2),
                     ("u", sa[0]), ("u", sa[1]), ("u", sb[0]), ("u", sb[1]), ("u", sc[0]), ("u", sc[1]),
                     ("f", alpha), ("u", 1 if beta else 0), ("u", 1 if bias is not None else 0), ("u", kchunk),
-                    self.p(X2), ("u", epi), ("u", act), self.p(db), ("u", 1 if db is not None else 0)]
+                    self.p(X2), ("u", epi), ("u", act), self.p(db), ("u", 1 if db is not None else 0), self._cnt()]
             grid = (tiles, nb1 * nb2, nz)
             use = self._variant(name, grid, args, M, N, ldc, nb1 * nb2)
             if use.endswith("#h"):
                 args = self._h_args(args, M, N, K)
-            self._go(use, grid, self._threads(use), *args)
-            if nz > 1:
-                self._go("ksum", self.blocks(M * N), 256, self.p(Cv), self.p(X2), ("u", M), ("u", N), ("u", ldc),
-                         ("u", nz))
+            self._go(use, grid, self._threads(use), *args)         # split k: its last part adds the parts
             if db is not None:
                 self._db = None                          # taken
             return True
