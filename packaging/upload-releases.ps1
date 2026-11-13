@@ -94,6 +94,17 @@ if ($r.Status -ne 200) { Fail $r 'Checking the token' }
 $have = @{}
 foreach ($x in $r.Data.releases) { $have["$($x.version)|$($x.filename)"] = $x }
 
+# a file listed under the wrong version (ApsiSetup-2.4.4-x64.exe under 2.6.0) is removed from that version only;
+# the same file under its own version is not touched
+foreach ($x in @($r.Data.releases)) {
+  if ($x.filename -match '(?:^|[-_])v?(\d+\.\d+\.\d+)(?=[-_.])' -and $Matches[1] -ne $x.version) {
+    Write-Host "remove  $($x.version) $($x.filename) (it is the $($Matches[1]) file, listed under $($x.version) by mistake)" -ForegroundColor Yellow
+    $d = Call 'DELETE' "/api/v1/releases/$($x.id)" $null
+    if ($d.Status -ne 200) { Fail $d 'Removing the misplaced file' }
+    $have.Remove("$($x.version)|$($x.filename)")
+  }
+}
+
 $done = 0; $skipped = 0; $failed = 0
 foreach ($it in ($items | Sort-Object Version, Platform)) {
   $old = $have["$($it.Version)|$($it.Name)"]
