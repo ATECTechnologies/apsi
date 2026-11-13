@@ -1,0 +1,29 @@
+# Converted from objs.py by `apsi convert` 2.6.0 (Python's exact semantics).
+use pycompat
+let time = pyimport("time")
+let dataclass = pyfrom("dataclasses", "dataclass")
+class Node:
+    let __slots__ = ("val", "left", "right")
+    fn __init__(self, v, l=none, r=none):
+        (self.val, self.left, self.right) = (v, l, r)
+fn make(d):
+    return Node(d) if d == 0 else Node(d, make(d - 1), make(d - 1))
+fn check(n):
+    return 1 if n.left is none else 1 + check(n.left) + check(n.right)
+@dataclass
+class P:
+    x: float
+    y: float
+    fn norm(self):
+        return (self.x * self.x + self.y * self.y) ** 0.5
+let t = time.perf_counter()
+let total = sum(check(make(14)) for _ in range(8))
+let ps = [P(i, i + 1) for i in range(200000)]
+let s = sum(p.norm() for p in ps)
+let d = {}
+for i in range(300000):
+    d[f"k{i % 1000}"] = d.get(f"k{i % 1000}", 0) + i
+let words = " ".join(f"w{i % 97}" for i in range(200000)).split()
+let Counter = pyfrom("collections", "Counter")
+let c = Counter(words).most_common(3)
+print("objs", total, round(s, 3), len(d), c[0], f"{time.perf_counter() - t:.3f}s")

@@ -365,11 +365,24 @@ async function convertPython(uri) {
   const apsi = requireApsi();
   if (!apsi) return;
   const ch = getOutput();
+  // how much to convert: a file and the modules it imports (default), the file alone, or the whole project
+  const isFolder = fs.existsSync(target) && fs.statSync(target).isDirectory();
+  let extra = [];
+  if (!isFolder) {
+    const pick = await vscode.window.showQuickPick([
+      { label: "$(file-symlink-file) This file and what it imports", description: "recommended", args: [] },
+      { label: "$(file) This file only", description: "its own modules stay Python", args: ["--only"] },
+      { label: "$(folder-library) The whole project", description: "every .py of the project (pyproject.toml / .git)", args: ["--project"] },
+      { label: "$(list-unordered) Show what would be converted", description: "writes nothing", args: ["--plan"] },
+    ], { placeHolder: "Convert to Apsi: how much?" });
+    if (!pick) return;
+    extra = pick.args;
+  }
   // the conversion runs in the background (the editor stays responsive); the result message is shown after the
   // progress note has closed, so "Converting to Apsi…" never stays on screen
   const r = await vscode.window.withProgress({ location: vscode.ProgressLocation.Notification, title: "Converting to Apsi…" },
     () => new Promise((resolve) => {
-      const inv = invocation(apsi, ["convert", target]);
+      const inv = invocation(apsi, ["convert", target, ...extra]);
       let stdout = "", stderr = "";
       let child;
       try {
@@ -385,11 +398,17 @@ async function convertPython(uri) {
       child.on("close", (code) => resolve({ status: code, stdout, stderr }));
     }));
   ch.clear();
-  ch.appendLine(`> ${[apsi.command, ...apsi.args, "convert", target].join(" ")}`);
+  ch.appendLine(`> ${[apsi.command, ...apsi.args, "convert", target, ...extra].join(" ")}`);
+  if (extra.includes("--plan")) {
+    if (r.stdout) ch.appendLine(r.stdout.trimEnd());
+    if (r.stderr) ch.appendLine(r.stderr.trimEnd());
+    ch.show(true);
+    return;
+  }
   if (r.stdout) ch.appendLine(r.stdout.trimEnd());
   if (r.stderr) ch.appendLine(r.stderr.trimEnd());
   if (r.error) ch.appendLine(`Apsi could not be started: ${r.error.message}`);
-  const isDir = fs.existsSync(target) && fs.statSync(target).isDirectory();
+  const isDir = isFolder || extra.includes("--project");
   const out = isDir ? null : target.replace(/\.py$/i, ".apsi");
   if (r.status === 0 && out && fs.existsSync(out)) {
     const doc = await vscode.workspace.openTextDocument(out);

@@ -30,6 +30,14 @@ from . import gpu_train_kernels as KS
 from .values import Record, tree_leaves, tree_map
 
 
+
+def _keeps_frozen(fn):
+    def run(*a, **kw):
+        from .layers import keeps_frozen
+        return keeps_frozen(fn)(*a, **kw)
+    run.__name__, run.__doc__, run.__wrapped__ = fn.__name__, fn.__doc__, fn
+    return run
+
 class TrainError(Exception):
     pass
 
@@ -1275,6 +1283,14 @@ class Gpu(_Ops):
         self._go("fakeq", self.blocks(((K + 31) // 32) * N), 256, self.p(W), self.p(WQ), ("u", K), ("u", N),
                  ("u", kind))
 
+    def _gemm_padded(self, A, B, Cv, bias, M, N, K, sam, sak, sbk, sbn, alpha, beta):
+        """A product whose sizes are not multiples of 4 (a SwiGLU width of 2730, say) on the tiled tensor-core
+        kernels, through zero-padded copies, instead of the slower general kernel. Same values up to the order of the
+        sums (zeros add nothing); the same bits every run."""
+        if os.environ.get("APSI_GEMM_PAD", "1").strip().lower() in ("0", "false", "no", "off"):
+            return False
+        return _gemm_padded_impl(self, A, B, Cv, bias, M, N, K, sam, sak, sbk, sbn, alpha, beta)
+
     def _tiled_ok(self, A, B, M, N, K, sam, sak, sbk, sbn, sa, sb):
         def q(*v):
             return all(int(x) % 4 == 0 for x in v)
@@ -1476,6 +1492,9 @@ class Gpu(_Ops):
             if db is not None:
                 self._db = None                          # taken
             return True
+        if passes == 1 and self.tiled and a_act is None and not epi and nb1 * nb2 == 1 and ldc == N and \
+                M * N * K >= (1 << 21) and self._gemm_padded(A, B, Cv, bias, M, N, K, sam, sak, sbk, sbn, alpha, beta):
+            return True
         tiles = ((M + KS.TILE - 1) // KS.TILE) * ((N + KS.TILE - 1) // KS.TILE)
         args = (self.p(A), self.p(B), self.p(Cv), self.p(bias), ("u", M), ("u", N), ("u", K), ("u", sam),
                 ("u", sak), ("u", sbk), ("u", sbn), ("u", ldc), ("u", nb2), ("u", sa[0]), ("u", sa[1]),
@@ -1485,6 +1504,51 @@ class Gpu(_Ops):
             self._go("gemm_tc" if passes == 1 else "gemm_tc3", (tiles, nb1 * nb2), 128, *args)
         else:
             self._go("gemm_simt", (tiles, nb1 * nb2), 256, *args)
+
+
+def _r4(n):
+    return (int(n) + 3) // 4 * 4
+
+
+def _pad_into(ops, key, src, rows, cols, rows_p, cols_p):
+    """src (rows x cols, dense) into a zeroed scratch buffer of rows_p x cols_p: the tiled kernels read 16 bytes at a
+    time and need sizes that are multiples of 4; zeros add nothing to a product."""
+    dst = ops._scratch(key, rows_p * cols_p)
+    ops.fill(dst, rows_p * cols_p, 0.0)
+    ops.cols(src, dst, rows, cols, cols_p, 0, False)
+    return dst
+
+
+def _gemm_padded_impl(ops, A, B, Cv, bias, M, N, K, sam, sak, sbk, sbn, alpha, beta):
+    if not ((sak == 1 and sam == K) or (sam == 1 and sak == M)) or not ((sbn == 1 and sbk == N) or
+                                                                      (sbk == 1 and sbn == K)):
+        return False
+    Mp, Np, Kp = _r4(M), _r4(N), _r4(K)
+    if (Mp, Np, Kp) == (M, N, K):
+        return False
+    if sak == 1:                                       # A stored M x K
+        Ap = _pad_into(ops, "pad_a", A, M, K, Mp, Kp)
+        a_str = (Kp, 1)
+    else:                                              # A stored K x M (a transposed view)
+        Ap = _pad_into(ops, "pad_a", A, K, M, Kp, Mp)
+        a_str = (1, Mp)
+    if sbn == 1:                                       # B stored K x N
+        Bp = _pad_into(ops, "pad_b", B, K, N, Kp, Np)
+        b_str = (Np, 1)
+    else:                                              # B stored N x K
+        Bp = _pad_into(ops, "pad_b", B, N, K, Np, Kp)
+        b_str = (1, Kp)
+    if beta:
+        Cp = _pad_into(ops, "pad_c", Cv, M, N, Mp, Np)
+    else:
+        Cp = ops._scratch("pad_c", Mp * Np)
+    biasp = _pad_into(ops, "pad_bias", bias, 1, N, 1, Np) if bias is not None else None
+    if ops._tiled_ok(Ap, Bp, Mp, Np, Kp, a_str[0], a_str[1], b_str[0], b_str[1], (0, 0), (0, 0)) is None:
+        return False
+    ops._gemm(Ap, Bp, Cp, biasp, Mp, Np, Kp, a_str[0], a_str[1], b_str[0], b_str[1], Np, 1, 1, (0, 0), (0, 0),
+              (0, 0), alpha, beta, 1)
+    ops.cols(Cv, Cp, M, N, Np, 0, True)                 # the M x N corner back into C
+    return True
 
 
 def _split_k(blocks, K, slots):
@@ -4734,6 +4798,7 @@ def _raw_of(a):
     return aops.raw(a)
 
 
+@_keeps_frozen
 def fit_batches(model, params, batches, loss="cross_entropy", opt=None, epochs=1, verbose=True, clip=None,
                 schedule=None, device="cuda", precision="auto", ops=None, compensated=None, every=None,
                 accumulate=1, stages=None, freeze=None, train_only=None, exact_sums=None, steps=None,
@@ -5219,6 +5284,7 @@ def _check_size(ops, params, opt, shards=1):
                       RuntimeWarning, stacklevel=3)
 
 
+@_keeps_frozen
 def fit(model, params, X, y=None, loss="mse", opt=None, epochs=10, batch_size=None, seed=0, verbose=True,
         clip=None, schedule=None, val=None, device="cuda", precision="auto", ops=None, ema=None, ewc=None,
         parallel="auto", stages=None, micro_batches=None, graph=None, mask=None, compensated=None, freeze=None,

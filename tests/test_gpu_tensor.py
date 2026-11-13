@@ -58,5 +58,18 @@ class GpuTensor(unittest.TestCase):
         self.assertIn("true", r.stdout.lower(), r.stderr)
 
 
+    def test_numpy_after_a_fallback(self):
+        """softmax(axis=) of a card tensor may come back as an ordinary tensor: .numpy() still works on it."""
+        path = os.path.join(ROOT, "tests", "_gt_np.apsi")
+        with open(path, "w") as f:
+            f.write("let x = randn([4, 3], seed=0)\nlet p = softmax(relu(gpu_tensor(x) @ randn([3, 2], seed=1)), "
+                    "axis=-1)\nassert max(abs(sum(p.numpy(), axis=-1) - 1.0)) < 1e-5\nprint(\"ok\")\n")
+        try:
+            r = subprocess.run([sys.executable, "-m", "apsi", "run", path], capture_output=True, text=True, cwd=ROOT)
+        finally:
+            os.remove(path)
+        self.assertIn("ok", r.stdout, r.stderr)
+
+
 if __name__ == "__main__":
     unittest.main()

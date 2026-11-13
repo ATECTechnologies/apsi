@@ -1177,6 +1177,24 @@ def _map_paths(t, fn, prefix=""):
     return fn(prefix, t) if isinstance(t, np.ndarray) or hasattr(t, "shape") else t
 
 
+def keeps_frozen(fn):
+    """fn(model, params, ..., freeze=, train_only=) returning a record with .params: the frozen weights of the result
+    are the very weights given (their values and their type), whatever precision training ran in."""
+    import functools
+
+    @functools.wraps(fn)
+    def run(model, params, *a, **kw):
+        r = fn(model, params, *a, **kw)
+        fz, to = kw.get("freeze"), kw.get("train_only")
+        if (fz is None and to is None) or not isinstance(r, Record) or "params" not in r.fields:
+            return r
+        still = frozen_paths(params, fz, to)
+        if still:
+            r.fields["params"] = _freeze_keep(params, r.fields["params"], still)
+        return r
+    return run
+
+
 def frozen_paths(params, freeze=None, train_only=None):
     if freeze is None and train_only is None:
         return set()
@@ -1845,6 +1863,7 @@ def fit(model, params, X, y=None, loss="mse", opt=None, epochs=10, batch_size=No
     vparams = (lambda p: lowbit.round_tree(p, kind)) if kind else (lambda p: p)
     Xr, Yr = X, target
     low = kind is not None or str(precision).lower() in ("auto", "fp32", "float32", "f32", "tf32", "bf16", "fp16")
+    params_in = params                        # frozen weights come back exactly as given (dtype too)
     if low:                                   # half the memory of float64 for weights, data and activations
         def _f32(t):
             return tree_map(lambda a: a.astype(np.float32) if isinstance(a, np.ndarray) and a.dtype.kind == "f"
@@ -1911,6 +1930,8 @@ def _fit_loop(env):
             extra = f"  val {vl:.5f}"
         if verbose and (ep % max(1, int(epochs) // 10) == 0 or ep == int(epochs) - 1):
             print(f"epoch {ep:4}  loss {history[-1]:.5f}{extra}")
+    if env.get("still") and env.get("params_in") is not None:
+        params = _freeze_keep(env["params_in"], params, env["still"])
     return Record(params=params, history=history, val_history=val_hist, device="numpy")
 
 

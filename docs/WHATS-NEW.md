@@ -21,6 +21,8 @@ The full list of changes is in the [changelog](https://github.com/ATECTechnologi
 | One model across many cards | a pipeline that splits any model, copies it, and stays exact | [GPU](GPU.md) |
 | The card never waits | queued copies, losses and gates on the card, one launch per reduction | [below](#10-the-card-never-waits) |
 | Settings in one file | `config/apsi-training.env`: every setting, its default, what it does | [Training](TRAINING.md#8-the-settings-file) |
+| Faster everyday code | checks the compiler can prove are gone: calls, loops, f-strings, structs | [below](#13-faster-everyday-code) |
+| Convert one file or a whole project | `apsi convert --only`, `--project`, `--exclude`, `--plan` | [below](#14-converting-python-one-file-or-the-whole-project) |
 
 ## 1. Exact training on any number of cards
 
@@ -170,13 +172,163 @@ safely it runs.
 - NumPy, one card and many cards compared on the same training, step for step.
 - CPU programs against C, C++, Rust, Go, Java, JavaScript, C# and Julia, and 2.6.0 against 2.4.4, on a GitHub
   runner and a 2-core VM: the eight heavy programs run at the same speed as 2.4.4 (0.99×; 0.83× the time of C), and
-  everyday code is within run-to-run noise of 2.4.4 (geometric mean 0.97× on the runner, 1.05× and 0.99× on two VM
-  runs). 2.6.0 changes training, not the language's speed.
+  everyday code is faster (section 13: fib 1.4×, a word count 2.3×, f-strings 2.8×, structs 1.7×).
+- Every benchmark category of the website (Python, matrix products, tables against pandas, the web server, real-time
+  video, models that learn, WebSocket) run again for 2.6.0 and 2.4.4 on the same machine.
 
 **Not measured again for 2.6.0** (the code is unchanged since 2.4.4, and the website keeps 2.4.4's numbers under
 "Measured with Apsi 2.4.4"): language models from Hugging Face on the card (`use hub`), the AI server, the GPU
 training speed against PyTorch, tables, databases, real-time video. `tools\bench_my_pc.bat` measures the GPU training
 speed and every CPU benchmark on your own computer.
+
+## 13. Faster everyday code
+
+Apsi checks types and units while a program runs. 2.6.0 drops the checks the compiler can prove will always pass,
+so ordinary code — functions, loops, strings, structs — runs faster with the same results and the same errors:
+
+- A typed `Int` or `Float` parameter that the function never rebinds is checked once, on the way in; after that,
+  comparing it is a plain condition and returning it needs no second check.
+- `for i in 0..n` with whole-number ends is Python's own `range`, and `i` is a known integer: indexing with it and
+  printing it in an f-string go straight through.
+- A name bound once to a list, dict, set or text literal calls its methods (`parts.append`, `counts.get`), is
+  iterated and is stored into directly.
+- A struct with untyped, `Int` or `Float` fields gets a constructor of its own.
+- On the card, products whose sizes are not multiples of 4 (a SwiGLU width of 2730) use the fast tiled tensor-core
+  kernels through zero-padded copies.
+
+Measured against 2.4.4 on the same machine (the lower end of several runs): recursive calls (fib 25) 1.4× faster, a
+word count 2.3×, 200k f-strings 2.8×, 200k structs 1.7×. The eight heavy `@native` programs were already at C's speed
+(0.83× the time of C) and are unchanged. The website's benchmark page has every measurement.
+
+## 14. Converting Python: one file or the whole project
+
+```bash
+apsi convert app.py                    # app.py and every module of the program it imports
+apsi convert app.py --only             # app.py alone; the program's other modules stay Python
+apsi convert app.py --project          # every .py of the project (pyproject.toml / setup.py / .git above it)
+apsi convert app.py --project --exclude "tests/*" --plan    # see the list first, write nothing
+```
+
+Files that import each other are converted together, so the converted modules import each other as Apsi files. In
+VS Code, *Convert Python to Apsi* asks which of these you want. The complete guide: [Python](PYTHON.md).
+
+## Every new name in one table
+
+| Name | Where | What it does | Default |
+|---|---|---|---|
+| `steps=N` | `fit_batches` (NumPy, one card) | trains N optimizer steps over as many epochs as needed | `none` (use `epochs`) |
+| `checkpoint="run.npz"` | `fit_batches` | weights, optimizer state, rounding error and data position, saved atomically; resumes on the next call | off |
+| `save_every=K` | `fit_batches` | a checkpoint every K steps (and always at the end and on any stop) | end and stop only |
+| `resume=false` | `fit_batches` | start from the beginning even if the checkpoint exists | `true` |
+| `callback=fn(r)` | `fit_batches` | after every epoch: `r.epoch`, `r.step`, `r.loss` | none |
+| `freeze=` / `train_only=` | `fit`, `fit_batches` | weights that stay exactly as they are, by path or function | none |
+| `exact_sums=` | GPU `fit`, `fit_batches` | double-float sums across batches, copies and cards | on below 2 B parameters |
+| `stages=` | GPU `fit`, `fit_batches` with `device="cuda:all"` | how many cards one copy of the model is split across | balanced automatically |
+| `gpu_tensor(x)`, `gpu_device()` | prelude | a tensor on the card; where it lives | — |
+| `pinn_fit`, `pinn_derivatives` | `use layers` | physics-informed training; u, ∂u, ∂²u at points | — |
+| `gla(size)`, `gla_count`, `gla_from_code`, `gla_loss` | `use layers` | GLA 3.0 as an Apsi model | — |
+| `tokens.focus`, `unfold`, `fit_chat`, `outline` | `use tokens` | fewer tokens, everything restorable | — |
+| `data.train_tokenizer` | `use data` | byte-level BPE, `tokenizer.json` | `vocab_size=8000` |
+| `apsi convert --only` / `--project` / `--exclude` / `--plan` | command line | how much Python is converted | the file and its imports |
+| `APSI_GEMM_PAD` | environment | products with sizes not multiples of 4 on the tiled kernels | `1` |
+| `APSI_GPU_GUARD` | environment | skip steps with inf/NaN gradients | `1` |
+| `APSI_GPU_DETERMINISTIC` | environment | fixed-order reductions everywhere, including attention's backward | `1` |
+| `APSI_GPU_EXACT_SUMS` | environment | force double-float sums on (`1`) or off (`0`) | automatic |
+| `APSI_GPU_ASYNC_COPY` | environment | queued copies through pinned memory | `1` |
+
+## Recipes
+
+**A long run that must not be lost.** Steps, a checkpoint every few hundred steps, and the guard (on by default):
+
+```apsi
+use layers
+let r = fit_batches(lm, lm.init(seed=0), batches, loss="cross_entropy", opt=adamw(lr=3e-4),
+                    steps=50000, checkpoint="lm.npz", save_every=500, backend="gpu",
+                    callback=fn(r) => print(f"epoch {r.epoch} step {r.step} loss {r.loss:.4f}"))
+```
+
+Stop it at any moment (Ctrl+C, a power cut, an error); run the same line again and it continues from the last
+save. A save takes about as long as writing the weights twice to disk; 500 steps is a good interval for models up
+to a few hundred million parameters.
+
+**Fine-tune only the head.**
+
+```apsi
+let r = fit(model, params, X, Y, loss="cross_entropy", opt=adamw(lr=1e-4), train_only="head*", backend="gpu")
+# every weight outside head* is bit for bit what it was before
+```
+
+**Run NumPy-style code on the card without rewriting it.**
+
+```apsi
+let a = gpu_tensor(x)                 # x: an ordinary tensor
+let h = relu(a @ w1 + b1)             # on the card
+let p = softmax(h @ w2, axis=-1)      # on the card
+print(p.numpy()[:3])                  # back to the processor
+```
+
+Anything Apsi has no kernel for is computed on the processor automatically and comes back as an ordinary tensor.
+
+**A model larger than one card.**
+
+```apsi
+let r = fit_batches(model, params, batches, loss="cross_entropy", opt=adamw(lr=2e-4),
+                    device="cuda:all", stages=2, accumulate=8)
+# 4 cards: 2 stages x 2 copies; the weights equal those of one card with accumulate=8
+```
+
+**Send a model only what the question needs.**
+
+```apsi
+use tokens
+let f = tokens.focus(read_text("server.py"), "where is the session timeout set?", budget=2000,
+                     keep=["def create_app"])
+send(f.text)                  # if the model asks for marker [4]:
+send(tokens.unfold(f, [4]))
+```
+
+**Train a tokenizer and a dataset from the same folder.**
+
+```apsi
+use data
+let tok = data.train_tokenizer("corpus/*.txt", vocab_size=16000, special_tokens=["<|endoftext|>", "<|pad|>"])
+tok.save("tok.json")          # also loads in Hugging Face tokenizers
+let ds = data.text_dataset("corpus/*.txt", tokenizer=tok, seq_len=512)
+```
+
+## Questions
+
+**Is 2.6.0 slower because of exact sums and determinism?** No. Everyday code is faster than in 2.4.4 (section 13),
+the heavy native programs run at the same speed, and on the card a small transformer's step went from 5.3–6.0 ms to
+4.0–4.7 ms on an RTX 3060, even though the deterministic attention backward runs two kernels instead of one. Exact
+sums cost 8 bytes per parameter of card memory.
+
+**My results differ from 2.4.4 in the last digits.** Expected: 2.6.0 sums more exactly. The difference is in the
+direction of the exact value; it is not a change in what the program computes.
+
+**Can I resume a checkpoint on another machine?** Yes, with the same model and data: the file holds the weights,
+the optimizer's moments in float32 and float64 and the position in the data. A different card gives the same
+result because training is deterministic.
+
+**What does the guard do when every step is bad?** It skips them all and the loss does not move; the history shows
+the same value repeated. That almost always means a bug in the data or the loss (a log of 0, a division by 0).
+`APSI_GPU_GUARD=0` lets the NaN through so you can see where it appears.
+
+**Does focus need GLA weights?** No. It uses GLA's code property graph (the structure of the code), not a trained
+GLA model. It runs on the processor in milliseconds.
+
+**Does training on several cards need special code?** No: `device="cuda:all"`. With `steps=` or `checkpoint=` it
+currently needs one card; the multi-card trainer raises a clear error instead of silently ignoring them.
+
+## Limits in 2.6.0
+
+- `steps=`, `checkpoint=` and `save_every=` work on NumPy and on one card; on several cards they are refused with a
+  message (planned).
+- Mixed second derivatives (∂²u/∂x∂y) are not in `pinn_fit`'s `d2u`; write that loss with `grad` on the processor.
+- `focus` reads Python by its syntax tree; other languages are read as text (blocks and lines), which still works but
+  links fewer parts.
+- Exact sums turn themselves off at 2 B parameters (memory); `exact_sums=true` forces them on.
+- AMD and Intel cards are not supported by the GPU trainer (NVIDIA, CUDA driver).
 
 ## Upgrading from 2.4.4
 

@@ -35,7 +35,7 @@ class Modes(unittest.TestCase):
             for path, w in L.param_paths(b.params):
                 frozen = L.frozen_paths(m.init(seed=0), kw.get("freeze"), kw.get("train_only"))
                 if path in frozen:
-                    self.assertLess(float(np.abs(np.asarray(w) - p0[path]).max()), 1e-6)
+                    np.testing.assert_array_equal(np.asarray(w), p0[path])     # the very weights given
 
     def test_fit_on_many_cards_for_what_its_kernels_do_not_do(self):
         X, y = data(1)

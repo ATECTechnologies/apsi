@@ -2,6 +2,30 @@
 
 ## 2.6.0 — exact training on any number of cards, GLA 3.0, training that finishes, fewer tokens (13 November 2026)
 
+### Faster everyday code
+- **Facts the compiler can prove are no longer checked at run time:** a typed `Int`/`Float` parameter that is never
+  rebound is a plain number for the whole call (a comparison of two such numbers is a plain condition; returning it
+  needs no second check); `for i in 0..n` with whole-number ends runs on Python's own `range` and `i` is a known
+  integer (indexes and f-strings use it directly); a name bound once to a list, dict, set or text literal calls its
+  methods, iterates and stores directly. Same results, same errors.
+- **Structs are built directly:** a struct whose fields are untyped, `Int` or `Float` gets a constructor of its own
+  (no general plan per call): creating 200,000 structs is 1.8× faster.
+- Measured against 2.4.4 on the same machine (the lower end of several runs): recursive calls (fib 25) 1.4×
+  faster, a word count 2.3×, 200k f-strings 2.8×, 200k structs 1.7×, an integer loop 1.1×; the eight heavy
+  `@native` programs are unchanged (the native code generator was already at C's speed).
+- **Products whose sizes are not multiples of 4** (a SwiGLU width of 2730, an odd vocabulary) run on the tiled
+  tensor-core kernels through zero-padded copies instead of the general kernel (`APSI_GEMM_PAD=0` turns it off).
+
+### Converting Python: one file, its imports, or the whole project
+- `apsi convert app.py` converts the file and every module of the program it imports (as before);
+  **`--only`** converts just the files named and keeps the program's other modules as Python imports;
+  **`--project`** converts every `.py` of the project the file belongs to (the folder with `pyproject.toml`,
+  `setup.py`, `setup.cfg`, `requirements.txt`, `Pipfile` or `.git`); **`--exclude PATTERN`** leaves files out;
+  **`--plan`** lists each file, where it goes and why, and writes nothing.
+- VS Code: *Convert Python to Apsi* asks how much: this file and its imports, this file only, the whole project, or
+  the plan first.
+- `pyimport` also finds modules in the program's own folder (a module kept as Python next to a converted program).
+
 ### Exact training on many cards
 - **The same weights on any number of cards, to the last bit:** the gradients of a step's batches, of the copies of
   a stage and of the values that cross a cut are summed exactly (double-float, two new kernels: `acc2`, an
@@ -73,6 +97,8 @@
   against the reference; `apsi gpu bench cards` checks that every card gives one card's weights bit for bit.
   `tools\gpu_check.bat`: the whole check on a Windows computer's card, written to gpu-check.txt.
 - **Faster record fields:** reading a record's field in the bytecode engine is 1.8x faster.
+- `.numpy()` works on every result of `gpu_tensor` code, also on a value the processor computed (a fallback, or
+  no card), so the same program runs with and without a card.
 
 ### Training modes
 - **Any optimizer on the GPU trainer:** adam, adamw and sgd keep their kernels; rmsprop, adagrad or an optimizer of
@@ -82,6 +108,8 @@
   function of the path) on NumPy, one card and many: the frozen weights get no gradient, do not count in `clip`,
   and keep their exact values (weight decay and momentum cannot move them). Fine-tuning, or GLA's phases (one brain
   at a time).
+- **Frozen means untouched, also in its type:** the result's frozen weights are the very arrays given (float64 stays
+  float64), on every backend; before, training in float32 could hand them back rounded to float32.
 - **Any loss name on the card:** a loss without a kernel (`"vae"`, …) is evaluated on the processor, like a loss
   function.
 - **Variants without a kernel run inside the model on the card** instead of refusing (an activation such as mish,
@@ -192,7 +220,7 @@
 - The same result as one card with the whole batch (tested with Adam, AdamW, SGD, clipping over the whole model, EMA,
   EWC, low-bit precision); a failure on any card stops all of them at once with that card's error.
 
-## 2.4.4 — Python, exactly; real time; data, databases and the web
+## 2.4.4 — Python, exactly; real time; data, databases and the web (10 November 2026)
 
 ### Training on the GPU with Apsi alone, low-bit formats, an AI server
 - **`fit(..., backend="gpu")`: Apsi's own GPU trainer** — CUDA kernels written in Apsi's code generator and loaded
@@ -506,7 +534,7 @@
   EPYC 7763: n-body 4.0×, ODE 1.5×, k-means 1.27×, compiling 1.21× faster, nothing slower
   (`benchmarks/commits/results-2.4.4.md`).
 
-## 2.0.0 — native machine code, all CPU cores and NVIDIA GPUs
+## 2.0.0 — native machine code, all CPU cores and NVIDIA GPUs (9 November 2026)
 
 Apsi 2.0 replaces "everything runs on the Python VM" with a native compiler. Python stays where it helps (the
 tooling, libraries, the rest of the language), while numeric code runs as machine code built through LLVM.
@@ -730,7 +758,7 @@ tooling, libraries, the rest of the language), while numeric code runs as machin
   Linux portable build bundle it; the shell installer installs it into a private environment when the system lacks
   it; the `.deb` recommends `python3-llvmlite`. Without it Apsi still runs, on the bytecode engine.
 
-## 1.10.0 — first production release with installers
+## 1.10.0 — first production release with installers (8 November 2026)
 
 Development started on **Sunday, 8 November 2026 at about 04:00** (Bangkok time, UTC+7); this release was completed the same morning at about **09:00** — about **5 hours** of development.
 

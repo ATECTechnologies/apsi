@@ -223,10 +223,10 @@ def install(interp):
         import importlib, sys as _sys
         # launchers run Python isolated (-I); local modules next to the program are found
         # only for programs that were explicitly granted --allow-python
-        cwd = os.getcwd()
-        added = cwd not in _sys.path
-        if added:
-            _sys.path.append(cwd)
+        # the program's own folder too: a module kept as Python next to a converted program (apsi convert --only)
+        here = interp.dir_stack[-1] if getattr(interp, "dir_stack", None) else None
+        added = [d for d in dict.fromkeys([os.getcwd(), here]) if d and d not in _sys.path]
+        _sys.path.extend(added)
         try:
             return importlib.import_module(name)
         except ImportError as e:
@@ -234,8 +234,9 @@ def install(interp):
             err.name = name
             raise err from None
         finally:
-            if added and cwd in _sys.path:
-                _sys.path.remove(cwd)
+            for d in added:
+                if d in _sys.path:
+                    _sys.path.remove(d)
 
     def to_torch(x, device=None):
         _need(interp, "python", "to_torch()")

@@ -15,6 +15,9 @@ what each one does, why it matters, and what you give up if you turn it off.
 - [8. The settings file](#8-the-settings-file)
 - [9. What happens if you turn things off](#9-what-happens-if-you-turn-things-off)
 - [10. Checking your card](#10-checking-your-card)
+- [11. How much card memory a model needs](#11-how-much-card-memory-a-model-needs)
+- [12. When something goes wrong](#12-when-something-goes-wrong)
+- [13. Recommended settings](#13-recommended-settings)
 
 ---
 
@@ -192,3 +195,45 @@ the most expensive outcome of all), and stability is always kept as high as poss
 every kernel on your card with the exact reference, trains GLA twice and checks the weights are identical, trains a
 transformer on the fused attention twice (identical again) and measures a step. `tools\flow_bench.bat` measures
 where a step's time goes (queued against waiting copies, the kernels on the card).
+
+## 11. How much card memory a model needs
+
+For each parameter, training on the card keeps:
+
+| What | Bytes | When |
+|---|---|---|
+| the weight (float32) | 4 | always |
+| its gradient | 4 | always |
+| Adam's two moments | 8 | `adam`, `adamw` (SGD with momentum: 4, plain SGD: 0) |
+| the carried rounding error of the update | 4 | compensated updates, on below 2 B parameters |
+| the double-float gradient sum | 8 | exact sums, on below 2 B parameters, with `accumulate` > 1 or several cards |
+
+So AdamW with every protection on needs about 28 bytes per parameter, plus the activations of one micro-batch
+(which grow with batch size × sequence length × width × layers). A 125 M-parameter model: about 3.5 GB before
+activations, comfortable on a 12 GB card. When the card runs out, the error says how much was in use; then lower the
+batch size and raise `accumulate` (the result is the same, bit for bit), or split the model with
+`device="cuda:all"`.
+
+## 12. When something goes wrong
+
+| What you see | The usual cause | What to do |
+|---|---|---|
+| The loss stays exactly the same number | every step was skipped by the guard: the gradient is inf/NaN every time | check the data and the loss (a log of 0, a division by 0, labels out of range); `APSI_GPU_GUARD=0` shows where the NaN first appears |
+| The loss is `nan` in the history | a NaN in the **loss** of a batch (the guard protects the weights, not the reported loss) | the same checks; the weights are still finite |
+| "the checkpoint … is of a model with N weights" | the file belongs to another model or another size | another `checkpoint=` path, or `resume=false` to start over |
+| "steps= and checkpoint= train on one card for now" | `device="cuda:all"` together with `steps=` / `checkpoint=` | `device="cuda:0"` with `accumulate=` for the same result, or train by `epochs=` on many cards |
+| "the card ran out of memory" | the model, the optimizer state and the activations do not fit | a smaller batch and a larger `accumulate` (the same result); several cards (`device="cuda:all"`) |
+| Two runs on the card differ | `APSI_GPU_DETERMINISTIC=0`, or a different number of cards with exact sums off | turn both back on (the defaults) |
+| Training became slower over a long run | the card reached its temperature limit (77 °C) and was slowed to stay there | better airflow, or a power limit (`APSI_GPU_POWER`, `apsi gpu setup`) that keeps the speed steady |
+| A resumed run differs from one long run | the data changed between the runs (a different file list or order) | resume with the same `batches` (a function of the epoch is fine if it is deterministic) |
+
+## 13. Recommended settings
+
+| Situation | Settings |
+|---|---|
+| Experimenting on a small model | the defaults; `epochs=` and `verbose=true` |
+| A run of hours or days | `steps=`, `checkpoint=`, `save_every=` about every 10–30 minutes of training |
+| A model larger than one card | `device="cuda:all"`, `stages=` the fewest cards it fits on, `accumulate=` for the batch size you want |
+| Comparing two ideas fairly | the defaults (deterministic): any difference in the result comes from the idea, not from chance |
+| Fine-tuning | `train_only=` the parts to learn, a learning rate 5–10× lower than for training from scratch |
+| The fastest possible step, reproducibility not needed | `APSI_GPU_DETERMINISTIC=0` (attention's backward in one kernel); keep the guard on |

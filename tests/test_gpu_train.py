@@ -673,6 +673,33 @@ class RealGpu(unittest.TestCase):
             np.testing.assert_array_equal(a_, b_)
             self.assertLess(np.abs(a_ - r_).max() / (np.abs(r_).max() + 1e-9), 1e-2)
 
+    def test_products_with_sizes_not_multiples_of_4(self):
+        """A SwiGLU width such as 2730: zero-padded copies on the tiled kernels, both layouts of each operand, bias,
+        alpha and accumulate, against the emulator; the same bits on a second run."""
+        g, e = self.g, GT.Emulator(tc=self.g.tc)
+        rng = np.random.default_rng(8)
+        M, N, K = 258, 2730, 130
+
+        def pair(a):
+            a = np.ascontiguousarray(a)
+            bg, be = g.alloc(a.size), e.alloc(a.size)
+            g.put(bg, a.reshape(-1))
+            e.put(be, a.reshape(-1))
+            return (bg, 0), (be, 0)
+        A, At = pair(rng.normal(size=(M, K))), pair(rng.normal(size=(K, M)))
+        B, Bt = pair(rng.normal(size=(K, N))), pair(rng.normal(size=(N, K)))
+        bias, c0 = pair(rng.normal(size=N)), rng.normal(size=(M, N))
+        runs = []
+        for _ in range(2):
+            C = pair(c0)
+            for dv, i in ((g, 0), (e, 1)):
+                dv.gemm(A[i], B[i], C[i], M, N, K, K, 1, N, 1, N, beta=True, bias=bias[i], passes=1)
+                dv.gemm(At[i], Bt[i], C[i], M, N, K, 1, M, 1, K, N, beta=True, alpha=0.5, passes=1)
+            a, b = g.get(C[0][0], M * N), e.get(C[1][0], M * N)
+            self.assertLess(np.abs(a - b).max() / (np.abs(b).max() + 1e-9), 2e-3)
+            runs.append(a.copy())
+        np.testing.assert_array_equal(runs[0], runs[1])
+
     def test_every_kernel_matches_the_emulator(self):
         g, e = self.g, GT.Emulator(tc=self.g.tc)
         rng = np.random.default_rng(2)

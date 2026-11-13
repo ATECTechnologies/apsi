@@ -73,5 +73,51 @@ class IdiomaticGate(unittest.TestCase):
             self.assertEqual(apsi("run", src[:-3] + ".apsi").stdout, "zero other\n")
 
 
+class Scopes(unittest.TestCase):
+    """One file and what it imports (the default), only the files named (--only), the whole project (--project),
+    --exclude and --plan."""
+
+    def project(self, td):
+        os.makedirs(os.path.join(td, "pkg"))
+        os.makedirs(os.path.join(td, "tests"))
+        files = {"pyproject.toml": "[project]\nname = 'x'\n", "main.py": "import helper\nfrom pkg import util\n"
+                 "print(helper.double(util.three()))\n", "helper.py": "def double(x):\n    return 2 * x\n",
+                 "pkg/__init__.py": "", "pkg/util.py": "def three():\n    return 3\n",
+                 "tests/test_h.py": "import helper\n"}
+        for k, v in files.items():
+            with open(os.path.join(td, k), "w") as f:
+                f.write(v)
+        return os.path.join(td, "main.py")
+
+    def converted(self, td):
+        return sorted(os.path.relpath(os.path.join(r, f), td).replace(os.sep, "/") for r, _d, fs in os.walk(td)
+                      for f in fs if f.endswith(".apsi"))
+
+    def test_follow_imports_by_default(self):
+        with tempfile.TemporaryDirectory() as td:
+            main = self.project(td)
+            self.assertEqual(apsi("convert", main).returncode, 0)
+            self.assertEqual(self.converted(td), ["helper.apsi", "main.apsi", "pkg/__init__.apsi", "pkg/util.apsi"])
+            self.assertEqual(apsi("run", main[:-3] + ".apsi").stdout, "6\n")
+
+    def test_only_the_file(self):
+        with tempfile.TemporaryDirectory() as td:
+            main = self.project(td)
+            r = apsi("convert", main, "--only")
+            self.assertEqual(r.returncode, 0, r.stderr)
+            self.assertIn("kept as Python imports (--only): helper, pkg", r.stdout)
+            self.assertEqual(self.converted(td), ["main.apsi"])
+            self.assertEqual(apsi("run", "--allow-python=all", main[:-3] + ".apsi", cwd=ROOT).stdout, "6\n")
+
+    def test_whole_project_with_exclude_and_plan(self):
+        with tempfile.TemporaryDirectory() as td:
+            main = self.project(td)
+            plan = apsi("convert", os.path.join(td, "pkg", "util.py"), "--project", "--plan")
+            self.assertIn("would write 5 files", plan.stdout)
+            self.assertEqual(self.converted(td), [])                      # --plan writes nothing
+            self.assertEqual(apsi("convert", main, "--project", "--exclude", "tests/*").returncode, 0)
+            self.assertEqual(self.converted(td), ["helper.apsi", "main.apsi", "pkg/__init__.apsi", "pkg/util.apsi"])
+
+
 if __name__ == "__main__":
     unittest.main()

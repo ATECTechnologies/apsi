@@ -271,6 +271,7 @@ class Converter:
         self.needs_python = False
         self.in_loop = 0
         self.local_modules = set()
+        self.kept_local = set()                     # modules next to the program kept as Python (convert --only)
         self.pkg_sources = {}               # .apsi path of a converted library -> its Python source
         self.renames = {}
 
@@ -752,6 +753,11 @@ class Converter:
         rel = (module or "").replace(".", os.sep)
         for cand in (rel + ".py", os.path.join(rel, "__init__.py")):
             if rel and os.path.exists(os.path.join(base, cand)):
+                keep = getattr(self, "keep_local", None)
+                if keep is not None and keep(os.path.abspath(os.path.join(base, cand))):
+                    if not level:
+                        self.kept_local.add(module)
+                        return None                 # stays a Python import: pyimport() finds it next to the program
                 apsi = cand[:-3] + ".apsi"
                 self.local_modules.add(os.path.join(base, cand))
                 return os.path.relpath(os.path.join(base, apsi), self.base_dir).replace(os.sep, "/")
@@ -769,7 +775,7 @@ class Converter:
             if kind == "compiled" and node is not None:
                 self.warn(node, f"'{top}' is a compiled (C/C++) library: used as is through "
                                 f"Python{self.packages.hint(top)}")
-            elif kind is None and node is not None and not self._local(top):
+            elif kind is None and node is not None and top not in self.kept_local and not self._local(top):
                 self.warn(node, f"'{top}' is not installed in the program's .venv or the converting Python, so it "
                                 f"was not converted; it stays a Python import{self.packages.hint(top)}")
             return None
@@ -1260,11 +1266,17 @@ def _pattern_names(p):
     return out
 
 
-def convert_source(source, filename="<python>", base_dir=None, packages=None, out_path=None, vendored=False):
+def convert_source(source, filename="<python>", base_dir=None, packages=None, out_path=None, vendored=False,
+                   keep_local=None):
     """Convert Python source; returns (apsi_text, warnings, local_modules). local_modules holds the paths of
-    modules next to the program, and (source, destination) pairs for converted libraries."""
+    modules next to the program, and (source, destination) pairs for converted libraries. keep_local: a function
+    path -> bool; a module next to the program for which it says true stays a Python import (convert --only)."""
     c = Converter(source, filename, base_dir, packages, out_path, vendored)
+    c.keep_local = keep_local
     text = c.convert()
+    if c.kept_local:
+        c.warnings.append((1, "modules of the program kept as Python imports (--only): "
+                              + ", ".join(sorted(c.kept_local)) + "; run with --allow-python"))
     return text, c.warnings, c.local_modules
 
 

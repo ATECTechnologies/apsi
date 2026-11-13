@@ -7,7 +7,10 @@ Python program, byte for byte. Large real programs convert in seconds and run im
 ```bash
 apsi convert script.py                 # writes script.apsi (and .apsi files for the modules it imports), checks them
 apsi convert script.py --run           # convert, check and run
-apsi convert src/ -o apsi_src/         # a whole project, keeping the folder layout
+apsi convert src/ -o apsi_src/         # a whole folder, keeping the folder layout
+apsi convert app.py --only             # just this file; the program's modules it imports stay Python
+apsi convert app.py --project          # the whole project app.py belongs to (pyproject.toml / .git above it)
+apsi convert app.py --project --plan   # list what would be converted, write nothing
 apsi convert script.py --stdout        # print the Apsi code
 apsi convert script.py --idiomatic     # map numpy/math/torch onto Apsi's own built-ins (small numeric scripts)
 ```
@@ -29,6 +32,33 @@ converted 5 files, 0 notes
 Modules that sit next to the program (`import GLA`, `from gla_brain_dual import X`, packages with `__init__.py`,
 `from . import x`) are converted with it and imported as Apsi files, and so are the installed libraries it imports
 that are written in Python (next section).
+
+## One file, what it imports, or the whole project
+
+Choose how much is converted; `--plan` shows the list first and writes nothing.
+
+| Command | Converts | Use it when |
+|---|---|---|
+| `apsi convert app.py` | `app.py` **and every module of the program it imports**, recursively (the default) | you want the program to run on Apsi as a whole |
+| `apsi convert app.py --only` | **only** `app.py`; the program's own modules it imports stay Python (`pyimport`) | you move a large program one file at a time; run the result with `--allow-python` |
+| `apsi convert app.py --project` | **every `.py` of the project** `app.py` belongs to: the folder with `pyproject.toml`, `setup.py`, `setup.cfg`, `requirements.txt`, `Pipfile` or `.git` above it | you convert a whole repository, scripts and tools included, keeping its layout |
+| `apsi convert src/` | every `.py` in a folder | you choose the folder yourself |
+| `… --exclude "tests/*"` | the same, without files whose path matches (may be repeated) | leave tests, examples or generated code out |
+| `… --plan` | nothing: lists each file, where it would go and why (named, imported by …, in the project) | you want to see the scope before writing |
+
+```text
+$ apsi convert main.py --plan
+apsi convert would write 4 files in /work/proj:
+  main.py          ->  main.apsi   (named)
+  helper.py        ->  helper.apsi   (imported by main.py)
+  pkg/__init__.py  ->  pkg/__init__.apsi   (imported by main.py)
+  pkg/util.py      ->  pkg/util.apsi   (imported by main.py)
+nothing written (--plan). Run the same command without --plan to convert.
+```
+
+Files that import each other are always converted together, so the converted modules import each other as Apsi
+files. A module already converted and newer than its `.py` is not converted again. With `--only`, a Python module
+kept next to the program is found by `pyimport` in the program's own folder.
 
 ## Libraries: what converts and what does not
 

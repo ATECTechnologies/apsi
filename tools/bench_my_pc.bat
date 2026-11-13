@@ -12,7 +12,7 @@ rem   4. a training step, measured: queued against waiting copies, the kernels' 
 rem   5. CPU programs:             the eight heavy programs in Apsi and every other language installed here
 rem                                (C/C++ with gcc or clang, Rust, Go, Java, Node.js, C#, Julia: missing ones are skipped)
 rem   6. Apsi 2.6.0 against 2.4.4: the same programs, start-up and checking, on this computer
-rem                                (needs Downloads\apsi-2.4.4-source.zip, which you already have)
+rem                                (needs apsi-2.4.4-source.zip in Downloads or Downloads\apsi-old-versions)
 rem Not run here (not part of this test): real language models from Hugging Face (use hub), the AI server, databases.
 setlocal EnableDelayedExpansion
 chcp 65001 >nul
@@ -76,6 +76,7 @@ type "%OUT%\heavy-2.6.0\results.md" >> "%LOG%" 2>nul
 echo == 6. Apsi 2.6.0 against 2.4.4
 echo == 6. 2.6.0 against 2.4.4 >> "%LOG%"
 set "OLDZIP=%USERPROFILE%\Downloads\apsi-2.4.4-source.zip"
+if not exist "%OLDZIP%" set "OLDZIP=%USERPROFILE%\Downloads\apsi-old-versions\apsi-2.4.4-source.zip"
 set "OLD=%TEMP%\apsi-bench-2.4.4"
 if exist "%OLDZIP%" (
     if not exist "%OLD%\apsi-2.4.4\apsi\__init__.py" powershell -NoProfile -Command "Expand-Archive -LiteralPath '%OLDZIP%' -DestinationPath '%OLD%' -Force"

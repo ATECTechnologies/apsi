@@ -1674,6 +1674,8 @@ class Interpreter:
         try:
             v = getattr(obj, name)
         except AttributeError:
+            if name == "numpy" and isinstance(obj, np.ndarray):     # gpu_tensor(x).numpy() also after a fallback
+                return lambda: obj
             raise _no_attr(obj, name) from None
         if not isinstance(obj, _NOT_PLAIN):
             _PLAIN_GET.add(c)                               # next time: straight to getattr (same checks apply)

@@ -59,6 +59,11 @@ class FuncCtx:
         self.used = set()
         self.nonlocals = set()
         self.globals = set()
+        self.bind = HELPER_PREFIX + "b"   # the shape-binding dict a checker gets ("None" when no shapes)
+        self.ints = set()           # id(Binding) of names that surely hold a Python int (Int parameters, range loops)
+        self.cls = {}               # id(Binding) -> list / dict / str / set: bound once, to a literal of that class
+        self.single = frozenset()   # names bound exactly once in this function's body
+        self.known = {}             # id(Binding) -> checker: typed scalar parameters never rebound in the body
 
 
 class Binding:
@@ -246,6 +251,10 @@ class CodeGen:
                 val = f"{chk}({val}, None, {s.targets[0]!r})"
             b = self.declare(scope, s.targets[0], mutable=s.mutable)
             self.emit(f"{b.py} = {val}")
+            if s.type is None and isinstance(s.targets[0], str) and s.targets[0] in scope.ctx.single:
+                c = _literal_class(s.value)
+                if c is not None:
+                    scope.ctx.cls[id(b)] = c
         else:
             tmp = self.fresh("t")
             self.emit(f"{tmp} = {HELPER_PREFIX}unpack({val}, {len(s.targets)})")
@@ -294,7 +303,7 @@ class CodeGen:
             else:
                 self.emit(f"{HELPER_PREFIX}setattr({self.expr(t.obj, scope)}, {t.name!r}, {val})")
         elif isinstance(t, A.Index):
-            self.emit(f"{HELPER_PREFIX}setidx({self.expr(t.obj, scope)}, {self.index(t.index, scope)}, {val})")
+            self.emit(self._setidx(t.obj, t.index, val, scope))
         elif isinstance(t, A.TupleLit) and any(not isinstance(x, A.Name) for x in t.items):
             tmp = self.fresh("t")
             self.emit(f"{tmp} = {HELPER_PREFIX}unpack({val}, {len(t.items)})")
@@ -340,8 +349,45 @@ class CodeGen:
     def cond(self, c):
         return c if self.pyc else f"{HELPER_PREFIX}truth({c})"
 
-    def fast_cond(self, c, scope):
+    def _scalar(self, e, scope):
+        """e is surely a plain number: a literal without a unit, or a checked Int/Float parameter never rebound."""
+        if isinstance(e, A.Num):
+            return e.unit is None and e.value.__class__ in (int, float)
+        if isinstance(e, A.Name):
+            b = scope.lookup(e.id)
+            return b is not None and (id(b) in scope.ctx.known or id(b) in scope.ctx.ints)
+        if isinstance(e, A.Unary) and e.op == "-":
+            return self._scalar(e.operand, scope)
+        return False
+
+    def _int(self, e, scope):
+        """e surely evaluates to a Python int (an int literal, an Int parameter or a range loop's variable)."""
+        if isinstance(e, A.Num):
+            return e.unit is None and e.value.__class__ is int
+        if isinstance(e, A.Name):
+            b = scope.lookup(e.id)
+            return b is not None and b.ctx is scope.ctx and id(b) in scope.ctx.ints
+        return False
+
+    def _cls(self, e, scope):
+        """list / dict / str / set when e surely is one (a literal, or a name bound once to a literal)."""
+        if isinstance(e, A.Str):
+            return str
+        if isinstance(e, A.Name):
+            b = scope.lookup(e.id)
+            return scope.ctx.cls.get(id(b)) if b is not None and b.ctx is scope.ctx else None
+        return None
+
+    def plain_cond(self, cond, scope):
+        """A comparison of two plain numbers is a Python bool: no truth check needed."""
+        return (not self.pyc and scope.ctx.kind == "fn" and isinstance(cond, A.Binary)
+                and cond.op in ("<", "<=", ">", ">=", "==", "!=") and self._scalar(cond.left, scope)
+                and self._scalar(cond.right, scope))
+
+    def fast_cond(self, c, scope, node=None):
         """A statement condition: plain bools (comparisons of numbers) skip the tensor check."""
+        if node is not None and self.plain_cond(node, scope):
+            return c
         if self.pyc or scope.ctx.kind != "fn":
             return self.cond(c)
         v = f"{HELPER_PREFIX}cnd"
@@ -350,7 +396,7 @@ class CodeGen:
     def s_If(self, s, scope):
         first = True
         for cond, body in s.branches:
-            c = self.fast_cond(self.expr(cond, scope), scope)
+            c = self.fast_cond(self.expr(cond, scope), scope, cond)
             self.emit(f"{'if' if first else 'elif'} {c}:")
             first = False
             self.indent += 1
@@ -457,7 +503,7 @@ class CodeGen:
             self.indent -= 1
 
     def s_While(self, s, scope):
-        self.emit(f"while {self.fast_cond(self.expr(s.cond, scope), scope)}:")
+        self.emit(f"while {self.fast_cond(self.expr(s.cond, scope), scope, s.cond)}:")
         self.indent += 1
         self.block(s.body, Scope(scope, scope.ctx, loop=True))
         self.indent -= 1
@@ -490,15 +536,27 @@ class CodeGen:
 
     def _for(self, s, scope):
         it = s.iter
+        int_loop = False
         if isinstance(it, A.Range):
-            src = f"{HELPER_PREFIX}irange({self.expr(it.start, scope)}, {self.expr(it.end, scope)}, {it.inclusive})"
+            a, b = self.expr(it.start, scope), self.expr(it.end, scope)
+            if not self.pyc and self._int(it.start, scope) and self._int(it.end, scope):
+                int_loop = True                       # both ends surely int: Python's range, an int variable
+                src = f"{HELPER_PREFIX}range({a}, {b} + 1)" if it.inclusive else f"{HELPER_PREFIX}range({a}, {b})"
+            else:
+                src = f"{HELPER_PREFIX}irange({a}, {b}, {it.inclusive})"
         elif self.pyc:
             src = self.expr(it, scope)
+        elif self._cls(it, scope) in (list, dict, str, set):
+            src = self.expr(it, scope)                # a list, dict, text or set: iterated as it is
         else:
             src = f"{HELPER_PREFIX}iterable({self.expr(it, scope)})"
         inner = Scope(scope, scope.ctx, loop=True)
         pats = s.targets
         tgt = self.pattern(pats[0], inner) if len(pats) == 1 else self.pattern(list(pats), inner)
+        if int_loop and len(pats) == 1 and isinstance(pats[0], str) and pats[0] in scope.ctx.single:
+            lb = inner.lookup(pats[0])
+            if lb is not None:
+                scope.ctx.ints.add(id(lb))
         self.emit(f"{'async ' if s.is_async else ''}for {tgt} in {src}:")
         self.indent += 1
         self.block(s.body, inner)
@@ -733,13 +791,20 @@ class CodeGen:
     def s_Return(self, s, scope):
         val = self.expr(s.value, scope) if s.value is not None else "None"
         ret = getattr(scope.ctx, "ret_check", None)
-        if ret and not scope.ctx.erased:
+        if ret and not scope.ctx.erased and not self._known_as(s.value, scope, getattr(scope.ctx, "ret_type", None)):
             val = self._ret(scope.ctx, val)
         self.emit(f"return {val}")
 
+    def _known_as(self, e, scope, checker):
+        """e is a parameter already checked with this very checker and never rebound (checking again changes nothing)."""
+        if not isinstance(e, A.Name):
+            return False
+        b = scope.lookup(e.id)
+        return b is not None and scope.ctx.known.get(id(b)) == checker
+
     def _ret(self, ctx, val):
         """The checked return value; Int/Float results of the expected class skip the checker call."""
-        call = f"{ctx.ret_check}({{}}, {HELPER_PREFIX}b, {'return value of ' + ctx.name + '()'!r})"
+        call = f"{ctx.ret_check}({{}}, {getattr(ctx, 'bind', HELPER_PREFIX + 'b')}, {'return value of ' + ctx.name + '()'!r})"
         fast = getattr(ctx, "ret_fast", None)
         if fast and ctx.kind == "fn":
             r = f"{HELPER_PREFIX}ret"
@@ -883,6 +948,8 @@ class CodeGen:
             if p.default is not None:
                 self.emit(f"if {py} is {HELPER_PREFIX}NO: {py} = {self.expr(p.default, fscope.parent)}")
         needs_b = any(p.type is not None for p in params) or ret is not None
+        if not self.pyc:
+            ctx.single = _single_names(body if not is_expr else [body], [p.name for p in params])
         syms = list(shape_params)
         for p in params:
             _collect_syms(p.type, syms)
@@ -892,16 +959,27 @@ class CodeGen:
             if needs_b:
                 # shape symbols are bound across parameters through one dict; scalar-only signatures need none
                 shaped = bool(syms) or any(_has_shape(t) for t in [p.type for p in params] + [ret])
-                self.emit(f"{HELPER_PREFIX}b = {{}}" if shaped else f"{HELPER_PREFIX}b = None")
+                if shaped:
+                    self.emit(f"{HELPER_PREFIX}b = {{}}")
+                else:
+                    ctx.bind = "None"              # scalar-only signatures: no shape dict, one store less a call
+            rebound = _rebound_names(body) if not is_expr else _rebound_names([body])
             for p, py in pnames:
                 if p.type is not None:
                     chk = self.checker(p.type)
-                    call = f"{chk}({py}, {HELPER_PREFIX}b, {'argument ' + repr(p.name) + ' of ' + ctx.name + '()'!r})"
+                    call = f"{chk}({py}, {ctx.bind}, {'argument ' + repr(p.name) + ' of ' + ctx.name + '()'!r})"
                     fast = _fast_class(p.type) if p.star is None else None
                     self.emit(f"{py} = {py} if {py}.__class__ is {fast} else {call}" if fast else f"{py} = {call}")
+                    if fast and p.name not in rebound:
+                        # checked once, never rebound: a number for the whole call (plain conditions, no re-check
+                        # when it is returned as a value of the same type)
+                        ctx.known[id(fscope.names.get(p.name))] = repr(p.type)
+                        if fast == f"{HELPER_PREFIX}int":
+                            ctx.ints.add(id(fscope.names.get(p.name)))
             if ret is not None:
                 ctx.ret_check = self.checker(ret)
                 ctx.ret_fast = _fast_class(ret)
+                ctx.ret_type = repr(ret)
         elif syms:
             pairs = ", ".join(f"({py}, {self.const(p.type, 'T')})" for p, py in pnames if p.type is not None)
             self.emit(f"{HELPER_PREFIX}b = {HELPER_PREFIX}shape_bind(({pairs},))")
@@ -1116,6 +1194,9 @@ class CodeGen:
                 v = {"r": "repr", "s": "str", "a": "ascii"}[conv] + f"({v})" if self.pyc else \
                     f"{HELPER_PREFIX}conv({v}, {conv!r})"
             spec_code = self.expr(spec, scope) if isinstance(spec, A.FStr) else repr(spec)
+            if not self.pyc and spec is None and not conv and self._int(ex, scope):
+                parts.append(f"{HELPER_PREFIX}str({v})")      # an int prints as Python prints it
+                continue
             if self.pyc:
                 parts.append(f"format({v}, {spec_code if spec is not None else repr('')})")
             else:
@@ -1180,6 +1261,10 @@ class CodeGen:
         direct = self._self_attr(e, scope)
         if direct:
             return direct
+        c = self._cls(e.obj, scope)
+        if c is not None and not e.name.startswith("_") and callable(getattr(c, e.name, None)):
+            obj = self.expr(e.obj, scope)                 # a method of a list, dict, text or set: Python's own lookup
+            return f"{obj}.{e.name}"
         code = f"{HELPER_PREFIX}attr({self.expr(e.obj, scope)}, {e.name!r})"
         return f"{HELPER_PREFIX}S({code})" if scope.ctx.erased else code
 
@@ -1212,7 +1297,15 @@ class CodeGen:
             return f"slice({', '.join(parts)})"
         if isinstance(n, A.TupleLit):
             return "(" + ", ".join(self.index(x, scope) for x in n.items) + ",)"
+        if self._int(n, scope) or isinstance(n, A.Str):
+            return self.expr(n, scope)                      # an int or a text is used as it is
         return f"{HELPER_PREFIX}idx({self.expr(n, scope)})"
+
+    def _setidx(self, obj_node, idx_node, val, scope):
+        obj, idx = self.expr(obj_node, scope), self.index(idx_node, scope)
+        if self._cls(obj_node, scope) in (list, dict):
+            return f"{obj}[{idx}] = {val}"                  # a list or a dict: Python's own store
+        return f"{HELPER_PREFIX}setidx({obj}, {idx}, {val})"
 
     def e_Index(self, e, scope):
         return f"{self.expr(e.obj, scope)}[{self.index(e.index, scope)}]"
@@ -1342,6 +1435,76 @@ def _walk_ast(nodes):
             stack.extend(n)
 
 
+_TARGET_FIELDS = ("target", "targets", "more")
+
+
+def _rebound_names(nodes):
+    """Names that may be assigned anywhere in these statements, nested functions included. Conservative: the Names in
+    assignment targets, and every bare name string the tree holds (let / for / with / except / import bindings,
+    parameters of inner functions)."""
+    out = set()
+
+    def strings(v, in_target):
+        if isinstance(v, str):
+            out.add(v)
+        elif isinstance(v, (list, tuple)):
+            for x in v:
+                strings(x, in_target)
+        elif isinstance(v, A.AST):
+            if isinstance(v, A.Name):
+                if in_target:
+                    out.add(v.id)
+                return
+            if isinstance(v, (A.Str, A.Num, A.FStr)):
+                return
+            if in_target and isinstance(v, (A.Index, A.Attr)):
+                in_target = False            # a[i] = x / a.f = x store into a, they do not rebind it
+            for f in v._fields:
+                strings(getattr(v, f), in_target or f in _TARGET_FIELDS)
+    strings(list(nodes), False)
+    return out
+
+
+def _single_names(nodes, params=()):
+    """The names that occur exactly once as a bare name string or an assignment target in these statements (nested
+    functions included): bound once and never rebound. Any other occurrence of the string counts, so this is
+    conservative."""
+    from collections import Counter
+    n = Counter(params)
+
+    def walk(v, in_target):
+        if isinstance(v, str):
+            n[v] += 1
+        elif isinstance(v, (list, tuple)):
+            for x in v:
+                walk(x, in_target)
+        elif isinstance(v, A.AST):
+            if isinstance(v, A.Name):
+                if in_target:
+                    n[v.id] += 1
+                return
+            if isinstance(v, (A.Str, A.Num, A.FStr)):
+                return
+            if in_target and isinstance(v, (A.Index, A.Attr)):
+                in_target = False            # a[i] = x / a.f = x store into a, they do not rebind it
+            for f in v._fields:
+                walk(getattr(v, f), in_target or f in _TARGET_FIELDS)
+    walk(list(nodes), False)
+    return frozenset(k for k, c in n.items() if c == 1)
+
+
+def _literal_class(e):
+    if isinstance(e, (A.ListLit, A.ListComp)):
+        return list
+    if isinstance(e, (A.DictLit, A.DictComp)):
+        return dict
+    if isinstance(e, (A.Str, A.FStr)):
+        return str
+    if isinstance(e, (A.SetLit, A.SetComp)):
+        return set
+    return None
+
+
 def _collect_syms(t, out):
     if isinstance(t, A.TName) and t.name in ("Tensor", "Vec", "Mat", "Matrix"):
         for a in t.args:
@@ -1458,8 +1621,42 @@ class Runtime:
             def construct(self_, st, args, kwargs):
                 return rt.construct(st, args, kwargs)
         st = StructType(_Interp(), name, fields, {}, None)
+        fast = self._fast_constructor(st)
+        if fast is not None:
+            st.__class__ = fast                          # its own __call__: P(1.0, 2.0) without the generic plan
         self.structs[name] = st
         return st
+
+    def _fast_constructor(self, st):
+        """A StructType subclass whose call builds the instance directly when every field is given by position and
+        every field type is absent, Int or Float (scalars need no shape bindings); anything else goes the general
+        way, with the same checks and messages."""
+        names, checks = [], []
+        for fname, t, _d in st.fields:
+            if not fname.isidentifier() or keyword.iskeyword(fname):
+                return None
+            fc = None if t is None else _fast_class(t)
+            if t is not None and fc is None:
+                return None
+            names.append(fname)
+            checks.append(None if t is None else (fc, self.make_checker(t)))
+        rt = self
+        env = {"_rt": rt, "_SI": StructInstance, "_int": int, "_float": float}
+        lines = ["def __call__(self, *args, **kwargs):",
+                 f"    if kwargs or len(args) != {len(names)}:",
+                 "        return _rt.construct(self, list(args), kwargs)"]
+        if names:
+            lines.append(f"    {', '.join('v_' + n for n in names)}, = args")
+        for i, (n, c) in enumerate(zip(names, checks)):
+            if c is None:
+                continue
+            cls = "_int" if c[0].endswith("int") else "_float"
+            env[f"_c{i}"] = c[1]
+            lines.append(f"    if v_{n}.__class__ is not {cls}: v_{n} = _c{i}(v_{n}, None, {f'field {n!r} of {st.name}'!r})")
+        lines.append("    return _SI(self, {" + ", ".join(f"{n!r}: v_{n}" for n in names) + "})")
+        exec("\n".join(lines), env)
+        return type(f"Struct_{st.name}" if st.name.isidentifier() else "Struct", (StructType,),
+                    {"__call__": env["__call__"]})
 
     def construct(self, st, args, kwargs):
         if not kwargs and len(args) == len(st.fields):          # the common case: every field by position
@@ -1815,7 +2012,8 @@ class Compiled:
             f"{HELPER_PREFIX}int": int, f"{HELPER_PREFIX}float": float, f"{HELPER_PREFIX}bool": bool, f"{HELPER_PREFIX}iterable": _iterable,
             f"{HELPER_PREFIX}idx": _idx, f"{HELPER_PREFIX}unpack": _unpack,
             f"{HELPER_PREFIX}Range": RangeVal, f"{HELPER_PREFIX}as_unit": _as_unit,
-            f"{HELPER_PREFIX}fmt": fmt, f"{HELPER_PREFIX}approx": ops.approx, f"{HELPER_PREFIX}pm": ops.plusminus,
+            f"{HELPER_PREFIX}fmt": fmt, f"{HELPER_PREFIX}str": str, f"{HELPER_PREFIX}range": range,
+            f"{HELPER_PREFIX}approx": ops.approx, f"{HELPER_PREFIX}pm": ops.plusminus,
             f"{HELPER_PREFIX}attr": interp.get_attr, f"{HELPER_PREFIX}setattr": interp.set_attr,
             f"{HELPER_PREFIX}setidx": _setidx(interp),
             f"{HELPER_PREFIX}AssertionFailed": AssertionFailed,
