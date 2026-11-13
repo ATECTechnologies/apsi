@@ -32,7 +32,8 @@ identical weights; steps and resume bit for bit; the NaN guard).
   queued behind the kernels already launched (`APSI_GPU_ASYNC_COPY=0` turns this off; `drop_ring()` gives the memory
   back); `fit_batches` keeps each batch's loss on the card and reads them once an epoch; tanh gates (gated attention)
   are computed, applied and differentiated on the card (`tanh_s` in float64, rounded once; `axpy_s`; `gate_g`).
-  A small transformer's step on an RTX 3060: 5.5–6.0 ms before, 4.0–4.5 ms after.
+  A small transformer's step on an RTX 3060 (a desktop in use, best of several runs): 5.3–6.0 ms before, 4.0–4.7
+  ms after; single runs vary by about ±15 %.
 - **Cross-entropy on the card with accurate exp and log** (Cody-Waite exp, log with a Newton step) instead of the
   approximate hardware instructions.
 - **A loss of your own can keep its large part on the card:** `loss.on_card = (output, labels_of, rest)` computes

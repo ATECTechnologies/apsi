@@ -148,7 +148,8 @@ SwiGLU and mixture-of-experts blocks; graph networks; convolutions; recurrent la
 - Reductions finish in one launch; split products add their parts inside the product.
 - The cross-entropy uses accurate exp and log (no approximate instructions).
 
-On an RTX 3060, a small transformer's step went from 5.5–6.0 ms to 4.0–4.5 ms, with identical weights every run.
+On an RTX 3060, a small transformer's step went from 5.3–6.0 ms to 4.0–4.7 ms (best runs; single runs vary by about
+±15 %), with identical weights every run.
 
 ## 11. Settings and tuning
 
@@ -167,6 +168,15 @@ safely it runs.
   identical weights, steps and resume bit for bit, the NaN guard, split products, the fused attention both ways — 60
   tests (`tools\gpu_check.bat`).
 - NumPy, one card and many cards compared on the same training, step for step.
+- CPU programs against C, C++, Rust, Go, Java, JavaScript, C# and Julia, and 2.6.0 against 2.4.4, on a GitHub
+  runner and a 2-core VM: the eight heavy programs run at the same speed as 2.4.4 (0.99×; 0.83× the time of C), and
+  everyday code is within run-to-run noise of 2.4.4 (geometric mean 0.97× on the runner, 1.05× and 0.99× on two VM
+  runs). 2.6.0 changes training, not the language's speed.
+
+**Not measured again for 2.6.0** (the code is unchanged since 2.4.4, and the website keeps 2.4.4's numbers under
+"Measured with Apsi 2.4.4"): language models from Hugging Face on the card (`use hub`), the AI server, the GPU
+training speed against PyTorch, tables, databases, real-time video. `tools\bench_my_pc.bat` measures the GPU training
+speed and every CPU benchmark on your own computer.
 
 ## Upgrading from 2.4.4
 

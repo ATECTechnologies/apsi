@@ -133,8 +133,9 @@ The card is fastest when it never waits for the processor. In 2.6.0:
   cross-entropy (`loss.on_card`); that part runs on the card and only the small outputs go to the processor. GLA's
   loss does this: the writer's logits never leave the card.
 
-Measured on an RTX 3060 (a 2-layer transformer, 128 wide, 8 × 128 tokens a step): 5.5–6.0 ms a step before these
-changes, 4.0–4.5 ms after, with the same weights every run.
+Measured on an RTX 3060 (a 2-layer transformer, 128 wide, 8 × 128 tokens a step, best of several runs on a desktop
+in use): 5.3–6.0 ms a step before these changes, 4.0–4.7 ms after, with the same weights every run. Single runs vary
+by about ±15 % with what else the computer is doing; `tools\flow_bench.bat` measures it on yours.
 
 ## 7. Your own tokenizer
 

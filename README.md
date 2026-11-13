@@ -110,7 +110,7 @@ Then read [Getting started](docs/GETTING-STARTED.md) (15 minutes) or [Write Apsi
 * **Any optimizer, loss and layer on the GPU trainer**, frozen parts for fine-tuning, `gpu_tensor` for your own code
   on the card, physics-informed networks (`pinn_fit`), one model across many cards.
 * **The card never waits:** queued copies through pinned memory, losses and gates kept on the card, one launch per
-  reduction — a small transformer's step from 5.5–6.0 ms to 4.0–4.5 ms on an RTX 3060.
+  reduction — a small transformer's step from 5.3–6.0 ms to 4.0–4.7 ms on an RTX 3060 (best runs).
 * **Every setting in one file:** [`config/apsi-training.env`](config/apsi-training.env), each with its default and
   what it does.
 
