@@ -357,6 +357,12 @@ def windows(stream, seq_len, pack=True, stride=None, pad_id=0):
             del buf_x[:step], buf_y[:step]
 
 
+def _path_like(s):
+    """A string that names files (a path, a glob, a folder), not text itself (text has new lines or is long)."""
+    return isinstance(s, str) and "\n" not in s and len(s) < 1024 and (
+        _kind(s) or os.path.exists(s) or any(c in s for c in "*?["))
+
+
 def text_dataset(source, tokenizer="bytes", seq_len=512, format="auto", field=None, template=None, chat="auto",
                  eos=None, train_on_prompt=False, pack=True, stride=None, text_split="file", path_check=None):
     from .data import Pipeline
@@ -365,9 +371,7 @@ def text_dataset(source, tokenizer="bytes", seq_len=512, format="auto", field=No
 
     def records():
         if hasattr(source, "_factory") or (isinstance(source, (list, tuple)) and source and
-                                           not all(isinstance(s, str) and (_kind(s) or os.path.exists(s) or
-                                                                           any(c in s for c in "*?["))
-                                                   for s in source)):
+                                           not all(_path_like(s) for s in source)):
             yield from source
             return
         for f in _files(source):

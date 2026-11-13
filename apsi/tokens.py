@@ -16,6 +16,10 @@ only a few lines changed.
     print(tokens.count(text))                    # tiktoken when installed, otherwise a close estimate
 
 Pick what fits your data — they combine (`dedupe(pack(x))`), and `best(x)` tries them and keeps the smallest.
+
+When the context is still too long for the budget, `focus(context, question, budget)` keeps the parts the question
+needs (chosen on GLA's code and text graphs) and marks what it left out, so any part can be put back with
+`unfold()`; `fit_chat(messages, budget)` does the same for a conversation (see token_focus.py).
 """
 import difflib
 import json
@@ -219,6 +223,8 @@ def restore(text, method):
 
 
 def module(interp=None):
+    from . import token_focus as F
     return {"count": count, "exact": exact, "savings": savings, "pack": pack, "unpack": unpack,
             "pack_jsonl": pack_jsonl, "dedupe": dedupe, "expand": expand, "diff": diff, "patch": patch,
-            "best": best, "restore": restore}
+            "best": best, "restore": restore, "focus": F.focus, "unfold": F.unfold, "fit_chat": F.fit_chat,
+            "outline": F.outline}

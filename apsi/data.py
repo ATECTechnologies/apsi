@@ -570,8 +570,17 @@ def install(interp):
         return td(source, tokenizer, seq_len, format, field, template, chat, eos, train_on_prompt, pack, stride,
                   text_split, path_check=_rpath)
 
+    def train_tokenizer(source, vocab_size=8000, min_frequency=2, special_tokens=("<|endoftext|>",), lower=False,
+                        format="auto", field=None, template=None, text_split="file", verbose=False, engine="auto"):
+        """A byte-level BPE tokenizer trained on text (files, globs, records or strings; see bpe.py): .encode,
+        .decode, .save("tokenizer.json"); text_dataset(tokenizer=...) takes it."""
+        from .bpe import train_from
+        prog = (lambda d, w: print(f"  merges {d:,} / {w:,}")) if verbose else None
+        return train_from(source, vocab_size, min_frequency, tuple(special_tokens or ()), lower, format, field,
+                          template, text_split, path_check=_rpath, progress=prog, engine=engine)
+
     mod = {
-        "text_dataset": text_dataset, "detect_format": lambda rec: __import__("apsi.textdata", fromlist=["x"]).detect(rec),
+        "text_dataset": text_dataset, "train_tokenizer": train_tokenizer, "detect_format": lambda rec: __import__("apsi.textdata", fromlist=["x"]).detect(rec),
         "from_jsonl": from_jsonl, "from_parquet": from_parquet, "interleave": interleave, "window": window,
         "shard": shard,
         "from_tensors": from_tensors, "from_list": from_list, "from_range": from_range,

@@ -91,6 +91,13 @@ class _Ops:
             self.axpy(Cv, X2, n)
 
 
+def _guard():
+    """Steps with a non-finite gradient (inf / NaN anywhere) are skipped on the card: the weights, the optimizer's
+    moments and the carried rounding error stay as they were, and the step is counted (the default; one sum of
+    squares of the gradient per step). APSI_GPU_GUARD=0 turns it off."""
+    return os.environ.get("APSI_GPU_GUARD", "1").strip().lower() not in ("0", "false", "no", "off")
+
+
 def _deterministic():
     """The same bits every run (the default): kernels add in a fixed order, never atomically. APSI_GPU_DETERMINISTIC=0
     lets the fused attention's backward add dQ atomically (one kernel instead of two)."""
@@ -314,6 +321,9 @@ class Emulator(_Ops):
         p[:] = t
 
     def adam(self, Pm, Gr, Mm, Vm, SQ, n, n_decay, lr, b1, b2, eps, c1, c2, wd, clip, COMP=None):
+        if not np.isfinite(self.v(SQ, 1)[0]):              # a non-finite gradient: the step is skipped
+            self.v(Gr, n)[:] = 0.0
+            return
         g = self.v(Gr, n) * self._clip(SQ, clip)
         p, m, v = self.v(Pm, n), self.v(Mm, n), self.v(Vm, n)
         w = p.copy()
@@ -327,6 +337,9 @@ class Emulator(_Ops):
         self.v(Gr, n)[:] = 0.0                    # the kernel clears the gradient it used
 
     def sgd(self, Pm, Gr, VEL, SQ, n, lr, mom, clip, COMP=None):
+        if not np.isfinite(self.v(SQ, 1)[0]):
+            self.v(Gr, n)[:] = 0.0
+            return
         vel = self.v(VEL, n)
         vel[:] = np.float32(mom) * vel + self.v(Gr, n) * self._clip(SQ, clip)
         p = self.v(Pm, n)
@@ -877,7 +890,8 @@ class Gpu(_Ops):
                 raise
             raise TrainError(f"the card ran out of memory ({self.used / 2 ** 30:.2f} GB in use, "
                              f"{4 * n / 2 ** 20:.0f} MB more asked, {self.dev.memory / 2 ** 30:.1f} GB on the card): "
-                             "a smaller batch_size, fewer or narrower layers, a shorter context, or more cards "
+                             "a smaller batch_size (with accumulate= for the same step), fewer or narrower layers, a "
+                             "shorter context, or more cards "
                              "(device=\"cuda:all\" splits the model across them)") from None
         self.used += 4 * n
         return Buf(p, n)
@@ -4722,7 +4736,8 @@ def _raw_of(a):
 
 def fit_batches(model, params, batches, loss="cross_entropy", opt=None, epochs=1, verbose=True, clip=None,
                 schedule=None, device="cuda", precision="auto", ops=None, compensated=None, every=None,
-                accumulate=1, stages=None, freeze=None, train_only=None, exact_sums=None):
+                accumulate=1, stages=None, freeze=None, train_only=None, exact_sums=None, steps=None,
+                checkpoint=None, save_every=None, resume=True, callback=None):
     """Train on batches that each bring their own shapes: batches is a list of (inputs, targets[, graph]) or a
     function epoch -> such a list. inputs may be a list (a dag with several inputs: token ids, node features, ...);
     each batch may have its own graph (a batch of graphs), its own number of rows and its own lengths. One card."""
@@ -4737,6 +4752,9 @@ def fit_batches(model, params, batches, loss="cross_entropy", opt=None, epochs=1
             if ops is None:
                 raise TrainError(f"no GPU to train on: {why}")
     if isinstance(ops, (list, tuple)):
+        if len(ops) > 1 and (steps or checkpoint):
+            raise TrainError("steps= and checkpoint= train on one card for now: give one card (device=\"cuda:0\"), "
+                             "or epochs= on several")
         if len(ops) > 1:                                 # the model split across the cards, copied over the rest
             from .gpu_pipeline import fit_batches_pipeline
             return fit_batches_pipeline(list(ops), model, params, batches, loss, opt, epochs, verbose, clip, schedule,
@@ -4770,8 +4788,29 @@ def fit_batches(model, params, batches, loss="cross_entropy", opt=None, epochs=1
         for b_ in EXACT:
             ops.fill((b_, 0), n, 0.0)
     net.exact = EXACT
+    want = int(steps) if steps else None                 # a number of optimizer steps instead of epochs
+    start_ep, skip = 0, 0
+    if checkpoint and resume and os.path.exists(str(checkpoint)):
+        t, step, start_ep, skip = _ckpt_load(str(checkpoint), ops, net, st1, st2, COMP)
+        opt.t = t
+        if verbose:
+            print(f"resumed from {checkpoint}: step {step}, epoch {start_ep}, batch {skip}")
+    last = start_ep + E if want is None else 1 << 30
+    pos = [start_ep, skip]                               # where the next step starts (epoch, batch)
+
+    def saved():
+        _ckpt_save(str(checkpoint), ops, net, st1, st2, COMP, t, step, pos[0], pos[1])
+
+    def after_step(ep_, bi_):                            # True: stop here (steps reached)
+        pos[0], pos[1] = ep_, bi_ + 1
+        if checkpoint and save_every and step % int(save_every) == 0:
+            saved()
+        return want is not None and step >= want
+    stop = False
     try:
-        for ep in range(E):
+        for ep in range(start_ep, last):
+            if stop:
+                break
             items = list(batches(ep) if callable(batches) else batches)
             if not items:
                 raise TrainError("no batches")
@@ -4784,6 +4823,8 @@ def fit_batches(model, params, batches, loss="cross_entropy", opt=None, epochs=1
             on_card = []                                 # the batches whose loss is in LOSSB
             A = max(1, int(accumulate or 1))
             for bi, item in enumerate(items):
+                if ep == start_ep and bi < skip:             # resumed: these batches were already trained on
+                    continue
                 group = min(A, len(items) - (bi // A) * A)       # the batches of this step
                 X, Y, g = _batch_parts(item)
                 multi = isinstance(X, (list, tuple))
@@ -4813,6 +4854,9 @@ def fit_batches(model, params, batches, loss="cross_entropy", opt=None, epochs=1
                     if (bi + 1) % A and bi + 1 < len(items):
                         continue
                     t, step = _apply_step(ops, net, opt, adam, wd, clip, schedule, step, t, st1, st2, SQ, COMP, n)
+                    if after_step(ep, bi):
+                        stop = True
+                        break
                     continue
                 rows, C = _rows(shape), shape[-1]
                 m = rows * C
@@ -4847,15 +4891,34 @@ def fit_batches(model, params, batches, loss="cross_entropy", opt=None, epochs=1
                 if (bi + 1) % A and bi + 1 < len(items):
                     continue                                 # gradients add up until the step's last batch
                 t, step = _apply_step(ops, net, opt, adam, wd, clip, schedule, step, t, st1, st2, SQ, COMP, n)
+                if after_step(ep, bi):
+                    stop = True
+                    break
+            if not stop:
+                pos[0], pos[1] = ep + 1, 0
             if on_card:
                 lb = ops.get(LOSSB, len(items))
                 for i in on_card:
                     tot += float(lb[i])
-            history.append(tot / rows_all)
-            if verbose and (ep % every == 0 or ep == E - 1):
-                print(f"epoch {ep:4}  loss {history[-1]:.5f}  ({len(items)} batches, GPU)")
+            history.append(tot / max(rows_all, 1))
+            if callback is not None:
+                callback(Record(epoch=ep, step=step, loss=history[-1]))
+            if verbose and (ep % every == 0 or ep == last - 1 or stop):
+                print(f"epoch {ep:4}  loss {history[-1]:.5f}  ({len(items)} batches, step {step}, GPU)")
         opt.t = t
         out_params = net.params()
+        if checkpoint:
+            saved()
+    except BaseException:                                # a crash or Ctrl+C: what was learned is kept
+        if checkpoint:
+            try:
+                ops.fill((net.G, 0), n, 0.0)
+                saved()
+                if verbose:
+                    print(f"training stopped at step {step}; saved to {checkpoint} (run again to resume)")
+            except Exception:                            # noqa: BLE001  (the card itself may be gone)
+                pass
+        raise
     finally:
         for b_ in (st1, st2, SQ, COMP, LOSS1, LOSSB):
             if b_ is not None:
@@ -4865,6 +4928,47 @@ def fit_batches(model, params, batches, loss="cross_entropy", opt=None, epochs=1
             ops.free(b_)
         net.close()
     return Record(params=out_params, history=history, device=getattr(ops, "name", "?"))
+
+
+def _ckpt_save(path, ops, net, st1, st2, COMP, t, step, epoch, batch=0):
+    """The flat weights, the optimizer's moments and the carried rounding error, written atomically."""
+    n = net.n
+    data = {"P": ops.get(net.P, n), "meta": np.array([n, t, step, epoch, batch], np.int64)}
+    for name, b_ in (("M", st1), ("V", st2), ("C", COMP)):
+        if b_ is not None:
+            data[name] = ops.get(b_, n)
+    master = getattr(net, "master", None)
+    if master is not None:
+        arrs = [np.asarray(a, np.float64).reshape(-1) for a in tree_leaves(master) if isinstance(a, np.ndarray)]
+        data["P64"] = np.concatenate(arrs) if arrs else np.zeros(0)   # the float64 master copy, in tree order
+    tmp = f"{path}.tmp.npz"
+    np.savez(tmp, **data)
+    os.replace(tmp, path)
+
+
+def _ckpt_load(path, ops, net, st1, st2, COMP):
+    with np.load(path) as z:
+        meta = [int(v) for v in z["meta"]] + [0]
+        n, t, step, epoch, batch = meta[:5]
+        if n != net.n:
+            raise TrainError(f"the checkpoint {path} is of a model with {n:,} weights, this one has {net.n:,}: "
+                             "a different model (delete the file or give another checkpoint=)")
+        ops.put(net.P, z["P"].astype(np.float32))
+        for name, b_ in (("M", st1), ("V", st2), ("C", COMP)):
+            if b_ is not None and name in z.files:
+                ops.put(b_, z[name].astype(np.float32))
+        if "P64" in z.files:
+            flat = z["P64"]
+            leaves, off = [], 0
+            for a in tree_leaves(net.params_tree):
+                if isinstance(a, np.ndarray):
+                    leaves.append(flat[off:off + a.size].reshape(a.shape))
+                    off += a.size
+                else:
+                    leaves.append(a)
+            it = iter(leaves)
+            net.master = tree_map(lambda a: next(it), net.params_tree)
+    return t, step, epoch, batch
 
 
 def _multi_loss(ops, net, outs, shapes, loss_fn, Yr, group, arena=None):
@@ -4985,6 +5089,9 @@ def _host_step(ops, net, opt, clip, lr):
     if master is None:                                   # float64 weights kept for the optimizer, as on NumPy
         master = tree_map(lambda a: np.asarray(a, np.float64) if isinstance(a, np.ndarray) else a, net.params_tree)
     P, G = master, net.params(net.G)
+    if _guard() and not all(np.all(np.isfinite(a)) for a in tree_leaves(G) if isinstance(a, np.ndarray)):
+        ops.fill((net.G, 0), net.n, 0.0)                # a non-finite gradient: the step is skipped
+        return
     if clip:
         nrm = _m.sqrt(sum(float(np.sum(np.asarray(a, np.float64) ** 2)) for a in tree_leaves(G)
                           if isinstance(a, np.ndarray)))
@@ -5038,7 +5145,7 @@ def _apply_step(ops, net, opt, adam, wd, clip, schedule, step, t, st1, st2, SQ, 
 
 def _native_step(ops, net, opt, adam, wd, clip, lr, t, st1, st2, SQ, COMP, n):
     ops.fill((SQ, 0), 1, 0.0)
-    if clip:
+    if clip or _guard():
         ops.sumsq((net.G, 0), n, (SQ, 0))
     if adam:
         ops.adam((net.P, 0), (net.G, 0), (st1, 0), (st2, 0), (SQ, 0), n, net.n_decay, lr, opt.b1, opt.b2,
@@ -5218,6 +5325,7 @@ def fit(model, params, X, y=None, loss="mse", opt=None, epochs=10, batch_size=No
     rng = np.random.default_rng(int(seed))
     net.seed = int(seed) * 7919 + 1
     adam = isinstance(opt, Adam)
+    guard = _guard()
     st1, st2 = ops.alloc(net.n), (ops.alloc(net.n) if adam else None)
     ops.fill((st1, 0), net.n, 0.0)
     if st2 is not None:
@@ -5353,14 +5461,14 @@ def fit(model, params, X, y=None, loss="mse", opt=None, epochs=10, batch_size=No
                     ops.axpy((EWC_T, 0), (EWC_A, 0), net.n, -1.0)
                     ops.mul3((EWC_T, 0), (EWC_T, 0), (EWC_F, 0), net.n)
                     ops.axpy((net.G, 0), (EWC_T, 0), net.n, lam)
-                if clip:
+                if clip or guard:
                     ops.fill((SQ, 0), 1, 0.0)
                     ops.sumsq((net.G, 0), net.n, (SQ, 0))
                 t_step += 1
                 if fz.ranges:
                     fz.zero_grads()
                     fz.save()
-                    if clip:
+                    if clip or guard:
                         ops.fill((SQ, 0), 1, 0.0)
                         ops.sumsq((net.G, 0), net.n, (SQ, 0))
                 if not native_opt(opt):
@@ -5564,7 +5672,7 @@ def _fit_parallel(ops_list, model, params, X, y, loss, opt, epochs, batch_size, 
                         o.axpy((rep["ET"], 0), (rep["EA"], lo), k, -1.0)
                         o.mul3((rep["ET"], 0), (rep["ET"], 0), (rep["EF"], lo), k)
                         o.axpy((net.G, lo), (rep["ET"], 0), k, EWC)
-                    if clip:
+                    if clip or _guard():
                         o.fill((rep["SQ"], 0), 1, 0.0)
                         if k > 0:
                             o.sumsq((net.G, lo), k, (rep["SQ"], 0))
