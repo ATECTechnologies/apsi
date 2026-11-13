@@ -46,6 +46,12 @@ class _Ops:
     """Kernel launches in terms of (buffer, offset) views; sizes in float32 elements."""
 
     tc = False
+
+    def _ring_ready(self):                               # pinned staging memory: the real card only
+        return False
+
+    def drop_ring(self):
+        pass
     _db = None
 
     def gemm(self, A, B, Cv, M, N, K, sam, sak, sbk, sbn, ldc, alpha=1.0, beta=False, bias=None, batch=(1, 1),
@@ -910,8 +916,9 @@ class Gpu(_Ops):
                     lib.cuEventQuery.argtypes = [ctypes.c_void_p]
                     self.dev.ensure()
                     ptr = ctypes.c_void_p()
+                    t0 = time.perf_counter()
                     self.dev.drv.check(lib.cuMemHostAlloc(ctypes.byref(ptr), self.RING, 1), "cuMemHostAlloc")
-                    r = {"ptr": ptr.value, "head": 0, "q": [], "free": []}
+                    r = {"ptr": ptr.value, "head": 0, "q": [], "free": [], "made_s": time.perf_counter() - t0}
                 except Exception:                        # noqa: BLE001  (no pinned memory: plain copies)
                     r = False
             self._ring = r
@@ -941,6 +948,17 @@ class Gpu(_Ops):
         self.dev.drv.check(lib.cuEventRecord(ev, None), "cuEventRecord")
         q.append((start, end, ev))
         r["head"] = end
+
+    def drop_ring(self):
+        """Give the pinned staging memory back (after the copies in flight finish)."""
+        r = self.__dict__.pop("_ring", None)
+        if r:
+            self.sync()
+            for _, _, ev in r["q"]:
+                self._lib.cuEventDestroy_v2(ev)
+            for ev in r["free"]:
+                self._lib.cuEventDestroy_v2(ev)
+            self._lib.cuMemFreeHost(ctypes.c_void_p(r["ptr"]))
 
     def _event_light(self):
         e = ctypes.c_void_p()
