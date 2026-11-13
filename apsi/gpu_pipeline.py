@@ -690,7 +690,7 @@ def _update(grid, opt, adam, wd, lr, t_step, clip, lam):
                 o.mul3((st.ET, 0), (st.ET, 0), (st.EF, lo), k)
                 o.axpy((net.G, lo), (st.ET, 0), k, lam)
             o.fill((st.SQ, 0), 1, 0.0)
-            if clip and k > 0:
+            if (clip or _GT()._guard()) and k > 0:
                 o.sumsq((net.G, lo), k, (st.SQ, 0))
     everyone = [st for row in grid for st in row]
     if clip:
