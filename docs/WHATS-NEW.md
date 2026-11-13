@@ -165,7 +165,7 @@ safely it runs.
 
 ## 12. How it was tested
 
-- 409 tests on every push, on Linux (x64, ARM64), macOS (Apple silicon, Intel) and Windows, Python 3.12–3.14.
+- 413 tests on every push, on Linux (x64, ARM64), macOS (Apple silicon, Intel) and Windows, Python 3.12–3.14.
 - On a real NVIDIA RTX 3060: every kernel against the exact reference, GLA and a transformer trained twice with
   identical weights, steps and resume bit for bit, the NaN guard, split products, the fused attention both ways — 60
   tests (`tools\gpu_check.bat`).

@@ -3,12 +3,36 @@
 **Install:** [apsi.dev/download](https://apsi.dev/download) — `ApsiSetup-2.6.0-x64.exe` (Windows 10/11),
 `ApsiSetup-2.6.0-linux.sh` (any Linux, WSL), `apsi_2.6.0_all.deb` (Ubuntu / Debian), or from this source:
 `pip install numpy`, then `./apsi.sh` / `apsi.bat`. What's new, with examples: [docs/WHATS-NEW.md](https://github.com/ATECTechnologies/apsi/blob/main/docs/WHATS-NEW.md);
-the training guide: [docs/TRAINING.md](https://github.com/ATECTechnologies/apsi/blob/main/docs/TRAINING.md).
+everyday code runs 1.22× faster than in 2.4.4 (geometric mean); the training guide: [docs/TRAINING.md](https://github.com/ATECTechnologies/apsi/blob/main/docs/TRAINING.md).
 
-Tested: 409 tests on every push (Linux x64 / ARM64, macOS Apple silicon / Intel, Windows; Python 3.12–3.14) and 60
+Tested: 413 tests on every push (Linux x64 / ARM64, macOS Apple silicon / Intel, Windows; Python 3.12–3.14) and 60
 on a real NVIDIA RTX 3060 (every kernel against the exact reference; GLA and a transformer trained twice with
 identical weights; steps and resume bit for bit; the NaN guard).
 
+### Faster everyday code
+- **Facts the compiler can prove are no longer checked at run time:** a typed `Int`/`Float` parameter that is never
+  rebound is a plain number for the whole call (a comparison of two such numbers is a plain condition; returning it
+  needs no second check); `for i in 0..n` with whole-number ends runs on Python's own `range` and `i` is a known
+  integer (indexes and f-strings use it directly); a name bound once to a list, dict, set or text literal calls its
+  methods, iterates and stores directly. Same results, same errors.
+- **Structs are built directly:** a struct whose fields are untyped, `Int` or `Float` gets a constructor of its own
+  (no general plan per call): creating 200,000 structs is 1.8× faster.
+- Measured against 2.4.4 on the same machine (GitHub runner): recursive calls (fib 25) 1.5×
+  faster, a word count 2.1×, 200k f-strings 2.3×, 200k structs 1.7× (GitHub runner, geometric mean of the 12
+  measurements 1.22×); the eight heavy `@native` programs are unchanged (the native code generator was already at
+  C's speed).
+- **Products whose sizes are not multiples of 4** (a SwiGLU width of 2730, an odd vocabulary) run on the tiled
+  tensor-core kernels through zero-padded copies instead of the general kernel (`APSI_GEMM_PAD=0` turns it off).
+
+### Converting Python: one file, its imports, or the whole project
+- `apsi convert app.py` converts the file and every module of the program it imports (as before);
+  **`--only`** converts just the files named and keeps the program's other modules as Python imports;
+  **`--project`** converts every `.py` of the project the file belongs to (the folder with `pyproject.toml`,
+  `setup.py`, `setup.cfg`, `requirements.txt`, `Pipfile` or `.git`); **`--exclude PATTERN`** leaves files out;
+  **`--plan`** lists each file, where it goes and why, and writes nothing.
+- VS Code: *Convert Python to Apsi* asks how much: this file and its imports, this file only, the whole project, or
+  the plan first.
+- `pyimport` also finds modules in the program's own folder (a module kept as Python next to a converted program).
 
 ### Exact training on many cards
 - **The same weights on any number of cards, to the last bit:** the gradients of a step's batches, of the copies of
@@ -81,6 +105,8 @@ identical weights; steps and resume bit for bit; the NaN guard).
   against the reference; `apsi gpu bench cards` checks that every card gives one card's weights bit for bit.
   `tools\gpu_check.bat`: the whole check on a Windows computer's card, written to gpu-check.txt.
 - **Faster record fields:** reading a record's field in the bytecode engine is 1.8x faster.
+- `.numpy()` works on every result of `gpu_tensor` code, also on a value the processor computed (a fallback, or
+  no card), so the same program runs with and without a card.
 
 ### Training modes
 - **Any optimizer on the GPU trainer:** adam, adamw and sgd keep their kernels; rmsprop, adagrad or an optimizer of
@@ -90,6 +116,8 @@ identical weights; steps and resume bit for bit; the NaN guard).
   function of the path) on NumPy, one card and many: the frozen weights get no gradient, do not count in `clip`,
   and keep their exact values (weight decay and momentum cannot move them). Fine-tuning, or GLA's phases (one brain
   at a time).
+- **Frozen means untouched, also in its type:** the result's frozen weights are the very arrays given (float64 stays
+  float64), on every backend; before, training in float32 could hand them back rounded to float32.
 - **Any loss name on the card:** a loss without a kernel (`"vae"`, …) is evaluated on the processor, like a loss
   function.
 - **Variants without a kernel run inside the model on the card** instead of refusing (an activation such as mish,
