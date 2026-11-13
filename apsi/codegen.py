@@ -352,7 +352,7 @@ class CodeGen:
     def _scalar(self, e, scope):
         """e is surely a plain number: a literal without a unit, or a checked Int/Float parameter never rebound."""
         if isinstance(e, A.Num):
-            return e.unit is None and e.value.__class__ in (int, float)
+            return e.unit is None and e.value.__class__ in (int, float) and not scope.ctx.exact
         if isinstance(e, A.Name):
             b = scope.lookup(e.id)
             return b is not None and (id(b) in scope.ctx.known or id(b) in scope.ctx.ints)
@@ -362,8 +362,8 @@ class CodeGen:
 
     def _int(self, e, scope):
         """e surely evaluates to a Python int (an int literal, an Int parameter or a range loop's variable)."""
-        if isinstance(e, A.Num):
-            return e.unit is None and e.value.__class__ is int
+        if isinstance(e, A.Num):                    # @precision(exact): literals are fractions
+            return e.unit is None and e.value.__class__ is int and not scope.ctx.exact
         if isinstance(e, A.Name):
             b = scope.lookup(e.id)
             return b is not None and b.ctx is scope.ctx and id(b) in scope.ctx.ints
