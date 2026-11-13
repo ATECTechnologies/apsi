@@ -119,5 +119,44 @@ class Scopes(unittest.TestCase):
             self.assertEqual(self.converted(td), ["helper.apsi", "main.apsi", "pkg/__init__.apsi", "pkg/util.apsi"])
 
 
+class Libraries(unittest.TestCase):
+    """Patterns of real libraries (datasets, fsspec, multiprocess, huggingface_hub): a name re-exported by a package,
+    `from .. import x` served by the package at run time, `import pkg.sub` inside pkg, import cycles, fields under an
+    if of a class body, globals(), `with (a / b).open() as f`, a bare return in an async generator."""
+
+    def test_library_patterns_run_like_python(self):
+        files = {
+            "pkg/__init__.py": "from . import ctx\nfrom .util import helper\nglobals().update({'AuthError': ctx.AuthError})\n"
+                               "def __getattr__(name):\n    if name == 'lazy':\n        from .sub import lazy\n        return lazy\n"
+                               "    raise AttributeError(name)\n",
+            "pkg/ctx.py": "class AuthError(Exception):\n    pass\n",
+            "pkg/util.py": "def helper():\n    return 'h'\n",
+            "pkg/sub/__init__.py": "def lazy():\n    return 'lazy'\n",
+            "pkg/conn.py": ("import os, pathlib, asyncio\nimport pkg.util\nfrom . import AuthError, util\nfrom . import lazy\n"
+                            "from typing import TYPE_CHECKING, ClassVar, Dict\n"
+                            "class M:\n    if TYPE_CHECKING:\n        f: ClassVar[Dict[str, int]] = {}\n"
+                            "    if os.name == 'nt':\n        w = 1\n    else:\n        w = 2\n    h: int = 1\n"
+                            "def _hidden():\n    return 5\n"
+                            "async def agen(n):\n    for i in range(n):\n        if i == 2:\n            return\n        yield i\n"
+                            "async def collect():\n    return [x async for x in agen(5)]\n"
+                            "def go(tmp):\n    p = pathlib.Path(tmp)\n    with (p / 'x.txt').open('w') as fh:\n        fh.write('ok')\n"
+                            "    try:\n        raise AuthError('e')\n    except AuthError as e:\n        caught = str(e)\n"
+                            "    return [caught, M.w > 0, M.h, globals()['_hidden'](), pkg.util.helper(), util.helper(), lazy(),\n"
+                            "            asyncio.run(collect()), (p / 'x.txt').read_text()]\n"),
+            "main.py": "import sys, tempfile\nfrom pkg import conn\nprint(conn.go(tempfile.mkdtemp()))\n",
+        }
+        with tempfile.TemporaryDirectory() as td:
+            for k, v in files.items():
+                os.makedirs(os.path.dirname(os.path.join(td, k)), exist_ok=True)
+                with open(os.path.join(td, k), "w") as f:
+                    f.write(v)
+            want = subprocess.run([sys.executable, "main.py"], capture_output=True, text=True, cwd=td).stdout
+            self.assertIn("lazy", want)
+            r = apsi("convert", os.path.join(td, "main.py"))
+            self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+            got = apsi("run", "--allow-all", os.path.join(td, "main.apsi"), cwd=td)
+            self.assertEqual(got.stdout, want, got.stderr)
+
+
 if __name__ == "__main__":
     unittest.main()

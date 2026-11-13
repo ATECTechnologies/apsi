@@ -789,6 +789,9 @@ class CodeGen:
         self.lines[decl_at] = (pad + "    " + ("; ".join(decls) if decls else "pass"), self.lines[decl_at][1])
 
     def s_Return(self, s, scope):
+        if s.value is None and not (getattr(scope.ctx, "ret_check", None) and not scope.ctx.erased):
+            self.emit("return")                         # bare: also valid in (async) generators
+            return
         val = self.expr(s.value, scope) if s.value is not None else "None"
         ret = getattr(scope.ctx, "ret_check", None)
         if ret and not scope.ctx.erased and not self._known_as(s.value, scope, getattr(scope.ctx, "ret_type", None)):
@@ -1994,6 +1997,11 @@ class Compiled:
         self.module.__file__ = os.path.abspath(filename) if not filename.startswith("<") else filename
         if modname not in ("__main__", "__apsi__") and not filename.startswith("<"):
             _give_spec(self.module)               # importlib.resources / metadata find a converted library's files
+        if gen.pyc and not filename.startswith("<"):        # Python-exact: while it runs, an import cycle sees it
+            interp.__dict__.setdefault("_partial", {})[os.path.abspath(filename)] = self.module
+            if modname not in ("__main__", "__apsi__"):     # and, as in Python, sys.modules has it before it runs:
+                import sys as _sys                          # its submodules become its attributes as they load
+                _sys.modules.setdefault(modname, self.module)
         g = self.module.__dict__
         g.update(builtins)
         g.update(gen.consts)

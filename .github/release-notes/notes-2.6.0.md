@@ -33,6 +33,13 @@ identical weights; steps and resume bit for bit; the NaN guard).
 - VS Code: *Convert Python to Apsi* asks how much: this file and its imports, this file only, the whole project, or
   the plan first.
 - `pyimport` also finds modules in the program's own folder (a module kept as Python next to a converted program).
+- **Real libraries convert and run:** checked on a downloader that brings datasets, huggingface_hub, fsspec, pyarrow,
+  multiprocess and dill with it (603 library modules): `from . import Name` takes a name the package re-exports (or
+  provides at run time) instead of failing; `import pkg.sub` inside pkg uses the converted package, never a second
+  Python copy; an import cycle sees the partly run module, as in Python; a module is in `sys.modules` before it runs
+  and becomes its parent's attribute however it was first loaded; one module per file however its path is spelled;
+  fields declared under an `if` of a class body; `globals()` / `locals()` / one-argument `eval` / `exec` see the
+  caller's namespace; `with (a / b).open() as f:`; a bare `return` in an async generator.
 
 ### Exact training on many cards
 - **The same weights on any number of cards, to the last bit:** the gradients of a step's batches, of the copies of
