@@ -203,6 +203,7 @@ def check(out=sys.stdout):
               f"(reference {runs[1][-1]:.4f}, difference {err:.1e})", file=out)
     bad += _check_gla(ops, out)
     bad += _check_tensors(ops, out)
+    bad += _check_flow(ops, out)
     print("every kernel agrees on this card" if not bad else f"{bad} differ: send this output back", file=out)
     return 1 if bad else 0
 
@@ -226,6 +227,40 @@ def _check_gla(ops, out):
           f"{runs[0].history[-1]:.4f}  (reference {runs[2].history[-1]:.4f}, difference {err:.1e}, "
           f"{'the same weights twice' if same else 'NOT the same weights twice'})", file=out)
     return 0 if ok else 1
+
+
+def _check_flow(ops, out):
+    """A transformer on the fused attention (bfloat16 products): the same weights twice (no atomic additions,
+    attention's backward included), and the time a step with copies queued behind the kernels against copies that
+    wait for the card."""
+    import os
+    import time
+    from unittest import mock
+    from . import gpu_train as GT, layers as L
+    from .stdlib import Adam
+    from .values import tree_leaves
+    rng = np.random.default_rng(4)
+    lm = L.transformer_lm(256, d=128, heads=2, layers=2, context=128)
+    batches = [(rng.integers(0, 256, (8, 128)), rng.integers(0, 256, (8, 128))) for _ in range(24)]
+    kw = dict(epochs=2, verbose=False, precision="auto", ops=ops)
+    runs, secs = [], {}
+    for mode in ("1", "1", "0"):
+        with mock.patch.dict(os.environ, {"APSI_GPU_ASYNC_COPY": mode}):
+            if mode == "0":
+                ops.__dict__.pop("_ring", None)
+            t0 = time.perf_counter()
+            runs.append(GT.fit_batches(lm, lm.init(seed=0), batches, "cross_entropy", opt=Adam(1e-3), **kw))
+            ops.sync()
+            secs[mode] = time.perf_counter() - t0
+    ops.__dict__.pop("_ring", None)
+    same = all(np.array_equal(np.asarray(a), np.asarray(b))
+               for a, b in zip(tree_leaves(runs[0].params), tree_leaves(runs[1].params)))
+    steps = 2 * len(batches)
+    print(f"  {'ok  ' if same else 'FAIL'} {'flow (fused attention)':<22} losses {runs[0].history[0]:.4f} -> "
+          f"{runs[0].history[-1]:.4f}  ({'the same weights twice' if same else 'NOT the same weights twice'}; "
+          f"{1e3 * secs['1'] / steps:.2f} ms a step with queued copies, {1e3 * secs['0'] / steps:.2f} ms waiting)",
+          file=out)
+    return 0 if same else 1
 
 
 def _check_tensors(ops, out):
