@@ -224,6 +224,33 @@ class _Null:
 NULL = _Null()
 
 
+def _max_mode():
+    return os.environ.get("APSI_GPU_TEMP", "").strip().lower() in ("max", "full", "card")
+
+
+def _max_governor(lib, h, key, read):
+    """APSI_GPU_TEMP=max: the card as PyTorch and games run it: its full default power limit (170 W on an RTX 3060,
+    put back at exit), its own fan curve and its own temperature limits (the driver slows the clocks near 83 C and
+    protects the card above that). Apsi does nothing during the run but report."""
+    g = Governor(read, 150.0)                          # (no ceiling of Apsi's own: never paces)
+    g.retarget = lambda ceiling: None                  # (a later run reusing it keeps it so)
+
+    def watts():
+        mw = ctypes.c_uint()
+        return round(mw.value / 1000.0, 1) if lib.nvmlDeviceGetPowerUsage(h, ctypes.byref(mw)) == 0 else None
+    g.read_power = watts
+    pc = _PowerControl.try_make(lib, h, key)
+    if pc is not None:
+        pc.set(int(pc.top))
+        g.max_power = pc                               # (kept: its restore runs at exit)
+        g.power_note = (f"maximum: the card's default power limit {pc.top / 1000:.0f} W set {pc.via}, its own fan "
+                        f"curve and temperature limits")
+    else:
+        g.power_note = ("maximum: the card's own limits (the power limit could not be raised here: administrator, "
+                        "or apsi gpu setup)")
+    return g
+
+
 def _pci_bus_id(dev):
     try:
         buf = ctypes.create_string_buffer(64)
@@ -236,7 +263,7 @@ def _pci_bus_id(dev):
 def governor(dev):
     """The governor of a native/cuda.Device (or NULL when the temperature cannot be read or control is off)."""
     target = _target()
-    if target is None or dev is None:
+    if (target is None and not _max_mode()) or dev is None:
         return NULL
     key = getattr(dev, "index", 0)
     with _lock:
@@ -261,6 +288,8 @@ def governor(dev):
         if read() is None:
             _govs[key] = NULL
             return NULL
+        if _max_mode():
+            return _govs.setdefault(key, _max_governor(lib, h, key, read))
         g = _govs[key] = Governor(read, target)
 
         def watts():
