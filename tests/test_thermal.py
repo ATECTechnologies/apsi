@@ -111,3 +111,47 @@ class SimulatedCard(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class PowerLimitRestore(unittest.TestCase):
+    """A run that was killed never put its lowered power limit back: the next run must restore the card's own limit
+    (recorded by the first change), not take the low one for the card's own."""
+
+    def test_killed_run_is_undone(self):
+        import ctypes
+        import tempfile
+
+        class Lib:
+            def __init__(self):
+                self.limit, self.default = 136000, 170000
+
+            def nvmlDeviceGetPowerManagementLimit(self, h, ref):
+                ref._obj.value = self.limit
+                return 0
+
+            def nvmlDeviceGetPowerManagementDefaultLimit(self, h, ref):
+                ref._obj.value = self.default
+                return 0
+
+            def nvmlDeviceGetPowerManagementLimitConstraints(self, h, lo, hi):
+                lo._obj.value, hi._obj.value = 100000, 170000
+                return 0
+
+            def nvmlDeviceSetPowerManagementLimit(self, h, v):
+                self.limit = v.value
+                return 0
+
+        with tempfile.TemporaryDirectory() as d, mock.patch.object(thermal, "_power_state_file",
+                                                                   lambda i: os.path.join(d, "p.txt")), \
+                mock.patch("atexit.register"):
+            lib = Lib()
+            pc = thermal._PowerControl.try_make(lib, None, 0)
+            pc.set(104000)                               # the first run lowers the limit and is killed: no restore
+            self.assertEqual(lib.limit, 104000)
+            pc2 = thermal._PowerControl.try_make(lib, None, 0)
+            self.assertEqual(lib.limit, 136000)          # the next run starts from the card's own limit
+            self.assertEqual(pc2.orig, 136000)
+            pc2.set(110000)
+            pc2.restore()                                # a clean end: the limit back, the record gone
+            self.assertEqual(lib.limit, 136000)
+            self.assertFalse(os.path.exists(os.path.join(d, "p.txt")))

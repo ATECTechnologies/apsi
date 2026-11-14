@@ -26,6 +26,8 @@ import time
 
 import numpy as np
 
+APSI_QKV = os.environ.get("APSI_QKV", "0").strip().lower() in ("1", "on", "yes", "true")   # measured slower (no tuned build for batches)
+
 from . import gpu_train_kernels as KS
 from .values import Record, tree_leaves, tree_map
 
@@ -1469,8 +1471,10 @@ class Gpu(_Ops):
             # few output tiles and a long k (gradients of weights): split k so the blocks fill whole waves of the
             # card (2 blocks per multiprocessor): 9 tiles split 7 ways is 63 blocks = 2 waves of 56, the second
             # almost empty; split 6 ways it is one full wave
-            if blocks < 4 * self.sms and nb1 * nb2 == 1 and K >= 512 and (beta or ldc == N) and not epi:
-                want = _split_k(blocks, K, self._per_sm(name) * self.sms)
+            sk = os.environ.get("APSI_SPLITK", "auto").strip().lower()   # auto | off | a number of parts
+            if sk not in ("off", "0", "1") and blocks < 4 * self.sms and nb1 * nb2 == 1 and K >= 512 and \
+                    (beta or ldc == N) and not epi:
+                want = int(sk) if sk.isdigit() else _split_k(blocks, K, self._per_sm(name) * self.sms)
                 if want > 1:
                     kchunk = -(-(-(-K // want)) // KS.BK) * KS.BK
                     nz = -(-K // kchunk)
@@ -1969,10 +1973,21 @@ class _Attention(_Node):
         M, Mk, Dkv = B * T, B * S, kvh * hd
         self.x, self.xm, self.cross, self.B, self.T, self.S = x, xm, mem is not None, B, T, S
         ps = self.net.passes
-        q, k, v = self.buf("q", M * D), self.buf("k", Mk * Dkv), self.buf("v", Mk * Dkv)
-        o.gemm(x, self.Wq.w, q, M, D, D, D, 1, D, 1, D, passes=ps)
-        for W, out in ((self.Wk, k), (self.Wv, v)):
-            o.gemm(xm, W.w, out, Mk, Dkv, D, D, 1, Dkv, 1, Dkv, passes=ps)
+        # q, k and v in one launch when their weights lie one after another (they do: Wq, Wk, Wv are stored in that
+        # order) and the three products have the same shape: three times the blocks of one product fill the card,
+        # and one launch replaces three. Their gradients then come back the same way (_grads_in).
+        self.qkv = mem is None and kvh == h and APSI_QKV and self.Wk.w[0] is self.Wq.w[0] and \
+            self.Wk.w[1] == self.Wq.w[1] + D * D and self.Wv.w[1] == self.Wq.w[1] + 2 * D * D and \
+            self.Wk.off == self.Wq.off + D * D and self.Wv.off == self.Wq.off + 2 * D * D
+        if self.qkv:
+            qb, qo = self.buf("qkv", 3 * M * D)
+            q, k, v = (qb, qo), (qb, qo + M * D), (qb, qo + 2 * M * D)
+            o.gemm(x, self.Wq.w, q, M, D, D, D, 1, D, 1, D, batch=(1, 3), sb=(0, D * D), sc=(0, M * D), passes=ps)
+        else:
+            q, k, v = self.buf("q", M * D), self.buf("k", Mk * Dkv), self.buf("v", Mk * Dkv)
+            o.gemm(x, self.Wq.w, q, M, D, D, D, 1, D, 1, D, passes=ps)
+            for W, out in ((self.Wk, k), (self.Wv, v)):
+                o.gemm(xm, W.w, out, Mk, Dkv, D, D, 1, Dkv, 1, Dkv, passes=ps)
         if self.qkn:                                    # an RMS norm of every head's query and key
             self.qraw, self.kraw = q, k
             self.qm, self.qr = self.buf("qm", M * h), self.buf("qr", M * h)
@@ -2062,7 +2077,11 @@ class _Attention(_Node):
         if self.fused:
             dd = self.gbuf("dd", B * h * T)
             o.flash_dot(datt, self.att, dd, B, T, h, hd)
-            dq, dk, dv = self.gbuf("dq", M * D), self.gbuf("dk", M * D), self.gbuf("dv", M * D)
+            if getattr(self, "qkv", False):
+                gb, go = self.gbuf("dqkv", 3 * M * D)
+                dq, dk, dv = (gb, go), (gb, go + M * D), (gb, go + 2 * M * D)
+            else:
+                dq, dk, dv = self.gbuf("dq", M * D), self.gbuf("dk", M * D), self.gbuf("dv", M * D)
             o.flash_bwd(self.q, self.k, self.v, datt, self.L, dd, dq, dk, dv, B, T, h, hd, self.causal, sc)
             return self._grads_in(dq, dk, dv, M, D, ps)
         dP = self.gbuf("dp", B * h * T * S)               # dP = datt v^T
@@ -2105,9 +2124,15 @@ class _Attention(_Node):
             o.colsum(dk, self.kraw, self.km, self.kr, self.gk.g, None, Mk * kvh, hd, 2)
             o.ln_b(self.kraw, self.gk.w, dk, self.km, self.kr, dk2, Mk * kvh, hd, True, None)
             dq, dk = dq2, dk2
-        o.gemm(self.x, dq, self.Wq.g, D, D, M, 1, D, D, 1, D, beta=True, passes=ps)
-        for W, d in ((self.Wk, dk), (self.Wv, dv)):
-            o.gemm(self.xm, d, W.g, D, Dkv, Mk, 1, D, Dkv, 1, Dkv, beta=True, passes=ps)
+        if getattr(self, "qkv", False) and not self.qkn and dk[0] is dq[0] and dk[1] == dq[1] + M * D and \
+                dv[0] is dq[0] and dv[1] == dq[1] + 2 * M * D:
+            # the three weight gradients in one launch: x^T [dq | dk | dv] into Gq | Gk | Gv (stored one after another)
+            o.gemm(self.x, dq, self.Wq.g, D, D, M, 1, D, D, 1, D, beta=True, batch=(1, 3), sb=(0, M * D),
+                   sc=(0, D * D), passes=ps)
+        else:
+            o.gemm(self.x, dq, self.Wq.g, D, D, M, 1, D, D, 1, D, beta=True, passes=ps)
+            for W, d in ((self.Wk, dk), (self.Wv, dv)):
+                o.gemm(self.xm, d, W.g, D, Dkv, Mk, 1, D, Dkv, 1, Dkv, beta=True, passes=ps)
         dx = self.gbuf("dx", M * D)
         o.gemm(dq, self.Wq.w, dx, M, D, D, D, 1, 1, D, D, passes=ps)
         dm = dx if not self.cross else self.gbuf("dmem", Mk * D)
@@ -4835,7 +4860,7 @@ def fit_batches(model, params, batches, loss="cross_entropy", opt=None, epochs=1
             from .gpu_pipeline import fit_batches_pipeline
             return fit_batches_pipeline(list(ops), model, params, batches, loss, opt, epochs, verbose, clip, schedule,
                                         precision, stages, max(1, int(accumulate or 1)),
-                                        _want_comp(compensated, params), every, freeze, train_only,
+                                        _want_comp(compensated, params, precision), every, freeze, train_only,
                                         _want_exact(exact_sums, params))
         ops = ops[0]
     loss = _host_loss(loss)
@@ -4848,7 +4873,7 @@ def fit_batches(model, params, batches, loss="cross_entropy", opt=None, epochs=1
     net = Net(ops, model, params, precision)
     n = net.n
     st1, st2, SQ = ops.alloc(n), (ops.alloc(n) if adam else None), ops.alloc(1)
-    COMP = ops.alloc(n) if _want_comp(compensated, params) else None
+    COMP = ops.alloc(n) if _want_comp(compensated, params, precision) else None
     LOSS1 = ops.alloc(1)
     LOSSB = None                                         # each batch's loss, read once an epoch (no wait a batch)
     for b_ in (st1, st2, COMP):
@@ -5244,13 +5269,19 @@ def _want_exact(exact, params):
     return sum(int(np.size(a)) for a in tree_leaves(params) if isinstance(a, np.ndarray)) < 2_000_000_000
 
 
-def _want_comp(compensated, params):
-    """Compensated weight updates: on by default below 2 B parameters (4 more bytes per parameter)."""
+def _want_comp(compensated, params, precision="fp32"):
+    """Compensated weight updates (4 more bytes per parameter and a fifth array for the optimizer to read and write).
+    On by default for float32 training below 2 B parameters, where a weight update can be smaller than float32's step
+    at the weight's size and would otherwise be lost. Off by default for bfloat16 and the narrower formats: their
+    products round every gradient far more coarsely than float32 rounds an update, so there the compensation costs
+    memory and time without changing what the model learns. compensated=true / APSI_GPU_COMPENSATED=1 turns it on."""
     if compensated is not None:
         return bool(compensated)
     env = os.environ.get("APSI_GPU_COMPENSATED", "").strip().lower()
     if env:
         return env not in ("0", "false", "no", "off")
+    if str(precision or "auto").lower() not in ("fp32", "float32", "tf32"):
+        return False
     return sum(int(np.asarray(a).size) for a in tree_leaves(params) if isinstance(a, np.ndarray)) < 2_000_000_000
 
 
@@ -5356,10 +5387,10 @@ def fit(model, params, X, y=None, loss="mse", opt=None, epochs=10, batch_size=No
             return fit_pipeline(list(ops), model, params, X, y, loss, opt, epochs, batch_size, seed, verbose, clip,
                                 schedule, val, precision, ema, ewc,
                                 "all" if stages is None and mode == "pipeline" else stages, micro_batches,
-                                _want_comp(compensated, params))
+                                _want_comp(compensated, params, precision))
         if len(ops) > 1:
             return _fit_parallel(list(ops), model, params, X, y, loss, opt, epochs, batch_size, seed, verbose, clip,
-                                 schedule, val, precision, ema, ewc, _want_comp(compensated, params))
+                                 schedule, val, precision, ema, ewc, _want_comp(compensated, params, precision))
         ops = ops[0]
     if ops is None:
         ops, why = globals()["device"](device)
@@ -5371,7 +5402,7 @@ def fit(model, params, X, y=None, loss="mse", opt=None, epochs=10, batch_size=No
                 from .gpu_pipeline import fit_pipeline
                 return fit_pipeline(many, model, params, X, y, loss, opt, epochs, batch_size, seed, verbose, clip,
                                     schedule, val, precision, ema, ewc, stages, micro_batches,
-                                    _want_comp(compensated, params))
+                                    _want_comp(compensated, params, precision))
     custom = callable(loss)                              # a loss function: evaluated on the processor
     if custom:
         if isinstance(ops, (list, tuple)) and len(ops) > 1:
@@ -5409,7 +5440,7 @@ def fit(model, params, X, y=None, loss="mse", opt=None, epochs=10, batch_size=No
         ops.fill((st2, 0), net.n, 0.0)
     SQ = ops.alloc(1)
     COMP = None
-    if _want_comp(compensated, params):
+    if _want_comp(compensated, params, precision):
         COMP = ops.alloc(net.n)
         ops.fill((COMP, 0), net.n, 0.0)
         net.owned.append(COMP)
