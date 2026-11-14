@@ -273,7 +273,7 @@ class Emulator(_Ops):
             mu = self.v(MEAN, M)[:, None] if mode == 1 else 0.0
             self.v(DG, N)[:] += (dy * (x - mu) * self.v(RSTD, M)[:, None]).sum(0)
 
-    def ln_f(self, X, Gm, Bt, Y, MEAN, RSTD, M, N, eps, rms):
+    def ln_f(self, X, Gm, Bt, Y, MEAN, RSTD, M, N, eps, rms, Y16=None):
         x = self.v(X, M * N).reshape(M, N)
         mu = np.zeros((M, 1), np.float32) if rms else x.mean(1, keepdims=True)
         var = ((x - mu) ** 2).mean(1, keepdims=True)
@@ -869,6 +869,7 @@ class Gpu(_Ops):
         self._occ = {}
         self._choice = {}
         self._wcache, self._wrange, self._wgen = {}, None, 0
+        self._twin = {}                                  # float32 output address -> (values, its bfloat16 twin)
         self.profile = None                              # {kernel: (seconds, launches)} while profiling
         self._pending = []
         self._lib = lib
@@ -884,6 +885,21 @@ class Gpu(_Ops):
         lib.cuEventCreate.argtypes = [ctypes.POINTER(ctypes.c_void_p), ctypes.c_uint]
         lib.cuFuncGetAttribute.argtypes = [ctypes.POINTER(ctypes.c_int), ctypes.c_int, ctypes.c_void_p]
         self._launch = lib.cuLaunchKernel
+        # Windows (WDDM) gathers launches in a buffer and hands them to the card in batches; between batches the card
+        # can sit idle (the load graph swinging between 40 and 90 %). A non-blocking cuStreamQuery every few launches
+        # hands the buffer over at once, so the card always has the next kernels. About a microsecond each.
+        # APSI_GPU_FLUSH=N (launches between flushes, 0 = off; default 32 on Windows, off elsewhere).
+        try:
+            fl = int(os.environ.get("APSI_GPU_FLUSH", "32" if os.name == "nt" else "0"))
+        except ValueError:
+            fl = 0
+        self._flush_every, self._since_flush = max(0, fl), 0
+        if fl > 0:
+            try:
+                lib.cuStreamQuery.argtypes = [ctypes.c_void_p]
+                self._query = lib.cuStreamQuery
+            except AttributeError:
+                self._flush_every = 0
         # a second stream: the weight gradient of a layer (x^T dy) runs beside its input gradient (dy W^T): the two
         # products are independent, and side by side they fill the card where one alone leaves it partly idle
         # (few output tiles: 1024 x 1024 weights). Non-blocking, so the default stream does not wait for it by itself.
@@ -946,6 +962,11 @@ class Gpu(_Ops):
             self._pending.append((label, e0, e1))
         if r:
             self.dev.drv.check(r, f"launching {name}")
+        if self._flush_every:
+            self._since_flush += 1
+            if self._since_flush >= self._flush_every:
+                self._since_flush = 0
+                self._query(self.cur)                    # not ready is the usual answer: only the hand-over matters
 
     def _event(self):
         e = ctypes.c_void_p()
@@ -998,6 +1019,9 @@ class Gpu(_Ops):
         self.used -= 4 * b.n
         self.dev.free(b.ptr)
         self._calls.clear()
+        if self._twin:                                   # a twin of (or in) freed memory is no longer one
+            lo, hi = b.ptr, b.ptr + 4 * max(1, b.n)
+            self._twin = {k: v for k, v in self._twin.items() if not (lo <= k < hi or lo <= v[1][1] < hi)}
 
     RING = 64 << 20                                      # pinned staging memory for copies to the card
 
@@ -1147,9 +1171,26 @@ class Gpu(_Ops):
                  self.p(RSTD), self.p(DG), self.p(DB), ("u", M), ("u", N), ("u", rows), ("u", mode), self.p(WB),
                  self.p(WG), ("u", 1 if part else 0), self._cnt())
 
-    def ln_f(self, X, Gm, Bt, Y, MEAN, RSTD, M, N, eps, rms):
+    def ln_f(self, X, Gm, Bt, Y, MEAN, RSTD, M, N, eps, rms, Y16=None):
+        """Y16 (optional): Y's bfloat16 twin, written in the same pass; the products that read Y then take the twin
+        instead of a conversion pass of their own."""
         self._go("ln_f", -(-M // 8), 256, self.p(X), self.p(Gm), self.p(Bt), self.p(Y), self.p(MEAN), self.p(RSTD),
-                 ("u", M), ("u", N), ("f", eps), ("u", 1 if rms else 0))
+                 ("u", M), ("u", N), ("f", eps), ("u", 1 if rms else 0), self.p(Y16), ("u", 1 if Y16 is not None else 0))
+        if Y16 is not None:
+            self._twin[self.p(Y)[1]] = (M * N, self.p(Y16))
+
+    def make_twin(self, view, n, dst):
+        """view's bfloat16 twin in dst (one pass), registered for the products that read view until drop_twin or
+        until view is written with a new twin. For a buffer read by several products (two or more conversions
+        before): one."""
+        self._go("to_bf16", self.blocks((n + 1) // 2), 256, self.p(view), self.p(dst), ("u", n))
+        self._twin[self.p(view)[1]] = (n, self.p(dst))
+
+    def drop_twin(self, view):
+        self._twin.pop(self.p(view)[1], None)
+
+    def twin_ok(self):
+        return "to_bf16" in self.fn and os.environ.get("APSI_BF16_TWIN", "1").strip().lower() not in ("0", "off", "no")
 
     def ln_b(self, X, Gm, DY, MEAN, RSTD, DX, M, N, rms, RES=None):
         self._go("ln_b", -(-M // 8), 256, self.p(X), self.p(Gm), self.p(DY), self.p(MEAN), self.p(RSTD), self.p(DX),
@@ -1454,6 +1495,10 @@ class Gpu(_Ops):
                     self._go("to_bf16", self.blocks((n + 1) // 2), 256, args[i], self.p((dst, 0)), ("u", n))
                     self._wcache[(ptr, n)] = hit = (self._wgen, dst)
                 out[i] = self.p((hit[1], 0))
+                continue
+            tw = self._twin.get(ptr)
+            if tw is not None and tw[0] >= n:            # written with its bfloat16 twin: no conversion
+                out[i] = tw[1]
                 continue
             dst = self._scratch(key, (n + 1) // 2)
             self._go("to_bf16", self.blocks((n + 1) // 2), 256, args[i], self.p(dst), ("u", n))
@@ -1855,6 +1900,11 @@ class _Linear(_Node):
         self.dh_given = False
         # dW[K, N] += x^T dy: A(k, m) = x[m * K + k]
         db = self.b.g if self.b is not None else None   # the bias gradient comes with the weight gradient
+        # dy is read by both products (x^T dy and dy W^T): its bfloat16 twin once instead of a conversion each
+        twin = need_dx and self.net.passes == 1 and self.x_pre is None and into_act is None and \
+            getattr(o, "twin_ok", lambda: False)() and (M * N) % 2 == 0
+        if twin:
+            o.make_twin(dy, M * N, self.gbuf("dy16", o.n16(M * N)))
         side = o.fork() if need_dx and hasattr(o, "fork") else None   # x^T dy beside dy W^T (independent products)
         try:
             if self.x_pre is not None:                  # x = act(h): applied while the product reads h
@@ -1876,6 +1926,8 @@ class _Linear(_Node):
             o.gemm(dy, self.W.w, dx, M, K, N, N, 1, 1, N, K, passes=self.net.passes)       # dy W^T
         if side:
             o.join(side)                                # both done before anything uses dx or overwrites dy
+        if twin:
+            o.drop_twin(dy)
         return dx
 
 
@@ -1932,8 +1984,11 @@ class _Norm(_Node):
         self.x = x
         y = self.buf("y", M * self.N)
         self.mean, self.rstd = self.buf("mean", M), self.buf("rstd", M)
-        self.net.ops.ln_f(x, self.gm.w, self.bt.w if self.bt else None, y, self.mean, self.rstd, M, self.N, self.eps,
-                          self.rms)
+        o = self.net.ops
+        y16 = self.buf("y16", o.n16(M * self.N)) if getattr(o, "twin_ok", lambda: False)() and \
+            self.net.passes == 1 and (M * self.N) % 2 == 0 else None
+        o.ln_f(x, self.gm.w, self.bt.w if self.bt else None, y, self.mean, self.rstd, M, self.N, self.eps, self.rms,
+               Y16=y16)
         return y, shape
 
     def bwd(self, dy, need_dx=True, residual=None):
@@ -2162,6 +2217,9 @@ class _Attention(_Node):
             att, self.L = self.buf("att", M * D), self.buf("lse", B * h * T)
             o.flash_fwd(q, k, v, att, self.L, B, T, h, hd, self.causal, sc)
             self.att = att
+            if ps == 1 and getattr(o, "twin_ok", lambda: False)() and (M * D) % 2 == 0:
+                # read by the output projection now and by its weight gradient later: converted once, not twice
+                o.make_twin(att, M * D, self.buf("att16", o.n16(M * D)))
             y = self.buf("y", M * D)
             o.gemm(att, self.Wo.w, y, M, D, D, D, 1, D, 1, D, bias=self.bo.w if self.bo else None, passes=ps, epi=3 if residual else 0,
                    X2=residual)
@@ -4682,9 +4740,9 @@ class Net:
         self.owned = []
         self.train = True
         self.seed = 12345
-        prec = str(precision or "auto").lower()
-        self.kind = lowbit.parse(prec)
-        self.passes = 3 if prec in ("fp32", "float32", "f32", "tf32", "fp64", "float64", "f64") else 1
+        prec = self.precision = resolve_precision(precision)
+        self.kind = lowbit.parse(prec) if prec not in PRECISIONS else None
+        self.passes = 3 if prec == "fp32" else 1
         leaves = [a for a in tree_leaves(params) if isinstance(a, np.ndarray)]
         # matrices first (weight decay and low-bit rounding apply to them), then vectors
         order = sorted(range(len(leaves)), key=lambda i: leaves[i].ndim < 2)
@@ -5422,6 +5480,25 @@ def _want_exact(exact, params):
     return sum(int(np.size(a)) for a in tree_leaves(params) if isinstance(a, np.ndarray)) < 2_000_000_000
 
 
+PRECISIONS = {
+    "bf16": "bfloat16 products on the tensor cores, float32 sums and master weights (the default)",
+    "fp32": "float32-exact products as three bfloat16 products (hi*hi + lo*hi + hi*lo): the float32 result, 3x the time",
+}
+
+
+def resolve_precision(precision):
+    """The precision a run trains in: the argument, else APSI_PRECISION, else bf16. "auto" means bf16; "tf32",
+    "fp64" and their spellings mean the float32-exact products; the low-bit formats (lowbit.parse) pass through."""
+    p = str(precision or "auto").strip().lower()
+    if p == "auto":
+        p = os.environ.get("APSI_PRECISION", "").strip().lower() or "bf16"
+    if p in ("auto", "bf16", "bfloat16", "fp16", "float16", "half", "mixed"):
+        return "bf16"
+    if p in ("fp32", "float32", "f32", "tf32", "fp64", "float64", "f64", "exact"):
+        return "fp32"
+    return p
+
+
 def _want_comp(compensated, params, precision="fp32"):
     """Compensated weight updates (4 more bytes per parameter and a fifth array for the optimizer to read and write).
     On by default for float32 training below 2 B parameters, where a weight update can be smaller than float32's step
@@ -5433,7 +5510,7 @@ def _want_comp(compensated, params, precision="fp32"):
     env = os.environ.get("APSI_GPU_COMPENSATED", "").strip().lower()
     if env:
         return env not in ("0", "false", "no", "off")
-    if str(precision or "auto").lower() not in ("fp32", "float32", "tf32"):
+    if resolve_precision(precision) != "fp32":
         return False
     return sum(int(np.asarray(a).size) for a in tree_leaves(params) if isinstance(a, np.ndarray)) < 2_000_000_000
 
@@ -5649,6 +5726,10 @@ def fit(model, params, X, y=None, loss="mse", opt=None, epochs=10, batch_size=No
     from . import thermal
     gov = thermal.governor(getattr(ops, "dev", None))        # keeps the card near APSI_GPU_TEMP (77 C)
     paced0 = (gov.status() or {}).get("paced_s") or 0.0
+    if verbose:
+        why = PRECISIONS.get(net.precision, "low-bit weights")
+        print(f"precision {net.precision}: {why}" + ("" if net.precision == "fp32" else
+              "; precision=\"fp32\" or APSI_PRECISION=fp32 for float32-exact products"))
     wd = float(getattr(opt, "wd", 0.0)) if isinstance(opt, AdamW) else 0.0
     ep_seconds, ep_temp, ep_t0 = [], [], time.perf_counter()
     try:

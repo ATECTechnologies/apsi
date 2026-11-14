@@ -301,13 +301,16 @@ the speed stay level, and a card that stays cool is never slowed.
 | `APSI_GPU_TEMP=79` | the ceiling in °C (default 79: held at 78–79); any value from 50 to 95 |
 | `APSI_GPU_TEMP=off` | no control (the card's own limits only) |
 
-**How the power limit is steered.** The controller looks 4 s ahead along the temperature's slope, so a card that
-starts heating quickly (a heavy phase after a light one) gets less power before it reaches the ceiling, not after;
-it cuts fast and gives back slowly (at most 2 W a second), so the limit does not swing; a reading at the ceiling
-cuts 6 % at once; and while the card draws less than its limit (evaluation, a light phase) the limit is not raised
-past what it draws, so the next heavy phase does not start from an unused high limit. In a simulated card (slow
-and fast coolers, rooms from 26 to 38 °C, a light phase and back) it never reads 80 and holds 78–79 under full load
-with at least 97 % of the power that temperature allows (tests/test_thermal.py).
+**Fixed power, the fans hold the temperature.** With the rights to set the card's limits (administrator, or the
+GPU helper below), Apsi does not lower the power to cool the card: the power limit stays where it was when the run
+started (the GPU Tuner's value), so the clocks and the speed stay level, and the card's fans are steered between 35 %
+and 100 % to hold it at 78.5 °C — looking 4 s ahead along the temperature's slope, faster at once when it rises,
+slower gently when it falls. Only if the fans are at 100 % and the card is still at the ceiling (a blocked cooler, a
+hot room) does the power limit come down, a few watts at a time, and it goes back as soon as the fans have room
+again. Below the band the driver's own fan curve is in charge, and it is put back at exit. In a simulated card (rooms
+from 25 to 42 °C, load changing every 40 s) it never reads 80, holds 77–79 under full load and never touches the
+power unless the fans are at full (tests/test_thermal.py). `APSI_GPU_FAN=0` leaves the fans alone; the power limit
+then holds the temperature as before (it looks ahead, cuts fast, gives back at most 2 W a second).
 
 **Steady speed: the power limit instead of pauses (administrator).** When Apsi runs as an administrator (Windows)
 or root (Linux), it holds the temperature by moving the card's power limit (between 55 % and 100 % of the default)

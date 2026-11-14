@@ -215,56 +215,75 @@ class Retarget(unittest.TestCase):
 
 
 class FanControl(unittest.TestCase):
-    """Faster fans near the ceiling (the driver's curve below it), back to the driver's curve at the end."""
+    """Fixed power, the fans hold the temperature; the power limit only when the fans are at 100 %."""
 
-    def test_fan_curve_and_restore(self):
-        calls = []
+    @staticmethod
+    def _sim(seconds, ambient, r_lo, r_hi, load=None):
+        """A card at a fixed 136 W limit: temperature rise per watt falls from r_lo (fans at 0 %) to r_hi (100 %);
+        the fans follow their command in about 2 s, the die in about 20 s; the sensor reads whole degrees."""
+        clock, st = [0.0], {"T": 50.0, "limit": 136000.0, "cmd": None, "fan": 30.0}
+        log = []
+
+        def power():
+            frac = 1.0 if load is None else load(clock[0])
+            return min(st["limit"] / 1000.0, 136.0 * frac)
+
+        def read():
+            return float(round(st["T"]))
+
+        class PC:
+            top, floor, orig, limit = 170000, 93500, 136000, 136000.0
+
+            def set(self, mw):
+                st["limit"] = float(mw)
+        pc = PC()
+        pc.step = thermal._PowerControl.step.__get__(pc)
+        g = thermal.Governor(read, 79.0)
+        g.power, g.read_power = pc, power
         fc = thermal._FanControl()
-        fc.top, fc.percent = 85, None
-        fc._set = lambda pct: calls.append(pct) or True
-        fc.step(65.0, 79.0)                              # cool: the driver's own curve, nothing set
-        self.assertEqual(calls, [])
-        fc.step(74.0, 79.0)                              # ceiling - 5: on the way up
-        fc.step(77.5, 79.0)                              # past ceiling - 2: the top
-        self.assertEqual(calls[-1], 85)
-        self.assertTrue(50 <= calls[0] < 85)
+        fc.percent, fc.level, fc.ok = None, None, True
+        fc._set = lambda pct: st.__setitem__("cmd", pct) or True
+        g.fan = fc
+        with mock.patch.object(thermal.time, "monotonic", lambda: clock[0]):
+            while clock[0] < seconds:
+                want = 30.0 + 0.4 * max(0.0, st["T"] - 50.0) if st["cmd"] is None else float(st["cmd"])
+                st["fan"] += (want - st["fan"]) * min(1.0, 0.05 / 2.0)
+                r = r_lo + (r_hi - r_lo) * st["fan"] / 100.0
+                st["T"] += (ambient + r * power() - st["T"]) * min(1.0, 0.05 / 20.0)
+                clock[0] += 0.05
+                g.tick()
+                log.append((clock[0], read(), st["limit"], st["fan"], power()))
         fc.auto()
-        self.assertIsNone(calls[-1])
+        return log, st
 
-    def test_more_cooling_more_power(self):
-        """With the fans at the top near the ceiling the simulated card keeps more power at 78-79 C."""
-        def run(with_fan):
-            clock, st = [0.0], {"T": 45.0, "limit": 136000.0, "fan": 0.0}
+    def test_fixed_power_fans_hold_ceiling(self):
+        log, st = self._sim(600.0, 35.0, 0.40, 0.20)
+        self.assertTrue(all(t < 80.0 for _, t, _, _, _ in log))
+        late = [x for x in log if x[0] > 200.0]
+        self.assertTrue(all(70.0 <= t <= 79.0 for _, t, _, _, _ in late))
+        self.assertTrue(all(lim == 136000.0 for _, _, lim, _, _ in log))          # the power never moved
+        self.assertGreater(max(f for *_, f, _ in late), 45.0)                    # the fans did the work
+        self.assertIsNone(st["cmd"])                                             # driver's curve at the end
 
-            def power():
-                return min(st["limit"] / 1000.0, 175.0)
+    def test_sudden_load_steps(self):
+        """Light and heavy phases every 40 s: still never 80, power untouched."""
+        log, _ = self._sim(600.0, 35.0, 0.40, 0.20, load=lambda t: 1.0 if int(t / 40) % 2 == 0 else 0.55)
+        self.assertTrue(all(t < 80.0 for _, t, _, _, _ in log))
+        heavy = [t for tm, t, _, _, _ in log if tm > 200.0 and int(tm / 40) % 2 == 0]
+        self.assertGreaterEqual(max(heavy), 75.0)                               # not cooled for nothing
+        self.assertTrue(all(lim == 136000.0 for _, _, lim, _, _ in log))
 
-            def read():
-                return float(round(st["T"] + 0.035 * power()))
+    def test_cool_card_driver_curve(self):
+        log, st = self._sim(300.0, 25.0, 0.30, 0.20)
+        self.assertIsNone(st["cmd"])
+        self.assertTrue(all(lim == 136000.0 for _, _, lim, _, _ in log))
 
-            class PC:
-                top, floor, limit = 170000, 93500, 136000.0
-
-                def set(self, mw):
-                    st["limit"] = float(mw)
-            pc = PC()
-            pc.step = thermal._PowerControl.step.__get__(pc)
-            g = thermal.Governor(read, 79.0)
-            g.power, g.read_power = pc, power
-            if with_fan:
-                fc = thermal._FanControl()
-                fc.top, fc.percent = 85, None
-                fc._set = lambda pct: st.__setitem__("fan", 0.0 if pct is None else (pct - 50) / 35.0) or True
-                g.fan = fc
-            watts = []
-            with mock.patch.object(thermal.time, "monotonic", lambda: clock[0]):
-                while clock[0] < 300.0:
-                    r = 0.30 * (1.0 - 0.15 * st["fan"])      # faster fans: less temperature rise per watt
-                    st["T"] += (32.0 + r * power() - st["T"]) * min(1.0, 0.05 / 20.0)
-                    clock[0] += 0.05
-                    g.tick()
-                    if clock[0] > 200:
-                        watts.append(power())
-                        self.assertLess(read(), 80.0)
-            return sum(watts) / len(watts)
-        self.assertGreater(run(True), run(False) * 1.08)
+    def test_fans_at_full_then_power_as_last_resort(self):
+        """A hot room: fans at 100 % cannot hold 79 at 136 W; the limit comes down only then, and the card stays
+        under 80 once the controller has it."""
+        log, _ = self._sim(900.0, 42.0, 0.42, 0.30)
+        late = [x for x in log if x[0] > 300.0]
+        self.assertTrue(all(t < 80.0 for _, t, _, _, _ in late))
+        self.assertLess(min(lim for _, _, lim, _, _ in late), 136000.0)
+        self.assertGreater(min(f for *_, f, _ in late), 75.0)
+        self.assertLess(max(lim for _, _, lim, _, _ in late) - min(lim for _, _, lim, _, _ in late), 12000.0)

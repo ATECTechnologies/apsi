@@ -28,9 +28,18 @@
 - **The held-out loss is computed on the card:** each batch's logits stay there and the loss kernel adds the mean
   into one number (before: every batch's logits were copied back and the softmax taken in float64 on the processor,
   hundreds of MB and seconds per evaluation with the card idle).
-- **Fans before power:** near the ceiling the card's fans run harder (up to 85 %, `APSI_GPU_FAN_MAX`) before the power
-  limit is lowered, so the card keeps more power at the same temperature; the driver's own curve comes back below it
-  and at the end (`APSI_GPU_FAN=0` leaves the fans alone).
+- **Fixed power, the fans hold the temperature:** while training, the card keeps the power limit it started with
+  (the GPU Tuner's) and its fans are steered between 35 % and 100 % to hold 78.5 °C (looking 4 s ahead, faster at
+  once, slower gently). The power limit moves only when the fans are at 100 % and the card is still at the ceiling,
+  a few watts at a time, and comes back as soon as the fans have room. Before, the power limit itself held the
+  temperature: the clocks fell with it (about 20 % less speed at 106 W), and once it reached its floor the work was
+  paused, which left the card idle between 40 and 90 % of the time. The driver's own fan curve comes back when the
+  card is well below the ceiling and at exit; `APSI_GPU_FAN=0` leaves the fans alone (the power limit holds it then).
+- **No idle gaps on Windows:** WDDM gathers launches into batches; every 32 launches a non-blocking stream query now
+  hands them to the card at once (`APSI_GPU_FLUSH=N`, 0 = off).
+- **A layer norm's output comes with its bfloat16 twin** written in the same pass; the products that read it (q, k, v
+  and the first MLP layer, and their weight gradients) take the twin instead of a conversion pass each (six per
+  layer before). `APSI_BF16_TWIN=0` turns it off.
 - **The card is held at 78–79 °C, never 80** (`APSI_GPU_TEMP` is now a ceiling, default 79, instead of a 77 °C
   target with a 75–78 band): the card gets all the power that temperature allows. The power limit looks ahead along
   the temperature's slope, cuts fast and gives back slowly, cuts 6 % at once at the ceiling and does not wind up
