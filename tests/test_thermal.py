@@ -203,3 +203,12 @@ class PowerLimitControl(unittest.TestCase):
             steady = (78.5 - amb) / 0.335
             late = [p for c, p in watts if c > 230]
             self.assertGreater(sum(late) / len(late), steady * 0.97, (tau, amb))
+
+
+class Retarget(unittest.TestCase):
+    def test_a_reused_governor_keeps_the_ceiling(self):
+        """A second run in the same program (a warm-up fit, then the training) reuses the governor: it must keep
+        steering to ceiling - 0.5 in [ceiling - 1, ceiling], never a band that reaches 80."""
+        g = thermal.Governor(lambda: 70.0, 79.0)
+        g.retarget(79.0)
+        self.assertEqual((g.target, g.low, g.high), (78.5, 78.0, 79.0))
