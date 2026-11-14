@@ -113,32 +113,35 @@ class Governor:
         power = getattr(self, "power", None)
         ceiling = getattr(self, "ceiling", self.target + 0.5)
         if fan is not None and fan.ok:
-            # fixed power, the fans hold the temperature; the power limit only as the last resort (fans at 100 %)
+            # fixed power, the fans hold the temperature; the power limit only as the last resort (fans at the top of their range)
             draw = None
             if getattr(self, "read_power", None):
                 try:
                     draw = self.read_power()
                 except Exception:                       # noqa: BLE001
                     draw = None
-            room = fan.control(self.smooth, self.slope, self.target, ceiling, dt, draw=draw)
+            run = float(getattr(power, "run", getattr(power, "orig", 0.0))) if power is not None else 0.0
+            pinned = power is not None and power.limit < run - 500.0
+            room = fan.control(self.smooth, self.slope, self.target, ceiling, dt, draw=draw, pinned=pinned)
             if fan.ok:
                 self.fraction = 0.0
                 if power is not None:
-                    # the last resort, slow and small so it never swings: fans at full and still too warm -> a few
-                    # watts less; fans with clear room again (below 85 %) -> the watts back, slowly, up to the
-                    # original limit and never above it. A reading at the ceiling + 0.5 itself: 4 % at once.
+                    # the last resort, slow and small so it never swings. The fans come first both ways: the watts
+                    # go down only with the fans at the top and the card still warm, and come back (slowly, up to
+                    # the run's limit) while the fans stay at the top, before the fans slow down again. A reading
+                    # at the ceiling + 0.5 itself: 4 % at once.
                     lim = power.limit
                     if t >= ceiling + 0.5:
                         lim *= 0.96
                     elif not room and self.smooth > self.target:
-                        lim -= 1500.0 * (self.smooth - self.target + 0.25) * dt
-                    elif fan.level is None or fan.level < 85.0:
-                        lim += 500.0 * dt
-                    lim = min(float(power.orig), max(float(power.floor), lim))
+                        lim -= 600.0 * (self.smooth - self.target + 0.25) * dt
+                    elif self.smooth < self.target - 0.5 and self.slope < 0.05:
+                        lim += 300.0 * dt
+                    lim = min(run, max(float(power.floor), lim))
                     if lim != power.limit:
                         power.limit = lim
                         applied = getattr(power, "applied", None)
-                        if applied is None or abs(lim - applied) >= 1000.0 or lim == power.orig != applied:
+                        if applied is None or abs(lim - applied) >= 1000.0 or lim == run != applied:
                             power.set(int(lim))
                             power.applied = lim
                 return
@@ -259,7 +262,14 @@ def governor(dev):
         if g.power_note is None:
             g.power = _PowerControl.try_make(lib, h, key)  # steer the power limit, not pauses (when allowed)
             if g.power is not None:                     # faster fans first, with the same rights
-                g.fan = _FanControl.try_make(lib, h, key, getattr(g.power, "via", "") == "directly")
+                prof = _profile(lib, h, key)            # this card's own settings (apsi gpu calibrate), if measured
+                g.fan = _FanControl.try_make(lib, h, key, getattr(g.power, "via", "") == "directly", prof)
+                g.power.run = float(g.power.limit)
+                if g.fan is not None:                   # the fans hold the temperature: the power can go up
+                    want = _train_power(g.power, prof)
+                    if want > g.power.limit + 500.0:
+                        g.power.set(int(want))
+                        g.power.limit = g.power.applied = g.power.run = float(want)
             if g.power is not None:
                 g.power_note = f"temperature held by the power limit, {g.power.via} (no pauses)"
         return g
@@ -439,24 +449,38 @@ class _PowerControl:
         return new <= self.floor + 1.0                 # at the floor: pauses may still be needed
 
 
+def _fan_range(prof=None):
+    """APSI_GPU_FAN_MIN / _MAX, else the card's measured range (apsi gpu calibrate), else 70-82 %."""
+    def pct(name, d):
+        try:
+            return max(0.0, min(100.0, float(os.environ.get(name, "").strip().rstrip("%") or d)))
+        except ValueError:
+            return float(d)
+    prof = prof or {}
+    lo, hi = pct("APSI_GPU_FAN_MIN", prof.get("fan_min", 70)), pct("APSI_GPU_FAN_MAX", prof.get("fan_max", 82))
+    return min(lo, hi), max(lo, hi)
+
+
 class _FanControl:
-    """The temperature is held by the fans, the power stays fixed. While a run trains, the card keeps the power
-    limit it started with (the GPU Tuner's value, chosen for work per watt) and its fans are steered between their
-    minimum and 100 % to hold it at the ceiling - 0.5 (78.5 C for the default 79): looking ahead along the
+    """The temperature is held by the fans, the power stays fixed. While a run trains, the card runs at a fixed power
+    limit (APSI_GPU_TRAIN_POWER, default 145 W, never below the card's own limit or above its default) and its fans
+    are steered between 70 and 82 % (APSI_GPU_FAN_MIN / APSI_GPU_FAN_MAX) to hold it at the ceiling - 0.5 (78.5 C
+    for the default 79): looking ahead along the
     temperature's slope, faster at once when it rises, slower gently when it falls. The power limit is touched only
-    if the fans are at 100 % and the card still reaches the ceiling (a blocked cooler, a hot room): then a few watts
+    if the fans are at the top of their range and the card still reaches the ceiling (a blocked cooler, a hot room): then a few watts
     at a time, and given back as soon as the fans have room again. Back to the driver's own fan curve when the card
     is well below the ceiling and at exit. Needs the rights of the power limit (administrator or the GPU helper);
     APSI_GPU_FAN=0 leaves the fans alone (the power limit holds the temperature instead)."""
 
-    LOW = 35.0                          # the slowest speed it asks for (most cards' minimum is 30 %)
+    LOW, TOP = 70.0, 82.0               # the range it steers in (APSI_GPU_FAN_MIN / APSI_GPU_FAN_MAX)
 
     @staticmethod
-    def try_make(lib, h, index, direct):
+    def try_make(lib, h, index, direct, prof=None):
         if os.environ.get("APSI_GPU_FAN", "1").strip().lower() in ("0", "off", "no", "false"):
             return None
         fc = _FanControl()
         fc.percent, fc.level, fc.ok = None, None, True
+        fc.low, fc.top = _fan_range(prof)
         if direct:
             if not hasattr(lib, "nvmlDeviceSetFanSpeed_v2"):
                 return None
@@ -470,8 +494,8 @@ class _FanControl:
         atexit.register(fc.auto)
         return fc
 
-    def control(self, smooth, slope, target, ceiling, dt, draw=None):
-        """One step of the fans: returns True while they still have room (below 100 %). Three terms, the way a
+    def control(self, smooth, slope, target, ceiling, dt, draw=None, pinned=False):
+        """One step of the fans: returns True while they still have room (below the top of their range). Three terms, the way a
         spacecraft's thermal loop is built: the error now, the error 4 s ahead along the temperature's slope, and a
         feed-forward from the power the card draws: heat that has gone in but not yet shown on the sensor (the die
         takes about 20 s to settle), so the fans answer a heavy phase as it starts, not after the degrees come."""
@@ -484,24 +508,31 @@ class _FanControl:
             # watts above the settled level -> degrees still to come (half of the about 0.3 C per W of a desktop card: the loop adds the rest)
             if smooth > target - 3.0:
                 e += 0.15 * max(0.0, draw - self.p_smooth)
+        low, top = getattr(self, "low", self.LOW), getattr(self, "top", self.TOP)
+        if pinned:                                     # the power is below the run's limit: fans stay at the top
+            self.level = top
+            self._apply(int(round(top)))
+            return False
         if self.level is None:
-            if smooth < ceiling - 6.0 and e < 0:
+            if smooth < ceiling - 10.0 and e < 0:
                 return True                            # cool: the driver's own curve
-            self.level = 60.0                          # taking over: a firm start
+            self.level = low                           # taking over: at the bottom of the range
         if e > 0:
-            self.level += 6.0 * e * dt + 2.0 * e       # up fast
+            self.level += 3.0 * e * dt + 1.0 * e       # up fast
         else:
-            self.level += 1.5 * e * dt                 # down gently (no swinging)
-        self.level = max(self.LOW, min(100.0, self.level))
-        if smooth < ceiling - 8.0 and self.level <= self.LOW + 0.5:
+            self.level += 0.75 * e * dt                # down gently (no swinging)
+        self.level = max(low, min(top, self.level))
+        if smooth < ceiling - 12.0 and self.level <= low + 0.5:
             self.level = None                          # well below: back to the driver's curve
             self._apply(None)
             return True
         self._apply(int(round(self.level)))
-        return self.level < 99.5
+        return self.level < top - 0.5
 
     def _apply(self, pct):
-        if pct == self.percent or (pct is not None and self.percent is not None and abs(pct - self.percent) < 2):
+        edge = pct is not None and pct in (int(round(getattr(self, "low", self.LOW))), int(round(getattr(self, "top", self.TOP))))
+        if pct == self.percent or (pct is not None and self.percent is not None and abs(pct - self.percent) < 2
+                                   and not edge):
             return
         if self._set(pct):
             self.percent = pct
@@ -513,6 +544,35 @@ class _FanControl:
             self._set(None)
             self.percent = None
         self.level = None
+
+
+def _profile(lib, h, index):
+    try:
+        name = ctypes.create_string_buffer(96)
+        if lib.nvmlDeviceGetName(h, name, ctypes.c_uint(96)) != 0:
+            return None
+        from . import gpu_calibrate
+        return gpu_calibrate.load_profile(gpu_calibrate.card_key(name.value.decode(errors="replace"), index))
+    except Exception:                                   # noqa: BLE001
+        return None
+
+
+def _train_power(pc, prof=None):
+    """The fixed power limit of a training run while the fans hold the temperature, in mW: APSI_GPU_TRAIN_POWER
+    (watts like 145W, or a share of the card's default like 85%), else what apsi gpu calibrate measured for this
+    card, else 85 % of its default (an RTX 3060: 145 of 170 W); never below the limit the card has and never above
+    its default. off: the card's limit as it is."""
+    v = os.environ.get("APSI_GPU_TRAIN_POWER", "").strip().lower()
+    if not v:                                       # the card's measured setting, else 85 % of its default
+        v = f"{prof['power_w']}w" if prof and prof.get("power_w") else "85%"
+    cur = float(pc.limit)
+    if v in ("", "off", "0", "no", "none"):
+        return cur
+    try:
+        mw = float(v[:-1]) / 100.0 * pc.top if v.endswith("%") else float(v.rstrip("w")) * 1000.0
+    except ValueError:
+        return cur
+    return min(float(pc.top), max(cur, mw))
 
 
 def _power_state_file(index):
@@ -702,12 +762,31 @@ def hold(target=79.0, index=0, seconds=None, quiet=False):
     return 0
 
 
+def _calibrate_all(index=None):
+    from . import gpu_calibrate
+    lib = _load_nvml()
+    n = ctypes.c_uint(0)
+    if lib is None or lib.nvmlDeviceGetCount_v2(ctypes.byref(n)) != 0 or not n.value:
+        print("no NVIDIA card to calibrate")
+        return 1
+    rc = 0
+    for i in ([index] if index is not None else range(n.value)):
+        try:
+            for m in gpu_calibrate.calibrate(i):
+                print(m)
+        except Exception as e:                          # noqa: BLE001
+            print(f"GPU {i}: calibration stopped ({e}); the defaults stay (85 % power, fans 70-82 %)")
+            rc = 1
+    return rc
+
+
 def add_parser(sub):
     p = sub.add_parser("gpu", help="the NVIDIA cards now: temperature, power, clocks; set a power limit")
     p.add_argument("what", nargs="?", default="status",
-                   choices=["status", "power", "watch", "setup", "remove", "hold", "bench"])
+                   choices=["status", "power", "watch", "setup", "remove", "hold", "bench", "calibrate"])
     p.add_argument("value", nargs="?", default=None,
-                   help="for power: 80%% (of the default), 130W or default; for hold: the ceiling (79); for bench: "
+                   help="calibrate: measures each card's power and fan settings for training (setup does it too); "
+                        "for power: 80%% (of the default), 130W or default; for hold: the ceiling (79); for bench: "
                         "127m (default), 11m, modern, check (every kernel against the reference) or cards")
     p.add_argument("--precision", default="auto", help="bench: auto (bf16), fp32, fp8, fp4, ...")
     p.add_argument("--steps", type=int, default=40, help="bench: training steps to time")
@@ -720,7 +799,11 @@ def _cmd(args):
         from . import gpu_helper
         for m in (gpu_helper.setup(args.value) if args.what == "setup" else gpu_helper.remove()):
             print(m)
+        if args.what == "setup" and os.environ.get("APSI_GPU_CALIBRATE", "1").strip().lower() not in ("0", "off", "no"):
+            _calibrate_all(args.gpu)                    # this card's own power and fan settings, measured once
         return 0
+    if args.what == "calibrate":
+        return _calibrate_all(args.gpu)
     if args.what == "hold":
         return hold(float(args.value or 79), args.gpu or 0)
     if args.what == "bench":

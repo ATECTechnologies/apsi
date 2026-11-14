@@ -14,7 +14,7 @@ import os
 import sys
 import time
 
-from . import __version__
+from . import __version__, __label__
 from .errors import ApsiError, CheckFailed
 
 PERMS = ("python", "ffi", "net", "fs", "env")
@@ -689,7 +689,8 @@ def cmd_serve(args):
 
 
 def cmd_version(args):
-    print(f"Apsi {__version__}")
+    from . import __label__
+    print(f"Apsi {__version__}" + (f" ({__label__})" if __label__ else ""))
     return 0
 
 
@@ -734,7 +735,7 @@ def _parser(light=False):
                "  apsi editors install     add Apsi to VS Code, Cursor, Windsurf, Sublime, Vim/Neovim, Notepad++\n"
                "  apsi convert app.py      translate Python (numpy, math, torch, …) into Apsi\n\n"
                "docs: docs/LANGUAGE.md — the complete language reference (chapter 24: every command)")
-    ap.add_argument("-V", "--version", action="version", version=f"Apsi {__version__}")
+    ap.add_argument("-V", "--version", action="version", version=f"Apsi {__version__}" + (f" ({__label__})" if __label__ else ""))
     sub = ap.add_subparsers(dest="cmd", metavar="COMMAND")
 
     def perm_flags(p):
