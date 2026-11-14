@@ -173,6 +173,9 @@ class _Null:
     def tick(self, sync=None):
         pass
 
+    def retarget(self, ceiling):
+        pass
+
     def status(self):
         return None
 

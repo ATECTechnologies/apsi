@@ -64,11 +64,35 @@ class _Ops:
         pass
     _db = None
 
+    def _bf_gemm(self, A, B, Cv, bias, M, N, K, sam, sak, sbk, sbn, ldc, alpha, beta, epi, X2, act, a_act, tmp):
+        return _bf_gemm_composite(self, A, B, Cv, bias, M, N, K, sam, sak, sbk, sbn, ldc, alpha, beta, epi, X2, act,
+                                  a_act, tmp)
+
+    def round16(self, view, n):
+        bf, o = view
+        bf.a[o:o + n] = _bf16(bf.a[o:o + n])
+
+    def n16(self, n):
+        """Buffer slots (float32-sized) for n bfloat16 values: half on the card, all of them in the Emulator (which
+        keeps bfloat16 values as rounded float32)."""
+        return n
+
     def gemm(self, A, B, Cv, M, N, K, sam, sak, sbk, sbn, ldc, alpha=1.0, beta=False, bias=None, batch=(1, 1),
-             sa=(0, 0), sb=(0, 0), sc=(0, 0), passes=1, epi=0, X2=None, act=0, a_act=None, tmp=None, db=None):
+             sa=(0, 0), sb=(0, 0), sc=(0, 0), passes=1, epi=0, X2=None, act=0, a_act=None, tmp=None, db=None, bf=False):
         """C = alpha A B (+ bias) (+ C), then epi: 1 X2 <- C, C <- act(C); 2 C <- C * act'(X2); 3 C <- C + X2.
-        A kernel that can do epi in its last step does (one pass over C); otherwise a second kernel does it."""
+        A kernel that can do epi in its last step does (one pass over C); otherwise a second kernel does it.
+        bf: the hidden layer of an MLP in bfloat16: epi 1 writes X2 and C in bfloat16; epi 2 and a_act read X2 / A
+        in bfloat16; epi 0 / 3 read A in bfloat16 (see Net: only where these kernels exist)."""
         nb1, nb2 = batch
+        if bf:
+            self._db = db
+            if not self._bf_gemm(A, B, Cv, bias, M, N, K, sam, sak, sbk, sbn, ldc, alpha, beta, epi, X2, act, a_act,
+                                 tmp):
+                raise TrainError("the bfloat16 hidden layer has no kernel for this product (APSI_BF16_HIDDEN=0)")
+            if self._db is not None:
+                self._db = None
+                self.colsum(B, None, None, None, None, db, K, N, 0)
+            return
         if db is not None:                               # + the column sums of B (dy) into db: the bias gradient
             self._db = db
             self.gemm(A, B, Cv, M, N, K, sam, sak, sbk, sbn, ldc, alpha, beta, bias, batch, sa, sb, sc, passes, epi,
@@ -99,6 +123,25 @@ class _Ops:
         else:
             self._gemm(*args)
             self.axpy(Cv, X2, n)
+
+
+def _bf_gemm_composite(ops, A, B, Cv, bias, M, N, K, sam, sak, sbk, sbn, ldc, alpha, beta, epi, X2, act, a_act, tmp):
+    """The bfloat16 hidden layer on the Emulator: the same products, then the values the card stores in bfloat16
+    rounded to bfloat16 (pre-activation first, the activation of the rounded value, then the activation itself)."""
+    if epi == 1:
+        ops.gemm(A, B, X2, M, N, K, sam, sak, sbk, sbn, ldc, alpha, beta, bias)
+        ops.round16(X2, M * N)
+        ops.act_f(X2, Cv, M * N, act)
+        ops.round16(Cv, M * N)
+    else:
+        ops.gemm(A, B, Cv, M, N, K, sam, sak, sbk, sbn, ldc, alpha, beta, bias, epi=epi, X2=X2, act=act,
+                 a_act=a_act, tmp=tmp)
+    return True
+
+
+def _bf16_hidden():
+    """APSI_BF16_HIDDEN=0 keeps the hidden layer of an MLP in float32 (the default in bf16 training: bfloat16)."""
+    return os.environ.get("APSI_BF16_HIDDEN", "1").strip().lower() not in ("0", "false", "no", "off")
 
 
 def _guard():
@@ -776,7 +819,7 @@ class Gpu(_Ops):
             try:                                         # shared-memory tiles: the fast products
                 tmod, self.fn["gemm_tkn"] = dev.load("apsi-train-tiled-1", KS.ptx("tiled"))
                 for name in KS.TILED[1:] + tuple(e[0] for e in KS.EPI_KERNELS) + \
-                        tuple(f"gemm_tmn_aa{j}" for j in KS.EPI_ACTS) + ("bf_lo", "to_bf16"):
+                        tuple(f"gemm_tmn_aa{j}" for j in KS.EPI_ACTS) + KS.BF16_KERNELS + ("bf_lo", "to_bf16"):
                     f = ctypes.c_void_p()
                     dev.drv.check(lib.cuModuleGetFunction(ctypes.byref(f), tmod, name.encode()), "cuModuleGetFunction")
                     self.fn[name] = f
@@ -794,7 +837,8 @@ class Gpu(_Ops):
                     xmod, first = dev.load(f"apsi-train-tiled-{tag}", KS.ptx(which))
                     xf = {f"gemm_tkn#{tag}": first}
                     for name in KS.TILED[1:] + tuple(e[0] for e in KS.EPI_KERNELS) + \
-                            (tuple(f"gemm_tmn_aa{j}" for j in KS.EPI_ACTS) if tag not in ("h", "v", "d", "e") else ()):
+                            ((tuple(f"gemm_tmn_aa{j}" for j in KS.EPI_ACTS) + KS.BF16_KERNELS)
+                             if tag not in ("h", "v", "d", "e") else ()):
                         f = ctypes.c_void_p()
                         dev.drv.check(lib.cuModuleGetFunction(ctypes.byref(f), xmod, name.encode()),
                                       "cuModuleGetFunction")
@@ -1478,6 +1522,20 @@ class Gpu(_Ops):
             bf = self._scr[key] = self.alloc(n)
         return (bf, 0)
 
+    def n16(self, n):
+        return (int(n) + 1) // 2
+
+    def round16(self, view, n):
+        raise TrainError("round16 is the Emulator's (the card's kernels write bfloat16 themselves)")
+
+    def _bf_gemm(self, A, B, Cv, bias, M, N, K, sam, sak, sbk, sbn, ldc, alpha, beta, epi, X2, act, a_act, tmp):
+        return self._gemm(A, B, Cv, bias, M, N, K, sam, sak, sbk, sbn, ldc, 1, 1, (0, 0), (0, 0), (0, 0), alpha, beta,
+                          1, epi=epi, X2=X2, act=act, a_act=a_act, bf=True)
+
+    def bf16_hidden_ok(self):
+        """The card can keep an MLP's hidden layer in bfloat16 (tiled tensor-core products and their bf builds)."""
+        return bool(self.tiled and self.tc and all(k in self.fn for k in KS.BF16_KERNELS))
+
     def _gemm3(self, A, B, Cv, bias, M, N, K, sam, sak, sbk, sbn, ldc, sa, sb, sc, alpha, beta, epi, X2, act):
         """float32 products on the shared-memory tensor-core kernels: hi(A) hi(B) + lo(A) hi(B) + hi(A) lo(B)."""
         dense_a = (sak == 1 and sam == K) or (sam == 1 and sak == M)
@@ -1498,7 +1556,31 @@ class Gpu(_Ops):
         return self._gemm(A, lo_b, Cv, None, *common, True, 1, epi=epi, X2=X2, act=act)
 
     def _gemm(self, A, B, Cv, bias, M, N, K, sam, sak, sbk, sbn, ldc, nb1, nb2, sa, sb, sc, alpha, beta, passes,
-              epi=0, X2=None, act=0, a_act=None):
+              epi=0, X2=None, act=0, a_act=None, bf=False):
+        if bf:                                           # the bfloat16 hidden layer: its own builds, nothing else
+            name = self._tiled_ok(A, B, M, N, K, sam, sak, sbk, sbn, sa, sb) if self.tiled else None
+            want = (f"gemm_tmn_aa{a_act}_bf" if (a_act is not None and name == "gemm_tmn") else
+                    f"gemm_tkn_e1a{act}_bf" if (epi == 1 and name == "gemm_tkn") else
+                    f"gemm_tkk_e2a{act}_bf" if (epi == 2 and name == "gemm_tkk") else
+                    "gemm_tkn_e3_bf" if (epi == 3 and name == "gemm_tkn") else
+                    "gemm_tkn_bf" if (epi == 0 and a_act is None and name == "gemm_tkn") else None)
+            if want is None or want not in self.fn or (epi and ldc != N):
+                return False
+            tiles = ((M + KS.BM - 1) // KS.BM) * ((N + KS.BN - 1) // KS.BN)
+            db = self._db if want.startswith("gemm_tmn") and sbn == 1 else None
+            args = [self.p(A), self.p(B), self.p(Cv), self.p(bias), ("u", M),
+                    ("u", N), ("u", K), ("u", sam), ("u", sak), ("u", sbk), ("u", sbn), ("u", ldc), ("u", 1),
+                    ("u", 0), ("u", 0), ("u", 0), ("u", 0), ("u", 0), ("u", 0),
+                    ("f", alpha), ("u", 1 if beta else 0), ("u", 1 if bias is not None else 0), ("u", K),
+                    self.p(X2), ("u", epi), ("u", act), self.p(db), ("u", 1 if db is not None else 0), self._cnt()]
+            grid = (tiles, 1, 1)
+            use = self._variant(want, grid, args, M, N, ldc, 1)
+            if use.endswith(("#h", "#v", "#d", "#e")):     # (those builds convert both operands: not for bf)
+                use = want
+            self._go(use, grid, self._threads(use), *args)
+            if db is not None:
+                self._db = None
+            return True
         if passes == 3 and self.tiled and a_act is None and nb1 * nb2 == 1 and \
                 os.environ.get("APSI_FP32_TILED", "0").strip() in ("1", "true", "yes") and \
                 self._gemm3(A, B, Cv, bias, M, N, K, sam, sak, sbk, sbn, ldc, sa, sb, sc, alpha, beta, epi, X2, act):
@@ -1735,6 +1817,8 @@ class _Linear(_Node):
     act = None                                          # set when an activation follows (fused into this product)
     share_out = False                                   # act(h) is only read by the next product: not kept
     x_pre = None                                        # the layer before keeps h instead of my input act(h)
+    bf = False                                          # my h and act(h) in bfloat16 (an MLP's hidden layer)
+    bf_in = False                                       # my input is that bfloat16 act(h)
 
     @property
     def takes_residual(self):
@@ -1743,14 +1827,21 @@ class _Linear(_Node):
     def fwd(self, x, shape, residual=None):
         o, M = self.net.ops, _rows(shape)
         self.x, self.M = x, M
+        if self.bf:                                     # h and act(h) in bfloat16
+            y = self.net.arena.get(("shared", "act16"), o.n16(M * self.N))
+            self.h = self.buf("h16", o.n16(M * self.N))
+            o.gemm(x, self.W.w, y, M, self.N, self.K, self.K, 1, self.N, 1, self.N,
+                   bias=self.b.w if self.b else None, passes=self.net.passes, epi=1, X2=self.h, act=self.act, bf=True)
+            return y, shape[:-1] + (self.N,)
         y = self.net.arena.get(("shared", "act"), M * self.N) if self.share_out else self.buf("y", M * self.N)
         if self.act is not None:                        # y = act(x W + b), the pre-activation kept for backward
             self.h = self.buf("h", M * self.N)
             o.gemm(x, self.W.w, y, M, self.N, self.K, self.K, 1, self.N, 1, self.N,
                    bias=self.b.w if self.b else None, passes=self.net.passes, epi=1, X2=self.h, act=self.act)
-        else:                                           # y = x W + b (+ the residual input)
+        else:                                           # y = x W + b (+ the residual input); x in bfloat16 if bf_in
             o.gemm(x, self.W.w, y, M, self.N, self.K, self.K, 1, self.N, 1, self.N,
-                   bias=self.b.w if self.b else None, passes=self.net.passes, epi=3 if residual else 0, X2=residual)
+                   bias=self.b.w if self.b else None, passes=self.net.passes, epi=3 if residual else 0, X2=residual,
+                   bf=self.bf_in)
         return y, shape[:-1] + (self.N,)
 
     def bwd(self, dy, need_dx=True, into_act=None):
@@ -1769,7 +1860,7 @@ class _Linear(_Node):
             if self.x_pre is not None:                  # x = act(h): applied while the product reads h
                 pre = self.x_pre
                 o.gemm(pre.h, dy, self.W.g, K, N, M, 1, K, N, 1, N, beta=True, passes=self.net.passes, a_act=pre.act,
-                       tmp=(self.net.arena.get(("shared", "act"), M * K), M * K), db=db)
+                       tmp=(self.net.arena.get(("shared", "act"), M * K), M * K), db=db, bf=pre.bf)
             else:
                 o.gemm(self.x, dy, self.W.g, K, N, M, 1, K, N, 1, N, beta=True, passes=self.net.passes, db=db)
         finally:
@@ -1780,7 +1871,7 @@ class _Linear(_Node):
         dx = self.gbuf("dx", M * K)
         if into_act is not None:
             o.gemm(dy, self.W.w, dx, M, K, N, N, 1, 1, N, K, passes=self.net.passes, epi=2, X2=into_act[1],
-                   act=into_act[0])
+                   act=into_act[0], bf=into_act[2] if len(into_act) > 2 else False)
         else:
             o.gemm(dy, self.W.w, dx, M, K, N, N, 1, 1, N, K, passes=self.net.passes)       # dy W^T
         if side:
@@ -1923,7 +2014,7 @@ class _Seq(_Node):
         for i in range(len(self.nodes) - 1, -1, -1):
             nd, before = self.nodes[i], (self.nodes[i - 1] if i > 0 else None)
             if isinstance(nd, _Linear) and isinstance(before, _Linear) and before.act is not None:
-                dy = nd.bwd(dy, True, into_act=(before.act, before.h))      # the activation's backward fused in
+                dy = nd.bwd(dy, True, into_act=(before.act, before.h, before.bf))   # the activation's backward
                 before.dh_given = True
             else:
                 dy = nd.bwd(dy, need_dx or i > 0)
@@ -4659,6 +4750,12 @@ class Net:
                 if isinstance(a_, _Linear) and a_.act is not None and isinstance(b_, _Linear) and \
                         b_.act is None and type(b_) is _Linear:
                     a_.share_out, b_.x_pre = True, a_
+                    # the hidden layer in bfloat16 (h kept, act(h) passed on): half the bytes of the widest tensors
+                    # of a transformer, written once and read by the products on both sides
+                    if self.passes == 1 and not self.kind and _bf16_hidden() and \
+                            getattr(self.ops, "bf16_hidden_ok", lambda: True)() and \
+                            a_.N % 4 == 0 and a_.K % 4 == 0 and b_.N % 4 == 0:
+                        a_.bf = b_.bf_in = True
             return _Seq(self, key, nodes)
         if isinstance(layer, L.Linear):
             return _Linear(self, key, layer, p)
