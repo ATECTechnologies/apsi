@@ -197,7 +197,7 @@ class PowerLimitControl(unittest.TestCase):
             temps, watts, g = self.run_card(tau, amb)
             full = [t for c, t in temps if 90 < c < 150 or c > 230]
             self.assertLess(max(t for c, t in temps), 80.0, (tau, amb))
-            self.assertGreaterEqual(min(full), 78.0, (tau, amb))
+            self.assertGreaterEqual(min(full), 77.0, (tau, amb))    # (changes gathered: 1 W, 1 s apart)
             self.assertEqual(g.paced, 0.0)
             # as much power as 78.5 C allows (the steady state of this card: amb + 0.335 P = 78.5)
             steady = (78.5 - amb) / 0.335
@@ -358,3 +358,13 @@ class Calibrate(unittest.TestCase):
             self.assertEqual(gc.load_profile("0:RTX")["fan_max"], 84)
             self.assertIsNone(gc.load_profile("1:other"))
             self.assertEqual(thermal._fan_range(gc.load_profile("0:RTX")), (70.0, 84.0))
+
+
+class CalibrateNoFans(Calibrate):
+    def test_driver_fans_only(self):
+        gc, st, args = self._card(33.0, 0.42, 0.26)
+        args["set_fan"] = lambda f: f is None                        # the driver refuses every speed
+        prof = gc.measure(**args)
+        self.assertIs(prof["fans"], False)
+        self.assertLess(prof["power_w"], 170.0)
+        self.assertFalse(st["load"])

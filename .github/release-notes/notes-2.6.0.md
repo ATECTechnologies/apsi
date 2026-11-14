@@ -47,6 +47,16 @@ identical weights; steps and resume bit for bit; the NaN guard).
   saved in `~/.apsi/gpu-profile.json` and used by every run. Without a measurement: 85 % of the default power, fans
   70–82 %. Safety: the trial power drops 10 % at the ceiling + 1, the load stops at the ceiling + 3, and the card's
   own fan curve and power limit come back at the end.
+- **Fans on GeForce cards under Windows:** where NVML refuses to set fan speeds, Apsi uses the driver's NvAPI fan
+  control (the interface the vendors' tuning tools use); a probe at the start says which, and the training report's
+  `control` line says what holds the temperature. The calibration restarts a phase whose trial power had to come
+  down (one constant power per fitted curve) and measures on the driver's fan curve when the fans cannot be set.
+- **The bfloat16 hidden layer's products on the fastest builds:** three of its four products (no activation on the
+  way in) may now run on the cp.async builds, reading the hidden layer and the weights' bfloat16 copies directly;
+  every faster build the card picks is first checked against the base build on the same inputs and never used if
+  it differs (`APSI_GEMM_VERIFY=0` skips the check).
+- **Fewer stalls from the power limit:** when it holds the temperature, changes are at least 1 W and 1 s apart
+  (each change makes the driver re-plan the clocks).
 - **No idle gaps on Windows:** WDDM gathers launches into batches; every 32 launches a non-blocking stream query now
   hands them to the card at once (`APSI_GPU_FLUSH=N`, 0 = off).
 - **bfloat16 twins instead of a conversion per product:** a layer norm writes its output's bfloat16 twin in the same

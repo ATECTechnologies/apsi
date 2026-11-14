@@ -111,40 +111,55 @@ def plan(idle, settled_hi, watts_hi, settled_lo, watts_lo, top_w, own_w, ceiling
 
 def measure(read_temp, read_power, set_power, set_fan, start_load, stop_load, top_w, own_w, ceiling=79.0,
             fan_lo=70.0, fan_hi=82.0, phase_s=70.0, sleep=time.sleep, now=time.monotonic, say=print):
-    """The two phases on the card (or a simulated one in the tests); returns plan(...)."""
+    """The two phases on the card (or a simulated one in the tests); returns plan(...). A phase whose trial power
+    had to come down starts its curve again at the new power (the fit needs one constant power). When the fans
+    cannot be set, one phase on the driver's own fan curve: the profile then holds only the power."""
     trial = min(float(top_w), max(float(own_w), 0.85 * float(top_w)))
     idle = read_temp()
     say(f"  idle {idle:.0f} C; load at {trial:.0f} W")
     set_power(trial)
+    fans_ok = set_fan(fan_hi) is not False
+    if not fans_ok:
+        say("  the fans cannot be set on this card/driver: measuring on the driver's own fan curve")
     start_load()
     out = []
     try:
-        for fan in (fan_hi, fan_lo):
-            set_fan(fan)
+        for fan in ((fan_hi, fan_lo) if fans_ok else (None,)):
+            if fan is not None and set_fan(fan) is False:
+                raise RuntimeError("the fans stopped taking their speed")
             ts, temps, ws = [], [], []
             t0 = now()
-            while now() - t0 < phase_s:
+            deadline = t0 + 2.5 * phase_s
+            while now() - t0 < phase_s and now() < deadline:
                 t = read_temp()
                 w = read_power()
-                ts.append(now())
-                temps.append(t)
-                if w:
-                    ws.append(w)
                 if t >= ceiling + 3.0:
                     raise RuntimeError(f"the card reached {t:.0f} C even with the safety cuts: calibration stopped")
                 if t >= ceiling + 1.0:
                     trial *= 0.9
                     set_power(trial)
                     say(f"  {t:.0f} C: trial power down to {trial:.0f} W")
+                    ts, temps, ws, t0 = [], [], [], now()     # a new curve at the new power
+                else:
+                    ts.append(now())
+                    temps.append(t)
+                    if w:
+                        ws.append(w)
                 sleep(0.5)
             settled, tau = fit(ts, temps)
             watts = sum(ws[len(ws) // 2:]) / max(1, len(ws) - len(ws) // 2) if ws else trial
-            say(f"  fans {fan:.0f} %: settles at {settled:.1f} C ({watts:.0f} W" +
-                (f", time constant {tau:.0f} s)" if tau else ")"))
+            say(f"  fans {'driver curve' if fan is None else f'{fan:.0f} %'}: settles at {settled:.1f} C "
+                f"({watts:.0f} W" + (f", time constant {tau:.0f} s)" if tau else ")"))
             out.append((settled, watts))
     finally:
         stop_load()
         set_fan(None)
+    if not fans_ok:
+        s_, w_ = out[0]
+        r = max(1e-3, (s_ - idle) / max(1.0, w_))
+        watts = max(0.55 * float(top_w), min(float(top_w), 0.97 * (ceiling - 1.5 - idle) / r))
+        return {"power_w": round(watts, 1), "fans": False, "c_per_w": round(r, 4), "idle_c": round(idle, 1),
+                "ceiling_c": ceiling}
     (s_hi, w_hi), (s_lo, w_lo) = out
     return plan(idle, s_hi, w_hi, s_lo, w_lo, top_w, own_w, ceiling, fan_lo, fan_hi)
 
@@ -184,8 +199,8 @@ def calibrate(index=0, ceiling=None, say=print):
     if pc is None:
         return [f"GPU {index}: the power limit cannot be set from here (administrator, or apsi gpu setup first)"]
     fc = thermal._FanControl.try_make(lib, h, index, getattr(pc, "via", "") == "directly")
-    if fc is None:
-        return [f"GPU {index}: the fans cannot be set (the driver refused): the power limit holds the temperature"]
+    if fc is None:                                  # (APSI_GPU_FAN=0, or no way to set fans): measured without
+        fc = type("NoFans", (), {"_set": staticmethod(lambda pct: False if pct is not None else True)})()
     ops, why = gpu_train.device(f"cuda:{index}")
     if ops is None:
         return [f"GPU {index}: {why}"]
@@ -202,11 +217,15 @@ def calibrate(index=0, ceiling=None, say=print):
     start, stop = _load(ops)
     say(f"GPU {index} {name}: calibrating (about 2.5 minutes at full load; the fans will be loud for a while)")
     try:
-        prof = measure(temp, watts, lambda w: pc.set(int(w * 1000)), fc._set, start, stop, pc.top / 1000.0,
+        prof = measure(temp, watts, lambda w: pc.set(int(w * 1000)), lambda f: bool(fc._set(f)), start, stop,
+                       pc.top / 1000.0,
                        pc.orig / 1000.0, ceiling, say=say)
     finally:
         pc.restore()
-    prof.update(name=name, measured=time.strftime("%Y-%m-%d"))
+    prof.update(name=name, measured=time.strftime("%Y-%m-%d"), v=2)
     save_profile(card_key(name, index), prof)
+    if prof.get("fans") is False:
+        return [f"GPU {index} {name}: the fans cannot be set here; about {prof['power_w']:.0f} W holds "
+                f"{ceiling - 1.5:.1f} C on the driver's fan curve (saved; the power limit holds the temperature)"]
     return [f"GPU {index} {name}: trains at {prof['power_w']:.0f} W, fans {prof['fan_min']}-{prof['fan_max']} %, "
             f"held at {ceiling - 0.5:.1f} C (saved; apsi gpu calibrate again after changing the cooling)"]
