@@ -69,8 +69,13 @@ class Governor:
     PERIOD = 0.5                       # seconds between temperature readings and adjustments
 
     def __init__(self, read_temp, target):
-        self.ceiling = float(target)
-        self.read_temp, self.target = read_temp, self.ceiling - 0.5
+        self.read_temp = read_temp
+        self.retarget(target)
+
+    def retarget(self, ceiling):
+        """A new ceiling (APSI_GPU_TEMP read again by the next run): steered to ceiling - 0.5, band [-1, 0]."""
+        self.ceiling = float(ceiling)
+        self.target = self.ceiling - 0.5
         self.low, self.high = self.ceiling - 1.0, self.ceiling
         self.fraction = 0.0            # of each piece of work, how much to wait after it (0 = full speed)
         self.integral = 0.0
@@ -190,8 +195,7 @@ def governor(dev):
     with _lock:
         g = _govs.get(key)
         if g is not None:
-            g.target = target
-            g.low, g.high = target - 2.0, target + 1.0
+            g.retarget(target)                      # the same steering as a new governor (78.5, band 78-79)
             return g
         lib = _load_nvml()
         if lib is None:
@@ -305,7 +309,7 @@ def cpu_governor():
             read = _cpu_reader()
             g = _govs["cpu"] = Governor(read, target) if read is not None else NULL
         elif g is not NULL:
-            g.target, g.low, g.high = target, target - 2.0, target + 1.0
+            g.retarget(target)
         return g
 
 
