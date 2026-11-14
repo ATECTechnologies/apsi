@@ -109,6 +109,9 @@ class Governor:
         err = self.smooth - self.target
         e = 0.0 if abs(err) < 0.25 else err - (0.25 if err > 0 else -0.25)
         self.last_read = now
+        fan = getattr(self, "fan", None)
+        if fan is not None:
+            fan.step(self.smooth, getattr(self, "ceiling", self.target + 0.5))
         power = getattr(self, "power", None)
         draw = None
         if power is not None and getattr(self, "read_power", None):
@@ -223,6 +226,8 @@ def governor(dev):
         g.power_note = _power_limit(lib, h)
         if g.power_note is None:
             g.power = _PowerControl.try_make(lib, h, key)  # steer the power limit, not pauses (when allowed)
+            if g.power is not None:                     # faster fans first, with the same rights
+                g.fan = _FanControl.try_make(lib, h, key, getattr(g.power, "via", "") == "directly")
             if g.power is not None:
                 g.power_note = f"temperature held by the power limit, {g.power.via} (no pauses)"
         return g
@@ -400,6 +405,57 @@ class _PowerControl:
             self.applied = new
         self.limit = new
         return new <= self.floor + 1.0                 # at the floor: pauses may still be needed
+
+
+class _FanControl:
+    """Faster fans before less power: while the card is near its ceiling, its fans are run harder than the driver's
+    quiet curve (up to APSI_GPU_FAN_MAX, default 85 %), so the cooler takes away more heat and the card keeps more of
+    its power at the same temperature. Back to the driver's own curve below the ceiling - 8 and at exit. Needs the
+    same rights as the power limit (administrator, or the GPU helper); APSI_GPU_FAN=0 leaves the fans alone."""
+
+    @staticmethod
+    def try_make(lib, h, index, direct):
+        if os.environ.get("APSI_GPU_FAN", "1").strip().lower() in ("0", "off", "no", "false"):
+            return None
+        try:
+            top = int(os.environ.get("APSI_GPU_FAN_MAX", "85"))
+        except ValueError:
+            top = 85
+        fc = _FanControl()
+        fc.top, fc.percent = max(40, min(100, top)), None
+        if direct:
+            if not hasattr(lib, "nvmlDeviceSetFanSpeed_v2"):
+                return None
+            from . import gpu_helper
+            fc._set = lambda pct: gpu_helper._fan(lib, h, pct).get("ok")
+        else:
+            from . import gpu_helper
+            fc._set = lambda pct: bool((gpu_helper.call("fan_auto" if pct is None else "fan", gpu=index,
+                                                        percent=pct) or {}).get("ok"))
+        import atexit
+        atexit.register(fc.auto)
+        return fc
+
+    def want(self, smooth, ceiling):
+        """The fan speed for a smoothed temperature: the driver's curve below ceiling - 8, then rising to the top
+        at ceiling - 2 (it is already there when the power limit starts to work)."""
+        if smooth is None or smooth < ceiling - 8.0:
+            return None
+        return int(min(self.top, 50 + (self.top - 50) * (smooth - (ceiling - 8.0)) / 6.0))
+
+    def step(self, smooth, ceiling):
+        pct = self.want(smooth, ceiling)
+        if pct == self.percent or (pct is not None and self.percent is not None and abs(pct - self.percent) < 5):
+            return
+        if self._set(pct):
+            self.percent = pct
+        else:
+            self.step = lambda *a: None                # refused once: leave the fans alone from now on
+
+    def auto(self):
+        if self.percent is not None:
+            self._set(None)
+            self.percent = None
 
 
 def _power_state_file(index):
