@@ -338,7 +338,7 @@ def gemm(out=sys.stdout, reps=20):
     bad = 0
     for label, M, N, K, akc, bnc in GEMM_SHAPES:
         a = rng.standard_normal((M, K)).astype(np.float32)
-        bm = rng.standard_normal((K, N)).astype(np.float32) / np.sqrt(K)
+        bm = (rng.standard_normal((K, N)) / np.sqrt(K)).astype(np.float32)
 
         def bf(x):
             u = x.view(np.uint32).astype(np.uint64)
@@ -350,6 +350,11 @@ def gemm(out=sys.stdout, reps=20):
         ops.put(B, (bm if bnc else np.ascontiguousarray(bm.T)).reshape(-1))
         sam, sak = (K, 1) if akc else (1, M)
         sbk, sbn = (N, 1) if bnc else (1, K)
+        # as in training: B is a weight (its bfloat16 copy made once), A has its bfloat16 twin (made by the layer
+        # that wrote it), so the cp.async builds are timed without a conversion pass of their own
+        ops.weights_are(B, K * N)
+        A16 = ops.alloc((M * K + 1) // 2)
+        ops.make_twin((A, 0), M * K, (A16, 0))
         cells = []
         for b in builds:
             os.environ["APSI_GEMM_VARIANT"] = b
@@ -369,10 +374,15 @@ def gemm(out=sys.stdout, reps=20):
                 cells.append(f"{tf:5.1f}{'' if ok else ' WRONG'} {err:.0e}"[:13])
             except Exception as e:                        # noqa: BLE001
                 cells.append(f"{type(e).__name__}"[:13])
+                if not getattr(gemm, "_told", False):
+                    import traceback
+                    gemm._told = True
+                    traceback.print_exc(file=out)
             finally:
                 os.environ.pop("APSI_GEMM_VARIANT", None)
                 ops._choice.clear()
-        for x in (A, B, Cb):
+        ops.weights_are(None, 0)
+        for x in (A, B, Cb, A16):
             ops.free(x)
         print(f"  {label:<30}" + "".join(f"{c:>14}" for c in cells), file=out, flush=True)
     print(f"\n{'every build gives the exact product to bfloat16 precision' if not bad else f'{bad} WRONG results'}"

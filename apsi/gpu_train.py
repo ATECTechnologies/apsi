@@ -141,8 +141,9 @@ def _bf_gemm_composite(ops, A, B, Cv, bias, M, N, K, sam, sak, sbk, sbn, ldc, al
 
 
 def _bf16_hidden():
-    """APSI_BF16_HIDDEN=0 keeps the hidden layer of an MLP in float32 (the default in bf16 training: bfloat16)."""
-    return os.environ.get("APSI_BF16_HIDDEN", "1").strip().lower() not in ("0", "false", "no", "off")
+    """APSI_BF16_HIDDEN=1 keeps the hidden layer of an MLP in bfloat16. Off by default: on the RTX 3060 check it
+    did not give the same weights twice (exact training), so it stays opt-in until it does."""
+    return os.environ.get("APSI_BF16_HIDDEN", "0").strip().lower() not in ("0", "false", "no", "off")
 
 
 def _guard():
@@ -905,7 +906,8 @@ class Gpu(_Ops):
         # products are independent, and side by side they fill the card where one alone leaves it partly idle
         # (few output tiles: 1024 x 1024 weights). Non-blocking, so the default stream does not wait for it by itself.
         self.cur, self.side = None, None
-        if os.environ.get("APSI_GPU_STREAMS", "1").strip().lower() not in ("0", "off", "no", "false"):
+        # off by default: with it on, the RTX 3060 check of three models (cnn, graph transformer, gla) differed
+        if os.environ.get("APSI_GPU_STREAMS", "0").strip().lower() not in ("0", "off", "no", "false"):
             try:
                 s2 = ctypes.c_void_p()
                 lib.cuStreamCreate.argtypes = [ctypes.POINTER(ctypes.c_void_p), ctypes.c_uint]
