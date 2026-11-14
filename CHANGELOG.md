@@ -25,6 +25,9 @@
   bfloat16 by the product that makes them and read in bfloat16 by the four products that use them, so the widest
   tensors of a transformer (4 × d per token) move half the bytes and take half the memory; the training follows the
   float32 one to 0.1 % (tests). `APSI_BF16_HIDDEN=0` keeps them in float32.
+- **The held-out loss is computed on the card:** each batch's logits stay there and the loss kernel adds the mean
+  into one number (before: every batch's logits were copied back and the softmax taken in float64 on the processor,
+  hundreds of MB and seconds per evaluation with the card idle).
 - **Fans before power:** near the ceiling the card's fans run harder (up to 85 %, `APSI_GPU_FAN_MAX`) before the power
   limit is lowered, so the card keeps more power at the same temperature; the driver's own curve comes back below it
   and at the end (`APSI_GPU_FAN=0` leaves the fans alone).
