@@ -21,6 +21,14 @@
   updates smaller than float32's step; in bf16 the products round every gradient far more coarsely, so it only cost
   memory and time: 0.5 GB less on the card for the 127 M GPT, and a lighter optimizer step. `compensated=true` or
   `APSI_GPU_COMPENSATED=1` turns it on.
+- **The card is held at 78–79 °C, never 80** (`APSI_GPU_TEMP` is now a ceiling, default 79, instead of a 77 °C
+  target with a 75–78 band): the card gets all the power that temperature allows. The power limit looks ahead along
+  the temperature's slope, cuts fast and gives back slowly, cuts 6 % at once at the ceiling and does not wind up
+  during light phases, so sudden changes of load no longer overshoot.
+- **A killed run no longer leaves the card slow:** the card's own power limit is recorded before the first change and
+  restored by the next run (a run closed with its window used to leave the lowered limit for good).
+- **Weight and input gradients side by side:** each linear layer's x^T dy runs on a second stream beside its
+  dy W^T (`APSI_GPU_STREAMS=0` turns it off).
 - `APSI_SPLITK=off|2|4|auto` fixes how the weight-gradient products split their long k (for tuning a card);
   `tools/tune_gpu.bat` measures every setting on this card.
 

@@ -29,12 +29,12 @@ and the driver compiles them for whatever card is present.
 | [1. Language models](#1-language-models-use-hub) | running Hugging Face models on the card, weight formats, tensor cores, threads |
 | [2. Training](#2-training-on-the-gpu-with-apsi-alone-backendgpu) | layers, precisions, measured speed against PyTorch, several cards, model size |
 | [3. Serving](#3-serving-the-openai-api) | the OpenAI API in front of a model, queues, metrics |
-| [4. Temperature control](#4-temperature-control) | the 77 °C control, the power limit, the GPU Tuner, `apsi gpu hold` |
+| [4. Temperature control](#4-temperature-control) | the 79 °C ceiling, the power limit, the GPU Tuner, `apsi gpu hold` |
 | [5. Images, video, your own kernels](#5-images-video-and-your-own-kernels-gpu) | `@gpu` functions |
 | [6. Troubleshooting](#6-troubleshooting) | slow training, out of memory, the card not found, and more |
 
 > **Important — for the full, steady speed of long training, give Apsi the right to set the card's power limit.**
-> Without it, the only way Apsi can keep a hot card at 77 °C is to *pause* the work, and a card that needs cooling
+> Without it, the only way Apsi can keep a hot card under its ceiling is to *pause* the work, and a card that needs cooling
 > then loses a large share of its speed (measured on an RTX 3060: a 127 M-parameter model trained at 10,332 tokens/s
 > with pauses, **18,074 tokens/s** with the power limit, at the same temperature). Do one of these:
 >
@@ -236,7 +236,7 @@ with the whole batch (tested: Adam, AdamW, SGD, clip over the whole model, EMA, 
 `r.stages`, `r.replicas` and `r.micro_batches` show what was used. A single layer must fit on one card (a layer is not
 split inside itself yet), and the layers are those of the trainer (the table above).
 
-**Any program at your temperature** — `apsi gpu hold 77` keeps the card near 77 °C by its power limit for whatever
+**Any program at your temperature** — `apsi gpu hold 79` keeps the card at 79 °C at most by its power limit for whatever
 runs on it (a PyTorch job, a renderer) until Ctrl+C, with the same control Apsi's training uses; the benchmark uses
 it so PyTorch and Apsi are measured under the same temperature.
 
@@ -286,7 +286,7 @@ GPU memory stayed flat during the soak (0.5B: 10,225 → 10,221 MB free) and the
 
 ## 4. Temperature control
 
-Long work — training, long answers, a busy server — keeps the card near **77 °C (75–78 °C)** instead of letting it
+Long work — training, long answers, a busy server — keeps the card at **78–79 °C, never 80** (a ceiling of 79 °C) instead of letting it
 run up to its own limit (often 83–90 °C on desktop cards). Apsi reads the temperature from the driver's management
 library (NVML, installed with the driver) twice a second; above the band it paces the work (after each training
 step or generated token it waits a fraction of the time that step took, so the card does less per second and
@@ -298,8 +298,16 @@ the speed stay level, and a card that stays cool is never slowed.
 
 | Setting | |
 |---|---|
-| `APSI_GPU_TEMP=77` | the target in °C (default 77 → band 75–78); any value from 50 to 95 |
+| `APSI_GPU_TEMP=79` | the ceiling in °C (default 79: held at 78–79); any value from 50 to 95 |
 | `APSI_GPU_TEMP=off` | no control (the card's own limits only) |
+
+**How the power limit is steered.** The controller looks 4 s ahead along the temperature's slope, so a card that
+starts heating quickly (a heavy phase after a light one) gets less power before it reaches the ceiling, not after;
+it cuts fast and gives back slowly (at most 2 W a second), so the limit does not swing; a reading at the ceiling
+cuts 6 % at once; and while the card draws less than its limit (evaluation, a light phase) the limit is not raised
+past what it draws, so the next heavy phase does not start from an unused high limit. In a simulated card (slow
+and fast coolers, rooms from 26 to 38 °C, a light phase and back) it never reads 80 and holds 78–79 under full load
+with at least 97 % of the power that temperature allows (tests/test_thermal.py).
 
 **Steady speed: the power limit instead of pauses (administrator).** When Apsi runs as an administrator (Windows)
 or root (Linux), it holds the temperature by moving the card's power limit (between 55 % and 100 % of the default)
@@ -330,7 +338,7 @@ every card back to its factory default. Windows asks once for administrator righ
 | Data center (H100, H200, B200, A100, L40S, L4, T4…) | unchanged | built and cooled for full sustained power |
 | Laptop GPUs | unchanged | the laptop manages the limit |
 
-With Apsi installed, *Apply* also runs `apsi gpu setup`, so Apsi fine-tunes the limit around 77 °C while it trains.
+With Apsi installed, *Apply* also runs `apsi gpu setup`, so Apsi fine-tunes the limit to stay at 78–79 °C while it trains.
 
 **Once per start of the computer: `apsi gpu power 80%`.** Run it once from a terminal opened as administrator (or
 with sudo): the card keeps that limit for every program until the computer or the driver restarts, so Apsi (and
@@ -408,7 +416,7 @@ next to the GPU line means the attention kernel could not be built (a bug: repor
 still works, more slowly, on separate kernels. A card held at a lower power limit (the GPU Tuner's 80 %) trades about
 5 % of speed for 6–10 °C; `Apsi-GPU-Tuner-Restore` puts the default back.
 
-**The card is hot or loud.** Temperature control is on by default (77 °C). Lower it with `APSI_GPU_TEMP=72`; check the
+**The card is hot or loud.** Temperature control is on by default (at most 79 °C). Lower it with `APSI_GPU_TEMP=72`; check the
 case airflow and fan curve. If the card still reaches 85 °C+, the control may be off (`APSI_GPU_TEMP=off`) or NVML
 missing (`r.gpu_temperature` is `none`).
 
