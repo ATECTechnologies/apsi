@@ -212,3 +212,59 @@ class Retarget(unittest.TestCase):
         g = thermal.Governor(lambda: 70.0, 79.0)
         g.retarget(79.0)
         self.assertEqual((g.target, g.low, g.high), (78.5, 78.0, 79.0))
+
+
+class FanControl(unittest.TestCase):
+    """Faster fans near the ceiling (the driver's curve below it), back to the driver's curve at the end."""
+
+    def test_fan_curve_and_restore(self):
+        calls = []
+        fc = thermal._FanControl()
+        fc.top, fc.percent = 85, None
+        fc._set = lambda pct: calls.append(pct) or True
+        fc.step(65.0, 79.0)                              # cool: the driver's own curve, nothing set
+        self.assertEqual(calls, [])
+        fc.step(74.0, 79.0)                              # ceiling - 5: on the way up
+        fc.step(77.5, 79.0)                              # past ceiling - 2: the top
+        self.assertEqual(calls[-1], 85)
+        self.assertTrue(50 <= calls[0] < 85)
+        fc.auto()
+        self.assertIsNone(calls[-1])
+
+    def test_more_cooling_more_power(self):
+        """With the fans at the top near the ceiling the simulated card keeps more power at 78-79 C."""
+        def run(with_fan):
+            clock, st = [0.0], {"T": 45.0, "limit": 136000.0, "fan": 0.0}
+
+            def power():
+                return min(st["limit"] / 1000.0, 175.0)
+
+            def read():
+                return float(round(st["T"] + 0.035 * power()))
+
+            class PC:
+                top, floor, limit = 170000, 93500, 136000.0
+
+                def set(self, mw):
+                    st["limit"] = float(mw)
+            pc = PC()
+            pc.step = thermal._PowerControl.step.__get__(pc)
+            g = thermal.Governor(read, 79.0)
+            g.power, g.read_power = pc, power
+            if with_fan:
+                fc = thermal._FanControl()
+                fc.top, fc.percent = 85, None
+                fc._set = lambda pct: st.__setitem__("fan", 0.0 if pct is None else (pct - 50) / 35.0) or True
+                g.fan = fc
+            watts = []
+            with mock.patch.object(thermal.time, "monotonic", lambda: clock[0]):
+                while clock[0] < 300.0:
+                    r = 0.30 * (1.0 - 0.15 * st["fan"])      # faster fans: less temperature rise per watt
+                    st["T"] += (32.0 + r * power() - st["T"]) * min(1.0, 0.05 / 20.0)
+                    clock[0] += 0.05
+                    g.tick()
+                    if clock[0] > 200:
+                        watts.append(power())
+                        self.assertLess(read(), 80.0)
+            return sum(watts) / len(watts)
+        self.assertGreater(run(True), run(False) * 1.08)

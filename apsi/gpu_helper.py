@@ -72,7 +72,31 @@ def handle(lib, req, key):
         mw = max(lim["min_mw"], min(lim["default_mw"], mw))          # never above the default
         r = lib.nvmlDeviceSetPowerManagementLimit(h, ctypes.c_uint(mw))
         return {"ok": r == 0, "mw": mw, "error": None if r == 0 else f"NVML error {r}"}
+    if op in ("fan", "fan_auto"):
+        return _fan(lib, h, None if op == "fan_auto" else req.get("percent"))
     return {"ok": False, "error": f"unknown request '{op}'"}
+
+
+def _fan(lib, h, percent):
+    """Every fan of the card at percent (30-100), or back to the driver's own curve (percent None)."""
+    n = ctypes.c_uint(1)
+    try:
+        if lib.nvmlDeviceGetNumFans(h, ctypes.byref(n)) != 0:
+            n.value = 1
+    except AttributeError:
+        n.value = 1
+    errs = []
+    for i in range(max(1, n.value)):
+        try:
+            if percent is None:
+                r = lib.nvmlDeviceSetDefaultFanSpeed_v2(h, ctypes.c_uint(i))
+            else:
+                r = lib.nvmlDeviceSetFanSpeed_v2(h, ctypes.c_uint(i), ctypes.c_uint(max(30, min(100, int(percent)))))
+        except AttributeError:
+            return {"ok": False, "error": "this driver cannot set fan speeds (NVML 520 or newer is needed)"}
+        if r:
+            errs.append(f"fan {i}: NVML error {r}")
+    return {"ok": not errs, "fans": n.value, "error": "; ".join(errs) or None}
 
 
 def serve(start_limit=None):
