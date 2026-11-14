@@ -429,7 +429,7 @@ def _main_module():
 
     # ------------------------------------------------------------------------- layer norm / RMS norm, a warp a row
     k = K("ln_f", [("X", G(f32)), ("G", G(f32)), ("B", G(f32)), ("Y", G(f32)), ("MEAN", G(f32)), ("RSTD", G(f32)),
-                   ("M", i32), ("N", i32), ("eps", f32), ("rms", i32)])
+                   ("M", i32), ("N", i32), ("eps", f32), ("rms", i32), ("Y16", G(f32)), ("has16", i32)])
     b, p = k.b, k.p
     lane = b.and_(k.tid, C(31))
     row = b.add(b.mul(k.cta, C(8)), b.lshr(k.tid, C(5)))
@@ -454,7 +454,17 @@ def _main_module():
             yv = k.var(y)
             with b.if_then(b.not_(isrms)):
                 b.store(b.fadd(y, k.ld(p["B"], i)), yv)
-            k.st(b.load(yv), p["Y"], idx)
+            yo = b.load(yv)
+            k.st(yo, p["Y"], idx)
+            # its bfloat16 twin in the same pass (round to nearest even, as to_bf16): the products that read this
+            # output take it as it is, no conversion pass per product
+            with b.if_then(b.icmp_unsigned("!=", p["has16"], C(0))):
+                bits = b.bitcast(yo, i32)
+                rnd = b.add(bits, b.add(C(0x7FFF), b.and_(b.lshr(bits, C(16)), C(1))))
+                nan = b.fcmp_unordered("uno", yo, yo)
+                hb = b.select(nan, b.or_(bits, C(0x00400000)), rnd)
+                p16 = b.bitcast(p["Y16"], ir.IntType(16).as_pointer(1))
+                b.store(b.trunc(b.lshr(hb, C(16)), ir.IntType(16)), b.gep(p16, [idx], inbounds=True), align=2)
         k.loop(lane, p["N"], C(32), out)
         with b.if_then(b.icmp_unsigned("==", lane, C(0))):
             k.st(mean, p["MEAN"], row)

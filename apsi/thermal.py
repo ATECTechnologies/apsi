@@ -110,9 +110,38 @@ class Governor:
         e = 0.0 if abs(err) < 0.25 else err - (0.25 if err > 0 else -0.25)
         self.last_read = now
         fan = getattr(self, "fan", None)
-        if fan is not None:
-            fan.step(self.smooth, getattr(self, "ceiling", self.target + 0.5))
         power = getattr(self, "power", None)
+        ceiling = getattr(self, "ceiling", self.target + 0.5)
+        if fan is not None and fan.ok:
+            # fixed power, the fans hold the temperature; the power limit only as the last resort (fans at 100 %)
+            draw = None
+            if getattr(self, "read_power", None):
+                try:
+                    draw = self.read_power()
+                except Exception:                       # noqa: BLE001
+                    draw = None
+            room = fan.control(self.smooth, self.slope, self.target, ceiling, dt, draw=draw)
+            if fan.ok:
+                self.fraction = 0.0
+                if power is not None:
+                    # the last resort, slow and small so it never swings: fans at full and still too warm -> a few
+                    # watts less; fans with clear room again (below 85 %) -> the watts back, slowly, up to the
+                    # original limit and never above it. A reading at the ceiling + 0.5 itself: 4 % at once.
+                    lim = power.limit
+                    if t >= ceiling + 0.5:
+                        lim *= 0.96
+                    elif not room and self.smooth > self.target:
+                        lim -= 1500.0 * (self.smooth - self.target + 0.25) * dt
+                    elif fan.level is None or fan.level < 85.0:
+                        lim += 500.0 * dt
+                    lim = min(float(power.orig), max(float(power.floor), lim))
+                    if lim != power.limit:
+                        power.limit = lim
+                        applied = getattr(power, "applied", None)
+                        if applied is None or abs(lim - applied) >= 1000.0 or lim == power.orig != applied:
+                            power.set(int(lim))
+                            power.applied = lim
+                return
         draw = None
         if power is not None and getattr(self, "read_power", None):
             try:
@@ -411,21 +440,23 @@ class _PowerControl:
 
 
 class _FanControl:
-    """Faster fans before less power: while the card is near its ceiling, its fans are run harder than the driver's
-    quiet curve (up to APSI_GPU_FAN_MAX, default 85 %), so the cooler takes away more heat and the card keeps more of
-    its power at the same temperature. Back to the driver's own curve below the ceiling - 8 and at exit. Needs the
-    same rights as the power limit (administrator, or the GPU helper); APSI_GPU_FAN=0 leaves the fans alone."""
+    """The temperature is held by the fans, the power stays fixed. While a run trains, the card keeps the power
+    limit it started with (the GPU Tuner's value, chosen for work per watt) and its fans are steered between their
+    minimum and 100 % to hold it at the ceiling - 0.5 (78.5 C for the default 79): looking ahead along the
+    temperature's slope, faster at once when it rises, slower gently when it falls. The power limit is touched only
+    if the fans are at 100 % and the card still reaches the ceiling (a blocked cooler, a hot room): then a few watts
+    at a time, and given back as soon as the fans have room again. Back to the driver's own fan curve when the card
+    is well below the ceiling and at exit. Needs the rights of the power limit (administrator or the GPU helper);
+    APSI_GPU_FAN=0 leaves the fans alone (the power limit holds the temperature instead)."""
+
+    LOW = 35.0                          # the slowest speed it asks for (most cards' minimum is 30 %)
 
     @staticmethod
     def try_make(lib, h, index, direct):
         if os.environ.get("APSI_GPU_FAN", "1").strip().lower() in ("0", "off", "no", "false"):
             return None
-        try:
-            top = int(os.environ.get("APSI_GPU_FAN_MAX", "85"))
-        except ValueError:
-            top = 85
         fc = _FanControl()
-        fc.top, fc.percent = max(40, min(100, top)), None
+        fc.percent, fc.level, fc.ok = None, None, True
         if direct:
             if not hasattr(lib, "nvmlDeviceSetFanSpeed_v2"):
                 return None
@@ -439,26 +470,49 @@ class _FanControl:
         atexit.register(fc.auto)
         return fc
 
-    def want(self, smooth, ceiling):
-        """The fan speed for a smoothed temperature: the driver's curve below ceiling - 8, then rising to the top
-        at ceiling - 2 (it is already there when the power limit starts to work)."""
-        if smooth is None or smooth < ceiling - 8.0:
-            return None
-        return int(min(self.top, 50 + (self.top - 50) * (smooth - (ceiling - 8.0)) / 6.0))
+    def control(self, smooth, slope, target, ceiling, dt, draw=None):
+        """One step of the fans: returns True while they still have room (below 100 %). Three terms, the way a
+        spacecraft's thermal loop is built: the error now, the error 4 s ahead along the temperature's slope, and a
+        feed-forward from the power the card draws: heat that has gone in but not yet shown on the sensor (the die
+        takes about 20 s to settle), so the fans answer a heavy phase as it starts, not after the degrees come."""
+        if not self.ok:
+            return False
+        e = (smooth - target) + 4.0 * slope            # 4 s ahead
+        if draw is not None and draw > 0:
+            ps = getattr(self, "p_smooth", None)
+            self.p_smooth = draw if ps is None else ps + min(1.0, dt / 20.0) * (draw - ps)
+            # watts above the settled level -> degrees still to come (half of the about 0.3 C per W of a desktop card: the loop adds the rest)
+            if smooth > target - 3.0:
+                e += 0.15 * max(0.0, draw - self.p_smooth)
+        if self.level is None:
+            if smooth < ceiling - 6.0 and e < 0:
+                return True                            # cool: the driver's own curve
+            self.level = 60.0                          # taking over: a firm start
+        if e > 0:
+            self.level += 6.0 * e * dt + 2.0 * e       # up fast
+        else:
+            self.level += 1.5 * e * dt                 # down gently (no swinging)
+        self.level = max(self.LOW, min(100.0, self.level))
+        if smooth < ceiling - 8.0 and self.level <= self.LOW + 0.5:
+            self.level = None                          # well below: back to the driver's curve
+            self._apply(None)
+            return True
+        self._apply(int(round(self.level)))
+        return self.level < 99.5
 
-    def step(self, smooth, ceiling):
-        pct = self.want(smooth, ceiling)
-        if pct == self.percent or (pct is not None and self.percent is not None and abs(pct - self.percent) < 5):
+    def _apply(self, pct):
+        if pct == self.percent or (pct is not None and self.percent is not None and abs(pct - self.percent) < 2):
             return
         if self._set(pct):
             self.percent = pct
         else:
-            self.step = lambda *a: None                # refused once: leave the fans alone from now on
+            self.ok = False                            # refused: the power limit holds the temperature instead
 
     def auto(self):
         if self.percent is not None:
             self._set(None)
             self.percent = None
+        self.level = None
 
 
 def _power_state_file(index):

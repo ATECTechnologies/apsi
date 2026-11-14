@@ -1092,3 +1092,51 @@ class HeldOutOnCard(unittest.TestCase):
         host = GT._eval_loss_host(lambda Xa: GT._forward_batches(net, ops, Xa, 16), (X[64:], Y[64:]), True,
                                   "cross_entropy", None)
         self.assertAlmostEqual(card, host, places=4)
+
+
+class Bf16Twin(unittest.TestCase):
+    """A layer norm's output written with its bfloat16 twin: the products reading it take the twin (no to_bf16
+    pass); a freed buffer's twin is forgotten."""
+
+    def _gpu(self):
+        import types
+        from apsi import gpu_train as GT
+        g = GT.Gpu.__new__(GT.Gpu)
+        g.launched = []
+        g._go = lambda name, grid, block, *a: g.launched.append(name)
+        g.fn = {"to_bf16": 1, "ln_f": 1}
+        g._twin, g._wcache, g._wrange, g._wgen = {}, {}, None, 0
+        g._calls, g._scr, g.used = {}, {}, 0
+        g.dev = types.SimpleNamespace(free=lambda p: None)
+        g._scratch = lambda key, n: (types.SimpleNamespace(ptr=0x900000, n=n), 0)
+        return g, GT
+
+    def test_twin_used_and_forgotten(self):
+        import types
+        g, GT = self._gpu()
+        Y = types.SimpleNamespace(ptr=0x100000, n=64)
+        Y16 = types.SimpleNamespace(ptr=0x200000, n=32)
+        W = types.SimpleNamespace(ptr=0x300000, n=64)
+        g.ln_f((Y, 0), (W, 0), None, (Y, 0), (W, 0), (W, 0), 8, 8, 1e-5, False, Y16=(Y16, 0))
+        args = [("p", 0x100000), ("p", 0x300000)] + [("u", 0)] * 30
+        out = g._h_args(args, 8, 8, 8)
+        self.assertEqual(out[0], ("p", 0x200000))                 # the twin, no conversion of A
+        self.assertEqual(g.launched.count("to_bf16"), 1)          # only B (not a twin) converted
+        g.free(Y16)
+        self.assertEqual(g._twin, {})
+        g._h_args(args, 8, 8, 8)
+        self.assertEqual(g.launched.count("to_bf16"), 3)
+
+
+class PrecisionDefault(unittest.TestCase):
+    def test_resolve(self):
+        from unittest import mock
+        from apsi import gpu_train as GT
+        with mock.patch.dict(os.environ, {"APSI_PRECISION": ""}):
+            self.assertEqual(GT.resolve_precision(None), "bf16")
+            self.assertEqual(GT.resolve_precision("auto"), "bf16")
+            self.assertEqual(GT.resolve_precision("tf32"), "fp32")
+            self.assertEqual(GT.resolve_precision("int8"), "int8")
+        with mock.patch.dict(os.environ, {"APSI_PRECISION": "fp32"}):
+            self.assertEqual(GT.resolve_precision("auto"), "fp32")
+            self.assertEqual(GT.resolve_precision("bf16"), "bf16")      # the argument wins
