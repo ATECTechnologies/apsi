@@ -43,14 +43,23 @@ def main():
     total = {}
     for label, M, N, K, a_kc, b_nc, cnt in SHAPES:
         A, B, Cb = ops.alloc(M * K), ops.alloc(K * N), ops.alloc(M * N)
-        ops.put(A, rng.standard_normal(M * K).astype(np.float32))
-        ops.put(B, rng.standard_normal(K * N).astype(np.float32))
         sam, sak = (K, 1) if a_kc else (1, M)
         sbk, sbn = (N, 1) if b_nc else (1, K)
         row = []
-        for v in ("auto", "x", "w", "h", "a"):
+        a_h = rng.standard_normal(M * K).astype(np.float32)
+        b_h = rng.standard_normal(K * N).astype(np.float32)
+        ops.put(A, a_h)
+        ops.put(B, b_h)
+        Am = a_h.reshape(M, K) if a_kc else a_h.reshape(K, M).T
+        Bm = b_h.reshape(K, N) if b_nc else b_h.reshape(N, K).T
+        ref = Am[:256].astype(np.float64) @ Bm.astype(np.float64)       # the first 256 rows, to check every build
+        for v in ("auto", "x", "w", "h", "v", "a"):
             os.environ["APSI_GEMM_VARIANT"] = v
             ops._choice = {}
+            ops.fill((Cb, 0), M * N, 0.0)
+            ops.gemm((A, 0), (B, 0), (Cb, 0), M, N, K, sam, sak, sbk, sbn, N)
+            got = ops.get(Cb, 256 * N).reshape(256, N)
+            err = float(np.abs(got - ref).max() / (np.abs(ref).max() + 1e-30))
             for _ in range(3):
                 ops.gemm((A, 0), (B, 0), (Cb, 0), M, N, K, sam, sak, sbk, sbn, N, beta=(not a_kc))
             ops.sync()
@@ -64,12 +73,13 @@ def main():
             ms = ctypes.c_float()
             ops._lib.cuEventElapsedTime(ctypes.byref(ms), e0, e1)
             t = ms.value / reps
-            row.append((v, t, 2.0 * M * N * K / (t / 1000.0) / 1e12))
+            row.append((v, t, 2.0 * M * N * K / (t / 1000.0) / 1e12, err))
         os.environ.pop("APSI_GEMM_VARIANT", None)
-        best = min(row, key=lambda r: r[1])
+        bad = [r[0] for r in row if r[3] > 2e-2]
+        best = min((r for r in row if r[3] <= 2e-2), key=lambda r: r[1])
         total[label] = best[1] * cnt
-        say(f"{label:30s} {M}x{N}x{K}  " + "  ".join(f"{v}:{tf:5.1f}TF" for v, _, tf in row) +
-            f"   best {best[0]} {best[1]:.3f} ms x{cnt} = {best[1] * cnt:.1f} ms/step")
+        say(f"{label:30s} {M}x{N}x{K}  " + "  ".join(f"{v}:{tf:5.1f}TF" for v, _, tf, _e in row) +
+            (f"  WRONG: {','.join(bad)}" if bad else "") + f"   best {best[0]} {best[1]:.3f} ms x{cnt} = {best[1] * cnt:.1f} ms/step")
         for bf in (A, B, Cb):
             ops.free(bf)
     say(f"all products of one step at the best build: {sum(total.values()):.1f} ms")

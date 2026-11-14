@@ -1843,8 +1843,8 @@ def _tiled_module(early=False, wide=False, h=False):
     NTL = BN // WNW // 8                          # n8 tiles per warp
     PADv = BKv + 8
     VPR = BKv // 4                                # float32 vectors of 4 per row of a k-contiguous slice
-    ir, m = _setup("apsi_train_tiled_h" if h else "apsi_train_tiled_w" if wide else "apsi_train_tiled_x" if early
-                   else "apsi_train_tiled")
+    ir, m = _setup("apsi_train_tiled_v" if (h and wide) else "apsi_train_tiled_h" if h else "apsi_train_tiled_w"
+                   if wide else "apsi_train_tiled_x" if early else "apsi_train_tiled")
     annotations = m.add_named_metadata("nvvm.annotations")
     g = _Gen(ir, m)
     i16, i32, i64, f32, C, F, G = ir.IntType(16), g.i32, g.i64, g.f32, g.C, g.F, g.G
@@ -2059,20 +2059,24 @@ def _tiled_module(early=False, wide=False, h=False):
             for which, ptr, kc, base_off, lim_o, s_o, o0 in (("A", A16, a_kc, offs[0], p["M"], p["sam"] if a_kc else p["sak"], bm),
                                                            ("B", B16, b_kc, offs[1], p["N"], p["sbn"] if b_kc else p["sbk"], bn)):
                 sb_ = sbase_a if which == "A" else sbase_b
-                if kc:                                # [row][k]: 128 rows x 16 k = 2 chunks of 8 per row
-                    row, kq = b.lshr(tid, C(1)), b.mul(b.and_(tid, C(1)), C(8))
-                    ci, cl, oi, ol = b.add(k0, kq), k_end, b.add(o0, row), lim_o
-                    dst = b.add(sb_, b.add(b.mul(row, C(PADv)), kq))
-                else:                                 # [k][row]: 16 k x 128 = 16 chunks of 8 per k
-                    kk, q8 = b.lshr(tid, C(4)), b.mul(b.and_(tid, C(15)), C(8))
-                    ci, cl, oi, ol = b.add(o0, q8), lim_o, b.add(k0, kk), k_end
-                    dst = b.add(sb_, b.add(b.mul(kk, C(PADT)), q8))
-                ok = b.and_(b.icmp_unsigned("<", ci, cl), b.icmp_unsigned("<", oi, ol))
-                ci2 = umin(ci, b.sub(cl, C(8)))
-                oi2 = umin(oi, b.sub(ol, C(1)))
-                idx = b.add(base_off, b.add(b.mul(z64(oi2), z64(s_o)), z64(ci2)))
-                src = b.ptrtoint(b.gep(ptr, [idx], inbounds=True), i64)
-                b.call(cpa, [b.ptrtoint(sh_ptr(dst), i64), src, b.select(ok, C(16), C(0))])
+                # 128 rows x BKv k = 128 * BKv / 8 chunks of 8 halves (16 bytes) per operand, NTH threads: each
+                # thread copies its share (one chunk with 256 threads, two with the 4-warp build)
+                for part in range(128 * BKv // 8 // NTH):
+                    cid = b.add(tid, C(NTH * part))
+                    if kc:                            # [row][k]: BKv / 8 chunks per row
+                        row, kq = b.udiv(cid, C(BKv // 8)), b.mul(b.urem(cid, C(BKv // 8)), C(8))
+                        ci, cl, oi, ol = b.add(k0, kq), k_end, b.add(o0, row), lim_o
+                        dst = b.add(sb_, b.add(b.mul(row, C(PADv)), kq))
+                    else:                             # [k][row]: 16 chunks of 8 per k
+                        kk, q8 = b.lshr(cid, C(4)), b.mul(b.and_(cid, C(15)), C(8))
+                        ci, cl, oi, ol = b.add(o0, q8), lim_o, b.add(k0, kk), k_end
+                        dst = b.add(sb_, b.add(b.mul(kk, C(PADT)), q8))
+                    ok = b.and_(b.icmp_unsigned("<", ci, cl), b.icmp_unsigned("<", oi, ol))
+                    ci2 = umin(ci, b.sub(cl, C(8)))
+                    oi2 = umin(oi, b.sub(ol, C(1)))
+                    idx = b.add(base_off, b.add(b.mul(z64(oi2), z64(s_o)), z64(ci2)))
+                    src = b.ptrtoint(b.gep(ptr, [idx], inbounds=True), i64)
+                    b.call(cpa, [b.ptrtoint(sh_ptr(dst), i64), src, b.select(ok, C(16), C(0))])
 
         if h:
             for st_ in range(STAGES - 1):
@@ -2734,6 +2738,7 @@ def ptx(which):
     text = {"main": _main_module, "tc": _tc_module, "tiled": _tiled_module, "tiled_x": lambda: _tiled_module(True),
             "tiled_w": lambda: _tiled_module(True, True),
             "tiled_h": lambda: _tiled_module(h=True),
+            "tiled_v": lambda: _tiled_module(True, True, True),
             "flash": _flash_module}[which]()
     if path:
         try:
