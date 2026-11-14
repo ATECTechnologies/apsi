@@ -1,7 +1,8 @@
 @echo off
 rem Uploads Apsi 2.6.0 (installers, the source code and the GPU Tuner) from your Downloads folder to apsi.dev.
 rem One file: the PowerShell below this header does the work. Asks for an API token (Settings -> Developer,
-rem "release"). The same file already on the site is skipped; a rebuilt file replaces it. Never duplicates.
+rem "release"). The same file already on the site is skipped; a rebuilt file replaces it; a file of the same version that
+rem is no longer in your Downloads folder is removed (an improved 2.6.0 replaces the old 2.6.0 whole). Never duplicates.
 set "APSI_UPLOAD_SELF=%~f0"
 powershell -NoProfile -ExecutionPolicy Bypass -Command "$s = (Get-Content -LiteralPath $env:APSI_UPLOAD_SELF -Raw) -split '##[ ]PS[ ]##'; & ([scriptblock]::Create($s[1]))"
 echo.
@@ -21,7 +22,9 @@ exit /b
 # Versions: 2.6.0 and newer by default (-Version 2.6.0+); -Version 2.4.4 for one version only, -Version all for
 # every version found. A file already on the site is skipped when it is the same file (same SHA-256) and replaced
 # when it is a newer build with the same name, so running it again is safe and never makes duplicates. Files are sent in 32 MB pieces, 4 at a time (Cloudflare accepts at most 100 MB per
-# request); a broken piece is sent again.
+# request); a broken piece is sent again. A file on the site under a version being uploaded that is not among the
+# files found here (an old build's name) is removed after the new files are up, so an improved release replaces the
+# old one whole; -Keep leaves such files alone.
 #
 # It asks for an API token once. Create it on the site: Settings -> Developer, tick "release", 30 days.
 # The token is never written to disk.
@@ -30,6 +33,7 @@ param(
   [string]$Site = 'https://apsi.dev',
   [string]$Version = '2.6.0+',
   [int]$Parallel = 4,
+  [switch]$Keep,
   [switch]$DryRun
 )
 $ErrorActionPreference = 'Stop'
@@ -186,7 +190,21 @@ foreach ($it in ($items | Sort-Object Version, Platform)) {
     $failed++
   }
 }
+# the old release's files that the new one no longer has (removed only when every new file went up)
+$pruned = 0
+if (-not $Keep -and $failed -eq 0) {
+  $names = @{}
+  foreach ($it in $items) { $names["$($it.Version)|$($it.Name)"] = $true }
+  $versions = @($items | ForEach-Object { $_.Version } | Sort-Object -Unique)
+  foreach ($x in $have.Values) {
+    if ($versions -contains $x.version -and -not $names["$($x.version)|$($x.filename)"]) {
+      Write-Host "remove  $($x.version) $($x.filename) (not in this build of $($x.version))" -ForegroundColor Yellow
+      $d = Call 'DELETE' "/api/v1/releases/$($x.id)" $null
+      if ($d.Status -eq 200) { $pruned++ } else { Write-Host "  could not remove it ($($d.Status))" -ForegroundColor Red }
+    }
+  }
+}
 $http.Dispose()
 if (Test-Path $tmp) { Remove-Item -LiteralPath $tmp -Recurse -Force -ErrorAction SilentlyContinue }
 Write-Host ''
-Write-Host "Uploaded $done, already there $skipped, failed $failed.  See $Site/download/all" -ForegroundColor Cyan
+Write-Host "Uploaded $done, already there $skipped, removed $pruned, failed $failed.  See $Site/download/all" -ForegroundColor Cyan

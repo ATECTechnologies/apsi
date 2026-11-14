@@ -1,6 +1,6 @@
 # Changelog
 
-## 2.6.0 — exact training on any number of cards, GLA 3.0, training that finishes, fewer tokens (13 November 2026)
+## 2.6.0 (Improved version) — exact training on any number of cards, GLA 3.0, training that finishes, fewer tokens (14 November 2026)
 
 ### Faster everyday code
 - **Facts the compiler can prove are no longer checked at run time:** a typed `Int`/`Float` parameter that is never
@@ -28,18 +28,31 @@
 - **The held-out loss is computed on the card:** each batch's logits stay there and the loss kernel adds the mean
   into one number (before: every batch's logits were copied back and the softmax taken in float64 on the processor,
   hundreds of MB and seconds per evaluation with the card idle).
-- **Fixed power, the fans hold the temperature:** while training, the card keeps the power limit it started with
-  (the GPU Tuner's) and its fans are steered between 35 % and 100 % to hold 78.5 °C (looking 4 s ahead, faster at
-  once, slower gently). The power limit moves only when the fans are at 100 % and the card is still at the ceiling,
-  a few watts at a time, and comes back as soon as the fans have room. Before, the power limit itself held the
-  temperature: the clocks fell with it (about 20 % less speed at 106 W), and once it reached its floor the work was
-  paused, which left the card idle between 40 and 90 % of the time. The driver's own fan curve comes back when the
-  card is well below the ceiling and at exit; `APSI_GPU_FAN=0` leaves the fans alone (the power limit holds it then).
+- **Fixed power, the fans hold the temperature:** while training, the card runs at a fixed power limit (measured per
+  card, else 85 % of the default — 145 W on an RTX 3060; `APSI_GPU_TRAIN_POWER=140W` or `85%`; never below the card's own limit, never above its default) and its
+  fans are steered between 70 and 82 % (`APSI_GPU_FAN_MIN` / `APSI_GPU_FAN_MAX`) to hold 78.5 °C: the error now, the
+  error 4 s ahead along the slope, and a feed-forward from the power drawn (heat that is in the die but not yet on the
+  sensor). The power limit moves only when the fans are at the top of their range and the card is still at the
+  ceiling, a few watts at a time, and comes back while the fans stay at the top. Before, the power limit itself held
+  the temperature: the clocks fell with it (about 20 % less speed at 106 W), and at its floor the work was paused,
+  which left the card idle between 40 and 90 % of the time. The driver's fan curve comes back when the card is well
+  below the ceiling and at exit; `APSI_GPU_FAN=0` leaves the fans alone (the power limit holds it then).
+- **bfloat16 is the default precision, said at the start of every run** (`precision="fp32"` or `APSI_PRECISION=fp32`
+  for float32-exact products as three bfloat16 products, 3× the time; the low-bit formats as before).
+- **Each card measured once, at install:** `apsi gpu setup` (the installer's GPU step, and the GPU Tuner) now also
+  runs `apsi gpu calibrate`: about 2.5 minutes of matrix products at a trial power with the fans at the top and then
+  the bottom of their range; each temperature curve is fitted to a first-order model, so the settled temperature is
+  known without waiting for it. From the degrees per watt at each fan speed come the highest power the fans hold at
+  77.5 °C (never below the card's own limit, never above its default) and the quietest fan range that holds it,
+  saved in `~/.apsi/gpu-profile.json` and used by every run. Without a measurement: 85 % of the default power, fans
+  70–82 %. Safety: the trial power drops 10 % at the ceiling + 1, the load stops at the ceiling + 3, and the card's
+  own fan curve and power limit come back at the end.
 - **No idle gaps on Windows:** WDDM gathers launches into batches; every 32 launches a non-blocking stream query now
   hands them to the card at once (`APSI_GPU_FLUSH=N`, 0 = off).
-- **A layer norm's output comes with its bfloat16 twin** written in the same pass; the products that read it (q, k, v
-  and the first MLP layer, and their weight gradients) take the twin instead of a conversion pass each (six per
-  layer before). `APSI_BF16_TWIN=0` turns it off.
+- **bfloat16 twins instead of a conversion per product:** a layer norm writes its output's bfloat16 twin in the same
+  pass, the attention output and each layer's dy are converted once for the two products that read them; the
+  products take the twin instead of a conversion pass each (about 6 GB less memory traffic per step of the 127 M
+  GPT). `APSI_BF16_TWIN=0` turns it off.
 - **The card is held at 78–79 °C, never 80** (`APSI_GPU_TEMP` is now a ceiling, default 79, instead of a 77 °C
   target with a 75–78 band): the card gets all the power that temperature allows. The power limit looks ahead along
   the temperature's slope, cuts fast and gives back slowly, cuts 6 % at once at the ceiling and does not wind up

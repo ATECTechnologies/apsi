@@ -789,12 +789,12 @@ async function install(options, hooks = {}) {
         const q = (x) => `'${String(x).replace(/'/g, "''")}'`;
         const ps = `$p = Start-Process -FilePath ${q(py)} -ArgumentList '-I','-X','utf8','-m','apsi','gpu','setup' ` +
                    `-Verb RunAs -WindowStyle Hidden -Wait -PassThru; exit $p.ExitCode`;
-        r = await run("powershell", ["-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", ps], { timeoutMs: 300000 });
+        r = await run("powershell", ["-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", ps], { timeoutMs: 600000 });
       } else if (which("pkexec")) {
-        r = await run("pkexec", ["env", `HOME=${HOME}`, py, "-I", "-X", "utf8", "-m", "apsi", "gpu", "setup"], { timeoutMs: 300000 });
+        r = await run("pkexec", ["env", `HOME=${HOME}`, py, "-I", "-X", "utf8", "-m", "apsi", "gpu", "setup"], { timeoutMs: 600000 });
       }
       say(r && r.code === 0
-        ? "GPU helper installed: training holds the card near 77 C by its power limit, no administrator needed"
+        ? "GPU helper installed and this card measured: training runs at a fixed power, its fans hold 78-79 C, no administrator needed"
         : "GPU helper not installed (later: 'apsi gpu setup' from a terminal opened as administrator, or the GPU Tuner)");
     }
 

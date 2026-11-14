@@ -302,12 +302,14 @@ the speed stay level, and a card that stays cool is never slowed.
 | `APSI_GPU_TEMP=off` | no control (the card's own limits only) |
 
 **Fixed power, the fans hold the temperature.** With the rights to set the card's limits (administrator, or the
-GPU helper below), Apsi does not lower the power to cool the card: the power limit stays where it was when the run
-started (the GPU Tuner's value), so the clocks and the speed stay level, and the card's fans are steered between 35 %
-and 100 % to hold it at 78.5 °C — looking 4 s ahead along the temperature's slope, faster at once when it rises,
-slower gently when it falls. Only if the fans are at 100 % and the card is still at the ceiling (a blocked cooler, a
+GPU helper below), Apsi does not lower the power to cool the card: the run trains at a fixed power limit (the one
+`apsi gpu calibrate` measured for this card, else 85 % of its default — 145 W on an RTX 3060; `APSI_GPU_TRAIN_POWER=140W`
+or `85%` sets it; never below the card's own limit, never above its default), the clocks and the speed stay level, and the card's fans are steered between 70 and 82 %
+(measured per card too; `APSI_GPU_FAN_MIN`, `APSI_GPU_FAN_MAX`) to hold it at 78.5 °C — the error now, the error 4 s ahead along the
+temperature's slope, and a feed-forward from the power drawn, so the fans answer a heavy phase as it starts. Only if
+the fans are at the top of their range and the card is still at the ceiling (a blocked cooler, a
 hot room) does the power limit come down, a few watts at a time, and it goes back as soon as the fans have room
-again. Below the band the driver's own fan curve is in charge, and it is put back at exit. In a simulated card (rooms
+again (the fans stay at the top until it is back). Below the band the driver's own fan curve is in charge, and it is put back at exit. In a simulated card (rooms
 from 25 to 42 °C, load changing every 40 s) it never reads 80, holds 77–79 under full load and never touches the
 power unless the fans are at full (tests/test_thermal.py). `APSI_GPU_FAN=0` leaves the fans alone; the power limit
 then holds the temperature as before (it looks ahead, cuts fast, gives back at most 2 W a second).
@@ -320,6 +322,15 @@ rights Apsi cannot change the card's limits and paces the work instead: the temp
 speed falls as far as the cooler needs (on the RTX 3060 in a small case: from 141,000 to about 100,000 tokens/s once
 the card is warm). `APSI_GPU_POWER_CONTROL=0` keeps pauses only. Better airflow or a higher fan curve gives the speed
 back in both cases.
+
+**Measured per card: `apsi gpu calibrate`.** About 2.5 minutes of matrix products at a trial power, with the fans
+at the top and then at the bottom of their range. Each temperature curve is fitted to T(t) = T_end + (T_start − T_end)
+e^(−t/τ), so the temperature the card would settle at is known without waiting for it; from the degrees per watt at
+each fan speed come the highest power the fans hold at 77.5 °C and the quietest fan range that holds it (widened up to
+95 % on a hot card). Saved in `~/.apsi/gpu-profile.json`, used by every run, measured again by running it again (after
+cleaning the cooler or a new case). `apsi gpu setup` runs it at the end (`APSI_GPU_CALIBRATE=0` skips it). Safety: the
+trial power drops 10 % at the ceiling + 1, the load stops at the ceiling + 3, and the card's own fan curve and power
+limit come back at the end.
 
 **Never as administrator again: `apsi gpu setup` (once).** It installs a small helper that Windows' Task Scheduler
 (or systemd on Linux) starts at every logon with administrator rights; its only job is to set the power limit when

@@ -24,7 +24,7 @@
     "version": "2.6.0",
     "notes": ".github/release-notes/notes-2.6.0.md",
     "latest": true,
-    "title": "Apsi 2.6.0",
+    "title": "Apsi 2.6.0 (Improved version)",
     "target": "release/2.6.0"
   }
 ]
