@@ -889,8 +889,10 @@ class Gpu(_Ops):
         self._occ = {}
         self._choice = {}
         self._wcache, self._wrange, self._wgen = {}, None, 0
+        self._w16, self._w16_gen = None, -1
         self._twin = {}                                  # float32 output address -> (values, its bfloat16 twin)
         self.profile = None                              # {kernel: (seconds, launches)} while profiling
+        self.launches = 0                                # kernels launched so far (the bench's count per step)
         self._pending = []
         self._lib = lib
         lib.cuEventRecord.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
@@ -959,6 +961,7 @@ class Gpu(_Ops):
     _CT = {"p": ctypes.c_uint64, "u": ctypes.c_uint32, "i": ctypes.c_int32, "f": ctypes.c_float}
 
     def _go(self, name, grid, block, *args):
+        self.launches += 1
         gx, gy, gz = (tuple(grid) + (1, 1))[:3] if isinstance(grid, tuple) else (grid, 1, 1)
         key = (name, gx, gy, gz, block, args)
         hit = self._calls.get(key)
@@ -1279,9 +1282,18 @@ class Gpu(_Ops):
 
     def adam(self, Pm, Gr, Mm, Vm, SQ, n, n_decay, lr, b1, b2, eps, c1, c2, wd, clip, COMP=None):
         self._wgen += 1
+        # the update of all the weights writes their bfloat16 copy too (the products' operand): no conversion pass
+        wr, at = self._wrange, self.p(Pm)[1]
+        full = self._w16 is not None and wr is not None and at == wr[0] and 4 * n == wr[1] - wr[0]
         self._go("adam", self.blocks(n), 256, self.p(Pm), self.p(Gr), self.p(Mm), self.p(Vm), self.p(SQ), ("u", n),
                  ("u", n_decay), ("f", lr), ("f", b1), ("f", b2), ("f", eps), ("f", c1), ("f", c2), ("f", wd),
-                 ("f", clip), self.p(COMP if COMP is not None else Pm), ("u", 1 if COMP is not None else 0))
+                 ("f", clip), self.p(COMP if COMP is not None else Pm), ("u", 1 if COMP is not None else 0),
+                 self.p((self._w16, 0) if full else Pm), ("u", 1 if full else 0))
+        if full:
+            self._w16_gen = self._wgen
+            for bf in self._wcache.values():             # (the copies made one weight at a time before)
+                self.free(bf[1])
+            self._wcache = {}
 
     def sgd(self, Pm, Gr, VEL, SQ, n, lr, mom, clip, COMP=None):
         self._wgen += 1
@@ -1532,6 +1544,12 @@ class Gpu(_Ops):
             self.free(bf[1])
         self._wcache = {}
         self._wrange = (buf.ptr, buf.ptr + 4 * n) if buf is not None else None
+        if self._w16 is not None:
+            self.free(self._w16)
+        # all the weights' bfloat16 copy, written by adam (valid while _w16_gen is the current update)
+        self._w16 = self.alloc((n + 1) // 2) if buf is not None and "to_bf16" in self.fn and \
+            os.environ.get("APSI_ADAM_W16", "1").strip().lower() not in ("0", "off", "no") else None
+        self._w16_gen = -1
 
     def _h_args(self, args, M, N, K):
         """The operands rounded to bfloat16 (one pass each), and the arguments that point there. A weight matrix is
@@ -1544,6 +1562,10 @@ class Gpu(_Ops):
             ptr = args[i][1]
             wr = self._wrange
             if wr is not None and wr[0] <= ptr < wr[1]:
+                off = (ptr - wr[0]) // 4
+                if self._w16_gen == self._wgen and off % 8 == 0:     # adam's copy (16-byte aligned)
+                    out[i] = ("p", self._w16.ptr + 2 * off)
+                    continue
                 hit = self._wcache.get((ptr, n))
                 if hit is None or hit[0] != self._wgen:
                     dst = hit[1] if hit is not None else self.alloc((n + 1) // 2)
@@ -1599,7 +1621,10 @@ class Gpu(_Ops):
         best, best_t = name, None
         times = {}
         ms = ctypes.c_float()
-        for cand in cands + cands:
+        # timed on an idle card: a product running on the other stream meanwhile made the times a coin toss (the
+        # register build won shapes the cp.async builds do 30 % faster)
+        self.sync()
+        for cand in cands + cands + cands:
             e0, e1 = self._event(), self._event()
             self._lib.cuEventRecord(e0, self.cur)
             self._go(cand, grid, self._threads(cand), *(self._h_args(targs, M, N, K) if cand.endswith(("#h", "#v", "#d", "#e", "#f", "#g", "#s")) else targs))

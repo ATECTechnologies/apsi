@@ -1466,7 +1466,8 @@ def _main_module():
 
     k = K("adam", [("P", G(f32)), ("G", G(f32)), ("M", G(f32)), ("V", G(f32)), ("SQ", G(f32)), ("n", i32),
                    ("n_decay", i32), ("lr", f32), ("b1", f32), ("b2", f32), ("eps", f32), ("c1", f32), ("c2", f32),
-                   ("wd", f32), ("clip", f32), ("COMP", G(f32)), ("hasc", i32)])
+                   ("wd", f32), ("clip", f32), ("COMP", G(f32)), ("hasc", i32), ("W16", G(ir.IntType(16))),
+                   ("has16", i32)])
     b, p = k.b, k.p
     sc = clip_scale(k, p)
     ok = finite_sq(k, p)
@@ -1485,7 +1486,13 @@ def _main_module():
         k.st(b.select(ok, m_, m0), p["M"], i)
         k.st(b.select(ok, v_, v0), p["V"], i)
         dec = b.select(b.icmp_unsigned("<", i, p["n_decay"]), b.fmul(w_old, b.fmul(p["lr"], p["wd"])), F(0.0))
-        k.st(kahan(k, p, w_old, b.fsub(F(0.0), b.fadd(dec, upd)), b.fsub(w, upd), i, ok), p["P"], i)
+        w_new = kahan(k, p, w_old, b.fsub(F(0.0), b.fadd(dec, upd)), b.fsub(w, upd), i, ok)
+        k.st(w_new, p["P"], i)
+        # W16: the weights' bfloat16 copy (what the products read) written here, not by a conversion pass after
+        with b.if_then(b.icmp_unsigned("!=", p["has16"], C(0))):
+            u = b.bitcast(w_new, i32)
+            h16 = b.trunc(b.lshr(b.add(b.add(u, C(0x7FFF)), b.and_(b.lshr(u, C(16)), C(1))), C(16)), ir.IntType(16))
+            b.store(h16, k.gep(p["W16"], i), align=2)
         k.st(F(0.0), p["G"], i)                       # the gradient is used up: cleared for the next step here
     k.grid_loop(p["n"], adam)
     k.ret()

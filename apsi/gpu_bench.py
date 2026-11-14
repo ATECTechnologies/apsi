@@ -94,13 +94,24 @@ def bench(which="127m", steps=40, precision="auto", out=sys.stdout):
     warm = 3                                                  # first steps: the products are timed and chosen
     GT.fit(model, params, X[:warm * batch], Y[:warm * batch], loss="cross_entropy", opt=adamw(lr=1e-3), epochs=1,
            batch_size=batch, verbose=False, precision=precision, ops=ops)
+    # a short run first: its time against the long one's leaves fit's own start and end (the weights to the card
+    # and back) out of the steady speed, the number a long training run sees
+    short = max(1, steps // 3)
+    ops.sync()
+    t0 = time.perf_counter()
+    GT.fit(model, params, X[:short * batch], Y[:short * batch], loss="cross_entropy", opt=adamw(lr=1e-3), epochs=1,
+           batch_size=batch, verbose=False, precision=precision, ops=ops)
+    ops.sync()
+    wall_short = time.perf_counter() - t0
     with _Sampler() as smp:
         ops.sync()
+        n0, c0 = getattr(ops, "launches", 0), time.thread_time()
         t0 = time.perf_counter()
         r = GT.fit(model, params, X, Y, loss="cross_entropy", opt=adamw(lr=1e-3), epochs=1, batch_size=batch,
                    verbose=False, precision=precision, ops=ops)
         ops.sync()
         wall = time.perf_counter() - t0
+        cpu, nl = time.thread_time() - c0, getattr(ops, "launches", 0) - n0
     tps = tokens / wall
     card = smp.summary()
     # the kernels of a few steps, timed on the card's own clock
@@ -114,10 +125,17 @@ def bench(which="127m", steps=40, precision="auto", out=sys.stdout):
         print(f"(no kernel profile: {e})", file=out)
     k_total = sum(t for t, _ in prof.values())
     k_tps = 4 * batch * cfg["context"] / k_total if k_total else None
+    steady = (steps - short) * batch * cfg["context"] / (wall - wall_short) if steps > short and wall > wall_short \
+        else None
     print(f"\n  {tps:,.0f} tokens/s over {wall:.1f} s (loss {r.history[0]:.3f})", file=out)
+    if steady:
+        print(f"  {steady:,.0f} tokens/s steady (fit's own start and end left out: the speed of a long run)", file=out)
     if k_tps:
         print(f"  {k_tps:,.0f} tokens/s if the card did nothing but these kernels "
               f"(the rest is waiting: launches, the processor, cooling)", file=out)
+    if nl:
+        print(f"  {nl / steps:.0f} kernel launches a step; the processor busy {1000 * cpu / steps:.1f} ms of each "
+              f"{1000 * wall / steps:.1f} ms step (the thread that launches)", file=out)
     if card.get("temperature_c_mean") is not None:
         line = f"  {card.get('card')}: {card.get('temperature_c_mean')} C mean, {card.get('temperature_c_max')} C max"
         if card.get("power_w_mean"):
@@ -160,6 +178,7 @@ def bench(which="127m", steps=40, precision="auto", out=sys.stdout):
             for t, name, c, tf in sorted(rows, reverse=True)[:30]:
                 print(f"  {name:<52} {c // 4:>5} {1000 * t / 4:8.2f}  {tf:6.1f}", file=out)
     rec = {"bench": which, "params_m": round(count / 1e6, 1), "precision": precision, "tokens_per_s": round(tps),
+           "steady_tokens_per_s": round(steady) if steady else None,
            "kernel_tokens_per_s": round(k_tps) if k_tps else None, "card": card,
            "kernels_ms_per_step": {g: round(1000 * t / 4, 3) for g, (t, _) in prof.items()} if prof else {},
            "apsi": __import__("apsi").__version__}
