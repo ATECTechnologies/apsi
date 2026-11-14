@@ -28,7 +28,7 @@ MAIN = ("apsi_kernel", "axpy", "add3", "mul3", "act_f", "act_b", "colsum", "ln_f
         "gemm_simt", "gather", "rope", "spmm", "edge_dot", "seg_softmax", "seg_softmax_b", "dot_acc", "scale_add",
         "cols", "colmul", "topk_gate", "topk_gate_b", "loss_ew", "im2col", "col2im", "perm_nc", "pool_f", "pool_b",
         "lstm_f", "lstm_b", "gru_a", "gru_b", "gru_b1", "gru_b2", "taylor_f", "taylor_b", "rowbias", "acc2",
-        "fin2", "ew1", "ew2", "colsum_fin", "embed_bs", "parts_sum", "ksum", "tanh_s", "axpy_s", "gate_g", "pad2")
+        "fin2", "ew1", "ew2", "colsum_fin", "embed_bs", "embed_rank", "embed_runs", "parts_sum", "ksum", "tanh_s", "axpy_s", "gate_g", "pad2")
 TC = ("apsi_kernel", "gemm_tc3")                     # apsi_kernel = the one-pass product
 # bytes of dynamic shared memory of the deep builds (3 stages of 128 x 32 tiles of A and B, rows padded to 40 halves)
 DYN_BYTES = 3 * 2 * max(128 * 40, 32 * 136) * 2
@@ -545,6 +545,47 @@ def _main_module():
         at = b.add(b.mul(i64of(b, k.ld(p["ROWS"], u)), i64of(b, p["D"])), i64of(b, d))
         k.st(b.fadd(k.ld(p["DE"], at), b.load(s)), p["DE"], at)
     k.grid_loop(b.mul(p["U"], p["D"]), embbs)
+    k.ret()
+
+    # embed_rank / embed_runs: the same sums as embed_bs with no trip to the processor (which made every step wait
+    # for the card there): token i goes to place (tokens with a smaller id) + (earlier tokens with its id) of the
+    # tokens sorted by id, stably; LEN marks where each id's run starts and how long it is. Then one thread per
+    # (run, column) sums its positions in order: the same bits as the sorted order of embed_bs.
+    k = K("embed_rank", [("IDS", G(i32)), ("M", i32), ("POS", G(i32)), ("SID", G(i32)), ("LEN", G(i32))])
+    b, p = k.b, k.p
+
+    def erank(i):
+        me = k.ld(p["IDS"], i)
+        less, same, before = k.var(C(0)), k.var(C(0)), k.var(C(0))
+
+        def scan(j):
+            v = k.ld(p["IDS"], j)
+            eq = b.icmp_signed("==", v, me)
+            b.store(b.add(b.load(less), b.zext(b.icmp_signed("<", v, me), i32)), less)
+            b.store(b.add(b.load(same), b.zext(eq, i32)), same)
+            b.store(b.add(b.load(before), b.zext(b.and_(eq, b.icmp_unsigned("<", j, i)), i32)), before)
+        k.loop(C(0), p["M"], C(1), scan)
+        at = b.add(b.load(less), b.load(before))
+        k.st(i, p["POS"], at)
+        k.st(me, p["SID"], at)
+        k.st(b.select(b.icmp_unsigned("==", b.load(before), C(0)), b.load(same), C(0)), p["LEN"], at)
+    k.grid_loop(p["M"], erank)
+    k.ret()
+
+    k = K("embed_runs", [("DY", G(f32)), ("POS", G(i32)), ("SID", G(i32)), ("LEN", G(i32)), ("DE", G(f32)),
+                         ("M", i32), ("D", i32)])
+    b, p = k.b, k.p
+
+    def eruns(i):
+        r, d = b.udiv(i, p["D"]), b.urem(i, p["D"])
+        n = k.ld(p["LEN"], r)
+        with b.if_then(b.icmp_unsigned("!=", n, C(0))):
+            sm = k.var(F(0.0))
+            k.loop(r, b.add(r, n), C(1), lambda j: b.store(b.fadd(b.load(sm), k.ld(p["DY"], b.add(
+                b.mul(i64of(b, k.ld(p["POS"], j)), i64of(b, p["D"])), i64of(b, d)))), sm))
+            at = b.add(b.mul(i64of(b, k.ld(p["SID"], r)), i64of(b, p["D"])), i64of(b, d))
+            k.st(b.fadd(k.ld(p["DE"], at), b.load(sm)), p["DE"], at)
+    k.grid_loop(b.mul(p["M"], p["D"]), eruns)
     k.ret()
 
     k = K("pos_f", [("X", G(f32)), ("P", G(f32)), ("Y", G(f32)), ("M", i32), ("D", i32), ("T", i32)])
@@ -1919,7 +1960,7 @@ def _tiled_module(early=False, wide=False, h=False, deep=False, stages=None, swz
             ("sam", i32), ("sak", i32), ("sbk", i32), ("sbn", i32), ("ldc", i32), ("nb2", i32), ("a1", i32),
             ("a2", i32), ("b1", i32), ("b2", i32), ("c1", i32), ("c2", i32), ("alpha", f32), ("beta", i32),
             ("has_bias", i32), ("kchunk", i32), ("X2", G(f32)), ("epi", i32), ("act", i32), ("DB", G(f32)),
-            ("want_db", i32), ("CNT", G(i32))]
+            ("want_db", i32), ("CNT", G(i32)), ("Y16", G(i16)), ("y16", i32)]
     membar_t = d("llvm.nvvm.membar.gl", ir.VoidType(), [])
     ld_cg_t = ir.InlineAsm(ir.FunctionType(f32, [i64]), "ld.global.cg.f32 $0, [$1];", "=f,l", side_effect=True)
 
@@ -2277,6 +2318,11 @@ def _tiled_module(early=False, wide=False, h=False, deep=False, stages=None, swz
                             b.store(b.trunc(rne(b.load(tmp)), i16), cp16, align=2)
                         else:
                             b.store(b.load(tmp), ptr, align=4)
+                            # y16: C's bfloat16 twin written in the same pass (the next products read it instead
+                            # of a conversion pass of their own)
+                            with b.if_then(b.icmp_unsigned("!=", p["y16"], C(0))):
+                                yp = b.gep(p["Y16"], [idx], inbounds=True)
+                                b.store(b.trunc(rne(b.load(tmp)), i16), yp, align=2)
 
         # The accumulators go through shared memory (free by now) a few rows of tiles at a time, and each warp then
         # walks its rows with a loop: the epilogue is emitted for one or two columns per lane instead of once per
