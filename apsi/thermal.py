@@ -325,12 +325,34 @@ class _PowerControl:
                 return None
             pc.set = lambda mw: gpu_helper.call("set", gpu=index, mw=int(mw))
             pc.via = "through the GPU helper"
-        pc.orig = cur.value
+        # the limit to put back: the one found before ANY Apsi program changed it. A run that was killed (its window
+        # closed) never put its lowered limit back; the next run would then take that low limit for the card's own
+        # and keep the card slow for good. So the first change records the original in a small file, every run
+        # restores from it, and the file goes when the limit is back.
+        state = _power_state_file(index)
+        orig = _read_power_state(state)
+        if orig is None:
+            orig = cur.value
+            _write_power_state(state, orig)
+        elif orig != cur.value:
+            pc_set = (lambda mw: lib.nvmlDeviceSetPowerManagementLimit(h, ctypes.c_uint(int(mw)))) if direct else \
+                (lambda mw: __import__("apsi.gpu_helper", fromlist=["x"]).call("set", gpu=index, mw=int(mw)))
+            pc_set(orig)                               # a killed run's limit: back to the card's own first
+        pc.orig = orig
         pc.top = dflt.value
         pc.floor = max(lo.value, int(dflt.value * 0.55))
-        pc.limit = float(cur.value)
+        pc.limit = float(orig)
+        pc.state = state
         import atexit
-        atexit.register(lambda: pc.set(pc.orig))
+
+        def _restore():
+            pc.set(pc.orig)
+            try:
+                os.remove(state)
+            except OSError:
+                pass
+        pc.restore = _restore
+        atexit.register(_restore)
         return pc
 
     def step(self, err, dt):
@@ -341,6 +363,28 @@ class _PowerControl:
                 self.set(int(new))
         self.limit = new
         return new <= self.floor + 1.0                 # at the floor: pauses may still be needed
+
+
+def _power_state_file(index):
+    import tempfile
+    return os.path.join(tempfile.gettempdir(), f"apsi-gpu{int(index)}-power-limit.txt")
+
+
+def _read_power_state(path):
+    try:
+        with open(path) as fh:
+            v = int(fh.read().strip())
+        return v if v > 0 else None
+    except (OSError, ValueError):
+        return None
+
+
+def _write_power_state(path, mw):
+    try:
+        with open(path, "w") as fh:
+            fh.write(str(int(mw)))
+    except OSError:
+        pass
 
 
 def _power_limit(lib, h):
@@ -504,7 +548,7 @@ def hold(target=77.0, index=0, seconds=None, quiet=False):
     except KeyboardInterrupt:
         pass
     finally:
-        g.power.set(g.power.orig)
+        (getattr(g.power, "restore", None) or (lambda: g.power.set(g.power.orig)))()
     return 0
 
 

@@ -16,6 +16,13 @@
   C's speed).
 - **Products whose sizes are not multiples of 4** (a SwiGLU width of 2730, an odd vocabulary) run on the tiled
   tensor-core kernels through zero-padded copies instead of the general kernel (`APSI_GEMM_PAD=0` turns it off).
+- **bfloat16 training no longer keeps compensated weights by default:** the compensation (4 bytes per parameter and
+  a fifth array for AdamW to read and write every step) stays on by default for fp32 training, where it keeps
+  updates smaller than float32's step; in bf16 the products round every gradient far more coarsely, so it only cost
+  memory and time: 0.5 GB less on the card for the 127 M GPT, and a lighter optimizer step. `compensated=true` or
+  `APSI_GPU_COMPENSATED=1` turns it on.
+- `APSI_SPLITK=off|2|4|auto` fixes how the weight-gradient products split their long k (for tuning a card);
+  `tools/tune_gpu.bat` measures every setting on this card.
 
 ### Converting Python: one file, its imports, or the whole project
 - `apsi convert app.py` converts the file and every module of the program it imports (as before);
