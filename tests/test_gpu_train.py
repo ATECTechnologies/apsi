@@ -1140,3 +1140,28 @@ class PrecisionDefault(unittest.TestCase):
         with mock.patch.dict(os.environ, {"APSI_PRECISION": "fp32"}):
             self.assertEqual(GT.resolve_precision("auto"), "fp32")
             self.assertEqual(GT.resolve_precision("bf16"), "bf16")      # the argument wins
+
+
+class NoInPlaceProducts(unittest.TestCase):
+    """dy W^T never writes over its own dy: the gradient buffers are shared by nodes two apart, and a linear layer
+    with a fused activation made the layer two places on one of them (wrong results on the card, worse with the
+    weight gradient on a second stream)."""
+
+    def test_mlp_stack(self):
+        from apsi.stdlib import adamw
+        seen = []
+        orig = GT._Ops.gemm
+
+        def spy(self, A, B, C, *a, **k):
+            if A[0] is C[0] or B[0] is C[0]:
+                seen.append(a[:3])
+            return orig(self, A, B, C, *a, **k)
+        m = L.Sequential([L.Linear(8, 16), L.Activation("relu"), L.Linear(16, 16), L.Activation("relu"),
+                          L.Linear(16, 16), L.Activation("gelu"), L.Linear(16, 4)])
+        X = np.random.default_rng(0).standard_normal((32, 8)).astype(np.float32)
+        Y = np.zeros((32, 4), np.float32)
+        from unittest import mock
+        with mock.patch.object(GT._Ops, "gemm", spy):
+            GT.fit(m, m.init(seed=0), X, Y, loss="mse", opt=adamw(lr=1e-3), epochs=1, batch_size=32,
+                   verbose=False, ops=GT.Emulator())
+        self.assertEqual(seen, [])

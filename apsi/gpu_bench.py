@@ -330,7 +330,7 @@ def gemm(out=sys.stdout, reps=20):
     if ops is None:
         print(f"no GPU: {why}", file=out)
         return 1
-    builds = ["a", "x", "w", "h", "v", "d", "e"]
+    builds = ["a", "x", "w", "h", "v", "d", "e", "f", "g"]
     rng = np.random.default_rng(0)
     print(f"{getattr(ops, 'name', '?')}: matrix products, every build (TFLOPS; error relative to the largest value)",
           file=out)
@@ -364,11 +364,12 @@ def gemm(out=sys.stdout, reps=20):
                 ops.sync()
                 got = ops.get(Cb, M * N).reshape(M, N).astype(np.float64)
                 err = float(np.max(np.abs(got - ref)) / max(1e-12, np.max(np.abs(ref))))
-                t0 = time.perf_counter()
+                ops.start_profile()                      # the card's own clock: the kernels alone
                 for _ in range(reps):
                     ops.gemm((A, 0), (B, 0), (Cb, 0), M, N, K, sam, sak, sbk, sbn, N)
-                ops.sync()
-                tf = 2.0 * M * N * K * reps / (time.perf_counter() - t0) / 1e12
+                prof = ops.stop_profile()
+                kt = sum(t for name, (t, c) in prof.items() if name.startswith("gemm"))
+                tf = 2.0 * M * N * K * reps / max(kt, 1e-9) / 1e12
                 ok = np.isfinite(err) and err < 1e-2
                 bad += 0 if ok else 1
                 cells.append(f"{tf:5.1f}{'' if ok else ' WRONG'} {err:.0e}"[:13])

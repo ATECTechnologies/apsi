@@ -32,6 +32,7 @@ MAIN = ("apsi_kernel", "axpy", "add3", "mul3", "act_f", "act_b", "colsum", "ln_f
 TC = ("apsi_kernel", "gemm_tc3")                     # apsi_kernel = the one-pass product
 # bytes of dynamic shared memory of the deep builds (3 stages of 128 x 32 tiles of A and B, rows padded to 40 halves)
 DYN_BYTES = 3 * 2 * max(128 * 40, 32 * 136) * 2
+DYN_BYTES2 = 2 * 2 * max(128 * 40, 32 * 136) * 2      # (the two-stage deep builds)
 
 
 def _setup(name):
@@ -1835,7 +1836,7 @@ EPI_KERNELS = tuple([(f"gemm_tkn_e1a{j}", True, False, 1, j) for j in EPI_ACTS] 
                     [(f"gemm_tkk_e2a{j}", True, True, 2, j) for j in EPI_ACTS] + [("gemm_tkn_e3", True, False, 3, None)])
 
 
-def _tiled_module(early=False, wide=False, h=False, deep=False):
+def _tiled_module(early=False, wide=False, h=False, deep=False, stages=None):
     """Matrix products on tensor cores with shared-memory tiles (sm_80+), the way fast GEMM libraries do them.
 
     A block of 8 warps computes 128 x 128 of C; each warp 64 x 32 (4 x 4 mma tiles of 16 x 8). The operands are read
@@ -1858,13 +1859,13 @@ def _tiled_module(early=False, wide=False, h=False, deep=False):
     # deep (with h): slices of 32 k, three in flight (the shape CUTLASS uses on Ampere for bfloat16: 128 x 128 x 32,
     # 3 stages): half the barriers of slices of 16; the 60 KB of tiles are dynamic shared memory (above the 48 KB a
     # static array may take), so one block of 8 warps (or 4 with wide) per multiprocessor
-    STAGES = 3 if deep else 4 if h else 2
+    STAGES = stages or (3 if deep else 4 if h else 2)
     BKv, NTH, WNW = ((32, 128, 2) if wide else (32, 256, 4)) if deep else \
         (16, 128, 2) if wide else (16, 256, 4) if h else (BK, 256, 4)
     NTL = BN // WNW // 8                          # n8 tiles per warp
     PADv = BKv + 8
     VPR = BKv // 4                                # float32 vectors of 4 per row of a k-contiguous slice
-    ir, m = _setup(("apsi_train_tiled_dw" if wide else "apsi_train_tiled_d") if deep else
+    ir, m = _setup((("apsi_train_tiled_dw" if wide else "apsi_train_tiled_d") + (f"_s{stages}" if stages else "")) if deep else
                    "apsi_train_tiled_v" if (h and wide) else "apsi_train_tiled_h" if h else "apsi_train_tiled_w"
                    if wide else "apsi_train_tiled_x" if early else "apsi_train_tiled")
     annotations = m.add_named_metadata("nvvm.annotations")
@@ -2805,6 +2806,10 @@ def ptx(which):
             "tiled_v": lambda: _tiled_module(True, True, True),
             "tiled_d": lambda: _tiled_module(False, False, True, True),
             "tiled_dw": lambda: _tiled_module(True, True, True, True),
+            # two stages of slices of 32: 40 KB of tiles, so two blocks share a multiprocessor (more warps to hide
+            # the waits) where three stages (60 KB) leave room for one
+            "tiled_d2": lambda: _tiled_module(False, False, True, True, 2),
+            "tiled_dw2": lambda: _tiled_module(True, True, True, True, 2),
             "flash": _flash_module}[which]()
     if path:
         try:
