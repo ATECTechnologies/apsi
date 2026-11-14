@@ -53,7 +53,7 @@ def main():
         Am = a_h.reshape(M, K) if a_kc else a_h.reshape(K, M).T
         Bm = b_h.reshape(K, N) if b_nc else b_h.reshape(N, K).T
         ref = Am[:256].astype(np.float64) @ Bm.astype(np.float64)       # the first 256 rows, to check every build
-        for v in ("auto", "x", "w", "h", "v", "a"):
+        for v in ("auto", "x", "w", "h", "v", "d", "e", "a"):
             os.environ["APSI_GEMM_VARIANT"] = v
             ops._choice = {}
             ops.fill((Cb, 0), M * N, 0.0)
