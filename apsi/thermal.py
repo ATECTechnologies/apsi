@@ -155,6 +155,10 @@ class Governor:
                                                 ceiling=getattr(self, "ceiling", None)) and self.integral == 0.0:
             self.fraction = 0.0                         # the power limit holds it: no pauses, steady speed
             return
+        pf = getattr(self, "pace_from", None)
+        if pf is not None and t < pf:                   # a power floor: the speed is kept, the card runs warmer
+            self.fraction, self.integral = 0.0, 0.0
+            return
         if self.fraction > 0.0 or e > 0.0:              # a cool card that is not paced winds nothing up
             gain = self.KI * (8.0 if e > 2.0 else 3.0 if e > 1.0 else 1.0)    # far above: catch up fast
             self.integral = min(0.85, max(0.0, self.integral + gain * e * dt))
@@ -304,11 +308,17 @@ def governor(dev):
                 g.fan = None if prof and prof.get("fans") is False else \
                     _FanControl.try_make(lib, h, key, getattr(g.power, "via", "") == "directly", prof)
                 g.power.run = float(g.power.limit)
-                if g.fan is not None:                   # the fans hold the temperature: the power can go up
-                    want = _train_power(g.power, prof)
-                    if want > g.power.limit + 500.0:
-                        g.power.set(int(want))
-                        g.power.limit = g.power.applied = g.power.run = float(want)
+                # the training power: fixed (145 W by default) and never below the floor (135 W by default), with or
+                # without fan control; the temperature is held by the fans first, the power only down to the floor,
+                # and pauses only as the card's own protection near 87 C
+                fl = _power_floor(g.power)
+                if fl is not None:
+                    g.power.floor = max(int(g.power.floor), int(fl))
+                    g.pace_from = 87.0
+                want = _train_power(g.power, prof)
+                if abs(want - g.power.limit) >= 500.0:
+                    g.power.set(int(want))
+                    g.power.limit = g.power.applied = g.power.run = float(want)
             if g.power is not None:
                 g.power_note = (f"fixed power limit set {g.power.via}; the fans hold the temperature"
                                 if getattr(g, "fan", None) is not None else
@@ -497,14 +507,15 @@ class _PowerControl:
 
 
 def _fan_range(prof=None):
-    """APSI_GPU_FAN_MIN / _MAX, else the card's measured range (apsi gpu calibrate), else 70-82 %."""
+    """APSI_GPU_FAN_MIN (else the card's measured bottom, else 70 %) to APSI_GPU_FAN_MAX (default 100 %: the power
+    stays at 135-145 W, so the fans may go all the way before anything else)."""
     def pct(name, d):
         try:
             return max(0.0, min(100.0, float(os.environ.get(name, "").strip().rstrip("%") or d)))
         except ValueError:
             return float(d)
     prof = prof or {}
-    lo, hi = pct("APSI_GPU_FAN_MIN", prof.get("fan_min", 70)), pct("APSI_GPU_FAN_MAX", prof.get("fan_max", 82))
+    lo, hi = pct("APSI_GPU_FAN_MIN", prof.get("fan_min", 70)), pct("APSI_GPU_FAN_MAX", 100)
     return min(lo, hi), max(lo, hi)
 
 
@@ -519,7 +530,7 @@ class _FanControl:
     is well below the ceiling and at exit. Needs the rights of the power limit (administrator or the GPU helper);
     APSI_GPU_FAN=0 leaves the fans alone (the power limit holds the temperature instead)."""
 
-    LOW, TOP = 70.0, 82.0               # the range it steers in (APSI_GPU_FAN_MIN / APSI_GPU_FAN_MAX)
+    LOW, TOP = 70.0, 100.0              # the range it steers in (APSI_GPU_FAN_MIN / APSI_GPU_FAN_MAX)
 
     @staticmethod
     def try_make(lib, h, index, direct, prof=None):
@@ -612,22 +623,33 @@ def _profile(lib, h, index):
         return None
 
 
-def _train_power(pc, prof=None):
-    """The fixed power limit of a training run while the fans hold the temperature, in mW: APSI_GPU_TRAIN_POWER
-    (watts like 145W, or a share of the card's default like 85%), else what apsi gpu calibrate measured for this
-    card, else 85 % of its default (an RTX 3060: 145 of 170 W); never below the limit the card has and never above
-    its default. off: the card's limit as it is."""
-    v = os.environ.get("APSI_GPU_TRAIN_POWER", "").strip().lower()
-    if not v:                                       # the card's measured setting, else 85 % of its default
-        v = f"{prof['power_w']}w" if prof and prof.get("power_w") else "85%"
-    cur = float(pc.limit)
+def _watts(v, pc):
+    v = v.strip().lower()
     if v in ("", "off", "0", "no", "none"):
-        return cur
+        return None
     try:
-        mw = float(v[:-1]) / 100.0 * pc.top if v.endswith("%") else float(v.rstrip("w")) * 1000.0
+        return float(v[:-1]) / 100.0 * pc.top if v.endswith("%") else float(v.rstrip("w")) * 1000.0
     except ValueError:
+        return None
+
+
+def _power_floor(pc):
+    """The lowest power limit a training run goes to, in mW (APSI_GPU_POWER_FLOOR, default 135W; off: 55 % of the
+    default as before), never above the card's default."""
+    mw = _watts(os.environ.get("APSI_GPU_POWER_FLOOR", "135W"), pc)
+    return None if mw is None else min(float(pc.top), mw)
+
+
+def _train_power(pc, prof=None):
+    """The fixed power limit of a training run, in mW: APSI_GPU_TRAIN_POWER (watts like 145W, or a share of the
+    card's default like 85%; default 145W), never below the floor (APSI_GPU_POWER_FLOOR, 135W) and never above the
+    card's default. off: the card's limit as it is. (The calibration's measurement sets the fans, not the power.)"""
+    cur = float(pc.limit)
+    mw = _watts(os.environ.get("APSI_GPU_TRAIN_POWER", "145W"), pc)
+    if mw is None:
         return cur
-    return min(float(pc.top), max(cur, mw))
+    fl = _power_floor(pc) or 0.0
+    return min(float(pc.top), max(fl, mw))
 
 
 def _power_state_file(index):

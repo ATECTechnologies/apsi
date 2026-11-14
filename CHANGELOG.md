@@ -28,15 +28,15 @@
 - **The held-out loss is computed on the card:** each batch's logits stay there and the loss kernel adds the mean
   into one number (before: every batch's logits were copied back and the softmax taken in float64 on the processor,
   hundreds of MB and seconds per evaluation with the card idle).
-- **Fixed power, the fans hold the temperature:** while training, the card runs at a fixed power limit (measured per
-  card, else 85 % of the default — 145 W on an RTX 3060; `APSI_GPU_TRAIN_POWER=140W` or `85%`; never below the card's own limit, never above its default) and its
-  fans are steered between 70 and 82 % (`APSI_GPU_FAN_MIN` / `APSI_GPU_FAN_MAX`) to hold 78.5 °C: the error now, the
-  error 4 s ahead along the slope, and a feed-forward from the power drawn (heat that is in the die but not yet on the
-  sensor). The power limit moves only when the fans are at the top of their range and the card is still at the
-  ceiling, a few watts at a time, and comes back while the fans stay at the top. Before, the power limit itself held
-  the temperature: the clocks fell with it (about 20 % less speed at 106 W), and at its floor the work was paused,
-  which left the card idle between 40 and 90 % of the time. The driver's fan curve comes back when the card is well
-  below the ceiling and at exit; `APSI_GPU_FAN=0` leaves the fans alone (the power limit holds it then).
+- **Fixed power, the fans hold the temperature:** while training, the card runs at a fixed 145 W
+  (`APSI_GPU_TRAIN_POWER=140W` or `85%`) and never below 135 W (`APSI_GPU_POWER_FLOOR`; never above the card's
+  default), and its fans are steered from 70 % up to 100 % (`APSI_GPU_FAN_MIN` / `APSI_GPU_FAN_MAX`) to hold
+  78.5 °C: the error now, the error 4 s ahead along the slope, and a feed-forward from the power drawn (heat that is
+  in the die but not yet on the sensor). Only with the fans at full and the card still at the ceiling does the power
+  come down, slowly and no further than 135 W; past that the card runs warmer rather than slower (pauses only as
+  protection from 87 °C). Before, the power limit itself held the temperature: the clocks fell with it (to 106-112 W
+  on an RTX 3060), and at its floor the work was paused. The driver's fan curve comes back when the card is well
+  below the ceiling and at exit; `APSI_GPU_FAN=0` leaves the fans alone.
 - **bfloat16 is the default precision, said at the start of every run** (`precision="fp32"` or `APSI_PRECISION=fp32`
   for float32-exact products as three bfloat16 products, 3× the time; the low-bit formats as before).
 - **Each card measured once, at install:** `apsi gpu setup` (the installer's GPU step, and the GPU Tuner) now also

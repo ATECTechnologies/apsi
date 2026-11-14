@@ -303,26 +303,15 @@ the speed stay level, and a card that stays cool is never slowed.
 | `APSI_GPU_TEMP=max` | the card's full default power limit for the run (put back at exit), its own fan curve and temperature limits (about 83 °C): the speed PyTorch gets when nothing holds the temperature |
 
 **Fixed power, the fans hold the temperature.** With the rights to set the card's limits (administrator, or the
-GPU helper below), Apsi does not lower the power to cool the card: the run trains at a fixed power limit (the one
-`apsi gpu calibrate` measured for this card, else 85 % of its default — 145 W on an RTX 3060; `APSI_GPU_TRAIN_POWER=140W`
-or `85%` sets it; never below the card's own limit, never above its default), the clocks and the speed stay level, and the card's fans are steered between 70 and 82 %
-(measured per card too; `APSI_GPU_FAN_MIN`, `APSI_GPU_FAN_MAX`) to hold it at 78.5 °C — the error now, the error 4 s ahead along the
-temperature's slope, and a feed-forward from the power drawn, so the fans answer a heavy phase as it starts. Only if
-the fans are at the top of their range and the card is still at the ceiling (a blocked cooler, a
-hot room) does the power limit come down, a few watts at a time, and it goes back as soon as the fans have room
-again (the fans stay at the top until it is back). Below the band the driver's own fan curve is in charge, and it is put back at exit. In a simulated card (rooms
-from 25 to 42 °C, load changing every 40 s) it never reads 80, holds 77–79 under full load and never touches the
-power unless the fans are at full (tests/test_thermal.py). `APSI_GPU_FAN=0` leaves the fans alone; the power limit
-then holds the temperature as before (it looks ahead, cuts fast, gives back at most 2 W a second).
-
-**Steady speed: the power limit instead of pauses (administrator).** When Apsi runs as an administrator (Windows)
-or root (Linux), it holds the temperature by moving the card's power limit (between 55 % and 100 % of the default)
-rather than pausing: the card then runs at slightly lower clocks and voltage, where it does more work per watt, so the
-speed stays level (typically 95 % or more of full speed) and the temperature stays at the target. Without those
-rights Apsi cannot change the card's limits and paces the work instead: the temperature is just as steady, but the
-speed falls as far as the cooler needs (on the RTX 3060 in a small case: from 141,000 to about 100,000 tokens/s once
-the card is warm). `APSI_GPU_POWER_CONTROL=0` keeps pauses only. Better airflow or a higher fan curve gives the speed
-back in both cases.
+GPU helper below), Apsi does not lower the power to cool the card: the run trains at a fixed 145 W
+(`APSI_GPU_TRAIN_POWER=140W` or `85%`) and never below 135 W (`APSI_GPU_POWER_FLOOR`; never above the card's
+default), so the clocks and the speed stay level, and the card's fans are steered from 70 % up to 100 %
+(`APSI_GPU_FAN_MIN`, `APSI_GPU_FAN_MAX`) to hold it at 78.5 °C — the error now, the error 4 s ahead along the
+temperature's slope, and a feed-forward from the power drawn, so the fans answer a heavy phase as it starts. Only
+if the fans are at full and the card is still at the ceiling does the power come down, a few watts at a time and no
+further than 135 W; past that the card runs warmer rather than slower (pauses only as protection from 87 °C).
+Below the band the driver's own fan curve is in charge, and it is put back at exit. `APSI_GPU_FAN=0` leaves the fans
+alone. `APSI_GPU_TEMP=max` gives the card its full default power and its own limits instead (as PyTorch runs it).
 
 **Measured per card: `apsi gpu calibrate`.** About 2.5 minutes of matrix products at a trial power, with the fans
 at the top and then at the bottom of their range. Each temperature curve is fitted to T(t) = T_end + (T_start − T_end)
