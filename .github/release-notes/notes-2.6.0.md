@@ -57,6 +57,9 @@ identical weights; steps and resume bit for bit; the NaN guard).
   it differs (`APSI_GEMM_VERIFY=0` skips the check).
 - **Fewer stalls from the power limit:** when it holds the temperature, changes are at least 1 W and 1 s apart
   (each change makes the driver re-plan the clocks).
+- **`APSI_GPU_TEMP=max`: the card as PyTorch runs it:** the full default power limit for the run (170 W on an RTX
+  3060, put back at exit), the card's own fan curve and temperature limits (the driver slows the clocks near 83 °C);
+  Apsi only reports. For the fastest training and for comparisons with programs that hold nothing.
 - **No idle gaps on Windows:** WDDM gathers launches into batches; every 32 launches a non-blocking stream query now
   hands them to the card at once (`APSI_GPU_FLUSH=N`, 0 = off).
 - **bfloat16 twins instead of a conversion per product:** a layer norm writes its output's bfloat16 twin in the same

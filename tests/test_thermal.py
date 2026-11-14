@@ -368,3 +368,26 @@ class CalibrateNoFans(Calibrate):
         self.assertIs(prof["fans"], False)
         self.assertLess(prof["power_w"], 170.0)
         self.assertFalse(st["load"])
+
+
+class MaxMode(unittest.TestCase):
+    def test_full_power_never_paces(self):
+        class PC:
+            top, limit, via = 170000, 136000.0, "directly"
+            seen = []
+
+            def set(self, mw):
+                PC.seen.append(mw)
+        with mock.patch.object(thermal._PowerControl, "try_make", staticmethod(lambda *a: PC())), \
+                mock.patch.dict(os.environ, {"APSI_GPU_TEMP": "max"}):
+            temps = iter([86.0] * 1000)
+            g = thermal._max_governor(None, None, 0, lambda: next(temps))
+            self.assertEqual(PC.seen, [170000])
+            g.retarget(79.0)
+            clock = [0.0]
+            with mock.patch.object(thermal.time, "monotonic", lambda: clock[0]):
+                for _ in range(200):
+                    clock[0] += 0.1
+                    g.tick()
+            self.assertEqual(g.fraction, 0.0)
+            self.assertEqual(g.paced, 0.0)

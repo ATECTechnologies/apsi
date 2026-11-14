@@ -300,6 +300,7 @@ the speed stay level, and a card that stays cool is never slowed.
 |---|---|
 | `APSI_GPU_TEMP=79` | the ceiling in °C (default 79: held at 78–79); any value from 50 to 95 |
 | `APSI_GPU_TEMP=off` | no control (the card's own limits only) |
+| `APSI_GPU_TEMP=max` | the card's full default power limit for the run (put back at exit), its own fan curve and temperature limits (about 83 °C): the speed PyTorch gets when nothing holds the temperature |
 
 **Fixed power, the fans hold the temperature.** With the rights to set the card's limits (administrator, or the
 GPU helper below), Apsi does not lower the power to cool the card: the run trains at a fixed power limit (the one
