@@ -88,16 +88,16 @@ def plan(idle, settled_hi, watts_hi, settled_lo, watts_lo, top_w, own_w, ceiling
     """The settings from the measurements: degrees per watt with the fans at the top (r_hi) and at the bottom (r_lo)
     of the range; the power the fans hold at the ceiling - 1.5 (never below the card's own limit, never above its
     default); the fan range: the bottom raised when even the bottom cannot hold that power, the top raised (up to
-    95 %) when the top of the range would hold less than the card's own limit."""
+    100 %) when the top of the range would hold less than the card's own limit."""
     hold = ceiling - 1.5
     r_hi = max(1e-3, (settled_hi - idle) / max(1.0, watts_hi))
     r_lo = max(r_hi, (settled_lo - idle) / max(1.0, watts_lo))
     lo, hi = fan_lo, fan_hi
     watts = (hold - idle) / r_hi
-    if watts < own_w and hi < 95.0:
+    if watts < own_w and hi < 100.0:
         # the slope per fan percent, from the two phases, extends the range upwards
         per = (r_lo - r_hi) / max(1.0, hi - lo)
-        while watts < own_w and hi < 95.0:
+        while watts < own_w and hi < 100.0:
             hi += 1.0
             watts = (hold - idle) / max(1e-3, r_hi - per * (hi - fan_hi))
     watts = max(float(own_w), min(float(top_w), 0.97 * watts))
@@ -222,7 +222,7 @@ def calibrate(index=0, ceiling=None, say=print):
                        pc.orig / 1000.0, ceiling, say=say)
     finally:
         pc.restore()
-    prof.update(name=name, measured=time.strftime("%Y-%m-%d"), v=2)
+    prof.update(name=name, measured=time.strftime("%Y-%m-%d"), v=3)
     save_profile(card_key(name, index), prof)
     if prof.get("fans") is False:
         return [f"GPU {index} {name}: the fans cannot be set here; about {prof['power_w']:.0f} W holds "

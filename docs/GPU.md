@@ -327,7 +327,7 @@ back in both cases.
 at the top and then at the bottom of their range. Each temperature curve is fitted to T(t) = T_end + (T_start − T_end)
 e^(−t/τ), so the temperature the card would settle at is known without waiting for it; from the degrees per watt at
 each fan speed come the highest power the fans hold at 77.5 °C and the quietest fan range that holds it (widened up to
-95 % on a hot card). Saved in `~/.apsi/gpu-profile.json`, used by every run, measured again by running it again (after
+100 % on a hot card). Saved in `~/.apsi/gpu-profile.json`, used by every run, measured again by running it again (after
 cleaning the cooler or a new case). `apsi gpu setup` runs it at the end (`APSI_GPU_CALIBRATE=0` skips it). Safety: the
 trial power drops 10 % at the ceiling + 1, the load stops at the ceiling + 3, and the card's own fan curve and power
 limit come back at the end.
