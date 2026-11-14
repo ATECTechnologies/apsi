@@ -10,6 +10,7 @@ Reports tokens per second (steady, after the first steps), the time of each kind
 power and the energy per token, and ends with one JSON line to send back when asking for tuning. The data is random
 tokens made here: nothing is downloaded."""
 import json
+import os
 import sys
 import threading
 import time
@@ -309,6 +310,77 @@ def _check_tensors(ops, out):
     return 0 if ok else 1
 
 
+GEMM_SHAPES = (               # (label, M, N, K, A k-contiguous, B n-contiguous): the 127 M GPT's large products
+    ("x W      4096 x 1024 x 1024", 4096, 1024, 1024, True, True),
+    ("x W1     4096 x 4096 x 1024", 4096, 4096, 1024, True, True),
+    ("h W2     4096 x 1024 x 4096", 4096, 1024, 4096, True, True),
+    ("dy W^T   4096 x 1024 x 1024", 4096, 1024, 1024, True, False),
+    ("dy W2^T  4096 x 4096 x 1024", 4096, 4096, 1024, True, False),
+    ("x^T dy   1024 x 1024 x 4096", 1024, 1024, 4096, False, True),
+    ("x^T dy1  1024 x 4096 x 4096", 1024, 4096, 4096, False, True),
+)
+
+
+def gemm(out=sys.stdout, reps=20):
+    """apsi gpu bench gemm: every build of the matrix product on this card, for the large shapes of a 127 M GPT:
+    its error against the exact product of the same bfloat16 inputs (float64 on the processor) and its speed in
+    TFLOPS. A build whose error is above bfloat16's own is marked WRONG."""
+    from . import gpu_train as GT
+    ops, why = GT.device("cuda")
+    if ops is None:
+        print(f"no GPU: {why}", file=out)
+        return 1
+    builds = ["a", "x", "w", "h", "v", "d", "e"]
+    rng = np.random.default_rng(0)
+    print(f"{getattr(ops, 'name', '?')}: matrix products, every build (TFLOPS; error relative to the largest value)",
+          file=out)
+    print(f"  {'product':<30}" + "".join(f"{b:>14}" for b in builds), file=out)
+    bad = 0
+    for label, M, N, K, akc, bnc in GEMM_SHAPES:
+        a = rng.standard_normal((M, K)).astype(np.float32)
+        bm = rng.standard_normal((K, N)).astype(np.float32) / np.sqrt(K)
+
+        def bf(x):
+            u = x.view(np.uint32).astype(np.uint64)
+            u = ((u + 0x7FFF + ((u >> 16) & 1)) >> 16) << 16
+            return u.astype(np.uint32).view(np.float32)
+        ref = bf(a).astype(np.float64) @ bf(bm).astype(np.float64)
+        A, B, Cb = ops.alloc(M * K), ops.alloc(K * N), ops.alloc(M * N)
+        ops.put(A, (a if akc else np.ascontiguousarray(a.T)).reshape(-1))
+        ops.put(B, (bm if bnc else np.ascontiguousarray(bm.T)).reshape(-1))
+        sam, sak = (K, 1) if akc else (1, M)
+        sbk, sbn = (N, 1) if bnc else (1, K)
+        cells = []
+        for b in builds:
+            os.environ["APSI_GEMM_VARIANT"] = b
+            ops._choice.clear()
+            try:
+                ops.gemm((A, 0), (B, 0), (Cb, 0), M, N, K, sam, sak, sbk, sbn, N)
+                ops.sync()
+                got = ops.get(Cb, M * N).reshape(M, N).astype(np.float64)
+                err = float(np.max(np.abs(got - ref)) / max(1e-12, np.max(np.abs(ref))))
+                t0 = time.perf_counter()
+                for _ in range(reps):
+                    ops.gemm((A, 0), (B, 0), (Cb, 0), M, N, K, sam, sak, sbk, sbn, N)
+                ops.sync()
+                tf = 2.0 * M * N * K * reps / (time.perf_counter() - t0) / 1e12
+                ok = np.isfinite(err) and err < 1e-2
+                bad += 0 if ok else 1
+                cells.append(f"{tf:5.1f}{'' if ok else ' WRONG'} {err:.0e}"[:13])
+            except Exception as e:                        # noqa: BLE001
+                cells.append(f"{type(e).__name__}"[:13])
+            finally:
+                os.environ.pop("APSI_GEMM_VARIANT", None)
+                ops._choice.clear()
+        for x in (A, B, Cb):
+            ops.free(x)
+        print(f"  {label:<30}" + "".join(f"{c:>14}" for c in cells), file=out, flush=True)
+    print(f"\n{'every build gives the exact product to bfloat16 precision' if not bad else f'{bad} WRONG results'}"
+          f" (a: base build; x, w: register builds; h, v, d, e: cp.async builds; a build a shape cannot use runs "
+          f"the base build)", file=out)
+    return 0 if not bad else 1
+
+
 def cards(out=sys.stdout):
     """One model split across every card against the same training on one card."""
     from . import layers as L, gpu_train as GT
@@ -354,7 +426,9 @@ def main(what="127m", precision="auto", steps=40):
         return check()
     if w == "cards":
         return cards()
+    if w == "gemm":
+        return gemm()
     if w not in CONFIGS:
-        print(f"apsi gpu bench {what}: {', '.join(CONFIGS)}, check or cards")
+        print(f"apsi gpu bench {what}: {', '.join(CONFIGS)}, check, gemm or cards")
         return 2
     return bench(w, int(steps), precision)

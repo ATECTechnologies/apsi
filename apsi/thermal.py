@@ -862,7 +862,7 @@ def add_parser(sub):
     p.add_argument("what", nargs="?", default="status",
                    choices=["status", "power", "watch", "setup", "remove", "hold", "bench", "calibrate"])
     p.add_argument("value", nargs="?", default=None,
-                   help="calibrate: measures each card's power and fan settings for training (setup does it too); "
+                   help="bench gemm: every build of the matrix product, its error and TFLOPS; calibrate: measures each card's power and fan settings for training (setup does it too); "
                         "for power: 80%% (of the default), 130W or default; for hold: the ceiling (79); for bench: "
                         "127m (default), 11m, modern, check (every kernel against the reference) or cards")
     p.add_argument("--precision", default="auto", help="bench: auto (bf16), fp32, fp8, fp4, ...")
