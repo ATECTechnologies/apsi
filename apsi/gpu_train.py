@@ -1528,11 +1528,15 @@ class Gpu(_Ops):
         prof, self.profile = self.profile, None
         targs = list(args)
         targs[2] = self.p(self._scratch("tune_c", M * ldc + N))
-        if targs[23][1]:
-            targs[23] = self.p(self._scratch("tune_x", max(1, grid[2] if len(grid) > 2 else 1) * M * ldc + N))
+        split = len(grid) > 2 and grid[2] > 1
+        if targs[23][1] and (split or targs[24][1] == 1):
+            # X2 written by the product (epi 1's pre-activation, or split k's parts): a scratch copy; X2 read by it
+            # (epi 2's pre-activation, epi 3's residual) stays the real one, so the inputs are real numbers
+            targs[23] = self.p(self._scratch("tune_x", max(1, grid[2] if split else 1) * M * ldc + N))
         if targs[26][1]:
             targs[26] = self.p(self._scratch("tune_db", N))
         best, best_t = name, None
+        times = {}
         ms = ctypes.c_float()
         for cand in cands + cands:
             e0, e1 = self._event(), self._event()
@@ -1543,10 +1547,15 @@ class Gpu(_Ops):
             self._lib.cuEventElapsedTime(ctypes.byref(ms), e0, e1)
             self._lib.cuEventDestroy_v2(e0)
             self._lib.cuEventDestroy_v2(e1)
-            if best_t is None or ms.value < best_t:
-                best, best_t = cand, ms.value
-        if best != name and not self._same_result(name, best, grid, targs, M, N, K, ldc):
-            best = name                                  # a build that does not give the same numbers: never used
+            times[cand] = min(times.get(cand, ms.value), ms.value)
+        # the fastest build that gives the base build's numbers (a build that does not is never used for the shape)
+        best = name
+        for cand in sorted(times, key=times.get):
+            if cand == name or times[cand] >= times.get(name, float("inf")):
+                break
+            if self._same_result(name, cand, grid, targs, M, N, K, ldc):
+                best = cand
+                break
         self.profile = prof
         self._choice[key] = best
         return best
@@ -1571,12 +1580,8 @@ class Gpu(_Ops):
                 u = raw.view(np.uint16)[:n].astype(np.uint32) << 16
                 return u.view(np.float32)
             return raw[:n]
-        if targs[20][1]:                                 # beta: C += ...: both start from the same zeros
-            self.fill(cview, M * ldc, 0.0)
-        ref = run(base)
-        if targs[20][1]:
-            self.fill(cview, M * ldc, 0.0)
-        got = run(cand)
+        ref = (self.fill(cview, M * ldc, 0.0), run(base))[1]       # both from the same zeros (beta, split k)
+        got = (self.fill(cview, M * ldc, 0.0), run(cand))[1]
         scale = float(np.max(np.abs(ref))) if ref.size else 0.0
         err = float(np.max(np.abs(got - ref))) if ref.size else 0.0
         ok = bool(np.isfinite(got).all()) and err <= 2e-2 * max(scale, 1e-6)
