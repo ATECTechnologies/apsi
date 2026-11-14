@@ -330,7 +330,7 @@ def gemm(out=sys.stdout, reps=20):
     if ops is None:
         print(f"no GPU: {why}", file=out)
         return 1
-    builds = ["a", "x", "w", "h", "v", "d", "e", "f", "g"]
+    builds = ["a", "x", "w", "v", "e", "g", "s"]
     rng = np.random.default_rng(0)
     print(f"{getattr(ops, 'name', '?')}: matrix products, every build (TFLOPS; error relative to the largest value)",
           file=out)

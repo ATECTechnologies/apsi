@@ -67,6 +67,15 @@ identical weights; steps and resume bit for bit; the NaN guard).
 - **Two more product builds the card times:** slices of 32 in two stages (40 KB of tiles), so two blocks share a
   multiprocessor; on the RTX 3060 the 4-warp one is the fastest build for most large products (13-17 TFLOPS of
   kernel time against 9-15 for the earlier builds; `apsi gpu bench gemm` measures every build's error and speed).
+- **Matrix products without register spills:** the epilogue (alpha, bias, beta, split-k parts, the fused last
+  step) was emitted once per accumulator, 128 copies that kept hundreds of values alive: every 64 x 64 build spilled
+  660-1,280 bytes per thread (ptxas). The accumulators now go through shared memory a few rows at a time and each warp
+  walks its rows in a loop, writing every row of C with consecutive lanes: no build spills, the 8-warp builds need half
+  the registers (two blocks per multiprocessor), and the base build is 1.5x faster on the RTX 3060.
+- **A 3-stage build without padding:** 16-byte chunks XOR-permuted instead of padded rows, so 128 x 128 x 32 tiles in
+  three stages take 48 KB and two blocks share a multiprocessor (14-17 TFLOPS on the large products).
+- **The PTX comes with Apsi** (`apsi/ptx/`, built by `tools/build_ptx.py` from the kernel file, keyed by its hash): no
+  LLVM build on the card's computer, and no failure of the computer's own LLVM (one stopped Python on Windows).
 - **No idle gaps on Windows:** WDDM gathers launches into batches; every 32 launches a non-blocking stream query now
   hands them to the card at once (`APSI_GPU_FLUSH=N`, 0 = off).
 - **bfloat16 twins instead of a conversion per product:** a layer norm writes its output's bfloat16 twin in the same

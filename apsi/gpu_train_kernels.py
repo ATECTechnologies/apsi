@@ -33,6 +33,7 @@ TC = ("apsi_kernel", "gemm_tc3")                     # apsi_kernel = the one-pas
 # bytes of dynamic shared memory of the deep builds (3 stages of 128 x 32 tiles of A and B, rows padded to 40 halves)
 DYN_BYTES = 3 * 2 * max(128 * 40, 32 * 136) * 2
 DYN_BYTES2 = 2 * 2 * max(128 * 40, 32 * 136) * 2      # (the two-stage deep builds)
+DYN_SWZ = 3 * 2 * 128 * 32 * 2                          # (the swizzled build: no padding)
 
 
 def _setup(name):
@@ -1836,7 +1837,7 @@ EPI_KERNELS = tuple([(f"gemm_tkn_e1a{j}", True, False, 1, j) for j in EPI_ACTS] 
                     [(f"gemm_tkk_e2a{j}", True, True, 2, j) for j in EPI_ACTS] + [("gemm_tkn_e3", True, False, 3, None)])
 
 
-def _tiled_module(early=False, wide=False, h=False, deep=False, stages=None):
+def _tiled_module(early=False, wide=False, h=False, deep=False, stages=None, swz=False):
     """Matrix products on tensor cores with shared-memory tiles (sm_80+), the way fast GEMM libraries do them.
 
     A block of 8 warps computes 128 x 128 of C; each warp 64 x 32 (4 x 4 mma tiles of 16 x 8). The operands are read
@@ -1863,9 +1864,14 @@ def _tiled_module(early=False, wide=False, h=False, deep=False, stages=None):
     BKv, NTH, WNW = ((32, 128, 2) if wide else (32, 256, 4)) if deep else \
         (16, 128, 2) if wide else (16, 256, 4) if h else (BK, 256, 4)
     NTL = BN // WNW // 8                          # n8 tiles per warp
-    PADv = BKv + 8
+    PADv = BKv if swz else BKv + 8
+    # swz: no padding; the 16-byte chunks of each row are XOR-permuted instead (k-rows of 64 bytes by (row >> 1) & 3,
+    # transposed rows of 256 bytes by k & 7), so ldmatrix's 8 rows still hit 8 different groups of banks: 48 KB for
+    # three stages of 128 x 32 tiles, and two blocks of 4 warps share a multiprocessor
+    PADT_ = 128 if swz else PADT
     VPR = BKv // 4                                # float32 vectors of 4 per row of a k-contiguous slice
-    ir, m = _setup((("apsi_train_tiled_dw" if wide else "apsi_train_tiled_d") + (f"_s{stages}" if stages else "")) if deep else
+    ir, m = _setup((("apsi_train_tiled_dw" if wide else "apsi_train_tiled_d") + (f"_s{stages}" if stages else "") +
+                    ("_swz" if swz else "")) if deep else
                    "apsi_train_tiled_v" if (h and wide) else "apsi_train_tiled_h" if h else "apsi_train_tiled_w"
                    if wide else "apsi_train_tiled_x" if early else "apsi_train_tiled")
     annotations = m.add_named_metadata("nvvm.annotations")
@@ -1875,7 +1881,7 @@ def _tiled_module(early=False, wide=False, h=False, deep=False, stages=None):
     ctaz_f = d("llvm.nvvm.read.ptx.sreg.ctaid.z", i32, [])
     nctaz_f = d("llvm.nvvm.read.ptx.sreg.nctaid.z", i32, [])
     bar_f = d("llvm.nvvm.barrier0", ir.VoidType(), [])
-    HALVES = STAGES * 2 * max(BM * PADv, BKv * PADT)
+    HALVES = STAGES * 2 * max(BM * PADv, BKv * PADT_)
     if deep:                                      # extern __shared__: sized at launch (DYN_BYTES)
         smem = ir.GlobalVariable(m, ir.ArrayType(i16, 0), "apsi_tiles", addrspace=3)
         smem.linkage = "external"
@@ -1888,21 +1894,24 @@ def _tiled_module(early=False, wide=False, h=False, deep=False, stages=None):
     mma = ir.InlineAsm(ir.FunctionType(ir.LiteralStructType([f32] * 4), [i32] * 6 + [f32] * 4),
                        "mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {$0,$1,$2,$3}, {$4,$5,$6,$7}, "
                        "{$8,$9}, {$10,$11,$12,$13};", "=f,=f,=f,=f,r,r,r,r,r,r,f,f,f,f", side_effect=False)
-    ldm = ir.InlineAsm(ir.FunctionType(ir.LiteralStructType([i32] * 4), [i64]),
-                       "ldmatrix.sync.aligned.m8n8.x4.shared.b16 {$0,$1,$2,$3}, [$4];", "=r,=r,=r,=r,l",
+    # shared-memory addresses as 32-bit offsets in the shared window (a 64-bit generic address per ldmatrix and
+    # cp.async cost twice the registers: the 64 x 64 warp tiles spilled hundreds of bytes per thread)
+    ldm = ir.InlineAsm(ir.FunctionType(ir.LiteralStructType([i32] * 4), [i32]),
+                       "ldmatrix.sync.aligned.m8n8.x4.shared.b16 {$0,$1,$2,$3}, [$4];", "=r,=r,=r,=r,r",
                        side_effect=True)
-    ldmt = ir.InlineAsm(ir.FunctionType(ir.LiteralStructType([i32] * 4), [i64]),
-                        "ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {$0,$1,$2,$3}, [$4];", "=r,=r,=r,=r,l",
+    ldmt = ir.InlineAsm(ir.FunctionType(ir.LiteralStructType([i32] * 4), [i32]),
+                        "ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {$0,$1,$2,$3}, [$4];", "=r,=r,=r,=r,r",
                         side_effect=True)
     red = ir.InlineAsm(ir.FunctionType(ir.VoidType(), [i64, f32]), "red.global.add.f32 [$0], $1;", "l,f",
                        side_effect=True)
     ldg4 = ir.InlineAsm(ir.FunctionType(ir.LiteralStructType([f32] * 4), [i64]),
                         "ld.global.v4.f32 {$0,$1,$2,$3}, [$4];", "=f,=f,=f,=f,l", side_effect=True)
-    cpa = ir.InlineAsm(ir.FunctionType(ir.VoidType(), [i64, i64, i32]), "cp.async.cg.shared.global [$0], [$1], 16, $2;",
-                       "l,l,r", side_effect=True)
+    cpa = ir.InlineAsm(ir.FunctionType(ir.VoidType(), [i32, i64, i32]), "cp.async.cg.shared.global [$0], [$1], 16, $2;",
+                       "r,l,r", side_effect=True)
     cpa_commit = ir.InlineAsm(ir.FunctionType(ir.VoidType(), []), "cp.async.commit_group;", "", side_effect=True)
     cpa_wait = ir.InlineAsm(ir.FunctionType(ir.VoidType(), []), f"cp.async.wait_group {max(0, STAGES - 2)};", "",
                             side_effect=True)
+    cpa_wait0 = ir.InlineAsm(ir.FunctionType(ir.VoidType(), []), "cp.async.wait_group 0;", "", side_effect=True)
     cvt2 = ir.InlineAsm(ir.FunctionType(i32, [f32, f32]), "cvt.rn.bf16x2.f32 $0, $1, $2;", "=r,f,f",
                         side_effect=False)
     ex2_f = d("llvm.nvvm.ex2.approx.f", f32, [f32])
@@ -2028,6 +2037,23 @@ def _tiled_module(early=False, wide=False, h=False, deep=False, stages=None):
         def sh_ptr(half_index):
             return b.gep(smem, [C(0), half_index], inbounds=True)
 
+        sbase32 = b.trunc(b.ptrtoint(b.gep(smem, [C(0), C(0)], inbounds=True), i64), i32)
+
+        def sh32(half_index):
+            """the 32-bit shared-window address of a half"""
+            return b.add(sbase32, b.shl(half_index, C(1)))
+
+        def swk(row, colh):
+            """column (in halves, a multiple of 8) of a k-row, permuted by chunk when swz"""
+            if not swz:
+                return colh
+            return b.xor(colh, b.shl(b.and_(b.lshr(row, C(1)), C(3)), C(3)))
+
+        def swt(krow, colh):
+            if not swz:
+                return colh
+            return b.xor(colh, b.shl(b.and_(krow, C(7)), C(3)))
+
         def store_row4(half_index, ws):
             """4 halves at consecutive k (8 bytes), given as 2 packed words."""
             v = ir.Constant(ir.VectorType(i32, 2), None)
@@ -2035,7 +2061,7 @@ def _tiled_module(early=False, wide=False, h=False, deep=False, stages=None):
             v = b.insert_element(v, ws[1], C(1))
             b.store(v, b.bitcast(sh_ptr(half_index), ir.VectorType(i32, 2).as_pointer(3)), align=8)
 
-        REG = max(BM * PADv, BKv * PADT)
+        REG = max(BM * PADv, BKv * PADT_)
         A_BASE = [C(0), C(REG)]
         B_BASE = [C(2 * REG), C(3 * REG)]
 
@@ -2074,7 +2100,7 @@ def _tiled_module(early=False, wide=False, h=False, deep=False, stages=None):
                 if kind in ("A", "B"):                # [m or n][k]: 4 consecutive k
                     store_row4(b.add(base, b.add(b.mul(r, C(PADv)), c)), hs)
                 else:                                 # [k][m or n]: 4 consecutive m or n, stored the same way
-                    store_row4(b.add(base, b.add(b.mul(c, C(PADT)), r)), hs)
+                    store_row4(b.add(base, b.add(b.mul(c, C(PADT_)), r)), hs)
 
         accs = [[[var(F(0.0)) for _ in range(4)] for _ in range(NTL)] for _ in range(4)]
         dbs = [var(F(0.0)) for _ in range(4)] if (not a_kc and not b_kc and epi_mode == 0 and not h) else None
@@ -2104,17 +2130,17 @@ def _tiled_module(early=False, wide=False, h=False, deep=False, stages=None):
                     if kc:                            # [row][k]: BKv / 8 chunks per row
                         row, kq = b.udiv(cid, C(BKv // 8)), b.mul(b.urem(cid, C(BKv // 8)), C(8))
                         ci, cl, oi, ol = b.add(k0, kq), k_end, b.add(o0, row), lim_o
-                        dst = b.add(sb_, b.add(b.mul(row, C(PADv)), kq))
+                        dst = b.add(sb_, b.add(b.mul(row, C(PADv)), swk(row, kq)))
                     else:                             # [k][row]: 16 chunks of 8 per k
                         kk, q8 = b.lshr(cid, C(4)), b.mul(b.and_(cid, C(15)), C(8))
                         ci, cl, oi, ol = b.add(o0, q8), lim_o, b.add(k0, kk), k_end
-                        dst = b.add(sb_, b.add(b.mul(kk, C(PADT)), q8))
+                        dst = b.add(sb_, b.add(b.mul(kk, C(PADT_)), swt(kk, q8)))
                     ok = b.and_(b.icmp_unsigned("<", ci, cl), b.icmp_unsigned("<", oi, ol))
                     ci2 = umin(ci, b.sub(cl, C(8)))
                     oi2 = umin(oi, b.sub(ol, C(1)))
                     idx = b.add(base_off, b.add(b.mul(z64(oi2), z64(s_o)), z64(ci2)))
                     src = b.ptrtoint(b.gep(ptr, [idx], inbounds=True), i64)
-                    b.call(cpa, [b.ptrtoint(sh_ptr(dst), i64), src, b.select(ok, C(16), C(0))])
+                    b.call(cpa, [sh32(dst), src, b.select(ok, C(16), C(0))])
 
         if h:
             for st_ in range(STAGES - 1):
@@ -2158,12 +2184,12 @@ def _tiled_module(early=False, wide=False, h=False, deep=False, stages=None):
                 if a_kc:                              # [m][k]: rows of A
                     row = b.add(b.add(b.mul(wm, C(64)), C(mt * 16)), b.and_(lane, C(15)))
                     col = b.add(C(ks * 16), b.mul(l16, C(8)))
-                    addr = b.ptrtoint(sh_ptr(b.add(abase, b.add(b.mul(row, C(PADv)), col))), i64)
+                    addr = sh32(b.add(abase, b.add(b.mul(row, C(PADv)), swk(row, col))))
                     r = b.call(ldm, [addr])
                 else:                                 # [k][m]: transposed while loading
                     krow = b.add(C(ks * 16), b.add(l7, b.mul(l16, C(8))))
                     mcol = b.add(b.add(b.mul(wm, C(64)), C(mt * 16)), b.mul(l8, C(8)))
-                    addr = b.ptrtoint(sh_ptr(b.add(abase, b.add(b.mul(krow, C(PADT)), mcol))), i64)
+                    addr = sh32(b.add(abase, b.add(b.mul(krow, C(PADT_)), swt(krow, mcol))))
                     r = b.call(ldmt, [addr])
                 afr.append([b.extract_value(r, j) for j in range(4)])
             bfr = []
@@ -2171,12 +2197,12 @@ def _tiled_module(early=False, wide=False, h=False, deep=False, stages=None):
                 if b_kc:                              # [n][k]
                     nrow = b.add(b.add(b.mul(wn, C(NTL * 8)), C(pr * 16)), b.add(l7, b.mul(l16, C(8))))
                     col = b.add(C(ks * 16), b.mul(l8, C(8)))
-                    addr = b.ptrtoint(sh_ptr(b.add(bbase, b.add(b.mul(nrow, C(PADv)), col))), i64)
+                    addr = sh32(b.add(bbase, b.add(b.mul(nrow, C(PADv)), swk(nrow, col))))
                     r = b.call(ldm, [addr])
                 else:                                 # [k][n], transposed while loading
                     krow = b.add(C(ks * 16), b.add(l7, b.mul(l8, C(8))))
                     ncol = b.add(b.add(b.mul(wn, C(NTL * 8)), C(pr * 16)), b.mul(l16, C(8)))
-                    addr = b.ptrtoint(sh_ptr(b.add(bbase, b.add(b.mul(krow, C(PADT)), ncol))), i64)
+                    addr = sh32(b.add(bbase, b.add(b.mul(krow, C(PADT_)), swt(krow, ncol))))
                     r = b.call(ldmt, [addr])
                 q = [b.extract_value(r, j) for j in range(4)]
                 bfr += [[q[0], q[1]], [q[2], q[3]]]
@@ -2203,59 +2229,103 @@ def _tiled_module(early=False, wide=False, h=False, deep=False, stages=None):
                         b.call(red, [b.ptrtoint(b.gep(p["DB"], [z64(col)], inbounds=True), i64), b.load(dbs[j])])
         split = b.icmp_unsigned(">", nz, C(1))
         first = b.icmp_unsigned("==", ctaz, C(0))
-        for mt in range(4):
-            for nt in range(NTL):
-                for c in range(4):
-                    row = b.add(b.add(bm, b.add(b.mul(wm, C(64)), C(mt * 16 + (c // 2) * 8))), gq)
-                    col = b.add(b.add(bn, b.add(b.mul(wn, C(NTL * 8)), C(nt * 8))), b.add(b.mul(tig, C(2)), C(c % 2)))
-                    with b.if_then(b.and_(b.icmp_unsigned("<", row, p["M"]), b.icmp_unsigned("<", col, p["N"]))):
-                        idx = b.add(offs[2], b.add(b.mul(z64(row), z64(p["ldc"])), z64(col)))
-                        ptr = b.gep(p["C"], [idx], inbounds=True)
-                        v = b.fmul(b.load(accs[mt][nt][c]), p["alpha"])
-                        tmp = var(v)
-                        with b.if_then(b.and_(b.icmp_unsigned("!=", p["has_bias"], C(0)), first)):
-                            bp = b.gep(p["BIAS"], [z64(col)], inbounds=True)
-                            b.store(b.fadd(b.load(tmp), b.load(bp, align=4)), tmp)
-                        with b.if_else(split) as (then, other):
-                            with then:                # each part of k writes its share to its own slice of the
-                                # workspace (X2: [parts, M, ldc]); ksum adds the parts in order (no atomics)
-                                widx = b.add(b.mul(z64(ctaz), b.mul(z64(p["M"]), z64(p["ldc"]))),
-                                             b.add(b.mul(z64(row), z64(p["ldc"])), z64(col)))
-                                b.store(b.load(tmp), b.gep(p["X2"], [widx], inbounds=True), align=4)
-                            with other:
-                                with b.if_then(b.icmp_unsigned("!=", p["beta"], C(0))):
-                                    b.store(b.fadd(b.load(tmp), b.load(ptr, align=4)), tmp)
-                                if epi_mode:              # this kernel's own last step, compiled in
-                                    xp = b.gep(p["X2"], [idx], inbounds=True)
-                                    xp16 = b.gep(b.bitcast(p["X2"], i16.as_pointer(1)), [idx], inbounds=True)
-                                    vv = b.load(tmp)
 
-                                    def ld_x():
-                                        if x16:
-                                            w = b.shl(b.zext(b.load(xp16, align=2), i32), C(16))
-                                            return b.bitcast(w, f32)
-                                        return b.load(xp, align=4)
-                                    if epi_mode == 1:
-                                        if x16:           # the pre-activation kept in bfloat16; act() of that value
-                                            hb = b.trunc(rne(vv), i16)
-                                            b.store(hb, xp16, align=2)
-                                            vv = b.bitcast(b.shl(b.zext(hb, i32), C(16)), f32)
-                                        else:
-                                            b.store(vv, xp, align=4)
-                                        out = _act_one(b, vv, act_j, F, ex2_f, False)
-                                    elif epi_mode == 2:
-                                        out = b.fmul(vv, _act_one(b, ld_x(), act_j, F, ex2_f, True))
-                                    else:
-                                        out = b.fadd(vv, ld_x())
-                                    b.store(out, tmp)
-                                if c16:
-                                    cp16 = b.gep(b.bitcast(p["C"], i16.as_pointer(1)), [idx], inbounds=True)
-                                    b.store(b.trunc(rne(b.load(tmp)), i16), cp16, align=2)
+        def elem(row, col, raw):
+            """one element of C: alpha, bias, the split-k workspace or beta and this kernel's own last step"""
+            with b.if_then(b.and_(b.icmp_unsigned("<", row, p["M"]), b.icmp_unsigned("<", col, p["N"]))):
+                idx = b.add(offs[2], b.add(b.mul(z64(row), z64(p["ldc"])), z64(col)))
+                ptr = b.gep(p["C"], [idx], inbounds=True)
+                tmp = var(F(0.0))
+                b.store(b.fmul(raw, p["alpha"]), tmp)
+                with b.if_then(b.and_(b.icmp_unsigned("!=", p["has_bias"], C(0)), first)):
+                    bp = b.gep(p["BIAS"], [z64(col)], inbounds=True)
+                    b.store(b.fadd(b.load(tmp), b.load(bp, align=4)), tmp)
+                with b.if_else(split) as (then, other):
+                    with then:                # each part of k writes its share to its own slice of the
+                        # workspace (X2: [parts, M, ldc]); the last part adds the parts in order (no atomics)
+                        widx = b.add(b.mul(z64(ctaz), b.mul(z64(p["M"]), z64(p["ldc"]))),
+                                     b.add(b.mul(z64(row), z64(p["ldc"])), z64(col)))
+                        b.store(b.load(tmp), b.gep(p["X2"], [widx], inbounds=True), align=4)
+                    with other:
+                        with b.if_then(b.icmp_unsigned("!=", p["beta"], C(0))):
+                            b.store(b.fadd(b.load(tmp), b.load(ptr, align=4)), tmp)
+                        if epi_mode:              # this kernel's own last step, compiled in
+                            xp = b.gep(p["X2"], [idx], inbounds=True)
+                            xp16 = b.gep(b.bitcast(p["X2"], i16.as_pointer(1)), [idx], inbounds=True)
+                            vv = b.load(tmp)
+
+                            def ld_x():
+                                if x16:
+                                    w = b.shl(b.zext(b.load(xp16, align=2), i32), C(16))
+                                    return b.bitcast(w, f32)
+                                return b.load(xp, align=4)
+                            if epi_mode == 1:
+                                if x16:           # the pre-activation kept in bfloat16; act() of that value
+                                    hb = b.trunc(rne(vv), i16)
+                                    b.store(hb, xp16, align=2)
+                                    vv = b.bitcast(b.shl(b.zext(hb, i32), C(16)), f32)
                                 else:
-                                    b.store(b.load(tmp), ptr, align=4)
-        # split k: the last part of this tile to finish adds the parts in order (what ksum did, in the same order,
-        # without a second launch); the counter of the tile is reset for the next product. The flag lives in the
-        # tiles' shared memory (free by now): no shared memory of its own.
+                                    b.store(vv, xp, align=4)
+                                out = _act_one(b, vv, act_j, F, ex2_f, False)
+                            elif epi_mode == 2:
+                                out = b.fmul(vv, _act_one(b, ld_x(), act_j, F, ex2_f, True))
+                            else:
+                                out = b.fadd(vv, ld_x())
+                            b.store(out, tmp)
+                        if c16:
+                            cp16 = b.gep(b.bitcast(p["C"], i16.as_pointer(1)), [idx], inbounds=True)
+                            b.store(b.trunc(rne(b.load(tmp)), i16), cp16, align=2)
+                        else:
+                            b.store(b.load(tmp), ptr, align=4)
+
+        # The accumulators go through shared memory (free by now) a few rows of tiles at a time, and each warp then
+        # walks its rows with a loop: the epilogue is emitted for one or two columns per lane instead of once per
+        # accumulator (128 copies kept hundreds of values alive: spills in every 64 x 64 build), and every row of
+        # C is written by consecutive lanes (coalesced) instead of in pairs scattered over eight rows.
+        if h:
+            b.call(cpa_wait0, [])
+        b.call(bar_f, [])
+        WCOLS = NTL * 8                                 # columns of a warp's tile (64 or 32)
+        RS = WCOLS + 4                                  # a staged row, padded: the mma layout writes without conflicts
+        nwarps = NTH // 32
+        smem_bytes = HALVES * 2
+        MTP = 4 if 4 * 16 * RS * 4 * nwarps <= smem_bytes else 2 if 2 * 16 * RS * 4 * nwarps <= smem_bytes else 1
+        stage = b.bitcast(b.gep(smem, [C(0), C(0)], inbounds=True), f32.as_pointer(3))
+        wbase = b.mul(warp, C(MTP * 16 * RS))
+        CPL = WCOLS // 32                               # columns per lane (2 or 1)
+        for rnd in range(4 // MTP):
+            if rnd:
+                b.call(bar_f, [])
+            for ml in range(MTP):
+                mt = rnd * MTP + ml
+                for nt in range(NTL):
+                    for c in range(4):
+                        r_ = b.add(C(ml * 16 + (c // 2) * 8), gq)
+                        c_ = b.add(C(nt * 8 + c % 2), b.mul(tig, C(2)))
+                        at = b.add(wbase, b.add(b.mul(r_, C(RS)), c_))
+                        b.store(b.load(accs[mt][nt][c]), b.gep(stage, [at], inbounds=True), align=4)
+            b.call(bar_f, [])
+            rv = var(C(0))
+            lh = fn.append_basic_block(f"ep_head{rnd}")
+            lb = fn.append_basic_block(f"ep_body{rnd}")
+            le = fn.append_basic_block(f"ep_end{rnd}")
+            b.branch(lh)
+            b.position_at_end(lh)
+            rr = b.load(rv)
+            b.cbranch(b.icmp_unsigned("<", rr, C(MTP * 16)), lb, le)
+            b.position_at_end(lb)
+            grow = b.add(bm, b.add(b.mul(wm, C(64)), b.add(C(rnd * MTP * 16), rr)))
+            for j in range(CPL):
+                lc = b.add(b.mul(lane, C(CPL)), C(j))
+                gcol = b.add(bn, b.add(b.mul(wn, C(WCOLS)), lc))
+                val = b.load(b.gep(stage, [b.add(wbase, b.add(b.mul(rr, C(RS)), lc))], inbounds=True), align=4)
+                elem(grow, gcol, val)
+            b.store(b.add(rr, C(1)), rv)
+            b.branch(lh)
+            b.position_at_end(le)
+
+        # split k: the last part of this tile to finish adds the parts in order (the same order every run, no
+        # atomics); the counter of the tile is reset for the next product. The flag lives in shared memory.
         with b.if_then(split):
             b.call(membar_t, [])
             b.call(bar_f, [])
@@ -2267,38 +2337,40 @@ def _tiled_module(early=False, wide=False, h=False, deep=False, stages=None):
             with b.if_then(b.icmp_unsigned("!=", b.load(flag), C(0))):
                 b.call(membar_t, [])
                 plane = b.mul(z64(p["M"]), z64(p["ldc"]))
-                els = []
-                for mt in range(4):
-                    for nt in range(NTL):
-                        for c in range(4):
-                            row = b.add(b.add(bm, b.add(b.mul(wm, C(64)), C(mt * 16 + (c // 2) * 8))), gq)
-                            col = b.add(b.add(bn, b.add(b.mul(wn, C(NTL * 8)), C(nt * 8))),
-                                        b.add(b.mul(tig, C(2)), C(c % 2)))
-                            ok = b.and_(b.icmp_unsigned("<", row, p["M"]), b.icmp_unsigned("<", col, p["N"]))
-                            at = b.add(b.mul(z64(b.select(ok, row, C(0))), z64(p["ldc"])),
-                                       z64(b.select(ok, col, C(0))))
-                            els.append((ok, at, var(F(0.0))))
-                zv = var(C(0))
-                head = fn.append_basic_block("ks_head")
-                body = fn.append_basic_block("ks_body")
-                end = fn.append_basic_block("ks_end")
-                b.branch(head)
-                b.position_at_end(head)
-                zi = b.load(zv)
-                b.cbranch(b.icmp_unsigned("<", zi, nz), body, end)
-                b.position_at_end(body)
-                zo = b.mul(z64(zi), plane)                # every element's part z: independent loads in flight
-                vals = [b.call(ld_cg_t, [b.ptrtoint(b.gep(p["X2"], [b.add(zo, at)], inbounds=True), i64)])
-                        for _, at, _ in els]
-                for (_, _, sv), v in zip(els, vals):
-                    b.store(b.fadd(b.load(sv), v), sv)
-                b.store(b.add(zi, C(1)), zv)
-                b.branch(head)
-                b.position_at_end(end)
-                for ok, at, sv in els:
-                    with b.if_then(ok):
-                        cp = b.gep(p["C"], [at], inbounds=True)
-                        b.store(b.fadd(b.load(cp, align=4), b.load(sv)), cp, align=4)
+                ev = var(tid)                                       # the tile's elements, NTH apart
+                kh = fn.append_basic_block("ks_head")
+                kb = fn.append_basic_block("ks_body")
+                ke = fn.append_basic_block("ks_end")
+                b.branch(kh)
+                b.position_at_end(kh)
+                e_ = b.load(ev)
+                b.cbranch(b.icmp_unsigned("<", e_, C(BM * BN)), kb, ke)
+                b.position_at_end(kb)
+                row = b.add(bm, b.udiv(e_, C(BN)))
+                col = b.add(bn, b.urem(e_, C(BN)))
+                with b.if_then(b.and_(b.icmp_unsigned("<", row, p["M"]), b.icmp_unsigned("<", col, p["N"]))):
+                    at = b.add(b.mul(z64(row), z64(p["ldc"])), z64(col))
+                    sv = var(F(0.0))
+                    zv = var(C(0))
+                    zh = fn.append_basic_block("kz_head")
+                    zb = fn.append_basic_block("kz_body")
+                    ze = fn.append_basic_block("kz_end")
+                    b.branch(zh)
+                    b.position_at_end(zh)
+                    zi = b.load(zv)
+                    b.cbranch(b.icmp_unsigned("<", zi, nz), zb, ze)
+                    b.position_at_end(zb)
+                    pv = b.call(ld_cg_t, [b.ptrtoint(b.gep(p["X2"], [b.add(b.mul(z64(zi), plane), at)],
+                                                           inbounds=True), i64)])
+                    b.store(b.fadd(b.load(sv), pv), sv)
+                    b.store(b.add(zi, C(1)), zv)
+                    b.branch(zh)
+                    b.position_at_end(ze)
+                    cp = b.gep(p["C"], [b.add(offs[2], at)], inbounds=True)
+                    b.store(b.fadd(b.load(cp, align=4), b.load(sv)), cp, align=4)
+                b.store(b.add(e_, C(NTH)), ev)
+                b.branch(kh)
+                b.position_at_end(ke)
                 with b.if_then(b.icmp_unsigned("==", tid, C(0))):
                     b.store(C(0), b.gep(p["CNT"], [z64(cta)], inbounds=True))
         b.ret_void()
@@ -2800,6 +2872,21 @@ def ptx(which):
                 return text
     except (OSError, ImportError):
         pass
+    # shipped with Apsi: the PTX built from this very file (apsi/ptx/, gzip), so a card needs no LLVM build at all
+    # (and no LLVM bug of the computer's own llvmlite can stop it)
+    try:
+        import gzip
+        import hashlib
+        with open(__file__, "rb") as fh:
+            src = hashlib.sha256(fh.read()).hexdigest()[:16]
+        shipped = os.path.join(os.path.dirname(__file__), "ptx", f"{which}-{src}.ptx.gz")
+        if os.path.exists(shipped):
+            with gzip.open(shipped, "rt", encoding="ascii") as fh:
+                text = fh.read()
+            _cache[which] = text
+            return text
+    except OSError:
+        pass
     text = {"main": _main_module, "tc": _tc_module, "tiled": _tiled_module, "tiled_x": lambda: _tiled_module(True),
             "tiled_w": lambda: _tiled_module(True, True),
             "tiled_h": lambda: _tiled_module(h=True),
@@ -2810,6 +2897,7 @@ def ptx(which):
             # the waits) where three stages (60 KB) leave room for one
             "tiled_d2": lambda: _tiled_module(False, False, True, True, 2),
             "tiled_dw2": lambda: _tiled_module(True, True, True, True, 2),
+            "tiled_sw": lambda: _tiled_module(True, True, True, True, 3, True),
             "flash": _flash_module}[which]()
     if path:
         try:

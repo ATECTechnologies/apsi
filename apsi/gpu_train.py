@@ -834,19 +834,20 @@ class Gpu(_Ops):
             # "v": the 4-warp 64 x 64 shape of "w" with "h"'s bfloat16 operands copied by cp.async four slices ahead
             # "d" / "e": slices of 32 k, three in flight, in dynamic shared memory (8 warps / 4 warps of 64 x 64)
             for tag, which in (("x", "tiled_x"), ("w", "tiled_w"), ("h", "tiled_h"), ("v", "tiled_v"),
-                               ("d", "tiled_d"), ("e", "tiled_dw"), ("f", "tiled_d2"), ("g", "tiled_dw2")):
+                               ("d", "tiled_d"), ("e", "tiled_dw"), ("f", "tiled_d2"), ("g", "tiled_dw2"),
+                               ("s", "tiled_sw")):
                 try:
                     xmod, first = dev.load(f"apsi-train-tiled-{tag}", KS.ptx(which))
                     xf = {f"gemm_tkn#{tag}": first}
                     for name in KS.TILED[1:] + tuple(e[0] for e in KS.EPI_KERNELS) + \
                             ((tuple(f"gemm_tmn_aa{j}" for j in KS.EPI_ACTS) + KS.BF16_KERNELS)
-                             if tag not in ("h", "v", "d", "e", "f", "g") else KS.BF16_H_KERNELS):
+                             if tag not in ("h", "v", "d", "e", "f", "g", "s") else KS.BF16_H_KERNELS):
                         f = ctypes.c_void_p()
                         dev.drv.check(lib.cuModuleGetFunction(ctypes.byref(f), xmod, name.encode()),
                                       "cuModuleGetFunction")
                         xf[f"{name}#{tag}"] = f
-                    if tag in ("d", "e", "f", "g"):      # tiles in dynamic shared memory (60 KB: above the 48 KB
-                        dyn = KS.DYN_BYTES if tag in ("d", "e") else KS.DYN_BYTES2     # a block gets unasked)
+                    if tag in ("d", "e", "f", "g", "s"):  # tiles in dynamic shared memory (60 KB: above the 48 KB
+                        dyn = KS.DYN_BYTES if tag in ("d", "e") else KS.DYN_SWZ if tag == "s" else KS.DYN_BYTES2
                         for nm, f in xf.items():
                             dev.drv.check(lib.cuFuncSetAttribute(f, 8, dyn), "cuFuncSetAttribute")
                             self._dyn[nm] = dyn
@@ -1452,7 +1453,7 @@ class Gpu(_Ops):
 
     @staticmethod
     def _threads(name):
-        return 128 if name.endswith(("#w", "#v", "#e", "#g")) else 256
+        return 128 if name.endswith(("#w", "#v", "#e", "#g", "#s")) else 256
 
     def _per_sm(self, name):
         """Blocks of this kernel that fit on one multiprocessor at once (registers, shared memory)."""
@@ -1517,9 +1518,9 @@ class Gpu(_Ops):
         cands = [name] + [f"{name}#{t}" for t in ("x", "w") if f"{name}#{t}" in self.fn]
         if not getattr(self, "_no_h", False) and self._h_ready(name, args, M, N, K, nb):
             cands.append(f"{name}#h")
-            cands += [f"{name}#{t}" for t in ("v", "d", "e", "f", "g") if f"{name}#{t}" in self.fn]
+            cands += [f"{name}#{t}" for t in ("v", "d", "e", "f", "g", "s") if f"{name}#{t}" in self.fn]
         force = os.environ.get("APSI_GEMM_VARIANT", "auto").strip().lower()
-        if force in ("x", "w", "h", "v", "d", "e", "f", "g"):
+        if force in ("x", "w", "h", "v", "d", "e", "f", "g", "s"):
             return f"{name}#{force}" if f"{name}#{force}" in cands else name
         if force == "a" or len(cands) == 1 or nb != 1:
             return name
@@ -1543,7 +1544,7 @@ class Gpu(_Ops):
         for cand in cands + cands:
             e0, e1 = self._event(), self._event()
             self._lib.cuEventRecord(e0, self.cur)
-            self._go(cand, grid, self._threads(cand), *(self._h_args(targs, M, N, K) if cand.endswith(("#h", "#v", "#d", "#e", "#f", "#g")) else targs))
+            self._go(cand, grid, self._threads(cand), *(self._h_args(targs, M, N, K) if cand.endswith(("#h", "#v", "#d", "#e", "#f", "#g", "#s")) else targs))
             self._lib.cuEventRecord(e1, self.cur)
             self._lib.cuEventSynchronize(e1)
             self._lib.cuEventElapsedTime(ctypes.byref(ms), e0, e1)
@@ -1574,7 +1575,7 @@ class Gpu(_Ops):
         slots = (n + 1) // 2 if c16 else n
 
         def run(nm):
-            a = self._h_args(targs, M, N, K) if nm.endswith(("#h", "#v", "#d", "#e", "#f", "#g")) else targs
+            a = self._h_args(targs, M, N, K) if nm.endswith(("#h", "#v", "#d", "#e", "#f", "#g", "#s")) else targs
             self._go(nm, grid, self._threads(nm), *a)
             self.sync()
             raw = self.get(cview[0], slots)
@@ -1671,7 +1672,7 @@ class Gpu(_Ops):
             self._no_h = a_act is not None
             try:
                 use = self._variant(want, grid, args, M, N, ldc, 1)
-                if use.endswith(("#h", "#v", "#d", "#e", "#f", "#g")):
+                if use.endswith(("#h", "#v", "#d", "#e", "#f", "#g", "#s")):
                     if a_act is not None:
                         use = want
                     else:
@@ -1722,7 +1723,7 @@ class Gpu(_Ops):
                     self.p(X2), ("u", epi), ("u", act), self.p(db), ("u", 1 if db is not None else 0), self._cnt()]
             grid = (tiles, nb1 * nb2, nz)
             use = self._variant(name, grid, args, M, N, ldc, nb1 * nb2)
-            if use.endswith(("#h", "#v", "#d", "#e", "#f", "#g")):
+            if use.endswith(("#h", "#v", "#d", "#e", "#f", "#g", "#s")):
                 args = self._h_args(args, M, N, K)
             self._go(use, grid, self._threads(use), *args)         # split k: its last part adds the parts
             if db is not None:
