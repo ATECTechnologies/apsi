@@ -77,6 +77,12 @@
   three stages take 48 KB and two blocks share a multiprocessor (14-17 TFLOPS on the large products).
 - **The PTX comes with Apsi** (`apsi/ptx/`, built by `tools/build_ptx.py` from the kernel file, keyed by its hash): no
   LLVM build on the card's computer, and no failure of the computer's own LLVM (one stopped Python on Windows).
+- **The attention's three weight gradients in one product:** x^T dq, x^T dk, x^T dv run as one batched product when
+  dq, dk, dv and the three gradients lie one after another (self-attention, as many key/value heads as query heads):
+  no split of k for 1024 x 1024 outputs (12 -> 18 TFLOPS on the RTX 3060). Batched products may now use the faster
+  register builds too. `APSI_QKV_GRADS=0` keeps three products.
+- **Weight gradients on the cp.async builds:** a product with a bias gradient may now run on the faster builds, the
+  bias gradient then being a column sum of its own (the 1024 x 4096 x 4096 one: 19 -> 21 TFLOPS).
 - **No idle gaps on Windows:** WDDM gathers launches into batches; every 32 launches a non-blocking stream query now
   hands them to the card at once (`APSI_GPU_FLUSH=N`, 0 = off).
 - **bfloat16 twins instead of a conversion per product:** a layer norm writes its output's bfloat16 twin in the same

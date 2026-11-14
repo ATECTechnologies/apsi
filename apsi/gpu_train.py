@@ -1470,8 +1470,9 @@ class Gpu(_Ops):
         return n
 
     def _h_ready(self, name, args, M, N, K, nb):
-        """Can the bfloat16-operand build run this product? (dense operands, dimensions in 8s, no bias gradient)"""
-        if f"{name}#h" not in self.fn or nb != 1 or args[27][1] or "to_bf16" not in self.fn:
+        """Can the bfloat16-operand build run this product? (dense operands, dimensions in 8s; a bias gradient is
+        then a column sum of its own)"""
+        if f"{name}#h" not in self.fn or nb != 1 or "to_bf16" not in self.fn:
             return False
         sam, sak, sbk, sbn = (a[1] for a in args[7:11])
         da = (sak == 1 and sam == K and K % 8 == 0) or (sam == 1 and sak == M and M % 8 == 0)
@@ -1489,6 +1490,7 @@ class Gpu(_Ops):
         """The operands rounded to bfloat16 (one pass each), and the arguments that point there. A weight matrix is
         rounded once after each update and reused by every product until the next one (forward and backward)."""
         out = list(args)
+        out[27] = ("u", 0)                               # (these builds add no bias gradient: colsum does)
         for i, n, key in ((0, M * K, "h_a"), (1, K * N, "h_b")):
             if i == 0 and getattr(self, "_a16", False):
                 continue                                 # A is bfloat16 already
@@ -1522,7 +1524,9 @@ class Gpu(_Ops):
         force = os.environ.get("APSI_GEMM_VARIANT", "auto").strip().lower()
         if force in ("x", "w", "h", "v", "d", "e", "f", "g", "s"):
             return f"{name}#{force}" if f"{name}#{force}" in cands else name
-        if force == "a" or len(cands) == 1 or nb != 1:
+        if nb != 1:                                      # batched: the builds that take batch offsets as they are
+            cands = [c for c in cands if c.endswith(("#x", "#w")) or c == name]
+        if force == "a" or len(cands) == 1:
             return name
         key = (name, grid, tuple(a for a in args if a[0] != "p"))
         pick = self._choice.get(key)
@@ -1530,7 +1534,9 @@ class Gpu(_Ops):
             return pick
         prof, self.profile = self.profile, None
         targs = list(args)
-        targs[2] = self.p(self._scratch("tune_c", M * ldc + N))
+        nb2_ = max(1, args[12][1])
+        span = (max(1, nb // nb2_) - 1) * args[17][1] + (nb2_ - 1) * args[18][1]   # (batches: their own slices)
+        targs[2] = self.p(self._scratch("tune_c", M * ldc + N + span))
         split = len(grid) > 2 and grid[2] > 1
         if targs[23][1] and (split or targs[24][1] == 1):
             # X2 written by the product (epi 1's pre-activation, or split k's parts): a scratch copy; X2 read by it
@@ -1570,7 +1576,7 @@ class Gpu(_Ops):
         if os.environ.get("APSI_GEMM_VERIFY", "1").strip().lower() in ("0", "off", "no"):
             return True
         c16 = base.split("#")[0].endswith("_bf") and targs[24][1] == 1
-        cview = (self._scratch("tune_c", M * ldc + N)[0], 0)
+        cview = (self._scratch("tune_c", 1)[0], 0)          # (already sized by _variant)
         n = min(M * ldc, 65536)
         slots = (n + 1) // 2 if c16 else n
 
@@ -1723,11 +1729,12 @@ class Gpu(_Ops):
                     self.p(X2), ("u", epi), ("u", act), self.p(db), ("u", 1 if db is not None else 0), self._cnt()]
             grid = (tiles, nb1 * nb2, nz)
             use = self._variant(name, grid, args, M, N, ldc, nb1 * nb2)
-            if use.endswith(("#h", "#v", "#d", "#e", "#f", "#g", "#s")):
+            hb = use.endswith(("#h", "#v", "#d", "#e", "#f", "#g", "#s"))
+            if hb:
                 args = self._h_args(args, M, N, K)
             self._go(use, grid, self._threads(use), *args)         # split k: its last part adds the parts
-            if db is not None:
-                self._db = None                          # taken
+            if db is not None and not hb:
+                self._db = None                          # taken (an h build leaves it to the column sum)
             return True
         if passes == 1 and self.tiled and a_act is None and not epi and nb1 * nb2 == 1 and ldc == N and \
                 M * N * K >= (1 << 21) and self._gemm_padded(A, B, Cv, bias, M, N, K, sam, sak, sbk, sbn, alpha, beta):
@@ -2344,7 +2351,7 @@ class _Attention(_Node):
         if self.fused:
             dd = self.gbuf("dd", B * h * T)
             o.flash_dot(datt, self.att, dd, B, T, h, hd)
-            if getattr(self, "qkv", False):
+            if getattr(self, "qkv", False) or self._qkv_grads():
                 gb, go = self.gbuf("dqkv", 3 * M * D)
                 dq, dk, dv = (gb, go), (gb, go + M * D), (gb, go + 2 * M * D)
             else:
@@ -2365,6 +2372,19 @@ class _Attention(_Node):
         o.gemm(dS, self.q, dk, S, hd, T, 1, S, D, 1, D, alpha=sc, batch=(B, h), sa=(h * T * S, T * S),
                sb=(T * D, hd), sc=(S * D, hd), passes=ps)                                   # dk = dS^T q
         return self._grads_in(dq, dk, dv, M, D, ps)
+
+    def _qkv_grads(self):
+        """The three weight gradients x^T dq, x^T dk, x^T dv as one batched product (a third of the launches, no
+        split of k: 1024 x 1024 outputs are too few tiles to fill the card one at a time): when dq, dk, dv can be
+        written one after another and Gq, Gk, Gv are stored one after another (self-attention, as many key / value
+        heads as query heads, no q/k norm). APSI_QKV_GRADS=0 keeps three products."""
+        if os.environ.get("APSI_QKV_GRADS", "1").strip().lower() in ("0", "off", "no", "false"):
+            return False
+        if self.cross or self.qkn or self.kvh != self.h or self.net.passes != 1:
+            return False
+        q, k, v = self.Wq.g, self.Wk.g, self.Wv.g
+        n = self.D * self.D
+        return k[0] is q[0] and v[0] is q[0] and k[1] == q[1] + n and v[1] == q[1] + 2 * n
 
     def _grads_in(self, dq, dk, dv, M, D, ps):
         o, h, kvh = self.net.ops, self.h, self.kvh
@@ -2391,7 +2411,8 @@ class _Attention(_Node):
             o.colsum(dk, self.kraw, self.km, self.kr, self.gk.g, None, Mk * kvh, hd, 2)
             o.ln_b(self.kraw, self.gk.w, dk, self.km, self.kr, dk2, Mk * kvh, hd, True, None)
             dq, dk = dq2, dk2
-        if getattr(self, "qkv", False) and not self.qkn and dk[0] is dq[0] and dk[1] == dq[1] + M * D and \
+        if (getattr(self, "qkv", False) or self._qkv_grads()) and not self.qkn and dk[0] is dq[0] and \
+                dk[1] == dq[1] + M * D and \
                 dv[0] is dq[0] and dv[1] == dq[1] + 2 * M * D:
             # the three weight gradients in one launch: x^T [dq | dk | dv] into Gq | Gk | Gv (stored one after another)
             o.gemm(self.x, dq, self.Wq.g, D, D, M, 1, D, D, 1, D, beta=True, batch=(1, 3), sb=(0, M * D),

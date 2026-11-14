@@ -1165,3 +1165,28 @@ class NoInPlaceProducts(unittest.TestCase):
             GT.fit(m, m.init(seed=0), X, Y, loss="mse", opt=adamw(lr=1e-3), epochs=1, batch_size=32,
                    verbose=False, ops=GT.Emulator())
         self.assertEqual(seen, [])
+
+
+class QkvGradsBatched(unittest.TestCase):
+    def test_same_training_one_launch(self):
+        """x^T dq, x^T dk, x^T dv as one batched product: the same losses as three products."""
+        from unittest import mock
+        from apsi.stdlib import adamw
+        rng = np.random.default_rng(0)
+        X = rng.integers(0, 50, (32, 32))
+        Y = np.roll(X, -1, 1)
+        seen, res = [], {}
+        orig = GT._Ops.gemm
+
+        def spy(self, *a, **k):
+            if k.get("batch", (1, 1)) == (1, 3):
+                seen.append(1)
+            return orig(self, *a, **k)
+        for v in ("1", "0"):
+            with mock.patch.dict(os.environ, {"APSI_QKV_GRADS": v}), mock.patch.object(GT._Ops, "gemm", spy):
+                m = L.transformer_lm(50, d=64, heads=2, layers=2, context=32)
+                res[v] = GT.fit(m, m.init(seed=0), X, Y, loss="cross_entropy", opt=adamw(lr=1e-3), epochs=2,
+                                batch_size=16, verbose=False, ops=GT.Emulator()).history
+            if v == "1":
+                self.assertTrue(seen)
+        self.assertEqual(res["1"], res["0"])
