@@ -1075,3 +1075,20 @@ class Bf16Hidden(unittest.TestCase):
                 hist[mode] = r.history
         self.assertEqual(seen, {(1, None), (2, None), (None, 1), (3, None)})
         np.testing.assert_allclose(hist["1"], hist["0"], rtol=2e-3)
+
+
+class HeldOutOnCard(unittest.TestCase):
+    def test_same_loss_as_the_host(self):
+        """The held-out cross-entropy computed on the card equals the host's float64 one (to float32 sums)."""
+        from apsi.stdlib import adamw
+        rng = np.random.default_rng(0)
+        X = rng.integers(0, 50, (80, 16))
+        Y = np.roll(X, -1, 1)
+        Y[70, 3] = -1                                    # a label left out
+        m = L.transformer_lm(50, d=64, heads=1, layers=1, context=16)
+        ops = GT.Emulator()
+        net = GT.Net(ops, m, m.init(seed=0))
+        card = GT._eval_ce_on_card(net, ops, (X[64:], Y[64:]), True, 16)
+        host = GT._eval_loss_host(lambda Xa: GT._forward_batches(net, ops, Xa, 16), (X[64:], Y[64:]), True,
+                                  "cross_entropy", None)
+        self.assertAlmostEqual(card, host, places=4)

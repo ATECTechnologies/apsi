@@ -6019,7 +6019,47 @@ def _forward_batches(net, ops, Xa, bs):
 
 
 def _eval_loss(net, ops, val, ids, ce, bs):
+    if (ce is True or ce == "cross_entropy") and bs and bs < (1 << 30):
+        r = _eval_ce_on_card(net, ops, val, ids, bs)
+        if r is not None:
+            return r
     return _eval_loss_host(lambda Xa: _forward_batches(net, ops, Xa, bs), val, ids, ce, None)
+
+
+def _eval_ce_on_card(net, ops, val, ids, bs):
+    """The held-out cross-entropy computed on the card: batch by batch the logits stay there and the loss kernel adds
+    the mean into one number, read once at the end. (The host path copied every batch's logits back and took the
+    softmax in float64 on the processor: hundreds of MB and seconds per evaluation with the card idle.)"""
+    from . import ops as aops
+    vx, vy = val
+    Xa = _inputs(aops.raw(vx), ids)
+    lab = np.asarray(aops.raw(vy))
+    if not np.issubdtype(lab.dtype, np.integer) and not np.all(np.mod(lab, 1) == 0):
+        return None
+    lab = np.ascontiguousarray(lab.astype(np.int32))
+    if len(lab) != len(Xa):
+        return None
+    valid = int((lab >= 0).sum())
+    if valid == 0:
+        return None
+    net.train = False
+    per = lab[0].size
+    Xd = net.arena.get("Xp", min(bs, len(Xa)) * int(np.prod(Xa.shape[1:])))
+    Yd = net.arena.get("Yp", min(bs, len(Xa)) * per)
+    LOSS = net.arena.get("val_loss", 1)
+    ops.fill(LOSS, 1, 0.0)
+    for s in range(0, len(Xa), bs):
+        xb, yb = Xa[s:s + bs], lab[s:s + bs]
+        ops.put(Xd[0], xb.reshape(-1))
+        ops.put(Yd[0], yb.reshape(-1))
+        net.round_weights()
+        out, shape = net.forward(Xd, xb.shape)
+        rows = _rows(shape)
+        if rows != yb.size:
+            return None
+        dout = net.arena.get("val_dout", rows * shape[-1])
+        ops.ce(out, Yd, dout, LOSS, rows, shape[-1], 0.0, 1.0 / valid)
+    return float(ops.get(LOSS[0], 1, LOSS[1])[0])
 
 
 def _eval_loss_host(forward, val, ids, ce, bs):
