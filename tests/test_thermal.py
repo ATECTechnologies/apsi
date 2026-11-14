@@ -292,14 +292,14 @@ class FanControl(unittest.TestCase):
             top, limit = 170000, 136000.0
         with mock.patch.dict(os.environ, {"APSI_GPU_TRAIN_POWER": ""}, clear=False):
             os.environ.pop("APSI_GPU_TRAIN_POWER")
-            self.assertEqual(thermal._train_power(PC()), 144500.0)            # 85 % of the default
-            self.assertEqual(thermal._train_power(PC(), {"power_w": 150.0}), 150000.0)   # the measured setting
+            self.assertEqual(thermal._train_power(PC()), 145000.0)            # the default: 145 W
+            self.assertEqual(thermal._train_power(PC(), {"power_w": 120.0}), 145000.0)   # (the profile: fans only)
         with mock.patch.dict(os.environ, {"APSI_GPU_TRAIN_POWER": "140W"}):
             self.assertEqual(thermal._train_power(PC()), 140000.0)
         with mock.patch.dict(os.environ, {"APSI_GPU_TRAIN_POWER": "200W"}):
             self.assertEqual(thermal._train_power(PC()), 170000.0)        # never above the default
         with mock.patch.dict(os.environ, {"APSI_GPU_TRAIN_POWER": "100W"}):
-            self.assertEqual(thermal._train_power(PC()), 136000.0)        # never below the card's own limit
+            self.assertEqual(thermal._train_power(PC()), 135000.0)        # never below the floor (135 W)
 
 
 class Calibrate(unittest.TestCase):
@@ -357,7 +357,7 @@ class Calibrate(unittest.TestCase):
             gc.save_profile("0:RTX", {"power_w": 150.0, "fan_min": 70, "fan_max": 84})
             self.assertEqual(gc.load_profile("0:RTX")["fan_max"], 84)
             self.assertIsNone(gc.load_profile("1:other"))
-            self.assertEqual(thermal._fan_range(gc.load_profile("0:RTX")), (70.0, 84.0))
+            self.assertEqual(thermal._fan_range(gc.load_profile("0:RTX")), (70.0, 100.0))
 
 
 class CalibrateNoFans(Calibrate):
@@ -391,3 +391,41 @@ class MaxMode(unittest.TestCase):
                     g.tick()
             self.assertEqual(g.fraction, 0.0)
             self.assertEqual(g.paced, 0.0)
+
+
+class PowerFloor(unittest.TestCase):
+    """A hot room where even full fans cannot hold 79 C at 145 W: the power stops at the 135 W floor, the card runs
+    warmer, nothing is paused."""
+
+    def test_floor_holds(self):
+        clock, st = [0.0], {"T": 50.0, "limit": 145000.0, "cmd": None, "fan": 40.0}
+
+        def power():
+            return st["limit"] / 1000.0
+
+        class PC:
+            top, floor, orig, limit, run = 170000, 135000, 136000, 145000.0, 145000.0
+
+            def set(self, mw):
+                st["limit"] = float(mw)
+        pc = PC()
+        pc.step = thermal._PowerControl.step.__get__(pc)
+        g = thermal.Governor(lambda: float(round(st["T"])), 79.0)
+        g.power, g.read_power, g.pace_from = pc, power, 87.0
+        fc = thermal._FanControl()
+        fc.percent, fc.level, fc.ok, fc.low, fc.top = None, None, True, 70.0, 100.0
+        fc._set = lambda pct: st.__setitem__("cmd", pct) or True
+        g.fan = fc
+        lims = []
+        with mock.patch.object(thermal.time, "monotonic", lambda: clock[0]):
+            while clock[0] < 900.0:
+                want = 40.0 if st["cmd"] is None else float(st["cmd"])
+                st["fan"] += (want - st["fan"]) * 0.025
+                r = 0.46 - 0.16 * st["fan"] / 100.0
+                st["T"] += (40.0 + r * power() - st["T"]) * 0.05 / 20.0
+                clock[0] += 0.05
+                g.tick()
+                lims.append(st["limit"])
+        self.assertGreaterEqual(min(lims), 135000.0)
+        self.assertEqual(g.paced, 0.0)
+        self.assertEqual(st["cmd"], 100)
