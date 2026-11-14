@@ -155,3 +155,51 @@ class PowerLimitRestore(unittest.TestCase):
             pc2.restore()                                # a clean end: the limit back, the record gone
             self.assertEqual(lib.limit, 136000)
             self.assertFalse(os.path.exists(os.path.join(d, "p.txt")))
+
+
+class PowerLimitControl(unittest.TestCase):
+    """The power limit holds a card at 78-79 C under full load and never lets it reach 80, through a light phase
+    and back (sudden changes of load), for slow and fast coolers and hot and cool rooms."""
+
+    def run_card(self, tau=20.0, amb=32.0, seconds=400.0):
+        clock, st = [0.0], {"T": 45.0, "limit": 136000.0}
+
+        def demand(t):
+            return 40.0 if t < 10 else 90.0 if 150 < t < 170 else 175.0
+
+        def power():
+            return min(st["limit"] / 1000.0, demand(clock[0]))
+
+        def read():
+            return float(round(st["T"] + 0.035 * power()))
+
+        class PC:
+            top, floor, limit = 170000, 93500, 136000.0
+
+            def set(self, mw):
+                st["limit"] = float(mw)
+        pc = PC()
+        pc.step = thermal._PowerControl.step.__get__(pc)
+        g = thermal.Governor(read, 79.0)
+        g.power, g.read_power = pc, power
+        temps, watts = [], []
+        with mock.patch.object(thermal.time, "monotonic", lambda: clock[0]):
+            while clock[0] < seconds:
+                st["T"] += (amb + 0.30 * power() - st["T"]) * min(1.0, 0.05 / tau)
+                clock[0] += 0.05
+                g.tick()
+                temps.append((clock[0], read()))
+                watts.append((clock[0], power()))
+        return temps, watts, g
+
+    def test_steady_and_never_80(self):
+        for tau, amb in ((20.0, 32.0), (8.0, 32.0), (40.0, 32.0), (20.0, 38.0), (20.0, 26.0)):
+            temps, watts, g = self.run_card(tau, amb)
+            full = [t for c, t in temps if 90 < c < 150 or c > 230]
+            self.assertLess(max(t for c, t in temps), 80.0, (tau, amb))
+            self.assertGreaterEqual(min(full), 78.0, (tau, amb))
+            self.assertEqual(g.paced, 0.0)
+            # as much power as 78.5 C allows (the steady state of this card: amb + 0.335 P = 78.5)
+            steady = (78.5 - amb) / 0.335
+            late = [p for c, p in watts if c > 230]
+            self.assertGreater(sum(late) / len(late), steady * 0.97, (tau, amb))

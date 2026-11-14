@@ -840,6 +840,41 @@ class Gpu(_Ops):
         lib.cuEventCreate.argtypes = [ctypes.POINTER(ctypes.c_void_p), ctypes.c_uint]
         lib.cuFuncGetAttribute.argtypes = [ctypes.POINTER(ctypes.c_int), ctypes.c_int, ctypes.c_void_p]
         self._launch = lib.cuLaunchKernel
+        # a second stream: the weight gradient of a layer (x^T dy) runs beside its input gradient (dy W^T): the two
+        # products are independent, and side by side they fill the card where one alone leaves it partly idle
+        # (few output tiles: 1024 x 1024 weights). Non-blocking, so the default stream does not wait for it by itself.
+        self.cur, self.side = None, None
+        if os.environ.get("APSI_GPU_STREAMS", "1").strip().lower() not in ("0", "off", "no", "false"):
+            try:
+                s2 = ctypes.c_void_p()
+                lib.cuStreamCreate.argtypes = [ctypes.POINTER(ctypes.c_void_p), ctypes.c_uint]
+                lib.cuStreamWaitEvent.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_uint]
+                if lib.cuStreamCreate(ctypes.byref(s2), 1) == 0:
+                    self.side = s2
+            except AttributeError:
+                self.side = None
+
+    def fork(self):
+        """From here the launches go to the side stream, after everything queued so far; join() brings them back.
+        Returns None (nothing to join) when there is no side stream or the kernels are being profiled."""
+        if self.side is None or self.profile is not None or self.cur is not None:
+            return None
+        ev = self._event()
+        self._lib.cuEventRecord(ev, None)
+        self._lib.cuStreamWaitEvent(self.side, ev, 0)
+        self._lib.cuEventDestroy_v2(ev)
+        self.cur = self.side
+        return True
+
+    def join(self, token):
+        """Back to the default stream, which waits for the side stream's work before its next launch."""
+        if not token:
+            return
+        ev = self._event()
+        self._lib.cuEventRecord(ev, self.side)
+        self.cur = None
+        self._lib.cuStreamWaitEvent(None, ev, 0)
+        self._lib.cuEventDestroy_v2(ev)
 
     _CT = {"p": ctypes.c_uint64, "u": ctypes.c_uint32, "i": ctypes.c_int32, "f": ctypes.c_float}
 
@@ -858,8 +893,8 @@ class Gpu(_Ops):
         if prof:                                         # CUDA events around the launch: the card's own clock
             e0, e1 = self._event(), self._event()
             self._lib.cuEventRecord(e0, None)
-        r = self._launch(self.fn[name], max(1, gx), max(1, gy), max(1, gz), block, 1, 1, self._dyn.get(name, 0), None,
-                         hit[1], None)
+        r = self._launch(self.fn[name], max(1, gx), max(1, gy), max(1, gz), block, 1, 1, self._dyn.get(name, 0),
+                         self.cur, hit[1], None)
         if prof:
             self._lib.cuEventRecord(e1, None)
             label = name if not name.startswith("gemm") else \
@@ -1409,9 +1444,9 @@ class Gpu(_Ops):
         ms = ctypes.c_float()
         for cand in cands + cands:
             e0, e1 = self._event(), self._event()
-            self._lib.cuEventRecord(e0, None)
+            self._lib.cuEventRecord(e0, self.cur)
             self._go(cand, grid, self._threads(cand), *(self._h_args(targs, M, N, K) if cand.endswith(("#h", "#v", "#d", "#e")) else targs))
-            self._lib.cuEventRecord(e1, None)
+            self._lib.cuEventRecord(e1, self.cur)
             self._lib.cuEventSynchronize(e1)
             self._lib.cuEventElapsedTime(ctypes.byref(ms), e0, e1)
             self._lib.cuEventDestroy_v2(e0)
@@ -1425,13 +1460,17 @@ class Gpu(_Ops):
     def _cnt(self):
         """Counters of the kernels whose last block finishes the sum (zero between launches: that block resets its
         own), one per column block: 65536 of them, made once."""
-        c = self.__dict__.get("_counters")
+        name = "_counters" if self.cur is None else "_counters_side"     # one set per stream (no race)
+        c = self.__dict__.get(name)
         if c is None:
-            c = self._counters = (self.alloc(65536), 0)
+            c = (self.alloc(65536), 0)
+            setattr(self, name, c)
             self.fill(c, 65536, 0.0)
         return self.p(c)
 
     def _scratch(self, key, n):
+        if self.cur is not None:                         # the side stream has scratch of its own (no race)
+            key = ("side", key)
         bf = self._scr.get(key)
         if bf is None or bf.n < n:
             if bf is not None:
@@ -1725,12 +1764,17 @@ class _Linear(_Node):
         self.dh_given = False
         # dW[K, N] += x^T dy: A(k, m) = x[m * K + k]
         db = self.b.g if self.b is not None else None   # the bias gradient comes with the weight gradient
-        if self.x_pre is not None:                      # x = act(h): applied while the product reads h
-            pre = self.x_pre
-            o.gemm(pre.h, dy, self.W.g, K, N, M, 1, K, N, 1, N, beta=True, passes=self.net.passes, a_act=pre.act,
-                   tmp=(self.net.arena.get(("shared", "act"), M * K), M * K), db=db)
-        else:
-            o.gemm(self.x, dy, self.W.g, K, N, M, 1, K, N, 1, N, beta=True, passes=self.net.passes, db=db)
+        side = o.fork() if need_dx and hasattr(o, "fork") else None   # x^T dy beside dy W^T (independent products)
+        try:
+            if self.x_pre is not None:                  # x = act(h): applied while the product reads h
+                pre = self.x_pre
+                o.gemm(pre.h, dy, self.W.g, K, N, M, 1, K, N, 1, N, beta=True, passes=self.net.passes, a_act=pre.act,
+                       tmp=(self.net.arena.get(("shared", "act"), M * K), M * K), db=db)
+            else:
+                o.gemm(self.x, dy, self.W.g, K, N, M, 1, K, N, 1, N, beta=True, passes=self.net.passes, db=db)
+        finally:
+            if side:
+                o.cur = None                            # dy W^T on the default stream meanwhile
         if not need_dx:
             return None
         dx = self.gbuf("dx", M * K)
@@ -1739,6 +1783,8 @@ class _Linear(_Node):
                    act=into_act[0])
         else:
             o.gemm(dy, self.W.w, dx, M, K, N, N, 1, 1, N, K, passes=self.net.passes)       # dy W^T
+        if side:
+            o.join(side)                                # both done before anything uses dx or overwrites dy
         return dx
 
 

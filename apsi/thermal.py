@@ -7,7 +7,8 @@ step, a generated token) Apsi waits a fraction of the time that piece took, so t
 cools; below the band the waiting goes away. The fraction moves a little every half second, so the temperature
 settles in the band rather than swinging. A cool card is never slowed.
 
-    APSI_GPU_TEMP=77        the target in degrees Celsius (default 77: the band is 75-78)
+    APSI_GPU_TEMP=79        the ceiling in degrees Celsius (default 79): the card is held just under it (78-79), as much
+                            power as that temperature allows and never more heat
     APSI_GPU_TEMP=off       no control (the card's own limits only)
     APSI_CPU_TEMP=77        the same for the processor during training and answering on it (Linux sensors; on
                             Windows the ACPI thermal zone, which needs an administrator)
@@ -27,13 +28,13 @@ _govs = {}
 
 
 def _target():
-    v = os.environ.get("APSI_GPU_TEMP", "77").strip().lower()
+    v = os.environ.get("APSI_GPU_TEMP", "79").strip().lower()
     if v in ("", "0", "off", "no", "false", "none"):
         return None
     try:
         t = float(v)
     except ValueError:
-        return 77.0
+        return 79.0
     return min(95.0, max(50.0, t))
 
 
@@ -62,12 +63,15 @@ def _load_nvml():
 
 
 class Governor:
-    """Paces the work of one GPU to keep it in [target - 2, target + 1] degrees Celsius."""
+    """Holds one GPU just under a ceiling (APSI_GPU_TEMP, default 79 C): the smoothed temperature is steered to
+    ceiling - 0.5, so the readings stay in [ceiling - 1, ceiling] and the card gets all the power that temperature
+    allows (a lower, wider band would leave power unused)."""
     PERIOD = 0.5                       # seconds between temperature readings and adjustments
 
     def __init__(self, read_temp, target):
-        self.read_temp, self.target = read_temp, float(target)
-        self.low, self.high = self.target - 2.0, self.target + 1.0
+        self.ceiling = float(target)
+        self.read_temp, self.target = read_temp, self.ceiling - 0.5
+        self.low, self.high = self.ceiling - 1.0, self.ceiling
         self.fraction = 0.0            # of each piece of work, how much to wait after it (0 = full speed)
         self.integral = 0.0
         self.temp = None
@@ -94,11 +98,21 @@ class Governor:
         self.max_temp = t if self.max_temp is None else max(self.max_temp, t)
         sm = getattr(self, "smooth", None)
         self.smooth = t if sm is None else sm + min(1.0, dt / 2.0) * (t - sm)
+        # the slope of the smoothed temperature (degrees per second), smoothed again: how fast the card heats now
+        sl = 0.0 if sm is None else (self.smooth - sm) / dt
+        self.slope = sl if getattr(self, "slope", None) is None else self.slope + min(1.0, dt / 2.0) * (sl - self.slope)
         err = self.smooth - self.target
-        e = 0.0 if abs(err) < 0.5 else err - (0.5 if err > 0 else -0.5)
+        e = 0.0 if abs(err) < 0.25 else err - (0.25 if err > 0 else -0.25)
         self.last_read = now
         power = getattr(self, "power", None)
-        if power is not None and not power.step(e, dt) and self.integral == 0.0:
+        draw = None
+        if power is not None and getattr(self, "read_power", None):
+            try:
+                draw = self.read_power()
+            except Exception:                           # noqa: BLE001
+                draw = None
+        if power is not None and not power.step(e, dt, raw=t, slope=self.slope, draw=draw,
+                                                ceiling=getattr(self, "ceiling", None)) and self.integral == 0.0:
             self.fraction = 0.0                         # the power limit holds it: no pauses, steady speed
             return
         if self.fraction > 0.0 or e > 0.0:              # a cool card that is not paced winds nothing up
@@ -135,7 +149,8 @@ class Governor:
             self.last_tick = time.monotonic()
 
     def status(self):
-        out = {"temperature_c": self.temp, "target_c": self.target, "band_c": [self.low, self.high],
+        out = {"temperature_c": self.temp, "ceiling_c": getattr(self, "ceiling", None), "target_c": self.target,
+               "band_c": [self.low, self.high],
                "paced_fraction": round(self.fraction, 3), "max_c": self.max_temp, "paced_s": round(self.paced, 1)}
         if getattr(self, "read_power", None):
             out["power_w"] = self.read_power()
@@ -355,12 +370,30 @@ class _PowerControl:
         atexit.register(_restore)
         return pc
 
-    def step(self, err, dt):
-        """PI on the temperature error: about 6 W per degree, and the limit keeps moving while the error lasts."""
-        new = min(self.top, max(self.floor, self.limit - (4000.0 * err * dt + 1500.0 * err * (err > 0))))
-        if abs(new - self.limit) >= 1000.0 or new in (self.top, self.floor):
-            if int(new) != int(self.limit):
-                self.set(int(new))
+    def step(self, err, dt, raw=None, slope=0.0, draw=None, ceiling=None):
+        """The power limit that holds the card just under its ceiling, steadily and through sudden changes of load:
+
+        * looking ahead: the error is taken 4 s ahead along the temperature's slope, so a card heating up quickly is
+          given less power before it gets there, not after (no overshoot when a heavy phase starts);
+        * fast down, slow up: too hot cuts the limit at once (about 4 W per degree and second, plus a step), too
+          cool gives it back at most 2 W per second, so the limit does not swing;
+        * at the ceiling itself (a raw reading at or above it): 6 % less at once, the guard against 80 C;
+        * no wind-up: while the card draws less than its limit (a light phase), the limit is not raised beyond what
+          it draws plus 8 W, so the next heavy phase does not start from an unused high limit."""
+        e = err + 4.0 * slope
+        if ceiling is not None and raw is not None and raw >= ceiling + 0.5:
+            new = self.limit * 0.94                    # at the ceiling: at once
+        elif e > 0:
+            new = self.limit - (4000.0 * e * dt + 1500.0 * e)
+        else:
+            new = self.limit + min(2000.0 * dt, -3000.0 * e * dt)
+            if draw is not None and draw > 0:
+                new = min(new, max(self.limit, draw * 1000.0 + 8000.0))
+        new = min(self.top, max(self.floor, new))
+        applied = getattr(self, "applied", self.limit)  # what the card has now (changes below 1 W are gathered)
+        if abs(new - applied) >= 1000.0 or (new in (self.top, self.floor) and int(new) != int(applied)):
+            self.set(int(new))
+            self.applied = new
         self.limit = new
         return new <= self.floor + 1.0                 # at the floor: pauses may still be needed
 
@@ -518,8 +551,8 @@ def set_power(spec, index=None):
     return msgs
 
 
-def hold(target=77.0, index=0, seconds=None, quiet=False):
-    """apsi gpu hold 77: keeps the card near the temperature by its power limit for ANY program running on it (a
+def hold(target=79.0, index=0, seconds=None, quiet=False):
+    """apsi gpu hold 79: keeps the card near the temperature by its power limit for ANY program running on it (a
     PyTorch job, a game, a renderer) until stopped (Ctrl+C) — the same control Apsi's own training uses, so other
     programs can be measured under the same conditions. Needs an administrator or the GPU helper."""
     os.environ["APSI_GPU_TEMP"] = str(target)
@@ -533,7 +566,7 @@ def hold(target=77.0, index=0, seconds=None, quiet=False):
     if g is NULL or getattr(g, "power", None) is None:
         print("the power limit cannot be set from here: run as administrator, or apsi gpu setup once")
         return 1
-    print(f"holding GPU {index} near {target:g} C by its power limit (Ctrl+C to stop)", flush=True)
+    print(f"holding GPU {index} at {target:g} C at most by its power limit (Ctrl+C to stop)", flush=True)
     t0 = last = time.monotonic()
     try:
         stop = os.environ.get("APSI_HOLD_STOP")           # a file whose appearance ends the hold (from another program)
@@ -557,7 +590,7 @@ def add_parser(sub):
     p.add_argument("what", nargs="?", default="status",
                    choices=["status", "power", "watch", "setup", "remove", "hold", "bench"])
     p.add_argument("value", nargs="?", default=None,
-                   help="for power: 80%% (of the default), 130W or default; for hold: the temperature (77); for bench: "
+                   help="for power: 80%% (of the default), 130W or default; for hold: the ceiling (79); for bench: "
                         "127m (default), 11m, modern, check (every kernel against the reference) or cards")
     p.add_argument("--precision", default="auto", help="bench: auto (bf16), fp32, fp8, fp4, ...")
     p.add_argument("--steps", type=int, default=40, help="bench: training steps to time")
@@ -572,7 +605,7 @@ def _cmd(args):
             print(m)
         return 0
     if args.what == "hold":
-        return hold(float(args.value or 77), args.gpu or 0)
+        return hold(float(args.value or 79), args.gpu or 0)
     if args.what == "bench":
         from . import gpu_bench
         return gpu_bench.main(args.value or "127m", args.precision, args.steps)
