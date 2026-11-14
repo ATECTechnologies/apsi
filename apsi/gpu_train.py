@@ -1604,20 +1604,20 @@ class Gpu(_Ops):
     _CUBLAS = None
 
     def _cublas_lib(self):
-        """NVIDIA's cuBLAS, only when asked for (APSI_CUBLAS=on to look for it, or the path to the library or its
-        folder): one more candidate for the products the card times. Off by default; never downloaded or installed
-        by Apsi."""
+        """NVIDIA's cuBLAS, when this computer already has it (the CUDA toolkit, PyTorch, the nvidia-cublas wheel;
+        APSI_CUBLAS=path to the library or its folder): one more candidate for the products the card times. Never
+        downloaded or installed by Apsi; APSI_CUBLAS=off leaves it out."""
         if Gpu._CUBLAS is not None:
             return Gpu._CUBLAS or None
         Gpu._CUBLAS = False
-        env = os.environ.get("APSI_CUBLAS", "").strip()
-        if not env or env.lower() in ("off", "0", "no", "false"):
-            return None                                  # off unless asked for: Apsi's own kernels by default
         self.dev.ensure()                                # (the card's context current: cuBLAS works in it)
+        env = os.environ.get("APSI_CUBLAS", "").strip()
+        if env.lower() in ("off", "0", "no", "false"):
+            return None
         names = (["cublas64_12.dll", "cublas64_11.dll"] if os.name == "nt" else
                  ["libcublas.so.12", "libcublas.so.11", "libcublas.so"])
         dirs = []
-        if env.lower() not in ("on", "1", "yes", "true", "auto"):
+        if env:
             dirs.append(env if os.path.isdir(env) else os.path.dirname(env))
         for var in ("CUDA_PATH", "CUDA_HOME"):
             if os.environ.get(var):
@@ -1658,7 +1658,7 @@ class Gpu(_Ops):
     def _cublas_ok(self, name, grid, args, M, N, K, nb):
         """Products cuBLAS can do here: one product (no batch, no split k), bfloat16 operands dense as the h build
         needs them, C as it is or + bias or + a residual (epi 0 / 3), no activation on the way in."""
-        if os.environ.get("APSI_CUBLAS", "").strip().lower() in ("", "off", "0", "no", "false"):
+        if os.environ.get("APSI_CUBLAS", "").strip().lower() in ("off", "0", "no", "false"):
             return False
         if nb != 1 or (len(grid) > 2 and grid[2] > 1) or args[24][1] not in (0, 3) or "to_bf16" not in self.fn:
             return False
