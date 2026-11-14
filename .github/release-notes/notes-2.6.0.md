@@ -58,6 +58,12 @@ identical weights; steps and resume bit for bit; the NaN guard).
 - **`APSI_GPU_TEMP=max`: the card as PyTorch runs it:** the full default power limit for the run (170 W on an RTX
   3060, put back at exit), the card's own fan curve and temperature limits (the driver slows the clocks near 83 °C);
   Apsi only reports. For the fastest training and for comparisons with programs that hold nothing.
+- **cuBLAS as one more build, when the computer has it:** where NVIDIA's cuBLAS is already present (the CUDA
+  toolkit, PyTorch's own copy, the nvidia-cublas wheel; `APSI_CUBLAS=path`), it joins the builds the card times for
+  each product shape — plain products, + bias, + a residual, weight gradients (their bias gradient as a pass of its
+  own) — on the same bfloat16 operands and twins, and like every build it is used only if it is faster and gives the
+  base build's numbers. Apsi never downloads it; `APSI_CUBLAS=off` leaves it out, `APSI_GEMM_VARIANT=cublas`
+  forces it where it can run.
 - **No idle gaps on Windows:** WDDM gathers launches into batches; every 32 launches a non-blocking stream query now
   hands them to the card at once (`APSI_GPU_FLUSH=N`, 0 = off).
 - **bfloat16 twins instead of a conversion per product:** a layer norm writes its output's bfloat16 twin in the same

@@ -1516,7 +1516,11 @@ class Gpu(_Ops):
         if not getattr(self, "_no_h", False) and self._h_ready(name, args, M, N, K, nb):
             cands.append(f"{name}#h")
             cands += [f"{name}#{t}" for t in ("v", "d", "e") if f"{name}#{t}" in self.fn]
+        if self._cublas_ok(name, grid, args, M, N, K, nb):
+            cands.append("cublas")
         force = os.environ.get("APSI_GEMM_VARIANT", "auto").strip().lower()
+        if force == "cublas" and "cublas" in cands:
+            return "cublas"
         if force in ("x", "w", "h", "v", "d", "e"):
             return f"{name}#{force}" if f"{name}#{force}" in cands else name
         if force == "a" or len(cands) == 1 or nb != 1:
@@ -1541,7 +1545,10 @@ class Gpu(_Ops):
         for cand in cands + cands:
             e0, e1 = self._event(), self._event()
             self._lib.cuEventRecord(e0, self.cur)
-            self._go(cand, grid, self._threads(cand), *(self._h_args(targs, M, N, K) if cand.endswith(("#h", "#v", "#d", "#e")) else targs))
+            if cand == "cublas":
+                self._cublas_run(targs, M, N, K)
+            else:
+                self._go(cand, grid, self._threads(cand), *(self._h_args(targs, M, N, K) if cand.endswith(("#h", "#v", "#d", "#e")) else targs))
             self._lib.cuEventRecord(e1, self.cur)
             self._lib.cuEventSynchronize(e1)
             self._lib.cuEventElapsedTime(ctypes.byref(ms), e0, e1)
@@ -1572,8 +1579,11 @@ class Gpu(_Ops):
         slots = (n + 1) // 2 if c16 else n
 
         def run(nm):
-            a = self._h_args(targs, M, N, K) if nm.endswith(("#h", "#v", "#d", "#e")) else targs
-            self._go(nm, grid, self._threads(nm), *a)
+            if nm == "cublas":
+                self._cublas_run(targs, M, N, K)
+            else:
+                a = self._h_args(targs, M, N, K) if nm.endswith(("#h", "#v", "#d", "#e")) else targs
+                self._go(nm, grid, self._threads(nm), *a)
             self.sync()
             raw = self.get(cview[0], slots)
             if c16:
@@ -1589,6 +1599,138 @@ class Gpu(_Ops):
             print(f"apsi: the {cand} build of a {M} x {N} x {K} product differs from the base build "
                   f"(max difference {err:.3g} of {scale:.3g}); the base build runs instead", file=sys.stderr)
         return ok
+
+    # ------------------------------------------------------------------ cuBLAS: one more build the card may pick
+    _CUBLAS = None
+
+    def _cublas_lib(self):
+        """NVIDIA's cuBLAS, when this computer already has it (the CUDA toolkit, PyTorch, the nvidia-cublas wheel;
+        APSI_CUBLAS=path to the library or its folder): one more candidate for the products the card times. Never
+        downloaded or installed by Apsi; APSI_CUBLAS=off leaves it out."""
+        if Gpu._CUBLAS is not None:
+            return Gpu._CUBLAS or None
+        Gpu._CUBLAS = False
+        self.dev.ensure()                                # (the card's context current: cuBLAS works in it)
+        env = os.environ.get("APSI_CUBLAS", "").strip()
+        if env.lower() in ("off", "0", "no", "false"):
+            return None
+        names = (["cublas64_12.dll", "cublas64_11.dll"] if os.name == "nt" else
+                 ["libcublas.so.12", "libcublas.so.11", "libcublas.so"])
+        dirs = []
+        if env:
+            dirs.append(env if os.path.isdir(env) else os.path.dirname(env))
+        for var in ("CUDA_PATH", "CUDA_HOME"):
+            if os.environ.get(var):
+                dirs += [os.path.join(os.environ[var], "bin"), os.path.join(os.environ[var], "lib64")]
+        import glob
+        roots = [p for p in sys.path if p and os.path.isdir(p)]
+        home = os.path.expanduser("~")
+        roots += glob.glob(os.path.join(home, ".apsi", "**", "site-packages"), recursive=True)[:20]
+        for r in roots:
+            dirs += [os.path.join(r, "torch", "lib"), os.path.join(r, "nvidia", "cublas", "bin"),
+                     os.path.join(r, "nvidia", "cublas", "lib")]
+        dirs += [d for d in os.environ.get("PATH", "").split(os.pathsep) if d]
+        for d in dirs:
+            for n in names:
+                f = os.path.join(d, n)
+                if not os.path.isfile(f):
+                    continue
+                try:
+                    if os.name == "nt":
+                        os.add_dll_directory(d)
+                    lib = ctypes.CDLL(f)
+                    h = ctypes.c_void_p()
+                    if lib.cublasCreate_v2(ctypes.byref(h)) != 0:
+                        continue
+                    lib.cublasSetStream_v2.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+                    lib.cublasCreate_v2.argtypes = [ctypes.POINTER(ctypes.c_void_p)]
+                    lib.cublasGemmEx.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_int, ctypes.c_int,
+                                                 ctypes.c_int, ctypes.c_int, ctypes.c_void_p, ctypes.c_void_p,
+                                                 ctypes.c_int, ctypes.c_int, ctypes.c_void_p, ctypes.c_int,
+                                                 ctypes.c_int, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_int,
+                                                 ctypes.c_int, ctypes.c_int, ctypes.c_int]
+                    Gpu._CUBLAS = (lib, h, f)
+                    return Gpu._CUBLAS
+                except (OSError, AttributeError):
+                    continue
+        return None
+
+    def _cublas_ok(self, name, grid, args, M, N, K, nb):
+        """Products cuBLAS can do here: one product (no batch, no split k), bfloat16 operands dense as the h build
+        needs them, C as it is or + bias or + a residual (epi 0 / 3), no activation on the way in."""
+        if os.environ.get("APSI_CUBLAS", "").strip().lower() in ("off", "0", "no", "false"):
+            return False
+        if nb != 1 or (len(grid) > 2 and grid[2] > 1) or args[24][1] not in (0, 3) or "to_bf16" not in self.fn:
+            return False
+        if "_aa" in name or (name.endswith("_bf") and name not in KS.A16_KERNELS) or \
+                (args[24][1] == 3 and (args[11][1] != N or args[20][1])):
+            return False
+        sam, sak, sbk, sbn = (a[1] for a in args[7:11])
+        da = (sak == 1 and sam == K and K % 8 == 0) or (sam == 1 and sak == M and M % 8 == 0)
+        db = (sbn == 1 and sbk == N and N % 8 == 0) or (sbk == 1 and sbn == K and K % 8 == 0)
+        return da and db and self._cublas_lib() is not None
+
+    def _cublas_run(self, args, M, N, K):
+        """C = alpha A B (+ C) (+ bias) (+ X2) with cuBLAS on the bfloat16 copies (twins) of A and B, float32 sums.
+        Row-major C = A B is column-major C^T = B^T A^T: cuBLAS gets B first."""
+        lib, h0, _ = self._cublas_lib()
+        hs = self.__dict__.setdefault("_cublas_h", {})   # one handle per stream (each has its own workspace)
+        key = self.cur.value if isinstance(self.cur, ctypes.c_void_p) else self.cur
+        h = hs.get(key)
+        if h is None:
+            if not hs:
+                h = h0
+            else:
+                h = ctypes.c_void_p()
+                if lib.cublasCreate_v2(ctypes.byref(h)) != 0:
+                    raise TrainError("cuBLAS: no second handle")
+            hs[key] = h
+        a = self._h_args(args, M, N, K)
+        prof = self.profile is not None
+        if prof:
+            e0, e1 = self._event(), self._event()
+            self._lib.cuEventRecord(e0, self.cur)
+        try:
+            self._cublas_core(lib, h, a, args, M, N, K)
+        finally:
+            if prof:
+                self._lib.cuEventRecord(e1, self.cur)
+                self._pending.append((f"gemm_cublas {M}x{N}x{K}", e0, e1))
+
+    def _cublas_core(self, lib, h, a, args, M, N, K):
+        A, B, Cp = a[0][1], a[1][1], args[2][1]
+        sam, sak, sbk, sbn = (x[1] for x in args[7:11])
+        ldc, alpha, beta = args[11][1], float(args[19][1]), bool(args[20][1])
+        has_bias, epi = bool(args[21][1]), args[24][1]
+        lib.cublasSetStream_v2(h, self.cur)
+        one, zero = ctypes.c_float(1.0), ctypes.c_float(0.0)
+        if epi == 3:                                     # C <- the residual, then + the product
+            self._lib.cuMemcpyDtoDAsync_v2(ctypes.c_uint64(Cp), ctypes.c_uint64(args[23][1]),
+                                          ctypes.c_size_t(4 * M * ldc), self.cur)
+            beta = True
+        if has_bias:                                     # C (+)= ones(M) bias(N): a product of depth 1
+            ones = self._scratch("cublas_ones", M)
+            if getattr(self, "_ones_n", 0) < M:
+                self.fill(ones, M, 1.0)
+                self._ones_n = M
+            lib.cublasSgemm_v2.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int,
+                                           ctypes.c_int, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_int,
+                                           ctypes.c_void_p, ctypes.c_int, ctypes.c_void_p, ctypes.c_void_p,
+                                           ctypes.c_int]
+            r = lib.cublasSgemm_v2(h, 0, 0, N, M, 1, ctypes.byref(one), ctypes.c_void_p(args[3][1]), N,
+                                   ctypes.c_void_p(self.p(ones)[1]), 1, ctypes.byref(one if beta else zero),
+                                   ctypes.c_void_p(Cp), ldc)
+            if r:
+                raise TrainError(f"cuBLAS bias pass failed ({r})")
+            beta = True
+        ta, lda = (0, sbk) if sbn == 1 else (1, sbn)     # B^T as cuBLAS's first operand
+        tb, ldb = (0, sam) if sak == 1 else (1, sak)     # A^T as its second
+        al = ctypes.c_float(alpha)
+        r = lib.cublasGemmEx(h, ta, tb, N, M, K, ctypes.byref(al), ctypes.c_void_p(B), 14, lda,
+                             ctypes.c_void_p(A), 14, ldb, ctypes.byref(one if beta else zero),
+                             ctypes.c_void_p(Cp), 0, ldc, 68, 99)
+        if r:
+            raise TrainError(f"cuBLAS product failed ({r})")
 
     def _cnt(self):
         """Counters of the kernels whose last block finishes the sum (zero between launches: that block resets its
@@ -1669,6 +1811,9 @@ class Gpu(_Ops):
             self._no_h = a_act is not None
             try:
                 use = self._variant(want, grid, args, M, N, ldc, 1)
+                if use == "cublas":                      # (A16_KERNELS only: A read as it is)
+                    self._cublas_run(args, M, N, K)
+                    return True
                 if use.endswith(("#h", "#v", "#d", "#e")):
                     if a_act is not None:
                         use = want
@@ -1720,6 +1865,9 @@ class Gpu(_Ops):
                     self.p(X2), ("u", epi), ("u", act), self.p(db), ("u", 1 if db is not None else 0), self._cnt()]
             grid = (tiles, nb1 * nb2, nz)
             use = self._variant(name, grid, args, M, N, ldc, nb1 * nb2)
+            if use == "cublas":                          # (the bias gradient, if any, as a pass of its own)
+                self._cublas_run(args, M, N, K)
+                return True
             if use.endswith(("#h", "#v", "#d", "#e")):
                 args = self._h_args(args, M, N, K)
             self._go(use, grid, self._threads(use), *args)         # split k: its last part adds the parts
