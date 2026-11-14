@@ -137,6 +137,27 @@ def bench(which="127m", steps=40, precision="auto", out=sys.stdout):
         print("\n  kernel                       share    ms/step", file=out)
         for g, (t, c) in sorted(groups.items(), key=lambda kv: -kv[1][0])[:14]:
             print(f"  {g:<28} {100 * t / k_total:5.1f} %  {1000 * t / 4:8.2f}", file=out)
+        # every product by shape and build: its speed in TFLOPS (bfloat16 tensor-core peak of an RTX 3060: ~25)
+        rows, gem_t, gem_f = [], 0.0, 0.0
+        for name, (t, c) in prof.items():
+            parts = name.split(" ")
+            if not parts[0].startswith("gemm") or len(parts) < 2:
+                continue
+            try:
+                M, N, K = (int(x) for x in parts[1].split("x"))
+            except ValueError:
+                continue
+            nb = int(parts[2][1:]) if len(parts) > 2 and parts[2].startswith("b") else 1
+            fl = 2.0 * M * N * K * nb * c
+            gem_t += t
+            gem_f += fl
+            rows.append((t, name, c, fl / t / 1e12 if t else 0.0))
+        if rows:
+            print(f"\n  products: {100 * gem_t / k_total:.1f} % of the card's time, {gem_f / gem_t / 1e12:.1f} TFLOPS "
+                  f"on average", file=out)
+            print("  product (build, M x N x K)                          launches  ms/step  TFLOPS", file=out)
+            for t, name, c, tf in sorted(rows, reverse=True)[:30]:
+                print(f"  {name:<52} {c // 4:>5} {1000 * t / 4:8.2f}  {tf:6.1f}", file=out)
     rec = {"bench": which, "params_m": round(count / 1e6, 1), "precision": precision, "tokens_per_s": round(tps),
            "kernel_tokens_per_s": round(k_tps) if k_tps else None, "card": card,
            "kernels_ms_per_step": {g: round(1000 * t / 4, 3) for g, (t, _) in prof.items()} if prof else {},
