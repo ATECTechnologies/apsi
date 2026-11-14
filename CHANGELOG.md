@@ -21,6 +21,13 @@
   updates smaller than float32's step; in bf16 the products round every gradient far more coarsely, so it only cost
   memory and time: 0.5 GB less on the card for the 127 M GPT, and a lighter optimizer step. `compensated=true` or
   `APSI_GPU_COMPENSATED=1` turns it on.
+- **The hidden layer of every MLP in bfloat16:** h = x W1 + b (kept for the backward pass) and act(h) are written in
+  bfloat16 by the product that makes them and read in bfloat16 by the four products that use them, so the widest
+  tensors of a transformer (4 × d per token) move half the bytes and take half the memory; the training follows the
+  float32 one to 0.1 % (tests). `APSI_BF16_HIDDEN=0` keeps them in float32.
+- **Fans before power:** near the ceiling the card's fans run harder (up to 85 %, `APSI_GPU_FAN_MAX`) before the power
+  limit is lowered, so the card keeps more power at the same temperature; the driver's own curve comes back below it
+  and at the end (`APSI_GPU_FAN=0` leaves the fans alone).
 - **The card is held at 78–79 °C, never 80** (`APSI_GPU_TEMP` is now a ceiling, default 79, instead of a 77 °C
   target with a 75–78 band): the card gets all the power that temperature allows. The power limit looks ahead along
   the temperature's slope, cuts fast and gives back slowly, cuts 6 % at once at the ceiling and does not wind up

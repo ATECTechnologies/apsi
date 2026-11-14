@@ -1046,3 +1046,32 @@ class Kernels(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class Bf16Hidden(unittest.TestCase):
+    """The hidden layer of every MLP (linear, activation, linear) kept in bfloat16: the four products that touch it
+    use their bfloat16 builds, and the training follows the float32 one closely (APSI_BF16_HIDDEN=0)."""
+
+    def test_engaged_and_close(self):
+        import os
+        from unittest import mock
+        from apsi.stdlib import adamw
+        seen = set()
+        orig = GT._Ops.gemm
+
+        def spy(self, *a, **k):
+            if k.get("bf"):
+                seen.add((k.get("epi"), k.get("a_act")))
+            return orig(self, *a, **k)
+        rng = np.random.default_rng(0)
+        X = rng.integers(0, 50, (64, 16))
+        Y = np.roll(X, -1, 1)
+        hist = {}
+        for mode in ("1", "0"):
+            with mock.patch.dict(os.environ, {"APSI_BF16_HIDDEN": mode}), mock.patch.object(GT._Ops, "gemm", spy):
+                m = L.transformer_lm(50, d=64, heads=1, layers=2, context=16)
+                r = GT.fit(m, m.init(seed=0), X, Y, loss="cross_entropy", opt=adamw(lr=1e-3), epochs=5,
+                           batch_size=16, verbose=False, ops=GT.Emulator())
+                hist[mode] = r.history
+        self.assertEqual(seen, {(1, None), (2, None), (None, 1), (3, None)})
+        np.testing.assert_allclose(hist["1"], hist["0"], rtol=2e-3)

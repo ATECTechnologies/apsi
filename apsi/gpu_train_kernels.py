@@ -1816,6 +1816,8 @@ PADT = 136                      # rows of a transposed tile (k rows of 128 m or 
 TILED = ("gemm_tkn", "gemm_tkk", "gemm_tmn", "gemm_tmk")
 # products with a last step compiled in: x W + b -> act (forward), dy W^T * act'(h) (backward), x W + b + residual
 EPI_ACTS = (0, 1, 2)            # relu, gelu, silu: compiled into their own product kernels (no choice per element)
+BF16_KERNELS = tuple([f"gemm_tkn_e1a{j}_bf" for j in EPI_ACTS] + [f"gemm_tkk_e2a{j}_bf" for j in EPI_ACTS] +
+                     [f"gemm_tmn_aa{j}_bf" for j in EPI_ACTS] + ["gemm_tkn_bf", "gemm_tkn_e3_bf"])
 EPI_KERNELS = tuple([(f"gemm_tkn_e1a{j}", True, False, 1, j) for j in EPI_ACTS] +
                     [(f"gemm_tkk_e2a{j}", True, True, 2, j) for j in EPI_ACTS] + [("gemm_tkn_e3", True, False, 3, None)])
 
@@ -1903,7 +1905,9 @@ def _tiled_module(early=False, wide=False, h=False, deep=False):
     # epi (after alpha, bias and beta): 1 = X2 <- v, C <- act(v) (a linear layer and its activation in one pass);
     # 2 = C <- v * act'(X2) (the backward pass through that activation); 3 = C <- v + X2 (a residual connection)
 
-    def kernel(name, a_kc, b_kc, epi_mode=0, act_j=None, a_act=None):
+    def kernel(name, a_kc, b_kc, epi_mode=0, act_j=None, a_act=None, a16=False, x16=False, c16=False):
+        """a16: A is stored in bfloat16 (2 bytes a value); x16: X2 (the kept pre-activation of epi 1 / 2) is
+        bfloat16; c16: C is written in bfloat16. The hidden layer of an MLP kept this way moves half the bytes."""
         fn = ir.Function(m, ir.FunctionType(ir.VoidType(), [t for _, t in args]), name=name)
         fn.calling_convention = "ptx_kernel"
         if early and not deep:                    # two blocks per multiprocessor (at most 128 / 255 registers)
@@ -1953,7 +1957,7 @@ def _tiled_module(early=False, wide=False, h=False, deep=False):
             return b.lshr(b.add(b.add(u, C(0x7FFF)), b.and_(b.lshr(u, C(16)), C(1))), C(16))
 
         def load4(base_off, ptr, contig_idx, contig_lim, other_idx, other_lim, contig_stride_is_1, s_other, act=None,
-                  raw=None):
+                  raw=None, half=False):
             """Issues the load of 4 float32 along the contiguous dimension; the values are used (zeros outside,
             the activation, the rounding to bfloat16) only after the products of the current slice, so the wait
             for memory overlaps the tensor-core work instead of preceding it. act: the activation applied on the
@@ -1962,14 +1966,22 @@ def _tiled_module(early=False, wide=False, h=False, deep=False):
             ci = umin(contig_idx, b.sub(contig_lim, C(4)))
             oi = umin(other_idx, b.sub(other_lim, C(1)))
             idx = b.add(base_off, b.add(b.mul(z64(oi), z64(s_other)), z64(ci)))
-            if early:
+            if half:                              # 4 bfloat16 (8 bytes): already rounded, widened to float32
+                p16 = b.bitcast(ptr, i16.as_pointer(1))
+                hv = b.load(b.bitcast(b.gep(p16, [idx], inbounds=True), ir.VectorType(i16, 4).as_pointer(1)), align=8)
+                vec = ir.Constant(ir.VectorType(f32, 4), None)
+                for j in range(4):
+                    w = b.shl(b.zext(b.extract_element(hv, C(j)), i32), C(16))
+                    vec = b.insert_element(vec, b.bitcast(w, f32), C(j))
+            elif early:
                 # an inline load with side effects: LLVM would otherwise sink it into the block that stores the next
                 # slice (after the products); with two blocks per multiprocessor the other block hides that wait,
                 # so this variant is chosen per product only where the card measures it faster
                 addr = b.ptrtoint(b.gep(ptr, [idx], inbounds=True), i64)
                 return ("pending", b.call(ldg4, [addr]), ok, act, raw)
-            vp = b.bitcast(b.gep(ptr, [idx], inbounds=True), ir.VectorType(f32, 4).as_pointer(1))
-            vec = b.load(vp, align=16)
+            else:
+                vp = b.bitcast(b.gep(ptr, [idx], inbounds=True), ir.VectorType(f32, 4).as_pointer(1))
+                vec = b.load(vp, align=16)
             hs = []
             for j in range(4):                    # rounded to bfloat16 at once (round to nearest even)
                 x = b.extract_element(vec, C(j))
@@ -2022,11 +2034,11 @@ def _tiled_module(early=False, wide=False, h=False, deep=False):
                 if a_kc:                              # A(m, k) = A[m * sam + k]
                     row, kq = b.udiv(idx, C(VPR)), b.mul(b.urem(idx, C(VPR)), C(4))
                     regs.append(("A", row, kq, load4(offs[0], p["A"], b.add(k0, kq), k_end, b.add(bm, row), p["M"],
-                                                     True, p["sam"])))
+                                                     True, p["sam"], half=a16)))
                 else:                                 # A(m, k) = A[k * sak + m]
                     kk, mq = b.lshr(idx, C(5)), b.mul(b.and_(idx, C(31)), C(4))
                     regs.append(("At", mq, kk, load4(offs[0], p["A"], b.add(bm, mq), p["M"], b.add(k0, kk), k_end,
-                                                     True, p["sak"], a_act)))
+                                                     True, p["sak"], a_act, half=a16)))
                 if b_kc:                              # B(k, n) = B[n * sbn + k]
                     nrow, kq = b.udiv(idx, C(VPR)), b.mul(b.urem(idx, C(VPR)), C(4))
                     regs.append(("B", nrow, kq, load4(offs[1], p["B"], b.add(k0, kq), k_end, b.add(bn, nrow), p["N"],
@@ -2201,16 +2213,32 @@ def _tiled_module(early=False, wide=False, h=False, deep=False):
                                     b.store(b.fadd(b.load(tmp), b.load(ptr, align=4)), tmp)
                                 if epi_mode:              # this kernel's own last step, compiled in
                                     xp = b.gep(p["X2"], [idx], inbounds=True)
+                                    xp16 = b.gep(b.bitcast(p["X2"], i16.as_pointer(1)), [idx], inbounds=True)
                                     vv = b.load(tmp)
+
+                                    def ld_x():
+                                        if x16:
+                                            w = b.shl(b.zext(b.load(xp16, align=2), i32), C(16))
+                                            return b.bitcast(w, f32)
+                                        return b.load(xp, align=4)
                                     if epi_mode == 1:
-                                        b.store(vv, xp, align=4)
+                                        if x16:           # the pre-activation kept in bfloat16; act() of that value
+                                            hb = b.trunc(rne(vv), i16)
+                                            b.store(hb, xp16, align=2)
+                                            vv = b.bitcast(b.shl(b.zext(hb, i32), C(16)), f32)
+                                        else:
+                                            b.store(vv, xp, align=4)
                                         out = _act_one(b, vv, act_j, F, ex2_f, False)
                                     elif epi_mode == 2:
-                                        out = b.fmul(vv, _act_one(b, b.load(xp, align=4), act_j, F, ex2_f, True))
+                                        out = b.fmul(vv, _act_one(b, ld_x(), act_j, F, ex2_f, True))
                                     else:
-                                        out = b.fadd(vv, b.load(xp, align=4))
+                                        out = b.fadd(vv, ld_x())
                                     b.store(out, tmp)
-                                b.store(b.load(tmp), ptr, align=4)
+                                if c16:
+                                    cp16 = b.gep(b.bitcast(p["C"], i16.as_pointer(1)), [idx], inbounds=True)
+                                    b.store(b.trunc(rne(b.load(tmp)), i16), cp16, align=2)
+                                else:
+                                    b.store(b.load(tmp), ptr, align=4)
         # split k: the last part of this tile to finish adds the parts in order (what ksum did, in the same order,
         # without a second launch); the counter of the tile is reset for the next product. The flag lives in the
         # tiles' shared memory (free by now): no shared memory of its own.
@@ -2270,6 +2298,14 @@ def _tiled_module(early=False, wide=False, h=False, deep=False):
     if not h:
         for j in EPI_ACTS:                        # dW = act(h)^T dy without keeping act(h)
             kernel(f"gemm_tmn_aa{j}", False, False, 0, None, j)
+        # the hidden layer of an MLP in bfloat16 (BF16_KERNELS): h = x W1 + b kept and act(h) written in bfloat16,
+        # act(h) W2 (+ residual) reading it, and the backward pass reading h in bfloat16
+        for j in EPI_ACTS:
+            kernel(f"gemm_tkn_e1a{j}_bf", True, False, 1, j, None, False, True, True)
+            kernel(f"gemm_tkk_e2a{j}_bf", True, True, 2, j, None, False, True, False)
+            kernel(f"gemm_tmn_aa{j}_bf", False, False, 0, None, j, True)
+        kernel("gemm_tkn_bf", True, False, 0, None, None, True)
+        kernel("gemm_tkn_e3_bf", True, False, 3, None, None, True)
 
     if early or h:
         return _emit(m, "sm_80")
