@@ -1826,6 +1826,9 @@ PADT = 136                      # rows of a transposed tile (k rows of 128 m or 
 TILED = ("gemm_tkn", "gemm_tkk", "gemm_tmn", "gemm_tmk")
 # products with a last step compiled in: x W + b -> act (forward), dy W^T * act'(h) (backward), x W + b + residual
 EPI_ACTS = (0, 1, 2)            # relu, gelu, silu: compiled into their own product kernels (no choice per element)
+BF16_H_KERNELS = tuple([f"gemm_tkn_e1a{j}_bf" for j in EPI_ACTS] + [f"gemm_tkk_e2a{j}_bf" for j in EPI_ACTS] +
+                       ["gemm_tkn_bf", "gemm_tkn_e3_bf"])      # (also in the cp.async builds)
+A16_KERNELS = ("gemm_tkn_bf", "gemm_tkn_e3_bf")                  # A stored in bfloat16: no conversion of A
 BF16_KERNELS = tuple([f"gemm_tkn_e1a{j}_bf" for j in EPI_ACTS] + [f"gemm_tkk_e2a{j}_bf" for j in EPI_ACTS] +
                      [f"gemm_tmn_aa{j}_bf" for j in EPI_ACTS] + ["gemm_tkn_bf", "gemm_tkn_e3_bf"])
 EPI_KERNELS = tuple([(f"gemm_tkn_e1a{j}", True, False, 1, j) for j in EPI_ACTS] +
@@ -2311,11 +2314,14 @@ def _tiled_module(early=False, wide=False, h=False, deep=False):
         # the hidden layer of an MLP in bfloat16 (BF16_KERNELS): h = x W1 + b kept and act(h) written in bfloat16,
         # act(h) W2 (+ residual) reading it, and the backward pass reading h in bfloat16
         for j in EPI_ACTS:
-            kernel(f"gemm_tkn_e1a{j}_bf", True, False, 1, j, None, False, True, True)
-            kernel(f"gemm_tkk_e2a{j}_bf", True, True, 2, j, None, False, True, False)
             kernel(f"gemm_tmn_aa{j}_bf", False, False, 0, None, j, True)
-        kernel("gemm_tkn_bf", True, False, 0, None, None, True)
-        kernel("gemm_tkn_e3_bf", True, False, 3, None, None, True)
+    # the bfloat16 hidden layer's products that apply no activation while reading A: in every build, also the
+    # cp.async ones (h, v, d, e), whose A and B are bfloat16 in memory anyway (A as it is, or its twin)
+    for j in EPI_ACTS:
+        kernel(f"gemm_tkn_e1a{j}_bf", True, False, 1, j, None, False, True, True)
+        kernel(f"gemm_tkk_e2a{j}_bf", True, True, 2, j, None, False, True, False)
+    kernel("gemm_tkn_bf", True, False, 0, None, None, True)
+    kernel("gemm_tkn_e3_bf", True, False, 3, None, None, True)
 
     if early or h:
         return _emit(m, "sm_80")

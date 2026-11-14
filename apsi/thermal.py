@@ -198,6 +198,15 @@ class Governor:
             out["power_limit_w"] = round(self.power.limit / 1000.0, 1)
         if getattr(self, "power_note", None):
             out["power_limit"] = self.power_note
+        fan = getattr(self, "fan", None)
+        if fan is not None and fan.ok:
+            out["control"] = (f"fixed power {round(getattr(self.power, 'run', self.power.limit) / 1000.0)} W, "
+                              f"fans {round(getattr(fan, 'low', fan.LOW))}-{round(getattr(fan, 'top', fan.TOP))} % "
+                              f"hold the temperature" + (f" (now {fan.percent} %)" if fan.percent else
+                                                         " (driver's curve now)"))
+        elif getattr(self, "power", None) is not None:
+            out["control"] = ("the power limit holds the temperature (the fans could not be set: "
+                              + (getattr(fan, "why", None) or "no fan control") + ")")
         return out
 
 
@@ -263,7 +272,8 @@ def governor(dev):
             g.power = _PowerControl.try_make(lib, h, key)  # steer the power limit, not pauses (when allowed)
             if g.power is not None:                     # faster fans first, with the same rights
                 prof = _profile(lib, h, key)            # this card's own settings (apsi gpu calibrate), if measured
-                g.fan = _FanControl.try_make(lib, h, key, getattr(g.power, "via", "") == "directly", prof)
+                g.fan = None if prof and prof.get("fans") is False else \
+                    _FanControl.try_make(lib, h, key, getattr(g.power, "via", "") == "directly", prof)
                 g.power.run = float(g.power.limit)
                 if g.fan is not None:                   # the fans hold the temperature: the power can go up
                     want = _train_power(g.power, prof)
@@ -271,7 +281,10 @@ def governor(dev):
                         g.power.set(int(want))
                         g.power.limit = g.power.applied = g.power.run = float(want)
             if g.power is not None:
-                g.power_note = f"temperature held by the power limit, {g.power.via} (no pauses)"
+                g.power_note = (f"fixed power limit set {g.power.via}; the fans hold the temperature"
+                                if getattr(g, "fan", None) is not None else
+                                f"temperature held by the power limit, {g.power.via} (no pauses; the fans could "
+                                f"not be set)")
         return g
 
 
@@ -442,9 +455,14 @@ class _PowerControl:
                 new = min(new, max(self.limit, draw * 1000.0 + 8000.0))
         new = min(self.top, max(self.floor, new))
         applied = getattr(self, "applied", self.limit)  # what the card has now (changes below 1 W are gathered)
-        if abs(new - applied) >= 1000.0 or (new in (self.top, self.floor) and int(new) != int(applied)):
+        # each change of the limit makes the driver re-plan the clocks (on Windows a short stall of the card), so
+        # small changes are gathered: at least 1 W and 1 s apart, except at the ceiling itself
+        urgent = ceiling is not None and raw is not None and raw >= ceiling + 0.5
+        tnow = time.monotonic()
+        if (abs(new - applied) >= 1000.0 or (new in (self.top, self.floor) and int(new) != int(applied))) and \
+                (urgent or tnow - getattr(self, "set_at", -1e9) >= 1.0):
             self.set(int(new))
-            self.applied = new
+            self.applied, self.set_at = new, tnow
         self.limit = new
         return new <= self.floor + 1.0                 # at the floor: pauses may still be needed
 
@@ -482,14 +500,21 @@ class _FanControl:
         fc.percent, fc.level, fc.ok = None, None, True
         fc.low, fc.top = _fan_range(prof)
         if direct:
-            if not hasattr(lib, "nvmlDeviceSetFanSpeed_v2"):
+            if not hasattr(lib, "nvmlDeviceSetFanSpeed_v2") and os.name != "nt":
                 return None
             from . import gpu_helper
-            fc._set = lambda pct: gpu_helper._fan(lib, h, pct).get("ok")
+            fc._set = lambda pct: gpu_helper._fan(lib, h, pct, index).get("ok")
         else:
             from . import gpu_helper
             fc._set = lambda pct: bool((gpu_helper.call("fan_auto" if pct is None else "fan", gpu=index,
                                                         percent=pct) or {}).get("ok"))
+        # a probe: handing the fans back to the driver's curve changes nothing, and tells whether this driver lets
+        # Apsi set them at all (NVML, or NvAPI on Windows); if not, the power limit holds the temperature
+        try:
+            if not fc._set(None):
+                return None
+        except Exception:                               # noqa: BLE001
+            return None
         import atexit
         atexit.register(fc.auto)
         return fc
@@ -538,6 +563,7 @@ class _FanControl:
             self.percent = pct
         else:
             self.ok = False                            # refused: the power limit holds the temperature instead
+            self.why = "the driver refused the fan speed"
 
     def auto(self):
         if self.percent is not None:

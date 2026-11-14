@@ -22,6 +22,7 @@ autodiff, and on any real GPU against the Emulator.
 import ctypes
 import math
 import os
+import sys
 import time
 
 import numpy as np
@@ -838,7 +839,7 @@ class Gpu(_Ops):
                     xf = {f"gemm_tkn#{tag}": first}
                     for name in KS.TILED[1:] + tuple(e[0] for e in KS.EPI_KERNELS) + \
                             ((tuple(f"gemm_tmn_aa{j}" for j in KS.EPI_ACTS) + KS.BF16_KERNELS)
-                             if tag not in ("h", "v", "d", "e") else ()):
+                             if tag not in ("h", "v", "d", "e") else KS.BF16_H_KERNELS):
                         f = ctypes.c_void_p()
                         dev.drv.check(lib.cuModuleGetFunction(ctypes.byref(f), xmod, name.encode()),
                                       "cuModuleGetFunction")
@@ -1486,6 +1487,8 @@ class Gpu(_Ops):
         rounded once after each update and reused by every product until the next one (forward and backward)."""
         out = list(args)
         for i, n, key in ((0, M * K, "h_a"), (1, K * N, "h_b")):
+            if i == 0 and getattr(self, "_a16", False):
+                continue                                 # A is bfloat16 already
             ptr = args[i][1]
             wr = self._wrange
             if wr is not None and wr[0] <= ptr < wr[1]:
@@ -1510,7 +1513,7 @@ class Gpu(_Ops):
         timed twice on scratch outputs the first time the shape comes; APSI_GEMM_VARIANT=a or x fixes it)."""
         K = args[6][1]
         cands = [name] + [f"{name}#{t}" for t in ("x", "w") if f"{name}#{t}" in self.fn]
-        if self._h_ready(name, args, M, N, K, nb):
+        if not getattr(self, "_no_h", False) and self._h_ready(name, args, M, N, K, nb):
             cands.append(f"{name}#h")
             cands += [f"{name}#{t}" for t in ("v", "d", "e") if f"{name}#{t}" in self.fn]
         force = os.environ.get("APSI_GEMM_VARIANT", "auto").strip().lower()
@@ -1542,9 +1545,45 @@ class Gpu(_Ops):
             self._lib.cuEventDestroy_v2(e1)
             if best_t is None or ms.value < best_t:
                 best, best_t = cand, ms.value
+        if best != name and not self._same_result(name, best, grid, targs, M, N, K, ldc):
+            best = name                                  # a build that does not give the same numbers: never used
         self.profile = prof
         self._choice[key] = best
         return best
+
+    def _same_result(self, base, cand, grid, targs, M, N, K, ldc):
+        """The first time a faster build is chosen for a shape: its output against the base build's, on the same
+        inputs (a sample of up to 64 K values; bfloat16 outputs compared as bfloat16). A build that differs by more
+        than bfloat16 rounding of a float32 sum is reported once and never used for that shape."""
+        if os.environ.get("APSI_GEMM_VERIFY", "1").strip().lower() in ("0", "off", "no"):
+            return True
+        c16 = base.split("#")[0].endswith("_bf") and targs[24][1] == 1
+        cview = (self._scratch("tune_c", M * ldc + N)[0], 0)
+        n = min(M * ldc, 65536)
+        slots = (n + 1) // 2 if c16 else n
+
+        def run(nm):
+            a = self._h_args(targs, M, N, K) if nm.endswith(("#h", "#v", "#d", "#e")) else targs
+            self._go(nm, grid, self._threads(nm), *a)
+            self.sync()
+            raw = self.get(cview[0], slots)
+            if c16:
+                u = raw.view(np.uint16)[:n].astype(np.uint32) << 16
+                return u.view(np.float32)
+            return raw[:n]
+        if targs[20][1]:                                 # beta: C += ...: both start from the same zeros
+            self.fill(cview, M * ldc, 0.0)
+        ref = run(base)
+        if targs[20][1]:
+            self.fill(cview, M * ldc, 0.0)
+        got = run(cand)
+        scale = float(np.max(np.abs(ref))) if ref.size else 0.0
+        err = float(np.max(np.abs(got - ref))) if ref.size else 0.0
+        ok = bool(np.isfinite(got).all()) and err <= 2e-2 * max(scale, 1e-6)
+        if not ok:
+            print(f"apsi: the {cand} build of a {M} x {N} x {K} product differs from the base build "
+                  f"(max difference {err:.3g} of {scale:.3g}); the base build runs instead", file=sys.stderr)
+        return ok
 
     def _cnt(self):
         """Counters of the kernels whose last block finishes the sum (zero between launches: that block resets its
@@ -1619,9 +1658,19 @@ class Gpu(_Ops):
                     ("f", alpha), ("u", 1 if beta else 0), ("u", 1 if bias is not None else 0), ("u", K),
                     self.p(X2), ("u", epi), ("u", act), self.p(db), ("u", 1 if db is not None else 0), self._cnt()]
             grid = (tiles, 1, 1)
-            use = self._variant(want, grid, args, M, N, ldc, 1)
-            if use.endswith(("#h", "#v", "#d", "#e")):     # (those builds convert both operands: not for bf)
-                use = want
+            # the cp.async builds read A and B as bfloat16 from memory: A as it is (A16_KERNELS) or its twin /
+            # one conversion, B (a weight) its cached bfloat16 copy; not where A gets an activation on the way in
+            self._a16 = want in KS.A16_KERNELS
+            self._no_h = a_act is not None
+            try:
+                use = self._variant(want, grid, args, M, N, ldc, 1)
+                if use.endswith(("#h", "#v", "#d", "#e")):
+                    if a_act is not None:
+                        use = want
+                    else:
+                        args = self._h_args(args, M, N, K)
+            finally:
+                self._a16 = self._no_h = False
             self._go(use, grid, self._threads(use), *args)
             if db is not None:
                 self._db = None
