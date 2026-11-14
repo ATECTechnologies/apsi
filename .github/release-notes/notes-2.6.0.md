@@ -61,8 +61,7 @@ identical weights; steps and resume bit for bit; the NaN guard).
   restored by the next run (a run closed with its window used to leave the lowered limit for good).
 - **Weight and input gradients side by side:** each linear layer's x^T dy runs on a second stream beside its
   dy W^T (`APSI_GPU_STREAMS=0` turns it off).
-- `APSI_SPLITK=off|2|4|auto` fixes how the weight-gradient products split their long k (for tuning a card);
-  `tools/tune_gpu.bat` measures every setting on this card.
+- `APSI_SPLITK=off|2|4|auto` fixes how the weight-gradient products split their long k (for tuning a card).
 
 ### Converting Python: one file, its imports, or the whole project
 - `apsi convert app.py` converts the file and every module of the program it imports (as before);
