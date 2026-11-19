@@ -141,6 +141,7 @@ Contextual (special only in one place, ordinary names elsewhere): `try`, `except
 | Form | Examples | Type |
 |---|---|---|
 | integer | `42`, `1_000_000` | `Int` |
+| integer in base 16, 2, 8 | `0xFF`, `0b1010_0101`, `0o755`, `0xdead_beef` | `Int` |
 | decimal | `3.14`, `0.5`, `6.02e23`, `1e-9`, `2.5E+3` | `Float` |
 | with a unit (letters right after the digits, no space) | `5m`, `2kg`, `300K`, `10ms`, `3eV`, `5µs` | `Quantity` |
 | with a bracketed unit | `9.81[m/s^2]`, `8.314[J/(mol K)]`, `1[N*m]`, `5[m²]` | `Quantity` |

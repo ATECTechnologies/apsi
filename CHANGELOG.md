@@ -2,6 +2,15 @@
 
 ## 2.6.0 (Improved version) — exact training on any number of cards, typed graph models, training that finishes, fewer tokens (14 November 2026)
 
+### Binary layouts and embedded work
+- **`use layout`:** `c_struct` (natural alignment or `pack=`, little / big endian, arrays, nested structs, bit
+  fields), `pack` / `unpack` / `view` (fields read and written in place), `numpy_dtype`, and `c_header()` with
+  static assertions of every offset; `register_map` for device registers (a C header of volatile accesses, read and
+  write over a memory image). Offsets checked against the C compiler; the headers compile with GCC and Clang.
+- **FFI:** `ptr_void` / `ptr_u8` take a bytearray, a tensor or a layout view (C writes into Apsi's memory);
+  `u8 u16 u32 u64 i8 i16` arguments.
+- **Base-16, 2 and 8 integers:** `0xFF`, `0b1010_0101`, `0o755`. `docs/EMBEDDED.md`.
+
 ### Sealed model packages
 - **`pack_model` / `load_package` / `package_info`** (`use layers`): a trained model's architecture and weights in
   one encrypted file (`.apsipkg`: ChaCha20 + HMAC-SHA256, a password through scrypt or a 256-bit key); nothing in it

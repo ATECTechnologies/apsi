@@ -139,6 +139,20 @@ def _tokenize(src):
 
         start_col = col()
         # numbers -------------------------------------------------------
+        if c == "0" and i + 1 < n and src[i + 1] in "xXbBoO":     # 0x1F, 0b1010, 0o755 (and _ between digits)
+            base = {"x": 16, "b": 2, "o": 8}[src[i + 1].lower()]
+            ok = {16: "0123456789abcdefABCDEF", 2: "01", 8: "01234567"}[base]
+            j = i + 2
+            while j < n and (src[j] in ok or (src[j] == "_" and j + 1 < n and src[j + 1] in ok)):
+                j += 1
+            digits = src[i + 2:j].replace("_", "")
+            if not digits:
+                raise LexError(f"{src[i:i + 2]} needs digits after it", line, start_col)
+            if j < n and (src[j].isalnum() or src[j] == "."):
+                raise LexError(f"'{src[j]}' in a base-{base} number", line, col() + (j - i))
+            add(NUMBER, str(int(digits, base)), None, start_col)
+            i = j
+            continue
         if c.isdigit():
             s = i
             while i < n and (src[i].isdigit() or src[i] == "_"):

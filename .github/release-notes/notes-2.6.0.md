@@ -9,6 +9,15 @@ Tested: 425 tests on every push (Linux x64 / ARM64, macOS Apple silicon / Intel,
 on a real NVIDIA RTX 3060 (every kernel against the exact reference; typed graph encoders and a transformer trained twice with
 identical weights; steps and resume bit for bit; the NaN guard).
 
+### Binary layouts and embedded work
+- **`use layout`:** `c_struct` (natural alignment or `pack=`, little / big endian, arrays, nested structs, bit
+  fields), `pack` / `unpack` / `view` (fields read and written in place), `numpy_dtype`, and `c_header()` with
+  static assertions of every offset; `register_map` for device registers (a C header of volatile accesses, read and
+  write over a memory image). Offsets checked against the C compiler; the headers compile with GCC and Clang.
+- **FFI:** `ptr_void` / `ptr_u8` take a bytearray, a tensor or a layout view (C writes into Apsi's memory);
+  `u8 u16 u32 u64 i8 i16` arguments.
+- **Base-16, 2 and 8 integers:** `0xFF`, `0b1010_0101`, `0o755`. `docs/EMBEDDED.md`.
+
 ### Sealed model packages
 - **`pack_model` / `load_package` / `package_info`** (`use layers`): a trained model's architecture and weights in
   one encrypted file (`.apsipkg`: ChaCha20 + HMAC-SHA256, a password through scrypt or a 256-bit key); nothing in it
