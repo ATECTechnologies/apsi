@@ -10,6 +10,7 @@ parameter tree, integrity checks and signatures.
 | **GGUF** `.gguf` | `save_gguf` | `load_gguf` | `gguf_info` | llama.cpp, Ollama, LM Studio, any GGUF reader |
 | **safetensors** | `save_safetensors` | `load_safetensors` | `safetensors_info` | PyTorch, JAX, Hugging Face |
 | ONNX / PyTorch | — | `onnx_model`, `torch_load` | — | see [`AI.md`](AI.md) |
+| **Sealed package** `.apsipkg` | `pack_model` | `load_package` | `package_info` | Apsi; a library of its own (`apsi package lib`) |
 
 All of them are in `use models`. Saving needs `--allow-write`, loading needs `--allow-read` (or the `fs`
 permission), exactly like other file functions, and `apsi audit` reports their use.
@@ -126,7 +127,48 @@ apsi model convert model.apsim model.safetensors
 `convert` reads `.safetensors`, `.gguf` and `.apsim` (including sharded ones) and writes any of the three.
 Compressed tensors are expanded to f32 when the target format cannot hold them.
 
-## 4. Choosing a format
+## 4. Sealed packages: a trained model to give away, without your code
+
+A package is one file with the model's architecture and its weights, encrypted: ChaCha20 (RFC 8439) with a
+256-bit key and HMAC-SHA256 over everything (encrypt-then-MAC). Without the key nothing in it can be read — not
+the weights, not even which layers the model has — and a changed byte is refused before anything is decoded. The
+architecture is stored as data (each layer's kind and the settings it was made with), so opening a package never
+runs code from the file, and the program that trained the model is not needed.
+
+```apsi
+use layers
+let p = fit(model, model.init(), X, y, loss="cross_entropy", epochs=10).params
+pack_model("classifier.apsipkg", model, p, password="a long passphrase",
+           metadata=record(classes=["cat", "dog"]), public=record(name="classifier", version="1.0"))
+
+let m = load_package("classifier.apsipkg", password="a long passphrase")
+print(m.predict(X_new), m.metadata.classes)
+print(package_info("classifier.apsipkg"))      # what anyone can read: the cipher and the public fields
+```
+
+`password=` derives the key with scrypt (2^15 × 8: slow to guess on purpose); `key=new_key()` uses 32 random
+bytes instead (keep the hex string safe: it opens the package). Only Apsi's own layers can be packaged; a layer
+written in your program is refused with a clear message.
+
+**A library for the people who run the model:**
+
+```bash
+apsi package lib classifier.apsipkg classifier --out dist     # dist/classifier/ + dist/pyproject.toml
+pip install dist                                               # or copy dist/classifier next to the program
+```
+
+```python
+import classifier
+classifier.load(password="a long passphrase")      # or key=...
+print(classifier.predict(x))
+```
+
+The library holds the package and three functions (`load`, `predict`, `info`); it needs only Apsi installed, never
+your training program or its folder. The key stays with whoever may run the model. `--embed-key KEY` puts the key
+inside the library so it runs without one: convenient for your own deployments, but anyone who has the library can
+then run the model.
+
+## 5. Choosing a format
 
 | Need | Use |
 |---|---|

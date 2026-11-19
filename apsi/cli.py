@@ -878,6 +878,8 @@ def _parser(light=False):
     _scale.add_parser(sub)
     from . import modelio as _modelio
     _modelio.add_parser(sub)
+    from . import modelpack as _modelpack
+    _modelpack.add_parser(sub)
     from . import ai_server as _ai_server
     _ai_server.add_parser(sub)
     from . import thermal as _thermal

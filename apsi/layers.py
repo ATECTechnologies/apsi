@@ -180,6 +180,22 @@ class Layer:
     """A layer: init(seed) -> params, and layer(params, x, train=false, **context) -> output."""
     kind = "layer"
 
+    def __init_subclass__(cls, **kw):
+        """Every layer remembers the arguments it was made with (init_args): a model can then be stored as data
+        and made again exactly (modelpack), with no code of the program that built it."""
+        super().__init_subclass__(**kw)
+        init = cls.__dict__.get("__init__")
+        if init is None:
+            return
+
+        def __init__(self, *a, **k):
+            if "_init_args" not in self.__dict__:      # the outermost constructor's arguments only
+                self.__dict__["_init_args"] = (type(self), a, k)
+            init(self, *a, **k)
+        __init__.__doc__, __init__.__name__, __init__.__qualname__ = init.__doc__, init.__name__, init.__qualname__
+        __init__.__wrapped__ = init
+        cls.__init__ = __init__
+
     def init(self, seed=0):
         return Record()                      # no parameters (an empty record keeps optimizers happy)
 
@@ -2167,9 +2183,10 @@ def module(interp=None):
         torch_module=guarded(torch_module, "torch_module()"), params_from_torch=guarded(params_from_torch, "params_from_torch()"),
         devices=devices_, check_torch=guarded(check_torch, "check_torch()"),
     )
-    from . import graphs, codegraph          # long-range and typed graph layers; code and text as graphs
+    from . import graphs, codegraph, modelpack   # graph layers; code and text as graphs; sealed model packages
     names.update(graphs.names())
     names.update(codegraph.names())
+    names.update(modelpack.names())
     return names
 
 

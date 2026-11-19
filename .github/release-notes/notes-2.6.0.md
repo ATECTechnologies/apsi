@@ -9,6 +9,13 @@ Tested: 425 tests on every push (Linux x64 / ARM64, macOS Apple silicon / Intel,
 on a real NVIDIA RTX 3060 (every kernel against the exact reference; typed graph encoders and a transformer trained twice with
 identical weights; steps and resume bit for bit; the NaN guard).
 
+### Sealed model packages
+- **`pack_model` / `load_package` / `package_info`** (`use layers`): a trained model's architecture and weights in
+  one encrypted file (`.apsipkg`: ChaCha20 + HMAC-SHA256, a password through scrypt or a 256-bit key); nothing in it
+  can be read without the key, a changed byte is refused, and the architecture is data, never code.
+  `apsi package lib MODEL NAME` builds a library around it (`load`, `predict`, `info`) that needs only Apsi, not the
+  program that trained the model. Every layer now remembers the arguments it was made with.
+
 ### Faster everyday code
 - **Facts the compiler can prove are no longer checked at run time:** a typed `Int`/`Float` parameter that is never
   rebound is a plain number for the whole call (a comparison of two such numbers is a plain condition; returning it
