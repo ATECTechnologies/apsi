@@ -800,6 +800,7 @@ class Emulator(_Ops):
 
 class Gpu(_Ops):
     """The kernels on a real NVIDIA GPU."""
+    _only16 = frozenset()                                # (set per instance by ln_f)
 
     def __init__(self, dev):
         self.dev = dev
@@ -896,6 +897,7 @@ class Gpu(_Ops):
         self._wcache, self._wrange, self._wgen = {}, None, 0
         self._w16, self._w16_gen = None, -1
         self._twin = {}                                  # float32 output address -> (values, its bfloat16 twin)
+        self._only16 = set()                             # addresses whose float32 values were never written
         self.profile = None                              # {kernel: (seconds, launches)} while profiling
         self.launches = 0                                # kernels launched so far (the bench's count per step)
         self._pending = []
@@ -1050,6 +1052,7 @@ class Gpu(_Ops):
         if self._twin:                                   # a twin of (or in) freed memory is no longer one
             lo, hi = b.ptr, b.ptr + 4 * max(1, b.n)
             self._twin = {k: v for k, v in self._twin.items() if not (lo <= k < hi or lo <= v[1][1] < hi)}
+            self._only16 = {k for k in self._only16 if not lo <= k < hi}
 
     RING = 64 << 20                                      # pinned staging memory for copies to the card
 
@@ -1199,13 +1202,18 @@ class Gpu(_Ops):
                  self.p(RSTD), self.p(DG), self.p(DB), ("u", M), ("u", N), ("u", rows), ("u", mode), self.p(WB),
                  self.p(WG), ("u", 1 if part else 0), self._cnt())
 
-    def ln_f(self, X, Gm, Bt, Y, MEAN, RSTD, M, N, eps, rms, Y16=None):
+    def ln_f(self, X, Gm, Bt, Y, MEAN, RSTD, M, N, eps, rms, Y16=None, only16=False):
         """Y16 (optional): Y's bfloat16 twin, written in the same pass; the products that read Y then take the twin
-        instead of a conversion pass of their own."""
+        instead of a conversion pass of their own. only16: Y itself is not written (every reader of Y is a product
+        on the cp.async builds: they read the twin)."""
+        only16 = bool(only16 and Y16 is not None)
         self._go("ln_f", -(-M // 8), 256, self.p(X), self.p(Gm), self.p(Bt), self.p(Y), self.p(MEAN), self.p(RSTD),
-                 ("u", M), ("u", N), ("f", eps), ("u", 1 if rms else 0), self.p(Y16), ("u", 1 if Y16 is not None else 0))
+                 ("u", M), ("u", N), ("f", eps), ("u", 1 if rms else 0), self.p(Y16),
+                 ("u", 2 if only16 else 1 if Y16 is not None else 0))
         if Y16 is not None:
             self._twin[self.p(Y)[1]] = (M * N, self.p(Y16))
+        o16 = self.__dict__.setdefault("_only16", set())
+        (o16.add if only16 else o16.discard)(self.p(Y)[1])
 
     def make_twin(self, view, n, dst):
         """view's bfloat16 twin in dst (one pass), registered for the products that read view until drop_twin or
@@ -1632,6 +1640,11 @@ class Gpu(_Ops):
         timed twice on scratch outputs the first time the shape comes; APSI_GEMM_VARIANT=a or x fixes it)."""
         K = args[6][1]
         h_only = getattr(self, "_h_only", False)        # A is bfloat16 in memory: only the cp.async builds read it
+        if not h_only and self._only16 and (args[0][1] in self._only16 or args[1][1] in self._only16):
+            h_only = True                                # an operand exists only as its twin
+            if not self._h_ready(name, args, M, N, K, nb):
+                raise TrainError(f"internal: a {M} x {N} x {K} product reads a bfloat16-only value but no cp.async "
+                                 "build fits it (APSI_ONLY16=0)")
         if h_only:
             cands = [f"{name}#{t}" for t in ("h", "v", "d", "e", "f", "g", "s") if f"{name}#{t}" in self.fn]
         else:
@@ -1859,6 +1872,9 @@ class Gpu(_Ops):
                 self._gemm3(A, B, Cv, bias, M, N, K, sam, sak, sbk, sbn, ldc, sa, sb, sc, alpha, beta, epi, X2, act):
             return True
         name = self._tiled_ok(A, B, M, N, K, sam, sak, sbk, sbn, sa, sb) if self.tiled and passes == 1 else None
+        if self._only16 and name is None and (self.p(A)[1] in self._only16 or self.p(B)[1] in self._only16):
+            raise TrainError(f"internal: a {M} x {N} x {K} product reads a bfloat16-only value on a build that needs "
+                             "float32 (APSI_ONLY16=0)")
         if a_act is not None:
             if name != "gemm_tmn" or f"gemm_tmn_aa{a_act}" not in self.fn or epi:
                 return False
@@ -2256,7 +2272,9 @@ class _Norm(_Node):
         self.gm = net.param(p.gamma)
         self.bt = None if rms else net.param(p.beta)
 
-    def fwd(self, x, shape):
+    def fwd(self, x, shape, only16=False):
+        """only16: every reader of the output is a product (the residual block's inner layer says so): the output
+        is written only as its bfloat16 twin (half the memory, half the bytes)."""
         M = self.M = _rows(shape)
         self.x = x
         y = self.buf("y", M * self.N)
@@ -2264,8 +2282,10 @@ class _Norm(_Node):
         o = self.net.ops
         y16 = self.buf("y16", o.n16(M * self.N)) if getattr(o, "twin_ok", lambda: False)() and \
             self.net.passes == 1 and (M * self.N) % 2 == 0 else None
+        only16 = bool(only16 and y16 is not None and M % 8 == 0 and self.N % 8 == 0 and
+                      os.environ.get("APSI_ONLY16", "1").strip().lower() not in ("0", "off", "no"))
         o.ln_f(x, self.gm.w, self.bt.w if self.bt else None, y, self.mean, self.rstd, M, self.N, self.eps, self.rms,
-               Y16=y16)
+               **({"Y16": y16, "only16": only16} if y16 is not None else {}))
         return y, shape
 
     def bwd(self, dy, need_dx=True, residual=None):
@@ -2360,8 +2380,19 @@ class _Residual(_Node):
         super().__init__(net, key)
         self.inner, self.norm = inner, norm
 
+    def _inner_reads_products_only(self):
+        """Every reader of the norm's output is a matrix product: self-attention (q, k, v and their weight
+        gradients) or a sequence that starts with a linear layer (its product and its weight gradient)."""
+        inner = self.inner
+        if isinstance(inner, _Attention):
+            return not inner.mmask
+        if isinstance(inner, _Seq) and inner.nodes and type(inner.nodes[0]) is _Linear:
+            first = inner.nodes[0]
+            return not first.bf and not first.bf_in and first.x_pre is None
+        return False
+
     def fwd(self, x, shape):
-        h, hs = self.norm.fwd(x, shape) if self.norm else (x, shape)
+        h, hs = self.norm.fwd(x, shape, only16=self._inner_reads_products_only()) if self.norm else (x, shape)
         self.n = int(np.prod(shape))
         if getattr(self.inner, "takes_residual", False):  # the inner layer's last product adds x itself
             y, _ = self.inner.fwd(h, hs, residual=x)

@@ -457,7 +457,8 @@ def _main_module():
             with b.if_then(b.not_(isrms)):
                 b.store(b.fadd(y, k.ld(p["B"], i)), yv)
             yo = b.load(yv)
-            k.st(yo, p["Y"], idx)
+            with b.if_then(b.icmp_unsigned("!=", p["has16"], C(2))):     # 2: only the twin (its readers take it)
+                k.st(yo, p["Y"], idx)
             # its bfloat16 twin in the same pass (round to nearest even, as to_bf16): the products that read this
             # output take it as it is, no conversion pass per product
             with b.if_then(b.icmp_unsigned("!=", p["has16"], C(0))):
