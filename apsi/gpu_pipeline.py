@@ -80,7 +80,7 @@ def dag_costs(nodes, inputs, xs, g):
     (a node table has the graph's nodes, token ids their tokens), pooling layers make one row per graph, a graph
     memory k slots per graph; the work is 6 multiply-adds per weight and row (forward and backward), lookups for
     embedding tables, and the attention's own work."""
-    from . import layers as L, graphs as GR, gla as GL
+    from . import layers as L, graphs as GR
     from . import ops as aops
     rows, seq = {}, {}
     G = int(g.graphs) if g is not None else None
@@ -104,23 +104,19 @@ def dag_costs(nodes, inputs, xs, g):
         mats, vecs = _count(p)
         if isinstance(layer, L.Embedding):
             w = 3.0 * layer.d * r
-        elif isinstance(layer, GL.NodeEncoder):
-            w = 3.0 * layer.d * 11 * r + 6.0 * 3 * layer.d * layer.d * r
         else:
             w = 6.0 * mats * r + 10.0 * vecs * r
         if isinstance(inner, L.MultiHeadAttention):
             S = T if len(srcs) == 1 else max(1, rows.get(srcs[1], 1) // G)
             w += 12.0 * r * S * inner.d
-        if isinstance(layer, (GR.HGTBrain, GR.GlobalAttention)):
+        if isinstance(layer, (GR.TypedGraphEncoder, GR.GlobalAttention)):
             per = max(1.0, r / G)
-            n_ga = len(layer.ga) if isinstance(layer, GR.HGTBrain) else 1
+            n_ga = len(layer.ga) if isinstance(layer, GR.TypedGraphEncoder) else 1
             w += 12.0 * n_ga * r * min(per, 4096) * layer.d
         out_rows = r
         if isinstance(layer, (GR.TypedPool, L.GraphPool, L.MeanPool, L.LastStep)):
             out_rows = G
-        elif isinstance(layer, GL.BrainMemory):
-            out_rows = G * (layer.ka + layer.kc + 3)
-        rows[name], seq[name] = out_rows, (layer.ka + layer.kc + 3 if isinstance(layer, GL.BrainMemory) else T)
+        rows[name], seq[name] = out_rows, T
         work.append(max(w, 1.0))
         size.append(mats + vecs)
     return work, size

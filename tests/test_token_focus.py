@@ -60,7 +60,7 @@ class Focus(unittest.TestCase):
 
     def test_large_sources_stay_within_budget_and_unfold_exactly(self):
         for path, q in (("apsi/lexer.py", "how are string escapes handled"),
-                        ("apsi/gla.py", "how is the router balance loss computed"),
+                        ("apsi/graphs.py", "how is the graph summary computed"),
                         ("docs/GPU.md", "how do I lower the temperature of the card")):
             text = open(os.path.join(ROOT, path), encoding="utf-8").read()
             for budget in (400, 1500):

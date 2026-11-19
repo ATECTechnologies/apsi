@@ -1134,7 +1134,7 @@ class TransformerBlock(Layer):
 
 
 def param_paths(params, prefix=""):
-    """[(path, array)] of every weight: "brain_a_l0.hgt.q.W", "w0_self.inner.Wq", "layers[2].W" …"""
+    """[(path, array)] of every weight: "enca_l0.hgt.q.W", "w0_self.inner.Wq", "layers[2].W" …"""
     out = []
     if isinstance(params, Record):
         for k, v in params.fields.items():
@@ -1149,7 +1149,7 @@ def param_paths(params, prefix=""):
 
 def frozen_ids(params, freeze=None, train_only=None):
     """The ids of the weights that stay as they are: freeze= names (a part of the model by its path: "enc",
-    "brain_a", "w0_self.inner") or a function path -> bool; train_only= the opposite (everything else is frozen)."""
+    "enca", "w0_self.inner") or a function path -> bool; train_only= the opposite (everything else is frozen)."""
     def matches(path, pats):
         if callable(pats):
             return bool(pats(path))
@@ -1222,7 +1222,7 @@ def fit_batches(model, params, batches, loss="cross_entropy", opt=None, epochs=1
     step is `accumulate` batches (their gradients averaged); the history is the mean loss of each epoch. backend: "auto"
     (the GPU trainer when there is a card), "gpu" or "numpy". device="cuda:all": the model (a dag or a sequence) split
     across the cards (stages=N or a list of node counts), `accumulate` batches flowing through as micro-batches.
-    freeze= / train_only=: parts of the model by name ("brain_a", "w*", a function of the path) that stay as they
+    freeze= / train_only=: parts of the model by name ("enca", "w*", a function of the path) that stay as they
     are / the only parts that learn. Any optimizer: adam, adamw and sgd have kernels of their own, the others step on
     the processor.
     steps=N: train for N optimizer steps (over as many epochs as that takes) instead of `epochs`. checkpoint="run.npz"
@@ -2167,10 +2167,9 @@ def module(interp=None):
         torch_module=guarded(torch_module, "torch_module()"), params_from_torch=guarded(params_from_torch, "params_from_torch()"),
         devices=devices_, check_torch=guarded(check_torch, "check_torch()"),
     )
-    from . import graphs, gla, gla_graph     # long-range graph layers (graph_transformer, global_attention, …), graph model
+    from . import graphs, codegraph          # long-range and typed graph layers; code and text as graphs
     names.update(graphs.names())
-    names.update(gla.names())
-    names.update(gla_graph.names())
+    names.update(codegraph.names())
     return names
 
 

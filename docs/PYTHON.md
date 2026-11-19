@@ -22,12 +22,14 @@ Typical output:
 
 ```text
 ✓ build_graph_cache.py → build_graph_cache.apsi  (0 notes)
+✓ trainer.py → trainer.apsi  (0 notes)
     run with --allow-python=all (it uses subprocess)
 ✓ model_parts.py → model_parts.apsi  (0 notes)
 
 converted 5 files, 0 notes
 ```
 
+Modules that sit next to the program (`import trainer`, `from model_parts import X`, packages with `__init__.py`,
 `from . import x`) are converted with it and imported as Apsi files, and so are the installed libraries it imports
 that are written in Python (next section).
 
@@ -181,6 +183,7 @@ a file needs, and `apsi run` says so when one is missing:
 
 ```bash
 apsi run train.apsi --allow-python                     # torch, numpy, scipy …
+apsi run trainer.apsi --allow-python=all -- train --epochs 3   # arguments after -- go to the program (sys.argv)
 ```
 
 Introspection that leads to interpreter internals (`__globals__`, `__subclasses__`, `__builtins__`, frame objects,
@@ -202,6 +205,7 @@ is refused unless the program was started with `--allow-python=all`.
   `json`, numpy and every operator. `tests/test_python_compat.py` converts each one and requires **byte-identical
   output**.
 * A 23,769-line AI training program with its four companion modules (graph building for 30 languages, web search,
+  safety filter, a model definition) converts in about 3 seconds and checks cleanly; its command-line tools, its
   multi-process graph-cache builder (results pickled across worker processes, resumable output) and its safety filter
   produce byte-identical files and output to Python.
 * A PyTorch-style training program (an `nn.Module` hierarchy that registers parameters through `__setattr__`,

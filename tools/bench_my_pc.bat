@@ -4,7 +4,7 @@ rem   Double-click it. Takes about 30-60 minutes. Close other heavy programs fir
 rem The results go to the folder bench-results-2.6.0 in the Apsi folder; send that folder back (or zip it).
 rem What it runs:
 rem   1. the machine:              apsi doctor (processor, memory, card, driver)
-rem   2. correctness on the card:  every GPU kernel against the exact reference, graph model and a transformer trained twice
+rem   2. correctness on the card:  every GPU kernel against the exact reference, typed graphs and a transformer trained twice
 rem                                (identical weights), steps / resume / NaN guard, the GPU tests
 rem   3. AI training speed:        the 10.9 M and 127 M GPT and the 127 M LLaMA/Qwen3-style model on the card
 rem                                (tokens/s, temperature, power, energy per token)
@@ -50,7 +50,7 @@ type "%OUT%\doctor.txt" >> "%LOG%"
 echo == 2. correctness on the card
 echo == 2. correctness on the card >> "%LOG%"
 !PY! -m apsi gpu bench check > "%OUT%\gpu-check.txt" 2>&1
-!PY! -m pytest -q -p no:cacheprovider tests/test_gpu_real.py tests/test_gpu_train.py tests/test_gla.py tests/test_training_modes.py tests/test_gpu_tensor.py tests/test_steps_resume.py tests/test_token_focus.py tests/test_bpe.py >> "%OUT%\gpu-check.txt" 2>&1
+!PY! -m pytest -q -p no:cacheprovider tests/test_gpu_real.py tests/test_gpu_train.py tests/test_training_modes.py tests/test_gpu_tensor.py tests/test_steps_resume.py tests/test_token_focus.py tests/test_bpe.py >> "%OUT%\gpu-check.txt" 2>&1
 type "%OUT%\gpu-check.txt" >> "%LOG%"
 
 echo == 3. AI training speed on the card (three models, a few minutes each)

@@ -242,29 +242,79 @@ def check(out=sys.stdout):
         bad += not ok
         print(f"  {'ok  ' if ok else 'FAIL'} {name:<22} losses {runs[0][0]:.4f} -> {runs[0][-1]:.4f}  "
               f"(reference {runs[1][-1]:.4f}, difference {err:.1e})", file=out)
-    bad += _check_gla(ops, out)
+    bad += _check_typed_graphs(ops, out)
     bad += _check_tensors(ops, out)
     bad += _check_flow(ops, out)
     print("every kernel agrees on this card" if not bad else f"{bad} differ: send this output back", file=out)
     return 1 if bad else 0
 
 
-def _check_gla(ops, out):
-    """graph model (brains, typed layers, learned-key attention, graph memory, gated masked cross-attention, tied output)
-    with batches of graphs and exact gradient sums: this card against the Emulator, and the same weights twice."""
-    from . import gla as GL, gpu_train as GT, layers as L
+def typed_graph_batches(sizes=(3, 2, 4, 3, 2, 3, 2, 4), seed=0):
+    """Batches of heterogeneous graphs (4 node types, 3 relations, 10 to 25 nodes each) with a class per graph that
+    depends on the graph's structure: (node features, classes, graph) for fit_batches."""
+    from . import layers as L
+    rng = np.random.default_rng(seed)
+    out = []
+    for G in sizes:
+        feats, edges, rel, ntype, batch, ys, off = [], [], [], [], [], [], 0
+        for gi in range(int(G)):
+            n = int(rng.integers(10, 26))
+            t = rng.integers(0, 4, n)
+            e = rng.integers(0, n, (2 * n, 2))
+            feats.append(rng.normal(size=(n, 8)) + t[:, None] * 0.5)
+            edges.append(e + off)
+            rel.append(rng.integers(0, 3, len(e)))
+            ntype.append(t)
+            batch.append(np.full(n, gi))
+            ys.append(int((t == 0).sum() + (t == 2).sum()) % 3)
+            off += n
+        g = L.graph(edges=np.concatenate(edges).tolist(), n=off, types=np.concatenate(rel),
+                    node_types=np.concatenate(ntype), batch=np.concatenate(batch))
+        out.append((np.concatenate(feats), np.array(ys), g))
+    return out
+
+
+def typed_graph_model():
+    """Two typed graph encoders over different node types of one graph (learned-key global attention, graph
+    context), a typed pool and a class per graph."""
+    from . import layers as L, graphs as GR
+    return L.Sequential([L.Linear(8, 16), GR.TypedGraphEncoder(16, 2, 2, types=[0, 1], relations=3, max_keys=8),
+                         GR.TypedGraphEncoder(16, 2, 1, types=[2, 3], relations=3, max_keys=8), GR.TypedPool(4),
+                         L.Linear(16, 3)])
+
+
+def typed_graph_dag():
+    """typed_graph_model as a dag of many nodes (each encoder split into its pieces, a pool and a head per node
+    type group, the two joined): for training split across cards, frozen parts, every optimizer."""
+    from . import layers as L, graphs as GR
+    nodes = [["inp", L.Linear(8, 16), "nodes"]]
+    for name, types, layers in (("enca", [0, 1], 2), ("encb", [2, 3], 3)):
+        more, last = GR.split_typed_encoder(name, GR.TypedGraphEncoder(16, 2, layers, types=types, relations=3,
+                                                                       max_keys=8), "inp")
+        nodes += more
+        k = name[-1]
+        nodes += [[f"pool{k}", GR.TypedPool(types), last],
+                  [f"sem{k}", L.Sequential([L.Linear(16, 16), L.Activation("gelu"), L.Linear(16, 16)]), f"pool{k}"]]
+    nodes += [["both", L.Combine("concat"), ["sema", "semb"]], ["head", L.Linear(32, 3), "both"]]
+    return L.DAG(nodes, inputs=["nodes"], output="head")
+
+
+def _check_typed_graphs(ops, out):
+    """Typed graph encoders (typed layers, learned-key attention, graph context, typed pool) with batches of graphs
+    and exact gradient sums: this card against the Emulator, and the same weights twice."""
+    from . import gpu_train as GT
     from .stdlib import Adam
     from .values import tree_leaves
-    m = GL.gla("tiny")
-    batches = [GL.gla_batch(GL.gla_task("tiny", int(b), seed=s)) for s, b in enumerate([3, 2, 4, 3, 2, 3, 2, 4])]
+    m = typed_graph_model()
+    batches = typed_graph_batches()
     kw = dict(epochs=2, verbose=False, precision="fp32", accumulate=4)
-    runs = [GT.fit_batches(m, m.init(seed=0), batches, GL.gla_loss, opt=Adam(3e-3), ops=o, **kw)
+    runs = [GT.fit_batches(m, m.init(seed=0), batches, "cross_entropy", opt=Adam(3e-3), ops=o, **kw)
             for o in (ops, ops, GT.Emulator(tc=ops.tc))]
     err = float(np.max(np.abs(np.asarray(runs[0].history) - runs[2].history) / (np.abs(runs[2].history) + 1e-6)))
     same = all(np.array_equal(np.asarray(a), np.asarray(b))
                for a, b in zip(tree_leaves(runs[0].params), tree_leaves(runs[1].params)))
     ok = err < 1e-3 and same
-    print(f"  {'ok  ' if ok else 'FAIL'} {'gla (graphs, exact sums)':<22} losses {runs[0].history[0]:.4f} -> "
+    print(f"  {'ok  ' if ok else 'FAIL'} {'typed graphs, exact sums':<22} losses {runs[0].history[0]:.4f} -> "
           f"{runs[0].history[-1]:.4f}  (reference {runs[2].history[-1]:.4f}, difference {err:.1e}, "
           f"{'the same weights twice' if same else 'NOT the same weights twice'})", file=out)
     return 0 if ok else 1

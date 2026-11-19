@@ -130,14 +130,25 @@ class Governor:
                     # go down only with the fans at the top and the card still warm, and come back (slowly, up to
                     # the run's limit) while the fans stay at the top, before the fans slow down again. A reading
                     # at the ceiling + 0.5 itself: 4 % at once.
+                    # The ceiling is never crossed: with the fans already at the top, the watts go below the training
+                    # floor too (gently, only as far as the temperature asks, down to the card's own minimum) and
+                    # come back to the floor and up as soon as there is room. Ahead of time as well: the
+                    # temperature 6 s along its slope above the ceiling starts the cut before the degrees come.
+                    ahead = self.smooth + 6.0 * max(0.0, self.slope)
                     lim = power.limit
-                    if t >= ceiling + 0.5:
+                    if t >= ceiling + 1.0:
+                        lim *= 0.93
+                    elif t >= ceiling + 0.5:
                         lim *= 0.96
-                    elif not room and self.smooth > self.target:
-                        lim -= 600.0 * (self.smooth - self.target + 0.25) * dt
+                    elif not room and (self.smooth > self.target or ahead > ceiling):
+                        lim -= 600.0 * (max(self.smooth - self.target, ahead - ceiling) + 0.25) * dt
                     elif self.smooth < self.target - 0.5 and self.slope < 0.05:
                         lim += 300.0 * dt
-                    lim = min(run, max(float(power.floor), lim))
+                    hot = not room and (self.smooth > ceiling - 0.5 or ahead > ceiling or t >= ceiling + 0.5)
+                    bottom = float(getattr(power, "hard", power.floor)) if hot else float(power.floor)
+                    if power.limit < power.floor and not hot:
+                        bottom = min(float(power.floor), power.limit + 300.0 * dt)   # back up gently
+                    lim = min(run, max(bottom, lim))
                     if lim != power.limit:
                         power.limit = lim
                         applied = getattr(power, "applied", None)
@@ -459,6 +470,7 @@ class _PowerControl:
         pc.orig = orig
         pc.top = dflt.value
         pc.floor = max(lo.value, int(dflt.value * 0.55))
+        pc.hard = pc.floor                             # the lowest the card allows (the training floor sits above)
         pc.limit = float(orig)
         pc.state = state
         import atexit

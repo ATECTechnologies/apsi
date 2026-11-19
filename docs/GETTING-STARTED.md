@@ -118,6 +118,7 @@ See [Libraries](LIBRARIES.md).
 
 ## 6. Where to go next
 
+- [What's new in 2.6.0](WHATS-NEW.md) — exact training on any number of cards, training that resumes after a crash, typed graph models, fewer tokens, your own tokenizer ([2.4.4](WHATS-NEW-2.4.4.md)).
 - [From Python](PYTHON.md) — `apsi convert` an existing program and run it unchanged.
 - [Language reference](LANGUAGE.md) — syntax, types, units, modules.
 - [AI and machine learning](AI.md) and [Reinforcement learning](RL.md).

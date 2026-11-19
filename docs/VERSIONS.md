@@ -4,6 +4,7 @@
 |---|---|---|---|---|
 | Released | 13 November 2026 | 10 November 2026 | November 2026 | 8 November 2026 |
 | AI training on the card | exact on any number of cards, the same weights every run, `steps=`, checkpoints that resume bit for bit, a NaN guard, any optimizer / loss / layer, `gpu_tensor`, physics-informed networks | Apsi's own kernels, faster than PyTorch on the models it supports | — | — |
+| Typed graph models | `typed_graph_encoder`, `hgt`, `code_graph`, `text_graph` | — | — | — |
 | Tokenizers | `data.train_tokenizer` (byte-level BPE) | Hugging Face tokenizers (read) | — | — |
 | Engines | as 2.4.4 | bytecode engine + native compiler + Python-exact mode (`use pycompat`) | bytecode engine **+ native compiler** (`@native`, LLVM machine code), `parallel for`, NVIDIA GPU kernels | bytecode engine |
 | Speed on the [benchmarks](/benchmarks) | as 2.4.4 | as 2.0.0; HTTP server about 3× faster, cold compile 32 % faster | next to C, C++, Rust; ahead of Go | about 500× slower than 2.0.0 (geometric mean; 12× to 2,400× per program) |
@@ -15,8 +16,10 @@
 | Large models | as 2.4.4 | as 2.0.0 | `apsi plan`, model files (GGUF, safetensors, `.apsim`), sharding | — |
 | Libraries (`apsi install / pack / publish / yank / unpublish`) | as 2.4.4 | as 2.0.0 | yes | yes |
 | Website commands (`apsi release …`) | as 2.4.4 | as 2.0.0 | yes | yes |
+| Standard modules | as 2.4.4, plus `tokens.focus`, `data.train_tokenizer`, `codegraph`, `gpu_tensor` | 44 modules, 1151 members, 315 built-ins | 34 modules, 833 members, 253 built-ins | 22 modules, 360 members, 201 built-ins |
 | Real time, video | as 2.4.4 | `use rt`: 1–2 kHz loops, video 640×480 → 4K at any size | — | — |
 | RAM / SSD / GPU management | as 2.4.4 | `use memory` | — | — |
+| Fewer AI tokens | `use tokens`, plus `focus` / `fit_chat` (built on code and text graphs) | `use tokens` (exactly reversible) | — | — |
 | Tables, databases | as 2.4.4 | `use dataframe`, `use db` (PostgreSQL, MySQL, MongoDB, Redis, SQLite) | — | — |
 | WebSocket, `.env`, debugger | as 2.4.4 | yes | — | — |
 | Documentation | [2.6.0 docs](/docs) | [2.4.4 docs](/docs/2.4.4) | [2.0.0 docs](/docs/2.0.0) | [1.10.0 docs](/docs/1.10.0) |

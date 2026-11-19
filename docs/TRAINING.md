@@ -133,7 +133,8 @@ The card is fastest when it never waits for the processor. In 2.6.0:
 - **One launch per reduction:** sums finish in the last block of the same kernel; split-k products add their parts
   in the last part of each tile (no second kernel).
 - **Large outputs stay on the card with your own loss:** a loss function can say which of its outputs is a plain
-  loss does this: the writer's logits never leave the card.
+  cross-entropy (`loss.on_card`); that part runs on the card and only the small outputs go to the processor. A
+  language model's logits then never leave the card.
 
 Measured on an RTX 3060 (a 2-layer transformer, 128 wide, 8 × 128 tokens a step, best of several runs on a desktop
 in use): 5.3–6.0 ms a step before these changes, 4.0–4.7 ms after, with the same weights every run. Single runs vary
@@ -191,6 +192,7 @@ the most expensive outcome of all), and stability is always kept as high as poss
 ## 10. Checking your card
 
 `apsi gpu bench check` (Windows: double-click `tools\gpu_check.bat`, the report goes to `gpu-check.txt`) compares
+every kernel on your card with the exact reference, trains typed graph encoders twice and checks the weights are identical, trains a
 transformer on the fused attention twice (identical again) and measures a step. `tools\flow_bench.bat` measures
 where a step's time goes (queued against waiting copies, the kernels on the card).
 

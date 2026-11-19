@@ -170,7 +170,7 @@ class GraphTransformer(Layer):
 class GlobalAttention(Layer):
     """Pre-norm residual self-attention over all nodes of the same graph: any node reaches any other in one step.
     Graphs of a batch never see each other. Above `max_keys` nodes a graph's keys are a subset: evenly strided, or with
-    learned_keys the max_keys nodes of highest learned score (graph model's landmark keys: every node's value is also scaled by
+    learned_keys the max_keys nodes of highest learned score (landmark keys: every node's value is also scaled by
     2 sigmoid(score), 1 at the start, so the scorer learns which nodes are worth finding). ratio: the attention runs
     with round(heads * ratio) heads of the same size (narrower than the model); bias: biases on q / k / v; zero_init:
     the output projection starts at zero (the layer starts as a no-op); types: only the nodes of these types attend and
@@ -417,12 +417,12 @@ class TypedNorm(Layer):
 
 
 class HGT(Layer):
-    """Heterogeneous graph transformer layer (as graph model's brains): a layer norm, query, key, value and output weights
+    """Heterogeneous graph transformer layer: a layer norm, query, key, value and output weights
     per node type; the key of every edge seen through its relation (a d_head x d_head matrix per relation and head);
     ONE softmax over all incoming edges of a node (self loops left out); a residual that leaves nodes without incoming
     edges unchanged; then a shared pre-norm feed-forward block (gelu) for the nodes of the layer's types. types and
     relations: counts (0..n-1) or lists of the node type and relation ids the layer owns; edges of other relations are
-    not read and nodes of other types pass through unchanged (several brains over one graph, each with its own
+    not read and nodes of other types pass through unchanged (several encoders over one graph, each with its own
     types)."""
     kind = "hgt"
 
@@ -484,7 +484,7 @@ def _graph_ids(g, N):
 
 
 def context_delta(x, own, batch, G, W, b, gate):
-    """graph model's graph summary: the mean of a graph's (owned) nodes, projected, WITHOUT its component along the mean
+    """A graph's summary: the mean of a graph's (owned) nodes, projected, WITHOUT its component along the mean
     itself (adding the plain mean every layer over-smooths), scaled by tanh(gate): [G, d]."""
     o = own.reshape(-1).astype(bool)
     ids = batch[o]
@@ -501,7 +501,7 @@ def context_delta(x, own, batch, G, W, b, gate):
 
 class GraphContext(Layer):
     """x + tanh(gate) * (the graph's summary, projected, without its common direction) for every owned node: every
-    node hears its whole graph after any layer (graph model's whole-graph context; the gate starts closed)."""
+    node hears its whole graph after any layer (whole-graph context; the gate starts closed)."""
     kind = "graph_context"
 
     def __init__(self, d, types=None):
@@ -528,7 +528,7 @@ class GraphContext(Layer):
 
 class TypedPool(Layer):
     """One vector per graph: the mean of every node type, mixed with a learned positive weight per type
-    (exp(log_weight), init `init`), as graph model's brains pool. presence="batch" (graph model): a type counts in a graph's mix when
+    (exp(log_weight), init `init`). presence="batch": a type counts in a graph's mix when
     the batch has nodes of it (a graph without any adds zeros); "graph": only the types the graph itself has."""
     kind = "typed_pool"
 
@@ -579,12 +579,12 @@ class TypedPool(Layer):
         return f"typed_pool({self.T} types)"
 
 
-class HGTBrain(Layer):
-    """One of graph model's brains over the node types it owns: an input projection per type (gelu), `layers` hgt layers, a
+class TypedGraphEncoder(Layer):
+    """An encoder over the node types it owns: an input projection per type (gelu), `layers` hgt layers, a
     global_attention after every `global_every`-th layer (learned keys, `ratio` of the heads, starting as a no-op), the
     graph context after every layer (one projection shared by the layers, a gate per layer that starts closed), a final
     layer norm. Nodes of other types pass through unchanged. Pool with typed_pool, add heads as you need."""
-    kind = "hgt_brain"
+    kind = "typed_graph_encoder"
 
     def __init__(self, d, heads, layers, types, relations, global_every=1, max_keys=4096, ratio=0.5, ffn_mult=4,
                  context=True):
@@ -635,13 +635,13 @@ class HGTBrain(Layer):
         return [self.inp] + self.layers + [self.ga[k] for k in sorted(self.ga)] + [self.final]
 
     def describe(self):
-        return f"hgt_brain(d={self.d}, {self.L} layers, {self.T} node types, global every {self.every})"
+        return f"typed_graph_encoder(d={self.d}, {self.L} layers, {self.T} node types, global every {self.every})"
 
 
-# ============================================================== a brain in pieces (to cut it across cards)
-class BrainInput(Layer):
-    """The first piece of a split hgt_brain: the typed input projection (gelu) of the owned nodes."""
-    kind = "brain_input"
+# ============================================================== a typed encoder in pieces (to cut it across cards)
+class TypedEncoderInput(Layer):
+    """The first piece of a split typed_graph_encoder: the typed input projection (gelu) of the owned nodes."""
+    kind = "typed_encoder_input"
 
     def __init__(self, d, types):
         self.d = int(d)
@@ -656,10 +656,10 @@ class BrainInput(Layer):
         return ops.where(own, ops.gelu(self.inp(p.input, x, **ctx)), x)
 
 
-class BrainShared(Layer):
-    """The weights the layers of a split brain share (the graph context's projection, a gate per layer): passes its
-    input through; the brain_layer pieces read them by this node's name."""
-    kind = "brain_shared"
+class TypedEncoderShared(Layer):
+    """The weights the layers of a split typed encoder share (the graph context's projection, a gate per layer): passes its
+    input through; the typed_encoder_layer pieces read them by this node's name."""
+    kind = "typed_encoder_shared"
 
     def __init__(self, d, layers):
         self.d, self.L = int(d), int(layers)
@@ -672,10 +672,10 @@ class BrainShared(Layer):
         return x
 
 
-class BrainLayer(Layer):
-    """One layer of a split brain: hgt, the global attention when it has one, the graph context with the weights of
-    the brain_shared node `owner` (gate number `li`)."""
-    kind = "brain_layer"
+class TypedEncoderLayer(Layer):
+    """One layer of a split typed encoder: hgt, the global attention when it has one, the graph context with the weights of
+    the typed_encoder_shared node `owner` (gate number `li`)."""
+    kind = "typed_encoder_layer"
 
     def __init__(self, hgt, ga, li, owner, types, context=True):
         self.hgt, self.ga, self.li, self.owner, self.context = hgt, ga, int(li), str(owner), bool(context)
@@ -705,9 +705,9 @@ class BrainLayer(Layer):
         return [self.hgt] + ([self.ga] if self.ga is not None else [])
 
 
-class BrainOutput(Layer):
-    """The last piece of a split brain: the final layer norm of the owned nodes."""
-    kind = "brain_output"
+class TypedEncoderOutput(Layer):
+    """The last piece of a split typed encoder: the final layer norm of the owned nodes."""
+    kind = "typed_encoder_output"
 
     def __init__(self, d, types):
         self.d = int(d)
@@ -722,17 +722,17 @@ class BrainOutput(Layer):
         return ops.where(own, self.final(p.final, x), x)
 
 
-def split_brain(name, brain, src):
-    """An hgt_brain as dag nodes [name_in, name_shared, name_l0 … name_out] (the same computation and the same
-    weights; the pieces can go to different cards). Returns (nodes, the name of the brain's output)."""
-    b = brain
+def split_typed_encoder(name, encoder, src):
+    """An typed_graph_encoder as dag nodes [name_in, name_shared, name_l0 … name_out] (the same computation and the same
+    weights; the pieces can go to different cards). Returns (nodes, the name of the encoder's output)."""
+    b = encoder
     types = list(b.type_ids) if b.type_ids is not None else b.T
-    nodes = [[f"{name}_in", BrainInput(b.d, types), src], [f"{name}_shared", BrainShared(b.d, b.L), f"{name}_in"]]
+    nodes = [[f"{name}_in", TypedEncoderInput(b.d, types), src], [f"{name}_shared", TypedEncoderShared(b.d, b.L), f"{name}_in"]]
     prev = f"{name}_shared"
     for li, l_ in enumerate(b.layers):
-        nodes.append([f"{name}_l{li}", BrainLayer(l_, b.ga.get(li), li, f"{name}_shared", types, b.context), prev])
+        nodes.append([f"{name}_l{li}", TypedEncoderLayer(l_, b.ga.get(li), li, f"{name}_shared", types, b.context), prev])
         prev = f"{name}_l{li}"
-    nodes.append([f"{name}_out", BrainOutput(b.d, types), prev])
+    nodes.append([f"{name}_out", TypedEncoderOutput(b.d, types), prev])
     return nodes, f"{name}_out"
 
 
@@ -758,6 +758,6 @@ def graph_transformer_net(n_in, d, out, layers=4, heads=4, relations=1, global_e
 def names():
     return dict(graph_transformer=GraphTransformer, global_attention=GlobalAttention, mix_hop=MixHop,
                 graph_memory=GraphMemory, hgt=HGT, typed_linear=TypedLinear, typed_norm=TypedNorm,
-                hgt_brain=HGTBrain, typed_pool=TypedPool, graph_context=GraphContext, split_brain=split_brain,
+                typed_graph_encoder=TypedGraphEncoder, typed_pool=TypedPool, graph_context=GraphContext, split_typed_encoder=split_typed_encoder,
                 graph_transformer_net=graph_transformer_net, k_hop=k_hop, hop_distances=hop_distances,
                 eccentricity=eccentricity)

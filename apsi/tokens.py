@@ -18,7 +18,7 @@ only a few lines changed.
 Pick what fits your data — they combine (`dedupe(pack(x))`), and `best(x)` tries them and keeps the smallest.
 
 When the context is still too long for the budget, `focus(context, question, budget)` keeps the parts the question
-needs (chosen on graph model's code and text graphs) and marks what it left out, so any part can be put back with
+needs (chosen on code and text graphs) and marks what it left out, so any part can be put back with
 `unfold()`; `fit_chat(messages, budget)` does the same for a conversation (see token_focus.py).
 """
 import difflib

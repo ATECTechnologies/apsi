@@ -166,7 +166,7 @@ class Trainer(unittest.TestCase):
         self.assertAlmostEqual(moved[True], 3e-7, delta=3e-8)
 
     def test_text_and_graph_models_in_batches(self):
-        """A graph-and-language model (graph model's shape): token ids and node features as two inputs of one dag, a different
+        """A graph-and-language model (two inputs): token ids and node features as two inputs of one dag, a different
         batch of graphs every step (sizes, edges, relations), a graph transformer, graph_memory, cross-attention from
         the text to the memory, rotary positions, grouped heads, SwiGLU: fit_batches on the card equals NumPy."""
         from apsi import graphs as GR
@@ -243,7 +243,7 @@ class Trainer(unittest.TestCase):
 
     def test_heterogeneous_graphs(self):
         """typed_linear, typed_norm and hgt (a type per node, keys through each relation, one softmax over a node's
-        in-edges, graph model's brain layer): training on the card equals NumPy, with a different graph every batch."""
+        in-edges, the typed encoder layer): training on the card equals NumPy, with a different graph every batch."""
         from apsi import graphs as GR
         rng = np.random.default_rng(0)
 
@@ -394,7 +394,7 @@ class Trainer(unittest.TestCase):
             np.testing.assert_allclose(np.asarray(L.predict(m, a.params, X, graph=g)),
                                        GT.predict(m, a.params, X, ops=GT.Emulator(), graph=g, precision="fp32"),
                                        rtol=1e-4, atol=1e-5, err_msg=name)
-        from apsi import graphs as GR                               # long-range graph layers (graph model's encoder)
+        from apsi import graphs as GR                               # long-range graph layers
         gt = L.graph(edges=e, n=N, types=rng.integers(0, 3, len(e)), batch=np.repeat(np.arange(4), 10))
         for name, m, gg in (("graph_transformer", GR.graph_transformer_net(8, 16, 3, layers=2, heads=4, relations=3,
                                                                           global_every=1, max_keys=6), gt),
@@ -549,7 +549,7 @@ class Trainer(unittest.TestCase):
         self.assertLess(min(best), 1 / 1.5, best)
 
     def test_ema_and_ewc(self):
-        """EMA of the weights (the graph model project's teacher weights) and EWC (keep what an earlier task needed)."""
+        """EMA of the weights (teacher weights) and EWC (keep what an earlier task needed)."""
         from apsi.values import tree_leaves
         rng = np.random.default_rng(3)
         m = L.mlp([6, 16, 3], "gelu")

@@ -1,3 +1,4 @@
+## 2.6.0 (Improved version) — exact training on any number of cards, typed graph models, training that finishes, fewer tokens (14 November 2026)
 
 **Install:** [apsi.dev/download](https://apsi.dev/download) — `ApsiSetup-2.6.0-x64.exe` (Windows 10/11),
 `ApsiSetup-2.6.0-linux.sh` (any Linux, WSL), `apsi_2.6.0_all.deb` (Ubuntu / Debian), or from this source:
@@ -5,6 +6,7 @@
 everyday code runs 1.22× faster than in 2.4.4 (geometric mean); the training guide: [docs/TRAINING.md](https://github.com/ATECTechnologies/apsi/blob/main/docs/TRAINING.md).
 
 Tested: 425 tests on every push (Linux x64 / ARM64, macOS Apple silicon / Intel, Windows; Python 3.12–3.14) and 81
+on a real NVIDIA RTX 3060 (every kernel against the exact reference; typed graph encoders and a transformer trained twice with
 identical weights; steps and resume bit for bit; the NaN guard).
 
 ### Faster everyday code
@@ -61,6 +63,7 @@ identical weights; steps and resume bit for bit; the NaN guard).
 - **Fixed: a linear layer could overwrite the gradient it was reading.** The gradient buffers are shared by
   nodes two apart, and a linear layer with a fused activation made the layer two places further (linear, act,
   linear) one of them, so dy W^T wrote over its own dy; with the weight gradient on the second stream at the same
+  time, the RTX 3060 check of three models (cnn, graph transformer, typed graphs) differed. Such a layer now writes to a buffer
   of its own (tests/test_gpu_train.py: no product writes over its input); with the fix the check agrees with the
   second stream on. The bfloat16 MLP hidden layer (`APSI_BF16_HIDDEN=1`) is opt-in: with it, the fused-attention
   transformer of the check did not give the same weights twice.
@@ -142,7 +145,8 @@ identical weights; steps and resume bit for bit; the NaN guard).
 - **Cross-entropy on the card with accurate exp and log** (Cody-Waite exp, log with a Newton step) instead of the
   approximate hardware instructions.
 - **A loss of your own can keep its large part on the card:** `loss.on_card = (output, labels_of, rest)` computes
-  writer's logits never leave the card (one card and many).
+  that output's cross-entropy on the card and sends only the other outputs to the processor: the largest logits
+  never leave the card (one card and many).
 - **Optimizers on the processor keep float64 weights** (a master copy, as NumPy does); the card gets them rounded
   once. Frozen weights stay frozen in the master copy too.
 
@@ -162,6 +166,8 @@ identical weights; steps and resume bit for bit; the NaN guard).
 
 ### Tokens and tokenizers
 - **`tokens.focus(context, query, budget)`** (`use tokens`): the parts of a long context a question needs, within a
+  token budget, chosen on code and text graphs — Python cut along its syntax tree (long functions into their parts)
+  and linked by its code property graph (calls, data flow), text cut into blocks and sentences and linked by shared rare words;
   scores from the question's words (rarer words count more, identifiers split into their pieces) spread by a
   personalised PageRank. Left-out parts become numbered markers; functions that do not fit may stay as outlines.
   `unfold(f)` gives the original exactly, `unfold(f, [n])` one part. `fit_chat(messages, budget)`,
@@ -179,6 +185,7 @@ identical weights; steps and resume bit for bit; the NaN guard).
   unchanged; without a card everything runs on the processor. `gpu_device()`. Element-wise kernels of their own:
   exp, log (Cody-Waite reduction, a Newton step: within a few units in the last place), IEEE division and square
   roots, powers, maximum, minimum, abs.
+- **`apsi gpu bench check`** also checks typed graph encoders (graphs, exact gradient sums, the same weights twice) and gpu_tensor
   against the reference; `apsi gpu bench cards` checks that every card gives one card's weights bit for bit.
   `tools\gpu_check.bat`: the whole check on a Windows computer's card, written to gpu-check.txt.
 - **Faster record fields:** reading a record's field in the bytecode engine is 1.8x faster.
@@ -191,7 +198,8 @@ identical weights; steps and resume bit for bit; the NaN guard).
   card and across cards (one optimizer per stage). The same training as NumPy.
 - **Frozen parts:** `fit(…, freeze=["enc", "layers[0]"])`, `train_only="w*"` (names by path, `*` at the end, or a
   function of the path) on NumPy, one card and many: the frozen weights get no gradient, do not count in `clip`,
-  at a time).
+  and keep their exact values (weight decay and momentum cannot move them). Fine-tuning, or training a model
+  part by part.
 - **Frozen means untouched, also in its type:** the result's frozen weights are the very arrays given (float64 stays
   float64), on every backend; before, training in float32 could hand them back rounded to float32.
 - **Any loss name on the card:** a loss without a kernel (`"vae"`, …) is evaluated on the processor, like a loss
@@ -203,22 +211,31 @@ identical weights; steps and resume bit for bit; the NaN guard).
   card).
 
 ### Graph-and-language models
+- **Code and text as graphs:** `code_graph(source)` (a code property graph of Python source: AST, CFG, scope- and
+  order-aware DFG / PDG, calls, SDG; every node with its depth and degrees), `text_graph(text)`.
+- **Encoders that own node types and relations:** `types=[…]` and `relations=[…]` on `hgt`, `typed_linear`,
   `typed_norm`, `global_attention`; nodes of other types pass through, edges of other relations are not read, so
+  several encoders share one graph. `typed_graph_encoder` (input projection, hgt layers, global attention, a centred graph
   context with one shared projection and a gate per layer, final norm), `typed_pool` (a learned weight per node type).
+- **`global_attention` options:** `ratio=` (fewer heads of the same size), `learned_keys=true` (values scaled by
   2 sigmoid(score); above `max_keys` the best-scored keys), `bias=`, `zero_init=`, `types=`.
 - **Attention:** `multi_head_attention(…, bias=false, gate=0.25, memory_mask=true)` — no output bias, the output
   scaled by tanh of a learned gate, a memory whose last column says which slots may be read; `tied_output(owner)`,
+  `slice_layer`.
 - **GPU trainer:** kernels for all of the above (typed groups by owned types, edges by owned relations, learned keys,
   graph context and typed pooling with the per-graph numbers on the processor, gated and masked cross-attention, the
   tied output); a `dag` with several outputs and a loss of your own over all of them, targets given as a record, on
   one card and across cards; a weight held by two stages (a tied output on another card than its embedding) gets the
   sum of both gradients; the cut of a dag balances the work each node really does (rows followed from the inputs:
+  graph nodes, tokens, one row per graph after pooling). A typed
+  encoder can be a node per layer, so a cut can fall inside it (its shared weights summed across the cards).
 - **`accumulate=A` across cards is A batches a step** whatever the number of cards and copies of the pipeline: the
   training no longer depends on how many cards there are.
 - **Layers written in Apsi:** a `custom_layer`'s forward function gets only the keywords it takes (`train`, `graph`,
   `mask`), never the dag's own context; such layers train inside a model on one card or split across cards.
 - **Fixed:** a lambda's parameter named like something outside it (`fn(p, x, train=true) => …` after `use nn`) could
   not be passed by keyword.
+- **Heterogeneous graphs:** `graph(…, node_types=)`, `typed_linear`, `typed_norm` and `hgt` (heterogeneous graph transformer:
   weights per node type, keys through each relation and head, one softmax over a node's in-edges) on NumPy and the
   GPU trainer (rows grouped by type, one product per type; the relations in one batched product).
 - **Any model split across cards in batches:** `fit_batches(…, device="cuda:all", accumulate=M, stages=)` cuts a
@@ -226,7 +243,8 @@ identical weights; steps and resume bit for bit; the NaN guard).
   micro-batch; the same training as one card, step for step.
 - **`fit_batches`** (`use layers`, every backend): batches that each bring their own shape and graph; `dag` models
   with several inputs (token ids and node features) on the GPU trainer; `graph_memory` on the card; cross-attention
-  grouped heads and SwiGLU) trains on the card exactly as on NumPy.
+  from text to a graph's memory. A graph-and-text model (graph transformer, graph memory, a decoder with rotary
+  positions, grouped heads and SwiGLU) trains on the card exactly as on NumPy.
 
 ### Physics-informed networks
 - **`pinn_fit` and `pinn_derivatives`** (`use layers`): the loss is any formula of the points and the network's

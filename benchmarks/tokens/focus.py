@@ -10,7 +10,7 @@ from apsi import token_focus as F, tokens as T     # noqa: E402
 
 CASES = [
     ("apsi/lexer.py", "how are string escapes handled?", 1500),
-    ("apsi/gla.py", "how is the router balance loss computed?", 1500),
+    ("apsi/graphs.py", "how is the graph summary computed?", 1500),
     ("apsi/gpu_train.py", "how does a checkpoint resume training?", 3000),
     ("docs/GPU.md", "the card is hot or loud: how do I lower its temperature?", 600),
     ("docs/TRAINING.md", "what happens if I turn the NaN guard off?", 500),

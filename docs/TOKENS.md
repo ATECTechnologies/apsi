@@ -123,6 +123,7 @@ let text, method = tokens.best(payload)
 send(text)                                   # and keep method to restore: tokens.restore(text, method)
 ```
 
+## When it still does not fit: `focus`
 
 The transforms above never lose anything, so they cannot shrink text that has no repetition — a large source file,
 a long manual. When such a context is longer than your budget, `tokens.focus` keeps **the parts the question needs**
@@ -156,17 +157,22 @@ import re
 A function that does not fit whole can appear as its outline instead:
 
 ```text
-# [[outline 4: lines 610-622]]
+# [[outline 4: lines 486-500]]
+def context_delta(x, own, batch, G, W, b, gate):
+    """A graph's summary: the mean of a graph's (owned) nodes, projected, WITHOUT its component along the mean"""
+    # calls: asarray, bincount, maximum, nonzero, raw, reshape, segment_sum, sqrt, sum_, tanh, where
     ...
 ```
 
 ### How it chooses
 
+It reads the context as a graph of its parts:
 
 1. **Units.** Python is cut along its syntax tree: top-level statements, functions, classes, methods; a function or
    block longer than 60 lines is cut further into its header and the statements of its body, so a long function can
    keep only the part that matters. Other code and text are cut into blocks between blank lines and at headings, and
    long paragraphs into sentences. The units cover the context exactly once.
+2. **A graph.** For Python, its code property graph (`code_graph`): calls, data flow from definitions to uses,
    dependences — so a function brings the functions it calls and the names it reads. For text, neighbouring units and
    units that share rare words.
 3. **Scores.** Each unit scores by the question's words it contains — rarer words count more, `snake_case` and

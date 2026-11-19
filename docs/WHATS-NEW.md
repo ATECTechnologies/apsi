@@ -1,7 +1,8 @@
 # What's new in Apsi 2.6.0
 
 2.6.0 is about **training you can trust**: the same weights on one card or eight, the same weights every run,
-Apsi model. It also brings a way to send language models far fewer tokens without losing anything for good, and a
+training that survives a crash and resumes to the exact bit, and models over graphs with many node types and
+relations. It also brings a way to send language models far fewer tokens without losing anything for good, and a
 tokenizer you train yourself. Everything from 2.4.4 keeps working unchanged; the new protections are on by default.
 The full list of changes is in the [changelog](https://github.com/ATECTechnologies/apsi/blob/main/CHANGELOG.md);
 2.4.4's page is [here](WHATS-NEW-2.4.4.md).
@@ -11,6 +12,8 @@ The full list of changes is in the [changelog](https://github.com/ATECTechnologi
 | Exact on any number of cards | one card, copies of the model and a model split across cards give the same weights, bit for bit | [below](#1-exact-training-on-any-number-of-cards) |
 | The same weights every run | no atomic additions anywhere in training | [below](#2-the-same-weights-every-run) |
 | Training that finishes | `steps=`, checkpoints that resume exactly, a guard against NaN steps, a save on any stop | [Training](TRAINING.md) |
+| Typed graph models | many node types and relations, code and text as graphs | [below](#4-typed-graph-models) |
+| Fewer tokens | `tokens.focus`: the parts a question needs, markers for the rest, everything restorable | [Tokens](TOKENS.md#when-it-still-does-not-fit-focus) |
 | Your own tokenizer | `data.train_tokenizer`: byte-level BPE, the tokenizer.json format | [Training](TRAINING.md#7-your-own-tokenizer) |
 | Tensors on the card | `gpu_tensor(x)`: any code on the card, the rest falls back by itself | [GPU](GPU.md) |
 | Any optimizer, any loss, any layer | on the GPU trainer, frozen parts, fine-tuning | [below](#7-training-modes) |
@@ -49,6 +52,7 @@ Train twice, get the same weights — on the real card, not only in theory. Ever
 a fixed order: bias and norm gradients (blocks of 32 columns × 8 lanes of rows, the last block to finish adds the
 chunks in order), embedding gradients (a sorted index, one thread per row), losses, sums of squares, split matrix
 products (the last part of each tile adds the parts in order), and the fused attention's backward (dQ in its own
+kernel, summed over the key tiles in registers). `apsi gpu bench check` trains typed graph encoders and a transformer twice on your
 card and compares the weights; on an RTX 3060 they are identical.
 
 `APSI_GPU_DETERMINISTIC=0` brings back the atomic dQ in attention (one kernel instead of two).
@@ -70,8 +74,16 @@ let r = fit_batches(lm, params, batches, loss="cross_entropy", opt=adamw(lr=3e-4
 
 On the GPU trainer and on NumPy. The complete guide, with what each protection costs: [TRAINING.md](TRAINING.md).
 
+## 4. Typed graph models
 
+Graphs with many node types and relations: `hgt` (a heterogeneous graph transformer layer), `typed_linear`,
+`typed_norm`, `typed_graph_encoder` (an input projection per node type, hgt layers, learned-key global attention, a
+graph context per layer) and `typed_pool`. Several encoders can share one graph, each over the node types it owns.
+`code_graph(source)` turns Python into a code property graph (syntax, control flow, data flow, calls) and
+`text_graph(text)` text into a word graph. It all trains on NumPy, on one card and split across cards, the same
+training step for step. Guide: [GRAPHS.md](GRAPHS.md).
 
+## 5. Fewer tokens
 
 `use tokens` already removed redundancy exactly. 2.6.0 adds **focus**, for contexts that are simply too long:
 
@@ -84,9 +96,11 @@ let all = tokens.unfold(f)  # the original, exactly
 ```
 
 It cuts the context along its structure (Python along its syntax tree; long functions into their parts; text into
+blocks and sentences), links the parts with the code property graph (calls, data flow) or shared rare words, scores
 them by the question and spreads the scores over the graph, then fills the budget. What it leaves out is listed by
 number, so a model can ask for it and you send `unfold(f, [n])`. `fit_chat(messages, budget)` does the same for
 conversations; `outline(source)` shows a file's structure. Optional: nothing changes until you call it. Works with any
+model. Guide: [TOKENS.md](TOKENS.md#when-it-still-does-not-fit-focus), example:
 `examples/46_focus_and_tokenizer.apsi`.
 
 ## 6. Your own tokenizer
@@ -151,6 +165,7 @@ safely it runs.
 ## 12. How it was tested
 
 - 413 tests on every push, on Linux (x64, ARM64), macOS (Apple silicon, Intel) and Windows, Python 3.12–3.14.
+- On a real NVIDIA RTX 3060: every kernel against the exact reference, typed graphs and a transformer trained twice with
   identical weights, steps and resume bit for bit, the NaN guard, split products, the fused attention both ways,
   products with sizes not multiples of 4 — 81 tests (`tools\bench_my_pc.bat`).
 - On the same desktop (Ryzen 5 5500, Windows 11): 2.6.0 against 2.4.4 at 1.28× and 1.35× on the geometric mean (two runs).
@@ -211,6 +226,7 @@ VS Code, *Convert Python to Apsi* asks which of these you want. The complete gui
 | `stages=` | GPU `fit`, `fit_batches` with `device="cuda:all"` | how many cards one copy of the model is split across | balanced automatically |
 | `gpu_tensor(x)`, `gpu_device()` | prelude | a tensor on the card; where it lives | — |
 | `pinn_fit`, `pinn_derivatives` | `use layers` | physics-informed training; u, ∂u, ∂²u at points | — |
+| `typed_graph_encoder`, `code_graph`, `text_graph` | `use layers` | typed graph models; code and text as graphs | — |
 | `tokens.focus`, `unfold`, `fit_chat`, `outline` | `use tokens` | fewer tokens, everything restorable | — |
 | `data.train_tokenizer` | `use data` | byte-level BPE, `tokenizer.json` | `vocab_size=8000` |
 | `apsi convert --only` / `--project` / `--exclude` / `--plan` | command line | how much Python is converted | the file and its imports |
@@ -298,6 +314,8 @@ result because training is deterministic.
 the same value repeated. That almost always means a bug in the data or the loss (a log of 0, a division by 0).
 `APSI_GPU_GUARD=0` lets the NaN through so you can see where it appears.
 
+**Does focus need model weights?** No. It uses the code property graph (the structure of the code), not a trained
+model. It runs on the processor in milliseconds.
 
 **Does training on several cards need special code?** No: `device="cuda:all"`. With `steps=` or `checkpoint=` it
 currently needs one card; the multi-card trainer raises a clear error instead of silently ignoring them.

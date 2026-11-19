@@ -5,7 +5,8 @@ import unittest
 
 import numpy as np
 
-from apsi import layers as L, gpu_train as GT, gla as GL
+from apsi import layers as L, gpu_train as GT
+from apsi.gpu_bench import typed_graph_batches, typed_graph_dag
 from apsi.stdlib import Adam, AdamW, RMSprop, SGD
 
 
@@ -57,16 +58,17 @@ class Modes(unittest.TestCase):
             np.testing.assert_allclose(a.history, b.history, rtol=1e-5)
 
     def test_phases_of_a_graph_and_language_model_across_cards(self):
-        """graph model's phases: one brain and the writer learn while the rest stays; any optimizer; split across cards."""
-        m = GL.gla("tiny")
-        batches = [GL.gla_batch(GL.gla_task("tiny", int(b), seed=s)) for s, b in enumerate([3, 2, 4, 3, 2, 3, 2, 4])]
-        for opt, kw in ((lambda: Adam(0.003), dict(freeze=["brain_a_*", "enc"])),
-                        (lambda: SGD(0.05, momentum=0.9), dict(train_only="w*", clip=0.5))):
-            a = L.fit_batches(m, m.init(seed=0), batches, GL.gla_loss, opt=opt(), epochs=2, backend="numpy",
+        """Phases of a typed graph model: one encoder and the heads learn while the rest stays; any optimizer; split
+        across cards."""
+        m = typed_graph_dag()
+        batches = typed_graph_batches()
+        for opt, kw in ((lambda: Adam(0.003), dict(freeze=["enca_*", "inp"])),
+                        (lambda: SGD(0.05, momentum=0.9), dict(train_only="sem*", clip=0.5))):
+            a = L.fit_batches(m, m.init(seed=0), batches, "cross_entropy", opt=opt(), epochs=2, backend="numpy",
                               verbose=False, accumulate=4, **kw)
             for n, st in ((1, None), (3, None), (4, 2)):
                 ops = GT.Emulator() if n == 1 else [GT.Emulator() for _ in range(n)]
-                b = GT.fit_batches(m, m.init(seed=0), batches, GL.gla_loss, opt=opt(), epochs=2, verbose=False,
+                b = GT.fit_batches(m, m.init(seed=0), batches, "cross_entropy", opt=opt(), epochs=2, verbose=False,
                                    precision="fp32", ops=ops, accumulate=4, stages=st, **kw)
                 np.testing.assert_allclose(a.history, b.history, rtol=1e-5)
             moved = {p for p, w in L.param_paths(b.params)
@@ -92,20 +94,22 @@ class Modes(unittest.TestCase):
         """Exact (double-float) sums of the gradients of a step's batches, of the copies of a stage and of the
         gradients that cross a cut: copies of the model and cuts between nodes give one card's weights bit for bit."""
         from apsi.values import tree_leaves
-        m = GL.gla("tiny")
-        batches = [GL.gla_batch(GL.gla_task("tiny", int(b), seed=s)) for s, b in enumerate([3, 2, 4, 3, 2, 3, 2, 4])]
+        m = typed_graph_dag()
+        batches = typed_graph_batches()
         names = [n for n, *_ in m.nodes]
+        third = len(names) // 3
 
         def run(ops, st=None, opt=lambda: Adam(0.003)):
-            return GT.fit_batches(m, m.init(seed=0), batches, GL.gla_loss, opt=opt(), epochs=2, verbose=False,
+            return GT.fit_batches(m, m.init(seed=0), batches, "cross_entropy", opt=opt(), epochs=2, verbose=False,
                                   precision="fp32", ops=ops, accumulate=4, stages=st)
         one = run(GT.Emulator())
-        for ops, st in (([GT.Emulator() for _ in range(2)], 1), ([GT.Emulator() for _ in range(4)], [12, 35])):
+        for ops, st in (([GT.Emulator() for _ in range(2)], 1),
+                        ([GT.Emulator() for _ in range(4)], [third, len(names) - third])):
             r = run(ops, st)
             for a, b in zip(tree_leaves(one.params), tree_leaves(r.params)):
                 np.testing.assert_array_equal(np.asarray(a), np.asarray(b))
         one = run(GT.Emulator(), None, lambda: SGD(0.1))
-        for cut in (12, 30):
+        for cut in (third, len(names) // 2):
             r = run([GT.Emulator() for _ in range(2)], [cut, len(names) - cut], lambda: SGD(0.1))
             for a, b in zip(tree_leaves(one.params), tree_leaves(r.params)):
                 np.testing.assert_array_equal(np.asarray(a), np.asarray(b))

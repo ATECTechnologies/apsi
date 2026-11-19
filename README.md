@@ -95,10 +95,15 @@ Then read [Getting started](docs/GETTING-STARTED.md) (15 minutes) or [Write Apsi
   cuts of a model split over cards are summed exactly (double-float, rounded once): adding cards makes training
   faster, never different.
 * **The same weights every run.** No atomic additions anywhere in training — bias and norm gradients, embeddings,
+  losses, split products, attention's backward all add in a fixed order. Checked on a real RTX 3060: typed graph encoders and a
   transformer trained twice give identical weights.
 * **Training that finishes.** `fit_batches(…, steps=20000, checkpoint="run.npz", save_every=500)`: saved on any stop
   (a crash, Ctrl+C), resumed bit for bit by running the same line again; a step with an inf or NaN gradient is skipped
   inside the optimizer kernel. [Training guide](docs/TRAINING.md).
+* **Typed graph models.** `typed_graph_encoder`, `hgt`, `typed_pool`, `code_graph(source)`: graphs with many node
+  types and relations, on NumPy, one card or many. [Graphs](docs/GRAPHS.md).
+* **Fewer tokens.** `tokens.focus(context, question, budget)` keeps what a question needs, chosen on
+  code and text graphs, and numbers what it leaves out so anything can be put back exactly (`unfold`);
   `fit_chat` for conversations. A 15,137-token module to 1,333 tokens for one question. [Tokens](docs/TOKENS.md).
 * **Your own tokenizer.** `data.train_tokenizer(corpus, vocab_size=32000)`: byte-level BPE in Apsi (or Rust when
   installed), saved as tokenizer.json.
@@ -128,6 +133,7 @@ Details, examples and measurements: [`docs/WHATS-NEW.md`](docs/WHATS-NEW.md) · 
 |---|---|---|
 | [Getting started](docs/GETTING-STARTED.md) | [Language reference](docs/LANGUAGE.md) | [AI](docs/AI.md) · [Layers](docs/LAYERS.md) · [Training](docs/TRAINING.md) · [GPU](docs/GPU.md) · [RL](docs/RL.md) |
 | [What's new](docs/WHATS-NEW.md) | [Everything on one page](docs/REFERENCE.md) | [From Python](docs/PYTHON.md) · [Native code](docs/NATIVE.md) |
+| [Install](docs/INSTALL.md) · [Linux](docs/INSTALL-LINUX.md) | [Project overview](docs/OVERVIEW.md) | [Real time](docs/REALTIME.md) · [Memory](docs/MEMORY.md) · [Tokens](docs/TOKENS.md) · [Hub](docs/HUB.md) · [Graphs](docs/GRAPHS.md) · [Number formats](docs/NUMBERS.md) |
 | [Troubleshooting](docs/TROUBLESHOOTING.md) | [Security](docs/SECURITY.md) | [Tables](docs/DATAFRAME.md) · [Databases](docs/DATABASES.md) · [Servers](docs/SERVER.md) |
 | [Versions compared](docs/VERSIONS.md) | [Editors](docs/EDITORS.md) | [Science](docs/SCIENCE.md) · [Debugging](docs/DEBUGGING.md) · [Configuration](docs/ENV.md) |
 

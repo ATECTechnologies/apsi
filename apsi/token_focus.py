@@ -1,13 +1,13 @@
-"""Send a model only the part of a long context that matters for the question, built on graph model's graphs.
+"""Send a model only the part of a long context that matters for the question, built on code and text graphs.
 
 `use tokens` (tokens.py) is lossless: it removes redundancy. This module goes further when a context is too long for
 the budget: it keeps what the question needs and replaces the rest with short, numbered markers that say exactly what
 was left out (which lines, which functions), so nothing is lost silently and any part can be put back.
 
-How it chooses (the same structure graph model reads):
+How it chooses (the structure of the code itself):
   * the context is cut into units: for Python, every top-level statement, function, class and method (from the
     abstract syntax tree); for other code and for text, blocks between blank lines, cut into sentences if long;
-  * the units are joined into a graph: for Python, graph model's code property graph (calls, data flow from definitions to
+  * the units are joined into a graph: for Python, the code property graph (calls, data flow from definitions to
     uses, the system dependence graph), so a function brings the functions it calls and the names it reads; for
     text, neighbouring units and units that share rare words;
   * each unit is scored by the question's words it contains (rarer words count more; snake_case and camelCase are
@@ -198,8 +198,8 @@ def _title(text):
 
 # ------------------------------------------------------------------ the graph
 def _python_edges(src, units):
-    """Edges between units from graph model's code property graph: calls, data flow, dependences."""
-    from .gla_graph import _Builder
+    """Edges between units from the code property graph: calls, data flow, dependences."""
+    from .codegraph import _Builder
     b = _Builder()
     b.visit(ast.parse(src))
     b.finish()

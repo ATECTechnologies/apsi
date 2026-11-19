@@ -1,5 +1,6 @@
 # 46_focus_and_tokenizer.apsi — send a model only what it needs, and train your own tokenizer
 #
+# tokens.focus keeps the parts of a long context that a question needs (chosen on code and text graphs) and
 # marks the rest, so any part can be put back exactly; data.train_tokenizer trains a byte-level BPE tokenizer.
 use tokens
 use data

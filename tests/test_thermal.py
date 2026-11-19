@@ -218,7 +218,7 @@ class FanControl(unittest.TestCase):
     """A fixed 145 W; the fans (70-82 %) hold the temperature; the power limit only when the fans are at the top."""
 
     @staticmethod
-    def _sim(seconds, ambient, r_lo, r_hi, load=None):
+    def _sim(seconds, ambient, r_lo, r_hi, load=None, floor=93500, top=82.0):
         """A card at a fixed 145 W limit: temperature rise per watt falls from r_lo (fans at 0 %) to r_hi (100 %);
         the fans follow their command in about 2 s, the die in about 20 s; the sensor reads whole degrees."""
         clock, st = [0.0], {"T": 50.0, "limit": 145000.0, "cmd": None, "fan": 30.0}
@@ -239,10 +239,11 @@ class FanControl(unittest.TestCase):
         pc = PC()
         pc.step = thermal._PowerControl.step.__get__(pc)
         g = thermal.Governor(read, 79.0)
+        pc.floor, pc.hard = floor, 93500
         g.power, g.read_power = pc, power
         fc = thermal._FanControl()
         fc.percent, fc.level, fc.ok = None, None, True
-        fc.low, fc.top = 70.0, 82.0
+        fc.low, fc.top = 70.0, top
         fc._set = lambda pct: st.__setitem__("cmd", pct) or True
         g.fan = fc
         with mock.patch.object(thermal.time, "monotonic", lambda: clock[0]):
@@ -286,6 +287,24 @@ class FanControl(unittest.TestCase):
         self.assertLess(min(x[2] for x in late), 145000.0)
         self.assertLess(max(x[2] for x in late) - min(x[2] for x in late), 12000.0)
         self.assertGreater(min(x[5] for x in late if x[5] is not None), 75.0)
+
+    def test_never_80_below_the_floor(self):
+        """A room so hot that 135 W with the fans at 100 % runs at 85 C: the watts go below the training floor,
+        only as far as needed, and the card never reads 80 once the controller has it."""
+        log, _ = self._sim(900.0, 45.0, 0.44, 0.30, floor=135000, top=100.0)
+        late = [x for x in log if x[0] > 120.0]
+        self.assertTrue(all(x[1] < 80.0 for x in late))
+        self.assertLess(min(x[2] for x in late), 135000.0)
+        self.assertGreater(min(x[2] for x in late), 93500.0)
+        steady = [x for x in log if x[0] > 500.0]
+        self.assertLess(max(x[2] for x in steady) - min(x[2] for x in steady), 8000.0)   # level, no swinging
+
+    def test_back_to_the_floor_when_it_cools(self):
+        """Hot, then the room cools: the power comes back up to the training floor and above."""
+        log, _ = self._sim(1200.0, 45.0, 0.44, 0.30, floor=135000, top=100.0,
+                           load=lambda t: 1.0 if t < 500.0 else 0.7)
+        self.assertTrue(all(x[1] < 80.0 for x in log if x[0] > 120.0))
+        self.assertGreaterEqual(log[-1][2], 135000.0)
 
     def test_train_power(self):
         class PC:

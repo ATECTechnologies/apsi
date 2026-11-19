@@ -1,5 +1,5 @@
 @echo off
-rem Check Apsi on this computer's NVIDIA card: every GPU kernel against the exact reference, graph model, gpu_tensor and the
+rem Check Apsi on this computer's NVIDIA card: every GPU kernel against the exact reference, typed graphs, gpu_tensor and the
 rem tests that need a real card. The whole report goes to gpu-check.txt in the Apsi folder.
 rem   Double-click it, or: tools\gpu_check.bat
 rem It uses the first Python whose NumPy loads (a free-threaded "3.14t" build often has no working NumPy).
@@ -31,7 +31,7 @@ echo == device >> "%OUT%"
 echo == every kernel against the reference >> "%OUT%"
 !PY! -m apsi gpu bench check >> "%OUT%" 2>&1
 echo == tests on the card >> "%OUT%"
-!PY! -m pytest -q -p no:cacheprovider tests/test_gpu_real.py tests/test_gpu_train.py tests/test_gla.py tests/test_training_modes.py tests/test_gpu_tensor.py >> "%OUT%" 2>&1
+!PY! -m pytest -q -p no:cacheprovider tests/test_gpu_real.py tests/test_gpu_train.py tests/test_training_modes.py tests/test_gpu_tensor.py >> "%OUT%" 2>&1
 echo == done >> "%OUT%"
 echo The report is in %OUT%
 endlocal
