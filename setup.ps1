@@ -69,6 +69,9 @@ if ($Installer) {
   if (Test-Path payload) { Remove-Item payload -Recurse -Force }
   & $vpy ..\packaging\build_payload.py --platform windows --out payload
   if ($LASTEXITCODE) { Pop-Location; exit 1 }
+  Step "Checking the payload (GPU kernels of this source, version, nothing that must not ship)"
+  & $vpy ..\tools\check_release.py payload
+  if ($LASTEXITCODE) { Pop-Location; exit 1 }
 
   Step "Building the setup wizard"
   # npm install (not ci) so the Windows builds of esbuild/rollup are used even if the lock file came from Linux

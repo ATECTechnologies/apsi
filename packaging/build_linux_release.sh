@@ -66,6 +66,8 @@ cp installer/release/*.AppImage "$OUT/"
 rm -rf installer/payload
 
 cp docs/INSTALL-LINUX.md "$OUT/INSTALL-LINUX.md"
+echo "== checking the release files"
+python3 tools/check_release.py "$OUT"/*.whl "$OUT"/*.deb "$OUT"/*.tar.gz "$P"
 (cd "$OUT" && sha256sum *.AppImage *.deb *.tar.gz *.whl $(ls *.vsix 2>/dev/null) > SHA256SUMS.txt)
 (cd "$ROOT/dist" && rm -f "apsi-$V-linux.zip" && mv linux "apsi-$V-linux" && zip -qr "apsi-$V-linux.zip" "apsi-$V-linux" \
    && mv "apsi-$V-linux" linux)
