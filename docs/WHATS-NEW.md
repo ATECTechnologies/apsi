@@ -164,10 +164,13 @@ safely it runs.
 
 ## 12. How it was tested
 
-- 413 tests on every push, on Linux (x64, ARM64), macOS (Apple silicon, Intel) and Windows, Python 3.12–3.14.
+- 445 tests pass on Linux (48 more are skipped there: they need a card or a tool); the suite runs on every push, on Linux (x64, ARM64), macOS (Apple silicon, Intel) and Windows, Python 3.12–3.14.
 - On a real NVIDIA RTX 3060: every kernel against the exact reference, typed graphs and a transformer trained twice with
   identical weights, steps and resume bit for bit, the NaN guard, split products, the fused attention both ways,
-  products with sizes not multiples of 4 — 81 tests (`tools\bench_my_pc.bat`).
+  products with sizes not multiples of 4, GINE with edge features — 13 of 13 checks and 112 tests (`tools\test_3060_quick.bat`,
+  about 4 minutes).
+- The 127 M GPT for 2 epochs on the same card: 20,708 tokens/s against PyTorch's 18,809 at the same temperature, never
+  above 79 °C, 5,398 MB of GPU memory.
 - On the same desktop (Ryzen 5 5500, Windows 11): 2.6.0 against 2.4.4 at 1.28× and 1.35× on the geometric mean (two runs).
 - NumPy, one card and many cards compared on the same training, step for step.
 - CPU programs against C, C++, Rust, Go, Java, JavaScript, C# and Julia, and 2.6.0 against 2.4.4, on a GitHub

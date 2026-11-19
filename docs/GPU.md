@@ -36,7 +36,7 @@ and the driver compiles them for whatever card is present.
 > **Important — for the full, steady speed of long training, give Apsi the right to set the card's power limit.**
 > Without it, the only way Apsi can keep a hot card under its ceiling is to *pause* the work, and a card that needs cooling
 > then loses a large share of its speed (measured on an RTX 3060: a 127 M-parameter model trained at 10,332 tokens/s
-> with pauses, **18,074 tokens/s** with the power limit, at the same temperature). Do one of these:
+> with pauses, **18,074 tokens/s** with the power limit (20,708 with Apsi 2.6.0), at the same temperature). Do one of these:
 >
 > 1. **Run Apsi as administrator** (Windows: right-click the terminal → *Run as administrator*; Linux: `sudo`), or
 > 2. **once**, run `apsi gpu setup` as administrator (or the *Apsi GPU Tuner — Apply* file from the download page):
@@ -160,12 +160,16 @@ In bfloat16 Apsi trains this model **1.19× as fast as PyTorch**, every epoch at
 
 | Run | Throughput | Held-out loss | GPU memory |
 |---|---:|---:|---:|
-| **Apsi bf16, held at 77 °C** | **18,074 tokens/s** (18,418 · 18,284 by epoch) | 6.65 → 2.810 | 4,564 MB |
+| **Apsi 2.6.0 bf16, held at 78 °C, 79 °C max** | **20,708 tokens/s** (21,219 · 20,595 by epoch) | 2.989 | 5,398 MB |
+| PyTorch 2.14 bf16 autocast, flash attention, held at 78 °C (80 °C max) | 18,809 tokens/s | 2.950 | 3,898 MB |
+| Apsi 2.4.4 bf16, held at 77 °C | 18,074 tokens/s (18,418 · 18,284 by epoch) | 6.65 → 2.810 | 4,564 MB |
 | Apsi, the kernels of one step alone (204 ms) | 20,043 tokens/s | | |
 | PyTorch 2.13 bf16 autocast, no temperature control | 20,111 tokens/s | 6.58 → 3.020 | 3,854 MB |
 | PyTorch tf32 / fp32 | 11,236 / 8,011 tokens/s | 3.025 / 3.027 | 4,565 MB |
 
-Held at 77 °C, Apsi trains the 127 M model at 2.3× PyTorch's fp32 and 1.6× its tf32 speed, with a lower held-out
+Apsi 2.6.0, at the same temperature as PyTorch, trains the 127 M model 1.10× as fast as PyTorch's bfloat16 with its own
+kernels (no cuBLAS), and the card never reaches 80 °C (the first rows: 20 and 14 November 2026). Earlier, held at 77 °C,
+Apsi 2.4.4 trained it at 2.3× PyTorch's fp32 and 1.6× its tf32 speed, with a lower held-out
 loss after the same two epochs; its kernels run as fast as PyTorch's bfloat16 does with the card left to heat up.
 Without administrator rights (cooling by pauses) the same model ran at 10,332 tokens/s: see the box at the top.
 
