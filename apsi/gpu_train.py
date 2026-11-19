@@ -1708,6 +1708,11 @@ class Gpu(_Ops):
         self.profile = prof
         self._choice[key] = best
         self._save_choice(repr(key), best)
+        for k in ("tune_c", "tune_x", "tune_db"):        # (timing outputs: not kept between shapes)
+            for kk in (k, ("side", k)):
+                bf = self._scr.pop(kk, None)
+                if bf is not None:
+                    self.free(bf)
         return best
 
     def _load_choices(self):
@@ -4845,11 +4850,16 @@ class Net:
         self.P, self.G = ops.alloc(self.n), ops.alloc(self.n)
         if hasattr(ops, "weights_are"):
             ops.weights_are(self.P, self.n)
-        flat = np.zeros(self.n, np.float32)
-        for a in leaves:
-            o = self.offsets[id(a)]
-            flat[o:o + a.size] = np.asarray(a, np.float32).reshape(-1)
-        ops.put(self.P, flat)
+        # to the card in pieces of about 64 MB: the computer never holds a second whole copy of the model
+        piece, buf, start = 1 << 24, [], 0
+        for i in order:
+            a = leaves[i]
+            buf.append(np.asarray(a, np.float32).reshape(-1))
+            if sum(x.size for x in buf) >= piece or i == order[-1]:
+                chunk = np.concatenate(buf) if len(buf) > 1 else buf[0]
+                ops.put(self.P, chunk, start)
+                start += chunk.size
+                buf = []
         self.mats = [(self.offsets[id(a)], a.shape) for a in leaves if a.ndim >= 2]
         self.qoff = {}
         if self.kind:
@@ -5059,9 +5069,12 @@ class Net:
         flat = self.ops.get(buf if buf is not None else self.P, self.n)
 
         def back(a):
+            # float32 views of the one array read back (the card's weights are float32: widening them to float64
+            # added nothing but a second copy of the model in the computer's memory); other float types as given
             if isinstance(a, np.ndarray) and id(a) in self.offsets:
                 o = self.offsets[id(a)]
-                return flat[o:o + a.size].reshape(a.shape).astype(a.dtype if a.dtype.kind == "f" else np.float32)
+                v = flat[o:o + a.size].reshape(a.shape)
+                return v if a.dtype in (np.float32, np.float64) or a.dtype.kind != "f" else v.astype(a.dtype)
             return a
         return tree_map(back, self.params_tree)
 
