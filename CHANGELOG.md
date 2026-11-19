@@ -9,6 +9,12 @@
   `apsi package lib MODEL NAME` builds a library around it (`load`, `predict`, `info`) that needs only Apsi, not the
   program that trained the model. Every layer now remembers the arguments it was made with.
 
+### Graph batches that never make the card wait
+- **The next batch's graph is prepared on another core** while the card trains on this one (sorted edges, offsets,
+  pooling order: the forms the layers asked for last time), and its buffers on the card come from a pool reused
+  from batch to batch instead of being allocated and freed (each free waited for the card). Graphs of any size and
+  any degrees per batch, the same training. `APSI_GRAPH_PREFETCH=0` turns the thread off.
+
 ### Faster everyday code
 - **Facts the compiler can prove are no longer checked at run time:** a typed `Int`/`Float` parameter that is never
   rebound is a plain number for the whole call (a comparison of two such numbers is a plain condition; returning it

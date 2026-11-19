@@ -3509,15 +3509,15 @@ class _GraphDev:
     def _put(self, a, dtype=np.int32):
         o = self.net.ops
         a = np.ascontiguousarray(np.asarray(a).astype(dtype).reshape(-1))
-        b = o.alloc(max(1, a.size))
+        b = self.net.pool_get(max(1, a.size))
         if a.size:
             o.put(b, a)
         self.bufs.append(b)
         return (b, 0)
 
     def close(self):
-        for b in self.bufs:
-            self.net.ops.free(b)
+        for b in self.bufs:                              # back to the net's pool: no free (a wait for the card)
+            self.net.pool_put(b)
         self.bufs, self.cache = [], {}
 
     def csr(self, which="all"):
@@ -3525,25 +3525,11 @@ class _GraphDev:
         hit = self.cache.get(("csr", which))
         if hit is not None:
             return hit
-        g = self.g
-        src, dst = np.asarray(g.src, np.int64), np.asarray(g.dst, np.int64)
-        rel = np.asarray(g.rel, np.int64)
-        hop = np.asarray(g.hop, np.int64)
-        if isinstance(which, tuple):                     # ("noself", relation ids): the edges of those relations,
-            from .graphs import owned_edges              # renumbered (a layer that owns some relations)
-            src, dst, rel = owned_edges(g, 0, which[1])
-            hop = np.ones(len(src), np.int64)
-        elif which == "noself":
-            keep = src != dst
-            src, dst, rel, hop = src[keep], dst[keep], rel[keep], hop[keep]
-        N, E = self.N, len(src)
-        order = np.argsort(dst, kind="stable")
-        s_, d_ = src[order], dst[order]
-        off = np.concatenate([[0], np.cumsum(np.bincount(d_, minlength=N))])
-        tperm = np.argsort(s_, kind="stable")              # edges (in target order) grouped by source
-        toff = np.concatenate([[0], np.cumsum(np.bincount(s_, minlength=N))])
+        h = graph_host(self.g, ("csr", which))
+        N, E = self.N, h["E"]
+        s_, d_, off, tperm, toff = h["s"], h["d"], h["off"], h["tperm"], h["toff"]
         fwd = dict(col=self._put(s_), off=self._put(off), row=self._put(d_), ids=self._put(np.arange(E)), n=N, E=E,
-                   src=s_, dst=d_, rel=rel[order], hop=hop[order], eoff=self._put(np.arange(E + 1)))
+                   src=s_, dst=d_, rel=h["rel"], hop=h["hop"], eoff=self._put(np.arange(E + 1)))
         bwd = dict(col=self._put(d_[tperm]), off=self._put(toff), vperm=self._put(tperm), n=N, E=E)
         hit = self.cache[("csr", which)] = (fwd, bwd)
         return hit
@@ -3580,19 +3566,86 @@ class _GraphDev:
         """The nodes of each graph: forward rows are graphs; values 1 / count (mean) or none (sum)."""
         hit = self.cache.get(("pool", how))
         if hit is None:
-            batch = np.asarray(self.g.batch, np.int64)
-            G = int(self.g.graphs)
-            order = np.argsort(batch, kind="stable")
-            cnt = np.bincount(batch, minlength=G)
-            off = np.concatenate([[0], np.cumsum(cnt)])
-            pos = np.empty(len(order), np.int64)
-            pos[order] = np.arange(len(order))
-            val = (1.0 / np.maximum(cnt, 1))[batch[order]] if how == "mean" else None
+            h = graph_host(self.g, ("pool", how))
+            batch, G, order, off, pos, val = h["batch"], h["G"], h["order"], h["off"], h["pos"], h["val"]
             fwd = dict(col=self._put(order), off=self._put(off), n=G, val=None if val is None else
                        self._put(val, np.float32))
             bwd = dict(col=self._put(batch), off=self._put(np.arange(self.N + 1)), vperm=self._put(pos), n=self.N)
             hit = self.cache[("pool", how)] = (fwd, bwd, G)
         return hit
+
+
+_HOST_FORMS = {}                                       # id(graph) -> (graph, {key: forms}), the last few graphs
+_HOST_FORMS_LOCK = __import__("threading").Lock()
+
+
+def graph_host(g, key):
+    """The processor's part of a graph's form on the card (sorted edges, offsets, pooling order), made once per graph
+    and kept for the last few graphs: a thread makes the next batch's while the card trains on this one."""
+    with _HOST_FORMS_LOCK:
+        ent = _HOST_FORMS.get(id(g))
+        if ent is None or ent[0] is not g:
+            ent = _HOST_FORMS[id(g)] = (g, {})
+            while len(_HOST_FORMS) > 8:                  # oldest first (dicts keep their order)
+                _HOST_FORMS.pop(next(iter(_HOST_FORMS)))
+        cache = ent[1]
+    hit = cache.get(key)
+    if hit is not None:
+        return hit
+    if key[0] == "csr":
+        which = key[1]
+        src, dst = np.asarray(g.src, np.int64), np.asarray(g.dst, np.int64)
+        rel = np.asarray(g.rel, np.int64)
+        hop = np.asarray(g.hop, np.int64)
+        if isinstance(which, tuple):                     # ("noself", relation ids): the edges of those relations,
+            from .graphs import owned_edges              # renumbered (a layer that owns some relations)
+            src, dst, rel = owned_edges(g, 0, which[1])
+            hop = np.ones(len(src), np.int64)
+        elif which == "noself":
+            keep = src != dst
+            src, dst, rel, hop = src[keep], dst[keep], rel[keep], hop[keep]
+        N = int(g.n)
+        order = np.argsort(dst, kind="stable")
+        s_, d_ = src[order], dst[order]
+        off = np.concatenate([[0], np.cumsum(np.bincount(d_, minlength=N))])
+        tperm = np.argsort(s_, kind="stable")              # edges (in target order) grouped by source
+        toff = np.concatenate([[0], np.cumsum(np.bincount(s_, minlength=N))])
+        hit = dict(E=len(s_), s=s_, d=d_, off=off, tperm=tperm, toff=toff, rel=rel[order], hop=hop[order])
+    elif key[0] == "pool":
+        batch = np.asarray(g.batch, np.int64)
+        G = int(g.graphs)
+        order = np.argsort(batch, kind="stable")
+        cnt = np.bincount(batch, minlength=G)
+        off = np.concatenate([[0], np.cumsum(cnt)])
+        pos = np.empty(len(order), np.int64)
+        pos[order] = np.arange(len(order))
+        val = (1.0 / np.maximum(cnt, 1))[batch[order]] if key[1] == "mean" else None
+        hit = dict(batch=batch, G=G, order=order, off=off, pos=pos, val=val)
+    else:
+        raise TrainError(f"internal: no host form {key!r}")
+    cache[key] = hit
+    return hit
+
+
+_PREFETCH = []
+
+
+def _prefetch_graph(g, keys):
+    """Make g's forms (graph_host) in a worker thread: NumPy's sorts release the interpreter, so the next batch's
+    graph is ready when its turn comes instead of being sorted while the card waits."""
+    if g is None or os.environ.get("APSI_GRAPH_PREFETCH", "1").strip().lower() in ("0", "off", "no"):
+        return
+    if not _PREFETCH:
+        from concurrent.futures import ThreadPoolExecutor
+        _PREFETCH.append(ThreadPoolExecutor(max_workers=1, thread_name_prefix="apsi-graphs"))
+
+    def work():
+        for k in keys:
+            try:
+                graph_host(g, k)
+            except Exception:                           # noqa: BLE001  (made again, with its error, when needed)
+                return
+    _PREFETCH[0].submit(work)
 
 
 def _need_graph(net, what):
@@ -4869,6 +4922,16 @@ class Net:
         self.fuse = os.environ.get("APSI_FUSE", "1").strip() not in ("0", "false", "no")
         self.root = self.compile(model, params, "m")
 
+    def pool_get(self, n):
+        """A card buffer of at least n slots from the net's pool (sizes in powers of two): a new graph every batch
+        reuses the buffers of the last one instead of allocating and freeing (each free waits for the card)."""
+        size = 1 << max(10, int(n - 1).bit_length())
+        free = self.__dict__.setdefault("_pool", {}).setdefault(size, [])
+        return free.pop() if free else self.ops.alloc(size)
+
+    def pool_put(self, b):
+        self.__dict__.setdefault("_pool", {}).setdefault(b.n, []).append(b)
+
     def param(self, a):
         if not isinstance(a, np.ndarray) or id(a) not in self.offsets:
             raise TrainError("a parameter of the model is not an array")
@@ -5085,6 +5148,9 @@ class Net:
             self.gdev.close()
         if hasattr(self.ops, "weights_are"):
             self.ops.weights_are(None, 0)
+        for bufs in self.__dict__.pop("_pool", {}).values():
+            for b in bufs:
+                self.ops.free(b)
         for b in [self.P, self.G, self.LOSS] + self.owned + ([self.WQ] if self.kind else []):
             self.ops.free(b)
 
@@ -5229,6 +5295,7 @@ def fit_batches(model, params, batches, loss="cross_entropy", opt=None, epochs=1
             ops.fill((LOSSB, 0), len(items), 0.0)
             on_card = []                                 # the batches whose loss is in LOSSB
             A = max(1, int(accumulate or 1))
+            want_forms = locals().get("want_forms") or []
             for bi, item in enumerate(items):
                 if ep == start_ep and bi < skip:             # resumed: these batches were already trained on
                     continue
@@ -5236,7 +5303,11 @@ def fit_batches(model, params, batches, loss="cross_entropy", opt=None, epochs=1
                 X, Y, g = _batch_parts(item)
                 multi = isinstance(X, (list, tuple))
                 xs = [_as_input(a) for a in (X if multi else [X])]
+                if net.gdev is not None:                    # the forms the layers asked of the last graph
+                    want_forms = [k for k in net.gdev.cache if k[0] in ("csr", "pool")] or want_forms
                 net.set_graph(g)
+                if want_forms and bi + 1 < len(items):      # the next graph's, made meanwhile on another core
+                    _prefetch_graph(_batch_parts(items[bi + 1])[2], want_forms)
                 net.train = True
                 net.round_weights()
                 views = []
