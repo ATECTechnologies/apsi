@@ -20,6 +20,7 @@ Everything runs the same on the Emulator (NumPy), which the tests use to check t
 autodiff, and on any real GPU against the Emulator.
 """
 import ctypes
+import json
 import math
 import os
 import sys
@@ -27,7 +28,8 @@ import time
 
 import numpy as np
 
-APSI_QKV = os.environ.get("APSI_QKV", "0").strip().lower() in ("1", "on", "yes", "true")   # measured slower (no tuned build for batches)
+# q, k, v forward as one batched product (the cp.async builds take batches when both operands are bfloat16 already)
+APSI_QKV = os.environ.get("APSI_QKV", "1").strip().lower() in ("1", "on", "yes", "true")
 
 from . import gpu_train_kernels as KS
 from .values import Record, tree_leaves, tree_map
@@ -80,7 +82,7 @@ class _Ops:
 
     def gemm(self, A, B, Cv, M, N, K, sam, sak, sbk, sbn, ldc, alpha=1.0, beta=False, bias=None, batch=(1, 1),
              sa=(0, 0), sb=(0, 0), sc=(0, 0), passes=1, epi=0, X2=None, act=0, a_act=None, tmp=None, db=None, bf=False,
-             y16=None):
+             y16=None, y16_only=False):
         """C = alpha A B (+ bias) (+ C), then epi: 1 X2 <- C, C <- act(C); 2 C <- C * act'(X2); 3 C <- C + X2.
         y16 (cards with bfloat16 twins): C's bfloat16 twin into y16, registered for the products that read C;
         written by the product's own last step where the build can, else by one conversion after it.
@@ -90,11 +92,12 @@ class _Ops:
         nb1, nb2 = batch
         if y16 is not None:
             self._y16, self._y16_done, self._y16_c = y16, False, self.p(Cv)[1]
+            self._y16_only = y16_only
             try:
                 self.gemm(A, B, Cv, M, N, K, sam, sak, sbk, sbn, ldc, alpha, beta, bias, batch, sa, sb, sc, passes,
                           epi, X2, act, a_act, tmp, db, bf)
             finally:
-                done, self._y16 = self._y16_done, None
+                done, self._y16, self._y16_only = self._y16_done, None, False
             if done:
                 self._twin[self.p(Cv)[1]] = (M * N, self.p(y16))
             else:
@@ -888,6 +891,8 @@ class Gpu(_Ops):
         self._scr = {}
         self._occ = {}
         self._choice = {}
+        self._choice_file = None
+        self._load_choices()
         self._wcache, self._wrange, self._wgen = {}, None, 0
         self._w16, self._w16_gen = None, -1
         self._twin = {}                                  # float32 output address -> (values, its bfloat16 twin)
@@ -1506,28 +1511,42 @@ class Gpu(_Ops):
     def _h_ready(self, name, args, M, N, K, nb):
         """Can the bfloat16-operand build run this product? (dense operands, dimensions in 8s; a bias gradient is
         then a column sum of its own)"""
-        if f"{name}#h" not in self.fn or nb != 1 or "to_bf16" not in self.fn:
+        if f"{name}#h" not in self.fn or "to_bf16" not in self.fn:
+            return False
+        if nb != 1 and any(a[1] % 8 for a in args[13:17]):   # batch offsets of A and B: 16-byte steps in bfloat16
             return False
         sam, sak, sbk, sbn = (a[1] for a in args[7:11])
+        K = (args[31][1] or K) if len(args) > 31 else K   # k segments: each one dense
         da = (sak == 1 and sam == K and K % 8 == 0) or (sam == 1 and sak == M and M % 8 == 0)
         db = (sbn == 1 and sbk == N and N % 8 == 0) or (sbk == 1 and sbn == K and K % 8 == 0)
         return da and db and args[0][1] % 8 == 0 and args[1][1] % 8 == 0
 
-    def gemm_a16(self, A16, B, Cv, M, N, K, sam, sak, sbk, sbn, ldc, beta=False, db=None):
-        """C (+)= A B with A already in bfloat16 in memory (a twin: dense, A16 its view), on the cp.async builds,
-        (+ the column sums of B into db). False when no build fits (the caller then takes another way)."""
+    def gemm_a16(self, A, B, Cv, M, N, K, sam, sak, sbk, sbn, ldc, beta=False, db=None, kseg=None, a16=True,
+                 bias=None, epi=0, X2=None):
+        """C (+)= A B on the cp.async builds only, A already in bfloat16 in memory (a twin, dense: a16) or float32
+        (converted on the way, as for any cp.async build), (+ the column sums of B into db). kseg=(L, sa, sb): k runs
+        over K / L segments, segment s of A at +s * sa values and of B at +s * sb: a sum of products whose operands
+        lie one after another, as one product of the whole k. False when no build fits (the caller takes another
+        way)."""
         if not (self.tiled and self.tc) or ldc != N:
             return False
-        name = self._tiled_ok(A16, B, M, N, K, sam, sak, sbk, sbn, (0, 0), (0, 0))
+        L, ssa, ssb = kseg if kseg is not None else (0, 0, 0)
+        if kseg is not None and (K % L or L % 32 or ssa != M * L or ssb != L * N):
+            return False                                 # (segments dense, one after another)
+        name = self._tiled_ok(A, B, M, N, K, sam, sak, sbk, sbn, (0, 0), (0, 0))
         tiles = ((M + KS.BM - 1) // KS.BM) * ((N + KS.BN - 1) // KS.BN)
-        args = [self.p(A16), self.p(B), self.p(Cv), self.p(None), ("u", M), ("u", N), ("u", K), ("u", sam),
+        args = [self.p(A), self.p(B), self.p(Cv), self.p(None), ("u", M), ("u", N), ("u", K), ("u", sam),
                 ("u", sak), ("u", sbk), ("u", sbn), ("u", ldc), ("u", 1), ("u", 0), ("u", 0), ("u", 0), ("u", 0),
-                ("u", 0), ("u", 0), ("f", 1.0), ("u", 1 if beta else 0), ("u", 0), ("u", K), self.p(None),
-                ("u", 0), ("u", 0), self.p(None), ("u", 0), self._cnt(), self.p(Cv), ("u", 0)]
+                ("u", 0), ("u", 0), ("f", 1.0), ("u", 1 if beta else 0), ("u", 1 if bias is not None else 0),
+                ("u", K), self.p(X2), ("u", epi), ("u", 0), self.p(None), ("u", 0), self._cnt(), self.p(Cv), ("u", 0),
+                ("u", L), ("u", ssa), ("u", ssb)]
+        args[3] = self.p(bias)
+        if name is not None and epi:
+            name = f"{name}_e{epi}" if epi == 3 and f"{name}_e{epi}" in self.fn else None
         if name is None or not self._h_ready(name, args, M, N, K, 1):
             return False
         grid = (tiles, 1, 1)
-        self._a16 = self._h_only = True
+        self._a16, self._h_only = a16, True
         try:
             use = self._variant(name, grid, args, M, N, ldc, 1)
             args = self._h_args(args, M, N, K)
@@ -1551,12 +1570,38 @@ class Gpu(_Ops):
             os.environ.get("APSI_ADAM_W16", "1").strip().lower() not in ("0", "off", "no") else None
         self._w16_gen = -1
 
-    def _h_args(self, args, M, N, K):
+    def a16_ready(self, M, N, K, epi=0):
+        """Will gemm_a16 take a dense M x N x K product (k contiguous in A, B a row-major weight)? (A producer that
+        writes only a bfloat16 output for it asks first.)"""
+        name = "gemm_tkn" + (f"_e{epi}" if epi else "")
+        return bool(self.tiled and self.tc and f"{name}#h" in self.fn and "to_bf16" in self.fn and
+                    M % 8 == 0 and N % 8 == 0 and K % 8 == 0)
+
+    def _bf16_free(self, args, M, N, K, nb):
+        """Both operands already in bfloat16 (twins, the weights' copy): a batched product then reads them on the
+        cp.async builds with no conversion pass (which its own timing would not count)."""
+        nb2 = max(1, args[12][1])
+        nb1 = max(1, nb // nb2)
+        wr = self._wrange
+        for i, n in ((0, M * K + (nb1 - 1) * args[13][1] + (nb2 - 1) * args[14][1]),
+                     (1, K * N + (nb1 - 1) * args[15][1] + (nb2 - 1) * args[16][1])):
+            ptr = args[i][1]
+            if wr is not None and wr[0] <= ptr < wr[1] and self._w16_gen == self._wgen and (ptr - wr[0]) // 4 % 8 == 0:
+                continue
+            tw = self._twin.get(ptr)
+            if tw is None or tw[0] < n:
+                return False
+        return True
+
+    def _h_args(self, args, M, N, K, nb=1):
         """The operands rounded to bfloat16 (one pass each), and the arguments that point there. A weight matrix is
         rounded once after each update and reused by every product until the next one (forward and backward)."""
         out = list(args)
         out[27] = ("u", 0)                               # (these builds add no bias gradient: colsum does)
-        for i, n, key in ((0, M * K, "h_a"), (1, K * N, "h_b")):
+        nb2 = max(1, args[12][1])
+        nb1 = max(1, nb // nb2)
+        for i, n, key in ((0, M * K + (nb1 - 1) * args[13][1] + (nb2 - 1) * args[14][1], "h_a"),
+                          (1, K * N + (nb1 - 1) * args[15][1] + (nb2 - 1) * args[16][1], "h_b")):
             if i == 0 and getattr(self, "_a16", False):
                 continue                                 # A is bfloat16 already
             ptr = args[i][1]
@@ -1591,23 +1636,28 @@ class Gpu(_Ops):
             cands = [f"{name}#{t}" for t in ("h", "v", "d", "e", "f", "g", "s") if f"{name}#{t}" in self.fn]
         else:
             cands = [name] + [f"{name}#{t}" for t in ("x", "w") if f"{name}#{t}" in self.fn]
-            if not getattr(self, "_no_h", False) and self._h_ready(name, args, M, N, K, nb):
+            if not getattr(self, "_no_h", False) and self._h_ready(name, args, M, N, K, nb) and \
+                    (nb == 1 or self._bf16_free(args, M, N, K, nb)):
                 cands.append(f"{name}#h")
                 cands += [f"{name}#{t}" for t in ("v", "d", "e", "f", "g", "s") if f"{name}#{t}" in self.fn]
         base = cands[0]                                  # the reference build (its numbers are the ones checked)
         force = os.environ.get("APSI_GEMM_VARIANT", "auto").strip().lower()
         if force in ("x", "w", "h", "v", "d", "e", "f", "g", "s"):
             return f"{name}#{force}" if f"{name}#{force}" in cands else base
-        if nb != 1:                                      # batched: the builds that take batch offsets as they are
-            cands = [c for c in cands if c.endswith(("#x", "#w")) or c == name]
         if force == "a" or len(cands) == 1:
             return base
-        key = (name, h_only, grid, tuple(a for a in args if a[0] != "p"))
+        key = (name, h_only, grid, tuple(cands), tuple(a for a in args if a[0] != "p"))
         pick = self._choice.get(key)
         if pick is not None:
             return pick
+        pick = self._saved.get(repr(key))
+        if pick in cands:                                # chosen on this card by an earlier run: no timing now
+            self._choice[key] = pick
+            return pick
         prof, self.profile = self.profile, None
         targs = list(args)
+        if len(targs) > 30:
+            targs[30] = ("u", 0)                         # (timed and checked on C itself: no twin written)
         nb2_ = max(1, args[12][1])
         span = (max(1, nb // nb2_) - 1) * args[17][1] + (nb2_ - 1) * args[18][1]   # (batches: their own slices)
         targs[2] = self.p(self._scratch("tune_c", M * ldc + N + span))
@@ -1627,7 +1677,7 @@ class Gpu(_Ops):
         for cand in cands + cands + cands:
             e0, e1 = self._event(), self._event()
             self._lib.cuEventRecord(e0, self.cur)
-            self._go(cand, grid, self._threads(cand), *(self._h_args(targs, M, N, K) if cand.endswith(("#h", "#v", "#d", "#e", "#f", "#g", "#s")) else targs))
+            self._go(cand, grid, self._threads(cand), *(self._h_args(targs, M, N, K, nb) if cand.endswith(("#h", "#v", "#d", "#e", "#f", "#g", "#s")) else targs))
             self._lib.cuEventRecord(e1, self.cur)
             self._lib.cuEventSynchronize(e1)
             self._lib.cuEventElapsedTime(ctypes.byref(ms), e0, e1)
@@ -1644,7 +1694,43 @@ class Gpu(_Ops):
                 break
         self.profile = prof
         self._choice[key] = best
+        self._save_choice(repr(key), best)
         return best
+
+    def _load_choices(self):
+        """The builds this card chose in earlier runs (~/.apsi/cache/gpu/gemm-<card and kernels>.json): a run starts
+        at full speed from its first step, with the same builds every run, instead of timing every new shape again.
+        APSI_GEMM_RETUNE=1 times them again (and saves the new choices)."""
+        self._saved = {}
+        if os.environ.get("APSI_GEMM_CACHE", "1").strip().lower() in ("0", "off", "no"):
+            return
+        try:
+            import hashlib
+            from .security import config_dir
+            with open(KS.__file__, "rb") as fh:
+                src = hashlib.sha256(fh.read() + str(getattr(self, "name", "")).encode()).hexdigest()[:16]
+            self._choice_file = os.path.join(config_dir(), "cache", "gpu", f"gemm-{src}.json")
+            if os.environ.get("APSI_GEMM_RETUNE", "").strip().lower() in ("1", "yes", "true"):
+                return
+            with open(self._choice_file, encoding="utf-8") as fh:
+                data = json.load(fh)
+            if isinstance(data, dict):
+                self._saved = {k: v for k, v in data.items() if isinstance(v, str) and v in self.fn}
+        except (OSError, ValueError, ImportError):
+            pass
+
+    def _save_choice(self, key, pick):
+        if self._choice_file is None:
+            return
+        self._saved[key] = pick
+        try:
+            os.makedirs(os.path.dirname(self._choice_file), exist_ok=True)
+            tmp = self._choice_file + f".{os.getpid()}.tmp"
+            with open(tmp, "w", encoding="utf-8") as fh:
+                json.dump(self._saved, fh, indent=0, sort_keys=True)
+            os.replace(tmp, self._choice_file)
+        except OSError:
+            pass
 
     def _same_result(self, base, cand, grid, targs, M, N, K, ldc):
         """The first time a faster build is chosen for a shape: its output against the base build's, on the same
@@ -1658,7 +1744,8 @@ class Gpu(_Ops):
         slots = (n + 1) // 2 if c16 else n
 
         def run(nm):
-            a = self._h_args(targs, M, N, K) if nm.endswith(("#h", "#v", "#d", "#e", "#f", "#g", "#s")) else targs
+            a = self._h_args(targs, M, N, K, grid[1] if len(grid) > 1 else 1) \
+                if nm.endswith(("#h", "#v", "#d", "#e", "#f", "#g", "#s")) else targs
             self._go(nm, grid, self._threads(nm), *a)
             self.sync()
             raw = self.get(cview[0], slots)
@@ -1748,7 +1835,7 @@ class Gpu(_Ops):
                     ("u", 0), ("u", 0), ("u", 0), ("u", 0), ("u", 0), ("u", 0),
                     ("f", alpha), ("u", 1 if beta else 0), ("u", 1 if bias is not None else 0), ("u", K),
                     self.p(X2), ("u", epi), ("u", act), self.p(db), ("u", 1 if db is not None else 0), self._cnt(),
-                    self.p(Cv), ("u", 0)]
+                    self.p(Cv), ("u", 0), ("u", 0), ("u", 0), ("u", 0)]
             grid = (tiles, 1, 1)
             # the cp.async builds read A and B as bfloat16 from memory: A as it is (A16_KERNELS) or its twin /
             # one conversion, B (a weight) its cached bfloat16 copy; not where A gets an activation on the way in
@@ -1805,17 +1892,17 @@ class Gpu(_Ops):
                     ("u", sa[0]), ("u", sa[1]), ("u", sb[0]), ("u", sb[1]), ("u", sc[0]), ("u", sc[1]),
                     ("f", alpha), ("u", 1 if beta else 0), ("u", 1 if bias is not None else 0), ("u", kchunk),
                     self.p(X2), ("u", epi), ("u", act), self.p(db), ("u", 1 if db is not None else 0), self._cnt(),
-                    self.p(Cv), ("u", 0)]
+                    self.p(Cv), ("u", 0), ("u", 0), ("u", 0), ("u", 0)]
             y16 = getattr(self, "_y16", None)
             if y16 is not None and passes == 1 and nz == 1 and ldc == N and nb1 * nb2 == 1 and \
                     self.p(Cv)[1] == self._y16_c:
-                args[29], args[30] = self.p(y16), ("u", 1)       # the twin from this product's last step
+                args[29], args[30] = self.p(y16), ("u", 2 if getattr(self, "_y16_only", False) else 1)
                 self._y16_done = True
             grid = (tiles, nb1 * nb2, nz)
             use = self._variant(name, grid, args, M, N, ldc, nb1 * nb2)
             hb = use.endswith(("#h", "#v", "#d", "#e", "#f", "#g", "#s"))
             if hb:
-                args = self._h_args(args, M, N, K)
+                args = self._h_args(args, M, N, K, nb1 * nb2)
             self._go(use, grid, self._threads(use), *args)         # split k: its last part adds the parts
             if db is not None and not hb:
                 self._db = None                          # taken (an h build leaves it to the column sum)
@@ -2013,6 +2100,8 @@ class _Linear(_Node):
     bf = False                                          # my h and act(h) in bfloat16 (an MLP's hidden layer)
     bf_in = False                                       # my input is that bfloat16 act(h)
     y16 = None                                          # act(h)'s bfloat16 twin (kept for backward)
+    y16_only = False                                    # ... and act(h) not written in float32 at all
+    next_lin = None                                     # the linear layer reading my act(h)
     dh16_ready = False                                  # the layer after wrote my dh's bfloat16 twin with dh
 
     @property
@@ -2036,9 +2125,19 @@ class _Linear(_Node):
             # through the activation, and no conversion pass of act(h) in either direction)
             self.y16 = self.buf("y16", o.n16(M * self.N)) if self.share_out and self.net.passes == 1 and \
                 getattr(o, "twin_ok", lambda: False)() and (M * self.N) % 2 == 0 else None
+            # its one reader (the next linear layer, forward and backward) takes the bfloat16 twin: no float32 act(h)
+            nxt = getattr(self, "next_lin", None)
+            self.y16_only = self.y16 is not None and nxt is not None and \
+                os.environ.get("APSI_Y16_ONLY", "1").strip().lower() not in ("0", "off", "no") and \
+                o.a16_ready(M, nxt.N, self.N, 3) and o.a16_ready(M, nxt.N, self.N, 0)
             o.gemm(x, self.W.w, y, M, self.N, self.K, self.K, 1, self.N, 1, self.N,
                    bias=self.b.w if self.b else None, passes=self.net.passes, epi=1, X2=self.h, act=self.act,
-                   **({"y16": self.y16} if self.y16 is not None else {}))
+                   **({"y16": self.y16, "y16_only": self.y16_only} if self.y16 is not None else {}))
+        elif self.x_pre is not None and getattr(self.x_pre, "y16_only", False):   # x only in bfloat16 (its twin)
+            if not o.gemm_a16(self.x_pre.y16, self.W.w, y, M, self.N, self.K, self.K, 1, self.N, 1, self.N,
+                              bias=self.b.w if self.b else None, epi=3 if residual else 0, X2=residual):
+                raise TrainError("internal: the bfloat16-only input found no product (APSI_Y16_ONLY=0)")
+            o.drop_twin(x)
         else:                                           # y = x W + b (+ the residual input); x in bfloat16 if bf_in
             o.gemm(x, self.W.w, y, M, self.N, self.K, self.K, 1, self.N, 1, self.N,
                    bias=self.b.w if self.b else None, passes=self.net.passes, epi=3 if residual else 0, X2=residual,
@@ -2520,9 +2619,23 @@ class _Attention(_Node):
             o.colsum(dk, self.kraw, self.km, self.kr, self.gk.g, None, Mk * kvh, hd, 2)
             o.ln_b(self.kraw, self.gk.w, dk, self.km, self.kr, dk2, Mk * kvh, hd, True, None)
             dq, dk = dq2, dk2
-        if (getattr(self, "qkv", False) or self._qkv_grads()) and not self.qkn and dk[0] is dq[0] and \
-                dk[1] == dq[1] + M * D and \
-                dv[0] is dq[0] and dv[1] == dq[1] + 2 * M * D:
+        together = dk[0] is dq[0] and dk[1] == dq[1] + M * D and dv[0] is dq[0] and dv[1] == dq[1] + 2 * M * D
+        # dq | dk | dv in bfloat16 once: read by the weight gradients and by dx (both on the cp.async builds)
+        twin = together and ps == 1 and getattr(o, "twin_ok", lambda: False)() and (M * D) % 2 == 0
+        if twin:
+            o.make_twin(dq, 3 * M * D, self.gbuf("dqkv16", o.n16(3 * M * D)))
+        try:
+            return self._grads_dx(dq, dk, dv, M, D, ps, together)
+        finally:
+            if twin:
+                o.drop_twin(dq)
+
+    def _grads_dx(self, dq, dk, dv, M, D, ps, together):
+        o, h, kvh = self.net.ops, self.h, self.kvh
+        hd = D // h
+        Dkv = kvh * hd
+        Mk = self.B * self.S
+        if (getattr(self, "qkv", False) or self._qkv_grads()) and not self.qkn and together:
             # the three weight gradients in one launch: x^T [dq | dk | dv] into Gq | Gk | Gv (stored one after another)
             o.gemm(self.x, dq, self.Wq.g, D, D, M, 1, D, D, 1, D, beta=True, batch=(1, 3), sb=(0, M * D),
                    sc=(0, D * D), passes=ps)
@@ -2531,6 +2644,13 @@ class _Attention(_Node):
             for W, d in ((self.Wk, dk), (self.Wv, dv)):
                 o.gemm(self.xm, d, W.g, D, Dkv, Mk, 1, D, Dkv, 1, Dkv, beta=True, passes=ps)
         dx = self.gbuf("dx", M * D)
+        Wq, Wk, Wv = self.Wq.w, self.Wk.w, self.Wv.w
+        if not self.cross and kvh == h and ps == 1 and hasattr(o, "gemm_a16") and \
+                dk[0] is dq[0] and dk[1] == dq[1] + M * D and dv[0] is dq[0] and dv[1] == dq[1] + 2 * M * D and \
+                Wk[0] is Wq[0] and Wk[1] == Wq[1] + D * D and Wv[0] is Wq[0] and Wv[1] == Wq[1] + 2 * D * D and \
+                os.environ.get("APSI_QKV_DX", "1").strip().lower() not in ("0", "off", "no") and \
+                o.gemm_a16(dq, Wq, dx, M, D, 3 * D, D, 1, 1, D, D, kseg=(D, M * D, D * D), a16=False):
+            return dx                                   # dq Wq^T + dk Wk^T + dv Wv^T: one product over 3 D of k
         o.gemm(dq, self.Wq.w, dx, M, D, D, D, 1, 1, D, D, passes=ps)
         dm = dx if not self.cross else self.gbuf("dmem", Mk * D)
         first = self.cross
@@ -4999,7 +5119,7 @@ class Net:
             for a_, b_ in zip(nodes, nodes[1:]):        # linear + act, then linear: keep h only
                 if isinstance(a_, _Linear) and a_.act is not None and isinstance(b_, _Linear) and \
                         b_.act is None and type(b_) is _Linear:
-                    a_.share_out, b_.x_pre = True, a_
+                    a_.share_out, b_.x_pre, a_.next_lin = True, a_, b_
                     # the hidden layer in bfloat16 (h kept, act(h) passed on): half the bytes of the widest tensors
                     # of a transformer, written once and read by the products on both sides
                     if self.passes == 1 and not self.kind and _bf16_hidden() and \

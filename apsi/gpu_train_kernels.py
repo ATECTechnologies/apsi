@@ -1967,7 +1967,8 @@ def _tiled_module(early=False, wide=False, h=False, deep=False, stages=None, swz
             ("sam", i32), ("sak", i32), ("sbk", i32), ("sbn", i32), ("ldc", i32), ("nb2", i32), ("a1", i32),
             ("a2", i32), ("b1", i32), ("b2", i32), ("c1", i32), ("c2", i32), ("alpha", f32), ("beta", i32),
             ("has_bias", i32), ("kchunk", i32), ("X2", G(f32)), ("epi", i32), ("act", i32), ("DB", G(f32)),
-            ("want_db", i32), ("CNT", G(i32)), ("Y16", G(i16)), ("y16", i32)]
+            ("want_db", i32), ("CNT", G(i32)), ("Y16", G(i16)), ("y16", i32),
+            ("kseg", i32), ("sas", i32), ("sbs", i32)]
     membar_t = d("llvm.nvvm.membar.gl", ir.VoidType(), [])
     ld_cg_t = ir.InlineAsm(ir.FunctionType(f32, [i64]), "ld.global.cg.f32 $0, [$1];", "=f,l", side_effect=True)
 
@@ -2019,6 +2020,7 @@ def _tiled_module(early=False, wide=False, h=False, deep=False, stages=None, swz
         bn = b.mul(b.udiv(within, gsize), C(BN))
         k_beg = b.mul(ctaz, p["kchunk"])
         k_end = umin(b.add(k_beg, p["kchunk"]), p["K"])
+        kseg_l = b.select(b.icmp_unsigned("==", p["kseg"], C(0)), C(0x7FFFFFFF), p["kseg"])
         ntiles = b.udiv(b.add(b.sub(k_end, umin(k_beg, k_end)), C(BKv - 1)), C(BKv))
         Mm1, Nm1 = b.sub(p["M"], C(1)), b.sub(p["N"], C(1))
         Km4 = b.sub(p["K"], C(4))
@@ -2164,12 +2166,19 @@ def _tiled_module(early=False, wide=False, h=False, deep=False, stages=None, swz
             """cp.async of slice kt (8 bfloat16 = 16 bytes per thread and operand) into a stage of shared memory;
             outside the matrix the bytes are zeros."""
             k0 = b.add(k_beg, b.mul(kt, C(BKv)))
+            # kseg: k runs over segments of kseg values, segment s of A at +s * sas and of B at +s * sbs (sum of
+            # products whose operands lie one after another: dq Wq^T + dk Wk^T + dv Wv^T as one product of 3x the k)
+            seg = b.udiv(k0, kseg_l)
+            k0 = b.sub(k0, b.mul(seg, kseg_l))
+            k_lim = umin(b.sub(k_end, b.mul(seg, kseg_l)), kseg_l)
+            offa = b.add(offs[0], b.mul(z64(seg), z64(p["sas"])))
+            offb = b.add(offs[1], b.mul(z64(seg), z64(p["sbs"])))
             sbase_a = b.mul(stage, C(2 * REG))
             sbase_b = b.add(sbase_a, C(REG))
             A16 = b.bitcast(p["A"], i16.as_pointer(1))
             B16 = b.bitcast(p["B"], i16.as_pointer(1))
-            for which, ptr, kc, base_off, lim_o, s_o, o0 in (("A", A16, a_kc, offs[0], p["M"], p["sam"] if a_kc else p["sak"], bm),
-                                                           ("B", B16, b_kc, offs[1], p["N"], p["sbn"] if b_kc else p["sbk"], bn)):
+            for which, ptr, kc, base_off, lim_o, s_o, o0 in (("A", A16, a_kc, offa, p["M"], p["sam"] if a_kc else p["sak"], bm),
+                                                           ("B", B16, b_kc, offb, p["N"], p["sbn"] if b_kc else p["sbk"], bn)):
                 sb_ = sbase_a if which == "A" else sbase_b
                 # 128 rows x BKv k = 128 * BKv / 8 chunks of 8 halves (16 bytes) per operand, NTH threads: each
                 # thread copies its share (one chunk with 256 threads, two with the 4-warp build)
@@ -2177,11 +2186,11 @@ def _tiled_module(early=False, wide=False, h=False, deep=False, stages=None, swz
                     cid = b.add(tid, C(NTH * part))
                     if kc:                            # [row][k]: BKv / 8 chunks per row
                         row, kq = b.udiv(cid, C(BKv // 8)), b.mul(b.urem(cid, C(BKv // 8)), C(8))
-                        ci, cl, oi, ol = b.add(k0, kq), k_end, b.add(o0, row), lim_o
+                        ci, cl, oi, ol = b.add(k0, kq), k_lim, b.add(o0, row), lim_o
                         dst = b.add(sb_, b.add(b.mul(row, C(PADv)), swk(row, kq)))
                     else:                             # [k][row]: 16 chunks of 8 per k
                         kk, q8 = b.lshr(cid, C(4)), b.mul(b.and_(cid, C(15)), C(8))
-                        ci, cl, oi, ol = b.add(o0, q8), lim_o, b.add(k0, kk), k_end
+                        ci, cl, oi, ol = b.add(o0, q8), lim_o, b.add(k0, kk), k_lim
                         dst = b.add(sb_, b.add(b.mul(kk, C(PADT_)), swt(kk, q8)))
                     ok = b.and_(b.icmp_unsigned("<", ci, cl), b.icmp_unsigned("<", oi, ol))
                     ci2 = umin(ci, b.sub(cl, C(8)))
@@ -2324,7 +2333,9 @@ def _tiled_module(early=False, wide=False, h=False, deep=False, stages=None, swz
                             cp16 = b.gep(b.bitcast(p["C"], i16.as_pointer(1)), [idx], inbounds=True)
                             b.store(b.trunc(rne(b.load(tmp)), i16), cp16, align=2)
                         else:
-                            b.store(b.load(tmp), ptr, align=4)
+                            # y16 = 2: only the bfloat16 twin (its one reader takes bfloat16: no float32 bytes)
+                            with b.if_then(b.icmp_unsigned("!=", p["y16"], C(2))):
+                                b.store(b.load(tmp), ptr, align=4)
                             # y16: C's bfloat16 twin written in the same pass (the next products read it instead
                             # of a conversion pass of their own)
                             with b.if_then(b.icmp_unsigned("!=", p["y16"], C(0))):
