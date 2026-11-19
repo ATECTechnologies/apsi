@@ -21,6 +21,9 @@
   program that trained the model. Every layer now remembers the arguments it was made with.
 
 ### Graph batches that never make the card wait
+- **Graphs of any size in one batch:** `batch_graphs([(x, graph, y), …])` (nodes renumbered; edges, relations,
+  node types and edge features kept), `graph(…, edge_features=)` and `gine` (GIN with edge features). Same training
+  on NumPy and the GPU trainer.
 - **The next batch's graph is prepared on another core** while the card trains on this one (sorted edges, offsets,
   pooling order: the forms the layers asked for last time), and its buffers on the card come from a pool reused
   from batch to batch instead of being allocated and freed (each free waited for the card). Graphs of any size and

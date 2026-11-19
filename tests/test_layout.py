@@ -152,3 +152,33 @@ class Notebooks(unittest.TestCase):
             text = open(os.path.join(d, "nb.apsi"), encoding="utf-8").read()
             self.assertIn("# (notebook only) %time", text)
             self.assertIn("# --- cell 2", text)
+
+
+class RaggedGraphs(unittest.TestCase):
+    def test_batch_graphs_and_gine(self):
+        """Graphs of different sizes with edge features batched; gine trains the same on NumPy and the GPU trainer."""
+        from apsi import layers as L, gpu_train as GT
+        from apsi.stdlib import Adam
+        rng = np.random.default_rng(0)
+        items = []
+        for _ in range(12):
+            n = int(rng.integers(3, 9))
+            g = L.graph(edges=rng.integers(0, n, (2 * n, 2)).tolist(), n=n,
+                        edge_features=rng.normal(size=(2 * n, 2)), undirected=True,
+                        node_types=rng.integers(0, 2, n))
+            items.append((rng.normal(size=(n, 4)), g, int(n % 3)))
+        X, Y, g = L.batch_graphs(items[:4])
+        self.assertEqual((len(X), g.n, g.graphs, len(Y)), (sum(len(i[0]) for i in items[:4]),) * 2 + (4, 4))
+        self.assertEqual(g.efeat.shape, (g.edges, 2))
+        self.assertEqual(list(np.bincount(g.batch)), [i[1].n for i in items[:4]])
+        np.testing.assert_array_equal(g.ntype, np.concatenate([i[1].ntype for i in items[:4]]))
+        batches = [L.batch_graphs(items[k:k + 4]) for k in range(0, 12, 4)]
+        m = L.Sequential([L.GINE(4, 16, 2), L.GINE(16, 16, 2), L.GraphPool("mean"), L.Linear(16, 3)])
+        a = L.fit_batches(m, m.init(seed=0), batches, "cross_entropy", opt=Adam(0.01), epochs=5, backend="numpy",
+                          verbose=False)
+        b = GT.fit_batches(m, m.init(seed=0), batches, "cross_entropy", opt=Adam(0.01), epochs=5, verbose=False,
+                           precision="fp32", ops=GT.Emulator())
+        np.testing.assert_allclose(a.history, b.history, rtol=1e-5)
+        self.assertLess(a.history[-1], a.history[0])
+        with self.assertRaises(Exception):
+            L.GINE(4, 8, 2)(m.layers[0].init(), X, graph=L.graph(edges=[[0, 1]], n=len(X)))

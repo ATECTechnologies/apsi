@@ -96,25 +96,34 @@ class Graph:
     (`rel`, 0 when the graph has one kind of edge) and a hop count (`hop`: 1 for an ordinary edge, k for a shortcut
     made by k_hop(), 0 for a self loop)."""
 
-    def __init__(self, src, dst, n, self_loops=True, undirected=False, rel=None, hop=None):
+    def __init__(self, src, dst, n, self_loops=True, undirected=False, rel=None, hop=None, efeat=None):
         src, dst = _ids(src), _ids(dst)
         rel = np.zeros(len(src), dtype=np.int64) if rel is None else _ids(rel)
         hop = np.ones(len(src), dtype=np.int64) if hop is None else _ids(hop)
         if len(rel) != len(src) or len(hop) != len(src):
             raise ShapeError("graph(): types= needs one entry per edge")
+        if efeat is not None:                        # a feature vector per edge (bond type, distance, …)
+            efeat = np.asarray(ops.raw(efeat), dtype=float)
+            efeat = efeat.reshape(len(src), -1) if efeat.size or not len(src) else efeat.reshape(0, 1)
+            if len(efeat) != len(src):
+                raise ShapeError(f"graph(): edge_features needs one row per edge ({len(src)})")
         if undirected:
             src, dst = np.concatenate([src, dst]), np.concatenate([dst, src])
             rel, hop = np.concatenate([rel, rel]), np.concatenate([hop, hop])
+            efeat = None if efeat is None else np.concatenate([efeat, efeat])
         if self_loops:
             loops = np.arange(int(n))
             keep = src != dst
             src, dst = np.concatenate([src[keep], loops]), np.concatenate([dst[keep], loops])
             rel = np.concatenate([rel[keep], np.zeros(int(n), dtype=np.int64)])
             hop = np.concatenate([hop[keep], np.zeros(int(n), dtype=np.int64)])
+            if efeat is not None:                    # self loops carry zeros
+                efeat = np.concatenate([efeat[keep], np.zeros((int(n), efeat.shape[1]))])
         if len(src) and (src.max() >= n or dst.max() >= n or src.min() < 0 or dst.min() < 0):
             raise ShapeError(f"graph(): edge refers to a node outside 0..{int(n) - 1}")
         self.src, self.dst, self.n = src, dst, int(n)
         self.rel, self.hop = rel, hop
+        self.efeat = efeat
         self.relations = int(rel.max()) + 1 if len(rel) else 1
         self.in_degree = np.bincount(dst, minlength=self.n).astype(float)
         self.out_degree = np.bincount(src, minlength=self.n).astype(float)
@@ -139,11 +148,12 @@ class Graph:
 
 
 def graph(edges=None, n=None, src=None, dst=None, self_loops=True, undirected=False, batch=None, types=None,
-          reverse=False, node_types=None):
+          reverse=False, node_types=None, edge_features=None):
     """graph(edges=[[0, 1], [1, 2]], n=3) or graph(src=tensor, dst=tensor, n=…). `batch` assigns nodes to
     separate graphs for graph-level tasks (used by graph_pool). `types` gives every edge a relation (0, 1, …) for
     graph_transformer layers; reverse=true adds each edge backwards as its own relation, so information flows both
-    ways with separate weights (use -> definition as well as definition -> use)."""
+    ways with separate weights (use -> definition as well as definition -> use). edge_features: a row of numbers
+    per edge [E, F] (bond types, distances, …), read by gine; self loops get zeros, reversed edges a copy."""
     if edges is not None:
         e = np.asarray(ops.raw(edges)).astype(np.int64).reshape(-1, 2) if len(edges) else np.zeros((0, 2), int)
         src, dst = e[:, 0], e[:, 1]
@@ -153,10 +163,12 @@ def graph(edges=None, n=None, src=None, dst=None, self_loops=True, undirected=Fa
     if n is None:
         n = int(max(np.max(src, initial=-1), np.max(dst, initial=-1))) + 1
     rel = _ids(types) if types is not None else np.zeros(len(src), dtype=np.int64)
+    ef = None if edge_features is None else np.asarray(ops.raw(edge_features), dtype=float).reshape(len(src), -1)
     if reverse:
         R = int(rel.max()) + 1 if len(rel) else 1
         src, dst, rel = np.concatenate([src, dst]), np.concatenate([dst, src]), np.concatenate([rel, rel + R])
-    g = Graph(src, dst, n, self_loops=self_loops, undirected=undirected, rel=rel)
+        ef = None if ef is None else np.concatenate([ef, ef])
+    g = Graph(src, dst, n, self_loops=self_loops, undirected=undirected, rel=rel, efeat=ef)
     g.batch = _ids(batch) if batch is not None else np.zeros(g.n, dtype=np.int64)
     g.graphs = int(g.batch.max()) + 1 if g.n else 0
     if node_types is not None:                       # a type per node (heterogeneous graphs: typed_linear, hgt)
@@ -1079,6 +1091,77 @@ class GIN(Layer):
 
     def describe(self):
         return f"gin({self.n_in} → {self.n_out})"
+
+
+class GINE(Layer):
+    """GIN with edge features (GINE): MLP((1 + eps) x_i + Σ_j relu(x_j + e_ji W_e + b_e)) over the neighbours j of
+    i, e_ji the edge's features (graph(…, edge_features=)): bonds, distances, any per-edge numbers."""
+    kind = "gine"
+
+    def __init__(self, n_in, n_out, edge_dim, hidden=None):
+        hidden = int(hidden or n_out)
+        self.n_in, self.n_out, self.edge_dim = int(n_in), int(n_out), int(edge_dim)
+        self.edge = Linear(self.edge_dim, self.n_in)
+        self.mlp = Sequential([Linear(n_in, hidden), Activation("relu"), Linear(hidden, n_out)])
+
+    def init(self, seed=0):
+        return Record(eps=np.zeros(1), edge=self.edge.init(_seed_of(seed, 1)), mlp=self.mlp.init(seed))
+
+    def apply(self, p, x, train=False, **ctx):
+        g = _graph(ctx)
+        if getattr(g, "efeat", None) is None:
+            raise ShapeError("gine needs a graph with edge_features=")
+        if g.efeat.shape[1] != self.edge_dim:
+            raise ShapeError(f"gine: edges have {g.efeat.shape[1]} features, the layer takes {self.edge_dim}")
+        keep = g.src != g.dst                                               # neighbours only
+        msg = ops.relu(x[g.src[keep]] + self.edge(p.edge, g.efeat[keep]))
+        agg = segment_sum(msg, g.dst[keep], g.n)
+        return self.mlp(p.mlp, (1 + p.eps) * x + agg, train=train, **ctx)
+
+    def describe(self):
+        return f"gine({self.n_in} → {self.n_out}, edges {self.edge_dim})"
+
+
+def batch_graphs(items):
+    """Graphs of different sizes as one batch: items [(x, graph), …] or [(x, graph, y), …] -> (x, graph) or
+    (x, y, graph), the order fit_batches takes. Nodes are renumbered, every graph keeps its edges, relations, hops, node types and edge features,
+    and graph.batch says which graph each node belongs to (graph_pool, typed_pool). y: a value or row per graph
+    (stacked), or a row per node when every y has one entry per node of its graph."""
+    if not items:
+        raise RuntimeErr("batch_graphs: no graphs")
+    xs, src, dst, rel, hop, nt, ef, bt, ys = [], [], [], [], [], [], [], [], []
+    off, gcount = 0, 0
+    has_ef = all(getattr(it[1], "efeat", None) is not None for it in items)
+    with_y = all(len(it) > 2 for it in items)
+    node_y = with_y and all(np.ndim(ops.raw(it[2])) >= 1 and len(np.asarray(ops.raw(it[2]))) == it[1].n
+                            for it in items) and any(it[1].n != 1 for it in items)
+    for gi, it in enumerate(items):
+        x, g = np.asarray(ops.raw(it[0])), it[1]
+        if len(x) != g.n:
+            raise ShapeError(f"batch_graphs: graph {gi} has {g.n} nodes, its features {len(x)} rows")
+        xs.append(x)
+        src.append(g.src + off)
+        dst.append(g.dst + off)
+        rel.append(g.rel)
+        hop.append(g.hop)
+        nt.append(g.ntype)
+        bt.append(g.batch + gcount)
+        gcount += max(1, g.graphs)
+        if has_ef:
+            ef.append(g.efeat)
+        if with_y:
+            ys.append(np.asarray(ops.raw(it[2])))
+        off += g.n
+    gb = Graph(np.concatenate(src), np.concatenate(dst), off, self_loops=False, rel=np.concatenate(rel),
+               hop=np.concatenate(hop), efeat=np.concatenate(ef) if has_ef else None)
+    gb.batch = np.concatenate(bt)
+    gb.graphs = gcount
+    gb.ntype = np.concatenate(nt)
+    X = np.concatenate(xs)
+    if not with_y:
+        return X, gb
+    Y = np.concatenate(ys) if node_y else np.stack(ys)
+    return X, Y, gb
 
 
 class GraphPool(Layer):
@@ -2169,7 +2252,7 @@ def module(interp=None):
         batch_norm_layer=BatchNorm, dropout_layer=Dropout, activation=activation, lambda_layer=LambdaLayer,
         scale=Scale, identity=Identity, select=Select, mean_pool=MeanPool, slice_layer=Slice,
         tied_output=TiedOutput,
-        gcn=GCN, sage=SAGE, gat=GAT, gin=GIN, graph_pool=GraphPool,
+        gcn=GCN, sage=SAGE, gat=GAT, gin=GIN, gine=GINE, batch_graphs=batch_graphs, graph_pool=GraphPool,
         # composition
         sequential=sequential, residual=residual, parallel=parallel, dag=dag, add=add, multiply=multiply,
         concatenate=concatenate, custom_layer=custom_layer, checkpoint=checkpoint, diagnose=diagnose, load_torch_weights=load_torch_weights,
