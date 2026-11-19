@@ -37,7 +37,7 @@ fit_batches(m, m.init(), [batch_graphs(chunk) for chunk in chunks], loss="cross_
 edges, relations, hops, node types and edge features kept, `graph.batch` telling which graph a node belongs to,
 targets stacked (one per graph, or one per node when each target has a row per node). `graph(…, edge_features=)`
 gives every edge a row of numbers (bond types, distances); `gine(n_in, n_out, edge_dim)` reads them:
-`MLP((1 + ε) x_i + Σ_j relu(x_j + e_ji W))`. On the GPU trainer gine runs on the processor inside the model; the
+`MLP((1 + ε) x_i + Σ_j relu(x_j + e_ji W))`, with kernels of its own on the GPU trainer; the
 next batch's graph is prepared on another core while the card trains.
 
 ## Relations and both directions

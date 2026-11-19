@@ -3534,6 +3534,17 @@ class _GraphDev:
         hit = self.cache[("csr", which)] = (fwd, bwd)
         return hit
 
+    def edge_features(self, which="noself"):
+        """The graph's edge features in the order of csr(which) (targets): [E, F] on the card."""
+        hit = self.cache.get(("efeat", which))
+        if hit is None:
+            ef = getattr(self.g, "efeat", None)
+            h = graph_host(self.g, ("csr", which))
+            if ef is None or h["eid"] is None:
+                raise TrainError("this layer needs a graph with edge_features=")
+            hit = self.cache[("efeat", which)] = (self._put(ef[h["eid"]], np.float32), ef.shape[1])
+        return hit
+
     def custom(self, key, src, dst):
         """A CSR of my own edges (src -> dst), cached under key: e.g. every node to every node of its graph."""
         hit = self.cache.get(("custom", key))
@@ -3597,20 +3608,23 @@ def graph_host(g, key):
         src, dst = np.asarray(g.src, np.int64), np.asarray(g.dst, np.int64)
         rel = np.asarray(g.rel, np.int64)
         hop = np.asarray(g.hop, np.int64)
+        eid = np.arange(len(src))                        # each edge's place in the graph's own edge list
         if isinstance(which, tuple):                     # ("noself", relation ids): the edges of those relations,
             from .graphs import owned_edges              # renumbered (a layer that owns some relations)
             src, dst, rel = owned_edges(g, 0, which[1])
             hop = np.ones(len(src), np.int64)
+            eid = None
         elif which == "noself":
             keep = src != dst
-            src, dst, rel, hop = src[keep], dst[keep], rel[keep], hop[keep]
+            src, dst, rel, hop, eid = src[keep], dst[keep], rel[keep], hop[keep], eid[keep]
         N = int(g.n)
         order = np.argsort(dst, kind="stable")
         s_, d_ = src[order], dst[order]
         off = np.concatenate([[0], np.cumsum(np.bincount(d_, minlength=N))])
         tperm = np.argsort(s_, kind="stable")              # edges (in target order) grouped by source
         toff = np.concatenate([[0], np.cumsum(np.bincount(s_, minlength=N))])
-        hit = dict(E=len(s_), s=s_, d=d_, off=off, tperm=tperm, toff=toff, rel=rel[order], hop=hop[order])
+        hit = dict(E=len(s_), s=s_, d=d_, off=off, tperm=tperm, toff=toff, rel=rel[order], hop=hop[order],
+                   eid=None if eid is None else eid[order])
     elif key[0] == "pool":
         batch = np.asarray(g.batch, np.int64)
         G = int(g.graphs)
@@ -3728,6 +3742,68 @@ class _SAGE(_Node):
         _, t = gd.csr()
         o.spmm(dm, t["col"], gd.values("mean") if self.mean else None, t["vperm"] if self.mean else None, t["off"],
                dx, M, 1, K, add=True)
+        return dx
+
+
+class _GINE(_Node):
+    """mlp((1 + eps) x_i + Σ_j relu(x_j + e_ji We + be)) over the in-edges (self loops left out), on the card:
+    the edge features through one product, the sources gathered, the messages summed per target in edge order
+    (the same sums every run)."""
+
+    def __init__(self, net, key, layer, p):
+        super().__init__(net, key)
+        self.K, self.Fe = layer.n_in, layer.edge_dim
+        self.eps = net.param(p.eps)
+        self.We, self.be = net.param(p.edge.W), net.param(p.edge.b)
+        self.mlp = net.compile(layer.mlp, p.mlp, key + ".m")
+
+    def fwd(self, x, shape):
+        gd = _need_graph(self.net, "gine")
+        o, M, K, ps = self.net.ops, _rows(shape), self.K, self.net.passes
+        f, _ = gd.csr("noself")
+        E = f["E"]
+        ef, Fe = gd.edge_features("noself")
+        if Fe != self.Fe:
+            raise TrainError(f"gine: edges have {Fe} features, the layer takes {self.Fe}")
+        self.x, self.M, self.E, self.ef = x, M, E, ef
+        pre = self.buf("pre", max(1, E * K))
+        if E:
+            o.gemm(ef, self.We.w, pre, E, K, Fe, Fe, 1, K, 1, K, bias=self.be.w, passes=ps)    # e W + b
+            g = self.buf("g", E * K)
+            o.gather(x, f["col"], g, E, K, 0)                                                  # x of the sources
+            o.axpy(pre, g, E * K)
+            msg = self.buf("msg", E * K)
+            o.act_f(pre, msg, E * K, 0)                                                         # relu
+        else:
+            msg = pre
+        z = self.buf("z", M * K)
+        o.spmm(msg, f["ids"], None, None, f["off"], z, M, 1, K)                               # Σ per target
+        o.scale_add(z, x, self.eps.w, M * K, 1.0)                                              # + (1 + eps) x
+        self.pre = pre
+        return self.mlp.fwd(z, shape)
+
+    def bwd(self, dy, need_dx=True):
+        gd = self.net.gdev
+        o, M, K, E, ps = self.net.ops, self.M, self.K, self.E, self.net.passes
+        f, t = gd.csr("noself")
+        dz = self.mlp.bwd(dy, True)
+        o.dot_acc(dz, self.x, M * K, self.eps.g)
+        dpre = None
+        if E:
+            dmsg = self.gbuf("dmsg", E * K)
+            o.gather(dz, f["row"], dmsg, E, K, 0)                                              # dz of the targets
+            dpre = self.gbuf("dpre", E * K)
+            o.act_b(self.pre, dmsg, dpre, E * K, 0)
+            o.gemm(self.ef, dpre, self.We.g, self.Fe, K, E, 1, self.Fe, K, 1, K, beta=True, passes=ps,
+                   db=self.be.g)
+        if not need_dx:
+            return None
+        dx = self.gbuf("dx", M * K)
+        if E:
+            o.spmm(dpre, t["vperm"], None, None, t["off"], dx, M, 1, K)                       # Σ per source
+        else:
+            o.fill(dx, M * K, 0.0)
+        o.scale_add(dx, dz, self.eps.w, M * K, 1.0)
         return dx
 
 
@@ -5069,6 +5145,8 @@ class Net:
             return _GCN(self, key, layer, p)
         if isinstance(layer, L.SAGE):
             return _SAGE(self, key, layer, p)
+        if isinstance(layer, L.GINE):
+            return _GINE(self, key, layer, p)
         if isinstance(layer, L.GIN):
             return _GIN(self, key, layer, p)
         if isinstance(layer, L.GAT):

@@ -199,7 +199,8 @@ def check(out=sys.stdout):
     lab = np.roll(ids, -1, 1)
     N = 60
     e = rng.integers(0, N, (240, 2)).tolist()
-    g = L.graph(edges=e, n=N, types=rng.integers(0, 3, 240), batch=np.repeat(np.arange(4), 15))
+    g = L.graph(edges=e, n=N, types=rng.integers(0, 3, 240), batch=np.repeat(np.arange(4), 15),
+                edge_features=rng.normal(size=(240, 3)))
     Xg, yg, mask = rng.normal(size=(N, 16)), rng.integers(0, 3, N), rng.random(N) < 0.6
     cases = [
         ("gpt", L.transformer_lm(50, d=64, heads=4, layers=2, context=24), ids, lab, {}),
@@ -209,6 +210,8 @@ def check(out=sys.stdout):
                                                 top_k=2, norm="rms"), ids, lab, {}),
         ("gat", L.gat_net(16, 8, 3, dropout=0.0), Xg, yg, dict(graph=g, mask=mask)),
         ("gcn / gin", L.Sequential([L.GCN(16, 32), L.Activation("elu"), L.GIN(32, 3)]), Xg, yg,
+         dict(graph=g, mask=mask)),
+        ("gine (edge features)", L.Sequential([L.GINE(16, 32, 3), L.Activation("elu"), L.GINE(32, 3, 3)]), Xg, yg,
          dict(graph=g, mask=mask)),
         ("graph transformer", GR.graph_transformer_net(16, 32, 3, layers=2, heads=4, relations=3, max_keys=8), Xg,
          yg, dict(graph=g, mask=mask)),
