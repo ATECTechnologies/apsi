@@ -8,7 +8,7 @@ set cpo&vim
 
 syn keyword apsiStatement   let var nextgroup=apsiVarName skipwhite
 syn keyword apsiFunction    fn nextgroup=apsiFuncName skipwhite
-syn keyword apsiStructKw    struct nextgroup=apsiStructName skipwhite
+syn keyword apsiStructKw    struct enum nextgroup=apsiStructName skipwhite
 syn keyword apsiConditional if elif else
 syn keyword apsiRepeat      while for in break continue parallel
 syn keyword apsiStatement   return pass assert
@@ -53,6 +53,7 @@ syn keyword apsiDtype f16 f32 f64 bf16 i32 i64 int8 int4 uint8 fp8 bf8 fp6 fp4 f
 
 " numbers with units: 5kg, 9.81[m/s^2], and unit conversions: as [km]
 syn match   apsiNumber   "\<\d[0-9_]*\%(\.\d[0-9_]*\)\=\%([eE][+-]\=\d\+\)\=" nextgroup=apsiUnitSuffix,apsiUnitBracket
+syn match   apsiNumber   "\<0[xX][0-9a-fA-F_]\+\>\|\<0[bB][01_]\+\>\|\<0[oO][0-7_]\+\>"
 syn match   apsiUnitSuffix  "[A-Za-zµμΩÅ°][A-Za-z0-9µμΩÅ]*" contained
 syn region  apsiUnitBracket matchgroup=apsiUnitDelim start="\[" end="\]" contained oneline contains=apsiUnitOp
 syn match   apsiUnitOp   "[*/^·]\|\*\*\|-\=\d\+" contained
