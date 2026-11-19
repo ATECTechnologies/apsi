@@ -40,6 +40,8 @@ _RISKY_ATTRS = {"gi_frame", "gi_code", "f_globals", "f_builtins", "f_locals", "f
                 "tofile", "dump"}
 
 
+_PATTERN_TYPES = {"str", "int", "float", "bool", "list", "dict", "tuple", "set", "bytes", "frozenset"}
+
 class _NoDefault:
     def __repr__(self):
         return "<no default>"
@@ -594,7 +596,10 @@ class CodeGen:
         self.indent -= 1
 
     def _dotted_code(self, dotted, scope):
+        """A name or dotted name in a pattern, as Python code."""
         parts = dotted.split(".")
+        if len(parts) == 1 and parts[0] in _PATTERN_TYPES and scope.lookup(parts[0]) is None:
+            return f"{HELPER_PREFIX}builtins.{parts[0]}"         # case str(): / case int(x): the built-in type
         code = self.load(parts[0], scope)
         if not code.replace("_", "a").isidentifier():           # constants and helpers are not valid in patterns
             raise RuntimeErr(f"'{dotted}' cannot be used in a case pattern")
@@ -2033,6 +2038,7 @@ class Compiled:
             f"{HELPER_PREFIX}struct": rt.struct, f"{HELPER_PREFIX}shape_bind": rt.shape_bind,
             f"{HELPER_PREFIX}evolve": rt.evolve,
             f"{HELPER_PREFIX}add_test": lambda name, fn, line: tests.append((name, fn, line)),
+            f"{HELPER_PREFIX}builtins": __import__("builtins"),     # built-in types in case patterns
         })
         self.globals = g
 

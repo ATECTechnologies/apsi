@@ -361,6 +361,8 @@ class Interpreter:
         self.modules.lazy("layout", lambda: __import__("apsi.layout", fromlist=["module"]).module())
         self.modules.lazy("log", lambda: __import__("apsi.log", fromlist=["module"]).module(self))
         self.modules.lazy("config", lambda: __import__("apsi.config", fromlist=["module"]).module(self))
+        from .enums import enum_type as _enum_type
+        self.globals.vars.setdefault("enum_type", _enum_type)
         from . import structures as _st
         self.modules.lazy("collections", _st.module)
         for k, v in _st.FUNCTIONS.items():

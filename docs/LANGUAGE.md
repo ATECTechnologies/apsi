@@ -132,8 +132,8 @@ true false none and or not use import assert evolve as pass
 ```
 
 Contextual (special only in one place, ordinary names elsewhere): `try`, `except`, `finally`, `raise`, `yield`
-(statements, section 7.2–7.3), `class`, `with`, `del`, `global`, `nonlocal`, `async`, `await` (section 9.4 and
-7.5–7.7), `is` (after an expression), `test` (starts a test block),
+(statements, section 7.2–7.3), `match` / `case` (section 7.8), `enum` (section 9.6), `class`, `with`, `del`, `global`,
+`nonlocal`, `async`, `await` (section 9.4 and 7.5–7.7), `is` (after an expression), `test` (starts a test block),
 `parallel` (only directly before `for`), `over step using tol record every into` (inside `evolve`).
 
 ### 3.5 Numbers
@@ -480,6 +480,32 @@ In Apsi files they are optional (an outer `var` is assigned without them); conve
 `(f(x) for x in xs)` is a generator: values are made one at a time, so `any(slow(x) for x in xs)` stops at the
 first true value and endless sources work. `[…]` is a list, `{…}` a set (`{x % 3 for x in xs}`) or a dict.
 
+### 7.8 `match` — choosing by the shape of a value
+
+```apsi
+fn describe(v):
+    match v:
+        case 0:
+            return "zero"
+        case [x, y]:                              # a sequence of two: its parts named
+            return f"pair {x} {y}"
+        case [first, *rest]:
+            return f"starts with {first}"
+        case {"kind": "point", "x": px}:          # a dict with these keys (others allowed)
+            return f"point at {px}"
+        case str() as s:                          # by type: str() int() float() list() dict() tuple() …
+            return "text " + s
+        case int(n) if n > 100:                   # a guard after if
+            return "big"
+        case Color.RED | Color.GREEN:             # alternatives; constants by their dotted name
+            return "warm or green"
+        case _:
+            return "other"
+```
+
+The first case that matches runs; `_` matches anything. Names in a pattern bind the matched parts. The rules are
+Python's `match` statement, exactly; `apsi convert` keeps a Python program's `match` as it is.
+
 ### 7.1 `parallel for`
 
 ```apsi
@@ -710,6 +736,27 @@ class Point:
 Methods see the scope around the class, not the class body (as in Python). Instances print with `__repr__` /
 `__str__`. A `struct` (9.1) is still the light, typed record for numeric code; a `class` is for objects with
 behaviour and for anything that has to fit into a Python library.
+
+### 9.6 Enumerations
+
+```apsi
+enum Color:
+    RED                  # 0
+    GREEN = 5
+    BLUE                 # 6: one more than the member before it
+
+enum Dir: N, E, S, W     # on one line
+
+print(Color.BLUE.name, Color.BLUE.value)     # BLUE 6
+print(Color(5), Color["RED"])                # by value, by name
+for d in Dir:                                # in order
+    print(d.name)
+```
+
+Members are compared by identity (`c == Color.GREEN`), work in `match` (`case Color.GREEN:`), as dictionary keys
+and in sets. Values are numbers or text; a member without one is the previous number plus one, the first 0 (as in
+C, so a `use layout` field can hold them). `enum_type("Color", [("RED", none), ("GREEN", 5)])` builds the same
+at run time.
 
 ### 9.5 `use pycompat` — Python's exact semantics for a file
 

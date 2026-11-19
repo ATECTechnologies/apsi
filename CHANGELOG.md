@@ -11,6 +11,8 @@
   `u8 u16 u32 u64 i8 i16` arguments.
 - **`apsi convert` takes Jupyter notebooks** (`.ipynb`, also inside folders): code cells in order, markdown as
   comments, `%` / `!` lines kept as marked comments.
+- **`enum` declarations** (`enum Color: RED, GREEN = 5, BLUE`, or one member per line) and **`match`** documented,
+  with built-in types in class patterns (`case str() as s:`, `case int(n) if n > 100:`).
 - **Base-16, 2 and 8 integers:** `0xFF`, `0b1010_0101`, `0o755`. `docs/EMBEDDED.md`.
 
 ### Sealed model packages
