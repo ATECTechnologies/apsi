@@ -60,6 +60,12 @@ Files that import each other are always converted together, so the converted mod
 files. A module already converted and newer than its `.py` is not converted again. With `--only`, a Python module
 kept next to the program is found by `pyimport` in the program's own folder.
 
+## Jupyter notebooks
+
+`apsi convert analysis.ipynb` converts a notebook like a `.py` file: the code cells in order (each marked
+`# --- cell N`), the markdown cells as comments, and notebook-only lines (`%magics`, `%%cell magics`, `!shell`,
+`name?`) kept as comments marked `(notebook only)`. Folders given to `apsi convert` include their notebooks.
+
 ## Libraries: what converts and what does not
 
 Python is needed only while converting. What `apsi convert` produces runs on Apsi.

@@ -132,3 +132,23 @@ class Literals(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class Notebooks(unittest.TestCase):
+    def test_ipynb_converts_and_runs(self):
+        import json
+        import sys
+        nb = {"cells": [{"cell_type": "markdown", "source": ["# Demo\n"]},
+                        {"cell_type": "code", "source": ["%time\n", "def sq(v):\n", "    return v * v\n"]},
+                        {"cell_type": "code", "source": ["!ls\n", "print(sum(sq(i) for i in range(4)))\n"]}],
+              "metadata": {}, "nbformat": 4, "nbformat_minor": 5}
+        with tempfile.TemporaryDirectory() as d:
+            p = os.path.join(d, "nb.ipynb")
+            json.dump(nb, open(p, "w"))
+            r = subprocess.run([sys.executable, "-m", "apsi", "convert", p, "--run"], capture_output=True, text=True,
+                               cwd=ROOT)
+            self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+            self.assertIn("14", r.stdout)
+            text = open(os.path.join(d, "nb.apsi"), encoding="utf-8").read()
+            self.assertIn("# (notebook only) %time", text)
+            self.assertIn("# --- cell 2", text)

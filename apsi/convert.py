@@ -1818,6 +1818,46 @@ def _excluded(path, base, patterns):
     return any(fnmatch.fnmatch(rel, pat) or fnmatch.fnmatch(os.path.basename(path), pat) for pat in patterns)
 
 
+def notebook_source(path):
+    """A Jupyter notebook (.ipynb) as one Python program: its code cells in order (each headed by a comment with its
+    number), markdown cells as comments, IPython magics (%, %%, !) and shell lines kept as comments with a note."""
+    import json as _json
+    with open(path, encoding="utf-8-sig") as fh:
+        nb = _json.load(fh)
+    cells = nb.get("cells") if isinstance(nb, dict) else None
+    if cells is None and isinstance(nb, dict):                       # nbformat 3: cells inside worksheets
+        cells = [c for w in nb.get("worksheets", []) for c in w.get("cells", [])]
+    out, n = [], 0
+    for c in cells or []:
+        src = c.get("source", c.get("input", ""))
+        text = "".join(src) if isinstance(src, list) else str(src)
+        if c.get("cell_type") == "markdown":
+            out += ["# " + ln if ln.strip() else "#" for ln in text.splitlines()]
+            out.append("")
+            continue
+        if c.get("cell_type") != "code":
+            continue
+        n += 1
+        out.append(f"# --- cell {n}")
+        magic_block = text.lstrip().startswith("%%")
+        for ln in text.splitlines():
+            st = ln.lstrip()
+            if magic_block or st.startswith(("%", "!")) or (st.startswith("?") or st.endswith("?") and
+                                                              st[:-1].isidentifier()):
+                out.append(ln[:len(ln) - len(st)] + "# (notebook only) " + st)
+            else:
+                out.append(ln)
+        out.append("")
+    return "\n".join(out) + "\n"
+
+
+def _read_program(src):
+    if src.lower().endswith(".ipynb"):
+        return notebook_source(src)
+    with open(src, encoding="utf-8-sig") as fh:
+        return fh.read()
+
+
 def cmd_convert(args):
     import argparse  # noqa: F401
     paths = list(args.paths)
@@ -1836,7 +1876,7 @@ def cmd_convert(args):
                 dirs[:] = [d for d in dirs if not d.startswith(".") and d not in ("__pycache__", "venv", ".venv",
                                                                                    "node_modules", "build", "dist")]
                 for f in sorted(files):
-                    if f.endswith(".py"):
+                    if f.endswith((".py", ".ipynb")):
                         src = os.path.join(root, f)
                         if excl and _excluded(src, p, excl):
                             continue
@@ -1851,7 +1891,7 @@ def cmd_convert(args):
             print(f"apsi convert: '{p}' does not exist", file=sys.stderr)
             return 2
     if not jobs:
-        print("apsi convert: no .py files found", file=sys.stderr)
+        print("apsi convert: no .py or .ipynb files found", file=sys.stderr)
         return 2
     only = getattr(args, "only", False)
     named = {os.path.abspath(a) for a, _b in jobs}
@@ -1873,8 +1913,7 @@ def cmd_convert(args):
             continue
         done.add(key)
         try:
-            with open(src, encoding="utf-8-sig") as fh:
-                code = fh.read()
+            code = _read_program(src)
             exact_why = idiomatic_blockers(ast.parse(code, src)) if idiomatic else []
             if idiomatic and not exact_why:
                 text, warns = convert_source(code, src)
@@ -2010,8 +2049,7 @@ def _plan(jobs, only, excl, reason="named"):
         if only:
             continue
         try:
-            with open(src, encoding="utf-8-sig") as fh:
-                c = Converter(fh.read(), src, None, None, dst, False)
+            c = Converter(_read_program(src), src, None, None, dst, False)
             c.convert()
         except Exception:                                # a file that does not parse: shown, not followed
             continue
@@ -2032,8 +2070,9 @@ def _plan(jobs, only, excl, reason="named"):
 
 
 def add_parser(sub):
-    p = sub.add_parser("convert", help="translate Python files or folders into Apsi (numpy, math, torch, … mapped)")
-    p.add_argument("paths", nargs="+", help=".py files or folders")
+    p = sub.add_parser("convert", help="translate Python files, Jupyter notebooks or folders into Apsi (numpy, math, "
+                                       "torch, … mapped)")
+    p.add_argument("paths", nargs="+", help=".py or .ipynb files, or folders")
     p.add_argument("-o", "--output", help="output file or folder (default: next to each .py file)")
     p.add_argument("--stdout", action="store_true", help="print the Apsi code instead of writing files")
     p.add_argument("--run", action="store_true", help="run the result (single file) when it checks cleanly")

@@ -9,6 +9,8 @@
   write over a memory image). Offsets checked against the C compiler; the headers compile with GCC and Clang.
 - **FFI:** `ptr_void` / `ptr_u8` take a bytearray, a tensor or a layout view (C writes into Apsi's memory);
   `u8 u16 u32 u64 i8 i16` arguments.
+- **`apsi convert` takes Jupyter notebooks** (`.ipynb`, also inside folders): code cells in order, markdown as
+  comments, `%` / `!` lines kept as marked comments.
 - **Base-16, 2 and 8 integers:** `0xFF`, `0b1010_0101`, `0o755`. `docs/EMBEDDED.md`.
 
 ### Sealed model packages
