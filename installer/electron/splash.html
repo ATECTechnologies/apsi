@@ -23,12 +23,14 @@
 </head>
 <body>
   <img src="../dist/wordmark.png" alt="apsi">
-  <div class="msg">Preparing Apsi Setup…</div>
+  <div class="msg" id="msg">Preparing Apsi Setup…</div>
   <div class="ver" id="ver"></div>
   <div class="bar"><i></i></div>
 <script>
   const v = new URLSearchParams(location.search).get("v");
-  if (v) document.getElementById("ver").textContent = "Version " + v;
+  const sv = new URLSearchParams(location.search).get("s");
+  if (v) document.getElementById("msg").textContent = "Preparing Apsi " + v + " Setup…";
+  document.getElementById("ver").textContent = sv ? "Setup " + sv : (v ? "Version " + v : "");
 </script>
 </body>
 </html>

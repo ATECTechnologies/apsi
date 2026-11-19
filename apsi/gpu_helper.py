@@ -285,6 +285,8 @@ def setup(start_limit=None):
     if sys.platform.startswith("win"):
         w = os.path.join(os.path.dirname(exe), "pythonw.exe")
         exe = w if os.path.exists(w) else exe
+        # a helper already running (from this or another Apsi version) is stopped first: one helper at a time
+        subprocess.run(["schtasks", "/End", "/TN", TASK], capture_output=True, text=True)
         user = f"{os.environ.get('USERDOMAIN', '')}\\{os.environ.get('USERNAME', '')}".strip("\\")
         cmd = ["schtasks", "/Create", "/TN", TASK, "/TR", f'"{exe}" "{script}" serve', "/SC", "ONLOGON",
                "/RL", "HIGHEST", "/RU", user, "/IT", "/F"]

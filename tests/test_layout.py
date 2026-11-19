@@ -94,7 +94,8 @@ class Layouts(unittest.TestCase):
     def test_headers_compile_and_c_writes_through_a_view(self):
         cc = shutil.which("cc") or shutil.which("gcc")
         _, f = _fields()
-        with tempfile.TemporaryDirectory() as d:
+        # (Windows keeps a loaded library locked until the process ends: the folder is left for the system to clean)
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as d:
             for name, pack in (("Nat", 0), ("Packed", 1), ("Four", 4)):
                 open(os.path.join(d, f"{name}.h"), "w").write(Lo.c_struct(name, f, pack=pack).c_header())
             R = Lo.register_map("TIM", 0x40000000, [("CR", 0, Lo.u32, [("en", 1)]), ("CNT", 4, Lo.u32)])
@@ -107,7 +108,7 @@ class Layouts(unittest.TestCase):
                                  '#include "sample.h"\nvoid fill(Sample *s, uint16_t id) { s->id = id; '
                                  's->flags = SAMPLE_FLAGS_OK_MASK | (5u << SAMPLE_FLAGS_MODE_SHIFT); '
                                  's->value = 2.5f; s->count += 10; }\n')
-            lib = os.path.join(d, "libdev.so")
+            lib = os.path.join(d, "dev.dll" if os.name == "nt" else "libdev.so")
             r = subprocess.run([cc, "-std=c11", "-Wall", "-Werror", "-shared", "-fPIC", src, "-o", lib],
                                capture_output=True, text=True)
             self.assertEqual(r.returncode, 0, r.stderr)

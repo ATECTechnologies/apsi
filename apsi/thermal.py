@@ -877,6 +877,8 @@ def add_parser(sub):
                    help="bench gemm: every build of the matrix product, its error and TFLOPS; calibrate: measures each card's power and fan settings for training (setup does it too); "
                         "for power: 80%% (of the default), 130W or default; for hold: the ceiling (79); for bench: "
                         "127m (default), 11m, modern, check (every kernel against the reference) or cards")
+    p.add_argument("--no-calibrate", action="store_true",
+                   help="setup: do not measure the card now (training uses safe defaults; apsi gpu calibrate later)")
     p.add_argument("--precision", default="auto", help="bench: auto (bf16), fp32, fp8, fp4, ...")
     p.add_argument("--steps", type=int, default=40, help="bench: training steps to time")
     p.add_argument("--gpu", type=int, default=None)
@@ -888,7 +890,7 @@ def _cmd(args):
         from . import gpu_helper
         for m in (gpu_helper.setup(args.value) if args.what == "setup" else gpu_helper.remove()):
             print(m)
-        if args.what == "setup" and os.environ.get("APSI_GPU_CALIBRATE", "1").strip().lower() not in ("0", "off", "no"):
+        if args.what == "setup" and not args.no_calibrate and os.environ.get("APSI_GPU_CALIBRATE", "1").strip().lower() not in ("0", "off", "no"):
             _calibrate_all(args.gpu)                    # this card's own power and fan settings, measured once
         return 0
     if args.what == "calibrate":

@@ -41,6 +41,8 @@ and the driver compiles them for whatever card is present.
 > 1. **Run Apsi as administrator** (Windows: right-click the terminal → *Run as administrator*; Linux: `sudo`), or
 > 2. **once**, run `apsi gpu setup` as administrator (or the *Apsi GPU Tuner — Apply* file from the download page):
 >    a small helper then lets every Apsi program set the power limit without administrator rights, at every logon.
+>    `apsi gpu remove` (as administrator) turns it off again — see
+>    [Turning the GPU helper off](#turning-the-gpu-helper-off-and-before-uninstalling).
 >
 > The training report says which one is in use: `temperature held by the power limit, directly (no pauses)` or
 > `… through the GPU helper`. If it reports cooling pauses, neither is set up.
@@ -447,6 +449,41 @@ Ampere and newer `lm.plan` / `r.device` give the reason (`APSI_TENSOR_CORES=0` s
 Raise `--max-queue`, use a smaller model or format, or run another server on another card.
 
 **Two copies of a model (int8 for the processor) fill the disk.** `apsi cache show`, `apsi cache clean int8`.
+
+## Turning the GPU helper off (and before uninstalling)
+
+The GPU helper and the GPU Tuner are the only parts of Apsi that run with administrator rights. They keep running
+after you close Apsi (the helper starts at every logon), and the helper runs the Python of the Apsi version that set
+it up, so Windows cannot delete that version's folder while it runs. The uninstaller removes the helper by itself
+(it asks for administrator rights once). To turn it off yourself, open a terminal **as administrator** and run:
+
+```
+apsi gpu remove
+```
+
+It stops the helper, deletes its Task Scheduler task (Windows) or systemd service (Linux), deletes its key and
+script in `~/.apsi`, and puts the card's default power limit back. If you also applied the **GPU Tuner**, run
+**Apsi-GPU-Tuner-Restore** (Windows: double-click and approve the prompt; Linux: `sudo sh apsi-gpu-tuner-restore-linux.sh`):
+it removes the task "Apsi GPU Tuner" / unit `apsi-gpu-tuner` and sets every card back to its factory defaults.
+
+Check that nothing is left:
+
+```
+apsi gpu status                         (power limit back at the default, no helper)
+schtasks /Query /TN "Apsi GPU helper"   (Windows: "cannot find the file specified" = removed)
+systemctl status apsi-gpu-helper        (Linux: "could not be found" = removed)
+```
+
+By hand, if Apsi is already gone (terminal as administrator):
+
+```
+schtasks /End /TN "Apsi GPU helper" & schtasks /Delete /TN "Apsi GPU helper" /F
+schtasks /Delete /TN "Apsi GPU Tuner" /F
+nvidia-smi -pl 170                      (your card's default power limit: nvidia-smi -q -d POWER shows it)
+```
+
+On Linux: `sudo systemctl disable --now apsi-gpu-helper apsi-gpu-tuner` and
+`sudo rm /etc/systemd/system/apsi-gpu-helper.service /etc/systemd/system/apsi-gpu-tuner.service`.
 
 ## Settings for the GPU
 

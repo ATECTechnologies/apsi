@@ -33,11 +33,18 @@ export function mockSetup() {
       return { ok: !problems.length, problems, warnings, dir: d };
     },
     install: async () => {
-      const steps = ["Verifying installer integrity", "Preparing", "Copying the Apsi runtime", "Creating the apsi command", "Adding Apsi to PATH", "Registering .apsi files", "Verifying the installation"];
-      for (let i = 0; i <= 100; i += 4) {
+      const steps = [["integrity", "Verifying installer integrity"], ["prepare", "Preparing"], ["runtime", "Copying the Apsi runtime"],
+        ["content", "Copying examples and documentation"], ["launchers", "Creating the apsi command"], ["path", "Adding Apsi to PATH"],
+        ["assoc", "Registering .apsi files"], ["gpu", "Setting up the GPU helper (approve the administrator prompt if Windows shows one)"],
+        ["shortcuts", "Creating shortcuts"], ["editors", "Adding Apsi to your code editors"], ["packages", "Installing optional packages"],
+        ["security", "Applying security settings"], ["uninstaller", "Registering the uninstaller"], ["verify", "Verifying the installation"]];
+      const stopAt = Number(new URLSearchParams(location.search).get("stop") || 101);
+      for (let i = 0; i <= 100; i += 2) {
         await new Promise((r) => setTimeout(r, 60));
-        progress({ percent: i, label: steps[Math.min(steps.length - 1, Math.floor(i / 18))] });
-        if (i % 20 === 0) logger(`step ${i}%`);
+        const [step, label] = steps[Math.min(steps.length - 1, Math.floor(i / (101 / steps.length)))];
+        progress({ step: i === 100 ? "done" : step, percent: i, label });
+        if (i % 10 === 0) logger(`${label} …`);
+        if (i >= stopAt) await new Promise(() => {});
       }
       return { ok: true, dir: sys.defaultDir, log: [] };
     },

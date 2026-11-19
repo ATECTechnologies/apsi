@@ -486,6 +486,17 @@ function winUninstallScript(record) {
     "# Apsi uninstaller (generated). Removes exactly what the installer created.",
     "$ErrorActionPreference = 'Continue'",
   ];
+  if (record.version) {
+    // the GPU helper (a Task Scheduler task, set up as administrator) runs the Python of one version and keeps its
+    // files open: when it runs from this folder it is removed first, with one administrator prompt
+    const py = pythonIn(record.dir);
+    lines.push(`$task = (schtasks /Query /TN 'Apsi GPU helper' /XML 2>$null) -join ''`);
+    lines.push(`if ($task -and $task.ToLower().Contains('${q(record.dir.toLowerCase())}')) {`);
+    lines.push(`  Write-Host 'Removing the Apsi GPU helper first (approve the administrator prompt)...'`);
+    lines.push(`  try { Start-Process -FilePath '${q(py)}' -ArgumentList '-I','-X','utf8','-m','apsi','gpu','remove' -Verb RunAs -WindowStyle Hidden -Wait -ErrorAction Stop } catch { Write-Host 'The GPU helper was not removed: run  apsi gpu remove  in a terminal opened as administrator, then uninstall again.' }`);
+    lines.push(`}`);
+    lines.push(`Get-Process -ErrorAction SilentlyContinue | Where-Object { $_.Path -and $_.Path.ToLower().StartsWith('${q(record.dir.toLowerCase())}\\') } | Stop-Process -Force -ErrorAction SilentlyContinue`);
+  }
   if (record.pathEntry) {
     lines.push(`$p=[Environment]::GetEnvironmentVariable('Path','User'); if($p){ $parts=$p.Split(';')|Where-Object{$_ -ne '' -and $_ -ne '${q(record.pathEntry)}'}; [Environment]::SetEnvironmentVariable('Path',($parts -join ';'),'User') }`);
   }
@@ -528,6 +539,13 @@ function winSharedUninstallScript(shared, root) {
 function linuxUninstallScript(record) {
   const q = (s) => `'${s.replace(/'/g, "'\\''")}'`;
   const lines = ["#!/bin/sh", "# Apsi uninstaller (generated). Removes exactly what the installer created."];
+  if (record.version) {
+    // the GPU helper (a systemd service, set up as root) runs this version's Python: removed first
+    lines.push(`if grep -qF ${q(record.dir)} /etc/systemd/system/apsi-gpu-helper.service 2>/dev/null; then`);
+    lines.push(`  echo "Removing the Apsi GPU helper first (root password)..."`);
+    lines.push(`  if command -v pkexec >/dev/null; then pkexec env HOME="$HOME" ${q(pythonIn(record.dir))} -I -m apsi gpu remove; else sudo env HOME="$HOME" ${q(pythonIn(record.dir))} -I -m apsi gpu remove; fi`);
+    lines.push(`fi`);
+  }
   for (const f of record.profileFiles || []) {
     lines.push(`[ -f ${q(f)} ] && sed -i '/^# >>> apsi >>>$/,/^# <<< apsi <<<$/d' ${q(f)}`);
   }
@@ -584,6 +602,7 @@ async function saveShared(root, shared) {
 const STEPS = [
   ["integrity", "Verifying installer integrity", 8], ["prepare", "Preparing", 2], ["runtime", "Copying the Apsi runtime", 55], ["content", "Copying examples and documentation", 5],
   ["launchers", "Creating the apsi command", 2], ["path", "Adding Apsi to PATH", 2], ["assoc", "Registering .apsi files", 2],
+  ["gpu", "Setting up the GPU helper (approve the administrator prompt if Windows shows one)", 4],
   ["shortcuts", "Creating shortcuts", 2], ["editors", "Adding Apsi to your code editors", 6],
   ["packages", "Installing optional packages", 15], ["security", "Applying security settings", 2],
   ["uninstaller", "Registering the uninstaller", 3], ["verify", "Verifying the installation", 5],
@@ -648,6 +667,7 @@ async function install(options, hooks = {}) {
       }
     }
     if (options.mode === "upgrade" || options.mode === "repair") {
+      await removeGpuHelperOf(dir, say);                  // it keeps the runtime's files open; set up again below
       await fsp.rm(path.join(dir, "runtime"), { recursive: true, force: true });
       say("Removed the previous runtime");
     }
@@ -781,22 +801,33 @@ async function install(options, hooks = {}) {
     }
     finish("assoc");
 
-    // 6b the GPU helper: training holds 77 C by the power limit without administrator rights (asks once)
+    // 6b the GPU helper: training holds 78-79 C by the fans and the power limit without administrator rights (asks
+    // once). The card is not measured here (that took minutes with nothing on the screen): the first training run
+    // uses safe defaults, and `apsi gpu calibrate` measures the card whenever the user wants.
+    step("gpu");
     if (c.gpuPower) {
       const py = pythonIn(dir);
       let r = null;
-      if (IS_WIN) {
-        const q = (x) => `'${String(x).replace(/'/g, "''")}'`;
-        const ps = `$p = Start-Process -FilePath ${q(py)} -ArgumentList '-I','-X','utf8','-m','apsi','gpu','setup' ` +
-                   `-Verb RunAs -WindowStyle Hidden -Wait -PassThru; exit $p.ExitCode`;
-        r = await run("powershell", ["-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", ps], { timeoutMs: 600000 });
-      } else if (which("pkexec")) {
-        r = await run("pkexec", ["env", `HOME=${HOME}`, py, "-I", "-X", "utf8", "-m", "apsi", "gpu", "setup"], { timeoutMs: 600000 });
-      }
+      say("Setting up the GPU helper: approve the administrator prompt (it can open behind this window)…");
+      const t0 = Date.now();
+      const tick = setInterval(() => step("gpu", Math.min(0.95, (Date.now() - t0) / 60000)), 500);
+      try {
+        if (IS_WIN) {
+          const q = (x) => `'${String(x).replace(/'/g, "''")}'`;
+          const ps = `try { $p = Start-Process -FilePath ${q(py)} -ArgumentList '-I','-X','utf8','-m','apsi','gpu','setup','--no-calibrate' ` +
+                     `-Verb RunAs -WindowStyle Hidden -Wait -PassThru -ErrorAction Stop; exit $p.ExitCode } catch { exit 1223 }`;
+          r = await run("powershell", ["-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", ps], { timeoutMs: 180000 });
+        } else if (which("pkexec")) {
+          r = await run("pkexec", ["env", `HOME=${HOME}`, py, "-I", "-X", "utf8", "-m", "apsi", "gpu", "setup", "--no-calibrate"], { timeoutMs: 180000 });
+        }
+      } finally { clearInterval(tick); }
       say(r && r.code === 0
-        ? "GPU helper installed and this card measured: training runs at a fixed power, its fans hold 78-79 C, no administrator needed"
+        ? "GPU helper installed: training holds the card at 78-79 C without administrator rights (apsi gpu remove undoes it)"
+        : r && r.code === 1223 ? "GPU helper skipped (the administrator prompt was declined); later: 'apsi gpu setup' in a terminal opened as administrator"
         : "GPU helper not installed (later: 'apsi gpu setup' from a terminal opened as administrator, or the GPU Tuner)");
+      if (r && r.code === 0) record.gpuHelper = true;
     }
+    finish("gpu");
 
     // 7 shortcuts
     step("shortcuts");
@@ -995,11 +1026,40 @@ async function undo(record, removeDir = true) {
   if (removeDir) await fsp.rm(record.dir, { recursive: true, force: true });
 }
 
+// The GPU helper (Task Scheduler task / systemd service, set up as administrator) runs one version's Python and keeps
+// its files open. Before that version's folder is removed or replaced, the helper is removed (one administrator prompt).
+async function removeGpuHelperOf(dir, say = () => {}) {
+  const low = dir.toLowerCase();
+  let uses = false;
+  if (IS_WIN) {
+    const r = await run("schtasks", ["/Query", "/TN", "Apsi GPU helper", "/XML"]);
+    uses = r.code === 0 && (r.out || "").toLowerCase().includes(low);
+  } else {
+    try { uses = fs.readFileSync("/etc/systemd/system/apsi-gpu-helper.service", "utf8").includes(dir); } catch { uses = false; }
+  }
+  if (!uses || !fs.existsSync(pythonIn(dir))) return false;
+  say("Removing the Apsi GPU helper of this version first (approve the administrator prompt)…");
+  let r = null;
+  if (IS_WIN) {
+    const q = (x) => `'${String(x).replace(/'/g, "''")}'`;
+    const ps = `try { $p = Start-Process -FilePath ${q(pythonIn(dir))} -ArgumentList '-I','-X','utf8','-m','apsi','gpu','remove' ` +
+               `-Verb RunAs -WindowStyle Hidden -Wait -PassThru -ErrorAction Stop; exit $p.ExitCode } catch { exit 1223 }`;
+    r = await run("powershell", ["-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", ps], { timeoutMs: 180000 });
+  } else if (which("pkexec")) {
+    r = await run("pkexec", ["env", `HOME=${HOME}`, pythonIn(dir), "-I", "-m", "apsi", "gpu", "remove"], { timeoutMs: 180000 });
+  }
+  const ok = !!(r && r.code === 0);
+  say(ok ? "The GPU helper is removed; the card is back to its default power limit"
+         : "The GPU helper could not be removed: run 'apsi gpu remove' in a terminal opened as administrator, then try again");
+  return ok;
+}
+
 async function uninstall(dir, hooks = {}) {
   const f = path.join(dir, "install.json");
   const record = JSON.parse(await fsp.readFile(f, "utf8"));
   const root = record.root && record.root !== record.dir ? record.root : null;
   hooks.onLog && hooks.onLog(`Removing Apsi ${record.version} from ${record.dir}`);
+  await removeGpuHelperOf(record.dir, (m) => hooks.onLog && hooks.onLog(m));
   await undo(record, true);
   if (!root) {
     hooks.onLog && hooks.onLog("Apsi has been removed.");

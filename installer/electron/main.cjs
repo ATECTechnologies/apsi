@@ -124,7 +124,9 @@ function createSplash() {
   splash.removeMenu();
   splash.once("ready-to-show", () => splash && !splash.isDestroyed() && splash.show());
   splash.on("closed", () => { splash = null; });
-  splash.loadFile(path.join(__dirname, "splash.html"), { query: { v: app.getVersion() } });
+  let setupV = "";
+  try { setupV = require("../package.json").setupVersion || ""; } catch { setupV = ""; }
+  splash.loadFile(path.join(__dirname, "splash.html"), { query: { v: app.getVersion(), s: setupV } });
 }
 
 function closeSplash() {
