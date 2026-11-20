@@ -1255,7 +1255,7 @@ class Gpu(_Ops):
         """view's bfloat16 twin in dst (one pass), registered for the products that read view until drop_twin or
         until view is written with a new twin. For a buffer read by several products (two or more conversions
         before): one."""
-        self._go("to_bf16", self.blocks((n + 1) // 2), 256, self.p(view), self.p(dst), ("u", n))
+        self._to_bf16(self.p(view), self.p(dst), n)
         self._twin[self.p(view)[1]] = (n, self.p(dst))
 
     def drop_twin(self, view):
@@ -1617,13 +1617,21 @@ class Gpu(_Ops):
             os.environ.get("APSI_ADAM_W16", "1").strip().lower() not in ("0", "off", "no") else None
         self._w16_gen = -1
 
+    def _to_bf16(self, src, dst, n):
+        """bfloat16 copy of n floats (src, dst: ("p", address)); to_bf16 has no grid-stride loop, so a long array goes
+        in launches of at most 65536 blocks of 256 threads (two values each)."""
+        step = 2 * 65536 * 256
+        for a in range(0, int(n), step):
+            k = min(step, int(n) - a)
+            self._go("to_bf16", self.blocks((k + 1) // 2), 256, ("p", src[1] + 4 * a), ("p", dst[1] + 2 * a), ("u", k))
+
     def refresh_w16(self):
         """Round every weight to its bfloat16 copy in one pass (after updates that did not write it)."""
         wr = self._wrange
         if self._w16 is None or wr is None:
             return
         n = (wr[1] - wr[0]) // 4
-        self._go("to_bf16", self.blocks((n + 1) // 2), 256, ("p", wr[0]), self.p((self._w16, 0)), ("u", n))
+        self._to_bf16(("p", wr[0]), ("p", self._w16.ptr), n)
         self._w16_gen = self._wgen
         for bf in self._wcache.values():
             self.free(bf[1])
@@ -1673,7 +1681,7 @@ class Gpu(_Ops):
                 hit = self._wcache.get((ptr, n))
                 if hit is None or hit[0] != self._wgen:
                     dst = hit[1] if hit is not None else self.alloc((n + 1) // 2)
-                    self._go("to_bf16", self.blocks((n + 1) // 2), 256, args[i], self.p((dst, 0)), ("u", n))
+                    self._to_bf16(args[i], self.p((dst, 0)), n)
                     self._wcache[(ptr, n)] = hit = (self._wgen, dst)
                 out[i] = self.p((hit[1], 0))
                 continue
@@ -1682,7 +1690,7 @@ class Gpu(_Ops):
                 out[i] = tw[1]
                 continue
             dst = self._scratch(key, (n + 1) // 2)
-            self._go("to_bf16", self.blocks((n + 1) // 2), 256, args[i], self.p(dst), ("u", n))
+            self._to_bf16(args[i], self.p(dst), n)
             out[i] = self.p(dst)
         return out
 
@@ -1879,8 +1887,11 @@ class Gpu(_Ops):
             if ldc != N or f"{name}_e{epi}" + (f"a{act}" if epi in (1, 2) else "") not in self.fn:
                 return False
         lo_a, lo_b = self._scratch("lo_a", M * K), self._scratch("lo_b", K * N)
-        self._go("bf_lo", self.blocks(M * K), 256, self.p(A), self.p(lo_a), ("u", M * K))
-        self._go("bf_lo", self.blocks(K * N), 256, self.p(B), self.p(lo_b), ("u", K * N))
+        for src, dst, cnt in ((A, lo_a, M * K), (B, lo_b, K * N)):
+            ps, pd = self.p(src)[1], self.p(dst)[1]
+            for a in range(0, cnt, 65536 * 256):         # (one value per thread, no grid-stride loop)
+                k = min(65536 * 256, cnt - a)
+                self._go("bf_lo", self.blocks(k), 256, ("p", ps + 4 * a), ("p", pd + 4 * a), ("u", k))
         common = (M, N, K, sam, sak, sbk, sbn, ldc, 1, 1, sa, sb, sc, alpha)
         self._gemm(A, B, Cv, bias, *common, beta, 1)
         self._gemm(lo_a, B, Cv, None, *common, True, 1)
