@@ -124,6 +124,7 @@ jobs:
         with: { path: art }
       - name: Files
         run: |
+          python -m pip install -q numpy
           V=$(python -c "import apsi; print(apsi.__version__)")
           [ "refs/heads/release/$V" = "$GITHUB_REF" ] || { echo "branch is not release/$V"; exit 1; }
           echo "V=$V" >> "$GITHUB_ENV"
