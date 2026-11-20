@@ -29,6 +29,7 @@ jobs:
   wizard-installer:
     # Modern Electron + React setup wizard (ApsiSetup-<v>-x64-wizard.exe / Apsi-<v>.AppImage)
     strategy:
+      fail-fast: false
       matrix:
         include:
           - { os: windows-2022, script: "dist:win", files: "installer/release/*.exe" }
@@ -104,3 +105,49 @@ jobs:
           sudo apt-get install -y ./dist/apsi_*_all.deb
           apsi version
           apsi test /usr/share/apsi/examples/05_orbit.apsi
+
+  # Publishes the GitHub release of the version in apsi/__init__.py from a push to its release/<version> branch:
+  # moves the tag v<version> to this commit (GitHub's "Source code" archives then hold it), sets the title and notes
+  # from .github/releases.json, marks it latest, and replaces its files with the builds of this run.
+  publish:
+    if: startsWith(github.ref, 'refs/heads/release/')
+    needs: [build, wizard-installer, smoke-test-linux, smoke-test-wizard-windows]
+    runs-on: ubuntu-24.04
+    permissions: { contents: write }
+    env: { GH_TOKEN: "${{ github.token }}" }
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.12" }
+      - uses: actions/download-artifact@v4
+        with: { path: art }
+      - name: Files
+        run: |
+          V=$(python -c "import apsi; print(apsi.__version__)")
+          [ "refs/heads/release/$V" = "$GITHUB_REF" ] || { echo "branch is not release/$V"; exit 1; }
+          echo "V=$V" >> "$GITHUB_ENV"
+          mkdir -p up
+          cp art/apsi-wizard-Windows/ApsiSetup-$V-x64.exe up/
+          cp art/apsi-wizard-Linux/*.AppImage up/ApsiSetup-$V-linux-x86_64.AppImage
+          cp art/apsi-release/apsi_${V}_all.deb art/apsi-release/apsi-$V-py3-none-any.whl art/apsi-release/apsi-language-$V.vsix up/
+          [ -f art/apsi-release/apsi-$V-windows-x64.zip ] && cp art/apsi-release/apsi-$V-windows-x64.zip up/ || true
+          python -m pip install -q numpy
+          python packaging/make_linux_installer.py up
+          (cd up && sha256sum * > SHA256SUMS.txt && ls -l)
+      - name: Tag, notes and files
+        run: |
+          git tag -f "v$V" "$GITHUB_SHA" && git push -f origin "refs/tags/v$V"
+          python - <<'PY' > meta.env
+          import json, os
+          r = next(x for x in json.load(open(".github/releases.json")) if x["version"] == os.environ["V"])
+          print(r["title"]); print(r["notes"])
+          PY
+          TITLE=$(sed -n 1p meta.env); NOTES=$(sed -n 2p meta.env)
+          if gh release view "v$V" >/dev/null 2>&1; then
+            gh release edit "v$V" --title "$TITLE" --notes-file "$NOTES" --latest --draft=false --prerelease=false
+            for a in $(gh release view "v$V" --json assets -q '.assets[].name'); do gh release delete-asset "v$V" "$a" -y; done
+          else
+            gh release create "v$V" --title "$TITLE" --notes-file "$NOTES" --latest --verify-tag
+          fi
+          gh release upload "v$V" up/* --clobber
+          gh release view "v$V" --json url,assets -q '.url, (.assets[].name)'
