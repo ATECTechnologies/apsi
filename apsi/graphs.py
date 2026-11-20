@@ -367,12 +367,13 @@ class NodeTextEncoder(Layer):
         sc = ops.sum_(rep * p.pool_query, axis=-1) / math.sqrt(d)          # [E]
         w = segment_softmax(ops.reshape(sc, -1, 1), rows, N)                # [E, 1]
         focus = segment_sum(rep * w, rows, N) @ p.pool_out.W + p.pool_out.b
+        node = (typ >= 0)[:, None]                         # a type < 0: a plain text (no type, no structure)
         out = (base + p.lang_emb[lang % self.Lg] * p.lang_mix + p.family_emb[fam % self.F] * p.family_mix
-               + focus * p.focus_gate + p.type_emb[typ] * p.type_mix)
+               + focus * p.focus_gate + ops.where(node, p.type_emb[np.maximum(typ, 0)] * p.type_mix, 0.0))
         se = p.struct_emb[0][st[:, 0]]
         for k in range(1, len(self.struct)):
             se = se + p.struct_emb[k][st[:, k]]
-        return out + se * p.struct_mix
+        return out + ops.where(node, se * p.struct_mix, 0.0)
 
     def describe(self):
         return f"node_text_encoder(d={self.d})"
@@ -555,6 +556,57 @@ class BrainRouting(Layer):
         return f"brain_routing(d={self.d}, {self.E} experts, top {self.k})"
 
 
+class MaskRows(Layer):
+    """Its input with the rows graph.picks[name] replaced by one learned vector (masked-feature training: the
+    model has to tell what was there from the context)."""
+    kind = "mask_rows"
+
+    def __init__(self, d, name="mask"):
+        self.d, self.name = int(d), str(name)
+
+    def init(self, seed=0):
+        return Record(mask_emb=_rng(seed).normal(size=self.d) * 0.02)
+
+    def apply(self, p, x, train=False, **ctx):
+        g = ctx.get("graph")
+        picks = getattr(g, "picks", None) or {}
+        idx = np.asarray(picks.get(self.name, []), np.int64).reshape(-1)
+        if not len(idx):
+            return x
+        N = int(np.shape(ops.raw(x))[0])
+        m = np.zeros((N, 1), bool)
+        m[idx] = True
+        return ops.where(m, p.mask_emb * np.ones((N, 1)), x)
+
+    def describe(self):
+        return f"mask_rows({self.name})"
+
+
+class GatedDelta(Layer):
+    """x + out(gelu(inp(f))) * f[:, 0]: a correction from side features that is exactly zero for the rows whose first
+    feature is 0 (GLA's math / physics adapter: the features of the numbers and units in a text; out starts at 0).
+    Input [x, f]."""
+    kind = "gated_delta"
+
+    def __init__(self, d, f, hidden=None):
+        self.d, self.f = int(d), int(f)
+        self.h = int(hidden or max(64, self.d // 4))
+
+    def init(self, seed=0):
+        rng = _rng(seed)
+        return Record(inp=Record(W=rng.uniform(-1, 1, (self.f, self.h)) / math.sqrt(self.f), b=np.zeros(self.h)),
+                      out=Record(W=np.zeros((self.h, self.d)), b=np.zeros(self.d)))
+
+    def apply(self, p, x, train=False, **ctx):
+        a, f = x
+        fa = np.asarray(ops.raw(f), np.float64)
+        dlt = ops.gelu_exact(fa @ p.inp.W + p.inp.b) @ p.out.W + p.out.b
+        return a + dlt * fa[:, :1]
+
+    def describe(self):
+        return f"gated_delta(d={self.d}, {self.f} features)"
+
+
 class MemorySlots(Layer):
     """A decoder's memory from two sets of node states and two summaries (GLA's writer memory): of each set, the k best
     nodes of every row (by a learned score; their projection scaled by sigmoid(score)) plus the embedding of their node
@@ -602,7 +654,11 @@ class MemorySlots(Layer):
         rank = np.arange(len(order)) - start[rr]
         ok = rank < K
         idx, rr, rank = order[ok], rr[ok], rank[ok]
-        types = np.asarray(g.ntype, np.int64)[rows[idx]] if hasattr(g, "ntype") else np.zeros(len(idx), np.int64)
+        picks = getattr(g, "picks", None) or {}
+        if name + "_type" in picks:                        # the node types to embed, when not graph.ntype
+            types = np.asarray(picks[name + "_type"], np.int64).reshape(-1)[keep][idx]
+        else:
+            types = np.asarray(g.ntype, np.int64)[rows[idx]] if hasattr(g, "ntype") else np.zeros(len(idx), np.int64)
         vals = (xs[idx] @ proj) * ops.reshape(ops.sigmoid(s[idx]), -1, 1) + p.type_emb[types] + p.slot_emb[slot]
         pos = rr * K + rank
         valid[rr, rank] = 1.0
@@ -1160,6 +1216,6 @@ def graph_transformer_net(n_in, d, out, layers=4, heads=4, relations=1, global_e
 def names():
     return dict(graph_transformer=GraphTransformer, global_attention=GlobalAttention, mix_hop=MixHop,
                 graph_memory=GraphMemory, pick_rows=PickRows, hgt=HGT, typed_linear=TypedLinear, typed_norm=TypedNorm,
-                typed_graph_encoder=TypedGraphEncoder, typed_pool=TypedPool, memory_slots=MemorySlots, brain_routing=BrainRouting, node_text_encoder=NodeTextEncoder, graph_context=GraphContext, split_typed_encoder=split_typed_encoder,
+                typed_graph_encoder=TypedGraphEncoder, typed_pool=TypedPool, memory_slots=MemorySlots, mask_rows=MaskRows, gated_delta=GatedDelta, brain_routing=BrainRouting, node_text_encoder=NodeTextEncoder, graph_context=GraphContext, split_typed_encoder=split_typed_encoder,
                 graph_transformer_net=graph_transformer_net, k_hop=k_hop, hop_distances=hop_distances,
                 eccentricity=eccentricity)

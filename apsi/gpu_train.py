@@ -3195,6 +3195,25 @@ class _DAG(_Node):
                     G.add(s_, dx)
 
 
+class _GradScale(_Node):
+    """grad_scale: the input itself going forward; alpha times the gradient going backward."""
+
+    def __init__(self, net, key, alpha):
+        super().__init__(net, key)
+        self.alpha = float(alpha)
+
+    def fwd(self, x, shape):
+        self.n = int(np.prod(shape))
+        return x, shape
+
+    def bwd(self, dy, need_dx=True):
+        dx = self.gbuf("dx", self.n)
+        self.net.ops.fill(dx, self.n, 0.0)
+        if self.alpha:
+            self.net.ops.axpy(dx, dy, self.n, self.alpha)
+        return dx
+
+
 class _TiedOutput(_Node):
     """tied_output: x @ E^T with the table E of an embedding of the same dag (one parameter, two users: both add
     their gradients into it)."""
@@ -5212,8 +5231,12 @@ class _PickRows(_Node):
     def fwd(self, x, shape):
         N, F = _rows(shape), int(shape[-1])
         sel = self.layer.rows(self.net.graph)
-        if not len(sel):
-            sel = np.zeros(1, np.int64)
+        self.empty = not len(sel)
+        if self.empty:                                   # nothing picked: one row of zeros (as NumPy), no gradient
+            self.N, self.R, self.F = N, 1, F
+            y = self.buf("y", F)
+            self.net.ops.fill(y, F, 0.0)
+            return y, (1, F)
         R = len(sel)
         order = np.argsort(sel, kind="stable")
         put = lambda name, a, dt=np.int32: _put_buf(self, name, a, dt)   # noqa: E731
@@ -5230,6 +5253,9 @@ class _PickRows(_Node):
         if not need_dx:
             return None
         dx = self.gbuf("dx", self.N * self.F)
+        if self.empty:
+            self.net.ops.fill(dx, self.N * self.F, 0.0)
+            return dx
         self.net.ops.spmm(dy, self.tcol, None, None, self.toff, dx, self.N, 1, self.F)
         return dx
 
@@ -5532,6 +5558,8 @@ class Net:
         if isinstance(layer, L.MultiHeadAttention) and (getattr(layer, "gate", None) is None or
                                                         not getattr(layer, "bias", True)):
             return _Attention(self, key, layer, p)
+        if isinstance(layer, L.GradScale):
+            return _GradScale(self, key, layer.alpha)
         if isinstance(layer, L.TiedOutput):
             return _TiedOutput(self, key, layer, self.dag_params)
         if isinstance(layer, L.SwiGLU):

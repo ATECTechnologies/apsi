@@ -762,6 +762,22 @@ class Slice(Layer):
         return f"slice({self.start}:{self.stop})"
 
 
+class GradScale(Layer):
+    """Identity going forward; going backward the gradient is multiplied by `alpha` (0: no gradient, 1: all of it): a
+    controlled share of one objective's gradient reaches the layers before it (GLA's soft bridge, alpha 0.08)."""
+    kind = "grad_scale"
+
+    def __init__(self, alpha=0.08):
+        self.alpha = float(alpha)
+
+    def apply(self, p, x, train=False, **ctx):
+        from .stdlib import stop_gradient
+        return x * self.alpha + stop_gradient(x) * (1.0 - self.alpha)
+
+    def describe(self):
+        return f"grad_scale({self.alpha})"
+
+
 class TiedOutput(Layer):
     """Logits with the weights of an embedding of the same dag (tied embeddings): x @ E^T, E the table of node
     `owner`. No weights of its own."""
@@ -2337,7 +2353,7 @@ def module(interp=None):
         apply_rope=apply_rope, moe=MoE, fit_batches=fit_batches, pinn_fit=_pinn_fit, pinn_derivatives=_pinn_derivatives,
         transformer_encoder=transformer_encoder, layer_norm_layer=LayerNorm, rms_norm_layer=RMSNorm,
         batch_norm_layer=BatchNorm, dropout_layer=Dropout, activation=activation, lambda_layer=LambdaLayer,
-        scale=Scale, identity=Identity, select=Select, mean_pool=MeanPool, slice_layer=Slice,
+        scale=Scale, identity=Identity, select=Select, mean_pool=MeanPool, slice_layer=Slice, grad_scale=GradScale,
         tied_output=TiedOutput, card_loss=card_loss,
         gcn=GCN, sage=SAGE, gat=GAT, gin=GIN, gine=GINE, batch_graphs=batch_graphs, graph_pool=GraphPool,
         # composition
