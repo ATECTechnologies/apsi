@@ -405,7 +405,7 @@ class Emulator(_Ops):
         c[:] = (t - p) - y
         p[:] = t
 
-    def adam(self, Pm, Gr, Mm, Vm, SQ, n, n_decay, lr, b1, b2, eps, c1, c2, wd, clip, COMP=None):
+    def adam(self, Pm, Gr, Mm, Vm, SQ, n, n_decay, lr, b1, b2, eps, c1, c2, wd, clip, COMP=None, part=None):
         if not np.isfinite(self.v(SQ, 1)[0]):              # a non-finite gradient: the step is skipped
             self.v(Gr, n)[:] = 0.0
             return
@@ -1329,16 +1329,25 @@ class Gpu(_Ops):
         part = self._scratch("sumsq_part", nb)
         self._go("sumsq", nb, 256, self.p(X), ("u", n), self.p(ACC), self.p(part), self._cnt())
 
-    def adam(self, Pm, Gr, Mm, Vm, SQ, n, n_decay, lr, b1, b2, eps, c1, c2, wd, clip, COMP=None):
-        self._wgen += 1
+    def adam(self, Pm, Gr, Mm, Vm, SQ, n, n_decay, lr, b1, b2, eps, c1, c2, wd, clip, COMP=None, part=None):
+        # part=(i, k): call i of k that together update every weight (parameter groups, each its own learning rate):
+        # each writes its share of the bfloat16 copy, the copy is current after the last one
+        i_, k_ = part if part is not None else (0, 1)
+        if i_ == 0:
+            self._wgen += 1
         # the update of all the weights writes their bfloat16 copy too (the products' operand): no conversion pass
         wr, at = self._wrange, self.p(Pm)[1]
-        full = self._w16 is not None and wr is not None and at == wr[0] and 4 * n == wr[1] - wr[0]
+        if k_ == 1:
+            full = self._w16 is not None and wr is not None and at == wr[0] and 4 * n == wr[1] - wr[0]
+            dst = self.p((self._w16, 0)) if full else None
+        else:
+            full = self._w16 is not None and wr is not None and wr[0] <= at and at + 4 * n <= wr[1]
+            dst = ("p", self._w16.ptr + 2 * ((at - wr[0]) // 4)) if full else None   # (bfloat16: 2 bytes each)
         self._go("adam", self.blocks(n), 256, self.p(Pm), self.p(Gr), self.p(Mm), self.p(Vm), self.p(SQ), ("u", n),
                  ("u", n_decay), ("f", lr), ("f", b1), ("f", b2), ("f", eps), ("f", c1), ("f", c2), ("f", wd),
                  ("f", clip), self.p(COMP if COMP is not None else Pm), ("u", 1 if COMP is not None else 0),
-                 self.p((self._w16, 0) if full else Pm), ("u", 1 if full else 0))
-        if full:
+                 dst if full else self.p(Pm), ("u", 1 if full else 0))
+        if full and i_ == k_ - 1:
             self._w16_gen = self._wgen
             for bf in self._wcache.values():             # (the copies made one weight at a time before)
                 self.free(bf[1])
@@ -5404,10 +5413,73 @@ class _SwiGLU(_Node):
         return dx
 
 
+def _leaf_paths(tree, pre=""):
+    """The dotted path of every array leaf, in tree_leaves order."""
+    from .values import Record
+    if isinstance(tree, Record):
+        items = tree.fields.items()
+    elif isinstance(tree, dict):
+        items = tree.items()
+    elif isinstance(tree, (list, tuple)):
+        items = ((str(i), v) for i, v in enumerate(tree))
+    else:
+        return [pre.rstrip(".")] if isinstance(tree, np.ndarray) else []
+    out = []
+    for k, v in items:
+        out += _leaf_paths(v, f"{pre}{k}.")
+    return out
+
+
+def _param_groups(groups, params, leaves):
+    """Parameter groups (each its own learning rate, betas, eps, weight decay and clipping): a list of records with
+    params = names of parts (a leaf belongs to the first group with a name equal to its path or a prefix of it at a
+    dot; "*" = every leaf no other group takes), and any of lr, b1, b2, eps, weight_decay, clip, decay ("matrices",
+    the default, "all", "none" or a list of the parts that decay) and no_decay (substrings of a path that take a weight out of decay). Leaves of no group
+    form group 0 with the optimizer's own settings."""
+    if not groups:
+        return None
+    from .values import Record
+    specs = []
+    for g in groups:
+        d = dict(g.fields) if isinstance(g, Record) else dict(g)
+        names = d.get("params", "*")
+        names = [names] if isinstance(names, str) else list(names)
+        dec = d.get("decay", "matrices")
+        dec = str(dec) if isinstance(dec, str) else [str(x) for x in dec]
+        specs.append(dict(names=[str(x) for x in names], lr=d.get("lr"), b1=d.get("b1"), b2=d.get("b2"),
+                          eps=d.get("eps"), weight_decay=d.get("weight_decay"), clip=d.get("clip"),
+                          decay=dec, no_decay=[str(x) for x in d.get("no_decay", [])]))
+    paths = _leaf_paths(params)
+    if len(paths) != len(leaves):
+        raise TrainError("parameter groups: the parameter tree has leaves that are not arrays")
+    gid, decay = [], []
+    for path, a in zip(paths, leaves):
+        g_, rest = 0, None
+        for j, sp in enumerate(specs):
+            if "*" in sp["names"] and rest is None:
+                rest = j + 1
+            if any(path == nm or path.startswith(nm + ".") for nm in sp["names"] if nm != "*"):
+                g_ = j + 1
+                break
+        if g_ == 0 and rest is not None:
+            g_ = rest
+        sp = specs[g_ - 1] if g_ else None
+        how = "matrices" if sp is None else sp["decay"]
+        if isinstance(how, list):                        # exactly these parts decay
+            dec = any(path == nm or path.startswith(nm + ".") for nm in how)
+        else:
+            dec = {"all": True, "none": False}.get(how, a.ndim >= 2)
+        if sp is not None and any(h in path.lower() for h in sp["no_decay"]):
+            dec = False
+        gid.append(g_)
+        decay.append(dec)
+    return dict(specs=specs, gid=gid, decay=decay)
+
+
 class Net:
     """A model compiled for the device: parameters in one flat array, a tree of nodes."""
 
-    def __init__(self, ops, model, params, precision="auto", graph=None, recompute=None):
+    def __init__(self, ops, model, params, precision="auto", graph=None, recompute=None, groups=None):
         from . import lowbit
         self.ops = ops
         self.graph, self.gdev, self.gkeep = graph, None, {}
@@ -5424,18 +5496,39 @@ class Net:
         self.kind = lowbit.parse(prec) if prec not in PRECISIONS else None
         self.passes = 3 if prec == "fp32" else 1
         leaves = [a for a in tree_leaves(params) if isinstance(a, np.ndarray)]
-        # matrices first (weight decay and low-bit rounding apply to them), then vectors
-        order = sorted(range(len(leaves)), key=lambda i: leaves[i].ndim < 2)
+        # matrices first (weight decay and low-bit rounding apply to them), then vectors; with parameter groups,
+        # group by group, each with its decayed weights first
+        self.groups = _param_groups(groups, params, leaves)
+        if self.groups is None:
+            gid, decay = [0] * len(leaves), [a.ndim >= 2 for a in leaves]
+        else:
+            gid, decay = self.groups["gid"], self.groups["decay"]
+        order = sorted(range(len(leaves)), key=lambda i: (gid[i], not decay[i]))
         # every matrix starts at a multiple of 8 elements (32 bytes): the tiled and bfloat16 products need aligned
         # operands, and one matrix of an odd size (a 66 x 1 head, say) would otherwise misalign all that follow
         self.offsets, off, self.n_decay = {}, 0, 0
+        seg = {}                                         # group -> [start, decayed end, end]
         for i in order:
             off = -(-off // 8) * 8                       # every parameter starts on a 32-byte boundary
+            sg = seg.setdefault(gid[i], [off, off, off])
             self.offsets[id(leaves[i])] = off
             off += leaves[i].size
-            if leaves[i].ndim >= 2:
-                self.n_decay = -(-off // 8) * 8          # the matrices (weight decay, low bit) end here
+            sg[2] = off
+            if decay[i]:
+                sg[1] = -(-off // 8) * 8
+                self.n_decay = sg[1]                     # the matrices (weight decay, low bit) end here
         self.n = max(off, self.n_decay)
+        if self.groups is not None:
+            if lowbit.parse(resolve_precision(precision)) if resolve_precision(precision) not in PRECISIONS else None:
+                raise TrainError("parameter groups do not work with low-bit training (precision=...)")
+            ks = sorted(seg)
+            self.segments = []                           # [start, length, decayed length, group]
+            for j, g_ in enumerate(ks):
+                a_, d_, e_ = seg[g_]
+                e_ = (seg[ks[j + 1]][0] if j + 1 < len(ks) else self.n)
+                self.segments.append([a_, e_ - a_, max(0, min(d_, e_) - a_), g_])
+        else:
+            self.segments = None
         self.leaves, self.params_tree = leaves, params
         self.P, self.G = ops.alloc(self.n), ops.alloc(self.n)
         if hasattr(ops, "weights_are"):
@@ -5814,7 +5907,7 @@ def _raw_of(a):
 def fit_batches(model, params, batches, loss="cross_entropy", opt=None, epochs=1, verbose=True, clip=None,
                 schedule=None, device="cuda", precision="auto", ops=None, compensated=None, every=None,
                 accumulate=1, stages=None, freeze=None, train_only=None, exact_sums=None, steps=None,
-                checkpoint=None, save_every=None, resume=True, callback=None, recompute=None):
+                checkpoint=None, save_every=None, resume=True, callback=None, recompute=None, groups=None):
     """Train on batches that each bring their own shapes: batches is a list of (inputs, targets[, graph]) or a
     function epoch -> such a list. inputs may be a list (a dag with several inputs: token ids, node features, ...);
     each batch may have its own graph (a batch of graphs), its own number of rows and its own lengths. One card."""
@@ -5846,7 +5939,9 @@ def fit_batches(model, params, batches, loss="cross_entropy", opt=None, epochs=1
     adam = isinstance(opt, Adam)
     wd = float(getattr(opt, "wd", 0.0)) if isinstance(opt, AdamW) else 0.0
     E = int(epochs)
-    net = Net(ops, model, params, precision, recompute=recompute)
+    net = Net(ops, model, params, precision, recompute=recompute, groups=groups)
+    if net.segments and not (adam and native_opt(opt)):
+        raise TrainError("parameter groups= need adam() or adamw()")
     n = net.n
     st1, st2, SQ = ops.alloc(n), (ops.alloc(n) if adam else None), ops.alloc(1)
     COMP = ops.alloc(n) if _want_comp(compensated, params, precision) else None
@@ -6048,10 +6143,17 @@ def _size_ratio(items, first):
         return 1.0
 
 
+def _layout_of(net):
+    """Where each weight sits in the flat array (offset and size, in tree order): a checkpoint is only read back
+    into the same layout."""
+    return np.array([[net.offsets[id(a)], a.size] for a in net.leaves], np.int64).reshape(-1, 2)
+
+
 def _ckpt_save(path, ops, net, st1, st2, COMP, t, step, epoch, batch=0, model=None):
     """The flat weights, the optimizer's moments and the carried rounding error, written atomically."""
     n = net.n
-    data = {"P": ops.get(net.P, n), "meta": np.array([n, t, step, epoch, batch], np.int64)}
+    data = {"P": ops.get(net.P, n), "meta": np.array([n, t, step, epoch, batch], np.int64),
+            "layout": _layout_of(net)}
     for name, b_ in (("M", st1), ("V", st2), ("C", COMP)):
         if b_ is not None:
             data[name] = ops.get(b_, n)
@@ -6077,6 +6179,10 @@ def _ckpt_load(path, ops, net, st1, st2, COMP, model=None):
         if n != net.n:
             raise TrainError(f"the checkpoint {path} is of a model with {n:,} weights, this one has {net.n:,}: "
                              "a different model (delete the file or give another checkpoint=)")
+        if ("layout" in z.files and not np.array_equal(z["layout"], _layout_of(net))) or \
+                ("layout" not in z.files and getattr(net, "segments", None)):
+            raise TrainError(f"the checkpoint {path} keeps its weights in another order (another model, other "
+                             "parameter groups= or an older Apsi): delete the file or give another checkpoint=")
         ops.put(net.P, z["P"].astype(np.float32))
         for name, b_ in (("M", st1), ("V", st2), ("C", COMP)):
             if b_ is not None and name in z.files:
@@ -6268,6 +6374,8 @@ def _apply_step(ops, net, opt, adam, wd, clip, schedule, step, t, st1, st2, SQ, 
 
 
 def _native_step(ops, net, opt, adam, wd, clip, lr, t, st1, st2, SQ, COMP, n):
+    if getattr(net, "segments", None) and adam:
+        return _group_step(ops, net, opt, wd, clip, lr, t, st1, st2, COMP)
     ops.fill((SQ, 0), 1, 0.0)
     if clip or _guard():
         ops.sumsq((net.G, 0), n, (SQ, 0))
@@ -6277,6 +6385,30 @@ def _native_step(ops, net, opt, adam, wd, clip, lr, t, st1, st2, SQ, COMP, n):
     else:
         ops.sgd((net.P, 0), (net.G, 0), (st1, 0), (SQ, 0), n, lr, float(opt.momentum), float(clip or 0.0),
                 (COMP, 0) if COMP else None)
+
+
+def _group_step(ops, net, opt, wd, clip, lr, t, st1, st2, COMP):
+    """AdamW over parameter groups: each group its own learning rate (scaled with the schedule like the
+    optimizer's), betas, eps, weight decay and gradient clipping (by the norm of its own gradients)."""
+    specs = net.groups["specs"]
+    gs = sorted({s_[3] for s_ in net.segments})
+    SQ = getattr(net, "_gsq", None)
+    if SQ is None or net._gsq_n < len(gs):
+        SQ = net._gsq = ops.alloc(max(8, len(gs)))
+        net._gsq_n = max(8, len(gs))
+    slot = {g_: i for i, g_ in enumerate(gs)}
+    ops.fill((SQ, 0), len(gs), 0.0)
+    for a_, k_, _d, g_ in net.segments:
+        ops.sumsq((net.G, a_), k_, (SQ, slot[g_]))
+    scale = lr / float(opt.lr) if float(opt.lr) else 1.0
+    for i, (a_, k_, d_, g_) in enumerate(net.segments):
+        sp = specs[g_ - 1] if g_ else {}
+        pick = lambda key, dflt: dflt if sp.get(key) is None else float(sp[key])     # noqa: E731
+        b1, b2 = pick("b1", opt.b1), pick("b2", opt.b2)
+        ops.adam((net.P, a_), (net.G, a_), (st1, a_), (st2, a_), (SQ, slot[g_]), k_, d_,
+                 pick("lr", float(opt.lr)) * scale, b1, b2, pick("eps", opt.eps), 1 - b1 ** t, 1 - b2 ** t,
+                 pick("weight_decay", wd), pick("clip", float(clip or 0.0)),
+                 (COMP, a_) if COMP else None, part=(i, len(net.segments)))
 
 
 def _want_exact(exact, params):

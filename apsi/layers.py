@@ -764,7 +764,7 @@ class Slice(Layer):
 
 class GradScale(Layer):
     """Identity going forward; going backward the gradient is multiplied by `alpha` (0: no gradient, 1: all of it): a
-    controlled share of one objective's gradient reaches the layers before it (GLA's soft bridge, alpha 0.08)."""
+    controlled share of one objective's gradient reaches the layers before it (a soft bridge, e.g. alpha 0.08)."""
     kind = "grad_scale"
 
     def __init__(self, alpha=0.08):
@@ -1334,7 +1334,7 @@ def _freeze_keep(old, new, paths):
 def fit_batches(model, params, batches, loss="cross_entropy", opt=None, epochs=1, backend="auto", device="cuda",
                 verbose=True, clip=None, schedule=None, precision="auto", compensated=None, every=None, accumulate=1,
                 stages=None, freeze=None, train_only=None, steps=None, checkpoint=None, save_every=None, resume=True,
-                callback=None, recompute=None, exact_sums=None):
+                callback=None, recompute=None, exact_sums=None, groups=None):
     """Train on batches that each bring their own shapes and graph: a list of (inputs, targets[, graph]) or a function
     epoch -> such a list. inputs may be a list (a dag with several inputs, e.g. token ids and node features). Each
     step is `accumulate` batches (their gradients averaged); the history is the mean loss of each epoch. backend: "auto"
@@ -1348,6 +1348,9 @@ def fit_batches(model, params, batches, loss="cross_entropy", opt=None, epochs=1
     end and when training stops on an error or Ctrl+C; running the same call again resumes exactly where it stopped
     (resume=false starts over). callback(record(epoch, step, loss)) after every epoch. A step whose gradient is not
     finite (inf / NaN) is skipped, so one bad batch cannot ruin the weights (APSI_GPU_GUARD=0 turns this off).
+    groups=[record(params=[names of parts], lr=, b1=, b2=, eps=, weight_decay=, clip=, decay="matrices"|"all"|"none"|[parts],
+    no_decay=[substrings of a path]), ...]: parameter groups, each with its own AdamW settings and its own gradient
+    clipping (params="*": every weight no other group takes); weights of no group use opt's settings and clip.
     recompute="auto" (the default on a card): the first step measures the memory; the blocks whose activations do not fit
     in the card's memory (residual / transformer blocks, hgt, global attention, graph transformer layers) are computed
     again in backward instead of kept, the rest keep them. true: every block; false: none."""
@@ -1362,10 +1365,15 @@ def fit_batches(model, params, batches, loss="cross_entropy", opt=None, epochs=1
                                       precision, compensated=compensated, every=every, accumulate=accumulate,
                                       stages=stages, freeze=freeze, train_only=train_only, steps=steps,
                                       checkpoint=checkpoint, save_every=save_every, resume=resume,
-                                      callback=callback, recompute=recompute, exact_sums=exact_sums)
+                                      callback=callback, recompute=recompute, exact_sums=exact_sums, groups=groups)
             except GT.TrainError as e:
                 raise RuntimeErr(f"backend=\"gpu\": {e}") from None
     lf = loss if callable(loss) else _loss_fn(loss)
+    if groups:                                           # parameter groups: one AdamW, each group its own settings
+        from .stdlib import GroupAdamW
+        if not isinstance(opt, Adam):
+            raise RuntimeErr("fit_batches: groups= need adam() or adamw()")
+        opt, clip = GroupAdamW(opt, groups, clip), None
     E = int(epochs)
     every = int(every or max(1, E // 10))
     history, step = [], 0

@@ -325,8 +325,33 @@ class Trainer(unittest.TestCase):
         self.assertTrue(any(nd.forced for nd in net.ck))
         net.close()
 
+    def test_parameter_groups(self):
+        """groups=: each part its own AdamW settings (learning rate, betas, eps, weight decay on every weight or on
+        the matrices without the named ones) and its own gradient clipping - the card equals the processor."""
+        rng = np.random.default_rng(4)
+        V, d, T = 17, 12, 5
+        m = L.DAG([["emb", L.Embedding(V, d), "tok"], ["h", L.Residual(L.SwiGLU(d, 24), pre_norm=L.RMSNorm(d)), "emb"],
+                   ["n", L.LayerNorm(d), "h"], ["out", L.Linear(d, V), "n"]], inputs=["tok"], output="out")
+        bs = []
+        for _ in range(4):
+            t = rng.integers(0, V, (3, T))
+            bs.append(([t], np.roll(t, -1, 1)))
+        groups = [dict(params=["h"], lr=0.003, b1=0.8, b2=0.95, eps=1e-6, weight_decay=0.1, decay="all", clip=0.05),
+                  dict(params=["emb", "out"], lr=0.02, weight_decay=0.05, no_decay=["emb"])]
+        a = L.fit_batches(m, m.init(seed=0), bs, "cross_entropy", opt=adamw(0.01, weight_decay=0.01), epochs=3,
+                          backend="numpy", verbose=False, clip=1.0, groups=groups)
+        b = GT.fit_batches(m, m.init(seed=0), bs, "cross_entropy", opt=adamw(0.01, weight_decay=0.01), epochs=3,
+                           verbose=False, precision="fp32", ops=GT.Emulator(), clip=1.0, groups=groups,
+                           compensated=False)
+        np.testing.assert_allclose(a.history, b.history, rtol=1e-5)
+        for x, y in zip(tree_leaves(a.params), tree_leaves(b.params)):
+            np.testing.assert_allclose(x, y, rtol=2e-4, atol=2e-6)
+        c = L.fit_batches(m, m.init(seed=0), bs, "cross_entropy", opt=adamw(0.01, weight_decay=0.01), epochs=3,
+                          backend="numpy", verbose=False, clip=1.0)
+        self.assertFalse(np.allclose(np.asarray(c.params.h.inner.Wg), np.asarray(a.params.h.inner.Wg)))
+
     def test_heterogeneous_brain_options(self):
-        """typed_graph_encoder as GLA's brains: global attention, graph context and final norm over every node
+        """typed_graph_encoder as multi-brain graph encoders: global attention, graph context and final norm over every node
         (scope="all"), the output projection's bias on every node of a type that receives edges (out_bias="type"),
         the exact gelu, typed_pool with fixed-weight other types: the card equals NumPy, with and without recompute."""
         from apsi import graphs as GR

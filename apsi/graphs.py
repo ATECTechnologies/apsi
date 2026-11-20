@@ -320,7 +320,7 @@ class GraphMemory(Layer):
 
 
 class NodeTextEncoder(Layer):
-    """Node features from each node's text (GLA's token-efficient encoder): the masked means of a token-id and a
+    """Node features from each node's text (a token-efficient text encoder): the masked means of a token-id and a
     hash-id embedding of its tokens, projected; plus a learned attention pooling of the tokens with their positions
     (gated, starts small); plus embeddings of the language, the language family, the node type and five structural
     codes, each with a learned mix. Input [N, 2 L + 9] integers per node: L token ids, L hash ids, the number of tokens
@@ -386,7 +386,7 @@ def _ln(x, w, b, eps=1e-5):
 
 
 class BrainRouting(Layer):
-    """GLA's routing of three brains' summaries through ONE mixture of experts and ONE fusion bridge, in the
+    """The routing of three graph encoders' summaries through ONE mixture of experts and ONE fusion bridge, in the
     order the original runs them: C (task 2), then A (task 0, fused with C's routed vector), then B (task 1, fused
     with A's). Router: layer norm, gate + task bias (+ noise while training), the top_k experts (chosen with a
     balancing bias that follows the experts' load), each a pre-norm two-layer GELU block blended with a running mean of
@@ -584,7 +584,7 @@ class MaskRows(Layer):
 
 class GatedDelta(Layer):
     """x + out(gelu(inp(f))) * f[:, 0]: a correction from side features that is exactly zero for the rows whose first
-    feature is 0 (GLA's math / physics adapter: the features of the numbers and units in a text; out starts at 0).
+    feature is 0 (a math / physics adapter: the features of the numbers and units in a text; out starts at 0).
     Input [x, f]."""
     kind = "gated_delta"
 
@@ -608,7 +608,7 @@ class GatedDelta(Layer):
 
 
 class MemorySlots(Layer):
-    """A decoder's memory from two sets of node states and two summaries (GLA's writer memory): of each set, the k best
+    """A decoder's memory from two sets of node states and two summaries (a writer's graph memory): of each set, the k best
     nodes of every row (by a learned score; their projection scaled by sigmoid(score)) plus the embedding of their node
     type and of the set's slot; each summary projected plus its slot; a learned null slot; an RMS norm over all.
     Input [A, C, sum_a, sum_c]: A and C node states [N, d_in] of the batch's graph, sum_a / sum_c [B, d_in]. The nodes

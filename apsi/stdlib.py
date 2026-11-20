@@ -897,6 +897,57 @@ class AdamW(Adam):
         return super().step(decayed, grads)
 
 
+class GroupAdamW(Adam):
+    """AdamW over parameter groups (fit_batches(groups=...)): each group its own learning rate (scaled with the
+    schedule like the base optimizer's), betas, eps, weight decay (on its matrices, or on every weight with
+    decay="all"; no_decay= substrings of a path take a weight out) and gradient clipping by its own norm. The same
+    update as the card's kernels."""
+
+    def __init__(self, base, groups, clip=None):
+        super().__init__(base.lr, base.b1, base.b2, base.eps)
+        self.lr0 = float(base.lr)
+        self.wd = float(getattr(base, "wd", 0.0)) if isinstance(base, AdamW) else 0.0
+        self.groups, self.clip, self._g = groups, clip, None
+
+    def step(self, params, grads):
+        from .gpu_train import _param_groups
+        pairs = []
+        tree_map(lambda a, g: pairs.append((a, g)), params, grads)     # (the gradient tree may hold extra leaves)
+        keep = [i for i, (a, _) in enumerate(pairs) if isinstance(ops.raw(a), np.ndarray)]
+        P = [pairs[i][0] for i in keep]
+        if self._g is None:
+            self._g = _param_groups(self.groups, params, [np.asarray(ops.raw(a)) for a in P])
+        gi, dec, specs = self._g["gid"], self._g["decay"], self._g["specs"]
+        G = [np.asarray(_float_arr(pairs[i][1]), np.float64) for i in keep]
+        if self.m is None:
+            z = lambda a: np.zeros(np.shape(ops.raw(a))) if isinstance(ops.raw(a), np.ndarray) else None  # noqa: E731
+            self.m, self.v = tree_map(z, params), tree_map(z, params)
+        M = [a for a in tree_leaves(self.m) if isinstance(a, np.ndarray)]
+        V = [a for a in tree_leaves(self.v) if isinstance(a, np.ndarray)]
+        self.t += 1
+        scale = self.lr / self.lr0 if self.lr0 else 1.0
+        norms = {}
+        for g_, a in zip(gi, G):
+            norms[g_] = norms.get(g_, 0.0) + float(np.sum(a * a))
+        out = []
+        for i, p in enumerate(P):
+            sp = self._g["specs"][gi[i] - 1] if gi[i] else {}
+            pick = lambda key, dflt: dflt if sp.get(key) is None else float(sp[key])     # noqa: E731
+            lr, b1, b2 = pick("lr", self.lr0) * scale, pick("b1", self.b1), pick("b2", self.b2)
+            eps, wd, clip = pick("eps", self.eps), pick("weight_decay", self.wd), pick("clip", self.clip or 0.0)
+            g = G[i]
+            nrm = math.sqrt(norms[gi[i]])
+            if clip and nrm > clip:
+                g = g * (clip / nrm)
+            M[i][...] = b1 * M[i] + (1 - b1) * g
+            V[i][...] = b2 * V[i] + (1 - b2) * g * g
+            pv = np.asarray(ops.raw(p), np.float64)
+            w = pv * (1 - lr * wd) if dec[i] else pv
+            out.append(np.asarray(w - lr * (M[i] / (1 - b1 ** self.t)) / (np.sqrt(V[i] / (1 - b2 ** self.t)) + eps)))
+        it = iter(out)
+        return tree_map(lambda a: next(it) if isinstance(ops.raw(a), np.ndarray) else a, params)
+
+
 def adamw(lr=1e-3, b1=0.9, b2=0.999, eps=1e-8, weight_decay=0.01):
     return AdamW(lr, b1, b2, eps, weight_decay)
 
