@@ -32,7 +32,7 @@ jobs:
       matrix:
         include:
           - { os: windows-2022, script: "dist:win", files: "installer/release/*.exe" }
-          - { os: ubuntu-22.04, script: "dist:linux", files: "installer/release/*.AppImage" }
+          - { os: ubuntu-24.04, script: "dist:linux", files: "installer/release/*.AppImage" }
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
