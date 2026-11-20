@@ -352,6 +352,24 @@ class Trainer(unittest.TestCase):
                                precision="fp32", ops=GT.Emulator(), recompute=rc)
             np.testing.assert_allclose(a.history, b.history, rtol=1e-5)
         self.assertLess(b.history[-1], b.history[0])
+        # two brains over one batch graph, each over the nodes of its own region (graph.region) only
+        m2 = L.DAG([["n0", L.Embedding(30, d), "nodes"],
+                    ["ea", GR.TypedGraphEncoder(d, 4, 2, [0, 1], [0, 1, 2], max_keys=3, scope="all", region=0,
+                                                out_bias="type", act="gelu_exact"), "n0"],
+                    ["eb", GR.TypedGraphEncoder(d, 4, 1, [2, 3], [3, 4], max_keys=3, scope="all", region=1,
+                                                out_bias="type", act="gelu_exact"), "ea"],
+                    ["pool", GR.TypedPool([0, 1, 2, 3]), "eb"], ["out", L.Linear(d, 3), "pool"]],
+                   inputs=["nodes"], output="out")
+        bs2 = []
+        for x_, y_, g in bs:
+            g.region = (g.ntype >= 2).astype(np.int64)
+            bs2.append((x_, y_, g))
+        a = L.fit_batches(m2, m2.init(seed=0), bs2, "cross_entropy", opt=Adam(0.01), epochs=3, backend="numpy",
+                          verbose=False)
+        for rc in (False, True):
+            b = GT.fit_batches(m2, m2.init(seed=0), bs2, "cross_entropy", opt=Adam(0.01), epochs=3, verbose=False,
+                               precision="fp32", ops=GT.Emulator(), recompute=rc)
+            np.testing.assert_allclose(a.history, b.history, rtol=1e-5)
 
     def test_node_text_encoder_and_memory_slots(self):
         """node_text_encoder (token / hash means, attention pooling with positions, language / family / type /

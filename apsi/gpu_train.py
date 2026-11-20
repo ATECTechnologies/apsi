@@ -4530,12 +4530,11 @@ class _GlobalAttention(_Node):
         if self.learned:
             self.ksw, self.ksb = net.param(p.ks_w), net.param(p.ks_b)
         self.T, self.type_ids = getattr(layer, "T", None), getattr(layer, "type_ids", None)
+        self.region = getattr(layer, "region", None)
+        self.masked = self.T is not None or self.region is not None
 
     def _own(self, N):
-        if self.T is None:
-            return np.ones(N, bool)
-        from .graphs import _owned_mask
-        return _owned_mask(self.net.graph, N, self.T, self.type_ids).reshape(-1)
+        return self.layer.own(self.net.graph, N).reshape(-1)
 
     def _gd(self, N):
         g = self.net.graph
@@ -4574,8 +4573,8 @@ class _GlobalAttention(_Node):
                 d_, minlength=N))])), row=put("e_row", d_), ids=gd.cache[ar], eoff=gd.cache[ar], n=N, E=E, src=s_,
                 dst=d_, cached=False)
             return gd, f, col
-        f = gd.custom(("global", self.max_keys, self.type_ids), src, dst)
-        ck = ("ga", self.max_keys, self.type_ids)
+        f = gd.custom(("global", self.max_keys, self.type_ids, self.region), src, dst)
+        ck = ("ga", self.max_keys, self.type_ids, self.region)
         if ck not in gd.cache:
             gd.cache[ck] = gd._put(f["src"])
         return gd, f, gd.cache[ck]
@@ -4612,7 +4611,7 @@ class _GlobalAttention(_Node):
             o.spmm(VR, _ofs(kid, c.e0), al, None, c.off, _ofs(self.msg, c.r0 * I), c.n, H, hd)
         y = self.buf("y", N * d)
         self.dropping = self.net.train and float(getattr(self.layer, "p_drop", 0.0)) > 0
-        if self.T is None and not self.dropping:
+        if not self.masked and not self.dropping:
             o.gemm(self.msg, self.Wo.w, y, N, d, I, I, 1, d, 1, d, bias=self.bo.w, passes=ps, epi=3, X2=x)
         else:
             dl = self.buf("dl", N * d)
@@ -4622,7 +4621,7 @@ class _GlobalAttention(_Node):
                 self.net.seed = (self.net.seed * 1103515245 + 12345) & 0x7FFFFFFF
                 o.drop_f(dl, dd_, self.dmask, N * d, float(self.layer.p_drop), self.net.seed)
                 dl = dd_
-            if self.T is None:
+            if not self.masked:
                 o.add3(y, x, dl, N * d)
             else:
                 self.own = _put_buf(self, "own", self._own(N), np.float32)
@@ -4633,7 +4632,7 @@ class _GlobalAttention(_Node):
         o, ps = self.net.ops, self.net.passes
         N, d, H, hd, I = self.N, self.d, self.H, self.hd, self.inner
         f, kid = self.f, self.kid
-        dd = dy if self.T is None else _diag(self, "ddl", dy, self.own, N, d, grad=True)
+        dd = dy if not self.masked else _diag(self, "ddl", dy, self.own, N, d, grad=True)
         if self.dropping:
             dm_ = self.gbuf("ddrop", N * d)
             o.mul3(dm_, dd, self.dmask, N * d)
@@ -4876,12 +4875,13 @@ class _TypedEncoder(_Node):
         or every node with scope="all")."""
         gd = _need_graph(self.net, "typed_graph_encoder")
         every = reach and getattr(self.layer, "scope", "owned") == "all"
-        k = ("typed-own", self.T, self.ids, every)
+        k = ("typed-own", self.T, self.ids, every, getattr(self.layer, "region", None) if every else None)
         if k not in gd.cache:
             from .graphs import _owned_mask
             own = _owned_mask(self.net.graph, N, self.T, self.ids).reshape(-1)
             if every:
-                own = np.ones_like(own)
+                from .graphs import region_mask
+                own = region_mask(self.net.graph, N, getattr(self.layer, "region", None)).reshape(-1)
             batch = np.asarray(self.net.graph.batch, np.int64)
             G = max(int(self.net.graph.graphs), int(batch.max(initial=-1)) + 1)
             gd.cache[k] = (gd._put(own, np.float32), gd._put(~own, np.float32), _Seg(gd, np.where(own, batch, -1), G))

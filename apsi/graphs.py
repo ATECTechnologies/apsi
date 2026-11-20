@@ -178,9 +178,10 @@ class GlobalAttention(Layer):
     kind = "global_attention"
 
     def __init__(self, d, heads=4, max_keys=4096, ratio=1.0, learned_keys=False, bias=False, zero_init=False,
-                 types=None, dropout=0.0):
+                 types=None, dropout=0.0, region=None):
         self.d, self.h, self.max_keys = int(d), int(heads), int(max_keys)
         self.p_drop = float(dropout)
+        self.region = None if region is None else int(region)    # only the nodes of this region (graph.region)
         if self.d % self.h:
             raise ShapeError(f"global_attention: d={self.d} must be divisible by heads={self.h}")
         self.hd = self.d // self.h
@@ -203,7 +204,11 @@ class GlobalAttention(Layer):
         return Record(**f)
 
     def own(self, g, N):
-        return np.ones((N, 1), bool) if self.T is None else _owned_mask(g, N, self.T, self.type_ids)
+        m = np.ones((N, 1), bool) if self.T is None else _owned_mask(g, N, self.T, self.type_ids)
+        return m & region_mask(g, N, self.region) if self.region is not None else m
+
+    def masked(self):
+        return self.T is not None or self.region is not None
 
     def keys_of(self, idx, score):
         """The key rows of one graph (its query rows idx): all of them, or max_keys of them."""
@@ -243,7 +248,7 @@ class GlobalAttention(Layer):
             return x
         out = segment_sum(ops.concat(outs, 0) if len(outs) > 1 else outs[0], np.concatenate(rows), N)
         delta = _drop(out @ p.Wo + p.bo, self.p_drop, train)
-        return x + (delta if self.T is None else ops.where(own, delta, 0.0))
+        return x + (ops.where(own, delta, 0.0) if self.masked() else delta)
 
     def describe(self):
         extra = (f", ratio={self.ratio}" if self.H != self.h else "") + (", learned keys" if self.learned else "")
@@ -656,6 +661,19 @@ class HGT(Layer):
         return f"hgt(d={self.d}, heads={self.h}, {self.T} node types, {self.R} relations)"
 
 
+def region_mask(g, N, region):
+    """[N, 1] bool: the nodes of `region` (graph.region, one int per node; set it on the batch's graph), or all."""
+    if region is None:
+        return np.ones((N, 1), bool)
+    r = getattr(g, "region", None) if g is not None else None
+    if r is None:
+        raise ShapeError(f"region={region}: the batch's graph has no .region (one region number per node)")
+    r = np.asarray(r, np.int64).reshape(-1)
+    if len(r) != N:
+        raise ShapeError(f"graph.region has {len(r)} entries for {N} nodes")
+    return (r == int(region))[:, None]
+
+
 def _drop(x, p, train):
     """Dropout of a branch while training (the rest of the time x)."""
     if not train or p <= 0:
@@ -784,7 +802,7 @@ class TypedGraphEncoder(Layer):
     kind = "typed_graph_encoder"
 
     def __init__(self, d, heads, layers, types, relations, global_every=1, max_keys=4096, ratio=0.5, ffn_mult=4,
-                 context=True, scope="owned", dropout=0.0, out_bias="node", act="gelu"):
+                 context=True, scope="owned", dropout=0.0, out_bias="node", act="gelu", region=None):
         self.d, self.h, self.L = int(d), int(heads), int(layers)
         self.T, self.type_ids = _owned(types)
         self.types = list(self.type_ids) if self.type_ids is not None else self.T
@@ -793,12 +811,14 @@ class TypedGraphEncoder(Layer):
             raise ShapeError('typed_graph_encoder: scope is "owned" (global attention, graph context and the final '
                              'norm over the owned nodes) or "all" (over every node of the graph)')
         self.scope, self.p_drop = scope, float(dropout)
+        self.region = None if region is None else int(region)    # scope="all": the nodes of this region only
         self.inp = TypedLinear(d, d, self.types)
         self.act = str(act)
         self.layers = [HGT(d, heads, self.types, relations, ffn_mult, dropout=dropout, out_bias=out_bias, act=act)
                        for _ in range(self.L)]
         self.ga = {li: GlobalAttention(d, heads, max_keys, ratio=ratio, learned_keys=True, bias=True, zero_init=True,
-                                       types=self.types if scope == "owned" else None, dropout=dropout)
+                                       types=self.types if scope == "owned" else None, dropout=dropout,
+                                       region=self.region if scope == "all" else None)
                    for li in range(self.L) if self.every > 0 and (li + 1) % self.every == 0}
         self.final = LayerNorm(d)
 
@@ -825,7 +845,7 @@ class TypedGraphEncoder(Layer):
         h = ops.where(own, ACTIVATIONS[self.act](self.inp(p.input, x, **ctx)), x)
         gi = 0
         order = sorted(self.ga)
-        reach = own if self.scope == "owned" else np.ones_like(own)      # where the global parts act
+        reach = own if self.scope == "owned" else region_mask(g, N, self.region)   # where the global parts act
         for li, layer in enumerate(self.layers):
             h = layer(p.layers[li], h, train=train, **ctx)
             if li in self.ga:
