@@ -2155,10 +2155,16 @@ class _Linear(_Node):
                    bias=self.b.w if self.b else None, passes=self.net.passes, epi=1, X2=self.h, act=self.act,
                    **({"y16": self.y16, "y16_only": self.y16_only} if self.y16 is not None else {}))
         elif self.x_pre is not None and getattr(self.x_pre, "y16_only", False):   # x only in bfloat16 (its twin)
-            if not o.gemm_a16(self.x_pre.y16, self.W.w, y, M, self.N, self.K, self.K, 1, self.N, 1, self.N,
-                              bias=self.b.w if self.b else None, epi=3 if residual else 0, X2=residual):
-                raise TrainError("internal: the bfloat16-only input found no product (APSI_Y16_ONLY=0)")
-            o.drop_twin(x)
+            if o.gemm_a16(self.x_pre.y16, self.W.w, y, M, self.N, self.K, self.K, 1, self.N, 1, self.N,
+                          bias=self.b.w if self.b else None, epi=3 if residual else 0, X2=residual):
+                o.drop_twin(x)
+            else:
+                # no bfloat16-input build for this shape: act(h) in float32 from the kept pre-activation, then the
+                # usual product (the twin stays for the weight gradient)
+                o.act_f(self.x_pre.h, x, M * self.K, self.x_pre.act)
+                o.gemm(x, self.W.w, y, M, self.N, self.K, self.K, 1, self.N, 1, self.N,
+                       bias=self.b.w if self.b else None, passes=self.net.passes, epi=3 if residual else 0,
+                       X2=residual)
         else:                                           # y = x W + b (+ the residual input); x in bfloat16 if bf_in
             o.gemm(x, self.W.w, y, M, self.N, self.K, self.K, 1, self.N, 1, self.N,
                    bias=self.b.w if self.b else None, passes=self.net.passes, epi=3 if residual else 0, X2=residual,
@@ -4367,7 +4373,7 @@ class _GlobalAttention(_Node):
             put = lambda name, a: _put_buf(self, name, a)              # noqa: E731
             f = dict(col=put("e_col", s_), off=put("e_off", np.concatenate([[0], np.cumsum(np.bincount(
                 d_, minlength=N))])), row=put("e_row", d_), ids=put("e_ids", np.arange(E)),
-                eoff=put("e_eoff", np.arange(E + 1)), n=N, E=E, src=s_, dst=d_)
+                eoff=put("e_eoff", np.arange(E + 1)), n=N, E=E, src=s_, dst=d_, cached=False)
             return gd, f, put("e_kid", s_)
         f = gd.custom(("global", self.max_keys, self.type_ids), src, dst)
         ck = ("ga", self.max_keys, self.type_ids)
@@ -4396,8 +4402,14 @@ class _GlobalAttention(_Node):
             self.VR = VR
             VR = _diag(self, "vrs", VR, self.s2, N, I)
         gd, f, kid = self._edges(N, score)
-        self.f, self.kid, self.q = f, kid, q
-        self.msg = _EdgeAttention.fwd(self, f, q, KR, VR, kid, N, H, hd)
+        self.f, self.kid, self.q, self.gdv = f, kid, q, gd
+        self.KR, self.VRs = KR, VR
+        # lean edge attention: nothing per edge is kept between forward and backward (the scores and weights are
+        # made again in backward, in buffers every global_attention layer shares), and the keys / values are read
+        # through their row ids instead of being copied per edge: memory grows with the nodes, not nodes x keys
+        al = self._scores(f, kid, q, KR, N, H, hd)
+        self.msg = self.buf("msg", N * I)
+        o.spmm(VR, kid, al, None, f["off"], self.msg, N, H, hd)
         y = self.buf("y", N * d)
         if self.T is None:
             o.gemm(self.msg, self.Wo.w, y, N, d, I, I, 1, d, 1, d, bias=self.bo.w, passes=ps, epi=3, X2=x)
@@ -4416,7 +4428,7 @@ class _GlobalAttention(_Node):
         o.gemm(self.msg, dd, self.Wo.g, I, d, N, 1, I, d, 1, d, beta=True, passes=ps, db=self.bo.g)
         dmsg = self.gbuf("dmsg", N * I)
         o.gemm(dd, self.Wo.w, dmsg, N, I, d, d, 1, 1, d, I, passes=ps)
-        dq, dK, dV = _EdgeAttention.bwd(self, f, self.q, kid, dmsg, N, H, hd, N)
+        dq, dK, dV = self._lean_bwd(f, kid, dmsg, N, H, hd)
         dh = self.gbuf("dh", N * d)
         if self.learned:                                   # v = v_raw 2 sigmoid(s): back to v_raw and to s
             dvs = self.gbuf("dvs", max(1, N))
@@ -4435,6 +4447,51 @@ class _GlobalAttention(_Node):
         if self.learned:
             o.gemm(dsc, self.ksw.w, dh, N, d, 1, 1, 1, 1, 1, d, beta=True, passes=3)
         return self.n.bwd(dh, True, residual=dy)
+
+    def _scores(self, f, kid, q, KR, N, H, hd):
+        """The attention weights of every edge, in the shared buffer (made again in backward)."""
+        o, E = self.net.ops, f["E"]
+        sc = self.net.arena.get(("shared", "ga_sc"), max(1, E * H))
+        al = self.net.arena.get(("shared", "ga_al"), max(1, E * H))
+        o.edge_dot(q, KR, f["row"], kid, sc, E, H, hd)                    # q[target] . k[key]
+        o.axpy(sc, sc, E * H, 1.0 / math.sqrt(hd) - 1.0)
+        o.seg_softmax(sc, f["off"], al, N, H, 1.0)
+        self._sc = sc
+        return al
+
+    def _by_key(self, f, N):
+        """The edges grouped by their key row (for the keys' and values' gradients without a copy per edge)."""
+        key = ("ga_bykey", id(f))
+        hit = self.gdv.cache.get(key) if f.get("cached", True) else None
+        if hit is not None and hit[3] is not f:
+            hit = None
+        if hit is None:
+            s_, d_ = np.asarray(f["src"], np.int64), np.asarray(f["dst"], np.int64)
+            perm = np.argsort(s_, kind="stable")
+            koff = np.concatenate([[0], np.cumsum(np.bincount(s_, minlength=N))])
+            if f.get("cached", True):
+                hit = self.gdv.cache[key] = (self.gdv._put(d_[perm]), self.gdv._put(perm), self.gdv._put(koff), f)
+            else:
+                put = lambda name, a: _put_buf(self, name, a)              # noqa: E731
+                hit = (put("k_row", d_[perm]), put("k_perm", perm), put("k_off", koff), f)
+        return hit[:3]
+
+    def _lean_bwd(self, f, kid, dmsg, N, H, hd):
+        o, E = self.net.ops, f["E"]
+        I = H * hd
+        al = self._scores(f, kid, self.q, self.KR, N, H, hd)             # the forward's weights, made again
+        dal = self.net.arena.get(("shared", "ga_dal"), max(1, E * H))
+        o.edge_dot(dmsg, self.VRs, f["row"], kid, dal, E, H, hd)
+        ds = self.net.arena.get(("shared", "ga_ds"), max(1, E * H))
+        o.seg_softmax_b(self._sc, al, dal, f["off"], ds, N, H, 1.0)
+        o.axpy(ds, ds, E * H, 1.0 / math.sqrt(hd) - 1.0)
+        dq = self.gbuf("dq", N * I)
+        o.spmm(self.KR, kid, ds, None, f["off"], dq, N, H, hd)
+        krow, kperm, koff = self._by_key(f, N)
+        dK, dV = self.gbuf("dkr", N * I), self.gbuf("dvr", N * I)
+        o.spmm(self.q, krow, ds, kperm, koff, dK, N, H, hd)
+        o.spmm(dmsg, krow, al, kperm, koff, dV, N, H, hd)
+        return dq, dK, dV
 
     def n_ids(self, N):
         gd = self.net.gdev

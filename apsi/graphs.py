@@ -520,7 +520,9 @@ def context_delta(x, own, batch, G, W, b, gate):
     xs = x[np.nonzero(o)[0]] if not o.all() else x
     mu = segment_sum(xs, ids, G) / cnt
     gproj = mu @ W + b
-    nrm = ops.sqrt(ops.sum_(mu * mu, axis=-1, keepdims=True))
+    ss = ops.sum_(mu * mu, axis=-1, keepdims=True)
+    # (a graph without owned nodes has mu = 0: the root is taken of 1e-12 there, so its gradient stays finite)
+    nrm = ops.sqrt(ops.where(np.asarray(ops.raw(ss)) > 1e-12, ss, 1e-12))
     nraw = np.asarray(ops.raw(nrm))
     u = mu / ops.where(nraw > 1e-6, nrm, 1e-6)
     gc = gproj - ops.sum_(gproj * u, axis=-1, keepdims=True) * u
