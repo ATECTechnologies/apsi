@@ -1,7 +1,7 @@
 @echo off
-rem Apsi 2.6.0 on this computer: every benchmark and test that needs your own processor and NVIDIA card.
+rem Apsi 2.6.2 on this computer: every benchmark and test that needs your own processor and NVIDIA card.
 rem   Double-click it. Takes about 30-60 minutes. Close other heavy programs first (games, browsers with video).
-rem The results go to the folder bench-results-2.6.0 in the Apsi folder; send that folder back (or zip it).
+rem The results go to the folder bench-results-2.6.2 in the Apsi folder; send that folder back (or zip it).
 rem What it runs:
 rem   1. the machine:              apsi doctor (processor, memory, card, driver)
 rem   2. correctness on the card:  every GPU kernel against the exact reference, typed graphs and a transformer trained twice
@@ -11,7 +11,7 @@ rem                                (tokens/s, temperature, power, energy per tok
 rem   4. a training step, measured: queued against waiting copies, the kernels' shares
 rem   5. CPU programs:             the eight heavy programs in Apsi and every other language installed here
 rem                                (C/C++ with gcc or clang, Rust, Go, Java, Node.js, C#, Julia: missing ones are skipped)
-rem   6. Apsi 2.6.0 against 2.4.4: the same programs, start-up and checking, on this computer
+rem   6. Apsi 2.6.2 against 2.4.4: the same programs, start-up and checking, on this computer
 rem                                (needs apsi-2.4.4-source.zip in Downloads or Downloads\apsi-old-versions)
 rem Not run here (not part of this test): real language models from Hugging Face (use hub), the AI server, databases.
 setlocal EnableDelayedExpansion
@@ -21,10 +21,10 @@ set "APSI=%CD%"
 set "PYTHONPATH=%APSI%;%PYTHONPATH%"
 set "PYTHONUTF8=1"
 set "APSI_NATIVE_QUIET=1"
-set "OUT=%APSI%\bench-results-2.6.0"
+set "OUT=%APSI%\bench-results-2.6.2"
 if not exist "%OUT%" mkdir "%OUT%"
 set "LOG=%OUT%\summary.txt"
-echo Apsi 2.6.0 benchmarks on this computer, %DATE% %TIME% > "%LOG%"
+echo Apsi 2.6.2 benchmarks on this computer, %DATE% %TIME% > "%LOG%"
 
 set "PY="
 for %%P in ("py -3.14" "py -3.13" "py -3.12" "python") do (
@@ -70,11 +70,11 @@ type "%OUT%\flow-bench.txt" >> "%LOG%"
 
 echo == 5. CPU programs against the other languages (15-30 minutes)
 echo == 5. CPU programs >> "%LOG%"
-!PY! benchmarks\heavy\run.py --skip Mojo --out "%OUT%\heavy-2.6.0" > "%OUT%\heavy-2.6.0.txt" 2>&1
-type "%OUT%\heavy-2.6.0\results.md" >> "%LOG%" 2>nul
+!PY! benchmarks\heavy\run.py --skip Mojo --out "%OUT%\heavy-2.6.2" > "%OUT%\heavy-2.6.2.txt" 2>&1
+type "%OUT%\heavy-2.6.2\results.md" >> "%LOG%" 2>nul
 
-echo == 6. Apsi 2.6.0 against 2.4.4
-echo == 6. 2.6.0 against 2.4.4 >> "%LOG%"
+echo == 6. Apsi 2.6.2 against 2.4.4
+echo == 6. 2.6.2 against 2.4.4 >> "%LOG%"
 set "OLDZIP=%USERPROFILE%\Downloads\apsi-2.4.4-source.zip"
 if not exist "%OLDZIP%" set "OLDZIP=%USERPROFILE%\Downloads\apsi-old-versions\apsi-2.4.4-source.zip"
 set "OLD=%TEMP%\apsi-bench-2.4.4"

@@ -337,7 +337,7 @@ class Mongo:
         self.req = 0
         try:
             hello = self.command({"hello": 1, "client": {"application": {"name": "apsi"},
-                                                         "driver": {"name": "apsi", "version": "2.6.0"}}}, db="admin")
+                                                         "driver": {"name": "apsi", "version": "2.6.2"}}}, db="admin")
             self.server = hello
             if user:
                 mechs = hello.get("saslSupportedMechs") or []

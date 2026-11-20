@@ -12,7 +12,7 @@
   <a href="https://github.com/ATECTechnologies/apsi/actions/workflows/darwin-arm64.yml"><img src="https://github.com/ATECTechnologies/apsi/actions/workflows/darwin-arm64.yml/badge.svg" alt="darwin-arm64"></a>
 </p>
 <p align="center">
-  <a href="https://apsi.dev/download"><img src="https://img.shields.io/badge/download-2.6.0-2ea44f" alt="Download Apsi 2.6.0"></a>
+  <a href="https://apsi.dev/download"><img src="https://img.shields.io/badge/download-2.6.2-2ea44f" alt="Download Apsi 2.6.2"></a>
   <img src="https://img.shields.io/badge/python-3.12%20%7C%203.13%20%7C%203.14-3776ab" alt="Python 3.12 | 3.13 | 3.14">
   <img src="https://img.shields.io/badge/native-LLVM%20%7C%20AVX2%20%7C%20AVX--512%20%7C%20NEON-555" alt="native code">
   <img src="https://img.shields.io/badge/GPU-CUDA%20%7C%20Tensor%20Cores-76b900" alt="GPU">
@@ -22,7 +22,7 @@
 <p align="center">
   <a href="https://apsi.dev">Website</a> ·
   <a href="https://apsi.dev/docs">Documentation</a> ·
-  <a href="docs/WHATS-NEW.md">What's new in 2.6.0</a> ·
+  <a href="docs/WHATS-NEW.md">What's new in 2.6.2</a> ·
   <a href="https://apsi.dev/benchmarks">Benchmarks</a> ·
   <a href="https://apsi.dev/download">Download</a>
 </p>
@@ -70,9 +70,9 @@ fn energy(x, v, k: Float) -> Float:
 
 | System | File | Install |
 |---|---|---|
-| Windows 10/11 (x64) | `ApsiSetup-2.6.0-x64.exe` | double-click (brings its own Python; no administrator rights) |
-| Any Linux, also WSL | `ApsiSetup-2.6.0-linux.sh` | `sh ApsiSetup-2.6.0-linux.sh` (no root) |
-| Ubuntu / Debian | `apsi_2.6.0_all.deb` | `sudo apt install ./apsi_2.6.0_all.deb` |
+| Windows 10/11 (x64) | `ApsiSetup-2.6.2-x64.exe` | double-click (brings its own Python; no administrator rights) |
+| Any Linux, also WSL | `ApsiSetup-2.6.2-linux.sh` | `sh ApsiSetup-2.6.2-linux.sh` (no root) |
+| Ubuntu / Debian | `apsi_2.6.2_all.deb` | `sudo apt install ./apsi_2.6.2_all.deb` |
 
 From this repository: `pip install numpy`, then `./apsi.sh run examples/01_hello.apsi` (Linux, macOS) or
 `apsi.bat run examples\01_hello.apsi` (Windows). Building the installers: [`docs/BUILD.md`](docs/BUILD.md).
@@ -88,6 +88,16 @@ apsi debug app.apsi             # breakpoints and stepping (or F5 in VS Code)
 ```
 
 Then read [Getting started](docs/GETTING-STARTED.md) (15 minutes) or [Write Apsi your way](docs/WRITE-APSI.md).
+
+## What's new in 2.6.2
+
+* **Large models on one card.** A 155 M-parameter model of several graph encoders, a mixture-of-experts router and an
+  18-layer decoder (graphs of 6,144 nodes, sequences of 3,072 tokens) trains on a 12 GB RTX 3060: activation
+  recompute measured per block, global attention in pieces, nothing per edge kept.
+* **Your own GPU kernels as layers** (`gpu_layer`), **parameter groups** (each part its own AdamW settings and
+  clipping), **weighted cross-entropy on the card** (`card_loss(weights=)`).
+* **Other programs' model files:** a parameter tree under another program's tensor names (`models.named_tensors` /
+  `from_named_tensors`), text metadata in `.safetensors`, running statistics of layers in checkpoints.
 
 ## What's new in 2.6.0
 

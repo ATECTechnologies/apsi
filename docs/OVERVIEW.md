@@ -1,4 +1,4 @@
-# Apsi 2.6.0 — project overview
+# Apsi 2.6.2 — project overview
 
 **Apsi** is a programming language for **AI**, **physics** and **servers**. Physical units, tensor-shape
 checking, automatic differentiation, number formats from FP64 down to FP4, data pipelines and a hardened
@@ -29,10 +29,10 @@ Download from [apsi.dev/download](https://apsi.dev/download) (built yourself: th
 
 | System | File |
 |---|---|
-| Windows 10/11 (x64) | `ApsiSetup-2.6.0-x64.exe` — setup wizard with its own Python; no administrator rights needed |
-| Any Linux (also WSL) | `sh ApsiSetup-2.6.0-linux.sh` — one-file installer, no root; commands, `.apsi` file type with icon, editor support |
-| Ubuntu / Debian | `sudo apt install ./apsi_2.6.0_all.deb` |
-| Any system with Python 3.12+ | `pip install apsi-2.6.0-py3-none-any.whl` |
+| Windows 10/11 (x64) | `ApsiSetup-2.6.2-x64.exe` — setup wizard with its own Python; no administrator rights needed |
+| Any Linux (also WSL) | `sh ApsiSetup-2.6.2-linux.sh` — one-file installer, no root; commands, `.apsi` file type with icon, editor support |
+| Ubuntu / Debian | `sudo apt install ./apsi_2.6.2_all.deb` |
+| Any system with Python 3.12+ | `pip install apsi-2.6.2-py3-none-any.whl` |
 | Code editors | the setup wizard adds Apsi to VS Code, Cursor, Windsurf, VSCodium, Sublime Text, Vim/Neovim and Notepad++ it finds (`apsi editors install` does the same later) |
 
 The installer adds `apsi` to your PATH, registers `.apsi` files (icon, *Run with Apsi*, *Edit*, and
@@ -198,7 +198,7 @@ is final: it is the first build of the project, completed with 2.4.4; later vers
 
 ## Documentation
 
-- [`WHATS-NEW.md`](WHATS-NEW.md) — **everything new in 2.6.0**, with examples, measurements and limits ([2.4.4](WHATS-NEW-2.4.4.md))
+- [`WHATS-NEW.md`](WHATS-NEW.md) — **everything new in 2.6.2**, with examples, measurements and limits ([2.4.4](WHATS-NEW-2.4.4.md))
 - [`GETTING-STARTED.md`](GETTING-STARTED.md) — install, first program, first model, first library
 - [`NATIVE.md`](NATIVE.md) — **native code**: `@native`, `parallel for`, `@gpu`, benchmarks against C, C++, Rust, Go, Java, JavaScript, C#, Julia and Mojo
 - [`LIBRARIES.md`](LIBRARIES.md) — `.apsil` libraries: install, create, pack, publish, the registry API

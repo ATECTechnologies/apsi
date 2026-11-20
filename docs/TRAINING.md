@@ -1,6 +1,6 @@
 # Training that finishes: steps, checkpoints, exact results, no surprises
 
-This page explains how Apsi 2.6.0 keeps a training run **correct, repeatable and alive**: training by steps,
+This page explains how Apsi 2.6.2 keeps a training run **correct, repeatable and alive**: training by steps,
 checkpoints that resume to the exact bit, protection against crashes and bad batches, the same weights on any
 number of cards, and the settings that control all of it. Every setting has a safe default; this page tells you
 what each one does, why it matters, and what you give up if you turn it off.
@@ -124,7 +124,7 @@ Each setting can be turned off; section 9 says what changes.
 
 ## 6. Speed: what keeps the card busy
 
-The card is fastest when it never waits for the processor. In 2.6.0:
+The card is fastest when it never waits for the processor. In 2.6.2:
 
 - **Copies are queued, not waited for.** Inputs go through pinned memory and are queued behind the kernels already
   running (`APSI_GPU_ASYNC_COPY`, default on), so the processor prepares the next batch while the card works.
