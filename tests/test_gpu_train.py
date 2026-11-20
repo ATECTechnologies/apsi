@@ -277,7 +277,9 @@ class Trainer(unittest.TestCase):
         def model(p1, p2):
             return L.DAG([["n0", L.Embedding(30, d), "nodes"],
                           ["enc", GR.TypedGraphEncoder(d, 4, 3, 3, 2, global_every=1), "n0"],
-                          ["mem", GR.GraphMemory(d, 3), "enc"], ["e", L.Embedding(V, d), "tok"],
+                          ["ga", GR.GlobalAttention(d, 4, max_keys=4, ratio=0.5, learned_keys=True, bias=True),
+                           "enc"],
+                          ["mem", GR.GraphMemory(d, 3), "ga"], ["e", L.Embedding(V, d), "tok"],
                           ["h", L.Residual(L.MultiHeadAttention(d, 4, causal=True), pre_norm=L.RMSNorm(d)), "e"],
                           ["d", L.Dropout(p1), "h"],
                           ["c", L.MultiHeadAttention(d, 4), ["d", "mem"]], ["r", L.add(), ["c", "d"]],
@@ -313,6 +315,10 @@ class Trainer(unittest.TestCase):
         b = GT.fit_batches(m0, m0.init(seed=0), bs, "cross_entropy", opt=Adam(0.01), epochs=3, verbose=False,
                            precision="fp32", ops=GT.Emulator(), recompute=True, accumulate=2)
         np.testing.assert_allclose(a.history, b.history, rtol=1e-5)
+        with mock.patch.dict(os.environ, {"APSI_GA_PIECE": "24"}):     # global attention in pieces of a few rows
+            c = GT.fit_batches(m0, m0.init(seed=0), bs, "cross_entropy", opt=Adam(0.01), epochs=3, verbose=False,
+                               precision="fp32", ops=GT.Emulator(), recompute=True, accumulate=2)
+        np.testing.assert_allclose(a.history, c.history, rtol=1e-5)
         net = GT.Net(GT.Emulator(), m, m.init(seed=0), "fp32", recompute=True)
         kinds = sorted({nd.kind for nd in net.ck})
         self.assertEqual(kinds, ["_GlobalAttention", "_HGT", "_Residual"])

@@ -1201,6 +1201,8 @@ class Gpu(_Ops):
         wr = self._wrange
         if wr is not None and wr[0] <= d_ < wr[1]:
             self._wgen += 1
+        self._twin.pop(d_, None)                         # dst holds new values: an old twin of it is stale
+        self._only16.discard(d_)
         self.dev.drv.check(self._lib.cuMemcpyDtoDAsync_v2(ctypes.c_uint64(d_), ctypes.c_uint64(s_),
                                                           ctypes.c_size_t(4 * n), None), "cuMemcpyDtoDAsync")
 
@@ -4578,9 +4580,10 @@ class _GlobalAttention(_Node):
         # lean edge attention: nothing per edge is kept between forward and backward (the scores and weights are
         # made again in backward, in buffers every global_attention layer shares), and the keys / values are read
         # through their row ids instead of being copied per edge: memory grows with the nodes, not nodes x keys
-        al = self._scores(f, kid, q, KR, N, H, hd)
         self.msg = self.buf("msg", N * I)
-        o.spmm(VR, kid, al, None, f["off"], self.msg, N, H, hd)
+        for c in self._chunks(f, N, H):                    # rows in pieces: per-edge buffers of one piece at a time
+            al = self._scores(c, kid, q, KR, H, hd)
+            o.spmm(VR, _ofs(kid, c.e0), al, None, c.off, _ofs(self.msg, c.r0 * I), c.n, H, hd)
         y = self.buf("y", N * d)
         if self.T is None:
             o.gemm(self.msg, self.Wo.w, y, N, d, I, I, 1, d, 1, d, bias=self.bo.w, passes=ps, epi=3, X2=x)
@@ -4619,49 +4622,91 @@ class _GlobalAttention(_Node):
             o.gemm(dsc, self.ksw.w, dh, N, d, 1, 1, 1, 1, 1, d, beta=True, passes=3)
         return self.n.bwd(dh, True, residual=dy)
 
-    def _scores(self, f, kid, q, KR, N, H, hd):
-        """The attention weights of every edge, in the shared buffer (made again in backward)."""
-        o, E = self.net.ops, f["E"]
+    class _Piece:
+        __slots__ = ("r0", "n", "e0", "E", "off", "k0", "nk", "krow", "kperm", "koff")
+
+    def _chunks(self, f, N, H):
+        """The edges in pieces of whole rows (targets), each with its rows' offsets and its edges grouped by key (for
+        the keys' and values' gradients without a copy per edge): the per-edge buffers (scores, weights and their
+        gradients) hold one piece, not every edge. APSI_GA_PIECE: the largest piece, in edges x heads."""
+        budget = max(1, int(os.environ.get("APSI_GA_PIECE", str(1 << 24))) // max(H, 1))
+        key = ("ga_pieces", id(f), budget)
+        cached = f.get("cached", True)
+        hit = self.gdv.cache.get(key) if cached else None
+        if hit is not None and hit[0] is f:
+            return hit[1]
+        s_, d_ = np.asarray(f["src"], np.int64), np.asarray(f["dst"], np.int64)
+        offh = np.concatenate([[0], np.cumsum(np.bincount(d_, minlength=N))]).astype(np.int64)
+        spans, r0 = [], 0
+        while r0 < N:
+            r1 = int(np.searchsorted(offh, offh[r0] + budget, side="right")) - 1
+            r1 = min(N, max(r1, r0 + 1))
+            spans.append((r0, r1))
+            r0 = r1
+        offs, krows, kperms, koffs, meta = [], [], [], [], []
+        po = pk = 0
+        for r0, r1 in spans:
+            e0, e1 = int(offh[r0]), int(offh[r1])
+            ks = s_[e0:e1]
+            k0 = int(ks.min()) if e1 > e0 else 0
+            nk = (int(ks.max()) - k0 + 1) if e1 > e0 else 0
+            perm = np.argsort(ks, kind="stable")
+            offs.append(offh[r0:r1 + 1] - e0)
+            krows.append(d_[e0:e1][perm])
+            kperms.append(perm)
+            koffs.append(np.concatenate([[0], np.cumsum(np.bincount(ks - k0, minlength=nk))]) if nk else
+                         np.zeros(1, np.int64))
+            meta.append((r0, r1 - r0, e0, e1 - e0, po, k0, nk, pk))
+            po += r1 - r0 + 1
+            pk += nk + 1 if nk else 1
+        cat = lambda xs: np.concatenate(xs) if xs else np.zeros(1, np.int64)    # noqa: E731
+        if cached:
+            put = self.gdv._put
+            OFF, KROW, KPERM, KOFF = (put(cat(offs)), put(cat(krows)), put(cat(kperms)), put(cat(koffs)))
+        else:
+            put = lambda name, a: _put_buf(self, name, a)                     # noqa: E731
+            OFF, KROW, KPERM, KOFF = (put("p_off", cat(offs)), put("p_krow", cat(krows)),
+                                      put("p_kperm", cat(kperms)), put("p_koff", cat(koffs)))
+        out = []
+        for r0, n, e0, E, po, k0, nk, pk in meta:
+            c = self._Piece()
+            c.r0, c.n, c.e0, c.E, c.k0, c.nk = r0, n, e0, E, k0, nk
+            c.off, c.krow, c.kperm, c.koff = _ofs(OFF, po), _ofs(KROW, e0), _ofs(KPERM, e0), _ofs(KOFF, pk)
+            out.append(c)
+        if cached:
+            self.gdv.cache[key] = (f, out)
+        return out
+
+    def _scores(self, c, kid, q, KR, H, hd):
+        """The attention weights of one piece's edges, in the shared buffer (made again in backward)."""
+        o, E = self.net.ops, c.E
         sc = self.net.arena.get(("shared", "ga_sc"), max(1, E * H))
         al = self.net.arena.get(("shared", "ga_al"), max(1, E * H))
-        o.edge_dot(q, KR, f["row"], kid, sc, E, H, hd)                    # q[target] . k[key]
+        o.edge_dot(q, KR, _ofs(self.f["row"], c.e0), _ofs(kid, c.e0), sc, E, H, hd)   # q[target] . k[key]
         o.axpy(sc, sc, E * H, 1.0 / math.sqrt(hd) - 1.0)
-        o.seg_softmax(sc, f["off"], al, N, H, 1.0)
+        o.seg_softmax(sc, c.off, al, c.n, H, 1.0)
         self._sc = sc
         return al
 
-    def _by_key(self, f, N):
-        """The edges grouped by their key row (for the keys' and values' gradients without a copy per edge)."""
-        key = ("ga_bykey", id(f))
-        hit = self.gdv.cache.get(key) if f.get("cached", True) else None
-        if hit is not None and hit[3] is not f:
-            hit = None
-        if hit is None:
-            s_, d_ = np.asarray(f["src"], np.int64), np.asarray(f["dst"], np.int64)
-            perm = np.argsort(s_, kind="stable")
-            koff = np.concatenate([[0], np.cumsum(np.bincount(s_, minlength=N))])
-            if f.get("cached", True):
-                hit = self.gdv.cache[key] = (self.gdv._put(d_[perm]), self.gdv._put(perm), self.gdv._put(koff), f)
-            else:
-                put = lambda name, a: _put_buf(self, name, a)              # noqa: E731
-                hit = (put("k_row", d_[perm]), put("k_perm", perm), put("k_off", koff), f)
-        return hit[:3]
-
     def _lean_bwd(self, f, kid, dmsg, N, H, hd):
-        o, E = self.net.ops, f["E"]
+        o = self.net.ops
         I = H * hd
-        al = self._scores(f, kid, self.q, self.KR, N, H, hd)             # the forward's weights, made again
-        dal = self.net.arena.get(("shared", "ga_dal"), max(1, E * H))
-        o.edge_dot(dmsg, self.VRs, f["row"], kid, dal, E, H, hd)
-        ds = self.net.arena.get(("shared", "ga_ds"), max(1, E * H))
-        o.seg_softmax_b(self._sc, al, dal, f["off"], ds, N, H, 1.0)
-        o.axpy(ds, ds, E * H, 1.0 / math.sqrt(hd) - 1.0)
         dq = self.gbuf("dq", N * I)
-        o.spmm(self.KR, kid, ds, None, f["off"], dq, N, H, hd)
-        krow, kperm, koff = self._by_key(f, N)
         dK, dV = self.gbuf("dkr", N * I), self.gbuf("dvr", N * I)
-        o.spmm(self.q, krow, ds, kperm, koff, dK, N, H, hd)
-        o.spmm(dmsg, krow, al, kperm, koff, dV, N, H, hd)
+        o.fill(dK, N * I, 0.0)
+        o.fill(dV, N * I, 0.0)
+        for c in self._chunks(f, N, H):
+            E = c.E
+            al = self._scores(c, kid, self.q, self.KR, H, hd)             # the forward's weights, made again
+            dal = self.net.arena.get(("shared", "ga_dal"), max(1, E * H))
+            o.edge_dot(dmsg, self.VRs, _ofs(f["row"], c.e0), _ofs(kid, c.e0), dal, E, H, hd)
+            ds = self.net.arena.get(("shared", "ga_ds"), max(1, E * H))
+            o.seg_softmax_b(self._sc, al, dal, c.off, ds, c.n, H, 1.0)
+            o.axpy(ds, ds, E * H, 1.0 / math.sqrt(hd) - 1.0)
+            o.spmm(self.KR, _ofs(kid, c.e0), ds, None, c.off, _ofs(dq, c.r0 * I), c.n, H, hd)
+            if c.nk:                                       # the keys of this piece: their gradients added
+                o.spmm(self.q, c.krow, ds, c.kperm, c.koff, _ofs(dK, c.k0 * I), c.nk, H, hd, add=True)
+                o.spmm(dmsg, c.krow, al, c.kperm, c.koff, _ofs(dV, c.k0 * I), c.nk, H, hd, add=True)
         return dq, dK, dV
 
     def n_ids(self, N):
