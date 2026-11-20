@@ -1334,7 +1334,7 @@ def _freeze_keep(old, new, paths):
 def fit_batches(model, params, batches, loss="cross_entropy", opt=None, epochs=1, backend="auto", device="cuda",
                 verbose=True, clip=None, schedule=None, precision="auto", compensated=None, every=None, accumulate=1,
                 stages=None, freeze=None, train_only=None, steps=None, checkpoint=None, save_every=None, resume=True,
-                callback=None, recompute=None):
+                callback=None, recompute=None, exact_sums=None):
     """Train on batches that each bring their own shapes and graph: a list of (inputs, targets[, graph]) or a function
     epoch -> such a list. inputs may be a list (a dag with several inputs, e.g. token ids and node features). Each
     step is `accumulate` batches (their gradients averaged); the history is the mean loss of each epoch. backend: "auto"
@@ -1362,7 +1362,7 @@ def fit_batches(model, params, batches, loss="cross_entropy", opt=None, epochs=1
                                       precision, compensated=compensated, every=every, accumulate=accumulate,
                                       stages=stages, freeze=freeze, train_only=train_only, steps=steps,
                                       checkpoint=checkpoint, save_every=save_every, resume=resume,
-                                      callback=callback, recompute=recompute)
+                                      callback=callback, recompute=recompute, exact_sums=exact_sums)
             except GT.TrainError as e:
                 raise RuntimeErr(f"backend=\"gpu\": {e}") from None
     lf = loss if callable(loss) else _loss_fn(loss)
