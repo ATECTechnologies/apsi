@@ -416,6 +416,28 @@ class Trainer(unittest.TestCase):
         np.testing.assert_allclose(a.history, b.history, rtol=1e-5)
         self.assertLess(b.history[-1], b.history[0])
 
+    def test_brain_routing(self):
+        """brain_routing (one mixture of experts with running statistics and expert communication, one fusion
+        bridge, for three summaries): training on the card equals NumPy, the statistics move the same way."""
+        from apsi import graphs as GR
+        rng = np.random.default_rng(7)
+        d = 8
+        bs = [(rng.normal(size=(4, 3 * d)), rng.integers(0, 3, 4)) for _ in range(3)]
+
+        def model():
+            return L.DAG([["c", L.Linear(3 * d, d), "x"], ["a", L.Linear(3 * d, d), "x"], ["b", L.Linear(3 * d, d), "x"],
+                          ["r", GR.BrainRouting(d, experts=4, top_k=2, noise=0.0, comm_heads=2), ["c", "a", "b"]],
+                          ["out", L.Linear(3 * d + 3, 3), "r"]], inputs=["x"], output="out")
+        m1, m2 = model(), model()
+        a = L.fit_batches(m1, m1.init(seed=0), bs, "cross_entropy", opt=Adam(0.01), epochs=3, backend="numpy",
+                          verbose=False)
+        b = GT.fit_batches(m2, m2.init(seed=0), bs, "cross_entropy", opt=Adam(0.01), epochs=3, verbose=False,
+                           precision="fp32", ops=GT.Emulator())
+        np.testing.assert_allclose(a.history, b.history, rtol=1e-5)
+        r1, r2 = m1.nodes[3][1].st, m2.nodes[3][1].st
+        np.testing.assert_allclose(r1["ema_out"], r2["ema_out"], rtol=1e-4, atol=1e-6)
+        np.testing.assert_allclose(r1["load_ema"], r2["load_ema"], rtol=1e-9)
+
     def test_your_own_kernels_as_a_layer(self):
         """gpu_layer: @gpu kernels written in Apsi as a layer (forward, backward with parameter gradients); the GPU
         trainer calls them on its own buffers; NumPy and the card train the same; with recompute too."""

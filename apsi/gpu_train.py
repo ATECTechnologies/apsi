@@ -3436,7 +3436,10 @@ class _HostLayer(_Node):
         from . import ops as aops
         self.rng = aops._RNG[0].bit_generator.state
         p = self._params()
+        stateful = getattr(self.layer, "stateful", False)
+        self.st_pre = self.layer.state_get() if stateful else None      # running statistics: replayed in backward
         y = self.layer(p, xs if self.multi else xs[0], train=self.net.train, **self._ctx())
+        self.st_post = self.layer.state_get() if stateful else None
         y = np.asarray(aops.raw(y), np.float32)
         self.pnow, self.out_shape = p, tuple(y.shape)
         out = self.buf("y", max(1, y.size))
@@ -3470,6 +3473,8 @@ class _HostLayer(_Node):
             return aops.sum_(y * dyh)
         g0 = aops._RNG[0].bit_generator.state
         aops._RNG[0].bit_generator.state = self.rng       # the same random numbers as the forward pass
+        if self.st_pre is not None:
+            layer.state_set(self.st_pre)                  # the same running statistics as the forward pass
         ids = getattr(layer, "takes_ids", False)
         isid = [ids is True or (isinstance(ids, (list, tuple)) and i < len(ids) and bool(ids[i]))
                 for i in range(len(self.xs))]
@@ -3478,6 +3483,8 @@ class _HostLayer(_Node):
             _, g = value_and_grad(f, wrt=wrt)(p, *self.xs)
         finally:
             aops._RNG[0].bit_generator.state = g0
+            if self.st_post is not None:
+                layer.state_set(self.st_post)
         g = list(g) if isinstance(g, (list, tuple)) and len(wrt) > 1 else [g]
         gp, rest = g[0], list(g[1:])
         gxs = [None if isid[i] else rest.pop(0) for i in range(len(self.xs))]

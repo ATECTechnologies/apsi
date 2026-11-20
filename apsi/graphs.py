@@ -378,6 +378,183 @@ class NodeTextEncoder(Layer):
         return f"node_text_encoder(d={self.d})"
 
 
+def _ln(x, w, b, eps=1e-5):
+    m = ops.mean(x, axis=-1, keepdims=True)
+    v = ops.mean((x - m) * (x - m), axis=-1, keepdims=True)
+    return (x - m) / ops.sqrt(v + eps) * w + b
+
+
+class BrainRouting(Layer):
+    """GLA's routing of three brains' summaries through ONE mixture of experts and ONE fusion bridge, in the
+    order the original runs them: C (task 2), then A (task 0, fused with C's routed vector), then B (task 1, fused
+    with A's). Router: layer norm, gate + task bias (+ noise while training), the top_k experts (chosen with a
+    balancing bias that follows the experts' load), each a pre-norm two-layer GELU block blended with a running mean of
+    its outputs; the chosen experts' outputs mixed by a one-layer attention between them (gated, starts nearly closed),
+    then weighted by their router probabilities; an auxiliary loss (load balance, z-loss, importance spread). Bridge:
+    fused = g a + (1 - g) out([a, b]) through a layer norm, g = sigmoid(gate([a, b])), a = proj_a(other brain, no
+    gradient), b = proj_b(routed); plus the anti-forgetting penalty of the other brain's centre.
+    Input [sem_c, sem_a, sem_b] ([B, d] each). Output [B, 3 d + 3]: routed C, fused A, fused B, the penalties for A and
+    B, the auxiliary loss (the mean of the three calls). Running statistics are state of the layer (state_get /
+    state_set; saved with the model)."""
+    kind = "brain_routing"
+    stateful = True
+
+    def __init__(self, d, experts=8, top_k=2, tasks=3, noise=0.06, comm_heads=8):
+        self.d, self.E, self.k, self.tasks, self.noise = int(d), int(experts), int(top_k), int(tasks), float(noise)
+        h = max(1, int(comm_heads))
+        while h > 1 and self.d % h:
+            h -= 1
+        self.ch = h
+        self.hidden = max(2 * self.d, self.d + self.d // 4)
+        self.reset_state()
+
+    def reset_state(self):
+        E, d = self.E, self.d
+        self.st = dict(load_ema=np.full(E, 1.0 / E), importance_ema=np.full(E, 1.0 / E), route_bias=np.zeros(E),
+                       ema_out=np.zeros((E, d)), fisher_diag=np.zeros(d), anchor_a=np.zeros(d), reward_ema=0.5)
+
+    def state_get(self):
+        return {k: (np.array(v, copy=True) if isinstance(v, np.ndarray) else v) for k, v in self.st.items()}
+
+    def state_set(self, st):
+        self.st = {k: (np.array(v, copy=True) if isinstance(v, np.ndarray) else v) for k, v in st.items()}
+
+    def init(self, seed=0):
+        rng = _rng(seed)
+        d, E, hd = self.d, self.E, self.hidden
+        u = lambda i, o: rng.uniform(-1, 1, (i, o)) / math.sqrt(i)        # noqa: E731
+        ln = lambda n: Record(w=np.ones(n), b=np.zeros(n))                # noqa: E731
+        experts = [Record(input_norm=ln(d), l1=Record(W=u(d, hd), b=np.zeros(hd)), n2=ln(hd),
+                          l2=Record(W=u(hd, d), b=np.zeros(d))) for _ in range(E)]
+        router = Record(task_bias=np.zeros((self.tasks, E)), pre_norm=ln(d), gate=Record(W=u(d, E), b=np.zeros(E)),
+                        experts=experts,
+                        comm=Record(gate=np.array(-3.0), norm1=ln(d), in_proj=Record(W=u(d, 3 * d), b=np.zeros(3 * d)),
+                                    out_proj=Record(W=u(d, d), b=np.zeros(d)), norm2=ln(d),
+                                    f1=Record(W=u(d, 2 * d), b=np.zeros(2 * d)), f2=Record(W=u(2 * d, d), b=np.zeros(d))))
+        bridge = Record(proj_a=Record(W=u(d, d), b=np.zeros(d)), proj_b=Record(W=u(d, d), b=np.zeros(d)),
+                        gate=Record(W=u(2 * d, d), b=np.zeros(d)), out=Record(W=u(2 * d, d), b=np.zeros(d)),
+                        out_norm=ln(d))
+        return Record(router=router, bridge=bridge)
+
+    def _expert(self, e, x, train):
+        q = _ln(x, e.input_norm.w, e.input_norm.b)
+        h = ops.gelu_exact(q @ e.l1.W + e.l1.b)
+        return _ln(h, e.n2.w, e.n2.b) @ e.l2.W + e.l2.b
+
+    def _comm(self, c, seq):
+        """seq [B, k, d]: one attention layer and a feed-forward block across the chosen experts (gated)."""
+        B, k, d = np.shape(ops.raw(seq))
+        if k < 2:
+            return seq
+        g = ops.sigmoid(c.gate)
+        h = _ln(seq, c.norm1.w, c.norm1.b)
+        qkv = h @ c.in_proj.W + c.in_proj.b                                   # [B, k, 3d]
+        H, hd = self.ch, d // self.ch
+        sp = lambda t: ops.transpose(ops.reshape(t, B, k, H, hd), (0, 2, 1, 3))    # noqa: E731
+        q, kk, v = sp(qkv[:, :, :d]), sp(qkv[:, :, d:2 * d]), sp(qkv[:, :, 2 * d:])
+        a = ops.softmax((q @ ops.transpose(kk, (0, 1, 3, 2))) / math.sqrt(hd), axis=-1)
+        att = ops.reshape(ops.transpose(a @ v, (0, 2, 1, 3)), B, k, d) @ c.out_proj.W + c.out_proj.b
+        seq = seq + g * att
+        h2 = _ln(seq, c.norm2.w, c.norm2.b)
+        return seq + g * (ops.gelu_exact(h2 @ c.f1.W + c.f1.b) @ c.f2.W + c.f2.b)
+
+    def _route(self, r, x, task, train):
+        B, E, k = int(np.shape(ops.raw(x))[0]), self.E, self.k
+        st = self.st
+        logits = _ln(x, r.pre_norm.w, r.pre_norm.b) @ r.gate.W + r.gate.b + r.task_bias[task]
+        if train and self.noise > 0:
+            logits = logits + ops._RNG[0].normal(size=(B, E)) * self.noise
+        probs = ops.softmax(logits, axis=-1)
+        pd = np.asarray(ops.raw(probs), np.float64)
+        pick = pd + st["route_bias"][None, :] if train else pd
+        sel = np.argsort(-pick, axis=1, kind="stable")[:, :k]                # [B, k]
+        rows = np.arange(B)[:, None]
+        sv = probs[rows, sel]
+        w = sv / ops.where(np.asarray(ops.raw(ops.sum_(sv, axis=1, keepdims=True))) > 1e-9,
+                           ops.sum_(sv, axis=1, keepdims=True), 1e-9)
+        hard = np.zeros((B, E))
+        hard[rows, sel] = 1.0 / k
+        hard = hard.mean(0)
+        aux = None
+        if train:
+            dB = 0.99 ** B
+            imp_prev = st["importance_ema"].copy()
+            st["load_ema"] = st["load_ema"] * dB + hard * (1 - dB)
+            st["importance_ema"] = st["importance_ema"] * dB + pd.mean(0) * (1 - dB)
+            st["route_bias"] = np.clip(st["route_bias"] + 1e-3 * min(B, 4) * np.sign(1.0 / E - st["load_ema"]),
+                                       -0.05, 0.05)
+            f = st["load_ema"].copy()
+            lb = ops.mean(E * ops.sum_(probs * f, axis=-1))
+            mx = np.max(np.asarray(ops.raw(logits)), axis=-1, keepdims=True)
+            lse = ops.log(ops.sum_(ops.exp(logits - mx), axis=-1)) + mx[:, 0]
+            z = ops.mean(lse * lse)
+            imp = 0.01 * probs + 0.99 * imp_prev
+            mu = ops.mean(imp, axis=-1, keepdims=True)
+            var = ops.mean((imp - mu) * (imp - mu), axis=-1)
+            cv2 = ops.mean(var / (ops.reshape(mu, B) * ops.reshape(mu, B) + 1e-9))
+            aux = 0.01 * lb + 1e-3 * z + 0.01 * cv2
+        outs = [None] * (B * k)
+        flat = sel.reshape(-1)
+        parts = []
+        for e in range(E):
+            slots = np.nonzero(flat == e)[0]
+            if not len(slots):
+                continue
+            o = self._expert(r.experts[e], x[slots // k], train)
+            if train:
+                st["ema_out"][e] = 0.95 * st["ema_out"][e] + 0.05 * np.asarray(ops.raw(o), np.float64).mean(0)
+            ema = st["ema_out"][e]
+            if np.abs(ema).sum() > 0:
+                o = 0.88 * o + 0.12 * ema
+            parts.append((slots, o))
+        order = np.concatenate([sl for sl, _ in parts])
+        allo = ops.concat([o for _, o in parts], 0) if len(parts) > 1 else parts[0][1]
+        inv = np.empty(B * k, np.int64)
+        inv[order] = np.arange(B * k)
+        eo = ops.reshape(allo[inv], B, k, self.d)
+        eo = self._comm(r.comm, eo)
+        out = ops.sum_(ops.reshape(w, B, k, 1) * eo, axis=1)
+        return out, aux
+
+    def _bridge(self, b, emb_other, routed):
+        a = np.asarray(ops.raw(emb_other), np.float64) @ b.proj_a.W + b.proj_a.b      # (no gradient to the other brain)
+        bb = routed @ b.proj_b.W + b.proj_b.b
+        cat = ops.concat([a, bb], 1)
+        g = ops.sigmoid(cat @ b.gate.W + b.gate.b)
+        fused = g * a + (1 - g) * (cat @ b.out.W + b.out.b)
+        return _ln(fused, b.out_norm.w, b.out_norm.b)
+
+    def _ewc(self, emb):
+        st = self.st
+        centre = ops.mean(emb, axis=0)
+        diff = centre - st["anchor_a"]
+        return 0.12 * ops.sum_(st["fisher_diag"] * diff * diff)
+
+    def apply(self, p, x, train=False, **ctx):
+        sc, sa, sb = x
+        B = int(np.shape(ops.raw(sa))[0])
+        rc, ac = self._route(p.router, sc, 2, train)
+        ra, aa = self._route(p.router, sa, 0, train)
+        fa = self._bridge(p.bridge, rc, ra)
+        ea = self._ewc(rc)
+        rb, ab = self._route(p.router, sb, 1, train)
+        fb = self._bridge(p.bridge, fa, rb)
+        eb = self._ewc(fa)
+        if train:                                       # the bridge's reward: a running mean of cos(a, fused)
+            for o_, f_ in ((rc, fa), (fa, fb)):
+                A_ = np.asarray(ops.raw(o_), np.float64)
+                F_ = np.asarray(ops.raw(f_), np.float64)
+                cs = (A_ * F_).sum(1) / np.maximum(np.linalg.norm(A_, axis=1) * np.linalg.norm(F_, axis=1), 1e-8)
+                for c_ in cs:
+                    self.st["reward_ema"] = 0.9 * self.st["reward_ema"] + 0.1 * float((c_ + 1.0) / 2.0)
+        aux = (ac + aa + ab) / 3.0 if train else 0.0
+        one = np.ones((B, 1))
+        return ops.concat([rc, fa, fb, one * ea, one * eb, one * aux], 1)
+
+    def describe(self):
+        return f"brain_routing(d={self.d}, {self.E} experts, top {self.k})"
+
+
 class MemorySlots(Layer):
     """A decoder's memory from two sets of node states and two summaries (GLA's writer memory): of each set, the k best
     nodes of every row (by a learned score; their projection scaled by sigmoid(score)) plus the embedding of their node
@@ -983,6 +1160,6 @@ def graph_transformer_net(n_in, d, out, layers=4, heads=4, relations=1, global_e
 def names():
     return dict(graph_transformer=GraphTransformer, global_attention=GlobalAttention, mix_hop=MixHop,
                 graph_memory=GraphMemory, pick_rows=PickRows, hgt=HGT, typed_linear=TypedLinear, typed_norm=TypedNorm,
-                typed_graph_encoder=TypedGraphEncoder, typed_pool=TypedPool, memory_slots=MemorySlots, node_text_encoder=NodeTextEncoder, graph_context=GraphContext, split_typed_encoder=split_typed_encoder,
+                typed_graph_encoder=TypedGraphEncoder, typed_pool=TypedPool, memory_slots=MemorySlots, brain_routing=BrainRouting, node_text_encoder=NodeTextEncoder, graph_context=GraphContext, split_typed_encoder=split_typed_encoder,
                 graph_transformer_net=graph_transformer_net, k_hop=k_hop, hop_distances=hop_distances,
                 eccentricity=eccentricity)
