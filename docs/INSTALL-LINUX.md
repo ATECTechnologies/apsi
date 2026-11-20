@@ -91,8 +91,7 @@ pip install apsi-2.6.0-py3-none-any.whl
 ## Uninstalling
 
 `~/.local/share/apsi/uninstall.sh` (shell installer and AppImage), `sudo apt remove apsi` (.deb). If you set up the
-GPU helper (`sudo apsi gpu setup`), the uninstaller removes it first; by hand: `sudo apsi gpu remove`, and
-`sudo sh apsi-gpu-tuner-restore-linux.sh` if you applied the GPU Tuner. See
+GPU helper (`sudo apsi gpu setup`), the uninstaller removes it first; by hand: `sudo apsi gpu remove`. See
 [Turning the GPU helper off](GPU.md#turning-the-gpu-helper-off-and-before-uninstalling).
 
 ## After installing

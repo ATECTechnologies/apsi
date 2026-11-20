@@ -61,7 +61,7 @@ terminal **as administrator** and run:
 apsi gpu remove
 ```
 
-Then uninstall again. If you applied the **GPU Tuner**, also run *Apsi-GPU-Tuner-Restore*. Details and the commands
+Then uninstall again. Details, and how to remove the *Apsi GPU Tuner* of earlier versions, with the commands
 for doing it by hand: [Turning the GPU helper off](GPU.md#turning-the-gpu-helper-off-and-before-uninstalling).
 
 ### What the .deb package does

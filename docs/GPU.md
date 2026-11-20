@@ -16,10 +16,9 @@ and the driver compiles them for whatever card is present.
 
 ### Quick start: train on your card in three steps
 
-1. **Once**, give Apsi the right to set the card's power limit (it holds the temperature this way, at full and
-   steady speed). The Windows and Linux installers do it for you: keep **Full GPU speed without administrator
-   rights** ticked and answer *Yes* once. Otherwise: **Apsi GPU Tuner → Apply** from the download page, or
-   `apsi gpu setup` from a terminal opened as administrator.
+1. **Once**, let Apsi set the card's power limit and fans (it holds the temperature this way, at full and steady
+   speed). The installer does it for you: keep **GPU helper** switched on and approve the one administrator prompt
+   (it can open behind the setup window). Otherwise: `apsi gpu setup` from a terminal opened as administrator.
 2. Train with `backend="gpu"` (the example in section 2). Nothing else to install.
 3. Read the report: the speed of every epoch, the temperature, and how it was held. `apsi gpu` shows the card at any
    time, `apsi gpu watch` every second.
@@ -29,7 +28,7 @@ and the driver compiles them for whatever card is present.
 | [1. Language models](#1-language-models-use-hub) | running Hugging Face models on the card, weight formats, tensor cores, threads |
 | [2. Training](#2-training-on-the-gpu-with-apsi-alone-backendgpu) | layers, precisions, measured speed against PyTorch, several cards, model size |
 | [3. Serving](#3-serving-the-openai-api) | the OpenAI API in front of a model, queues, metrics |
-| [4. Temperature control](#4-temperature-control) | the 79 °C ceiling, the power limit, the GPU Tuner, `apsi gpu hold` |
+| [4. Temperature control](#4-temperature-control) | the 79 °C ceiling, fans and power, the GPU helper, `apsi gpu hold` |
 | [5. Images, video, your own kernels](#5-images-video-and-your-own-kernels-gpu) | `@gpu` functions |
 | [6. Troubleshooting](#6-troubleshooting) | slow training, out of memory, the card not found, and more |
 
@@ -39,7 +38,7 @@ and the driver compiles them for whatever card is present.
 > with pauses, **18,074 tokens/s** with the power limit (20,708 with Apsi 2.6.0), at the same temperature). Do one of these:
 >
 > 1. **Run Apsi as administrator** (Windows: right-click the terminal → *Run as administrator*; Linux: `sudo`), or
-> 2. **once**, run `apsi gpu setup` as administrator (or the *Apsi GPU Tuner — Apply* file from the download page):
+> 2. **once**, keep the installer's *GPU helper* option, or run `apsi gpu setup` as administrator:
 >    a small helper then lets every Apsi program set the power limit without administrator rights, at every logon.
 >    `apsi gpu remove` (as administrator) turns it off again — see
 >    [Turning the GPU helper off](#turning-the-gpu-helper-off-and-before-uninstalling).
@@ -333,21 +332,14 @@ an Apsi program asks (localhost only, with a key only your account can read, nev
 then on every Apsi program holds the temperature by the power limit without administrator rights. `apsi gpu setup 80%`
 also applies 80 % at every logon; `apsi gpu remove` takes it all away and restores the default.
 
-**The Apsi GPU Tuner (download page).** Two plain-text files per system, no installation: *Apply* sets every
-NVIDIA card in the computer to the power limit measured as the best for sustained training and keeps it after
-every restart (a Task Scheduler task on Windows, a systemd service on Linux); *Restore* removes all of it and puts
-every card back to its factory default. Windows asks once for administrator rights (the file asks by itself).
+**How training holds 78–79 °C.** With the GPU helper, a training run sets a fixed power limit (145 W on an RTX
+3060, or the value `apsi gpu calibrate` measured for your card), turns the fans up as far as needed (up to 100 %), and
+looks six seconds ahead: only when the fans alone cannot hold the ceiling does it lower the power limit, gently
+(about 7 % at a time), and it raises it again as the card cools. The card never reaches 80 °C and never pauses. The
+card's own fan curve and power limit come back when training ends.
 
-| Card | Power limit | Effect |
-|---|---|---|
-| GeForce RTX 50 / RTX 40 | 75 % | about -25 % power for about -5 % training speed |
-| GeForce RTX 30 | 80 % | about -5 % speed, 6–10 °C cooler |
-| GeForce RTX 20, GTX 16, GTX 10 | 85 % | about -4 % speed, cooler |
-| Workstation (RTX PRO, RTX A-series, Ada, Quadro) | 90 % | steadier clocks for about -2 % |
-| Data center (H100, H200, B200, A100, L40S, L4, T4…) | unchanged | built and cooled for full sustained power |
-| Laptop GPUs | unchanged | the laptop manages the limit |
-
-With Apsi installed, *Apply* also runs `apsi gpu setup`, so Apsi fine-tunes the limit to stay at 78–79 °C while it trains.
+(The *Apsi GPU Tuner* files of earlier versions set a fixed lower limit at every start. They are no longer needed and
+no longer offered; how to remove them: [Turning the GPU helper off](#turning-the-gpu-helper-off-and-before-uninstalling).)
 
 **Once per start of the computer: `apsi gpu power 80%`.** Run it once from a terminal opened as administrator (or
 with sudo): the card keeps that limit for every program until the computer or the driver restarts, so Apsi (and
@@ -420,10 +412,10 @@ on the card (games, browsers with hardware acceleration, another Apsi) use memor
 
 **Training is slower than it should be, or its speed swings.** Look at the training report. *Cooling pauses* mean
 Apsi cannot set the power limit: run it as administrator, or set up the helper once (`apsi gpu setup` as
-administrator, or the GPU Tuner's Apply file) — see the box at the top of this page. *fused attention unavailable*
+administrator, or the installer's GPU helper option) — see the box at the top of this page. *fused attention unavailable*
 next to the GPU line means the attention kernel could not be built (a bug: report it with that line); training
-still works, more slowly, on separate kernels. A card held at a lower power limit (the GPU Tuner's 80 %) trades about
-5 % of speed for 6–10 °C; `Apsi-GPU-Tuner-Restore` puts the default back.
+still works, more slowly, on separate kernels. A card held at a lower power limit (`APSI_GPU_POWER=80`) trades about
+5 % of speed for 6–10 °C.
 
 **The card is hot or loud.** Temperature control is on by default (at most 79 °C). Lower it with `APSI_GPU_TEMP=72`; check the
 case airflow and fan curve. If the card still reaches 85 °C+, the control may be off (`APSI_GPU_TEMP=off`) or NVML
@@ -452,7 +444,7 @@ Raise `--max-queue`, use a smaller model or format, or run another server on ano
 
 ## Turning the GPU helper off (and before uninstalling)
 
-The GPU helper and the GPU Tuner are the only parts of Apsi that run with administrator rights. They keep running
+The GPU helper is the only part of Apsi that runs with administrator rights. They keep running
 after you close Apsi (the helper starts at every logon), and the helper runs the Python of the Apsi version that set
 it up, so Windows cannot delete that version's folder while it runs. The uninstaller removes the helper by itself
 (it asks for administrator rights once). To turn it off yourself, open a terminal **as administrator** and run:
@@ -462,9 +454,7 @@ apsi gpu remove
 ```
 
 It stops the helper, deletes its Task Scheduler task (Windows) or systemd service (Linux), deletes its key and
-script in `~/.apsi`, and puts the card's default power limit back. If you also applied the **GPU Tuner**, run
-**Apsi-GPU-Tuner-Restore** (Windows: double-click and approve the prompt; Linux: `sudo sh apsi-gpu-tuner-restore-linux.sh`):
-it removes the task "Apsi GPU Tuner" / unit `apsi-gpu-tuner` and sets every card back to its factory defaults.
+script in `~/.apsi`, and puts the card's default power limit back. The uninstaller does the same by itself.
 
 Check that nothing is left:
 
@@ -474,7 +464,7 @@ schtasks /Query /TN "Apsi GPU helper"   (Windows: "cannot find the file specifie
 systemctl status apsi-gpu-helper        (Linux: "could not be found" = removed)
 ```
 
-By hand, if Apsi is already gone (terminal as administrator):
+By hand, if Apsi is already gone, and to remove the *Apsi GPU Tuner* of earlier versions (terminal as administrator):
 
 ```
 schtasks /End /TN "Apsi GPU helper" & schtasks /Delete /TN "Apsi GPU helper" /F

@@ -156,8 +156,8 @@ On an RTX 3060, a small transformer's step went from 5.3–6.0 ms to 4.0–4.7 m
 
 Every setting is an environment variable with a safe default, collected in
 [`config/apsi-training.env`](../config/apsi-training.env) with a line about each: run
-`apsi run train.apsi --env-file apsi-training.env`. Temperature control (77 °C by default) and the power limit
-(`APSI_GPU_POWER`, set once with administrator rights by `apsi gpu setup` or the Apsi GPU Tuner) keep long runs at a
+`apsi run train.apsi --env-file apsi-training.env`. Temperature control (78–79 °C, never 80) through the fans and
+the power limit (the GPU helper, set up once with administrator rights by the installer or `apsi gpu setup`) keep long runs at a
 steady speed. [TRAINING.md](TRAINING.md#9-what-happens-if-you-turn-things-off) lists what each protection costs and
 what turning it off would change; turning things off never changes what a program means, only how exactly or how
 safely it runs.

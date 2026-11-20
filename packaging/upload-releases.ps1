@@ -5,9 +5,7 @@
 # It uploads:
 #   Downloads\apsi-X.Y.Z\installer\release\ApsiSetup-X.Y.Z-x64.exe   -> Windows installer
 #   Downloads\apsi-X.Y.Z-linux.zip  (ApsiSetup-X.Y.Z-linux.sh and the .deb inside it)  -> Linux installer
-#   source\apsi-X.Y.Z-source.zip in that zip                                           -> Source code
-#   the Apsi GPU Tuner in that zip (gpu-tuner\: Apply / Restore for Windows and Linux) -> the Download page's
-#   "Apsi GPU Tuner" section
+#   Downloads\apsi-X.Y.Z-source.zip, or source\apsi-X.Y.Z-source.zip in that zip                                           -> Source code
 # Versions: 2.6.0 and newer by default (-Version 2.6.0+); -Version 2.4.4 for one version only, -Version all for
 # every version found. A file already on the site is skipped when it is the same file (same SHA-256) and replaced
 # when it is a newer build with the same name, so running it again is safe and never makes duplicates. Files are sent in 32 MB pieces, 4 at a time (Cloudflare accepts at most 100 MB per
@@ -40,6 +38,10 @@ Get-ChildItem -LiteralPath $Root -Directory | ForEach-Object {
   Get-ChildItem -LiteralPath (Join-Path $_.FullName 'installer\release') -Filter "ApsiSetup-$v-x64.exe" -ErrorAction SilentlyContinue |
     ForEach-Object { Add-Build $_.FullName $v 'windows' 'Windows installer' }
 }
+# the source code next to them: Downloads\apsi-X.Y.Z-source.zip
+Get-ChildItem -LiteralPath $Root -File -Filter 'apsi-*-source.zip' | ForEach-Object {
+  if ($_.Name -match '^apsi-(\d+\.\d+\.\d+)-source\.zip$') { Add-Build $_.FullName $Matches[1] 'source' 'Source code' }
+}
 Get-ChildItem -LiteralPath $Root -File -Filter 'apsi-*-linux.zip' | ForEach-Object {
   if ($_.Name -notmatch '^apsi-(\d+\.\d+\.\d+)-linux\.zip$') { return }
   $v = $Matches[1]
@@ -49,10 +51,6 @@ Get-ChildItem -LiteralPath $Root -File -Filter 'apsi-*-linux.zip' | ForEach-Obje
   Get-ChildItem -LiteralPath $dir -Recurse -File | Where-Object { -not $_.FullName.Contains('\source\') } | ForEach-Object {
     if ($_.Name -like 'ApsiSetup-*-linux.sh') { Add-Build $_.FullName $v 'linux' 'Linux installer' }
     elseif ($_.Name -like '*.deb') { Add-Build $_.FullName $v 'linux' 'Debian / Ubuntu package (.deb)' }
-    elseif ($_.Name -eq 'Apsi-GPU-Tuner-Apply.bat') { Add-Build $_.FullName $v 'windows' 'GPU Tuner: Apply recommended settings (Windows)' }
-    elseif ($_.Name -eq 'Apsi-GPU-Tuner-Restore.bat') { Add-Build $_.FullName $v 'windows' 'GPU Tuner: Restore factory defaults (Windows)' }
-    elseif ($_.Name -eq 'apsi-gpu-tuner-apply-linux.sh') { Add-Build $_.FullName $v 'linux' 'GPU Tuner: Apply recommended settings (Linux)' }
-    elseif ($_.Name -eq 'apsi-gpu-tuner-restore-linux.sh') { Add-Build $_.FullName $v 'linux' 'GPU Tuner: Restore factory defaults (Linux)' }
   }
 }
 if ($Version -match '^(\d+\.\d+\.\d+)\+$') {
