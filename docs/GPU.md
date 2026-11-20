@@ -127,7 +127,8 @@ let logits = predict(model, r.params, X_test, backend="gpu")
 | Optimizers | Adam, AdamW, SGD (momentum); `clip=` (global norm, computed on the card), `schedule=`; compensated weight updates (the rounding error of every update carried to the next, so updates far below float32's step at a weight's size still add up: 300 steps of 1e-9 move a weight of 1 by 3e-7, a plain float32 update not at all), on by default for fp32 training below 2 B parameters and off for bf16 and the narrower formats (their products round every gradient far more coarsely than float32 rounds an update, so there it would only cost memory and time); `compensated=true` / `APSI_GPU_COMPENSATED=1` turns it on, `=0` off |
 | Precision | `"auto"`/`"bf16"`: bfloat16 tensor cores, float32 sums; `"fp32"`: three tensor-core passes (about float32); `"fp8"`, `"fp6"`, `"fp6_e2m3"`, `"fp4"`, `"int8"`, `"int4"`: weights rounded to that format every forward pass, float32 master copy |
 | Any optimizer, frozen parts | adam, adamw, sgd on the card's kernels; any other optimizer (`step(params, grads)`) on the processor with the weights as the model's tree; `freeze=` / `train_only=` keep parts of the model exactly as they are (no gradient, not in `clip`, untouched by weight decay), on one card and many |
-| Any other layer, any loss | a layer with no kernel of its own (`custom_layer`, `lambda_layer`, bilinear, batch_norm, graph_memory, …) runs on the processor with Apsi's autodiff inside the model on the card (its input and weights copied over, its output and gradients copied back; the rest stays on the card); a loss written as a function (`fit(…, loss=my_loss)`) is evaluated on the processor the same way, on one card. `APSI_GPU_HOST_LAYERS=0` refuses them instead |
+| Any other layer, any loss | a layer with no kernel of its own (`custom_layer`, `lambda_layer`, bilinear, batch_norm, graph_memory, …) runs on the processor with Apsi's autodiff inside the model on the card (its input and weights copied over, its output and gradients copied back; the rest stays on the card); a loss written as a function (`fit(…, loss=my_loss)`) is evaluated on the processor the same way, on one card. `APSI_GPU_HOST_LAYERS=0` refuses them instead; `gpu_layer(forward, backward)` runs your own `@gpu` kernels for such a part on the card instead (see section 6) |
+| Memory | `recompute="auto"` (default): the blocks whose activations do not fit in the card's memory run their forward again in backward instead of keeping them; same results to the last bit (see TRAINING.md, "How much card memory a model needs") |
 
 How it works: parameters, gradients and the AdamW state are three flat arrays updated by one kernel; the data set is
 copied to the card once and every batch is gathered there, so inside an epoch the processor never makes the card
@@ -394,6 +395,48 @@ the copies. Several GPUs: `APSI_GPUS=0,2`. Small launches go to the processor by
 `APSI_GPU_MIN`). See [NATIVE.md](NATIVE.md) and [REALTIME.md](REALTIME.md).
 
 ---
+
+### Your own kernels inside training (`gpu_layer`)
+
+Any part of a model the trainer has no kernel for can be written by you, in Apsi, and run on the card by the trainer
+itself: `gpu_layer(forward, backward, init=, out=)` takes two `@gpu` functions. The trainer calls them on its own
+card buffers (no copy to the processor and back), in the middle of the forward and backward passes, between its own
+kernels:
+
+```
+use layers
+
+@gpu
+fn scale_fwd(x, y, w, b):                 # y = x * w + b, one thread per row
+    parallel for i in 0..x.shape[0]:
+        for j in 0..x.shape[1]:
+            y[i, j] = x[i, j] * w[j] + b[j]
+
+@gpu
+fn scale_bwd(x, y, dy, dx, w, b, dw, db):   # dx, and the parameters' gradients (each starts at zero)
+    parallel for j in 0..x.shape[1]:
+        for i in 0..x.shape[0]:
+            dx[i, j] = dy[i, j] * w[j]
+            dw[j] += dy[i, j] * x[i, j]
+            db[j] += dy[i, j]
+
+fn scale_init(seed):
+    return record(w=ones(64), b=zeros(64))
+
+let model = sequential([linear(32, 64), gpu_layer(scale_fwd, scale_bwd, init=scale_init), activation("gelu"),
+                        linear(64, 10)])
+```
+
+- `forward(x, y, *params)` writes the output `y`; `backward(x, y, dy, dx, *params, *grads)` writes the input's
+  gradient `dx` and adds to the parameters' gradients. The parameters are the leaves of `init(seed)`'s record, in
+  its field order. `out=fn(shape) -> shape` when the output's shape is not the input's.
+- The same functions run on the processor when there is no card, on the NumPy backend (`backend="numpy"`, through
+  `backward` for the gradients) and in `predict`, so a model with your kernels trains and checks everywhere, with the
+  same results.
+- A kernel the card cannot compile (the error says why) runs on the processor instead, and its results go back to the
+  card: training still works, only that layer is slower.
+- Layers you write as plain Apsi functions (`custom_layer`) still train with the GPU trainer: they run on the
+  processor between the card's layers. `gpu_layer` is how to move such a part onto the card.
 
 ## 7. Troubleshooting
 

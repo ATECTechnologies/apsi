@@ -258,7 +258,7 @@ class Stage:
         from .gpu_train import Net, _Arena
         self.ops, self.index, self.count = ops, index, count
         self.first, self.last = index == 0, index == count - 1
-        self.net = Net(ops, L.Sequential(layers), list(plist), precision)
+        self.net = Net(ops, L.Sequential(layers), list(plist), precision, recompute=False)
         self.garena = self.net.arena                     # the backward pass's buffers: one micro-batch at a time
         self.net.garena = self.garena
         self.slots = [_Arena(ops) for _ in range(max(1, slots))]
@@ -792,7 +792,7 @@ class SegStage(Stage):
             own = getattr(l_, "owner", None)             # weights on both cards, their gradients summed every step
             if isinstance(own, str) and own not in held and all_params is not None and hasattr(all_params, own):
                 held[own] = getattr(all_params, own)
-        self.net = Net(ops, model, Record(**held), precision)
+        self.net = Net(ops, model, Record(**held), precision, recompute=False)
         self.garena = self.net.arena
         self.net.garena = self.garena
         self.slots = [_Arena(ops) for _ in range(max(1, slots))]

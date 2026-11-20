@@ -67,6 +67,9 @@ class _Ops:
         pass
     _db = None
 
+    def forget(self, b):                                 # (bfloat16 twins: the real card only)
+        pass
+
     def _bf_gemm(self, A, B, Cv, bias, M, N, K, sam, sak, sbk, sbn, ldc, alpha, beta, epi, X2, act, a_act, tmp):
         return _bf_gemm_composite(self, A, B, Cv, bias, M, N, K, sam, sak, sbk, sbn, ldc, alpha, beta, epi, X2, act,
                                   a_act, tmp)
@@ -194,6 +197,7 @@ class Emulator(_Ops):
 
     def alloc(self, n):
         self.used += 4 * n
+        self.peak = max(getattr(self, "peak", 0), self.used)
         return Buf(0, n, np.zeros(max(1, n), np.float32))
 
     def free(self, b):
@@ -216,6 +220,9 @@ class Emulator(_Ops):
 
     def fill(self, view, n, value):
         self.v(view, n)[:] = value
+
+    def copy(self, dst, src, n):
+        self.v(dst, n)[:] = self.v(src, n)
 
     def axpy(self, Y, X, n, a=1.0):
         y = self.v(Y, n)
@@ -1043,13 +1050,23 @@ class Gpu(_Ops):
                              "shorter context, or more cards "
                              "(device=\"cuda:all\" splits the model across them)") from None
         self.used += 4 * n
+        self.peak = max(getattr(self, "peak", 0), self.used)
+        if self.used > self.dev.memory and not getattr(self, "_spill_said", False):
+            self._spill_said = True                      # Windows lets the driver spill into the computer's memory
+            print(f"note: {self.used / 2 ** 30:.1f} GB asked of a {self.dev.memory / 2 ** 30:.1f} GB card: the rest "
+                  "spills into the computer's memory, which is many times slower (recompute=true, a smaller "
+                  "batch_size with accumulate=, or a shorter context keep it on the card)")
         return Buf(p, n)
 
     def free(self, b):
         self.used -= 4 * b.n
         self.dev.free(b.ptr)
         self._calls.clear()
-        if self._twin:                                   # a twin of (or in) freed memory is no longer one
+        self.forget(b)                                   # a twin of (or in) freed memory is no longer one
+
+    def forget(self, b):
+        """b will hold other values: no bfloat16 twin of (or in) it, no value of it that exists only as a twin."""
+        if self._twin or self._only16:
             lo, hi = b.ptr, b.ptr + 4 * max(1, b.n)
             self._twin = {k: v for k, v in self._twin.items() if not (lo <= k < hi or lo <= v[1][1] < hi)}
             self._only16 = {k for k in self._only16 if not lo <= k < hi}
@@ -1161,7 +1178,9 @@ class Gpu(_Ops):
         source must be finished (the caller syncs it)."""
         self.dev.ensure()
         dptr, sptr = self.p(dst)[1], src_ops.p(src)[1]
-        self._wgen += 1                                  # (the weights may be what changes)
+        wr = self._wrange
+        if wr is None or wr[0] <= dptr < wr[1]:
+            self._wgen += 1                              # the weights change: their bfloat16 copies are stale
         if src_ops is self or src_ops.dev is self.dev:
             self.dev.drv.check(self._lib.cuMemcpyDtoDAsync_v2(ctypes.c_uint64(dptr), ctypes.c_uint64(sptr),
                                                               ctypes.c_size_t(4 * n), None), "cuMemcpyDtoDAsync")
@@ -1173,6 +1192,17 @@ class Gpu(_Ops):
             r = 1
         if r != 0:                                       # no peer copy: through the host
             self.put(dst[0], src_ops.get(src[0], n, src[1]), dst[1])
+
+    def copy(self, dst, src, n):
+        """dst <- src on this card (activations: the weights' bfloat16 copies stay valid)."""
+        d_, s_ = self.p(dst)[1], self.p(src)[1]
+        if d_ == s_ or n <= 0:
+            return
+        wr = self._wrange
+        if wr is not None and wr[0] <= d_ < wr[1]:
+            self._wgen += 1
+        self.dev.drv.check(self._lib.cuMemcpyDtoDAsync_v2(ctypes.c_uint64(d_), ctypes.c_uint64(s_),
+                                                          ctypes.c_size_t(4 * n), None), "cuMemcpyDtoDAsync")
 
     def add3(self, Z, X, Y, n):
         self._go("add3", self.blocks(n), 256, self.p(Z), self.p(X), self.p(Y), ("u", n))
@@ -2106,6 +2136,143 @@ class _Node:
 
 def _rows(shape):
     return int(np.prod(shape[:-1])) if len(shape) > 1 else 1
+
+
+class _SharedArena:
+    """The arena seen by a recomputed layer: its buffers are named by their place inside the layer, not by the layer,
+    so every recomputed layer of the same kind writes the same buffers (only one runs at a time)."""
+
+    def __init__(self, base):
+        self.base, self.keys, self.prefix, self.gprefix, self.track = base, set(), None, None, None
+
+    @property
+    def ops(self):
+        return self.base.ops
+
+    @property
+    def bufs(self):
+        return self.base.bufs
+
+    def _map(self, key):
+        if isinstance(key, tuple) and key:
+            k0 = key[0]
+            if k0 == "g" and len(key) > 1 and isinstance(key[1], str) and key[1].startswith(self.gprefix):
+                return ("ck", self.kind, "g", key[1][len(self.gprefix):]) + key[2:]
+            if isinstance(k0, str) and k0.startswith(self.prefix):
+                return ("ck", self.kind, k0[len(self.prefix):]) + key[1:]
+        return None
+
+    def get(self, key, n):
+        k = self._map(key)
+        if k is None:
+            return self.base.get(key, n)
+        self.keys.add(k)
+        if self.track is not None:
+            self.track[k] = max(self.track.get(k, 0), n)
+        return self.base.get(k, n)
+
+    def close(self):
+        pass
+
+
+class _Recompute(_Node):
+    """Activation recomputation (gradient checkpointing) of one layer: forward keeps only the layer's input and output;
+    backward runs the layer's forward again (into buffers every recomputed layer shares), then its backward. The
+    activations of a deep model take the memory of one layer instead of all of them, for about a third more work.
+    live: the layer keeps its activations like any other (chosen per layer while they fit in the card's memory)."""
+
+    def __init__(self, net, key, inner, prefix, gprefix):
+        super().__init__(net, key)
+        self.inner, self.prefix, self.gprefix = inner, prefix, gprefix
+        self.kind = type(inner).__name__
+        self.live, self.foot, self.rows = False, 0, 0
+        self.nodes = [inner]
+
+    def _enter(self):
+        net = self.net
+        sa, sg = net._ck_arena, net._ck_garena
+        self._saved = (net.arena, net.garena)
+        for a in {id(sa): sa, id(sg): sg}.values():
+            a.prefix, a.gprefix, a.kind = self.prefix, self.gprefix, self.kind
+            for k in a.keys:                             # the shared buffers hold another layer's values now
+                b = a.base.bufs.get(k)
+                if b is not None:
+                    net.ops.forget(b)
+        net.arena, net.garena = sa, sg
+
+    def _leave(self):
+        self.net.arena, self.net.garena = self._saved
+
+    def fwd(self, x, shape):
+        self.x, self.shape = x, shape
+        if self.live:
+            return self.inner.fwd(x, shape)
+        net, o = self.net, self.net.ops
+        s0 = net.seed
+        self._enter()
+        try:
+            y, ys = self.inner.fwd(x, shape)
+        finally:
+            self._leave()
+        self.seeds = (s0, net.seed)
+        n = int(np.prod(ys))
+        out = self.buf("out", n)
+        o.copy(out, y, n)
+        self.rows = max(self.rows, _rows(shape))
+        return out, ys
+
+    def bwd(self, dy, need_dx=True):
+        if self.live:
+            return self.inner.bwd(dy, need_dx)
+        net, o = self.net, self.net.ops
+        s0, s1 = self.seeds[0], net.seed
+        net.seed = s0                                    # the same dropout masks as the first time
+        track = {} if not self.foot else None
+        net._ck_arena.track = net._ck_garena.track = track
+        self._enter()
+        try:
+            self.inner.fwd(self.x, self.shape)
+            dx = self.inner.bwd(dy, need_dx)
+        finally:
+            self._leave()
+            net._ck_arena.track = net._ck_garena.track = None
+            net.seed = s1
+        if track:
+            self.foot = 4 * sum(track.values())        # what the layer's own buffers would take
+        if dx is None:
+            return None
+        m = int(np.prod(self.shape))
+        d = self.gbuf("dx", m)
+        o.copy(d, dx, m)
+        return d
+
+
+def _recompute_mode(v, ops):
+    """recompute=: "auto" (the GPU trainer measures the first step and recomputes only the layers that do not fit),
+    true (every block), false (none). APSI_RECOMPUTE overrides."""
+    env = os.environ.get("APSI_RECOMPUTE", "").strip().lower()
+    if env:
+        v = env
+    if v is None:
+        v = "auto"
+    if isinstance(v, str):
+        v = v.strip().lower()
+        if v in ("0", "false", "no", "off", "none"):
+            return False
+        if v in ("1", "true", "yes", "on", "all"):
+            return True
+        if v == "auto":
+            return "auto" if getattr(getattr(ops, "dev", None), "memory", 0) or os.environ.get("APSI_GPU_MEMORY_MB") \
+                else False
+        raise TrainError(f"recompute={v!r}: auto, true or false")
+    return bool(v)
+
+
+def _recomputable(layer):
+    from . import layers as L
+    from . import graphs as GR
+    return isinstance(layer, (L.Residual, L.TransformerBlock, GR.HGT, GR.GlobalAttention, GR.GraphTransformer,
+                              GR.TypedEncoderLayer))
 
 
 class _Linear(_Node):
@@ -4371,10 +4538,14 @@ class _GlobalAttention(_Node):
             s_, d_ = src[order], dst[order]
             E = len(s_)
             put = lambda name, a: _put_buf(self, name, a)              # noqa: E731
-            f = dict(col=put("e_col", s_), off=put("e_off", np.concatenate([[0], np.cumsum(np.bincount(
-                d_, minlength=N))])), row=put("e_row", d_), ids=put("e_ids", np.arange(E)),
-                eoff=put("e_eoff", np.arange(E + 1)), n=N, E=E, src=s_, dst=d_, cached=False)
-            return gd, f, put("e_kid", s_)
+            ar = ("ga-arange", E)                          # 0..E: the same for every layer of this batch
+            if ar not in gd.cache:
+                gd.cache[ar] = gd._put(np.arange(E + 1))
+            col = put("e_col", s_)                         # (the key of each edge is its column: one buffer)
+            f = dict(col=col, off=put("e_off", np.concatenate([[0], np.cumsum(np.bincount(
+                d_, minlength=N))])), row=put("e_row", d_), ids=gd.cache[ar], eoff=gd.cache[ar], n=N, E=E, src=s_,
+                dst=d_, cached=False)
+            return gd, f, col
         f = gd.custom(("global", self.max_keys, self.type_ids), src, dst)
         ck = ("ga", self.max_keys, self.type_ids)
         if ck not in gd.cache:
@@ -4604,10 +4775,11 @@ class _TypedEncoder(_Node):
         self.layer, self.d, self.T, self.ids = layer, layer.d, layer.T, layer.type_ids
         d = self.d
         self.inp = _TypedLin(self, "in.", net.param(p.input.W), net.param(p.input.b), d, d, self.T)
-        self.layers = [net.compile(l_, pp, f"{key}.l{i}", f"{gk}.l{i}") for i, (l_, pp) in
+        # the gradients of layer i are read by layer i - 1 only: layers two apart share their gradient buffers
+        self.layers = [net.compile(l_, pp, f"{key}.l{i}", f"{gk}.l{i % 2}") for i, (l_, pp) in
                        enumerate(zip(layer.layers, p.layers))]
         order = sorted(layer.ga)
-        self.ga = {li: net.compile(layer.ga[li], p.attend[order.index(li)], f"{key}.g{li}", f"{gk}.g{li}")
+        self.ga = {li: net.compile(layer.ga[li], p.attend[order.index(li)], f"{key}.g{li}", f"{gk}.g{li % 2}")
                    for li in order}
         self.ctx = [_Context(self, net.param(p.ctx_W), net.param(p.ctx_b), net.param(p.ctx_gate), li, d)
                     for li in range(layer.L)] if layer.context else []
@@ -4996,6 +5168,69 @@ class _GraphPool(_Node):
         return dx
 
 
+class _KernelLayer(_Node):
+    """gpu_layer: your own @gpu kernels called on the trainer's buffers, on the card, with no copy (the processor
+    runs them on the emulator). Each call waits for the trainer's work first; a kernel the card cannot run falls back
+    to the processor and its results are written back to the card."""
+
+    def __init__(self, net, key, layer, p):
+        super().__init__(net, key)
+        self.layer = layer
+        self.ps = [net.param(a) for a in layer.params_of(p)]
+
+    def _view(self, v, shape):
+        o = self.net.ops
+        n = int(np.prod(shape)) if shape else 1
+        dev = getattr(getattr(o, "dev", None), "activate", None) and o.dev
+        if not dev:                                       # the emulator: the buffer itself
+            return o.v(v, n).reshape(shape)
+        from .native.gpu import GpuArray
+        return GpuArray.on_device(dev, o.p(v)[1], shape, np.float32)
+
+    def _call(self, fn, views):
+        o = self.net.ops
+        o.sync()                                          # the trainer's kernels first
+        try:
+            fn(*views)
+        except TrainError:
+            raise
+        except Exception as e:                            # noqa: BLE001
+            raise TrainError(f"gpu_layer '{self.layer.name}': {type(e).__name__}: {e}") from None
+        for v in views:                                   # fell back to the processor: its results to the card
+            if hasattr(v, "dev_ok") and not v.dev_ok:
+                v.device_ptr()
+        if hasattr(o, "dev"):
+            o.dev.sync()
+
+    def fwd(self, x, shape):
+        self.x, self.shape = x, tuple(shape)
+        ys = self.ys = self.layer.out_shape(shape)
+        y = self.y = self.buf("y", int(np.prod(ys)))
+        self._call(self.layer.forward, [self._view(x, self.shape), self._view(y, ys)] +
+                   [self._view(p.w, p.shape) for p in self.ps])
+        return y, ys
+
+    def bwd(self, dy, need_dx=True):
+        if self.layer.backward is None:
+            raise TrainError(f"gpu_layer '{self.layer.name}': give backward= to train it")
+        o = self.net.ops
+        n = int(np.prod(self.shape))
+        dx = self.gbuf("dx", n)
+        o.fill(dx, n, 0.0)
+        dps = []
+        for i, p in enumerate(self.ps):
+            b = self.gbuf(f"dp{i}", p.n)
+            o.fill(b, p.n, 0.0)
+            dps.append(b)
+        self._call(self.layer.backward,
+                   [self._view(self.x, self.shape), self._view(self.y, self.ys), self._view(dy, self.ys),
+                    self._view(dx, self.shape)] + [self._view(p.w, p.shape) for p in self.ps] +
+                   [self._view(b, p.shape) for b, p in zip(dps, self.ps)])
+        for b, p in zip(dps, self.ps):
+            o.axpy(p.g, b, p.n, 1.0)
+        return dx
+
+
 class _SwiGLU(_Node):
     """down(act(x Wg) * (x Wu)): the gate product keeps its pre-activation and writes the activation in the same
     pass; the backward pass needs no other buffers than the gate, the up product and their product."""
@@ -5046,12 +5281,16 @@ class _SwiGLU(_Node):
 class Net:
     """A model compiled for the device: parameters in one flat array, a tree of nodes."""
 
-    def __init__(self, ops, model, params, precision="auto", graph=None):
+    def __init__(self, ops, model, params, precision="auto", graph=None, recompute=None):
         from . import lowbit
         self.ops = ops
         self.graph, self.gdev, self.gkeep = graph, None, {}
         self.arena = _Arena(ops)
         self.garena = self.arena                        # the backward pass's buffers (the same arena on one card)
+        self.recompute = _recompute_mode(recompute, ops)
+        self.ck, self._in_ck, self._planned = [], False, False
+        self._ck_arena = self._ck_garena = _SharedArena(self.arena)
+        self.mem_fixed, self.size_ratio = None, 1.0
         self.owned = []
         self.train = True
         self.seed = 12345
@@ -5106,7 +5345,28 @@ class Net:
         return _Param(self, a.shape, self.offsets[id(a)])
 
     def compile(self, layer, p, key, gk=None):
-        nd = self._compile(layer, p, key, gk or key)
+        gk = gk or key
+        from . import layers as L
+        forced = isinstance(layer, L.Checkpoint)         # checkpoint(layer): always recomputed
+        if forced:
+            if self._in_ck:
+                return self.compile(layer.inner, p, key, gk)
+            layer = layer.inner
+        if (forced or (self.recompute and _recomputable(layer))) and not self._in_ck:
+            self._in_ck = True
+            try:
+                inner = self._compile(layer, p, key + ".r", gk + ".r")
+            finally:
+                self._in_ck = False
+            if getattr(inner, "gkey", None) is None:
+                inner.gkey = gk + ".r"
+            if isinstance(inner, _HostLayer):
+                return inner
+            nd = _Recompute(self, key, inner, key + ".r", gk + ".r")
+            nd.gkey, nd.forced = gk, forced
+            self.ck.append(nd)
+            return nd
+        nd = self._compile(layer, p, key, gk)
         if getattr(nd, "gkey", None) is None:
             nd.gkey = gk or key
         return nd
@@ -5176,6 +5436,8 @@ class Net:
             return _TiedOutput(self, key, layer, self.dag_params)
         if isinstance(layer, L.SwiGLU):
             return _SwiGLU(self, key, layer, p)
+        if isinstance(layer, L.KernelLayer):
+            return _KernelLayer(self, key, layer, p)
         if isinstance(layer, L.MoE):
             return _MoE(self, key, layer, p)
         if isinstance(layer, L.DAG):
@@ -5266,6 +5528,38 @@ class Net:
 
     def backward(self, dy):
         self.root.bwd(dy, False)
+        if not self._planned:
+            self._planned = True
+            self.plan_recompute()
+
+    def plan_recompute(self):
+        """After the first backward pass (every recomputed layer measured): the layers whose activations fit in the
+        card's memory keep them, the last layers first (backward needs them first); the rest are recomputed. The
+        memory of the largest batch is what has to fit (size_ratio: its inputs over the first batch's)."""
+        if self.recompute != "auto" or not any(not nd.forced for nd in self.ck):
+            return
+        mem = getattr(getattr(self.ops, "dev", None), "memory", 0) or int(os.environ.get("APSI_GPU_MEMORY_MB", "0")) \
+            * 2 ** 20
+        if not mem:
+            return
+        frac = float(os.environ.get("APSI_GPU_MEMORY_TARGET", "0.85"))
+        fixed = self.mem_fixed if self.mem_fixed is not None else 0
+        r = max(1.0, float(self.size_ratio))
+        room = frac * mem - (fixed + r * (self.ops.used - fixed))
+        live = 0
+        for nd in reversed(self.ck):
+            if nd.forced:
+                continue
+            need = r * nd.foot
+            if need <= room:
+                nd.live, room, live = True, room - need, live + 1
+        self.recompute_plan = (live, len(self.ck))
+        if live == len(self.ck):  # (no forced one either)                         # everything fits: the shared buffers go
+            for k in list(self._ck_arena.keys):
+                b = self.arena.bufs.pop(k, None)
+                if b is not None:
+                    self.ops.free(b)
+            self._ck_arena.keys = set()
 
     def set_graph(self, g, keep=False):
         """Another graph for the next steps (a batch of graphs): its forms on the card are made when needed. keep:
@@ -5382,7 +5676,7 @@ def _raw_of(a):
 def fit_batches(model, params, batches, loss="cross_entropy", opt=None, epochs=1, verbose=True, clip=None,
                 schedule=None, device="cuda", precision="auto", ops=None, compensated=None, every=None,
                 accumulate=1, stages=None, freeze=None, train_only=None, exact_sums=None, steps=None,
-                checkpoint=None, save_every=None, resume=True, callback=None):
+                checkpoint=None, save_every=None, resume=True, callback=None, recompute=None):
     """Train on batches that each bring their own shapes: batches is a list of (inputs, targets[, graph]) or a
     function epoch -> such a list. inputs may be a list (a dag with several inputs: token ids, node features, ...);
     each batch may have its own graph (a batch of graphs), its own number of rows and its own lengths. One card."""
@@ -5414,7 +5708,7 @@ def fit_batches(model, params, batches, loss="cross_entropy", opt=None, epochs=1
     adam = isinstance(opt, Adam)
     wd = float(getattr(opt, "wd", 0.0)) if isinstance(opt, AdamW) else 0.0
     E = int(epochs)
-    net = Net(ops, model, params, precision)
+    net = Net(ops, model, params, precision, recompute=recompute)
     n = net.n
     st1, st2, SQ = ops.alloc(n), (ops.alloc(n) if adam else None), ops.alloc(1)
     COMP = ops.alloc(n) if _want_comp(compensated, params, precision) else None
@@ -5442,12 +5736,17 @@ def fit_batches(model, params, batches, loss="cross_entropy", opt=None, epochs=1
             print(f"resumed from {checkpoint}: step {step}, epoch {start_ep}, batch {skip}")
     last = start_ep + E if want is None else 1 << 30
     pos = [start_ep, skip]                               # where the next step starts (epoch, batch)
+    net.mem_fixed = ops.used                             # weights, gradients, the optimizer: before any activation
 
     def saved():
         _ckpt_save(str(checkpoint), ops, net, st1, st2, COMP, t, step, pos[0], pos[1])
 
+    step0 = step
+
     def after_step(ep_, bi_):                            # True: stop here (steps reached)
         pos[0], pos[1] = ep_, bi_ + 1
+        if verbose and step == step0 + 2:                 # the second step runs with the plan the first one made
+            _say_memory(ops, net)
         if checkpoint and save_every and step % int(save_every) == 0:
             saved()
         return want is not None and step >= want
@@ -5459,6 +5758,8 @@ def fit_batches(model, params, batches, loss="cross_entropy", opt=None, epochs=1
             items = list(batches(ep) if callable(batches) else batches)
             if not items:
                 raise TrainError("no batches")
+            if not net._planned and net.recompute == "auto":
+                net.size_ratio = _size_ratio(items, skip if ep == start_ep else 0)
             tot, rows_all = 0.0, 0
             if LOSSB is None or LOSSB.n < len(items):
                 if LOSSB is not None:
@@ -5577,7 +5878,36 @@ def fit_batches(model, params, batches, loss="cross_entropy", opt=None, epochs=1
         for b_ in (EXACT or ()):
             ops.free(b_)
         net.close()
-    return Record(params=out_params, history=history, device=getattr(ops, "name", "?"))
+    return Record(params=out_params, history=history, device=getattr(ops, "name", "?"),
+                  gpu_memory_mb=round(getattr(ops, "peak", ops.used) / 2 ** 20),
+                  recomputed=sum(1 for nd in net.ck if not nd.live), blocks=len(net.ck))
+
+
+def _say_memory(ops, net):
+    mem = getattr(getattr(ops, "dev", None), "memory", 0)
+    if not mem or not net.ck:
+        return
+    rc = sum(1 for nd in net.ck if not nd.live)
+    print(f"card memory: {getattr(ops, 'peak', ops.used) / 2 ** 30:.2f} of {mem / 2 ** 30:.1f} GB at the peak; "
+          f"{rc} of {len(net.ck)} blocks recomputed in backward")
+
+
+def _size_ratio(items, first):
+    """How much larger the largest batch is than the first one trained on (inputs and graph nodes): the memory the
+    first step measured, scaled to the largest."""
+    def size(it):
+        X, _, g = _batch_parts(it)
+        xs = X if isinstance(X, (list, tuple)) else [X]
+        parts = [int(np.prod(np.shape(_raw_of(a)))) for a in xs]
+        if g is not None:
+            parts.append(int(np.asarray(getattr(g, "batch", ())).size))
+        return parts
+    try:
+        sizes = [size(it) for it in items]
+        f = sizes[min(first, len(sizes) - 1)]
+        return max(max((s_[i] / max(f[i], 1)) for s_ in sizes) for i in range(len(f)))
+    except Exception:                                    # noqa: BLE001 - odd batches: no scaling
+        return 1.0
 
 
 def _ckpt_save(path, ops, net, st1, st2, COMP, t, step, epoch, batch=0):
@@ -6514,7 +6844,7 @@ def predict(model, params, X, device="cuda", precision="auto", batch_size=64, op
         if ops is None:
             raise TrainError(f"no GPU: {why}")
     first = model.layers[0] if isinstance(model, L.Sequential) and model.layers else model
-    net = Net(ops, model, params, precision, graph)
+    net = Net(ops, model, params, precision, graph, recompute=False)
     try:
         if isinstance(X, (list, tuple)) or getattr(model, "kind", "") == "dag":
             # several inputs (token ids, node features ...) and / or several outputs: one pass, as given

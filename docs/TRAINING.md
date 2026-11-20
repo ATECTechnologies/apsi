@@ -213,9 +213,42 @@ For each parameter, training on the card keeps:
 
 So AdamW with every protection on needs about 28 bytes per parameter, plus the activations of one micro-batch
 (which grow with batch size × sequence length × width × layers). A 125 M-parameter model: about 3.5 GB before
-activations, comfortable on a 12 GB card. When the card runs out, the error says how much was in use; then lower the
-batch size and raise `accumulate` (the result is the same, bit for bit), or split the model with
-`device="cuda:all"`.
+activations, comfortable on a 12 GB card.
+
+### Activations: recomputed when they do not fit (`recompute=`)
+
+The activations of a deep model are usually most of the memory: a graph layer keeps, per node, its keys under every
+relation; an attention layer its scores; every block its inputs and outputs. With `recompute="auto"` (the default on
+a card), the first training step keeps only the input and the output of each block (residual and transformer blocks,
+`hgt`, `global_attention`, graph transformer layers) and runs the block's forward again in backward, in buffers that
+every recomputed block shares. That step measures what each block would keep; from the second step on, the blocks
+that fit under 85 % of the card's memory keep their activations (the last blocks first, since backward needs them
+first) and only the rest are recomputed. The memory of the largest batch in the data is what has to fit, not the
+first one's. The training log says what was chosen:
+
+```
+card memory: 9.84 of 12.0 GB at the peak; 41 of 89 blocks recomputed in backward
+```
+
+The results do not change: recomputation repeats exactly the same kernels and the same dropout masks, so the losses
+and the weights are the same to the last bit as keeping everything. A recomputed block costs about a third more work
+(its forward runs twice).
+
+| Setting | What it does |
+|---|---|
+| `recompute="auto"` (default) | measure, then recompute only what does not fit |
+| `recompute=true` | recompute every block (least memory) |
+| `recompute=false` | keep every activation (fastest when it fits) |
+| `checkpoint(layer)` | this layer is always recomputed, whatever the setting |
+| `APSI_RECOMPUTE=auto/1/0` | the same, for a whole run |
+| `APSI_GPU_MEMORY_TARGET=0.85` | the share of the card's memory the plan aims for |
+
+On Windows the driver can lend the card part of the computer's memory when the card is full; the program then keeps
+running, many times slower, and the computer's memory fills up (and with it the swap file on the disk). Apsi says so
+when it happens (`note: … GB asked of a 12.0 GB card`); with the default `recompute="auto"` it should not.
+
+When the card still runs out, the error says how much was in use; then lower the batch size and raise `accumulate`
+(the result is the same, bit for bit), or split the model with `device="cuda:all"`.
 
 ## 12. When something goes wrong
 
@@ -225,7 +258,8 @@ batch size and raise `accumulate` (the result is the same, bit for bit), or spli
 | The loss is `nan` in the history | a NaN in the **loss** of a batch (the guard protects the weights, not the reported loss) | the same checks; the weights are still finite |
 | "the checkpoint … is of a model with N weights" | the file belongs to another model or another size | another `checkpoint=` path, or `resume=false` to start over |
 | "steps= and checkpoint= train on one card for now" | `device="cuda:all"` together with `steps=` / `checkpoint=` | `device="cuda:0"` with `accumulate=` for the same result, or train by `epochs=` on many cards |
-| "the card ran out of memory" | the model, the optimizer state and the activations do not fit | a smaller batch and a larger `accumulate` (the same result); several cards (`device="cuda:all"`) |
+| "the card ran out of memory" | the model, the optimizer state and the activations do not fit | `recompute=true`; a smaller batch and a larger `accumulate` (the same result); several cards (`device="cuda:all"`) |
+| Training is very slow and the computer's memory is full | Windows lent the card the computer's memory (a "note: … GB asked of a … GB card" line) | `recompute=true`, or a smaller batch with a larger `accumulate` |
 | Two runs on the card differ | `APSI_GPU_DETERMINISTIC=0`, or a different number of cards with exact sums off | turn both back on (the defaults) |
 | Training became slower over a long run | the card reached its temperature limit (77 °C) and was slowed to stay there | better airflow, or a power limit (`APSI_GPU_POWER`, `apsi gpu setup`) that keeps the speed steady |
 | A resumed run differs from one long run | the data changed between the runs (a different file list or order) | resume with the same `batches` (a function of the epoch is fine if it is deterministic) |

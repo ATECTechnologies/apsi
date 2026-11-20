@@ -1318,7 +1318,7 @@ def _freeze_keep(old, new, paths):
 def fit_batches(model, params, batches, loss="cross_entropy", opt=None, epochs=1, backend="auto", device="cuda",
                 verbose=True, clip=None, schedule=None, precision="auto", compensated=None, every=None, accumulate=1,
                 stages=None, freeze=None, train_only=None, steps=None, checkpoint=None, save_every=None, resume=True,
-                callback=None):
+                callback=None, recompute=None):
     """Train on batches that each bring their own shapes and graph: a list of (inputs, targets[, graph]) or a function
     epoch -> such a list. inputs may be a list (a dag with several inputs, e.g. token ids and node features). Each
     step is `accumulate` batches (their gradients averaged); the history is the mean loss of each epoch. backend: "auto"
@@ -1331,7 +1331,10 @@ def fit_batches(model, params, batches, loss="cross_entropy", opt=None, epochs=1
     with save_every=K: the weights, the optimizer's state and the position in the data are saved every K steps, at the
     end and when training stops on an error or Ctrl+C; running the same call again resumes exactly where it stopped
     (resume=false starts over). callback(record(epoch, step, loss)) after every epoch. A step whose gradient is not
-    finite (inf / NaN) is skipped, so one bad batch cannot ruin the weights (APSI_GPU_GUARD=0 turns this off)."""
+    finite (inf / NaN) is skipped, so one bad batch cannot ruin the weights (APSI_GPU_GUARD=0 turns this off).
+    recompute="auto" (the default on a card): the first step measures the memory; the blocks whose activations do not fit
+    in the card's memory (residual / transformer blocks, hgt, global attention, graph transformer layers) are computed
+    again in backward instead of kept, the rest keep them. true: every block; false: none."""
     from .stdlib import Adam, value_and_grad
     opt = opt or Adam(1e-3)
     which = str(backend or "auto").lower()
@@ -1343,7 +1346,7 @@ def fit_batches(model, params, batches, loss="cross_entropy", opt=None, epochs=1
                                       precision, compensated=compensated, every=every, accumulate=accumulate,
                                       stages=stages, freeze=freeze, train_only=train_only, steps=steps,
                                       checkpoint=checkpoint, save_every=save_every, resume=resume,
-                                      callback=callback)
+                                      callback=callback, recompute=recompute)
             except GT.TrainError as e:
                 raise RuntimeErr(f"backend=\"gpu\": {e}") from None
     lf = loss if callable(loss) else _loss_fn(loss)
@@ -1550,6 +1553,63 @@ class CustomLayer(Layer):
 
     def describe(self):
         return self.name
+
+
+class KernelLayer(Layer):
+    """A layer made of your own GPU kernels (@gpu functions): the trainer calls them on its own buffers, on the card,
+    with no copy. forward(x, y, *params) writes the output y; backward(x, y, dy, dx, *params, *grads) writes the
+    input's gradient dx and the parameters' gradients (each starts at zero; the trainer adds them to the step's).
+    params: the leaves of init(seed)'s record, in its field order. out(shape) -> the output's shape (default: the
+    input's). Without a card (or on the NumPy backend) the same functions run on the processor, so a model with
+    kernel layers trains, checks and predicts everywhere."""
+    kind = "gpu_layer"
+
+    def __init__(self, forward, backward=None, init=None, out=None, name="gpu_layer"):
+        self.forward, self.backward, self.init_fn, self.out_fn = forward, backward, init, out
+        self.name = str(name)
+
+    def init(self, seed=0):
+        if self.init_fn is None:
+            return Record()
+        return self.init_fn(seed=0 if seed is None else int(seed))
+
+    def out_shape(self, shape):
+        if self.out_fn is None:
+            return tuple(int(s) for s in shape)
+        return tuple(int(s) for s in ops.raw(self.out_fn(list(int(s) for s in shape))))
+
+    def params_of(self, p):
+        from .values import tree_leaves
+        return [a for a in tree_leaves(p) if a is not None and not isinstance(a, (str, bool))]
+
+    def apply(self, p, x, train=False, **ctx):
+        from . import autodiff as AD
+        leaves = self.params_of(p)
+        xv = np.asarray(AD._v(x), np.float64)
+        pv = [np.ascontiguousarray(np.asarray(AD._v(a), np.float64)) for a in leaves]
+        y = np.zeros(self.out_shape(xv.shape), np.float64)
+        xv = np.ascontiguousarray(xv)
+        self.forward(xv, y, *pv)
+        if not any(isinstance(a, AD.Node) for a in [x] + leaves):
+            return y
+        if self.backward is None:
+            raise RuntimeErr(f"gpu_layer '{self.name}': give backward= to train it")
+
+        def vjp(g, outv, need, *raw):
+            dy = np.ascontiguousarray(np.asarray(AD._v(g), np.float64))
+            dx = np.zeros(xv.shape, np.float64)
+            dps = [np.zeros(a.shape, np.float64) for a in pv]
+            self.backward(xv, y, dy, dx, *pv, *dps)
+            return (dx, *dps)
+        return AD.Node(y, (x, *leaves), vjp)
+
+    def describe(self):
+        return f"gpu_layer({self.name})"
+
+
+def gpu_layer(forward, backward=None, init=None, out=None, name="gpu_layer"):
+    """A layer from your own @gpu kernels, run by the GPU trainer on its buffers (see KernelLayer)."""
+    return KernelLayer(forward, backward, init, out, name)
 
 
 class Checkpoint(Layer):
@@ -2282,7 +2342,7 @@ def module(interp=None):
         gcn=GCN, sage=SAGE, gat=GAT, gin=GIN, gine=GINE, batch_graphs=batch_graphs, graph_pool=GraphPool,
         # composition
         sequential=sequential, residual=residual, parallel=parallel, dag=dag, add=add, multiply=multiply,
-        concatenate=concatenate, custom_layer=custom_layer, checkpoint=checkpoint, diagnose=diagnose, load_torch_weights=load_torch_weights,
+        concatenate=concatenate, custom_layer=custom_layer, gpu_layer=gpu_layer, checkpoint=checkpoint, diagnose=diagnose, load_torch_weights=load_torch_weights,
         # model zoo
         mlp=mlp, resnet_mlp=resnet_mlp, cnn=cnn, lstm_classifier=lstm_classifier, transformer_lm=transformer_lm,
         transformer_classifier=transformer_classifier, autoencoder=autoencoder, vae=vae, vae_loss=vae_loss,
