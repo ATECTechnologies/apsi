@@ -4825,6 +4825,8 @@ class _GraphMemory(_Node):
         g = self.net.graph
         batch = np.asarray(g.batch, np.int64) if g is not None else np.zeros(N, np.int64)
         G = int(batch.max()) + 1 if N else 0
+        lead = getattr(g, "leading", None) if g is not None else None
+        G = min(G, int(lead)) if lead is not None else G                   # graph(leading=n): the first n only
         sc = self.buf("sc", max(1, N))
         o.gemm(x, self.w.w, sc, N, 1, d, d, 1, 1, 1, 1, bias=self.b.w, passes=3)
         raw = o.get(sc[0], N, sc[1]).astype(np.float64)
@@ -4867,6 +4869,39 @@ class _GraphMemory(_Node):
         dx = self.gbuf("dx", N * d)
         o.spmm(dy, self.tcol, self.wv, self.tcol, self.toff, dx, N, 1, d)
         o.gemm(dsc, self.w.w, dx, N, d, 1, 1, 1, 1, 1, d, beta=True, passes=3)          # + dscore w^T
+        return dx
+
+
+class _PickRows(_Node):
+    """pick_rows: the rows named by the batch's graph (graph.picks[name]) gathered in one sparse product; their
+    gradient added back to the picked rows the same way (a row picked twice gets both)."""
+
+    def __init__(self, net, key, layer):
+        super().__init__(net, key)
+        self.layer = layer
+
+    def fwd(self, x, shape):
+        N, F = _rows(shape), int(shape[-1])
+        sel = self.layer.rows(self.net.graph)
+        if not len(sel):
+            sel = np.zeros(1, np.int64)
+        R = len(sel)
+        order = np.argsort(sel, kind="stable")
+        put = lambda name, a, dt=np.int32: _put_buf(self, name, a, dt)   # noqa: E731
+        self.sel = put("sel", sel)
+        self.ids = put("ids", np.arange(R + 1))
+        self.tcol = put("tcol", order)
+        self.toff = put("toff", np.concatenate([[0], np.cumsum(np.bincount(sel, minlength=N))]))
+        self.N, self.R, self.F = N, R, F
+        y = self.buf("y", max(1, R * F))
+        self.net.ops.spmm(x, self.sel, None, None, self.ids, y, R, 1, F)
+        return y, (R, F)
+
+    def bwd(self, dy, need_dx=True):
+        if not need_dx:
+            return None
+        dx = self.gbuf("dx", self.N * self.F)
+        self.net.ops.spmm(dy, self.tcol, None, None, self.toff, dx, self.N, 1, self.F)
         return dx
 
 
@@ -5123,6 +5158,8 @@ class Net:
             return _MixHop(self, key, layer, p)
         if isinstance(layer, GR.GraphMemory):
             return _GraphMemory(self, key, layer, p)
+        if isinstance(layer, GR.PickRows):
+            return _PickRows(self, key, layer)
         if isinstance(layer, GR.HGT):
             return _HGT(self, key, layer, p, gk)
         if isinstance(layer, GR.TypedLinear):

@@ -295,6 +295,8 @@ class GraphMemory(Layer):
         N = int(np.shape(ops.raw(x))[0])
         batch = g.batch if g is not None else np.zeros(N, dtype=np.int64)
         graphs = int(batch.max()) + 1 if N else 0
+        lead = getattr(g, "leading", None) if g is not None else None
+        graphs = min(graphs, int(lead)) if lead is not None else graphs      # graph(leading=n): the first n only
         score = ops.reshape(x @ p.w + p.b, N)
         raw = np.asarray(ops.raw(score))
         rows, valid = [], np.zeros((graphs, self.k))
@@ -309,6 +311,32 @@ class GraphMemory(Layer):
 
     def describe(self):
         return f"graph_memory(d={self.d}, k={self.k})"
+
+
+class PickRows(Layer):
+    """The rows of its input named by the graph of the batch: graph(...).picks[name] (a list of row ids, repeats
+    allowed). For heads that read some nodes only - the masked words of a masked-word loss, the node pairs of a
+    structure loss - without sending every node state to the loss."""
+    kind = "pick_rows"
+
+    def __init__(self, name):
+        self.name = str(name)
+
+    def init(self, seed=0):
+        return Record()
+
+    def rows(self, g):
+        picks = getattr(g, "picks", None) or {}
+        if self.name not in picks:
+            raise ShapeError(f"pick_rows('{self.name}'): the batch's graph has no picks['{self.name}']")
+        return np.asarray(picks[self.name], dtype=np.int64).reshape(-1)
+
+    def apply(self, p, x, train=False, **ctx):
+        idx = self.rows(ctx.get("graph"))
+        return x[idx] if len(idx) else ops.reshape(x[np.zeros(1, np.int64)], 1, -1) * 0.0
+
+    def describe(self):
+        return f"pick_rows('{self.name}')"
 
 
 # ============================================================== heterogeneous graphs (a type per node)
@@ -757,7 +785,7 @@ def graph_transformer_net(n_in, d, out, layers=4, heads=4, relations=1, global_e
 
 def names():
     return dict(graph_transformer=GraphTransformer, global_attention=GlobalAttention, mix_hop=MixHop,
-                graph_memory=GraphMemory, hgt=HGT, typed_linear=TypedLinear, typed_norm=TypedNorm,
+                graph_memory=GraphMemory, pick_rows=PickRows, hgt=HGT, typed_linear=TypedLinear, typed_norm=TypedNorm,
                 typed_graph_encoder=TypedGraphEncoder, typed_pool=TypedPool, graph_context=GraphContext, split_typed_encoder=split_typed_encoder,
                 graph_transformer_net=graph_transformer_net, k_hop=k_hop, hop_distances=hop_distances,
                 eccentricity=eccentricity)

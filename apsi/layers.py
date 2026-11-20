@@ -148,12 +148,14 @@ class Graph:
 
 
 def graph(edges=None, n=None, src=None, dst=None, self_loops=True, undirected=False, batch=None, types=None,
-          reverse=False, node_types=None, edge_features=None):
+          reverse=False, node_types=None, edge_features=None, leading=None):
     """graph(edges=[[0, 1], [1, 2]], n=3) or graph(src=tensor, dst=tensor, n=…). `batch` assigns nodes to
     separate graphs for graph-level tasks (used by graph_pool). `types` gives every edge a relation (0, 1, …) for
     graph_transformer layers; reverse=true adds each edge backwards as its own relation, so information flows both
     ways with separate weights (use -> definition as well as definition -> use). edge_features: a row of numbers
-    per edge [E, F] (bond types, distances, …), read by gine; self loops get zeros, reversed edges a copy."""
+    per edge [E, F] (bond types, distances, …), read by gine; self loops get zeros, reversed edges a copy.
+    leading=n: only the first n graphs of the batch go into graph_memory (the ones a decoder reads, one per row of
+    its batch); the graphs after them are encoded and pooled too (e.g. the targets of a contrastive loss)."""
     if edges is not None:
         e = np.asarray(ops.raw(edges)).astype(np.int64).reshape(-1, 2) if len(edges) else np.zeros((0, 2), int)
         src, dst = e[:, 0], e[:, 1]
@@ -171,6 +173,7 @@ def graph(edges=None, n=None, src=None, dst=None, self_loops=True, undirected=Fa
     g = Graph(src, dst, n, self_loops=self_loops, undirected=undirected, rel=rel, efeat=ef)
     g.batch = _ids(batch) if batch is not None else np.zeros(g.n, dtype=np.int64)
     g.graphs = int(g.batch.max()) + 1 if g.n else 0
+    g.leading = int(leading) if leading is not None else None
     if node_types is not None:                       # a type per node (heterogeneous graphs: typed_linear, hgt)
         g.ntype = _ids(node_types)
         if len(g.ntype) != g.n:

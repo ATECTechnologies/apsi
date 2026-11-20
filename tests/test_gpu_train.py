@@ -225,6 +225,42 @@ class Trainer(unittest.TestCase):
         np.testing.assert_allclose(a.history, b.history, rtol=1e-5)
         self.assertLess(b.history[-1], b.history[0])
 
+    def test_leading_graphs_and_picked_rows(self):
+        """graph(leading=n): only the first n graphs go into graph_memory (the decoder's rows), the rest are encoded
+        too; pick_rows: the nodes a head reads, named by the batch's graph; card_loss over both outputs. On the card
+        equals NumPy."""
+        from apsi import graphs as GR
+        from apsi.values import Record
+        from apsi.stdlib import cross_entropy
+        rng = np.random.default_rng(1)
+        V, d, T, W = 20, 16, 6, 12
+        m = L.DAG([["n0", L.Embedding(30, d), "nodes"], ["n1", GR.HGT(d, 4, types=3, relations=2), "n0"],
+                   ["mem", GR.GraphMemory(d, 3), "n1"], ["pk", GR.PickRows("masked"), "n1"],
+                   ["mlm", L.Linear(d, W), "pk"], ["e", L.Embedding(V, d), "tok"],
+                   ["h", L.Residual(L.MultiHeadAttention(d, 4, causal=True), pre_norm=L.RMSNorm(d)), "e"],
+                   ["c", L.MultiHeadAttention(d, 4), ["h", "mem"]], ["r", L.add(), ["c", "h"]],
+                   ["out", L.Linear(d, V), "r"]], inputs=["tok", "nodes"], output=["out", "mlm"])
+        loss = L.card_loss(0, lambda outs, ys: cross_entropy(outs[1], ys.masked))
+        bs = []
+        for _ in range(4):
+            G = 3
+            sizes = rng.integers(4, 8, G + 2)
+            N = int(sizes.sum())
+            e = rng.integers(0, N, (2 * N, 2))
+            g = L.graph(edges=e.tolist(), n=N, batch=np.repeat(np.arange(G + 2), sizes),
+                        types=rng.integers(0, 2, len(e)), node_types=rng.integers(0, 3, N), self_loops=False,
+                        leading=G)
+            g.picks = {"masked": rng.integers(0, N, 5)}
+            t = rng.integers(0, V, (G, T))
+            y = np.roll(t, -1, 1)
+            y[:, :1] = -1
+            bs.append(([t, rng.integers(0, 30, N)], Record(labels=y, masked=rng.integers(0, W, 5)), g))
+        a = L.fit_batches(m, m.init(seed=0), bs, loss, opt=Adam(0.01), epochs=3, backend="numpy", verbose=False)
+        b = GT.fit_batches(m, m.init(seed=0), bs, loss, opt=Adam(0.01), epochs=3, verbose=False, precision="fp32",
+                           ops=GT.Emulator())
+        np.testing.assert_allclose(a.history, b.history, rtol=1e-5)
+        self.assertLess(b.history[-1], b.history[0])
+
     def test_any_model_split_across_cards_in_batches(self):
         """A two-input graph-and-language dag (hgt, global attention, graph memory, cross-attention, rotary positions,
         grouped heads, SwiGLU), a different batch of graphs every step, gradients of 4 batches averaged per step:
