@@ -245,7 +245,7 @@ def save_safetensors(path, params, metadata=None):
             v = dequantize(v)
         if isinstance(v, Quantity):
             v = v.v
-        arr = np.ascontiguousarray(np.asarray(v))
+        arr = np.ascontiguousarray(np.asarray(v)) if np.ndim(v) else np.array(np.asarray(v).reshape(()))   # (ascontiguousarray makes a scalar 1-d)
         if arr.dtype not in _NP_TO_ST:
             arr = arr.astype(np.float32)
         data = arr.tobytes()
