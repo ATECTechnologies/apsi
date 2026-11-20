@@ -1,13 +1,21 @@
-## 2.6.0 (Improved version) — exact training on any number of cards, typed graph models, training that finishes, fewer tokens (14 November 2026)
+## 2.6.0 (Improved version) — exact training on any number of cards, typed graph models, training that finishes, fewer tokens (20 November 2026)
 
 **Install:** [apsi.dev/download](https://apsi.dev/download) — `ApsiSetup-2.6.0-x64.exe` (Windows 10/11),
 `ApsiSetup-2.6.0-linux.sh` (any Linux, WSL), `apsi_2.6.0_all.deb` (Ubuntu / Debian), or from this source:
 `pip install numpy`, then `./apsi.sh` / `apsi.bat`. What's new, with examples: [docs/WHATS-NEW.md](https://github.com/ATECTechnologies/apsi/blob/main/docs/WHATS-NEW.md);
 everyday code runs 1.22× faster than in 2.4.4 (geometric mean); the training guide: [docs/TRAINING.md](https://github.com/ATECTechnologies/apsi/blob/main/docs/TRAINING.md).
 
-Tested: 425 tests on every push (Linux x64 / ARM64, macOS Apple silicon / Intel, Windows; Python 3.12–3.14) and 81
-on a real NVIDIA RTX 3060 (every kernel against the exact reference; typed graph encoders and a transformer trained twice with
-identical weights; steps and resume bit for bit; the NaN guard).
+**Faster than PyTorch on the same card:** a 127 M GPT trained for 2 epochs on an RTX 3060 at 20,708 tokens/s against
+PyTorch 2.14 bf16's 18,809 at the same temperature (1.10×), with Apsi's own 16-bit kernels (no cuBLAS), the card never
+above 79 °C.
+
+Tested: 445 tests on every push (Linux x64 / ARM64, macOS Apple silicon / Intel, Windows; Python 3.12–3.14) and 112
+on a real NVIDIA RTX 3060 (13 of 13 kernel checks against the exact reference; typed graph encoders and a transformer
+trained twice with identical weights; steps and resume bit for bit; the NaN guard).
+
+**Setup 1.50.0:** the GPU helper step takes seconds (it no longer measures the card during setup), the wizard shows each
+stage and the elapsed time, and uninstalling removes the GPU helper first (`apsi gpu remove` as administrator does it
+by hand).
 
 ### Binary layouts and embedded work
 - **`use layout`:** `c_struct` (natural alignment or `pack=`, little / big endian, arrays, nested structs, bit

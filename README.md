@@ -91,6 +91,8 @@ Then read [Getting started](docs/GETTING-STARTED.md) (15 minutes) or [Write Apsi
 
 ## What's new in 2.6.0
 
+* **Faster than PyTorch on the same card.** A 127 M GPT, 2 epochs on an RTX 3060: 20,708 tokens/s against PyTorch 2.14
+  bf16's 18,809 at the same temperature (1.10×), on Apsi's own 16-bit kernels (no cuBLAS), the card never above 79 °C.
 * **The same weights on one card or eight.** Gradients of accumulated batches, of copies of the model and across the
   cuts of a model split over cards are summed exactly (double-float, rounded once): adding cards makes training
   faster, never different.
@@ -124,7 +126,7 @@ Details, examples and measurements: [`docs/WHATS-NEW.md`](docs/WHATS-NEW.md) · 
 | Operating systems | Windows 10 / 11 (x64), Linux x86-64 and ARM64 (Ubuntu 22.04+, Debian 12+, Fedora, Arch, WSL), macOS on Apple silicon and Intel — each tested on every push |
 | Python (host runtime) | 3.12, 3.13, 3.14 |
 | Native compiler | x86-64 with AVX2 / AVX-512, ARM64 with NEON (needs `llvmlite`; on Intel Macs, where llvmlite has no wheels, Apsi runs without it) |
-| GPUs | NVIDIA GTX 1660 and newer for `@gpu` (Tensor Cores through cuBLAS); AMD ROCm, Apple MPS, Intel XPU through the PyTorch backend |
+| GPUs | NVIDIA GTX 1660 and newer (training on Apsi's own tensor-core kernels; only the NVIDIA driver needed); AMD ROCm, Apple MPS, Intel XPU through the PyTorch backend |
 | Editors | VS Code, Cursor, Windsurf, VSCodium, Sublime Text, Vim/Neovim, Notepad++, JetBrains, Helix, Zed, Emacs |
 
 ## Documentation
