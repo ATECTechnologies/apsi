@@ -1056,6 +1056,10 @@ Load a module with `use NAME` (all its names) or `use NAME as n` (then `n.member
 | `qlinear(x, W, b=None)` | x @ W (+ b) where W may be a QTensor — decodes, multiplies and accumulates in FP32. |
 | `quantize_model(params, dtype=None, min_size=1024)` | Store every weight matrix (>= min_size elements) in a compact format; others stay as-is. |
 | `safetensors_info(path)` | function |
+| `safetensors_metadata(path)` | The text metadata of a .safetensors file (a dict of strings). |
+| `load_named_tensors(path)` | Every tensor of a .safetensors file under its exact name (a dict). |
+| `named_tensors(params, rows, shapes=None)` | A parameter tree under another program's names (rows [name, path, index, transpose, start, end]). |
+| `from_named_tensors(like, named, rows)` | The inverse: a parameter tree shaped like `like`, filled from named tensors. |
 | `save_gguf(path, params, metadata=None, dtype='f16', name=None, architecture='apsi')` | function |
 | `save_model(path, params, metadata=None, shard='4GB', sign=False)` | function |
 | `save_safetensors(path, params, metadata=None)` | function |

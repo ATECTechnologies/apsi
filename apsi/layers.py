@@ -1375,7 +1375,7 @@ def fit_batches(model, params, batches, loss="cross_entropy", opt=None, epochs=1
     want = int(steps) if steps else None
     start_ep, skip = 0, 0
     if checkpoint and resume and os.path.exists(str(checkpoint)):
-        params, step, start_ep, skip = _np_ckpt_load(str(checkpoint), params, opt)
+        params, step, start_ep, skip = _np_ckpt_load(str(checkpoint), params, opt, model)
         if verbose:
             print(f"resumed from {checkpoint}: step {step}, epoch {start_ep}, batch {skip}")
     last = start_ep + E if want is None else 1 << 30
@@ -1398,7 +1398,7 @@ def fit_batches(model, params, batches, loss="cross_entropy", opt=None, epochs=1
                 step += 1
                 pos[0], pos[1] = ep, s0 + A
                 if checkpoint and save_every and step % int(save_every) == 0:
-                    _np_ckpt_save(str(checkpoint), params, opt, step, pos)
+                    _np_ckpt_save(str(checkpoint), params, opt, step, pos, model)
                 if want is not None and step >= want:
                     stop = True
                     break
@@ -1410,11 +1410,11 @@ def fit_batches(model, params, batches, loss="cross_entropy", opt=None, epochs=1
             if verbose and (ep % every == 0 or ep == last - 1 or stop):
                 print(f"epoch {ep:4}  loss {history[-1]:.5f}  ({len(items)} batches, step {step})")
         if checkpoint:
-            _np_ckpt_save(str(checkpoint), params, opt, step, pos)
+            _np_ckpt_save(str(checkpoint), params, opt, step, pos, model)
     except BaseException:
         if checkpoint:
             try:
-                _np_ckpt_save(str(checkpoint), params, opt, step, pos)
+                _np_ckpt_save(str(checkpoint), params, opt, step, pos, model)
                 if verbose:
                     print(f"training stopped at step {step}; saved to {checkpoint} (run again to resume)")
             except Exception:                            # noqa: BLE001
@@ -1450,7 +1450,7 @@ def _np_step(model, params, chunk, loss, lf, opt, schedule, step, clip, still, g
     return _freeze_keep(params, opt.step(params, gr), still), tot, True
 
 
-def _np_ckpt_save(path, params, opt, step, pos):
+def _np_ckpt_save(path, params, opt, step, pos, model=None):
     leaves = [np.asarray(ops.raw(a)) for a in tree_leaves(params) if isinstance(ops.raw(a), np.ndarray)]
     data = {f"p{i}": a for i, a in enumerate(leaves)}
     for name in ("m", "v", "vel", "velocity"):
@@ -1459,13 +1459,17 @@ def _np_ckpt_save(path, params, opt, step, pos):
             for i, a in enumerate(x for x in tree_leaves(tree) if isinstance(x, np.ndarray)):
                 data[f"{name}{i}"] = a
     data["meta"] = np.array([step, pos[0], pos[1], int(getattr(opt, "t", 0)), len(leaves)], np.int64)
+    if model is not None:
+        data.update(state_arrays(model))                 # running statistics of stateful layers
     tmp = f"{path}.tmp.npz"
     np.savez(tmp, **data)
     os.replace(tmp, path)
 
 
-def _np_ckpt_load(path, params, opt):
+def _np_ckpt_load(path, params, opt, model=None):
     with np.load(path) as z:
+        if model is not None:
+            restore_state_arrays(model, z)
         step, ep, bi, t, nleaf = (int(v) for v in z["meta"])
         arrays = [a for a in tree_leaves(params) if isinstance(ops.raw(a), np.ndarray)]
         if nleaf != len(arrays) or any(z[f"p{i}"].shape != np.shape(ops.raw(a)) for i, a in enumerate(arrays)):
@@ -1652,6 +1656,61 @@ class Checkpoint(Layer):
 def checkpoint(layer):
     """Gradient checkpointing: checkpoint(layer) gives the same results with much less activation memory."""
     return Checkpoint(layer)
+
+
+def stateful_layers(model):
+    """The layers of a model that carry state besides their weights (running statistics), in a fixed order."""
+    out, seen = [], set()
+
+    def walk(l):
+        if id(l) in seen or not isinstance(l, Layer):
+            return
+        seen.add(id(l))
+        if getattr(l, "stateful", False):
+            out.append(l)
+        for c in l.children():
+            walk(c)
+    walk(model)
+    return out
+
+
+def model_state(model):
+    """The state of every stateful layer of the model (a list of records), to save next to the weights."""
+    return [Record(**l.state_get()) for l in stateful_layers(model)]
+
+
+def set_model_state(model, states):
+    """Put back the state model_state() returned (e.g. read from a file)."""
+    layers = stateful_layers(model)
+    states = list(states)
+    if len(states) != len(layers):
+        raise RuntimeErr(f"set_model_state: {len(states)} states for {len(layers)} stateful layers")
+    for l, st in zip(layers, states):
+        d = dict(st.fields) if isinstance(st, Record) else dict(st)
+        l.state_set({k: (np.asarray(ops.raw(v), np.float64) if np.ndim(ops.raw(v)) else float(ops.raw(v)))
+                     for k, v in d.items()})
+
+
+def state_arrays(model, prefix="S"):
+    """The model's layer state as flat arrays (name -> array), for checkpoints."""
+    out = {}
+    for i, l in enumerate(stateful_layers(model)):
+        for k, v in l.state_get().items():
+            out[f"{prefix}{i}:{k}"] = np.asarray(v, np.float64)
+    return out
+
+
+def restore_state_arrays(model, data, prefix="S"):
+    """Put back state_arrays() (data: a mapping such as an open .npz); missing names keep the layer's state."""
+    files = set(getattr(data, "files", None) or list(data.keys()))
+    for i, l in enumerate(stateful_layers(model)):
+        st = l.state_get()
+        for k, v in list(st.items()):
+            key = f"{prefix}{i}:{k}"
+            if key in files:
+                a = np.asarray(data[key], np.float64)
+                st[k] = a if np.ndim(v) else float(a)
+        l.state_set(st)
 
 
 def custom_layer(init, forward, name="model", parts=None):
@@ -2358,7 +2417,7 @@ def module(interp=None):
         gcn=GCN, sage=SAGE, gat=GAT, gin=GIN, gine=GINE, batch_graphs=batch_graphs, graph_pool=GraphPool,
         # composition
         sequential=sequential, residual=residual, parallel=parallel, dag=dag, add=add, multiply=multiply,
-        concatenate=concatenate, custom_layer=custom_layer, gpu_layer=gpu_layer, checkpoint=checkpoint, diagnose=diagnose, load_torch_weights=load_torch_weights,
+        concatenate=concatenate, custom_layer=custom_layer, model_state=model_state, set_model_state=set_model_state, gpu_layer=gpu_layer, checkpoint=checkpoint, diagnose=diagnose, load_torch_weights=load_torch_weights,
         # model zoo
         mlp=mlp, resnet_mlp=resnet_mlp, cnn=cnn, lstm_classifier=lstm_classifier, transformer_lm=transformer_lm,
         transformer_classifier=transformer_classifier, autoencoder=autoencoder, vae=vae, vae_loss=vae_loss,

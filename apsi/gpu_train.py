@@ -5868,7 +5868,7 @@ def fit_batches(model, params, batches, loss="cross_entropy", opt=None, epochs=1
     want = int(steps) if steps else None                 # a number of optimizer steps instead of epochs
     start_ep, skip = 0, 0
     if checkpoint and resume and os.path.exists(str(checkpoint)):
-        t, step, start_ep, skip = _ckpt_load(str(checkpoint), ops, net, st1, st2, COMP)
+        t, step, start_ep, skip = _ckpt_load(str(checkpoint), ops, net, st1, st2, COMP, model)
         opt.t = t
         if verbose:
             print(f"resumed from {checkpoint}: step {step}, epoch {start_ep}, batch {skip}")
@@ -5877,7 +5877,7 @@ def fit_batches(model, params, batches, loss="cross_entropy", opt=None, epochs=1
     net.mem_fixed = ops.used                             # weights, gradients, the optimizer: before any activation
 
     def saved():
-        _ckpt_save(str(checkpoint), ops, net, st1, st2, COMP, t, step, pos[0], pos[1])
+        _ckpt_save(str(checkpoint), ops, net, st1, st2, COMP, t, step, pos[0], pos[1], model)
 
     step0 = step
 
@@ -6048,7 +6048,7 @@ def _size_ratio(items, first):
         return 1.0
 
 
-def _ckpt_save(path, ops, net, st1, st2, COMP, t, step, epoch, batch=0):
+def _ckpt_save(path, ops, net, st1, st2, COMP, t, step, epoch, batch=0, model=None):
     """The flat weights, the optimizer's moments and the carried rounding error, written atomically."""
     n = net.n
     data = {"P": ops.get(net.P, n), "meta": np.array([n, t, step, epoch, batch], np.int64)}
@@ -6059,13 +6059,19 @@ def _ckpt_save(path, ops, net, st1, st2, COMP, t, step, epoch, batch=0):
     if master is not None:
         arrs = [np.asarray(a, np.float64).reshape(-1) for a in tree_leaves(master) if isinstance(a, np.ndarray)]
         data["P64"] = np.concatenate(arrs) if arrs else np.zeros(0)   # the float64 master copy, in tree order
+    if model is not None:
+        from .layers import state_arrays
+        data.update(state_arrays(model))                 # running statistics of stateful layers
     tmp = f"{path}.tmp.npz"
     np.savez(tmp, **data)
     os.replace(tmp, path)
 
 
-def _ckpt_load(path, ops, net, st1, st2, COMP):
+def _ckpt_load(path, ops, net, st1, st2, COMP, model=None):
     with np.load(path) as z:
+        if model is not None:
+            from .layers import restore_state_arrays
+            restore_state_arrays(model, z)
         meta = [int(v) for v in z["meta"]] + [0]
         n, t, step, epoch, batch = meta[:5]
         if n != net.n:
