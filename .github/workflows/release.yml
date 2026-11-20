@@ -47,6 +47,7 @@ jobs:
       - name: Installer core tests
         if: runner.os == 'Linux'
         run: |
+          sudo apt-get update && sudo apt-get install -y python3-numpy
           cd installer && npm ci --no-audit --no-fund && npm run payload:linux && npm test
       - name: Build wizard
         shell: bash
