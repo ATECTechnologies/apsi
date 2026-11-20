@@ -6459,6 +6459,24 @@ def predict(model, params, X, device="cuda", precision="auto", batch_size=64, op
     first = model.layers[0] if isinstance(model, L.Sequential) and model.layers else model
     net = Net(ops, model, params, precision, graph)
     try:
+        if isinstance(X, (list, tuple)) or getattr(model, "kind", "") == "dag":
+            # several inputs (token ids, node features ...) and / or several outputs: one pass, as given
+            xs = [_as_input(a) for a in (X if isinstance(X, (list, tuple)) else [X])]
+            net.train = False
+            net.set_graph(graph)
+            net.round_weights()
+            views = []
+            for i, a in enumerate(xs):
+                v = net.arena.get(("in", i), a.size)
+                ops.put(v[0], a.reshape(-1), v[1])
+                views.append(v)
+            if len(xs) > 1:
+                out, shape = net.forward(views, [a.shape for a in xs])
+            else:
+                out, shape = net.forward(views[0], xs[0].shape)
+            if isinstance(out, list):
+                return [ops.get(o_[0], int(np.prod(s_)), o_[1]).reshape(s_) for o_, s_ in zip(out, shape)]
+            return ops.get(out[0], int(np.prod(shape)), out[1]).reshape(shape)
         return _forward_batches(net, ops, _inputs(aops.raw(X), isinstance(first, L.Embedding)),
                                 int(batch_size) if graph is None else 1 << 62)
     finally:

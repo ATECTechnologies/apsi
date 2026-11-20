@@ -2154,7 +2154,7 @@ def predict(model, params, X, backend="numpy", device="auto", precision="auto", 
     if which == "gpu":
         from . import gpu_train
         dev = "cuda" if str(device).lower() in ("auto", "gpu", "cuda") else device
-        return gpu_train.predict(model, params, X, device=dev, precision=precision)
+        return gpu_train.predict(model, params, X, device=dev, precision=precision, graph=ctx.get("graph"))
     if which == "torch":
         from . import torch_backend
         return torch_backend.predict(model, params, X, device=device, precision=precision, **ctx)

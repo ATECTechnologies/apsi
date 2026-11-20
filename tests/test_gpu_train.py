@@ -260,6 +260,12 @@ class Trainer(unittest.TestCase):
                            ops=GT.Emulator())
         np.testing.assert_allclose(a.history, b.history, rtol=1e-5)
         self.assertLess(b.history[-1], b.history[0])
+        # predict on the card: several inputs, several outputs, the batch's graph
+        X, _, g = bs[0]
+        want = m(b.params, X, graph=g)
+        got = GT.predict(m, b.params, X, precision="fp32", ops=GT.Emulator(), graph=g)
+        for w_, g_ in zip(want, got):
+            np.testing.assert_allclose(np.asarray(w_), g_, rtol=1e-4, atol=1e-5)
 
     def test_any_model_split_across_cards_in_batches(self):
         """A two-input graph-and-language dag (hgt, global attention, graph memory, cross-attention, rotary positions,
