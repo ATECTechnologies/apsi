@@ -5426,26 +5426,36 @@ class Net:
         leaves = [a for a in tree_leaves(params) if isinstance(a, np.ndarray)]
         # matrices first (weight decay and low-bit rounding apply to them), then vectors
         order = sorted(range(len(leaves)), key=lambda i: leaves[i].ndim < 2)
-        self.offsets, off = {}, 0
+        # every matrix starts at a multiple of 8 elements (32 bytes): the tiled and bfloat16 products need aligned
+        # operands, and one matrix of an odd size (a 66 x 1 head, say) would otherwise misalign all that follow
+        self.offsets, off, self.n_decay = {}, 0, 0
         for i in order:
+            off = -(-off // 8) * 8                       # every parameter starts on a 32-byte boundary
             self.offsets[id(leaves[i])] = off
             off += leaves[i].size
-        self.n = off
-        self.n_decay = sum(a.size for a in leaves if a.ndim >= 2)
+            if leaves[i].ndim >= 2:
+                self.n_decay = -(-off // 8) * 8          # the matrices (weight decay, low bit) end here
+        self.n = max(off, self.n_decay)
         self.leaves, self.params_tree = leaves, params
         self.P, self.G = ops.alloc(self.n), ops.alloc(self.n)
         if hasattr(ops, "weights_are"):
             ops.weights_are(self.P, self.n)
         # to the card in pieces of about 64 MB: the computer never holds a second whole copy of the model
-        piece, buf, start = 1 << 24, [], 0
+        piece, buf, start, pos = 1 << 24, [], 0, 0
         for i in order:
             a = leaves[i]
+            o_ = self.offsets[id(a)]
+            if o_ > pos:                                 # (the alignment gap: zeros)
+                buf.append(np.zeros(o_ - pos, np.float32))
             buf.append(np.asarray(a, np.float32).reshape(-1))
+            pos = o_ + a.size
             if sum(x.size for x in buf) >= piece or i == order[-1]:
                 chunk = np.concatenate(buf) if len(buf) > 1 else buf[0]
                 ops.put(self.P, chunk, start)
                 start += chunk.size
                 buf = []
+        if self.n > pos:
+            ops.fill((self.P, pos), self.n - pos, 0.0)
         self.mats = [(self.offsets[id(a)], a.shape) for a in leaves if a.ndim >= 2]
         self.qoff = {}
         if self.kind:
