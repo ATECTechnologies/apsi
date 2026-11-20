@@ -6218,7 +6218,8 @@ def _multi_loss(ops, net, outs, shapes, loss_fn, Yr, group, arena=None):
     douts, fn, card, lossv = [None] * len(outs), loss_fn, set(), None
     spec = getattr(loss_fn, "on_card", None)
     if spec is not None:
-        i_ce, labels_of, rest = spec
+        i_ce, labels_of, rest = spec[:3]
+        weights_of = spec[3] if len(spec) > 3 else None
         lab = labels_of(Yr)
         if lab is not None:
             lab = np.ascontiguousarray(np.asarray(lab).reshape(-1).astype(np.int32))
@@ -6230,8 +6231,29 @@ def _multi_loss(ops, net, outs, shapes, loss_fn, Yr, group, arena=None):
             d = arena.get(("dout", i_ce), rows * V)
             lossv = arena.get("ce_loss", 1)
             ops.fill(lossv, 1, 0.0)
-            w = 1.0 / max(int((lab >= 0).sum()), 1)
-            ops.ce(outs[i_ce], yd, d, lossv, rows, V, w / group, w)
+            wts = weights_of(Yr) if weights_of is not None else None
+            if wts is None:
+                w = 1.0 / max(int((lab >= 0).sum()), 1)
+                ops.ce(outs[i_ce], yd, d, lossv, rows, V, w / group, w)
+            else:
+                # sum(w ce) / sum(w): every row at 1 / sum(w), then each row of another weight once more, at
+                # (w - 1) / sum(w), its gradient added to that row's
+                wv = np.asarray(wts, np.float64).reshape(-1)
+                if wv.size != rows:
+                    raise TrainError(f"cross_entropy weights: {wv.size} for {rows} rows")
+                ok = lab >= 0
+                w = 1.0 / max(float(wv[ok].sum()), 1e-12)
+                ops.ce(outs[i_ce], yd, d, lossv, rows, V, w / group, w)
+                extra = [int(r) for r in np.nonzero(ok & (wv != 1.0))[0]]
+                if extra:
+                    tmp = arena.get("ce_extra", V)
+                    zero = arena.get("ce_zero", 1)
+                    ops.fill(zero, 1, 0.0)
+                    o0 = outs[i_ce]
+                    for r in extra:
+                        c_ = float(wv[r] - 1.0) * w
+                        ops.ce((o0[0], o0[1] + r * V), (yd[0], yd[1] + r), tmp, lossv, 1, V, c_ / group, c_)
+                        ops.scale_add((d[0], d[1] + r * V), tmp, zero, V, 1.0)
             douts[i_ce], fn, card = d, rest, {i_ce}
     keep = [i for i in range(len(outs)) if i not in card]
     hs = [ops.get(outs[i][0], int(np.prod(shapes[i])), outs[i][1]).reshape(shapes[i]).astype(np.float64)

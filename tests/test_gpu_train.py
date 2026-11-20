@@ -350,6 +350,35 @@ class Trainer(unittest.TestCase):
                           backend="numpy", verbose=False, clip=1.0)
         self.assertFalse(np.allclose(np.asarray(c.params.h.inner.Wg), np.asarray(a.params.h.inner.Wg)))
 
+    def test_card_loss_weights(self):
+        """card_loss(weights=...): sum(w ce) / sum(w) - on the card (the cross-entropy kept there, rows of another
+        weight added once more) equal to the processor."""
+        from apsi.values import Record
+        rng = np.random.default_rng(6)
+        V, d, T = 13, 8, 5
+        m = L.DAG([["emb", L.Embedding(V, d), "tok"], ["h", L.Linear(d, d), "emb"], ["out", L.Linear(d, V), "h"],
+                   ["aux", L.Linear(d, 1), "h"]], inputs=["tok"], output=["out", "aux"])
+        bs = []
+        for _ in range(3):
+            t = rng.integers(0, V, (3, T))
+            lab = np.roll(t, -1, 1)
+            lab[:, 0] = -1
+            w = np.ones((3, T))
+            w[:, 1] = 2.0
+            w[0, 3] = 0.5
+            bs.append(([t], Record(labels=lab, weights=w)))
+        loss = L.card_loss(0, lambda outs, ys: 0.1 * aops.mean(outs[1] * outs[1]), weights="weights")
+        a = L.fit_batches(m, m.init(seed=0), bs, loss, opt=Adam(0.01), epochs=3, backend="numpy", verbose=False)
+        b = GT.fit_batches(m, m.init(seed=0), bs, loss, opt=Adam(0.01), epochs=3, verbose=False, precision="fp32",
+                           ops=GT.Emulator(), compensated=False)
+        np.testing.assert_allclose(a.history, b.history, rtol=1e-5)
+        for x, y in zip(tree_leaves(a.params), tree_leaves(b.params)):
+            np.testing.assert_allclose(x, y, rtol=2e-4, atol=2e-6)
+        c = L.fit_batches(m, m.init(seed=0), [(x_, Record(labels=y_.labels)) for x_, y_ in bs],
+                          L.card_loss(0, lambda outs, ys: 0.1 * aops.mean(outs[1] * outs[1])), opt=Adam(0.01),
+                          epochs=3, backend="numpy", verbose=False)
+        self.assertNotAlmostEqual(a.history[0], c.history[0], places=6)
+
     def test_heterogeneous_brain_options(self):
         """typed_graph_encoder as multi-brain graph encoders: global attention, graph context and final norm over every node
         (scope="all"), the output projection's bias on every node of a type that receives edges (out_bias="type"),

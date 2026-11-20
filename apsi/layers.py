@@ -1985,26 +1985,43 @@ DAG.apply = _dag_apply_shared
 
 
 # =============================================================== training & inspection
-def card_loss(output=0, rest=None, labels="labels"):
+def card_loss(output=0, rest=None, labels="labels", weights=None):
     """A loss over a model with several outputs (a dag with output=[...]): the cross-entropy of output `output`
     against the targets' `labels` field (class ids, -1 left out) plus rest(outputs, targets) for everything else
     (heads, auxiliary terms; rest must not read outputs[output]). Targets: a record, e.g.
     record(labels=next_tokens, valid=..., issues=...). On the GPU trainer the cross-entropy stays on the card (a
     language model's logits never leave it) and only the other outputs go to the processor; on NumPy the same loss
-    is computed on the processor."""
+    is computed on the processor. weights="field": a weight per label (same shape), the cross-entropy then being
+    sum(w * ce) / sum(w) over the labelled rows (e.g. a token that counts double)."""
     from .stdlib import cross_entropy
-    out_i, field = int(output), str(labels)
+    out_i, field, wfield = int(output), str(labels), (str(weights) if weights else None)
 
     def labels_of(ys):
         return getattr(ys, field) if isinstance(ys, Record) else ys
+
+    def weights_of(ys):
+        return getattr(ys, wfield, None) if (wfield and isinstance(ys, Record)) else None
 
     def rest_of(outs, ys):
         return rest(outs, ys) if rest is not None else 0.0
 
     def f(outs, ys):
         outs = list(outs) if isinstance(outs, (list, tuple)) else [outs]
-        return cross_entropy(outs[out_i], labels_of(ys)) + rest_of(outs, ys)
-    f.on_card = (out_i, labels_of, rest_of)
+        w = weights_of(ys)
+        if w is None:
+            return cross_entropy(outs[out_i], labels_of(ys)) + rest_of(outs, ys)
+        logits = outs[out_i]
+        lab = np.asarray(ops.raw(labels_of(ys))).reshape(-1).astype(np.int64)
+        wv = np.asarray(ops.raw(w), np.float64).reshape(-1)
+        V = int(np.shape(ops.raw(logits))[-1])
+        lg = ops.reshape(logits, -1, V)
+        ok = lab >= 0
+        lsm = ops.log_softmax(lg, axis=-1)
+        rows = np.nonzero(ok)[0]
+        picked = lsm[rows, lab[rows]] if len(rows) else 0.0
+        ce = -ops.sum_(picked * wv[rows]) / max(float(wv[rows].sum()), 1e-12) if len(rows) else 0.0
+        return ce + rest_of(outs, ys)
+    f.on_card = (out_i, labels_of, rest_of, weights_of)
     f.__name__ = "card_loss"
     return f
 
