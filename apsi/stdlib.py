@@ -903,7 +903,43 @@ class GroupAdamW(Adam):
     decay="all"; no_decay= substrings of a path take a weight out) and gradient clipping by its own norm. The same
     update as the card's kernels."""
 
+    def has_batch_groups(self):
+        return any(str((dict(g.fields) if hasattr(g, "fields") else dict(g)).get("every", "step")) == "batch"
+                   for g in (self.groups or []))
+
+    def step_batch(self, params, grads):
+        """The every="batch" groups' own step on one batch's (unscaled) gradient; the other weights unchanged."""
+        if self._g is None:
+            from .gpu_train import _param_groups
+            P = [a for a in tree_leaves(params) if isinstance(ops.raw(a), np.ndarray)]
+            self._g = _param_groups(self.groups, params, [np.asarray(ops.raw(a)) for a in P])
+        for g_ in {g for g in self._g["gid"] if g and self._g["specs"][g - 1].get("every") == "batch"}:
+            self._bt[g_] = self._bt.get(g_, 0) + 1
+        self._batch_call = True
+        try:
+            return self.step(params, grads)
+        finally:
+            self._batch_call = False
+
+    def batch_mask(self, params, grads):
+        """grads with the every="batch" groups' entries set to 0 (their gradient is used up by step_batch)."""
+        if self._g is None:
+            from .gpu_train import _param_groups
+            P = [a for a in tree_leaves(params) if isinstance(ops.raw(a), np.ndarray)]
+            self._g = _param_groups(self.groups, params, [np.asarray(ops.raw(a)) for a in P])
+        gid = self._g["gid"]
+        k = [0]
+
+        def f(p, a):
+            if not isinstance(ops.raw(p), np.ndarray):
+                return a
+            g_ = gid[k[0]]
+            k[0] += 1
+            return a * 0.0 if g_ and self._g["specs"][g_ - 1].get("every") == "batch" else a
+        return tree_map(f, params, grads)
+
     def __init__(self, base, groups, clip=None):
+        self._bt = {}
         super().__init__(base.lr, base.b1, base.b2, base.eps)
         self.lr0 = float(base.lr)
         self.wd = float(getattr(base, "wd", 0.0)) if isinstance(base, AdamW) else 0.0
@@ -924,7 +960,9 @@ class GroupAdamW(Adam):
             self.m, self.v = tree_map(z, params), tree_map(z, params)
         M = [a for a in tree_leaves(self.m) if isinstance(a, np.ndarray)]
         V = [a for a in tree_leaves(self.v) if isinstance(a, np.ndarray)]
-        self.t += 1
+        bc = getattr(self, "_batch_call", False)
+        if not bc:
+            self.t += 1
         scale = self.lr / self.lr0 if self.lr0 else 1.0
         norms = {}
         for g_, a in zip(gi, G):
@@ -932,6 +970,12 @@ class GroupAdamW(Adam):
         out = []
         for i, p in enumerate(P):
             sp = self._g["specs"][gi[i] - 1] if gi[i] else {}
+            if sp.get("every") == "batch" and not getattr(self, "_batch_call", False):
+                out.append(np.asarray(ops.raw(p), np.float64))       # (stepped after each batch: step_batch)
+                continue
+            if getattr(self, "_batch_call", False) and sp.get("every") != "batch":
+                out.append(np.asarray(ops.raw(p), np.float64))
+                continue
             pick = lambda key, dflt: dflt if sp.get(key) is None else float(sp[key])     # noqa: E731
             lr, b1, b2 = pick("lr", self.lr0) * scale, pick("b1", self.b1), pick("b2", self.b2)
             eps, wd, clip = pick("eps", self.eps), pick("weight_decay", self.wd), pick("clip", self.clip or 0.0)
@@ -939,11 +983,12 @@ class GroupAdamW(Adam):
             nrm = math.sqrt(norms[gi[i]])
             if clip and nrm > clip:
                 g = g * (clip / nrm)
+            t_ = self._bt.get(gi[i], 0) if bc else self.t
             M[i][...] = b1 * M[i] + (1 - b1) * g
             V[i][...] = b2 * V[i] + (1 - b2) * g * g
             pv = np.asarray(ops.raw(p), np.float64)
             w = pv * (1 - lr * wd) if dec[i] else pv
-            out.append(np.asarray(w - lr * (M[i] / (1 - b1 ** self.t)) / (np.sqrt(V[i] / (1 - b2 ** self.t)) + eps)))
+            out.append(np.asarray(w - lr * (M[i] / (1 - b1 ** t_)) / (np.sqrt(V[i] / (1 - b2 ** t_)) + eps)))
         it = iter(out)
         return tree_map(lambda a: next(it) if isinstance(ops.raw(a), np.ndarray) else a, params)
 

@@ -29,7 +29,7 @@ from . import ops
 from .errors import RuntimeErr, ShapeError
 from .layers import (Layer, Linear, Activation, Sequential, LayerNorm, GraphPool, Graph, _glorot, _rng, _seed_of,
                      _graph, segment_sum, segment_softmax, segment_mean)
-from .values import Record
+from .values import Record, tree_map
 
 
 # ============================================================== graph structure
@@ -532,6 +532,12 @@ class BrainRouting(Layer):
         return 0.12 * ops.sum_(st["fisher_diag"] * diff * diff)
 
     def apply(self, p, x, train=False, **ctx):
+        g = ctx.get("graph")
+        mode = getattr(g, "route_mode", "joint") if g is not None else "joint"
+        if mode in ("lang", "lang_eval"):              # lang_eval: the same, as evaluation (no statistics)
+            return self._apply_lang(p, x, train and mode == "lang", g)
+        if mode == "none":
+            train = False                                # (a batch that must not touch the running statistics)
         sc, sa, sb = x
         B = int(np.shape(ops.raw(sa))[0])
         rc, ac = self._route(p.router, sc, 2, train)
@@ -551,6 +557,41 @@ class BrainRouting(Layer):
         aux = (ac + aa + ab) / 3.0 if train else 0.0
         one = np.ones((B, 1))
         return ops.concat([rc, fa, fb, one * ea, one * eb, one * aux], 1)
+
+    def _apply_lang(self, p, x, train, g):
+        """A text micro-batch: the third encoder's summaries through the router (task 2), one call per group of rows
+        (graph.route_split: e.g. the texts, then the responses), the auxiliary loss their mean; the first encoder's view
+        of the texts (its first rows) through the router (task 0) and the bridge with the texts' routed summaries, as
+        evaluation (no gradient, no running statistics, no auxiliary loss). Rows beyond the first encoder's are zero in
+        its columns."""
+        sc, sa, _sb = x
+        R = int(np.shape(ops.raw(sc))[0])
+        split = [int(v) for v in (getattr(g, "route_split", None) or [R])]
+        outs, auxs, a0 = [], [], 0
+        for n_ in split:
+            if n_ <= 0:
+                continue
+            r_, a_ = self._route(p.router, sc[a0:a0 + n_], 2, train)
+            outs.append(r_)
+            if a_ is not None:
+                auxs.append(a_)
+            a0 += n_
+        rc = ops.concat(outs, 0) if len(outs) > 1 else outs[0]
+        Ba = int(np.shape(ops.raw(sa))[0])
+        cols = []
+        if Ba > 0:
+            sa_c = np.asarray(ops.raw(sa), np.float64)
+            pr = Record(**{k: (tree_map(lambda v: np.asarray(ops.raw(v), np.float64), p.fields[k]))
+                           for k in p.fields})
+            ra, _ = self._route(pr.router, sa_c, 0, False)
+            rc0 = np.asarray(ops.raw(rc), np.float64)[:Ba]
+            fa = np.asarray(ops.raw(self._bridge(pr.bridge, rc0, ra)), np.float64)
+            fa = np.concatenate([fa, np.zeros((R - Ba, self.d))], 0) if R > Ba else fa[:R]
+        else:
+            fa = np.zeros((R, self.d))
+        aux = sum(auxs[1:], auxs[0]) / len(auxs) if (train and auxs) else 0.0
+        one = np.ones((R, 1))
+        return ops.concat([rc, fa, np.zeros((R, self.d)), np.zeros((R, 1)), np.zeros((R, 1)), one * aux], 1)
 
     def describe(self):
         return f"brain_routing(d={self.d}, {self.E} experts, top {self.k})"
@@ -670,6 +711,9 @@ class MemorySlots(Layer):
     def apply(self, p, x, train=False, **ctx):
         g = ctx.get("graph")
         A, C, sa, sc = x
+        if getattr(g, "mem_a_const", False):            # the A nodes and summary as given, no gradient back
+            A = np.asarray(ops.raw(A), np.float64)
+            sa = np.asarray(ops.raw(sa), np.float64)
         B = int(np.shape(ops.raw(sa))[0])
         ma, va = self._nodes(A, p.score_a.W, p.score_a.b, p.node_proj_a, p, g, self.pick_a, B, self.ka, 0)
         mc, vc = self._nodes(C, p.score_c.W, p.score_c.b, p.node_proj_c, p, g, self.pick_c, B, self.kc, 1)

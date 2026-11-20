@@ -379,6 +379,40 @@ class Trainer(unittest.TestCase):
                           epochs=3, backend="numpy", verbose=False)
         self.assertNotAlmostEqual(a.history[0], c.history[0], places=6)
 
+    def test_batch_groups_and_scaled_batches(self):
+        """groups every="batch" (a part with its own step after every batch) and card_loss(scale=) (a batch that
+        counts more, or not at all): the card equals the processor."""
+        from apsi.values import Record
+        rng = np.random.default_rng(8)
+        V, d, T = 11, 8, 5
+        m = L.DAG([["emb", L.Embedding(V, d), "tok"], ["h", L.Linear(d, d), "emb"], ["out", L.Linear(d, V), "h"],
+                   ["aux", L.Linear(d, 1), "h"]], inputs=["tok"], output=["out", "aux"])
+        bs = []
+        for i in range(6):
+            t = rng.integers(0, V, (3, T))
+            bs.append(([t], Record(labels=np.roll(t, -1, 1), scale=[1.5, 1.5, 0.0][i % 3])))
+        var = []                                         # steps of their own length, a batch held for the next
+        for i in range(7):
+            t = rng.integers(0, V, (3, T))
+            var.append(([t], Record(labels=np.roll(t, -1, 1), scale=[1.0, 0.5, 1.0, 0.0, 1.0, 1.0, 0.5][i],
+                                    hold=i in (1, 4), end_step=i in (2, 3, 6), step_items=[3, 3, 3, 1, 3, 3, 3][i])))
+        loss = L.card_loss(0, lambda outs, ys: ys.scale * 0.1 * aops.mean(outs[1] * outs[1]), scale="scale")
+        groups = [dict(params=["out"], lr=0.02, b2=0.95, eps=1e-8, decay="all", clip=0.5, every="batch")]
+        a = L.fit_batches(m, m.init(seed=0), bs, loss, opt=adamw(0.01), epochs=2, backend="numpy", verbose=False,
+                          accumulate=3, clip=1.0, groups=groups)
+        b = GT.fit_batches(m, m.init(seed=0), bs, loss, opt=adamw(0.01), epochs=2, verbose=False, precision="fp32",
+                           ops=GT.Emulator(), compensated=False, accumulate=3, clip=1.0, groups=groups)
+        np.testing.assert_allclose(a.history, b.history, rtol=1e-5)
+        for x, y in zip(tree_leaves(a.params), tree_leaves(b.params)):
+            np.testing.assert_allclose(x, y, rtol=3e-4, atol=3e-6)
+        a = L.fit_batches(m, m.init(seed=0), var, loss, opt=adamw(0.01), epochs=2, backend="numpy", verbose=False,
+                          accumulate=0, clip=1.0, groups=groups)
+        b = GT.fit_batches(m, m.init(seed=0), var, loss, opt=adamw(0.01), epochs=2, verbose=False, precision="fp32",
+                           ops=GT.Emulator(), compensated=False, accumulate=0, clip=1.0, groups=groups)
+        np.testing.assert_allclose(a.history, b.history, rtol=1e-5)
+        for x, y in zip(tree_leaves(a.params), tree_leaves(b.params)):
+            np.testing.assert_allclose(x, y, rtol=3e-4, atol=3e-6)
+
     def test_heterogeneous_brain_options(self):
         """typed_graph_encoder as multi-brain graph encoders: global attention, graph context and final norm over every node
         (scope="all"), the output projection's bias on every node of a type that receives edges (out_bias="type"),

@@ -5451,7 +5451,9 @@ def _param_groups(groups, params, leaves):
     """Parameter groups (each its own learning rate, betas, eps, weight decay and clipping): a list of records with
     params = names of parts (a leaf belongs to the first group with a name equal to its path or a prefix of it at a
     dot; "*" = every leaf no other group takes), and any of lr, b1, b2, eps, weight_decay, clip, decay ("matrices",
-    the default, "all", "none" or a list of the parts that decay) and no_decay (substrings of a path that take a weight out of decay). Leaves of no group
+    the default, "all", "none" or a list of the parts that decay), every ("step", the default, or "batch": the group
+    takes its own optimizer step after every batch, on that batch's gradient alone, as a part trained by its own
+    optimizer would) and no_decay (substrings of a path that take a weight out of decay). Leaves of no group
     form group 0 with the optimizer's own settings."""
     if not groups:
         return None
@@ -5465,7 +5467,8 @@ def _param_groups(groups, params, leaves):
         dec = str(dec) if isinstance(dec, str) else [str(x) for x in dec]
         specs.append(dict(names=[str(x) for x in names], lr=d.get("lr"), b1=d.get("b1"), b2=d.get("b2"),
                           eps=d.get("eps"), weight_decay=d.get("weight_decay"), clip=d.get("clip"),
-                          decay=dec, no_decay=[str(x) for x in d.get("no_decay", [])]))
+                          decay=dec, no_decay=[str(x) for x in d.get("no_decay", [])],
+                          every=str(d.get("every", "step"))))
     paths = _leaf_paths(params)
     if len(paths) != len(leaves):
         raise TrainError("parameter groups: the parameter tree has leaves that are not arrays")
@@ -6018,12 +6021,16 @@ def fit_batches(model, params, batches, loss="cross_entropy", opt=None, epochs=1
             ops.fill((LOSSB, 0), len(items), 0.0)
             on_card = []                                 # the batches whose loss is in LOSSB
             A = max(1, int(accumulate or 1))
+            VAR = accumulate is not None and int(accumulate) == 0
             want_forms = locals().get("want_forms") or []
             for bi, item in enumerate(items):
                 if ep == start_ep and bi < skip:             # resumed: these batches were already trained on
                     continue
-                group = min(A, len(items) - (bi // A) * A)       # the batches of this step
                 X, Y, g = _batch_parts(item)
+                if VAR:                                     # steps of their own length (accumulate=0)
+                    group = max(1, int(getattr(Y, "step_items", 1)))
+                else:
+                    group = min(A, len(items) - (bi // A) * A)       # the batches of this step
                 multi = isinstance(X, (list, tuple))
                 xs = [_as_input(a) for a in (X if multi else [X])]
                 if net.gdev is not None:                    # the forms the layers asked of the last graph
@@ -6048,11 +6055,19 @@ def fit_batches(model, params, batches, loss="cross_entropy", opt=None, epochs=1
                         raise TrainError("a model with several outputs trains with a loss function of your own")
                     lv, dout = _multi_loss(ops, net, out, shape, loss_fn, Yr, group)
                     net.backward(dout)
+                    _sp = getattr(loss_fn, "on_card", None)
+                    _s = float(_sp[4](Yr)) if (_sp is not None and len(_sp) > 4) else 1.0
+                    if _s == 0:                          # (a batch of weight 0 takes no step of its own)
+                        _batch_group_clear(ops, net)
+                    elif not bool(getattr(Yr, "hold", False)):   # hold: its gradient joins the next batch's step
+                        _batch_group_step(ops, net, opt, wd, clip, float(aops.raw(schedule(step)))
+                                          if schedule is not None else float(opt.lr), st1, st2, COMP, group)
                     if EXACT is not None:                         # this batch's gradients, summed exactly
                         ops.acc2((EXACT[0], 0), (EXACT[1], 0), (net.G, 0), n)
                     tot += lv
                     rows_all += 1
-                    if (bi + 1) % A and bi + 1 < len(items):
+                    if (VAR and not bool(getattr(Y, "end_step", True))) or \
+                            (not VAR and (bi + 1) % A and bi + 1 < len(items)):
                         continue
                     t, step = _apply_step(ops, net, opt, adam, wd, clip, schedule, step, t, st1, st2, SQ, COMP, n)
                     if after_step(ep, bi):
@@ -6089,7 +6104,8 @@ def fit_batches(model, params, batches, loss="cross_entropy", opt=None, epochs=1
                 if lv is not None:
                     tot += lv
                 rows_all += 1
-                if (bi + 1) % A and bi + 1 < len(items):
+                if (VAR and not bool(getattr(Y, "end_step", True))) or \
+                        (not VAR and (bi + 1) % A and bi + 1 < len(items)):
                     continue                                 # gradients add up until the step's last batch
                 t, step = _apply_step(ops, net, opt, adam, wd, clip, schedule, step, t, st1, st2, SQ, COMP, n)
                 if after_step(ep, bi):
@@ -6231,6 +6247,7 @@ def _multi_loss(ops, net, outs, shapes, loss_fn, Yr, group, arena=None):
     if spec is not None:
         i_ce, labels_of, rest = spec[:3]
         weights_of = spec[3] if len(spec) > 3 else None
+        sc_ = float(spec[4](Yr)) if len(spec) > 4 else 1.0
         lab = labels_of(Yr)
         if lab is not None:
             lab = np.ascontiguousarray(np.asarray(lab).reshape(-1).astype(np.int32))
@@ -6244,7 +6261,7 @@ def _multi_loss(ops, net, outs, shapes, loss_fn, Yr, group, arena=None):
             ops.fill(lossv, 1, 0.0)
             wts = weights_of(Yr) if weights_of is not None else None
             if wts is None:
-                w = 1.0 / max(int((lab >= 0).sum()), 1)
+                w = sc_ / max(int((lab >= 0).sum()), 1)
                 ops.ce(outs[i_ce], yd, d, lossv, rows, V, w / group, w)
             else:
                 # sum(w ce) / sum(w): every row at 1 / sum(w), then each row of another weight once more, at
@@ -6253,7 +6270,7 @@ def _multi_loss(ops, net, outs, shapes, loss_fn, Yr, group, arena=None):
                 if wv.size != rows:
                     raise TrainError(f"cross_entropy weights: {wv.size} for {rows} rows")
                 ok = lab >= 0
-                w = 1.0 / max(float(wv[ok].sum()), 1e-12)
+                w = sc_ / max(float(wv[ok].sum()), 1e-12)
                 ops.ce(outs[i_ce], yd, d, lossv, rows, V, w / group, w)
                 extra = [int(r) for r in np.nonzero(ok & (wv != 1.0))[0]]
                 if extra:
@@ -6440,16 +6457,58 @@ def _group_step(ops, net, opt, wd, clip, lr, t, st1, st2, COMP):
     for a_, k_, _d, g_ in net.segments:
         ops.sumsq((net.G, a_), k_, (SQ, slot[g_]))
     scale = lr / float(opt.lr) if float(opt.lr) else 1.0
-    for i, (a_, k_, d_, g_) in enumerate(net.segments):
+    segs = [s_ for s_ in net.segments if not (s_[3] and specs[s_[3] - 1].get("every") == "batch")]
+    for i, (a_, k_, d_, g_) in enumerate(segs):
         sp = specs[g_ - 1] if g_ else {}
         pick = lambda key, dflt: dflt if sp.get(key) is None else float(sp[key])     # noqa: E731
         b1, b2 = pick("b1", opt.b1), pick("b2", opt.b2)
         ops.adam((net.P, a_), (net.G, a_), (st1, a_), (st2, a_), (SQ, slot[g_]), k_, d_,
                  pick("lr", float(opt.lr)) * scale, b1, b2, pick("eps", opt.eps), 1 - b1 ** t, 1 - b2 ** t,
                  pick("weight_decay", wd), pick("clip", float(clip or 0.0)),
-                 (COMP, a_) if COMP else None, part=(i, len(net.segments)))
+                 (COMP, a_) if COMP else None, part=(i, len(segs)))
     if hasattr(ops, "refresh_w16"):
         ops.refresh_w16()
+
+
+def _batch_group_step(ops, net, opt, wd, clip, lr, st1, st2, COMP, group):
+    """The groups with every="batch": their own AdamW step on this batch's gradient (the trainer scaled it by
+    1 / group; eps and the clipping norm are scaled the same way, so the update is the one of the unscaled
+    gradient), their own step count; their gradient is then cleared."""
+    if not getattr(net, "segments", None):
+        return False
+    specs = net.groups["specs"]
+    segs = [s_ for s_ in net.segments if s_[3] and specs[s_[3] - 1].get("every") == "batch"]
+    if not segs:
+        return False
+    SQ = getattr(net, "_bsq", None)
+    if SQ is None:
+        SQ = net._bsq = ops.alloc(8)
+    tb = net.__dict__.setdefault("_bt", {})
+    scale = lr / float(opt.lr) if float(opt.lr) else 1.0
+    for i, (a_, k_, d_, g_) in enumerate(segs):
+        sp = specs[g_ - 1]
+        pick = lambda key, dflt: dflt if sp.get(key) is None else float(sp[key])     # noqa: E731
+        tb[g_] = tb.get(g_, 0) + 1
+        t_ = tb[g_]
+        b1, b2 = pick("b1", opt.b1), pick("b2", opt.b2)
+        ops.fill((SQ, 0), 1, 0.0)
+        ops.sumsq((net.G, a_), k_, (SQ, 0))
+        ops.adam((net.P, a_), (net.G, a_), (st1, a_), (st2, a_), (SQ, 0), k_, d_, pick("lr", float(opt.lr)) * scale,
+                 b1, b2, pick("eps", opt.eps) / group, 1 - b1 ** t_, 1 - b2 ** t_, pick("weight_decay", wd),
+                 pick("clip", float(clip or 0.0)) / group, (COMP, a_) if COMP else None, part=(i, len(segs)))
+    if hasattr(ops, "refresh_w16"):
+        ops.refresh_w16()
+    return True
+
+
+def _batch_group_clear(ops, net):
+    """The every="batch" groups' gradient of a batch that takes no step: cleared."""
+    if not getattr(net, "segments", None):
+        return
+    specs = net.groups["specs"]
+    for a_, k_, _d, g_ in net.segments:
+        if g_ and specs[g_ - 1].get("every") == "batch":
+            ops.fill((net.G, a_), k_, 0.0)
 
 
 def _want_exact(exact, params):

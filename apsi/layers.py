@@ -1396,15 +1396,25 @@ def fit_batches(model, params, batches, loss="cross_entropy", opt=None, epochs=1
                 break
             items = list(batches(ep) if callable(batches) else batches)
             tot, seen = 0.0, 0
-            for s0 in range(0, len(items), A):
+            if accumulate is not None and int(accumulate) == 0:   # steps of their own length: targets.end_step
+                starts, cur = [], 0
+                for j, it_ in enumerate(items):
+                    if bool(getattr(_batch_parts(it_)[1], "end_step", True)):
+                        starts.append((cur, j + 1))
+                        cur = j + 1
+                if cur < len(items):
+                    starts.append((cur, len(items)))
+            else:
+                starts = [(s0, min(s0 + A, len(items))) for s0 in range(0, len(items), A)]
+            for s0, s1 in starts:
                 if ep == start_ep and s0 < skip:
                     continue
-                chunk = items[s0:s0 + A]
+                chunk = items[s0:s1]
                 params, lv_sum, ok = _np_step(model, params, chunk, loss, lf, opt, schedule, step, clip, still, guard)
                 tot += lv_sum
                 seen += len(chunk)
                 step += 1
-                pos[0], pos[1] = ep, s0 + A
+                pos[0], pos[1] = ep, s1
                 if checkpoint and save_every and step % int(save_every) == 0:
                     _np_ckpt_save(str(checkpoint), params, opt, step, pos, model)
                 if want is not None and step >= want:
@@ -1436,13 +1446,34 @@ def _np_step(model, params, chunk, loss, lf, opt, schedule, step, clip, still, g
     from .stdlib import value_and_grad
     from .gpu_train import _batch_parts
     acc, tot = None, 0.0
+    if schedule is not None:
+        opt.lr = float(ops.raw(schedule(step)))
     for item in chunk:
         X, Y, g = _batch_parts(item)
         ctx = {"graph": g} if g is not None else {}
         if not callable(loss) or not isinstance(Y, Record):
             Y = np.asarray(ops.raw(Y))                  # a loss of your own may take a record of targets
         lv, gr = value_and_grad(lambda p: lf(model(p, X, train=True, **ctx), Y))(params)
-        gr = tree_map(lambda a: a / len(chunk) if isinstance(a, np.ndarray) else a, gr)
+        if getattr(opt, "has_batch_groups", None) and opt.has_batch_groups():
+            sp = getattr(lf, "on_card", None)
+            s_ = float(sp[4](Y)) if (sp is not None and len(sp) > 4) else 1.0
+            hold = bool(getattr(Y, "hold", False)) if isinstance(Y, Record) else False
+            if s_ > 0 and not hold:                      # parts with their own step after every batch
+                held = getattr(opt, "_held", None)
+                g_all = gr if held is None else tree_map(lambda a, b: a + b, held, gr)
+                opt._held = None
+                params = opt.step_batch(params, g_all)
+                gr = opt.batch_mask(params, gr)
+            elif s_ > 0 and hold:                        # its gradient joins the next batch's step
+                bm = opt.batch_mask(params, gr)
+                part = tree_map(lambda a, b: a - b, gr, bm)
+                opt._held = part if getattr(opt, "_held", None) is None else tree_map(lambda a, b: a + b, opt._held, part)
+                gr = bm
+            else:
+                gr = opt.batch_mask(params, gr)
+        div = int(getattr(Y, "step_items", 0) or 0) if isinstance(Y, Record) else 0
+        div = div or len(chunk)
+        gr = tree_map(lambda a, d_=div: a / d_ if isinstance(a, (np.ndarray, np.floating, float)) else a, gr)
         acc = gr if acc is None else tree_map(lambda a, b: a + b, acc, gr)
         tot += float(ops.raw(lv))
     gr = _freeze_grads(acc, still)                       # frozen weights: no gradient (and kept exactly below)
@@ -1667,14 +1698,15 @@ def checkpoint(layer):
 
 
 def stateful_layers(model):
-    """The layers of a model that carry state besides their weights (running statistics), in a fixed order."""
+    """The layers of a model that carry state besides their weights (running statistics; persistent = true: state
+    the layer trains itself, such as a head with its own optimizer), in a fixed order."""
     out, seen = [], set()
 
     def walk(l):
         if id(l) in seen or not isinstance(l, Layer):
             return
         seen.add(id(l))
-        if getattr(l, "stateful", False):
+        if getattr(l, "stateful", False) or getattr(l, "persistent", False):
             out.append(l)
         for c in l.children():
             walk(c)
@@ -1985,16 +2017,22 @@ DAG.apply = _dag_apply_shared
 
 
 # =============================================================== training & inspection
-def card_loss(output=0, rest=None, labels="labels", weights=None):
+def card_loss(output=0, rest=None, labels="labels", weights=None, scale=None):
     """A loss over a model with several outputs (a dag with output=[...]): the cross-entropy of output `output`
     against the targets' `labels` field (class ids, -1 left out) plus rest(outputs, targets) for everything else
     (heads, auxiliary terms; rest must not read outputs[output]). Targets: a record, e.g.
     record(labels=next_tokens, valid=..., issues=...). On the GPU trainer the cross-entropy stays on the card (a
     language model's logits never leave it) and only the other outputs go to the processor; on NumPy the same loss
     is computed on the processor. weights="field": a weight per label (same shape), the cross-entropy then being
-    sum(w * ce) / sum(w) over the labelled rows (e.g. a token that counts double)."""
+    sum(w * ce) / sum(w) over the labelled rows (e.g. a token that counts double). scale="field": the
+    cross-entropy of that batch multiplied by the targets' field (a batch that counts more or less in its step)."""
     from .stdlib import cross_entropy
     out_i, field, wfield = int(output), str(labels), (str(weights) if weights else None)
+    sfield = str(scale) if scale else None
+
+    def scale_of(ys):
+        v = getattr(ys, sfield, None) if (sfield and isinstance(ys, Record)) else None
+        return 1.0 if v is None else float(ops.raw(v))
 
     def labels_of(ys):
         return getattr(ys, field) if isinstance(ys, Record) else ys
@@ -2009,7 +2047,7 @@ def card_loss(output=0, rest=None, labels="labels", weights=None):
         outs = list(outs) if isinstance(outs, (list, tuple)) else [outs]
         w = weights_of(ys)
         if w is None:
-            return cross_entropy(outs[out_i], labels_of(ys)) + rest_of(outs, ys)
+            return scale_of(ys) * cross_entropy(outs[out_i], labels_of(ys)) + rest_of(outs, ys)
         logits = outs[out_i]
         lab = np.asarray(ops.raw(labels_of(ys))).reshape(-1).astype(np.int64)
         wv = np.asarray(ops.raw(w), np.float64).reshape(-1)
@@ -2020,8 +2058,8 @@ def card_loss(output=0, rest=None, labels="labels", weights=None):
         rows = np.nonzero(ok)[0]
         picked = lsm[rows, lab[rows]] if len(rows) else 0.0
         ce = -ops.sum_(picked * wv[rows]) / max(float(wv[rows].sum()), 1e-12) if len(rows) else 0.0
-        return ce + rest_of(outs, ys)
-    f.on_card = (out_i, labels_of, rest_of, weights_of)
+        return scale_of(ys) * ce + rest_of(outs, ys)
+    f.on_card = (out_i, labels_of, rest_of, weights_of, scale_of)
     f.__name__ = "card_loss"
     return f
 
