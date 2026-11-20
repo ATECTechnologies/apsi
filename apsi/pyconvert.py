@@ -271,6 +271,7 @@ class Converter:
         self.needs_python = False
         self.in_loop = 0
         self.local_modules = set()
+        self.kept_local = set()                     # modules next to the program kept as Python (convert --only)
         self.pkg_sources = {}               # .apsi path of a converted library -> its Python source
         self.renames = {}
 
@@ -495,6 +496,12 @@ class Converter:
         self.emit(f"{self.target(s.target)} {op}= {self.rhs(s.value)}", ind)
 
     def s_AnnAssign(self, s, ind):
+        if self.scope.kind == "class" and isinstance(s.target, ast.Name) and getattr(self, "_class_nested", False):
+            if s.value is not None:                      # inside an if of the class body: the value only
+                self._bind(s.target.id, self.rhs(s.value), ind)
+            else:
+                self.emit("pass", ind)
+            return
         if self.scope.kind == "class" and isinstance(s.target, ast.Name):
             ann = self.annotation(s.annotation)
             n = s.target.id
@@ -526,22 +533,44 @@ class Converter:
 
     # ---- control flow
     def s_If(self, s, ind):
+        if self.scope.kind == "class":                   # a field declared under an if: an assignment there
+            nested, self._class_nested = getattr(self, "_class_nested", False), True
+            try:
+                return self._if(s, ind)
+            finally:
+                self._class_nested = nested
+        return self._if(s, ind)
+
+    def _if(self, s, ind):
         if self._is_type_checking(s.test) and not s.orelse:
             self.emit("if false:  # typing.TYPE_CHECKING", ind)
             self.block(s.body, ind + 1)
             return
+        # in a class body each branch declares the names it binds (one branch's `var x` is not the other's)
+        cls = self.scope.kind == "class"
+        base = set(self.scope.declared) if cls else None
+        seen = set()
+
+        def branch(body):
+            if cls:
+                self.scope.declared = set(base)
+            self.block(body, ind + 1)
+            if cls:
+                seen.update(self.scope.declared)
         self.emit(f"if {self.ex(s.test, top=True)}:", ind)
-        self.block(s.body, ind + 1)
+        branch(s.body)
         orelse = s.orelse
         while len(orelse) == 1 and isinstance(orelse[0], ast.If) and self._is_elif(orelse[0]):
             e = orelse[0]
             self._comments_before(e.lineno, ind)
             self.emit(f"elif {self.ex(e.test, top=True)}:", ind)
-            self.block(e.body, ind + 1)
+            branch(e.body)
             orelse = e.orelse
         if orelse:
             self.emit("else:", ind)
-            self.block(orelse, ind + 1)
+            branch(orelse)
+        if cls:
+            self.scope.declared = base | seen
 
     def _is_type_checking(self, t):
         return (isinstance(t, ast.Name) and t.id == "TYPE_CHECKING") or (
@@ -752,6 +781,11 @@ class Converter:
         rel = (module or "").replace(".", os.sep)
         for cand in (rel + ".py", os.path.join(rel, "__init__.py")):
             if rel and os.path.exists(os.path.join(base, cand)):
+                keep = getattr(self, "keep_local", None)
+                if keep is not None and keep(os.path.abspath(os.path.join(base, cand))):
+                    if not level:
+                        self.kept_local.add(module)
+                        return None                 # stays a Python import: pyimport() finds it next to the program
                 apsi = cand[:-3] + ".apsi"
                 self.local_modules.add(os.path.join(base, cand))
                 return os.path.relpath(os.path.join(base, apsi), self.base_dir).replace(os.sep, "/")
@@ -769,7 +803,7 @@ class Converter:
             if kind == "compiled" and node is not None:
                 self.warn(node, f"'{top}' is a compiled (C/C++) library: used as is through "
                                 f"Python{self.packages.hint(top)}")
-            elif kind is None and node is not None and not self._local(top):
+            elif kind is None and node is not None and top not in self.kept_local and not self._local(top):
                 self.warn(node, f"'{top}' is not installed in the program's .venv or the converting Python, so it "
                                 f"was not converted; it stays a Python import{self.packages.hint(top)}")
             return None
@@ -802,6 +836,23 @@ class Converter:
                         self.emit(f'import "{local}" as {tmp}', ind)
                         self.emit(f"{self.name(alias)} = {tmp}", ind)
                     continue
+            if not a.asname and "." in a.name:
+                # import pkg.sub: when pkg is converted too, pkg and pkg.sub are its Apsi modules (never a second,
+                # Python copy of the same library next to the converted one)
+                parts = a.name.split(".")
+                chain = [self._package(".".join(parts[:k + 1])) for k in range(len(parts))]
+                if all(chain):
+                    root = parts[0]
+                    if self._binds_new(root):
+                        self.scope.declared.add(root)
+                        self.emit(f'import "{chain[0]}" as {self.name(root)}', ind)
+                    else:
+                        tmp = self.fresh("mod")
+                        self.emit(f'import "{chain[0]}" as {tmp}', ind)
+                        self.emit(f"{self.name(root)} = {tmp}", ind)
+                    for path in chain[1:]:
+                        self.emit(f'import "{path}" as {self.fresh("mod")}', ind)
+                    continue
             if a.asname:
                 self._bind(a.asname, f"pyimport({q(a.name)})", ind)
             elif "." in a.name:
@@ -824,7 +875,16 @@ class Converter:
             for a in s.names:
                 path = self._local(a.name, s.level)
                 if path is None:
-                    raise Unsupported(f"relative import of '{a.name}' (no {a.name}.py next to this file)")
+                    # not a module: a name of the package (a class, a function, a constant), taken from the module
+                    # of the package that defines it (its __init__ may only re-export it at run time)
+                    found = self._package_name(a.name, s.level) or self._package_init(s.level)
+                    if found is None:
+                        raise Unsupported(f"relative import of '{a.name}' (no {a.name}.py next to this file, and "
+                                          f"no module of the package defines it)")
+                    tmp = self.fresh("mod")
+                    self.emit(f'import "{found}" as {tmp}', ind)
+                    self._bind(a.asname or a.name, f"{tmp}.{a.name}", ind)
+                    continue
                 tmp = self.fresh("mod")
                 self.emit(f'import "{path}" as {tmp}', ind)
                 self._bind(a.asname or a.name, tmp, ind)
@@ -852,6 +912,53 @@ class Converter:
                 self._star_external(s.module, ind)
                 continue
             self._bind(a.asname or a.name, f"pyfrom({q(s.module)}, {q(a.name)})", ind)
+
+    def _package_init(self, level):
+        """The package's own __init__ (from this module), for a name it provides at run time (a module __getattr__,
+        lazy attributes): `from .. import x` is then the package's attribute x, as in Python."""
+        base = self.base_dir
+        for _ in range(max(0, level - 1)):
+            base = os.path.dirname(base)
+        init = os.path.join(base, "__init__.py")
+        if not os.path.exists(init):
+            return None
+        self.local_modules.add(init)
+        return os.path.relpath(os.path.join(base, "__init__.apsi"), self.base_dir).replace(os.sep, "/")
+
+    def _package_name(self, name, level):
+        """The .apsi path (from this module) of the module of this package that defines `name` at its top level:
+        __init__.py first, then the other modules of the package folder in name order; None when none does."""
+        import ast as _ast
+        base = self.base_dir
+        for _ in range(max(0, level - 1)):
+            base = os.path.dirname(base)
+        try:
+            files = sorted(f for f in os.listdir(base) if f.endswith(".py"))
+        except OSError:
+            return None
+        files.sort(key=lambda f: f != "__init__.py")
+        me = os.path.abspath(self.filename) if self.filename else ""
+        for f in files:
+            full = os.path.join(base, f)
+            if os.path.abspath(full) == me:
+                continue
+            try:
+                with open(full, encoding="utf-8-sig") as fh:
+                    tree = _ast.parse(fh.read())
+            except (OSError, SyntaxError, ValueError):
+                continue
+            for node in tree.body:
+                names = []
+                if isinstance(node, (_ast.ClassDef, _ast.FunctionDef, _ast.AsyncFunctionDef)):
+                    names = [node.name]
+                elif isinstance(node, _ast.Assign):
+                    names = [t.id for t in node.targets if isinstance(t, _ast.Name)]
+                elif isinstance(node, _ast.AnnAssign) and isinstance(node.target, _ast.Name):
+                    names = [node.target.id]
+                if name in names:
+                    self.local_modules.add(full)
+                    return os.path.relpath(os.path.join(base, f[:-3] + ".apsi"), self.base_dir).replace(os.sep, "/")
+        return None
 
     def _star_external(self, module, ind):
         """`from module import *` for an installed module: the names it exports today, bound in one statement."""
@@ -897,10 +1004,25 @@ class Converter:
             tree = ast.parse(open(py, encoding="utf-8").read())
         except (OSError, SyntaxError):
             return True
-        for s in tree.body:
+        def top(stmts):                                    # module level, through if / try / with blocks
+            for st in stmts:
+                yield st
+                for f in ("body", "orelse", "finalbody"):
+                    if isinstance(st, (ast.If, ast.Try, ast.With)) and hasattr(st, f):
+                        yield from top(getattr(st, f))
+                if isinstance(st, ast.Try):
+                    for h in st.handlers:
+                        yield from top(h.body)
+        for s in top(tree.body):
             if isinstance(s, (ast.FunctionDef, ast.ClassDef, ast.AsyncFunctionDef)) and s.name == name:
                 return True
             if isinstance(s, ast.Assign) and any(name in _bound_names(t) for t in s.targets):
+                return True
+            if isinstance(s, ast.AnnAssign) and name in _bound_names(s.target) and s.value is not None:
+                return True
+            # `from .experimental import experimental`: the package's attribute is that object, not the submodule
+            if isinstance(s, (ast.ImportFrom, ast.Import)) and any((a.asname or a.name.split(".")[0]) == name
+                                                                   for a in s.names):
                 return True
         return False
 
@@ -1260,11 +1382,17 @@ def _pattern_names(p):
     return out
 
 
-def convert_source(source, filename="<python>", base_dir=None, packages=None, out_path=None, vendored=False):
+def convert_source(source, filename="<python>", base_dir=None, packages=None, out_path=None, vendored=False,
+                   keep_local=None):
     """Convert Python source; returns (apsi_text, warnings, local_modules). local_modules holds the paths of
-    modules next to the program, and (source, destination) pairs for converted libraries."""
+    modules next to the program, and (source, destination) pairs for converted libraries. keep_local: a function
+    path -> bool; a module next to the program for which it says true stays a Python import (convert --only)."""
     c = Converter(source, filename, base_dir, packages, out_path, vendored)
+    c.keep_local = keep_local
     text = c.convert()
+    if c.kept_local:
+        c.warnings.append((1, "modules of the program kept as Python imports (--only): "
+                              + ", ".join(sorted(c.kept_local)) + "; run with --allow-python"))
     return text, c.warnings, c.local_modules
 
 

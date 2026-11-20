@@ -1,4 +1,4 @@
-; Apsi 2.4.4 — Windows 10/11 x64 installer (per-user, no admin rights needed)
+; Apsi 2.6.0 — Windows 10/11 x64 installer (per-user, no admin rights needed)
 ; Built by packaging/build_all.sh with NSIS (makensis), which runs on Linux or Windows.
 Unicode true
 !include "MUI2.nsh"
@@ -9,7 +9,7 @@ ${StrStr}
 ${UnStrRep}
 
 !ifndef VERSION
-  !define VERSION "2.4.4"
+  !define VERSION "2.6.0"
 !endif
 !ifndef PAYLOAD
   !define PAYLOAD "..\..\build\windows\Apsi"

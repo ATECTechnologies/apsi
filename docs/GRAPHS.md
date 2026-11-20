@@ -20,6 +20,24 @@ both are measurable:
 | `graph_memory(d, k)` | the `k` most salient node states of every graph, weighted by a learned score: `[graphs, k, d]` for a decoder to attend into | the whole graph, node by node |
 | `graph_transformer_net(n_in, d, out, layers, heads, relations, global_every, task)` | a complete model: input projection, local blocks with a global block every `global_every` layers, final norm, node or graph output | all of the above |
 | `hop_distances(g, node)`, `eccentricity(g)` | breadth-first hop counts; the longest shortest path | measuring how far information must go |
+| `hgt(d, heads, types, relations)`, `typed_linear`, `typed_norm` | heterogeneous graphs (`graph(…, node_types=)`): weights per node type, keys through each relation; `types` / `relations` as counts or lists of the ids a layer owns (the rest pass through) | one hop per layer |
+| `global_attention(…, ratio=0.5, learned_keys=true, bias=true, zero_init=true, types=[…])` | half the heads, values weighted by a learned score that also picks the keys above `max_keys`, starts as a no-op | any distance in one layer |
+
+## Graphs of any size, with edge features
+
+```apsi
+let items = [(x1, graph(edges=e1, n=n1, edge_features=f1)), (x2, graph(edges=e2, n=n2, edge_features=f2)), …]
+let X, Y, g = batch_graphs([(x1, g1, y1), (x2, g2, y2), (x3, g3, y3)])     # one batch, sizes all different
+let m = sequential([gine(4, 64, edge_dim=3), gine(64, 64, edge_dim=3), graph_pool("mean"), linear(64, classes)])
+fit_batches(m, m.init(), [batch_graphs(chunk) for chunk in chunks], loss="cross_entropy")
+```
+
+`batch_graphs` puts graphs with different numbers of nodes, edges and degrees into one batch: nodes renumbered,
+edges, relations, hops, node types and edge features kept, `graph.batch` telling which graph a node belongs to,
+targets stacked (one per graph, or one per node when each target has a row per node). `graph(…, edge_features=)`
+gives every edge a row of numbers (bond types, distances); `gine(n_in, n_out, edge_dim)` reads them:
+`MLP((1 + ε) x_i + Σ_j relu(x_j + e_ji W))`, with kernels of its own on the GPU trainer; the
+next batch's graph is prepared on another core while the card trains.
 
 ## Relations and both directions
 

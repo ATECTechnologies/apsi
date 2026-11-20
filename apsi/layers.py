@@ -28,6 +28,8 @@ Backends: every model runs on NumPy (default) or PyTorch — fit(…, backend="t
   check_torch(). The torch backend runs PyTorch, so it needs the 'python' permission (--allow-python).
 """
 import math
+import os
+import re
 
 import numpy as np
 
@@ -94,31 +96,41 @@ class Graph:
     (`rel`, 0 when the graph has one kind of edge) and a hop count (`hop`: 1 for an ordinary edge, k for a shortcut
     made by k_hop(), 0 for a self loop)."""
 
-    def __init__(self, src, dst, n, self_loops=True, undirected=False, rel=None, hop=None):
+    def __init__(self, src, dst, n, self_loops=True, undirected=False, rel=None, hop=None, efeat=None):
         src, dst = _ids(src), _ids(dst)
         rel = np.zeros(len(src), dtype=np.int64) if rel is None else _ids(rel)
         hop = np.ones(len(src), dtype=np.int64) if hop is None else _ids(hop)
         if len(rel) != len(src) or len(hop) != len(src):
             raise ShapeError("graph(): types= needs one entry per edge")
+        if efeat is not None:                        # a feature vector per edge (bond type, distance, …)
+            efeat = np.asarray(ops.raw(efeat), dtype=float)
+            efeat = efeat.reshape(len(src), -1) if efeat.size or not len(src) else efeat.reshape(0, 1)
+            if len(efeat) != len(src):
+                raise ShapeError(f"graph(): edge_features needs one row per edge ({len(src)})")
         if undirected:
             src, dst = np.concatenate([src, dst]), np.concatenate([dst, src])
             rel, hop = np.concatenate([rel, rel]), np.concatenate([hop, hop])
+            efeat = None if efeat is None else np.concatenate([efeat, efeat])
         if self_loops:
             loops = np.arange(int(n))
             keep = src != dst
             src, dst = np.concatenate([src[keep], loops]), np.concatenate([dst[keep], loops])
             rel = np.concatenate([rel[keep], np.zeros(int(n), dtype=np.int64)])
             hop = np.concatenate([hop[keep], np.zeros(int(n), dtype=np.int64)])
+            if efeat is not None:                    # self loops carry zeros
+                efeat = np.concatenate([efeat[keep], np.zeros((int(n), efeat.shape[1]))])
         if len(src) and (src.max() >= n or dst.max() >= n or src.min() < 0 or dst.min() < 0):
             raise ShapeError(f"graph(): edge refers to a node outside 0..{int(n) - 1}")
         self.src, self.dst, self.n = src, dst, int(n)
         self.rel, self.hop = rel, hop
+        self.efeat = efeat
         self.relations = int(rel.max()) + 1 if len(rel) else 1
         self.in_degree = np.bincount(dst, minlength=self.n).astype(float)
         self.out_degree = np.bincount(src, minlength=self.n).astype(float)
         self.edges = len(src)
         self.batch = np.zeros(self.n, dtype=np.int64)
         self.graphs = 1 if self.n else 0
+        self.ntype = np.zeros(self.n, dtype=np.int64)
 
     def __repr__(self):
         extra = f", {self.relations} relations" if self.relations > 1 else ""
@@ -136,11 +148,12 @@ class Graph:
 
 
 def graph(edges=None, n=None, src=None, dst=None, self_loops=True, undirected=False, batch=None, types=None,
-          reverse=False):
+          reverse=False, node_types=None, edge_features=None):
     """graph(edges=[[0, 1], [1, 2]], n=3) or graph(src=tensor, dst=tensor, n=…). `batch` assigns nodes to
     separate graphs for graph-level tasks (used by graph_pool). `types` gives every edge a relation (0, 1, …) for
     graph_transformer layers; reverse=true adds each edge backwards as its own relation, so information flows both
-    ways with separate weights (use -> definition as well as definition -> use)."""
+    ways with separate weights (use -> definition as well as definition -> use). edge_features: a row of numbers
+    per edge [E, F] (bond types, distances, …), read by gine; self loops get zeros, reversed edges a copy."""
     if edges is not None:
         e = np.asarray(ops.raw(edges)).astype(np.int64).reshape(-1, 2) if len(edges) else np.zeros((0, 2), int)
         src, dst = e[:, 0], e[:, 1]
@@ -150,12 +163,18 @@ def graph(edges=None, n=None, src=None, dst=None, self_loops=True, undirected=Fa
     if n is None:
         n = int(max(np.max(src, initial=-1), np.max(dst, initial=-1))) + 1
     rel = _ids(types) if types is not None else np.zeros(len(src), dtype=np.int64)
+    ef = None if edge_features is None else np.asarray(ops.raw(edge_features), dtype=float).reshape(len(src), -1)
     if reverse:
         R = int(rel.max()) + 1 if len(rel) else 1
         src, dst, rel = np.concatenate([src, dst]), np.concatenate([dst, src]), np.concatenate([rel, rel + R])
-    g = Graph(src, dst, n, self_loops=self_loops, undirected=undirected, rel=rel)
+        ef = None if ef is None else np.concatenate([ef, ef])
+    g = Graph(src, dst, n, self_loops=self_loops, undirected=undirected, rel=rel, efeat=ef)
     g.batch = _ids(batch) if batch is not None else np.zeros(g.n, dtype=np.int64)
     g.graphs = int(g.batch.max()) + 1 if g.n else 0
+    if node_types is not None:                       # a type per node (heterogeneous graphs: typed_linear, hgt)
+        g.ntype = _ids(node_types)
+        if len(g.ntype) != g.n:
+            raise ShapeError(f"graph(): node_types needs one entry per node ({g.n})")
     return g
 
 
@@ -172,6 +191,22 @@ def _glorot(rng, n_in, n_out):
 class Layer:
     """A layer: init(seed) -> params, and layer(params, x, train=false, **context) -> output."""
     kind = "layer"
+
+    def __init_subclass__(cls, **kw):
+        """Every layer remembers the arguments it was made with (init_args): a model can then be stored as data
+        and made again exactly (modelpack), with no code of the program that built it."""
+        super().__init_subclass__(**kw)
+        init = cls.__dict__.get("__init__")
+        if init is None:
+            return
+
+        def __init__(self, *a, **k):
+            if "_init_args" not in self.__dict__:      # the outermost constructor's arguments only
+                self.__dict__["_init_args"] = (type(self), a, k)
+            init(self, *a, **k)
+        __init__.__doc__, __init__.__name__, __init__.__qualname__ = init.__doc__, init.__name__, init.__qualname__
+        __init__.__wrapped__ = init
+        cls.__init__ = __init__
 
     def init(self, seed=0):
         return Record()                      # no parameters (an empty record keeps optimizers happy)
@@ -401,29 +436,95 @@ class LastStep(Layer):
         return x[:, -1, :]
 
 
+def rope_tables(T, hd, base=10000.0, offset=0):
+    """cos and sin of the rotary position angles, [T, hd] (the half-split layout: pairs (i, i + hd / 2))."""
+    half = hd // 2
+    inv = 1.0 / (float(base) ** (np.arange(half) * 2.0 / hd))
+    ang = (np.arange(int(offset), int(offset) + int(T))[:, None] * inv[None, :])
+    return np.concatenate([np.cos(ang)] * 2, 1), np.concatenate([np.sin(ang)] * 2, 1)
+
+
+def _rotate_half_matrix(hd):
+    """R with x @ R = rotate_half(x) = [-x2, x1]."""
+    half = hd // 2
+    R = np.zeros((hd, hd))
+    R[half:, :half] = -np.eye(half)
+    R[:half, half:] = np.eye(half)
+    return R
+
+
+def apply_rope(x, base=10000.0, offset=0):
+    """Rotary position embedding on [..., T, hd] (positions offset.., the half-split layout of LLaMA / Qwen)."""
+    sh = np.shape(ops.raw(x))
+    T, hd = sh[-2], sh[-1]
+    if hd % 2:
+        raise ShapeError(f"rope: the head size {hd} must be even")
+    cos, sin = rope_tables(T, hd, base, offset)
+    return x * cos + (x @ _rotate_half_matrix(hd)) * sin
+
+
 class MultiHeadAttention(Layer):
+    """Self-attention (or cross-attention when called on [query, memory]).
+
+    kv_heads: grouped-query attention (fewer key / value heads, each shared by heads / kv_heads query heads);
+    rope: rotary positions on the queries and keys (rope_base); qk_norm: an RMS norm of each head's query and key
+    (learned scale per head dimension) before the positions, as in Qwen3 / Gemma 3."""
     kind = "attention"
 
-    def __init__(self, d, heads=4, causal=False):
+    def __init__(self, d, heads=4, causal=False, kv_heads=None, rope=False, rope_base=10000.0, qk_norm=False,
+                 eps=1e-6, bias=True, gate=None, memory_mask=False):
         self.d, self.h, self.causal = int(d), int(heads), bool(causal)
+        self.bias = bool(bias)
+        self.gate = None if gate is None else float(gate)       # output * tanh(g), g learned from `gate`
+        self.memory_mask = bool(memory_mask)                     # the memory's last column: 1 read, 0 never read
         if self.d % self.h:
             raise ShapeError(f"multi_head_attention: d={self.d} must be divisible by heads={self.h}")
+        self.kvh = int(kv_heads) if kv_heads else self.h
+        if self.kvh < 1 or self.h % self.kvh:
+            raise ShapeError(f"multi_head_attention: heads={self.h} must be a multiple of kv_heads={self.kvh}")
+        self.hd = self.d // self.h
+        self.rope, self.rope_base, self.qk_norm, self.eps = bool(rope), float(rope_base), bool(qk_norm), float(eps)
+        if self.rope and self.hd % 2:
+            raise ShapeError(f"multi_head_attention: rope needs an even head size (d / heads = {self.hd})")
 
     def init(self, seed=0):
         rng = _rng(seed)
-        return Record(Wq=_glorot(rng, self.d, self.d), Wk=_glorot(rng, self.d, self.d),
-                      Wv=_glorot(rng, self.d, self.d), Wo=_glorot(rng, self.d, self.d), bo=np.zeros(self.d))
+        dkv = self.kvh * self.hd
+        f = dict(Wq=_glorot(rng, self.d, self.d), Wk=_glorot(rng, self.d, dkv), Wv=_glorot(rng, self.d, dkv),
+                 Wo=_glorot(rng, self.d, self.d))
+        if self.bias:
+            f["bo"] = np.zeros(self.d)
+        if self.qk_norm:
+            f.update(q_norm=np.ones(self.hd), k_norm=np.ones(self.hd))
+        if self.gate is not None:
+            f["gate"] = np.array([self.gate])
+        return Record(**f)
 
     def apply(self, p, x, train=False, mask=None, **ctx):
         src = x if not isinstance(x, (list, tuple)) else x[0]
         mem = src if not isinstance(x, (list, tuple)) else x[1]          # cross-attention: [query, memory]
         B, T, D = np.shape(ops.raw(src))
         S = np.shape(ops.raw(mem))[1]
-        hd = D // self.h
+        if self.memory_mask:                                               # [B, S, d + 1]: the last column says
+            keep = np.asarray(ops.raw(mem))[:, :, -1]                      # which memory slots may be read
+            mem = mem[:, :, :-1]
+            extra = ((keep - 1.0) * 1e9).reshape(B, 1, 1, S)
+            mask = extra if mask is None else mask + extra
+        hd, h, kvh = self.hd, self.h, self.kvh
 
-        def split(t, L):
-            return ops.transpose(ops.reshape(t, B, L, self.h, hd), (0, 2, 1, 3))
-        q, k, v = split(src @ p.Wq, T), split(mem @ p.Wk, S), split(mem @ p.Wv, S)
+        def split(t, L, n):
+            return ops.transpose(ops.reshape(t, B, L, n, hd), (0, 2, 1, 3))
+        q, k, v = split(src @ p.Wq, T, h), split(mem @ p.Wk, S, kvh), split(mem @ p.Wv, S, kvh)
+        if self.qk_norm:
+            q = q / ops.sqrt(ops.mean(q * q, axis=-1, keepdims=True) + self.eps) * p.q_norm
+            k = k / ops.sqrt(ops.mean(k * k, axis=-1, keepdims=True) + self.eps) * p.k_norm
+        if self.rope:
+            q, k = apply_rope(q, self.rope_base), apply_rope(k, self.rope_base)
+        if kvh != h:                                                       # each key / value head serves h / kvh
+            g = h // kvh
+            one = np.ones((1, 1, g, 1, 1))
+            k = ops.reshape(ops.reshape(k, B, kvh, 1, S, hd) * one, B, h, S, hd)
+            v = ops.reshape(ops.reshape(v, B, kvh, 1, S, hd) * one, B, h, S, hd)
         s = (q @ ops.transpose(k, (0, 1, 3, 2))) / math.sqrt(hd)
         if self.causal:
             s = s + np.triu(np.full((T, S), -1e9), k=1)
@@ -431,10 +532,42 @@ class MultiHeadAttention(Layer):
             s = s + mask
         o = ops.softmax(s, axis=-1) @ v
         o = ops.reshape(ops.transpose(o, (0, 2, 1, 3)), B, T, D)
-        return o @ p.Wo + p.bo
+        y = o @ p.Wo
+        if self.bias:
+            y = y + p.bo
+        return y * ops.tanh(p.gate[0]) if self.gate is not None else y
 
     def describe(self):
-        return f"multi_head_attention(d={self.d}, heads={self.h}{', causal' if self.causal else ''})"
+        extra = (f", kv_heads={self.kvh}" if self.kvh != self.h else "") + (", rope" if self.rope else "") + \
+            (", qk_norm" if self.qk_norm else "") + (", gated" if self.gate is not None else "") + \
+            (", masked memory" if self.memory_mask else "")
+        return f"multi_head_attention(d={self.d}, heads={self.h}{', causal' if self.causal else ''}{extra})"
+
+
+class SwiGLU(Layer):
+    """Gated feed-forward block: down(act(x gate) * (x up)), act "silu" (SwiGLU, LLaMA / Qwen) or "gelu" (GeGLU)."""
+    kind = "swiglu"
+
+    def __init__(self, d, ff=None, act="silu", d_out=None):
+        self.d, self.ff = int(d), int(ff or (8 * int(d)) // 3)
+        self.d_out = int(d_out or d)
+        self.act = str(act).lower()
+        if self.act not in ("silu", "swish", "gelu", "relu"):
+            raise ShapeError(f"swiglu: act '{act}' (silu, gelu, relu)")
+
+    def init(self, seed=0):
+        rng = _rng(seed)
+        return Record(Wg=_glorot(rng, self.d, self.ff), Wu=_glorot(rng, self.d, self.ff),
+                      Wd=_glorot(rng, self.ff, self.d_out))
+
+    def apply(self, p, x, train=False, **ctx):
+        g = x @ p.Wg
+        a = {"silu": lambda t: t * ops.sigmoid(t), "swish": lambda t: t * ops.sigmoid(t), "gelu": ops.gelu,
+             "relu": ops.relu}[self.act](g)
+        return (a * (x @ p.Wu)) @ p.Wd
+
+    def describe(self):
+        return f"swiglu({self.d} -> {self.ff} -> {self.d_out}, {self.act})"
 
 
 class LayerNorm(Layer):
@@ -536,7 +669,7 @@ ACTIVATIONS = {
     "softplus": lambda x: ops.log(1 + ops.exp(x)), "silu": lambda x: x * ops.sigmoid(x),
     "swish": lambda x: x * ops.sigmoid(x), "leaky_relu": _leaky, "elu": _elu,
     "mish": lambda x: x * ops.tanh(ops.log(1 + ops.exp(x))), "linear": lambda x: x, "identity": lambda x: x,
-    "softmax": lambda x: ops.softmax(x, axis=-1),
+    "softmax": lambda x: ops.softmax(x, axis=-1), "sin": ops.sin, "cos": ops.cos,
 }
 
 
@@ -610,6 +743,90 @@ class Select(Layer):
 
     def describe(self):
         return f"select({self.i})"
+
+
+class Slice(Layer):
+    """Columns start..stop of the last axis (a part of a layer's output)."""
+    kind = "slice"
+
+    def __init__(self, start, stop):
+        self.start, self.stop = int(start), int(stop)
+
+    def apply(self, p, x, train=False, **ctx):
+        return x[..., self.start:self.stop]
+
+    def describe(self):
+        return f"slice({self.start}:{self.stop})"
+
+
+class TiedOutput(Layer):
+    """Logits with the weights of an embedding of the same dag (tied embeddings): x @ E^T, E the table of node
+    `owner`. No weights of its own."""
+    kind = "tied_output"
+
+    def __init__(self, owner):
+        self.owner = str(owner)
+
+    def apply(self, p, x, train=False, **ctx):
+        E = getattr(ctx["_dag_params"], self.owner).E
+        return x @ ops.transpose(E, (1, 0))
+
+    def describe(self):
+        return f"tied_output({self.owner})"
+
+
+class MoE(Layer):
+    """Mixture of experts: a router picks the top_k of `experts` gated feed-forward blocks (swiglu) for every row;
+    the output is their sum weighted by a softmax over the chosen router scores. Each row pays for top_k experts
+    while the layer holds `experts` of them. The choice is not differentiable; the weights are."""
+    kind = "moe"
+
+    def __init__(self, d, experts=8, top_k=2, ff=None, act="silu"):
+        self.d, self.E, self.k = int(d), int(experts), int(top_k)
+        if not 1 <= self.k <= self.E:
+            raise ShapeError(f"moe: top_k={self.k} must be between 1 and experts={self.E}")
+        self.ff = int(ff or (8 * self.d) // 3)
+        self.act = str(act).lower()
+        if self.act not in ("silu", "swish", "gelu", "relu"):
+            raise ShapeError(f"moe: act '{act}' (silu, gelu, relu)")
+
+    def init(self, seed=0):
+        rng = _rng(seed)
+        d, f, E = self.d, self.ff, self.E
+        return Record(Wr=_glorot(rng, d, E) * 0.1, Wg=np.stack([_glorot(rng, d, f) for _ in range(E)]),
+                      Wu=np.stack([_glorot(rng, d, f) for _ in range(E)]),
+                      Wd=np.stack([_glorot(rng, f, d) for _ in range(E)]))
+
+    def route(self, logits):
+        """The chosen experts of every row (top_k, the larger score first, the lower index on a tie)."""
+        return np.argsort(-np.asarray(ops.raw(logits)), axis=1, kind="stable")[:, :self.k]
+
+    def apply(self, p, x, train=False, **ctx):
+        sh = np.shape(ops.raw(x))
+        M = int(np.prod(sh[:-1]))
+        xf = ops.reshape(x, M, self.d)
+        logits = xf @ p.Wr
+        idx = self.route(logits)
+        rows = np.repeat(np.arange(M), self.k)
+        sel = ops.reshape(ops.reshape(logits, M * self.E)[rows * self.E + idx.reshape(-1)], M, self.k)
+        gate = ops.reshape(ops.softmax(sel, axis=-1), M * self.k)
+        act = {"silu": lambda t: t * ops.sigmoid(t), "swish": lambda t: t * ops.sigmoid(t), "gelu": ops.gelu,
+               "relu": ops.relu}[self.act]
+        parts, where = [], []
+        flat = idx.reshape(-1)
+        for e in range(self.E):
+            pos = np.nonzero(flat == e)[0]                     # (row, slot) pairs routed to expert e
+            if not len(pos):
+                continue
+            xe = xf[rows[pos]]
+            ye = (act(xe @ p.Wg[e]) * (xe @ p.Wu[e])) @ p.Wd[e]
+            parts.append(ye * ops.reshape(gate[pos], len(pos), 1))
+            where.append(rows[pos])
+        out = segment_sum(ops.concat(parts, 0), np.concatenate(where), M)
+        return ops.reshape(out, *sh)
+
+    def describe(self):
+        return f"moe(d={self.d}, {self.E} experts, top {self.k}, ff={self.ff})"
 
 
 # ---------------------------------------------------------------- composition
@@ -876,6 +1093,77 @@ class GIN(Layer):
         return f"gin({self.n_in} → {self.n_out})"
 
 
+class GINE(Layer):
+    """GIN with edge features (GINE): MLP((1 + eps) x_i + Σ_j relu(x_j + e_ji W_e + b_e)) over the neighbours j of
+    i, e_ji the edge's features (graph(…, edge_features=)): bonds, distances, any per-edge numbers."""
+    kind = "gine"
+
+    def __init__(self, n_in, n_out, edge_dim, hidden=None):
+        hidden = int(hidden or n_out)
+        self.n_in, self.n_out, self.edge_dim = int(n_in), int(n_out), int(edge_dim)
+        self.edge = Linear(self.edge_dim, self.n_in)
+        self.mlp = Sequential([Linear(n_in, hidden), Activation("relu"), Linear(hidden, n_out)])
+
+    def init(self, seed=0):
+        return Record(eps=np.zeros(1), edge=self.edge.init(_seed_of(seed, 1)), mlp=self.mlp.init(seed))
+
+    def apply(self, p, x, train=False, **ctx):
+        g = _graph(ctx)
+        if getattr(g, "efeat", None) is None:
+            raise ShapeError("gine needs a graph with edge_features=")
+        if g.efeat.shape[1] != self.edge_dim:
+            raise ShapeError(f"gine: edges have {g.efeat.shape[1]} features, the layer takes {self.edge_dim}")
+        keep = g.src != g.dst                                               # neighbours only
+        msg = ops.relu(x[g.src[keep]] + self.edge(p.edge, g.efeat[keep]))
+        agg = segment_sum(msg, g.dst[keep], g.n)
+        return self.mlp(p.mlp, (1 + p.eps) * x + agg, train=train, **ctx)
+
+    def describe(self):
+        return f"gine({self.n_in} → {self.n_out}, edges {self.edge_dim})"
+
+
+def batch_graphs(items):
+    """Graphs of different sizes as one batch: items [(x, graph), …] or [(x, graph, y), …] -> (x, graph) or
+    (x, y, graph), the order fit_batches takes. Nodes are renumbered, every graph keeps its edges, relations, hops, node types and edge features,
+    and graph.batch says which graph each node belongs to (graph_pool). y: a value or row per graph
+    (stacked), or a row per node when every y has one entry per node of its graph."""
+    if not items:
+        raise RuntimeErr("batch_graphs: no graphs")
+    xs, src, dst, rel, hop, nt, ef, bt, ys = [], [], [], [], [], [], [], [], []
+    off, gcount = 0, 0
+    has_ef = all(getattr(it[1], "efeat", None) is not None for it in items)
+    with_y = all(len(it) > 2 for it in items)
+    node_y = with_y and all(np.ndim(ops.raw(it[2])) >= 1 and len(np.asarray(ops.raw(it[2]))) == it[1].n
+                            for it in items) and any(it[1].n != 1 for it in items)
+    for gi, it in enumerate(items):
+        x, g = np.asarray(ops.raw(it[0])), it[1]
+        if len(x) != g.n:
+            raise ShapeError(f"batch_graphs: graph {gi} has {g.n} nodes, its features {len(x)} rows")
+        xs.append(x)
+        src.append(g.src + off)
+        dst.append(g.dst + off)
+        rel.append(g.rel)
+        hop.append(g.hop)
+        nt.append(g.ntype)
+        bt.append(g.batch + gcount)
+        gcount += max(1, g.graphs)
+        if has_ef:
+            ef.append(g.efeat)
+        if with_y:
+            ys.append(np.asarray(ops.raw(it[2])))
+        off += g.n
+    gb = Graph(np.concatenate(src), np.concatenate(dst), off, self_loops=False, rel=np.concatenate(rel),
+               hop=np.concatenate(hop), efeat=np.concatenate(ef) if has_ef else None)
+    gb.batch = np.concatenate(bt)
+    gb.graphs = gcount
+    gb.ntype = np.concatenate(nt)
+    X = np.concatenate(xs)
+    if not with_y:
+        return X, gb
+    Y = np.concatenate(ys) if node_y else np.stack(ys)
+    return X, Y, gb
+
+
 class GraphPool(Layer):
     """Node features -> one vector per graph (mean, sum or max over each graph's nodes)."""
     kind = "graph_pool"
@@ -894,15 +1182,37 @@ class GraphPool(Layer):
 
 # ---------------------------------------------------------------- transformer
 class TransformerBlock(Layer):
-    """Pre-norm transformer block: x + attention(norm(x)), then x + MLP(norm(x))."""
+    """Pre-norm transformer block: x + attention(norm(x)), then x + MLP(norm(x)).
+
+    norm="layer" | "rms"; ffn="mlp" (Linear, activation, Linear) | "swiglu"; kv_heads / rope / qk_norm: see
+    multi_head_attention. transformer_block(d, heads, kv_heads=2, rope=true, qk_norm=true, norm="rms",
+    ffn="swiglu") is a LLaMA / Qwen3 block."""
     kind = "transformer_block"
 
-    def __init__(self, d, heads=4, ff=None, causal=False, dropout=0.0, activation="gelu"):
-        ff = int(ff or 4 * d)
+    def __init__(self, d, heads=4, ff=None, causal=False, dropout=0.0, activation="gelu", kv_heads=None, rope=False,
+                 rope_base=10000.0, qk_norm=False, norm="layer", ffn="mlp", experts=8, top_k=2):
         self.d = int(d)
-        self.attn = Residual(MultiHeadAttention(d, heads, causal), pre_norm=LayerNorm(d))
-        self.mlp = Residual(Sequential([Linear(d, ff), Activation(activation), Dropout(dropout), Linear(ff, d)]),
-                            pre_norm=LayerNorm(d))
+        self.norm_kind, self.ffn_kind = str(norm).lower(), str(ffn).lower()
+        if self.norm_kind not in ("layer", "rms"):
+            raise ShapeError(f"transformer_block: norm '{norm}' (layer, rms)")
+        if self.ffn_kind not in ("mlp", "swiglu", "moe"):
+            raise ShapeError(f"transformer_block: ffn '{ffn}' (mlp, swiglu, moe)")
+        mk = (lambda: LayerNorm(d)) if self.norm_kind == "layer" else (lambda: RMSNorm(d))
+        self.attn = Residual(MultiHeadAttention(d, heads, causal, kv_heads, rope, rope_base, qk_norm), pre_norm=mk())
+        if self.ffn_kind == "moe":
+            ff = int(ff or (8 * int(d)) // 3)
+            body = MoE(d, experts, top_k, ff, "silu" if str(activation).lower() == "gelu" else activation)
+            if dropout:
+                body = Sequential([body, Dropout(dropout)])
+        elif self.ffn_kind == "swiglu":
+            ff = int(ff or (8 * int(d)) // 3)
+            body = SwiGLU(d, ff, "silu" if str(activation).lower() == "gelu" else activation)   # (gelu: the default)
+            if dropout:
+                body = Sequential([body, Dropout(dropout)])
+        else:
+            ff = int(ff or 4 * d)
+            body = Sequential([Linear(d, ff), Activation(activation), Dropout(dropout), Linear(ff, d)])
+        self.mlp = Residual(body, pre_norm=mk())
         self.heads, self.ff, self.causal = int(heads), ff, bool(causal)
 
     def init(self, seed=0):
@@ -915,7 +1225,256 @@ class TransformerBlock(Layer):
         return [self.attn, self.mlp]
 
     def describe(self):
-        return f"transformer_block(d={self.d}, heads={self.heads}, ff={self.ff}{', causal' if self.causal else ''})"
+        a = self.attn.inner
+        extra = (f", kv_heads={a.kvh}" if a.kvh != a.h else "") + (", rope" if a.rope else "") + \
+            (", qk_norm" if a.qk_norm else "") + (", rms" if self.norm_kind == "rms" else "") + \
+            (f", {self.ffn_kind}" if self.ffn_kind != "mlp" else "")
+        return f"transformer_block(d={self.d}, heads={self.heads}, ff={self.ff}{', causal' if self.causal else ''}{extra})"
+
+
+def param_paths(params, prefix=""):
+    """[(path, array)] of every weight: "enca_l0.hgt.q.W", "w0_self.inner.Wq", "layers[2].W" …"""
+    out = []
+    if isinstance(params, Record):
+        for k, v in params.fields.items():
+            out += param_paths(v, f"{prefix}.{k}" if prefix else k)
+    elif isinstance(params, (list, tuple)):
+        for i, v in enumerate(params):
+            out += param_paths(v, f"{prefix}[{i}]")
+    elif isinstance(params, np.ndarray):
+        out.append((prefix, params))
+    return out
+
+
+def frozen_ids(params, freeze=None, train_only=None):
+    """The ids of the weights that stay as they are: freeze= names (a part of the model by its path: "enc",
+    "enca", "w0_self.inner") or a function path -> bool; train_only= the opposite (everything else is frozen)."""
+    def matches(path, pats):
+        if callable(pats):
+            return bool(pats(path))
+        pats = [pats] if isinstance(pats, str) else list(pats)
+        for q in pats:
+            q = str(q)
+            if path == q or path.startswith(q + ".") or path.startswith(q + "["):
+                return True
+            if q.endswith("*") and path.startswith(q[:-1]):
+                return True
+        return False
+    out = set()
+    for path, a in param_paths(params):
+        if (freeze is not None and matches(path, freeze)) or (train_only is not None and not matches(path, train_only)):
+            out.add(id(a))
+    return out
+
+
+def _map_paths(t, fn, prefix=""):
+    """t with every array replaced by fn(path, array)."""
+    if isinstance(t, Record):
+        return Record(**{k: _map_paths(v, fn, f"{prefix}.{k}" if prefix else k) for k, v in t.fields.items()})
+    if isinstance(t, (list, tuple)):
+        return type(t)(_map_paths(v, fn, f"{prefix}[{i}]") for i, v in enumerate(t))
+    return fn(prefix, t) if isinstance(t, np.ndarray) or hasattr(t, "shape") else t
+
+
+def keeps_frozen(fn):
+    """fn(model, params, ..., freeze=, train_only=) returning a record with .params: the frozen weights of the result
+    are the very weights given (their values and their type), whatever precision training ran in."""
+    import functools
+
+    @functools.wraps(fn)
+    def run(model, params, *a, **kw):
+        r = fn(model, params, *a, **kw)
+        fz, to = kw.get("freeze"), kw.get("train_only")
+        if (fz is None and to is None) or not isinstance(r, Record) or "params" not in r.fields:
+            return r
+        still = frozen_paths(params, fz, to)
+        if still:
+            r.fields["params"] = _freeze_keep(params, r.fields["params"], still)
+        return r
+    return run
+
+
+def frozen_paths(params, freeze=None, train_only=None):
+    if freeze is None and train_only is None:
+        return set()
+    ids = frozen_ids(params, freeze, train_only)
+    return {p for p, a in param_paths(params) if id(a) in ids}
+
+
+def _freeze_grads(g, paths):
+    return _map_paths(g, lambda p, a: a * 0.0 if p in paths else a) if paths else g
+
+
+def _freeze_keep(old, new, paths):
+    if not paths:
+        return new
+    olds = dict(param_paths(old))
+    return _map_paths(new, lambda p, a: olds[p] if p in paths and p in olds else a)
+
+
+def fit_batches(model, params, batches, loss="cross_entropy", opt=None, epochs=1, backend="auto", device="cuda",
+                verbose=True, clip=None, schedule=None, precision="auto", compensated=None, every=None, accumulate=1,
+                stages=None, freeze=None, train_only=None, steps=None, checkpoint=None, save_every=None, resume=True,
+                callback=None):
+    """Train on batches that each bring their own shapes and graph: a list of (inputs, targets[, graph]) or a function
+    epoch -> such a list. inputs may be a list (a dag with several inputs, e.g. token ids and node features). Each
+    step is `accumulate` batches (their gradients averaged); the history is the mean loss of each epoch. backend: "auto"
+    (the GPU trainer when there is a card), "gpu" or "numpy". device="cuda:all": the model (a dag or a sequence) split
+    across the cards (stages=N or a list of node counts), `accumulate` batches flowing through as micro-batches.
+    freeze= / train_only=: parts of the model by name ("enca", "w*", a function of the path) that stay as they
+    are / the only parts that learn. Any optimizer: adam, adamw and sgd have kernels of their own, the others step on
+    the processor.
+    steps=N: train for N optimizer steps (over as many epochs as that takes) instead of `epochs`. checkpoint="run.npz"
+    with save_every=K: the weights, the optimizer's state and the position in the data are saved every K steps, at the
+    end and when training stops on an error or Ctrl+C; running the same call again resumes exactly where it stopped
+    (resume=false starts over). callback(record(epoch, step, loss)) after every epoch. A step whose gradient is not
+    finite (inf / NaN) is skipped, so one bad batch cannot ruin the weights (APSI_GPU_GUARD=0 turns this off)."""
+    from .stdlib import Adam, value_and_grad
+    opt = opt or Adam(1e-3)
+    which = str(backend or "auto").lower()
+    if which in ("auto", "gpu"):
+        from . import gpu_train as GT
+        if which == "gpu" or _gpu_ready():
+            try:
+                return GT.fit_batches(model, params, batches, loss, opt, epochs, verbose, clip, schedule, device,
+                                      precision, compensated=compensated, every=every, accumulate=accumulate,
+                                      stages=stages, freeze=freeze, train_only=train_only, steps=steps,
+                                      checkpoint=checkpoint, save_every=save_every, resume=resume,
+                                      callback=callback)
+            except GT.TrainError as e:
+                raise RuntimeErr(f"backend=\"gpu\": {e}") from None
+    lf = loss if callable(loss) else _loss_fn(loss)
+    E = int(epochs)
+    every = int(every or max(1, E // 10))
+    history, step = [], 0
+    still = frozen_paths(params, freeze, train_only)
+    from .gpu_train import _batch_parts
+    A = max(1, int(accumulate or 1))
+    want = int(steps) if steps else None
+    start_ep, skip = 0, 0
+    if checkpoint and resume and os.path.exists(str(checkpoint)):
+        params, step, start_ep, skip = _np_ckpt_load(str(checkpoint), params, opt)
+        if verbose:
+            print(f"resumed from {checkpoint}: step {step}, epoch {start_ep}, batch {skip}")
+    last = start_ep + E if want is None else 1 << 30
+    guard = os.environ.get("APSI_GPU_GUARD", "1").strip().lower() not in ("0", "false", "no", "off")
+    pos = [start_ep, skip]
+    stop = False
+    try:
+        for ep in range(start_ep, last):
+            if stop:
+                break
+            items = list(batches(ep) if callable(batches) else batches)
+            tot, seen = 0.0, 0
+            for s0 in range(0, len(items), A):
+                if ep == start_ep and s0 < skip:
+                    continue
+                chunk = items[s0:s0 + A]
+                params, lv_sum, ok = _np_step(model, params, chunk, loss, lf, opt, schedule, step, clip, still, guard)
+                tot += lv_sum
+                seen += len(chunk)
+                step += 1
+                pos[0], pos[1] = ep, s0 + A
+                if checkpoint and save_every and step % int(save_every) == 0:
+                    _np_ckpt_save(str(checkpoint), params, opt, step, pos)
+                if want is not None and step >= want:
+                    stop = True
+                    break
+            if not stop:
+                pos[0], pos[1] = ep + 1, 0
+            history.append(tot / max(1, seen))
+            if callback is not None:
+                callback(Record(epoch=ep, step=step, loss=history[-1]))
+            if verbose and (ep % every == 0 or ep == last - 1 or stop):
+                print(f"epoch {ep:4}  loss {history[-1]:.5f}  ({len(items)} batches, step {step})")
+        if checkpoint:
+            _np_ckpt_save(str(checkpoint), params, opt, step, pos)
+    except BaseException:
+        if checkpoint:
+            try:
+                _np_ckpt_save(str(checkpoint), params, opt, step, pos)
+                if verbose:
+                    print(f"training stopped at step {step}; saved to {checkpoint} (run again to resume)")
+            except Exception:                            # noqa: BLE001
+                pass
+        raise
+    return Record(params=params, history=history, device="processor")
+
+
+def _np_step(model, params, chunk, loss, lf, opt, schedule, step, clip, still, guard):
+    """One optimizer step over the batches of `chunk` (their gradients averaged): (params, summed loss, taken?)."""
+    from .stdlib import value_and_grad
+    from .gpu_train import _batch_parts
+    acc, tot = None, 0.0
+    for item in chunk:
+        X, Y, g = _batch_parts(item)
+        ctx = {"graph": g} if g is not None else {}
+        if not callable(loss) or not isinstance(Y, Record):
+            Y = np.asarray(ops.raw(Y))                  # a loss of your own may take a record of targets
+        lv, gr = value_and_grad(lambda p: lf(model(p, X, train=True, **ctx), Y))(params)
+        gr = tree_map(lambda a: a / len(chunk) if isinstance(a, np.ndarray) else a, gr)
+        acc = gr if acc is None else tree_map(lambda a, b: a + b, acc, gr)
+        tot += float(ops.raw(lv))
+    gr = _freeze_grads(acc, still)                       # frozen weights: no gradient (and kept exactly below)
+    if guard and not all(np.all(np.isfinite(np.asarray(ops.raw(a)))) for a in tree_leaves(gr)
+                         if isinstance(ops.raw(a), np.ndarray)):
+        return params, tot, False                       # a non-finite gradient: this step is skipped
+    if schedule is not None:
+        opt.lr = float(ops.raw(schedule(step)))
+    if clip:
+        norm = math.sqrt(sum(float(np.sum(np.asarray(ops.raw(a)) ** 2)) for a in tree_leaves(gr)))
+        if norm > clip:
+            gr = tree_map(lambda a: a * (clip / norm), gr)
+    return _freeze_keep(params, opt.step(params, gr), still), tot, True
+
+
+def _np_ckpt_save(path, params, opt, step, pos):
+    leaves = [np.asarray(ops.raw(a)) for a in tree_leaves(params) if isinstance(ops.raw(a), np.ndarray)]
+    data = {f"p{i}": a for i, a in enumerate(leaves)}
+    for name in ("m", "v", "vel", "velocity"):
+        tree = getattr(opt, name, None)
+        if tree is not None:
+            for i, a in enumerate(x for x in tree_leaves(tree) if isinstance(x, np.ndarray)):
+                data[f"{name}{i}"] = a
+    data["meta"] = np.array([step, pos[0], pos[1], int(getattr(opt, "t", 0)), len(leaves)], np.int64)
+    tmp = f"{path}.tmp.npz"
+    np.savez(tmp, **data)
+    os.replace(tmp, path)
+
+
+def _np_ckpt_load(path, params, opt):
+    with np.load(path) as z:
+        step, ep, bi, t, nleaf = (int(v) for v in z["meta"])
+        arrays = [a for a in tree_leaves(params) if isinstance(ops.raw(a), np.ndarray)]
+        if nleaf != len(arrays) or any(z[f"p{i}"].shape != np.shape(ops.raw(a)) for i, a in enumerate(arrays)):
+            raise RuntimeErr(f"the checkpoint {path} is of another model (delete it or give another checkpoint=)")
+        it = iter([z[f"p{i}"] for i in range(nleaf)])
+        params = tree_map(lambda a: next(it) if isinstance(ops.raw(a), np.ndarray) else a, params)
+        for name in ("m", "v", "vel", "velocity"):
+            if f"{name}0" in z.files:
+                it2 = iter([z[k] for k in sorted((k for k in z.files if re.fullmatch(name + r"\d+", k)),
+                                                 key=lambda k: int(k[len(name):]))])
+                setattr(opt, name, tree_map(lambda a: next(it2) if isinstance(ops.raw(a), np.ndarray) else a, params))
+        if hasattr(opt, "t"):
+            opt.t = t
+    return params, step, ep, bi
+
+
+def _pinn_fit(model, params, points, loss, epochs=2000, opt=None, backend="auto", device="cuda", verbose=True,
+              schedule=None, clip=None, every=None, compensated=True, graph=None):
+    """Train a physics-informed network: loss(x, u, du, d2u) with u [N, m], du / d2u [N, d, m] (see apsi.pinn)."""
+    from . import pinn
+    try:
+        return pinn.fit(model, params, points, loss, epochs, opt, backend, device, verbose, schedule, clip, every,
+                        compensated=compensated, graph=graph)
+    except pinn.PinnError as e:
+        raise RuntimeErr(str(e)) from None
+
+
+def _pinn_derivatives(model, params, points, graph=None):
+    """Record(u, du, d2u): the network and its first and second derivatives along each input at the points."""
+    from . import pinn
+    return pinn.derivatives(model, params, points, graph)
 
 
 # =============================================================== constructors exposed to Apsi
@@ -946,7 +1505,24 @@ class CustomLayer(Layer):
         return self.init_fn(seed=0 if seed is None else int(seed))
 
     def __call__(self, params, *xs, train=None, **kw):
-        return self.forward_fn(params, *xs, train=self.training if train is None else bool(train), **kw)
+        kw = {k: v for k, v in kw.items() if not k.startswith("_")}          # the dag's own context stays inside
+        kw["train"] = self.training if train is None else bool(train)
+        acc = self._accepts()
+        if acc is not None:                         # pass what the function takes: forward(p, x) works as well as
+            kw = {k: v for k, v in kw.items() if k in acc}      # forward(p, x, train, graph, mask)
+        return self.forward_fn(params, *xs, **kw)
+
+    def _accepts(self):
+        """The keyword names the forward function takes, or None when it takes any."""
+        if not hasattr(self, "_acc"):
+            import inspect
+            try:
+                ps = inspect.signature(self.forward_fn).parameters.values()
+                self._acc = None if any(p.kind == p.VAR_KEYWORD for p in ps) else \
+                    {p.name for p in ps if p.kind in (p.POSITIONAL_OR_KEYWORD, p.KEYWORD_ONLY)}
+            except (TypeError, ValueError):
+                self._acc = None
+        return self._acc
 
     def train(self, mode=True):
         self.training = bool(mode)
@@ -1106,8 +1682,10 @@ def concatenate():
     return Combine("concat")
 
 
-def transformer_encoder(d, heads=4, layers=2, ff=None, causal=False, dropout=0.0):
-    return Sequential([TransformerBlock(d, heads, ff, causal, dropout) for _ in range(int(layers))] + [LayerNorm(d)])
+def transformer_encoder(d, heads=4, layers=2, ff=None, causal=False, dropout=0.0, **block):
+    """layers transformer blocks and a final norm; block: kv_heads, rope, rope_base, qk_norm, norm, ffn, activation."""
+    blocks = [TransformerBlock(d, heads, ff, causal, dropout, **block) for _ in range(int(layers))]
+    return Sequential(blocks + [RMSNorm(d) if str(block.get("norm", "layer")).lower() == "rms" else LayerNorm(d)])
 
 
 # ---------------------------------------------------------------- model zoo
@@ -1153,10 +1731,16 @@ def lstm_classifier(n_in, hidden, classes, layers=1):
     return Sequential(L + [Linear(d, classes)])
 
 
-def transformer_lm(vocab, d=64, heads=4, layers=2, context=128, dropout=0.0):
-    """Decoder-only (GPT-style) language model: token ids [B, T] -> logits [B, T, vocab]."""
-    return Sequential([Embedding(vocab, d), PositionalEncoding(context, d, learned=True),
-                       transformer_encoder(d, heads, layers, causal=True, dropout=dropout), Linear(d, vocab)])
+def transformer_lm(vocab, d=64, heads=4, layers=2, context=128, dropout=0.0, ff=None, **block):
+    """Decoder-only (GPT-style) language model: token ids [B, T] -> logits [B, T, vocab].
+
+    block options (kv_heads, rope, rope_base, qk_norm, norm, ffn, activation) shape every block; with rope=true the
+    model has no learned position table. transformer_lm(32000, d=768, heads=12, layers=12, kv_heads=4, rope=true,
+    qk_norm=true, norm="rms", ffn="swiglu") is a modern (LLaMA / Qwen3 style) model."""
+    pos = [] if block.get("rope") else [PositionalEncoding(context, d, learned=True)]
+    return Sequential([Embedding(vocab, d)] + pos +
+                      [transformer_encoder(d, heads, layers, ff=ff, causal=True, dropout=dropout, **block),
+                       Linear(d, vocab)])
 
 
 def transformer_classifier(vocab, classes, d=64, heads=4, layers=2, context=128):
@@ -1287,7 +1871,7 @@ def _backend(backend, model=None, loss=None, plain=True):
     b = str(backend or "numpy").lower()
     b = {"apsi-gpu": "gpu", "native-gpu": "gpu", "cuda": "gpu", "apsi": "numpy", "cpu": "numpy"}.get(b, b)
     if b in ("auto", "auto-notorch"):
-        if model is not None and plain and loss in ("cross_entropy", "mse") and _gpu_ready() and \
+        if model is not None and plain and loss in ("cross_entropy", "mse", "mae", "bce") and _gpu_ready() and \
                 _gpu_supports(model) is None:
             return "gpu"
         if b == "auto-notorch":
@@ -1316,7 +1900,8 @@ def _gpu_supports(model):
 
 def fit(model, params, X, y=None, loss="mse", opt=None, epochs=10, batch_size=None, seed=0, verbose=True,
         clip=None, schedule=None, graph=None, mask=None, val=None, backend="numpy", device="auto",
-        precision="auto", compile=False, workers=1, ema=None, ewc=None):
+        precision="auto", compile=False, workers=1, ema=None, ewc=None, parallel="auto", stages=None,
+        micro_batches=None, compensated=None, freeze=None, train_only=None):
     """Train `model`. Returns record(params, history, val_history, device).
 
     loss: "mse", "cross_entropy", "mae", "bce", "vae" ("huber" on torch) or a function loss(prediction, target).
@@ -1329,20 +1914,27 @@ def fit(model, params, X, y=None, loss="mse", opt=None, epochs=10, batch_size=No
     workers=N (numpy backend, mini-batches): data-parallel training on N processes — every batch is split into N
     shards, the gradients of the shards are averaged (weighted by shard size, so the result is the gradient of the
     whole batch) and one optimizer step is taken. "auto" uses every core.
+    backend="gpu" on several cards (device="cuda:all" or "cuda:0,1,2"): parallel="data" (a copy of the model on every
+    card), "pipeline" (the model split across the cards; stages=N pieces or a list of the units in each;
+    micro_batches=M) or "auto" (copies when the model fits one card, else the fewest pieces that fit).
+    freeze= / train_only=: parts of the model by name ("enc", "layers[0]", "w*", or a function of the path) that
+    stay as they are / the only parts that learn (fine-tuning, training one part of a model at a time).
     """
-    which = _backend(backend, model, loss if isinstance(loss, str) else None, graph is None and mask is None)
+    which = _backend(backend, model, loss if isinstance(loss, str) else None, True)
     if which == "gpu":
         from . import gpu_train
-        if graph is not None or mask is not None:
-            raise RuntimeErr("backend=\"gpu\": graph tasks train with backend=\"torch\" or \"numpy\"")
         dev = "cuda" if str(device).lower() in ("auto", "gpu", "cuda") else device
         try:
             return gpu_train.fit(model, params, X, y, loss, opt, epochs, batch_size, seed, verbose, clip, schedule, val,
-                                 device=dev, precision=precision, ema=ema, ewc=ewc)
+                                 device=dev, precision=precision, ema=ema, ewc=ewc, parallel=parallel, stages=stages,
+                                 micro_batches=micro_batches, graph=graph, mask=mask, compensated=compensated,
+                                 freeze=freeze, train_only=train_only)
         except gpu_train.TrainError as e:
             raise RuntimeErr(f"backend=\"gpu\": {e}")
     if ema is not None or ewc is not None:
         raise RuntimeErr("ema= and ewc= train on the GPU trainer: fit(..., backend=\"gpu\")")
+    if which == "torch" and (freeze is not None or train_only is not None):
+        raise RuntimeErr("freeze= / train_only= train on backend=\"numpy\" or \"gpu\"")
     if which == "torch":
         from . import torch_backend
         return torch_backend.fit(model, params, X, y, loss, opt, epochs, batch_size, seed, verbose, clip, schedule,
@@ -1370,6 +1962,7 @@ def fit(model, params, X, y=None, loss="mse", opt=None, epochs=10, batch_size=No
     vparams = (lambda p: lowbit.round_tree(p, kind)) if kind else (lambda p: p)
     Xr, Yr = X, target
     low = kind is not None or str(precision).lower() in ("auto", "fp32", "float32", "f32", "tf32", "bf16", "fp16")
+    params_in = params                        # frozen weights come back exactly as given (dtype too)
     if low:                                   # half the memory of float64 for weights, data and activations
         def _f32(t):
             return tree_map(lambda a: a.astype(np.float32) if isinstance(a, np.ndarray) and a.dtype.kind == "f"
@@ -1381,6 +1974,7 @@ def fit(model, params, X, y=None, loss="mse", opt=None, epochs=10, batch_size=No
     rng = np.random.default_rng(int(seed))
     np.random.seed(int(seed))
     history, val_hist, step = [], [], 0
+    still = frozen_paths(params, freeze, train_only)
     team = _Team(vg, Xr, Yr, workers) if not full and _want_workers(workers) > 1 else None
     if team is not None:
         vg = team.vg
@@ -1416,9 +2010,11 @@ def _fit_loop(env):
                 l, g = vg(params, b)
             else:
                 l, g = vg(params, Xr if b is None else _take(Xr, b), Yr if b is None else _take(Yr, b))
+            still = env.get("still")
+            g = _freeze_grads(g, still)
             if clip:
                 g = clip_grad_norm(g, clip)
-            params = opt.step(params, g)
+            params = _freeze_keep(params, opt.step(params, g), still)
             if low:
                 params = _f32(params)
             total += float(ops.raw(l)) * (1 if b is None else len(b))
@@ -1433,6 +2029,8 @@ def _fit_loop(env):
             extra = f"  val {vl:.5f}"
         if verbose and (ep % max(1, int(epochs) // 10) == 0 or ep == int(epochs) - 1):
             print(f"epoch {ep:4}  loss {history[-1]:.5f}{extra}")
+    if env.get("still") and env.get("params_in") is not None:
+        params = _freeze_keep(env["params_in"], params, env["still"])
     return Record(params=params, history=history, val_history=val_hist, device="numpy")
 
 
@@ -1648,11 +2246,13 @@ def module(interp=None):
         linear=linear, dense=dense, bilinear=Bilinear, embedding=Embedding, positional_encoding=PositionalEncoding,
         conv2d_layer=Conv2D, max_pool=MaxPool, avg_pool=AvgPool, global_avg_pool=GlobalAvgPool,
         flatten_layer=Flatten, reshape_layer=Reshape, lstm_layer=LSTMLayer, gru_layer=GRULayer, last_step=LastStep,
-        multi_head_attention=MultiHeadAttention, transformer_block=TransformerBlock,
+        multi_head_attention=MultiHeadAttention, transformer_block=TransformerBlock, swiglu=SwiGLU,
+        apply_rope=apply_rope, moe=MoE, fit_batches=fit_batches, pinn_fit=_pinn_fit, pinn_derivatives=_pinn_derivatives,
         transformer_encoder=transformer_encoder, layer_norm_layer=LayerNorm, rms_norm_layer=RMSNorm,
         batch_norm_layer=BatchNorm, dropout_layer=Dropout, activation=activation, lambda_layer=LambdaLayer,
-        scale=Scale, identity=Identity, select=Select, mean_pool=MeanPool,
-        gcn=GCN, sage=SAGE, gat=GAT, gin=GIN, graph_pool=GraphPool,
+        scale=Scale, identity=Identity, select=Select, mean_pool=MeanPool, slice_layer=Slice,
+        tied_output=TiedOutput,
+        gcn=GCN, sage=SAGE, gat=GAT, gin=GIN, gine=GINE, batch_graphs=batch_graphs, graph_pool=GraphPool,
         # composition
         sequential=sequential, residual=residual, parallel=parallel, dag=dag, add=add, multiply=multiply,
         concatenate=concatenate, custom_layer=custom_layer, checkpoint=checkpoint, diagnose=diagnose, load_torch_weights=load_torch_weights,
@@ -1666,8 +2266,9 @@ def module(interp=None):
         torch_module=guarded(torch_module, "torch_module()"), params_from_torch=guarded(params_from_torch, "params_from_torch()"),
         devices=devices_, check_torch=guarded(check_torch, "check_torch()"),
     )
-    from . import graphs                     # long-range graph layers (graph_transformer, global_attention, …)
+    from . import graphs, modelpack              # graph layers; sealed model packages
     names.update(graphs.names())
+    names.update(modelpack.names())
     return names
 
 

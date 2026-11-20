@@ -24,5 +24,4 @@ Files:
     apsi-@V@-py3-none-any.whl    pip package
     source/apsi-@V@-source.zip   complete source code, documentation, tests and examples
     LICENSE, CHANGELOG.md, INSTALL-LINUX.md
-    gpu-tuner/                     Apsi GPU Tuner: Apply / Restore for Windows and Linux (best power limit for training)
     SHA256SUMS.txt                 checksums of every file

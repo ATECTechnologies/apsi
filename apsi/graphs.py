@@ -168,46 +168,85 @@ class GraphTransformer(Layer):
 
 
 class GlobalAttention(Layer):
-    """Pre-norm residual self-attention over all nodes of the same graph: any node reaches any other in one step."""
+    """Pre-norm residual self-attention over all nodes of the same graph: any node reaches any other in one step.
+    Graphs of a batch never see each other. Above `max_keys` nodes a graph's keys are a subset: evenly strided, or with
+    learned_keys the max_keys nodes of highest learned score (landmark keys: every node's value is also scaled by
+    2 sigmoid(score), 1 at the start, so the scorer learns which nodes are worth finding). ratio: the attention runs
+    with round(heads * ratio) heads of the same size (narrower than the model); bias: biases on q / k / v; zero_init:
+    the output projection starts at zero (the layer starts as a no-op); types: only the nodes of these types attend and
+    are attended (the others pass through)."""
     kind = "global_attention"
 
-    def __init__(self, d, heads=4, max_keys=4096):
+    def __init__(self, d, heads=4, max_keys=4096, ratio=1.0, learned_keys=False, bias=False, zero_init=False,
+                 types=None):
         self.d, self.h, self.max_keys = int(d), int(heads), int(max_keys)
         if self.d % self.h:
             raise ShapeError(f"global_attention: d={self.d} must be divisible by heads={self.h}")
+        self.hd = self.d // self.h
+        self.ratio = float(ratio)
+        self.H = max(1, int(round(self.h * self.ratio)))
+        self.inner = self.H * self.hd
+        self.learned, self.bias, self.zero = bool(learned_keys), bool(bias), bool(zero_init)
+        self.T, self.type_ids = _owned(types) if types is not None else (None, None)
         self.norm = LayerNorm(self.d)
 
     def init(self, seed=0):
         rng = _rng(seed)
-        d = self.d
-        return Record(n=self.norm.init(), Wq=_glorot(rng, d, d), Wk=_glorot(rng, d, d), Wv=_glorot(rng, d, d),
-                      Wo=_glorot(rng, d, d) * 0.5, bo=np.zeros(d))
+        d, i = self.d, self.inner
+        f = dict(n=self.norm.init(), Wq=_glorot(rng, d, i), Wk=_glorot(rng, d, i), Wv=_glorot(rng, d, i),
+                 Wo=np.zeros((i, d)) if self.zero else _glorot(rng, i, d) * 0.5, bo=np.zeros(d))
+        if self.bias:
+            f.update(bq=np.zeros(i), bk=np.zeros(i), bv=np.zeros(i))
+        if self.learned:
+            f.update(ks_w=rng.normal(size=(d, 1)) * 0.02, ks_b=np.zeros(1))
+        return Record(**f)
+
+    def own(self, g, N):
+        return np.ones((N, 1), bool) if self.T is None else _owned_mask(g, N, self.T, self.type_ids)
+
+    def keys_of(self, idx, score):
+        """The key rows of one graph (its query rows idx): all of them, or max_keys of them."""
+        if len(idx) <= self.max_keys or self.max_keys <= 0:
+            return idx
+        if self.learned:
+            return idx[np.sort(np.argsort(-score[idx], kind="stable")[:self.max_keys])]
+        return idx[np.linspace(0, len(idx) - 1, self.max_keys).astype(int)]
 
     def apply(self, p, x, train=False, **ctx):
         g = ctx.get("graph")
         N = int(np.shape(ops.raw(x))[0])
-        batch = g.batch if g is not None else np.zeros(N, dtype=np.int64)
-        H, hd = self.h, self.d // self.h
+        batch = np.asarray(g.batch, np.int64) if g is not None else np.zeros(N, dtype=np.int64)
+        own = self.own(g, N)
+        H, hd, inner = self.H, self.hd, self.inner
         h = self.norm(p.n, x)
+        q, k, v = h @ p.Wq, h @ p.Wk, h @ p.Wv
+        if self.bias:
+            q, k, v = q + p.bq, k + p.bk, v + p.bv
+        score = None
+        if self.learned:
+            s = h @ p.ks_w + p.ks_b                                              # [N, 1]
+            v = v * (2.0 * ops.sigmoid(s))
+            score = np.asarray(ops.raw(s)).reshape(-1)
         outs, rows = [], []
-        for b in np.unique(batch):
-            idx = np.nonzero(batch == b)[0]
-            keys = idx if len(idx) <= self.max_keys else idx[np.linspace(0, len(idx) - 1, self.max_keys).astype(int)]
-            hb, hk = h[idx], h[keys]
+        for b in np.unique(batch[own.reshape(-1)]):
+            idx = np.nonzero((batch == b) & own.reshape(-1))[0]
+            keys = self.keys_of(idx, score)
             n, m = len(idx), len(keys)
-            q = ops.transpose(ops.reshape(hb @ p.Wq, n, H, hd), (1, 0, 2))           # [H, n, hd]
-            k = ops.transpose(ops.reshape(hk @ p.Wk, m, H, hd), (1, 2, 0))           # [H, hd, m]
-            v = ops.transpose(ops.reshape(hk @ p.Wv, m, H, hd), (1, 0, 2))           # [H, m, hd]
-            a = ops.softmax((q @ k) / math.sqrt(hd), axis=-1)
-            o = ops.reshape(ops.transpose(a @ v, (1, 0, 2)), n, self.d)
-            outs.append(o)
+            qb = ops.transpose(ops.reshape(q[idx], n, H, hd), (1, 0, 2))          # [H, n, hd]
+            kb = ops.transpose(ops.reshape(k[keys], m, H, hd), (1, 2, 0))         # [H, hd, m]
+            vb = ops.transpose(ops.reshape(v[keys], m, H, hd), (1, 0, 2))         # [H, m, hd]
+            a = ops.softmax((qb @ kb) / math.sqrt(hd), axis=-1)
+            outs.append(ops.reshape(ops.transpose(a @ vb, (1, 0, 2)), n, inner))
             rows.append(idx)
-        out = segment_sum(ops.concat(outs, 0), np.concatenate(rows), N) if len(outs) > 1 else \
-            segment_sum(outs[0], rows[0], N)
-        return x + out @ p.Wo + p.bo
+        if not outs:
+            return x
+        out = segment_sum(ops.concat(outs, 0) if len(outs) > 1 else outs[0], np.concatenate(rows), N)
+        delta = out @ p.Wo + p.bo
+        return x + (delta if self.T is None else ops.where(own, delta, 0.0))
 
     def describe(self):
-        return f"global_attention(d={self.d}, heads={self.h}, max_keys={self.max_keys})"
+        extra = (f", ratio={self.ratio}" if self.H != self.h else "") + (", learned keys" if self.learned else "")
+        return f"global_attention(d={self.d}, heads={self.h}, max_keys={self.max_keys}{extra})"
 
 
 class MixHop(Layer):
@@ -272,6 +311,172 @@ class GraphMemory(Layer):
         return f"graph_memory(d={self.d}, k={self.k})"
 
 
+# ============================================================== heterogeneous graphs (a type per node)
+def _owned(types):
+    """(count, ids): types=T owns the node types 0..T-1 (ids None); a list owns exactly those type ids, in order (the
+    i-th id gets the i-th set of weights). A layer leaves the nodes of the types it does not own unchanged."""
+    if hasattr(types, "__len__") or isinstance(types, np.ndarray):
+        ids = tuple(int(t) for t in np.asarray(ops.raw(types)).reshape(-1))
+        if not ids or len(set(ids)) != len(ids) or min(ids) < 0:
+            raise ShapeError(f"node types {list(ids)}: give distinct type ids >= 0")
+        return len(ids), ids
+    T = int(types)
+    if T < 1:
+        raise ShapeError("types must be >= 1 (or a list of node type ids)")
+    return T, None
+
+
+def local_types(g, n, T, ids=None):
+    """Each node's index among the types a layer owns (0..T-1), T for a node of a type it does not own."""
+    t = np.asarray(g.ntype if g is not None and hasattr(g, "ntype") else np.zeros(n, np.int64), np.int64)
+    if ids is None:
+        return np.where(t < T, t, T)
+    lut = np.full(max(int(t.max(initial=0)), max(ids)) + 1, T, np.int64)
+    lut[list(ids)] = np.arange(T)
+    return lut[t]
+
+
+def _type_masks(g, n, types, ids=None):
+    loc = local_types(g, n, types, ids)
+    return [(loc == k)[:, None] for k in range(types)]
+
+
+def owned_edges(g, R, rel_ids=None):
+    """(src, dst, rel) of the edges a layer reads: no self loops; with rel_ids only the edges of those relations, their
+    relation renumbered 0..len(rel_ids)-1."""
+    keep = g.src != g.dst
+    src, dst, rel = g.src[keep], g.dst[keep], g.rel[keep]
+    if rel_ids is not None:
+        lut = np.full(max(int(rel.max(initial=0)), max(rel_ids)) + 1, -1, np.int64)
+        lut[list(rel_ids)] = np.arange(len(rel_ids))
+        r = lut[rel]
+        k = r >= 0
+        src, dst, rel = src[k], dst[k], r[k]
+    elif len(rel) and rel.max() >= R:
+        raise ShapeError(f"a layer with {R} relations got a graph with relation {int(rel.max())}")
+    return src, dst, rel
+
+
+def _owned_mask(g, n, T, ids):
+    return (local_types(g, n, T, ids) < T)[:, None]
+
+
+class TypedLinear(Layer):
+    """A linear layer with its own weights for every node type: row i goes through W[type(i)] + b[type(i)]. Rows of
+    a type the layer does not own give zeros. types: a count (types 0..T-1) or a list of node type ids; the types come
+    from graph(..., node_types=)."""
+    kind = "typed_linear"
+
+    def __init__(self, n_in, n_out, types, bias=True, std=None):
+        self.n_in, self.n_out, self.bias = int(n_in), int(n_out), bool(bias)
+        self.T, self.type_ids = _owned(types)
+        self.std = std
+
+    def init(self, seed=0):
+        rng = _rng(seed)
+        s = self.std if self.std else 1.0 / math.sqrt(self.n_in)
+        W = rng.normal(size=(self.T, self.n_in, self.n_out)) * s
+        return Record(W=W, b=np.zeros((self.T, self.n_out))) if self.bias else Record(W=W)
+
+    def apply(self, p, x, train=False, **ctx):
+        masks = _type_masks(ctx.get("graph"), int(np.shape(ops.raw(x))[0]), self.T, self.type_ids)
+        acc = None
+        for t, m in enumerate(masks):
+            y = x @ p.W[t] + (p.b[t] if self.bias else 0.0)
+            y = ops.where(m, y, 0.0)
+            acc = y if acc is None else acc + y
+        return acc
+
+    def describe(self):
+        return f"typed_linear({self.n_in} -> {self.n_out}, {self.T} types)"
+
+
+class TypedNorm(Layer):
+    """Layer norm with its own scale and shift for every node type; rows of a type the layer does not own give
+    zeros."""
+    kind = "typed_norm"
+
+    def __init__(self, d, types, eps=1e-5):
+        self.d, self.eps = int(d), float(eps)
+        self.T, self.type_ids = _owned(types)
+
+    def init(self, seed=0):
+        return Record(gamma=np.ones((self.T, self.d)), beta=np.zeros((self.T, self.d)))
+
+    def apply(self, p, x, train=False, **ctx):
+        from .stdlib import layer_norm
+        masks = _type_masks(ctx.get("graph"), int(np.shape(ops.raw(x))[0]), self.T, self.type_ids)
+        acc = None
+        for t, m in enumerate(masks):
+            y = ops.where(m, layer_norm(x, p.gamma[t], p.beta[t], self.eps), 0.0)
+            acc = y if acc is None else acc + y
+        return acc
+
+    def describe(self):
+        return f"typed_norm({self.d}, {self.T} types)"
+
+
+class HGT(Layer):
+    """Heterogeneous graph transformer layer: a layer norm, query, key, value and output weights
+    per node type; the key of every edge seen through its relation (a d_head x d_head matrix per relation and head);
+    ONE softmax over all incoming edges of a node (self loops left out); a residual that leaves nodes without incoming
+    edges unchanged; then a shared pre-norm feed-forward block (gelu) for the nodes of the layer's types. types and
+    relations: counts (0..n-1) or lists of the node type and relation ids the layer owns; edges of other relations are
+    not read and nodes of other types pass through unchanged (several encoders over one graph, each with its own
+    types)."""
+    kind = "hgt"
+
+    def __init__(self, d, heads=4, types=1, relations=1, ffn_mult=4):
+        self.d, self.h, self.fm = int(d), int(heads), int(ffn_mult)
+        self.T, self.type_ids = _owned(types)
+        self.R, self.rel_ids = _owned(relations)
+        if self.d % self.h:
+            raise ShapeError(f"hgt: d={self.d} must be divisible by heads={self.h}")
+        self.hd = self.d // self.h
+        self.norm = TypedNorm(d, types)
+        self.q, self.k, self.v, self.o = (TypedLinear(d, d, types) for _ in range(4))
+        self.ffn = Sequential([LayerNorm(d), Linear(d, d * self.fm), Activation("gelu"), Linear(d * self.fm, d)]) \
+            if self.fm > 0 else None
+
+    def init(self, seed=0):
+        rng = _rng(seed)
+        f = dict(norm=self.norm.init(_seed_of(seed, 0)), q=self.q.init(_seed_of(seed, 1)),
+                 k=self.k.init(_seed_of(seed, 2)), v=self.v.init(_seed_of(seed, 3)), o=self.o.init(_seed_of(seed, 4)),
+                 rel=rng.normal(size=(self.R, self.h, self.hd, self.hd)) * 0.02)
+        if self.ffn is not None:
+            f["ffn"] = self.ffn.init(_seed_of(seed, 5))
+        return Record(**f)
+
+    def apply(self, p, x, train=False, **ctx):
+        g = _graph(ctx)
+        N, H, hd = int(np.shape(ops.raw(x))[0]), self.h, self.hd
+        src, dst, rel = owned_edges(g, self.R, self.rel_ids)
+        xn = self.norm(p.norm, x, **ctx)
+        q = ops.reshape(self.q(p.q, xn, **ctx), N, H, hd)
+        k = ops.reshape(self.k(p.k, xn, **ctx), N, H, hd)
+        v = ops.reshape(self.v(p.v, xn, **ctx), N, H, hd)
+        any_type = _owned_mask(g, N, self.T, self.type_ids)
+        if len(src):
+            E = len(src)                                                  # the key through the edge's relation
+            kr = ops.reshape(ops.reshape(k[src], E, H, 1, hd) @ p.rel[rel], E, H, hd)
+            score = ops.sum_(q[dst] * kr, axis=-1) / math.sqrt(hd)        # [E, H]
+            a = segment_softmax(score, dst, N)
+            msg = ops.reshape(ops.reshape(a, -1, H, 1) * v[src], -1, self.d)
+            agg = segment_sum(msg, dst, N)
+            has_in = (np.bincount(dst, minlength=N) > 0)[:, None]
+            x = x + ops.where(has_in, self.o(p.o, agg, **ctx), 0.0)
+        if self.ffn is None:
+            return x
+        f = self.ffn(p.ffn, x, train=train)
+        return x + ops.where(any_type, f, 0.0)
+
+    def children(self):
+        return [self.ffn] if self.ffn is not None else []
+
+    def describe(self):
+        return f"hgt(d={self.d}, heads={self.h}, {self.T} node types, {self.R} relations)"
+
+
 def graph_transformer_net(n_in, d, out, layers=4, heads=4, relations=1, global_every=2, max_keys=4096,
                           task="node", pool="mean"):
     """Input projection, `layers` graph_transformer blocks with a global_attention block after every
@@ -293,6 +498,6 @@ def graph_transformer_net(n_in, d, out, layers=4, heads=4, relations=1, global_e
 
 def names():
     return dict(graph_transformer=GraphTransformer, global_attention=GlobalAttention, mix_hop=MixHop,
-                graph_memory=GraphMemory,
+                graph_memory=GraphMemory, hgt=HGT, typed_linear=TypedLinear, typed_norm=TypedNorm,
                 graph_transformer_net=graph_transformer_net, k_hop=k_hop, hop_distances=hop_distances,
                 eccentricity=eccentricity)

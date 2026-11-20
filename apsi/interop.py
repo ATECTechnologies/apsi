@@ -82,12 +82,33 @@ def _from_torch(t):
 _CTYPES = {"f64": ctypes.c_double, "f32": ctypes.c_float, "i32": ctypes.c_int32,
            "i64": ctypes.c_int64, "void": None, "str": ctypes.c_char_p,
            "ptr_f64": ctypes.POINTER(ctypes.c_double), "ptr_f32": ctypes.POINTER(ctypes.c_float),
-           "ptr_i32": ctypes.POINTER(ctypes.c_int32), "ptr_i64": ctypes.POINTER(ctypes.c_int64)}
+           "ptr_i32": ctypes.POINTER(ctypes.c_int32), "ptr_i64": ctypes.POINTER(ctypes.c_int64),
+           "u8": ctypes.c_uint8, "u16": ctypes.c_uint16, "u32": ctypes.c_uint32, "u64": ctypes.c_uint64,
+           "i8": ctypes.c_int8, "i16": ctypes.c_int16,
+           "ptr_u8": ctypes.POINTER(ctypes.c_uint8), "ptr_void": ctypes.c_void_p}
+
+
+def _buffer_ptr(a, t):
+    """A writable buffer's address for C (not copied: C writes into it): a bytearray, a NumPy array (uint8 for
+    ptr_u8, any type for ptr_void) or a layout view. bytes (read-only) go as a copy."""
+    if hasattr(a, "_m") and hasattr(a, "_o"):                  # a layout view: its memory from its offset
+        a = np.frombuffer(object.__getattribute__(a, "_m"), np.uint8)[object.__getattribute__(a, "_o"):]
+    if isinstance(a, bytes):
+        a = np.frombuffer(bytearray(a), np.uint8)
+    if isinstance(a, bytearray):
+        a = np.frombuffer(a, np.uint8)
+    if not isinstance(a, np.ndarray) or not a.flags["C_CONTIGUOUS"]:
+        raise RuntimeErr(f"{t} takes a bytearray, a contiguous tensor or a layout view")
+    if t == "ptr_u8" and a.dtype != np.uint8:
+        a = a.view(np.uint8) if a.dtype.itemsize == 1 else a.reshape(-1).view(np.uint8)
+    return a, (a.ctypes.data_as(_CTYPES[t]) if t == "ptr_u8" else ctypes.c_void_p(a.ctypes.data))
 _NP_FOR_PTR = {"ptr_f64": np.float64, "ptr_f32": np.float32, "ptr_i32": np.int32, "ptr_i64": np.int64}
 
 
 def _tname(t):
     if isinstance(t, Dtype):
+        return t.name
+    if type(t).__name__ == "Scalar" and hasattr(t, "ctype"):      # layout.u8 … layout.f64
         return t.name
     return str(t)
 
@@ -99,7 +120,7 @@ class CFunction:
     def __call__(self, *args):
         if len(args) != len(self.argtypes):
             raise RuntimeErr(f"C function {self.name} takes {len(self.argtypes)} argument(s), got {len(args)}")
-        conv = []
+        conv, keepalive = [], []
         for a, t in zip(args, self.argtypes):
             if isinstance(a, Quantity):
                 raise RuntimeErr(f"pass plain numbers to C ({self.name}); use x.magnitude")
@@ -109,6 +130,10 @@ class CFunction:
                     raise RuntimeErr(f"argument for {t} must be a contiguous {t[4:]} tensor "
                                      f"(use tensor(x, dtype={t[4:]}))")
                 conv.append(arr.ctypes.data_as(_CTYPES[t]))
+            elif t in ("ptr_u8", "ptr_void"):
+                keep, ptr = _buffer_ptr(a, t)
+                conv.append(ptr)
+                keepalive.append(keep)
             elif t == "str":
                 conv.append(str(a).encode())
             else:
@@ -223,10 +248,10 @@ def install(interp):
         import importlib, sys as _sys
         # launchers run Python isolated (-I); local modules next to the program are found
         # only for programs that were explicitly granted --allow-python
-        cwd = os.getcwd()
-        added = cwd not in _sys.path
-        if added:
-            _sys.path.append(cwd)
+        # the program's own folder too: a module kept as Python next to a converted program (apsi convert --only)
+        here = interp.dir_stack[-1] if getattr(interp, "dir_stack", None) else None
+        added = [d for d in dict.fromkeys([os.getcwd(), here]) if d and d not in _sys.path]
+        _sys.path.extend(added)
         try:
             return importlib.import_module(name)
         except ImportError as e:
@@ -234,8 +259,9 @@ def install(interp):
             err.name = name
             raise err from None
         finally:
-            if added and cwd in _sys.path:
-                _sys.path.remove(cwd)
+            for d in added:
+                if d in _sys.path:
+                    _sys.path.remove(d)
 
     def to_torch(x, device=None):
         _need(interp, "python", "to_torch()")
@@ -367,13 +393,15 @@ def install(interp):
                  json_str=json_str, permissions=permissions, getenv=getenv,
                  security_policy=security_policy)
     g.update(funcs)
-    for t in ("ptr_f64", "ptr_f32", "ptr_i32", "ptr_i64", "void"):
+    for t in ("ptr_f64", "ptr_f32", "ptr_i32", "ptr_i64", "ptr_u8", "ptr_void", "void"):
         g[t] = Dtype(t, None)
     g["cstr"] = Dtype("str", None)
     interp.modules["io"] = {k: funcs[k] for k in ("exists", "read_text", "write_text", "load_json", "save_json",
                                                  "load_csv", "save_csv", "json_parse", "json_str")}
     interp.modules["ffi"] = {"cload": cload, "ptr_f64": g["ptr_f64"], "ptr_f32": g["ptr_f32"],
-                             "ptr_i32": g["ptr_i32"], "ptr_i64": g["ptr_i64"], "void": g["void"]}
+                             "ptr_i32": g["ptr_i32"], "ptr_i64": g["ptr_i64"], "ptr_u8": g["ptr_u8"],
+                             "ptr_void": g["ptr_void"], "void": g["void"],
+                             **{t: Dtype(t, None) for t in ("u8", "u16", "u32", "u64", "i8", "i16", "i32", "i64", "f32", "f64")}}
     interp.modules["python"] = {"pyimport": pyimport, "to_torch": to_torch, "from_torch": from_torch,
                                 "to_py": to_py, "from_py": from_py}
     interp.modules["net"] = {"http_get": http_get, "http_post_json": http_post_json}

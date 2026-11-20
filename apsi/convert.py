@@ -1791,9 +1791,84 @@ def _up_to_date(apsi_path, py_path):
         return False
 
 
+_PROJECT_MARKERS = ("pyproject.toml", "setup.py", "setup.cfg", "requirements.txt", ".git", "Pipfile", "poetry.lock")
+
+
+def project_root(path):
+    """The project a .py file or folder belongs to: the nearest folder above it with pyproject.toml, setup.py,
+    setup.cfg, requirements.txt, Pipfile or .git; without one, the top of its package (__init__.py folders); without
+    a package, its own folder."""
+    d = os.path.abspath(path if os.path.isdir(path) else os.path.dirname(path) or ".")
+    probe = d
+    while True:
+        if any(os.path.exists(os.path.join(probe, m)) for m in _PROJECT_MARKERS):
+            return probe
+        up = os.path.dirname(probe)
+        if up == probe:
+            break
+        probe = up
+    while os.path.exists(os.path.join(d, "__init__.py")) and os.path.dirname(d) != d:
+        d = os.path.dirname(d)
+    return d
+
+
+def _excluded(path, base, patterns):
+    import fnmatch
+    rel = os.path.relpath(path, base).replace(os.sep, "/")
+    return any(fnmatch.fnmatch(rel, pat) or fnmatch.fnmatch(os.path.basename(path), pat) for pat in patterns)
+
+
+def notebook_source(path):
+    """A Jupyter notebook (.ipynb) as one Python program: its code cells in order (each headed by a comment with its
+    number), markdown cells as comments, IPython magics (%, %%, !) and shell lines kept as comments with a note."""
+    import json as _json
+    with open(path, encoding="utf-8-sig") as fh:
+        nb = _json.load(fh)
+    cells = nb.get("cells") if isinstance(nb, dict) else None
+    if cells is None and isinstance(nb, dict):                       # nbformat 3: cells inside worksheets
+        cells = [c for w in nb.get("worksheets", []) for c in w.get("cells", [])]
+    out, n = [], 0
+    for c in cells or []:
+        src = c.get("source", c.get("input", ""))
+        text = "".join(src) if isinstance(src, list) else str(src)
+        if c.get("cell_type") == "markdown":
+            out += ["# " + ln if ln.strip() else "#" for ln in text.splitlines()]
+            out.append("")
+            continue
+        if c.get("cell_type") != "code":
+            continue
+        n += 1
+        out.append(f"# --- cell {n}")
+        magic_block = text.lstrip().startswith("%%")
+        for ln in text.splitlines():
+            st = ln.lstrip()
+            if magic_block or st.startswith(("%", "!")) or (st.startswith("?") or st.endswith("?") and
+                                                              st[:-1].isidentifier()):
+                out.append(ln[:len(ln) - len(st)] + "# (notebook only) " + st)
+            else:
+                out.append(ln)
+        out.append("")
+    return "\n".join(out) + "\n"
+
+
+def _read_program(src):
+    if src.lower().endswith(".ipynb"):
+        return notebook_source(src)
+    with open(src, encoding="utf-8-sig") as fh:
+        return fh.read()
+
+
 def cmd_convert(args):
     import argparse  # noqa: F401
-    paths = args.paths
+    paths = list(args.paths)
+    excl = list(getattr(args, "exclude", None) or [])
+    if getattr(args, "project", False):
+        roots = list(dict.fromkeys(project_root(p) for p in paths if os.path.exists(p)))
+        for r in roots:
+            print(f"project: {r}", file=sys.stderr if args.stdout else sys.stdout)
+        if roots and args.output and len(roots) == 1 and os.path.isfile(paths[0]):
+            pass
+        paths = roots or paths
     jobs = []
     for p in paths:
         if os.path.isdir(p):
@@ -1801,8 +1876,10 @@ def cmd_convert(args):
                 dirs[:] = [d for d in dirs if not d.startswith(".") and d not in ("__pycache__", "venv", ".venv",
                                                                                    "node_modules", "build", "dist")]
                 for f in sorted(files):
-                    if f.endswith(".py"):
+                    if f.endswith((".py", ".ipynb")):
                         src = os.path.join(root, f)
+                        if excl and _excluded(src, p, excl):
+                            continue
                         rel = os.path.relpath(src, p)
                         out = os.path.join(args.output, rel) if args.output else src
                         jobs.append((src, os.path.splitext(out)[0] + ".apsi"))
@@ -1814,8 +1891,13 @@ def cmd_convert(args):
             print(f"apsi convert: '{p}' does not exist", file=sys.stderr)
             return 2
     if not jobs:
-        print("apsi convert: no .py files found", file=sys.stderr)
+        print("apsi convert: no .py or .ipynb files found", file=sys.stderr)
         return 2
+    only = getattr(args, "only", False)
+    named = {os.path.abspath(a) for a, _b in jobs}
+    keep_local = (lambda path: os.path.abspath(path) not in named) if only else None
+    if getattr(args, "plan", False):
+        return _plan(jobs, only, excl, "in the project" if getattr(args, "project", False) else "named")
     idiomatic = getattr(args, "idiomatic", False)
     status = 0
     total_warn = 0
@@ -1831,8 +1913,7 @@ def cmd_convert(args):
             continue
         done.add(key)
         try:
-            with open(src, encoding="utf-8-sig") as fh:
-                code = fh.read()
+            code = _read_program(src)
             exact_why = idiomatic_blockers(ast.parse(code, src)) if idiomatic else []
             if idiomatic and not exact_why:
                 text, warns = convert_source(code, src)
@@ -1851,7 +1932,7 @@ def cmd_convert(args):
                         pk = packages.setdefault(out_dir0, Packages(os.path.dirname(os.path.abspath(src)),
                                                                     os.path.join(out_dir0, "apsi_packages")))
                 text, warns, deps = faithful(code, src, packages=pk, out_path=os.path.abspath(dst),
-                                             vendored=bool(vendored))
+                                             vendored=bool(vendored), keep_local=keep_local)
                 if exact_why:
                     first = ", ".join(f"line {ln}: {why}" for ln, why in exact_why[:3])
                     more = f" and {len(exact_why) - 3} more" if len(exact_why) > 3 else ""
@@ -1872,6 +1953,8 @@ def cmd_convert(args):
                     rel = os.path.relpath(dep, os.path.dirname(os.path.abspath(src)))
                     ddst = os.path.splitext(os.path.join(out_dir, rel))[0] + ".apsi"
                     lib = vendored                         # a sibling inside a library stays a library module
+                if excl and isinstance(dep, str) and _excluded(dep, os.path.dirname(os.path.abspath(src)), excl):
+                    continue
                 if os.path.abspath(dep) not in done and not (
                         _up_to_date(ddst, dep)
                         and not any(os.path.abspath(j[0]) == os.path.abspath(dep) for j in jobs)):
@@ -1951,9 +2034,45 @@ def cmd_convert(args):
     return status
 
 
+def _plan(jobs, only, excl, reason="named"):
+    """What `apsi convert` would do, without writing: each file, why it is converted, where it goes."""
+    from .pyconvert import Converter
+    seen, order, why = set(), [], {}
+    queue = [(os.path.abspath(a), os.path.abspath(b), reason) for a, b in jobs]
+    while queue:
+        src, dst, reason = queue.pop(0)
+        if src in seen:
+            continue
+        seen.add(src)
+        order.append((src, dst))
+        why[src] = reason
+        if only:
+            continue
+        try:
+            c = Converter(_read_program(src), src, None, None, dst, False)
+            c.convert()
+        except Exception:                                # a file that does not parse: shown, not followed
+            continue
+        for dep in sorted(d for d in c.local_modules if isinstance(d, str)):
+            if excl and _excluded(dep, os.path.dirname(src), excl):
+                continue
+            rel = os.path.relpath(dep, os.path.dirname(src))
+            ddst = os.path.splitext(os.path.join(os.path.dirname(dst), rel))[0] + ".apsi"
+            queue.append((os.path.abspath(dep), os.path.abspath(ddst), f"imported by {os.path.basename(src)}"))
+    base = os.path.commonpath([os.path.dirname(a) for a, _b in order] + [os.path.dirname(b) for _a, b in order])
+    print(f"apsi convert would write {len(order)} file{'s' if len(order) != 1 else ''} in {base}"
+          f"{' (only the files named; their local imports stay Python)' if only else ''}:")
+    w = max(len(os.path.relpath(a, base)) for a, _b in order)
+    for src, dst in order:
+        print(f"  {os.path.relpath(src, base):<{w}}  ->  {os.path.relpath(dst, base)}   ({why[src]})")
+    print("nothing written (--plan). Run the same command without --plan to convert.")
+    return 0
+
+
 def add_parser(sub):
-    p = sub.add_parser("convert", help="translate Python files or folders into Apsi (numpy, math, torch, … mapped)")
-    p.add_argument("paths", nargs="+", help=".py files or folders")
+    p = sub.add_parser("convert", help="translate Python files, Jupyter notebooks or folders into Apsi (numpy, math, "
+                                       "torch, … mapped)")
+    p.add_argument("paths", nargs="+", help=".py or .ipynb files, or folders")
     p.add_argument("-o", "--output", help="output file or folder (default: next to each .py file)")
     p.add_argument("--stdout", action="store_true", help="print the Apsi code instead of writing files")
     p.add_argument("--run", action="store_true", help="run the result (single file) when it checks cleanly")
@@ -1962,6 +2081,17 @@ def add_parser(sub):
     p.add_argument("--no-packages", action="store_true",
                    help="keep installed libraries as Python imports instead of converting the pure-Python ones "
                         "into apsi_packages/ next to the program")
+    g = p.add_mutually_exclusive_group()
+    g.add_argument("--only", action="store_true",
+                   help="convert only the files named; modules they import from the program's folder stay Python "
+                        "(run with --allow-python)")
+    g.add_argument("--project", action="store_true",
+                   help="convert the whole project each file belongs to (the folder with pyproject.toml, setup.py, "
+                        "requirements.txt or .git above it), every .py in it")
+    p.add_argument("--plan", action="store_true",
+                   help="list what would be converted (and why), write nothing")
+    p.add_argument("--exclude", action="append", default=[], metavar="PATTERN",
+                   help="skip .py files whose path matches (fnmatch, e.g. 'tests/*'); may be repeated")
     p.add_argument("--idiomatic", action="store_true",
                    help="map numpy/math/torch onto Apsi's own built-ins and structs (small numeric scripts); the "
                         "default keeps Python's exact semantics with `use pycompat`")

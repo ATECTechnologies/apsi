@@ -16,10 +16,9 @@ and the driver compiles them for whatever card is present.
 
 ### Quick start: train on your card in three steps
 
-1. **Once**, give Apsi the right to set the card's power limit (it holds the temperature this way, at full and
-   steady speed). The Windows and Linux installers do it for you: keep **Full GPU speed without administrator
-   rights** ticked and answer *Yes* once. Otherwise: **Apsi GPU Tuner → Apply** from the download page, or
-   `apsi gpu setup` from a terminal opened as administrator.
+1. **Once**, let Apsi set the card's power limit and fans (it holds the temperature this way, at full and steady
+   speed). The installer does it for you: keep **GPU helper** switched on and approve the one administrator prompt
+   (it can open behind the setup window). Otherwise: `apsi gpu setup` from a terminal opened as administrator.
 2. Train with `backend="gpu"` (the example in section 2). Nothing else to install.
 3. Read the report: the speed of every epoch, the temperature, and how it was held. `apsi gpu` shows the card at any
    time, `apsi gpu watch` every second.
@@ -29,18 +28,20 @@ and the driver compiles them for whatever card is present.
 | [1. Language models](#1-language-models-use-hub) | running Hugging Face models on the card, weight formats, tensor cores, threads |
 | [2. Training](#2-training-on-the-gpu-with-apsi-alone-backendgpu) | layers, precisions, measured speed against PyTorch, several cards, model size |
 | [3. Serving](#3-serving-the-openai-api) | the OpenAI API in front of a model, queues, metrics |
-| [4. Temperature control](#4-temperature-control) | the 77 °C control, the power limit, the GPU Tuner, `apsi gpu hold` |
+| [4. Temperature control](#4-temperature-control) | the 79 °C ceiling, fans and power, the GPU helper, `apsi gpu hold` |
 | [5. Images, video, your own kernels](#5-images-video-and-your-own-kernels-gpu) | `@gpu` functions |
 | [6. Troubleshooting](#6-troubleshooting) | slow training, out of memory, the card not found, and more |
 
 > **Important — for the full, steady speed of long training, give Apsi the right to set the card's power limit.**
-> Without it, the only way Apsi can keep a hot card at 77 °C is to *pause* the work, and a card that needs cooling
+> Without it, the only way Apsi can keep a hot card under its ceiling is to *pause* the work, and a card that needs cooling
 > then loses a large share of its speed (measured on an RTX 3060: a 127 M-parameter model trained at 10,332 tokens/s
-> with pauses, **18,074 tokens/s** with the power limit, at the same temperature). Do one of these:
+> with pauses, **18,074 tokens/s** with the power limit (20,708 with Apsi 2.6.0), at the same temperature). Do one of these:
 >
 > 1. **Run Apsi as administrator** (Windows: right-click the terminal → *Run as administrator*; Linux: `sudo`), or
-> 2. **once**, run `apsi gpu setup` as administrator (or the *Apsi GPU Tuner — Apply* file from the download page):
+> 2. **once**, keep the installer's *GPU helper* option, or run `apsi gpu setup` as administrator:
 >    a small helper then lets every Apsi program set the power limit without administrator rights, at every logon.
+>    `apsi gpu remove` (as administrator) turns it off again — see
+>    [Turning the GPU helper off](#turning-the-gpu-helper-off-and-before-uninstalling).
 >
 > The training report says which one is in use: `temperature held by the power limit, directly (no pauses)` or
 > `… through the GPU helper`. If it reports cooling pauses, neither is set up.
@@ -120,11 +121,13 @@ let logits = predict(model, r.params, X_test, backend="gpu")
 
 | | |
 |---|---|
-| Layers | linear, activation (relu, gelu, silu/swish, tanh, sigmoid, leaky_relu, identity), dropout, layer_norm, rms_norm, embedding, positional_encoding (learned or fixed), residual (with pre_norm), multi_head_attention (self-attention, causal or not), transformer_block — so `mlp`, `resnet_mlp`, `transformer_lm`, `transformer_encoder` |
-| Losses | `cross_entropy` (negative labels left out), `mse` |
-| Optimizers | Adam, AdamW, SGD (momentum); `clip=` (global norm, computed on the card), `schedule=` |
+| Layers | linear, activation (relu, gelu, silu/swish, tanh, sigmoid, leaky_relu, elu, softplus, mish, identity), dropout, layer_norm, rms_norm, embedding, positional_encoding (learned or fixed), residual (with pre_norm), multi_head_attention (causal or not; `kv_heads=` grouped-query, `rope=true` rotary positions, `qk_norm=true` per-head query / key norms), swiglu, moe (mixture of experts: `moe(d, experts=8, top_k=2)`; the router's top-k on the card, every expert on its own rows, no row dropped), transformer_block (`norm="rms"`, `ffn="swiglu"` or `"moe"`), dag (any graph of layers with one input and one output; cross-attention as a node with two inputs `["query", "memory"]`, any memory length), parallel, add / multiply / concatenate / mean, scale, identity, reshape, flatten, mean_pool, conv2d (any kernel, stride, padding), max_pool, avg_pool, global_avg_pool, lstm, gru, last_step — so `cnn`, `lstm_classifier`, `mlp`, `resnet_mlp`, `transformer_lm`, `transformer_encoder`, and LLaMA / Qwen3-style models |
+| Graphs | gcn, sage (mean, sum), gin, gat (heads concatenated or averaged), graph_transformer (keys and values by relation, biases by relation and hop; `k_hop` shortcuts), hgt, typed_linear, typed_norm (a type per node: `graph(…, node_types=)`; the types and relations a layer owns), graph_memory, global_attention (every node over its graph, `max_keys`; learned keys, `ratio`, `types`), mix_hop, graph_pool (mean, sum), `graph_transformer_net` on sparse graphs of any size — `fit(…, graph=g, mask=train_nodes)` for node tasks, `graph(…, batch=)` for one row per graph; `gcn_net`, `gat_net`, `gin_net`. The edges are kept in compressed rows on the card (CSR, made once per graph); every node sums its edges in a register: no atomic additions, the same result every run |
+| Losses | `cross_entropy` (negative labels left out), `mse`, `mae`, `bce` (on logits); `mask=` for graph tasks |
+| Optimizers | Adam, AdamW, SGD (momentum); `clip=` (global norm, computed on the card), `schedule=`; compensated weight updates (the rounding error of every update carried to the next, so updates far below float32's step at a weight's size still add up: 300 steps of 1e-9 move a weight of 1 by 3e-7, a plain float32 update not at all), on by default for fp32 training below 2 B parameters and off for bf16 and the narrower formats (their products round every gradient far more coarsely than float32 rounds an update, so there it would only cost memory and time); `compensated=true` / `APSI_GPU_COMPENSATED=1` turns it on, `=0` off |
 | Precision | `"auto"`/`"bf16"`: bfloat16 tensor cores, float32 sums; `"fp32"`: three tensor-core passes (about float32); `"fp8"`, `"fp6"`, `"fp6_e2m3"`, `"fp4"`, `"int8"`, `"int4"`: weights rounded to that format every forward pass, float32 master copy |
-| Not yet | convolutions, LSTM/GRU, graph layers, mixture of experts, custom layers, losses other than the two — `backend="torch"` or `"numpy"` train those, and `fit` says so |
+| Any optimizer, frozen parts | adam, adamw, sgd on the card's kernels; any other optimizer (`step(params, grads)`) on the processor with the weights as the model's tree; `freeze=` / `train_only=` keep parts of the model exactly as they are (no gradient, not in `clip`, untouched by weight decay), on one card and many |
+| Any other layer, any loss | a layer with no kernel of its own (`custom_layer`, `lambda_layer`, bilinear, batch_norm, graph_memory, …) runs on the processor with Apsi's autodiff inside the model on the card (its input and weights copied over, its output and gradients copied back; the rest stays on the card); a loss written as a function (`fit(…, loss=my_loss)`) is evaluated on the processor the same way, on one card. `APSI_GPU_HOST_LAYERS=0` refuses them instead |
 
 How it works: parameters, gradients and the AdamW state are three flat arrays updated by one kernel; the data set is
 copied to the card once and every batch is gathered there, so inside an epoch the processor never makes the card
@@ -158,12 +161,16 @@ In bfloat16 Apsi trains this model **1.19× as fast as PyTorch**, every epoch at
 
 | Run | Throughput | Held-out loss | GPU memory |
 |---|---:|---:|---:|
-| **Apsi bf16, held at 77 °C** | **18,074 tokens/s** (18,418 · 18,284 by epoch) | 6.65 → 2.810 | 4,564 MB |
+| **Apsi 2.6.0 bf16, held at 78 °C, 79 °C max** | **20,708 tokens/s** (21,219 · 20,595 by epoch) | 2.989 | 5,398 MB |
+| PyTorch 2.14 bf16 autocast, flash attention, held at 78 °C (80 °C max) | 18,809 tokens/s | 2.950 | 3,898 MB |
+| Apsi 2.4.4 bf16, held at 77 °C | 18,074 tokens/s (18,418 · 18,284 by epoch) | 6.65 → 2.810 | 4,564 MB |
 | Apsi, the kernels of one step alone (204 ms) | 20,043 tokens/s | | |
 | PyTorch 2.13 bf16 autocast, no temperature control | 20,111 tokens/s | 6.58 → 3.020 | 3,854 MB |
 | PyTorch tf32 / fp32 | 11,236 / 8,011 tokens/s | 3.025 / 3.027 | 4,565 MB |
 
-Held at 77 °C, Apsi trains the 127 M model at 2.3× PyTorch's fp32 and 1.6× its tf32 speed, with a lower held-out
+Apsi 2.6.0, at the same temperature as PyTorch, trains the 127 M model 1.10× as fast as PyTorch's bfloat16 with its own
+kernels (no cuBLAS), and the card never reaches 80 °C (the first rows: 20 and 14 November 2026). Earlier, held at 77 °C,
+Apsi 2.4.4 trained it at 2.3× PyTorch's fp32 and 1.6× its tf32 speed, with a lower held-out
 loss after the same two epochs; its kernels run as fast as PyTorch's bfloat16 does with the card left to heat up.
 Without administrator rights (cooling by pauses) the same model ran at 10,332 tokens/s: see the box at the top.
 
@@ -176,6 +183,30 @@ rate; PyTorch's cuBLAS float32 is still faster than Apsi's three-pass float32. P
 activations are bfloat16; Apsi keeps float32 activations). The products come in four builds and the card times them
 for each shape the first time it sees it, keeping the fastest (`APSI_GEMM_VARIANT=a|x|w|h` fixes one).
 
+**Batches of their own shape** — `fit_batches(model, params, batches, loss, opt, epochs)` trains on a list of
+`(inputs, targets)` or `(inputs, targets, graph)` (or a function `epoch -> list`): every batch may have its own
+number of rows, its own lengths and its own graph (a batch of graphs), and `inputs` may be a list for a `dag` with
+several inputs, e.g. token ids and the node features of the graphs they talk about. With `graph_memory` (the k best
+nodes of every graph) and cross-attention from the text to that memory, a model of graphs and text trains on the
+card; the tests check it against NumPy step by step. `backend="numpy"` runs the same on the processor.
+`accumulate=4` averages the gradients of 4 batches per step. With `device="cuda:all"` the model — a `dag` with
+several inputs as well as a sequence — is cut into stages between its nodes (each stage receives the values it needs
+by name, several at once, and hands on the ones later stages need), the `accumulate` batches of a step flow through
+the stages as micro-batches, each with its own graph, and the cards left copy the pipeline (`stages=2` on 4 cards:
+2 stages x 2 replicas). The same training as one card, step for step, and the same weights to the last bit: the
+gradients of a step's batches, of the copies of a stage and of the values that cross a cut are summed exactly
+(double-float) and rounded once, so neither the number of cards nor where the model is cut changes a single bit
+(`exact_sums=false` turns it off; on by default below 2 B parameters). A `dag` with several outputs trains with a
+loss of your own over all of them (the outputs travel to the last stage); a weight two stages hold (a tied output
+on another card than its embedding) gets the sum of both gradients.
+
+**Measure it on your card** — `apsi gpu bench` trains the 127 M GPT above on random tokens (nothing downloaded) and
+reports the tokens per second, what the card would do on its kernels alone, each kind of kernel's share of a step,
+the temperature, the power and the energy per 1,000 tokens, then one JSON line to send back for tuning.
+`apsi gpu bench modern` does the same for a LLaMA / Qwen3-style model, `apsi gpu bench check` trains every new layer
+on the card and on the exact reference and compares, `apsi gpu bench cards` splits a model across all the cards and
+compares with one card.
+
 **Several cards** — `fit(…, backend="gpu", device="cuda:all")` (or `device="cuda:0,1,2,3"`): data-parallel
 training for any model the trainer supports. Every card holds the model and takes its share of each batch; then each
 card sums only *its slice* of the gradient, pulled from all the others at the same time (reduce-scatter; NVLink /
@@ -184,7 +215,32 @@ optimizer's state, and the cards exchange the updated slices (all-gather). The g
 squared sums across the cards. The result equals one card with the whole batch (tested: Adam, AdamW, SGD, clip, EMA,
 EWC); per card the memory is 8 + 8 / N bytes per parameter plus that card's activations.
 
-**Any program at your temperature** — `apsi gpu hold 77` keeps the card near 77 °C by its power limit for whatever
+**One model split across cards (2.6.0)** — when the model is too large for one card, Apsi splits it across the cards by itself
+(`fit(…, backend="gpu")`: the default `device="cuda"` takes every card when the first one cannot hold the model;
+`device="cuda:all"` likewise), or on request with `parallel="pipeline"`. The model is cut into *stages*, one per card, at the points that balance the work (matrix
+products, attention, the rest) and keep each stage's weights, gradients and optimizer state inside its card. Each
+card holds only its own stage, so the trainable size grows with the number of cards: 3, 8, 64 cards, no limit in the
+code. A batch is cut into micro-batches that flow through the stages in a one-forward-one-backward order: while card 2
+works on micro-batch 1, card 1 already works on micro-batch 2, so the cards run at the same time (the idle start and
+end of a step shrink as micro-batches grow: `(stages - 1) / (micro-batches + stages - 1)` of it). Only the activations
+at the cuts travel between cards (card to card where the driver allows), never the weights. With more cards than
+stages the pipeline is copied: 8 cards and 4 stages are 2 replicas, each takes half of the batch, and the copies of a
+stage sum their gradients and share the optimizer's work as in data-parallel training. The result equals one card
+with the whole batch (tested: Adam, AdamW, SGD, clip over the whole model, EMA, EWC, low-bit precision).
+
+| Option | Meaning |
+|---|---|
+| `parallel="auto"` | a copy per card when the model fits on one; else the fewest stages that fit, the rest of the cards as replicas |
+| `parallel="pipeline"` | split across every card (`stages=` fewer, the cards left as replicas) |
+| `parallel="data"` | a copy per card (the model must fit on one) |
+| `stages=4` | four stages, cut where the work balances |
+| `stages=[6, 4, 4, 6]` | your own cut: the units in each stage (a unit is a layer; a transformer block gives two, its attention and its MLP) |
+| `micro_batches=16` | pieces of a batch in the pipeline (default 4 x the stages, at most the rows) |
+
+`r.stages`, `r.replicas` and `r.micro_batches` show what was used. A single layer must fit on one card (a layer is not
+split inside itself yet), and the layers are those of the trainer (the table above).
+
+**Any program at your temperature** — `apsi gpu hold 79` keeps the card at 79 °C at most by its power limit for whatever
 runs on it (a PyTorch job, a renderer) until Ctrl+C, with the same control Apsi's training uses; the benchmark uses
 it so PyTorch and Apsi are measured under the same temperature.
 
@@ -234,7 +290,7 @@ GPU memory stayed flat during the soak (0.5B: 10,225 → 10,221 MB free) and the
 
 ## 4. Temperature control
 
-Long work — training, long answers, a busy server — keeps the card near **77 °C (75–78 °C)** instead of letting it
+Long work — training, long answers, a busy server — keeps the card at **78–79 °C, never 80** (a ceiling of 79 °C) instead of letting it
 run up to its own limit (often 83–90 °C on desktop cards). Apsi reads the temperature from the driver's management
 library (NVML, installed with the driver) twice a second; above the band it paces the work (after each training
 step or generated token it waits a fraction of the time that step took, so the card does less per second and
@@ -246,17 +302,29 @@ the speed stay level, and a card that stays cool is never slowed.
 
 | Setting | |
 |---|---|
-| `APSI_GPU_TEMP=77` | the target in °C (default 77 → band 75–78); any value from 50 to 95 |
+| `APSI_GPU_TEMP=79` | the ceiling in °C (default 79: held at 78–79); any value from 50 to 95 |
 | `APSI_GPU_TEMP=off` | no control (the card's own limits only) |
+| `APSI_GPU_TEMP=max` | the card's full default power limit for the run (put back at exit), its own fan curve and temperature limits (about 83 °C): the speed PyTorch gets when nothing holds the temperature |
 
-**Steady speed: the power limit instead of pauses (administrator).** When Apsi runs as an administrator (Windows)
-or root (Linux), it holds the temperature by moving the card's power limit (between 55 % and 100 % of the default)
-rather than pausing: the card then runs at slightly lower clocks and voltage, where it does more work per watt, so the
-speed stays level (typically 95 % or more of full speed) and the temperature stays at the target. Without those
-rights Apsi cannot change the card's limits and paces the work instead: the temperature is just as steady, but the
-speed falls as far as the cooler needs (on the RTX 3060 in a small case: from 141,000 to about 100,000 tokens/s once
-the card is warm). `APSI_GPU_POWER_CONTROL=0` keeps pauses only. Better airflow or a higher fan curve gives the speed
-back in both cases.
+**Fixed power, the fans hold the temperature.** With the rights to set the card's limits (administrator, or the
+GPU helper below), Apsi does not lower the power to cool the card: the run trains at a fixed 145 W
+(`APSI_GPU_TRAIN_POWER=140W` or `85%`) and never below 135 W (`APSI_GPU_POWER_FLOOR`; never above the card's
+default), so the clocks and the speed stay level, and the card's fans are steered from 70 % up to 100 %
+(`APSI_GPU_FAN_MIN`, `APSI_GPU_FAN_MAX`) to hold it at 78.5 °C — the error now, the error 4 s ahead along the
+temperature's slope, and a feed-forward from the power drawn, so the fans answer a heavy phase as it starts. Only
+if the fans are at full and the card is still at the ceiling does the power come down, a few watts at a time and no
+further than 135 W; past that the card runs warmer rather than slower (pauses only as protection from 87 °C).
+Below the band the driver's own fan curve is in charge, and it is put back at exit. `APSI_GPU_FAN=0` leaves the fans
+alone. `APSI_GPU_TEMP=max` gives the card its full default power and its own limits instead (as PyTorch runs it).
+
+**Measured per card: `apsi gpu calibrate`.** About 2.5 minutes of matrix products at a trial power, with the fans
+at the top and then at the bottom of their range. Each temperature curve is fitted to T(t) = T_end + (T_start − T_end)
+e^(−t/τ), so the temperature the card would settle at is known without waiting for it; from the degrees per watt at
+each fan speed come the highest power the fans hold at 77.5 °C and the quietest fan range that holds it (widened up to
+100 % on a hot card). Saved in `~/.apsi/gpu-profile.json`, used by every run, measured again by running it again (after
+cleaning the cooler or a new case). `apsi gpu setup` runs it at the end (`APSI_GPU_CALIBRATE=0` skips it). Safety: the
+trial power drops 10 % at the ceiling + 1, the load stops at the ceiling + 3, and the card's own fan curve and power
+limit come back at the end.
 
 **Never as administrator again: `apsi gpu setup` (once).** It installs a small helper that Windows' Task Scheduler
 (or systemd on Linux) starts at every logon with administrator rights; its only job is to set the power limit when
@@ -264,21 +332,14 @@ an Apsi program asks (localhost only, with a key only your account can read, nev
 then on every Apsi program holds the temperature by the power limit without administrator rights. `apsi gpu setup 80%`
 also applies 80 % at every logon; `apsi gpu remove` takes it all away and restores the default.
 
-**The Apsi GPU Tuner (download page).** Two plain-text files per system, no installation: *Apply* sets every
-NVIDIA card in the computer to the power limit measured as the best for sustained training and keeps it after
-every restart (a Task Scheduler task on Windows, a systemd service on Linux); *Restore* removes all of it and puts
-every card back to its factory default. Windows asks once for administrator rights (the file asks by itself).
+**How training holds 78–79 °C.** With the GPU helper, a training run sets a fixed power limit (145 W on an RTX
+3060, or the value `apsi gpu calibrate` measured for your card), turns the fans up as far as needed (up to 100 %), and
+looks six seconds ahead: only when the fans alone cannot hold the ceiling does it lower the power limit, gently
+(about 7 % at a time), and it raises it again as the card cools. The card never reaches 80 °C and never pauses. The
+card's own fan curve and power limit come back when training ends.
 
-| Card | Power limit | Effect |
-|---|---|---|
-| GeForce RTX 50 / RTX 40 | 75 % | about -25 % power for about -5 % training speed |
-| GeForce RTX 30 | 80 % | about -5 % speed, 6–10 °C cooler |
-| GeForce RTX 20, GTX 16, GTX 10 | 85 % | about -4 % speed, cooler |
-| Workstation (RTX PRO, RTX A-series, Ada, Quadro) | 90 % | steadier clocks for about -2 % |
-| Data center (H100, H200, B200, A100, L40S, L4, T4…) | unchanged | built and cooled for full sustained power |
-| Laptop GPUs | unchanged | the laptop manages the limit |
-
-With Apsi installed, *Apply* also runs `apsi gpu setup`, so Apsi fine-tunes the limit around 77 °C while it trains.
+(The *Apsi GPU Tuner* files of earlier versions set a fixed lower limit at every start. They are no longer needed and
+no longer offered; how to remove them: [Turning the GPU helper off](#turning-the-gpu-helper-off-and-before-uninstalling).)
 
 **Once per start of the computer: `apsi gpu power 80%`.** Run it once from a terminal opened as administrator (or
 with sudo): the card keeps that limit for every program until the computer or the driver restarts, so Apsi (and
@@ -304,7 +365,27 @@ Without NVML (very old drivers), there is no control and nothing else changes.
 
 ---
 
-## 5. Images, video and your own kernels (`@gpu`)
+## 5. Tensors on the card (`gpu_tensor`)
+
+Programs run on the processor by default. `gpu_tensor(x)` puts a tensor on the card with the GPU trainer's own
+kernels (no CUDA toolkit, no CuPy, no PyTorch); without a card the same code runs on the processor:
+
+```apsi
+let a = gpu_tensor(x)                       # gpu_device() says where: the card's name, or "cpu"
+let h = (a @ w + bias).gelu()               # stays on the card
+let z = h.T @ h                             # transposes without copies
+print(h.sum(axis=-1).numpy())
+```
+
+On the card: `@` (2-D, batched 3-D, `[B, M, K] @ [K, N]`), `+ - * / **` with a tensor of the same shape or a number
+(`+ -` with a row vector too), `-x`, `abs`, `.exp() .log() .sqrt() .rsqrt() .square() .reciprocal()`,
+`.maximum(y) .minimum(y)` (division and square roots IEEE-exact, exp and log within a few units in the last place),
+`.relu() .gelu() .silu() .tanh() .sigmoid() .softplus() .mish() .elu() .leaky_relu()
+.sin() .cos()`, `.softmax()`, `.layer_norm(gamma, beta)`, `.rms_norm(gamma)`, `.sum(axis)`, `.mean(axis)`,
+`.rows(ids)`, `.reshape(…)`. Any other function (`exp(h)`, `sort(h)`, your own) sees an ordinary tensor: the values
+come to the processor for it, so nothing has to be rewritten to run. `.numpy()` brings the values back.
+
+## 6. Images, video and your own kernels (`@gpu`)
 
 A function written once compiles for the processor (`@native`) and the card (`@gpu`), one thread per element:
 luminance + Sobel edges on RGB frames ran at 69 fps in 4K and 34 fps in 8K on the RTX 3060 (9 and 2 fps on all 12
@@ -314,7 +395,7 @@ the copies. Several GPUs: `APSI_GPUS=0,2`. Small launches go to the processor by
 
 ---
 
-## 6. Troubleshooting
+## 7. Troubleshooting
 
 **"no NVIDIA GPU" / `lm.device` is `cpu`.** `lm.device_note` says why. Install or update the NVIDIA display driver
 (any driver from 2020 on); on Linux, `nvidia-smi` must work. `APSI_NO_GPU=1` is set? Remote desktops and some
@@ -331,12 +412,12 @@ on the card (games, browsers with hardware acceleration, another Apsi) use memor
 
 **Training is slower than it should be, or its speed swings.** Look at the training report. *Cooling pauses* mean
 Apsi cannot set the power limit: run it as administrator, or set up the helper once (`apsi gpu setup` as
-administrator, or the GPU Tuner's Apply file) — see the box at the top of this page. *fused attention unavailable*
+administrator, or the installer's GPU helper option) — see the box at the top of this page. *fused attention unavailable*
 next to the GPU line means the attention kernel could not be built (a bug: report it with that line); training
-still works, more slowly, on separate kernels. A card held at a lower power limit (the GPU Tuner's 80 %) trades about
-5 % of speed for 6–10 °C; `Apsi-GPU-Tuner-Restore` puts the default back.
+still works, more slowly, on separate kernels. A card held at a lower power limit (`APSI_GPU_POWER=80`) trades about
+5 % of speed for 6–10 °C.
 
-**The card is hot or loud.** Temperature control is on by default (77 °C). Lower it with `APSI_GPU_TEMP=72`; check the
+**The card is hot or loud.** Temperature control is on by default (at most 79 °C). Lower it with `APSI_GPU_TEMP=72`; check the
 case airflow and fan curve. If the card still reaches 85 °C+, the control may be off (`APSI_GPU_TEMP=off`) or NVML
 missing (`r.gpu_temperature` is `none`).
 
@@ -361,7 +442,43 @@ Raise `--max-queue`, use a smaller model or format, or run another server on ano
 
 **Two copies of a model (int8 for the processor) fill the disk.** `apsi cache show`, `apsi cache clean int8`.
 
+## Turning the GPU helper off (and before uninstalling)
+
+The GPU helper is the only part of Apsi that runs with administrator rights. They keep running
+after you close Apsi (the helper starts at every logon), and the helper runs the Python of the Apsi version that set
+it up, so Windows cannot delete that version's folder while it runs. The uninstaller removes the helper by itself
+(it asks for administrator rights once). To turn it off yourself, open a terminal **as administrator** and run:
+
+```
+apsi gpu remove
+```
+
+It stops the helper, deletes its Task Scheduler task (Windows) or systemd service (Linux), deletes its key and
+script in `~/.apsi`, and puts the card's default power limit back. The uninstaller does the same by itself.
+
+Check that nothing is left:
+
+```
+apsi gpu status                         (power limit back at the default, no helper)
+schtasks /Query /TN "Apsi GPU helper"   (Windows: "cannot find the file specified" = removed)
+systemctl status apsi-gpu-helper        (Linux: "could not be found" = removed)
+```
+
+By hand, if Apsi is already gone, and to remove the *Apsi GPU Tuner* of earlier versions (terminal as administrator):
+
+```
+schtasks /End /TN "Apsi GPU helper" & schtasks /Delete /TN "Apsi GPU helper" /F
+schtasks /Delete /TN "Apsi GPU Tuner" /F
+nvidia-smi -pl 170                      (your card's default power limit: nvidia-smi -q -d POWER shows it)
+```
+
+On Linux: `sudo systemctl disable --now apsi-gpu-helper apsi-gpu-tuner` and
+`sudo rm /etc/systemd/system/apsi-gpu-helper.service /etc/systemd/system/apsi-gpu-tuner.service`.
+
 ## Settings for the GPU
+
+Every setting below is also in [`config/apsi-training.env`](../config/apsi-training.env) with its default; what each
+protection costs and what turning it off changes: [TRAINING.md](TRAINING.md#9-what-happens-if-you-turn-things-off).
 
 | Variable | Default | Effect |
 |---|---|---|
@@ -376,6 +493,11 @@ Raise `--max-queue`, use a smaller model or format, or run another server on ano
 | `APSI_PROMPT_ON_GPU` | `64` | prompts of this many tokens or more through processor layers stream to the card |
 | `APSI_CPU_WEIGHTS` | `int8` | processor layers in `bf16` instead |
 | `APSI_PRECISION` | `auto` | training precision for every program |
+| `APSI_GPU_GUARD` | `1` | a step whose gradient holds inf or NaN is skipped (weights and optimizer state unchanged); `0`: off |
+| `APSI_GPU_EXACT_SUMS` | (on below 2 B parameters) | exact double-float sums of accumulated batches, copies and cuts; `0` / `1` |
+| `APSI_GPU_COMPENSATED` | (on below 2 B parameters) | each weight carries its rounding error into the next update; `0` / `1` |
+| `APSI_GPU_DETERMINISTIC` | `1` | the same weights every run (no atomic additions anywhere); `0`: the fused attention's backward adds dQ atomically (one kernel instead of two) |
+| `APSI_GPU_ASYNC_COPY` | `1` | copies to the card queued behind the running kernels through pinned memory; `0`: each copy waits for the card |
 | `APSI_FP8_MATMUL` | `1` | `0`: no fp8 tensor-core products with `backend="torch"` |
 | `APSI_API_KEY` | | the key `apsi serve-model` requires |
 | `APSI_GPUS` | all | which cards `@gpu` code uses, e.g. `0,2` |

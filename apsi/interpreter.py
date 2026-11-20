@@ -358,8 +358,11 @@ class Interpreter:
         self.modules.lazy("hub", lambda: __import__("apsi.hub", fromlist=["module"]).module(self))
         self.modules.lazy("tokens", lambda: __import__("apsi.tokens", fromlist=["module"]).module(self))
         self.modules.lazy("memory", lambda: __import__("apsi.memory", fromlist=["module"]).module(self))
+        self.modules.lazy("layout", lambda: __import__("apsi.layout", fromlist=["module"]).module())
         self.modules.lazy("log", lambda: __import__("apsi.log", fromlist=["module"]).module(self))
         self.modules.lazy("config", lambda: __import__("apsi.config", fromlist=["module"]).module(self))
+        from .enums import enum_type as _enum_type
+        self.globals.vars.setdefault("enum_type", _enum_type)
         from . import structures as _st
         self.modules.lazy("collections", _st.module)
         for k, v in _st.FUNCTIONS.items():
@@ -489,8 +492,12 @@ class Interpreter:
     def import_module(self, path):
         """`import "x.apsi" as m` in a Python-exact file: the module object itself (m._private works, objects
         pickle by reference, the module is in sys.modules under its file name)."""
+        key = os.path.abspath(os.path.normpath(path))
+        part = self.__dict__.get("_partial", {}).get(key)
+        if part is not None and key in self.importing and key not in self.module_cache:
+            return part                     # an import cycle, as in Python: the module as far as it has run
         self.import_compiled(path)
-        env = self.module_cache[os.path.normpath(path)]
+        env = self.module_cache[os.path.abspath(os.path.normpath(path))]
         mod = getattr(env, "module", None)
         if mod is None:
             from .values import Namespace
@@ -551,7 +558,9 @@ class Interpreter:
 
             def find_spec(self, name, target_path=None, target=None):
                 import importlib.machinery
-                base = os.path.join(root, *name.split("."))
+                shadow = f"apsi_{abs(hash(getattr(interp, '_main_dir', '') or '')):x}."
+                rel = name[len(shadow):] if name.startswith(shadow) else name   # a library under its private name
+                base = os.path.join(root, *rel.split("."))
                 for cand in (base + ".apsi", os.path.join(base, "__init__.apsi")):
                     if os.path.isfile(cand):
                         return importlib.machinery.ModuleSpec(name, _Loader(cand), origin=cand,
@@ -564,7 +573,13 @@ class Interpreter:
 
             def create_module(self, spec):
                 interp.import_compiled(self.file)
-                return _sys.modules.get(spec.name)
+                mod = _sys.modules.get(spec.name)
+                if mod is None:                           # imported under its other name (plain or private)
+                    env = interp.module_cache.get(os.path.abspath(self.file))
+                    mod = getattr(env, "module", None)
+                    if mod is not None:
+                        _sys.modules[spec.name] = mod
+                return mod
 
             def exec_module(self, module):
                 pass
@@ -572,7 +587,7 @@ class Interpreter:
         _sys.meta_path.insert(0, _Finder())
 
     def import_compiled(self, path):
-        path = os.path.normpath(path)
+        path = os.path.abspath(os.path.normpath(path))    # one module per file, however the path is spelled
         self._library_finder(os.path.abspath(path))
         if path not in self.module_cache:
             import sys as _sys
@@ -603,9 +618,13 @@ class Interpreter:
             mod = getattr(menv, "module", None)
             if mod is not None:
                 _sys.modules.setdefault(mod.__name__, mod)
-                parent, _, leaf = mod.__name__.rpartition(".")
-                if parent and parent in _sys.modules:
-                    setattr(_sys.modules[parent], leaf, mod)   # importing pkg.sub makes it pkg's attribute
+        mod = getattr(self.module_cache[path], "module", None)
+        if mod is not None:
+            import sys as _sys
+            parent, _, leaf = mod.__name__.rpartition(".")
+            pm = _sys.modules.get(parent) if parent else None
+            if pm is not None and getattr(pm, leaf, None) is None:
+                setattr(pm, leaf, mod)          # importing pkg.sub makes it pkg's attribute (also when loaded first)
         return {k: v for k, v in self.module_cache[path].vars.items() if not k.startswith("_")}
 
     def run_tests(self, report=print):
@@ -1035,7 +1054,7 @@ class Interpreter:
         path = s.path
         if not os.path.isabs(path):
             path = os.path.join(self.dir_stack[-1], path)
-        path = os.path.normpath(path)
+        path = os.path.abspath(os.path.normpath(path))      # one module per file, however the path is spelled
         if path not in self.module_cache:
             if not os.path.exists(path):
                 raise NameErr(f"cannot find file '{s.path}'")
@@ -1616,6 +1635,10 @@ class Interpreter:
 
     def get_attr(self, obj, name):
         c = obj.__class__
+        if c is Record:                                           # the commonest: a record's field
+            f = obj.fields
+            if name in f:
+                return f[name]
         if (c is str or c is list or c is dict or c in _PLAIN_GET) and name[0] != "_" and name not in _SLOW_NAMES:
             try:                                                  # text, lists, dicts, class instances …
                 return getattr(obj, name)
@@ -1670,6 +1693,8 @@ class Interpreter:
         try:
             v = getattr(obj, name)
         except AttributeError:
+            if name == "numpy" and isinstance(obj, np.ndarray):     # gpu_tensor(x).numpy() also after a fallback
+                return lambda: obj
             raise _no_attr(obj, name) from None
         if not isinstance(obj, _NOT_PLAIN):
             _PLAIN_GET.add(c)                               # next time: straight to getattr (same checks apply)

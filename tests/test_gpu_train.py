@@ -1,6 +1,8 @@
 """Apsi's own GPU trainer: gradients against Apsi's autodiff (on the Emulator), training curves against the NumPy
 backend, and - when there is an NVIDIA card - every kernel and a whole training run against the Emulator."""
+import os
 import unittest
+from unittest import mock
 
 import numpy as np
 
@@ -53,6 +55,372 @@ class Trainer(unittest.TestCase):
         grads_match(self, L.transformer_lm(23, d=32, heads=4, layers=2, context=12), rng.integers(0, 23, (3, 12)),
                     lab, "cross_entropy")
 
+    def test_modern_blocks_are_exact(self):
+        """Grouped-query attention, rotary positions, per-head query / key norms, RMS norm and SwiGLU: the gradients
+        on the GPU trainer equal Apsi's autodiff; training equals the NumPy backend, fused attention or not, on one
+        card or split across three."""
+        rng = np.random.default_rng(0)
+        for kw in (dict(kv_heads=2), dict(rope=True), dict(qk_norm=True), dict(norm="rms", ffn="swiglu"),
+                   dict(kv_heads=1, rope=True, qk_norm=True, norm="rms", ffn="swiglu"),
+                   dict(kv_heads=2, rope=True, qk_norm=True, ffn="swiglu", activation="relu")):
+            lab = rng.integers(0, 23, (3, 12))
+            lab[0, :3] = -100
+            grads_match(self, L.transformer_lm(23, d=32, heads=4, layers=2, context=12, **kw),
+                        rng.integers(0, 23, (3, 12)), lab, "cross_entropy")
+        grads_match(self, L.Sequential([L.Linear(10, 16), L.SwiGLU(16, 24, d_out=5)]), rng.normal(size=(16, 10)),
+                    rng.normal(size=(16, 5)), "mse")
+        lm = L.transformer_lm(30, d=128, heads=4, layers=2, context=40, kv_heads=2, rope=True, qk_norm=True,
+                              norm="rms", ffn="swiglu")
+        ids = rng.integers(0, 30, (24, 40))
+        lab = np.roll(ids, -1, 1)
+        kw = dict(loss="cross_entropy", opt=None, epochs=3, batch_size=8, verbose=False)
+        ref = L.fit(lm, lm.init(seed=0), ids, lab, precision="fp32", **dict(kw, opt=Adam(3e-3))).history
+        for ops in (GT.Emulator(), [GT.Emulator() for _ in range(3)]):
+            r = GT.fit(lm, lm.init(seed=0), ids, lab, precision="fp32", ops=ops, parallel="pipeline",
+                       **dict(kw, opt=Adam(3e-3))).history
+            np.testing.assert_allclose(ref, r, rtol=1e-5)
+        e = GT.Emulator()
+        e.flash = True                                              # the fused kernel's path (bfloat16 inputs)
+        r = GT.fit(lm, lm.init(seed=0), ids, lab, ops=e, **dict(kw, opt=Adam(3e-3))).history
+        np.testing.assert_allclose(ref, r, rtol=3e-3)
+
+    def test_convolutions_and_pooling_are_exact(self):
+        """conv2d (any kernel, stride, padding), max_pool (ties share the gradient), avg_pool, global_avg_pool, odd
+        sizes that leave rows out of the windows: gradients equal autodiff; cnn trains like NumPy."""
+        rng = np.random.default_rng(0)
+        X, y = rng.normal(size=(6, 3, 13, 13)), rng.integers(0, 4, 6)
+        grads_match(self, L.cnn(3, 4, image=12, channels=(5, 6), dense_width=16), X[:, :, :12, :12], y,
+                    "cross_entropy")
+        grads_match(self, L.Sequential([L.Conv2D(3, 4, 3, stride=2, padding=1), L.Activation("relu"), L.AvgPool(2),
+                                        L.Conv2D(4, 5, 1, padding=0), L.GlobalAvgPool(), L.Linear(5, 4)]), X, y,
+                    "cross_entropy")
+        grads_match(self, L.Sequential([L.Conv2D(3, 4, 5, padding="same"), L.MaxPool(3), L.Flatten(),
+                                        L.Linear(64, 4)]), X, y, "cross_entropy")
+        grads_match(self, L.Sequential([L.MaxPool(2), L.Flatten(), L.Linear(32, 3)]),
+                    np.round(rng.normal(size=(4, 2, 8, 8))), rng.integers(0, 3, 4), "cross_entropy")
+        m = L.cnn(3, 4, image=12, channels=(5, 6), dense_width=16)
+        kw = dict(loss="cross_entropy", epochs=3, batch_size=3, verbose=False, precision="fp32")
+        a = L.fit(m, m.init(seed=0), X[:, :, :12, :12], y, opt=Adam(0.01), **kw)
+        b = GT.fit(m, m.init(seed=0), X[:, :, :12, :12], y, opt=Adam(0.01), ops=GT.Emulator(), **kw)
+        np.testing.assert_allclose(a.history, b.history, rtol=1e-5)
+
+    def test_recurrent_layers_are_exact(self):
+        """lstm and gru (sequences or the last step), last_step: gradients equal autodiff; training equals NumPy."""
+        rng = np.random.default_rng(0)
+        X, y, ys = rng.normal(size=(5, 7, 6)), rng.integers(0, 3, 5), rng.normal(size=(5, 7, 4))
+        for m, Y, loss in ((L.lstm_classifier(6, 8, 3, layers=2), y, "cross_entropy"),
+                           (L.Sequential([L.GRULayer(6, 8), L.GRULayer(8, 4)]), ys, "mse"),
+                           (L.Sequential([L.LSTMLayer(6, 8), L.LastStep(), L.Linear(8, 3)]), y, "cross_entropy"),
+                           (L.Sequential([L.GRULayer(6, 8, return_sequences=False), L.Linear(8, 3)]), y,
+                            "cross_entropy")):
+            grads_match(self, m, X, Y, loss)
+        for m in (L.lstm_classifier(6, 8, 3), L.Sequential([L.GRULayer(6, 8, False), L.Linear(8, 3)])):
+            kw = dict(loss="cross_entropy", epochs=3, batch_size=2, verbose=False, precision="fp32")
+            a = L.fit(m, m.init(seed=0), X, y, opt=Adam(0.01), **kw)
+            b = GT.fit(m, m.init(seed=0), X, y, opt=Adam(0.01), ops=GT.Emulator(), **kw)
+            np.testing.assert_allclose(a.history, b.history, rtol=1e-5)
+
+    def test_any_layer_and_any_loss(self):
+        """Layers with no kernel of their own (custom layers, lambdas, batch_norm) run on the processor inside a model
+        trained on the card, and a loss written as a function is evaluated there: the gradients and the training
+        equal NumPy."""
+        from apsi import ops as aops
+        from apsi.values import Record
+        rng = np.random.default_rng(0)
+        X, Y = rng.normal(size=(16, 10)), rng.normal(size=(16, 4))
+        cl = L.CustomLayer(lambda seed=0: Record(A=np.random.default_rng(seed).normal(size=(8, 8)) * 0.3,
+                                                 c=np.zeros(8)),
+                           lambda p, x, train=False: aops.tanh(x @ p.A) + p.c * x, "mine")
+        for m in (L.Sequential([L.Linear(10, 8), L.LambdaLayer(lambda x: x * aops.sigmoid(2 * x)), L.Linear(8, 4)]),
+                  L.Sequential([L.Linear(10, 8), cl, L.Linear(8, 4)]),
+                  L.Sequential([L.Linear(10, 8, bias=False), L.BatchNorm(8), L.Activation("relu"), L.Linear(8, 4)])):
+            grads_match(self, m, X, Y, "mse")
+
+        def huber(p, y):
+            d = p - y
+            a = aops.abs_(d)
+            return aops.mean(aops.where(np.asarray(aops.raw(a)) < 1, 0.5 * d * d, a - 0.5))
+        m = L.Sequential([L.Linear(10, 16), L.LambdaLayer(lambda x: x * aops.sigmoid(x)), L.Linear(16, 4)])
+        kw = dict(loss=huber, epochs=3, batch_size=8, verbose=False, precision="fp32", val=(X, Y))
+        a = L.fit(m, m.init(seed=0), X, Y, opt=Adam(0.01), **kw)
+        b = GT.fit(m, m.init(seed=0), X, Y, opt=Adam(0.01), ops=GT.Emulator(), **kw)
+        np.testing.assert_allclose(a.history, b.history, rtol=1e-6)
+        np.testing.assert_allclose(a.val_history, b.val_history, rtol=1e-6)
+        with self.assertRaises(GT.TrainError):
+            GT.fit(m, m.init(seed=0), X, Y, opt=Adam(0.01), ops=[GT.Emulator(), GT.Emulator()], **kw)
+
+    def test_compensated_weights_keep_tiny_updates(self):
+        """Updates far below float32's step at a weight's size are lost by a plain float32 update and kept by the
+        compensated one (the default): 300 Adam steps of 1e-9 move the weights near 1 by 3e-7."""
+        rng = np.random.default_rng(0)
+        X, Y = rng.normal(size=(64, 8)), rng.normal(size=(64, 4))
+        m = L.mlp([8, 16, 4], "tanh")
+        W0 = np.asarray(tree_leaves(m.init(seed=0))[0], np.float32)
+        big = np.abs(W0) > 0.5
+        moved = {}
+        for comp in (False, True):
+            r = GT.fit(m, m.init(seed=0), X, Y, loss="mse", opt=Adam(1e-9), epochs=300, verbose=False,
+                       precision="fp32", ops=GT.Emulator(), compensated=comp)
+            moved[comp] = float(np.abs(np.asarray(tree_leaves(r.params)[0]) - W0)[big].mean())
+        self.assertEqual(moved[False], 0.0)
+        self.assertAlmostEqual(moved[True], 3e-7, delta=3e-8)
+
+    def test_text_and_graph_models_in_batches(self):
+        """A model of graphs and text (two inputs): token ids and node features as two inputs of one dag, a different
+        batch of graphs every step (sizes, edges, relations), a graph transformer, graph_memory, cross-attention from
+        the text to the memory, rotary positions, grouped heads, SwiGLU: fit_batches on the card equals NumPy."""
+        from apsi import graphs as GR
+        rng = np.random.default_rng(0)
+        V, d, f, T, k = 20, 16, 6, 8, 4
+
+        def make(G):
+            sizes = rng.integers(3, 9, G)
+            N = int(sizes.sum())
+            src, dst, off = [], [], 0
+            for s_ in sizes:
+                e = rng.integers(0, s_, (2 * s_, 2)) + off
+                src += list(e[:, 0])
+                dst += list(e[:, 1])
+                off += s_
+            g = L.graph(edges=np.stack([src, dst], 1).tolist(), n=N, batch=np.repeat(np.arange(G), sizes),
+                        types=rng.integers(0, 2, len(src)))
+            toks = rng.integers(0, V, (G, T))
+            return [toks, rng.normal(size=(N, f))], np.roll(toks, -1, 1), g
+        batches = [make(G) for G in (3, 2, 4)]
+        m = L.DAG([["e", L.Embedding(V, d), "tok"],
+                   ["h", L.Residual(L.MultiHeadAttention(d, 4, causal=True, rope=True, kv_heads=2),
+                                    pre_norm=L.RMSNorm(d)), "e"],
+                   ["n0", L.Linear(f, d), "nodes"], ["n1", GR.GraphTransformer(d, 4, relations=2), "n0"],
+                   ["mem", GR.GraphMemory(d, k), "n1"], ["c", L.MultiHeadAttention(d, 4), ["h", "mem"]],
+                   ["r", L.add(), ["c", "h"]], ["f", L.Residual(L.SwiGLU(d, 32), pre_norm=L.RMSNorm(d)), "r"],
+                   ["out", L.Linear(d, V), "f"]], inputs=["tok", "nodes"], output="out")
+        a = L.fit_batches(m, m.init(seed=0), batches, "cross_entropy", opt=Adam(0.01), epochs=4, backend="numpy",
+                          verbose=False)
+        b = GT.fit_batches(m, m.init(seed=0), batches, "cross_entropy", opt=Adam(0.01), epochs=4, verbose=False,
+                           precision="fp32", ops=GT.Emulator())
+        np.testing.assert_allclose(a.history, b.history, rtol=1e-5)
+        self.assertLess(b.history[-1], b.history[0] - 1.0)
+
+    def test_any_model_split_across_cards_in_batches(self):
+        """A two-input dag of graphs and text (hgt, global attention, graph memory, cross-attention, rotary positions,
+        grouped heads, SwiGLU), a different batch of graphs every step, gradients of 4 batches averaged per step:
+        NumPy, one card, the dag split into 4 stages, and 2 stages x 2 replicas all train the same."""
+        from apsi import graphs as GR
+        rng = np.random.default_rng(0)
+        V, d, f, T, k = 20, 16, 6, 8, 4
+
+        def make(G):
+            sizes = rng.integers(3, 9, G)
+            N = int(sizes.sum())
+            src, dst, off = [], [], 0
+            for s_ in sizes:
+                e = rng.integers(0, s_, (2 * s_, 2)) + off
+                src += list(e[:, 0])
+                dst += list(e[:, 1])
+                off += s_
+            g = L.graph(edges=np.stack([src, dst], 1).tolist(), n=N, batch=np.repeat(np.arange(G), sizes),
+                        types=rng.integers(0, 2, len(src)), node_types=rng.integers(0, 3, N))
+            toks = rng.integers(0, V, (G, T))
+            return [toks, rng.normal(size=(N, f))], np.roll(toks, -1, 1), g
+        batches = [make(G) for G in (3, 2, 4, 3, 2, 3, 2, 4)]
+        m = L.DAG([["e", L.Embedding(V, d), "tok"],
+                   ["h", L.Residual(L.MultiHeadAttention(d, 4, causal=True, rope=True, kv_heads=2),
+                                    pre_norm=L.RMSNorm(d)), "e"],
+                   ["n0", L.Linear(f, d), "nodes"], ["n1", GR.HGT(d, 4, types=3, relations=2), "n0"],
+                   ["n2", GR.GlobalAttention(d, 4), "n1"], ["mem", GR.GraphMemory(d, k), "n2"],
+                   ["c", L.MultiHeadAttention(d, 4), ["h", "mem"]], ["r", L.add(), ["c", "h"]],
+                   ["f", L.Residual(L.SwiGLU(d, 32), pre_norm=L.RMSNorm(d)), "r"], ["out", L.Linear(d, V), "f"]],
+                  inputs=["tok", "nodes"], output="out")
+        kw = dict(epochs=3, verbose=False)
+        ref = L.fit_batches(m, m.init(seed=0), batches, "cross_entropy", opt=Adam(0.01), backend="numpy",
+                            accumulate=4, **kw).history
+        for ops, acc, st in ((GT.Emulator(), 4, None), ([GT.Emulator() for _ in range(4)], 4, None),
+                             ([GT.Emulator() for _ in range(4)], 4, 2)):
+            r = GT.fit_batches(m, m.init(seed=0), batches, "cross_entropy", opt=Adam(0.01), precision="fp32", ops=ops,
+                               accumulate=acc, stages=st, **kw)
+            np.testing.assert_allclose(ref, r.history, rtol=1e-5)
+        self.assertEqual((len(r.stages), r.replicas), (2, 2))
+
+    def test_heterogeneous_graphs(self):
+        """typed_linear, typed_norm and hgt (a type per node, keys through each relation, one softmax over a node's
+        in-edges, the typed encoder layer): training on the card equals NumPy, with a different graph every batch."""
+        from apsi import graphs as GR
+        rng = np.random.default_rng(0)
+
+        def make():
+            N = int(rng.integers(15, 30))
+            E = 3 * N
+            g = L.graph(edges=rng.integers(0, N, (E, 2)).tolist(), n=N, types=rng.integers(0, 3, E),
+                        node_types=rng.integers(0, 4, N))
+            return rng.normal(size=(N, 8)), rng.integers(0, 3, N), g
+        batches = [make() for _ in range(3)]
+        for m in (L.Sequential([GR.TypedLinear(8, 16, 3), GR.TypedNorm(16, 3), L.Activation("tanh"),
+                                L.Linear(16, 3)]),
+                  L.Sequential([L.Linear(8, 16), GR.HGT(16, 4, types=3, relations=3), GR.HGT(16, 2, 4, 3),
+                                L.Linear(16, 3)])):
+            a = L.fit_batches(m, m.init(seed=0), batches, "cross_entropy", opt=Adam(0.01), epochs=3,
+                              backend="numpy", verbose=False)
+            b = GT.fit_batches(m, m.init(seed=0), batches, "cross_entropy", opt=Adam(0.01), epochs=3, verbose=False,
+                               precision="fp32", ops=GT.Emulator())
+            np.testing.assert_allclose(a.history, b.history, rtol=1e-5)
+
+    def test_physics_informed_networks(self):
+        """pinn: Taylor mode on the card (values, first and second derivatives along every input through the network
+        in one stack, the gradient back through the same stack) equals Apsi's autodiff of any order, for every
+        smooth activation, several inputs and outputs; training the oscillator u'' + w^2 u = 0 gives the same losses
+        on both paths."""
+        from apsi import pinn, ops as aops
+        rng = np.random.default_rng(0)
+        for act in ("tanh", "sin", "cos", "sigmoid", "silu", "softplus"):
+            m = L.mlp([3, 8, 8, 2], act)
+            p = m.init(seed=1)
+            X = rng.normal(size=(7, 3))
+            ref = pinn.derivatives(m, p, X)
+            net = pinn._Taylor(GT.Emulator(), m, p, X.astype(np.float32))
+            try:
+                u, du, d2u = net.forward()
+            finally:
+                net.close()
+            for got, want in ((u, ref.u), (du, ref.du), (d2u, ref.d2u)):
+                np.testing.assert_allclose(got, want, rtol=1e-4, atol=5e-6, err_msg=act)
+        T = np.linspace(0, 2, 40)[:, None]
+
+        def loss(x, u, du, d2u):
+            res = d2u[:, 0, 0] + 4.0 * u[:, 0]
+            return aops.mean(res * res) + 10 * ((u[0, 0] - 1) ** 2 + du[0, 0, 0] ** 2)
+        m = L.mlp([1, 24, 24, 1], "tanh")
+        a = pinn.fit(m, m.init(seed=0), T, loss, epochs=60, opt=Adam(0.01), backend="numpy", verbose=False)
+        b = pinn.fit(m, m.init(seed=0), T, loss, epochs=60, opt=Adam(0.01), backend="gpu", ops_=GT.Emulator(),
+                     verbose=False)
+        np.testing.assert_allclose(a.history, b.history, rtol=1e-4)
+        self.assertEqual(b.backend, "gpu")
+        with self.assertRaises(pinn.PinnError):                      # not a Taylor-mode network
+            pinn.fit(L.Sequential([L.Linear(1, 4), L.Activation("relu"), L.Linear(4, 1)]),
+                     L.Sequential([L.Linear(1, 4), L.Activation("relu"), L.Linear(4, 1)]).init(), T, loss, epochs=1,
+                     backend="gpu", ops_=GT.Emulator(), verbose=False)
+
+    def test_mae_and_bce_losses(self):
+        """mae and bce on the GPU trainer, one card, data parallel, a split model and a masked graph: the NumPy
+        backend's losses."""
+        rng = np.random.default_rng(1)
+        X = rng.normal(size=(48, 6))
+        for loss, yy in (("mae", rng.normal(size=(48, 3))), ("bce", (rng.random((48, 3)) < 0.4).astype(float))):
+            m = L.mlp([6, 16, 16, 3], "gelu")
+            kw = dict(loss=loss, epochs=3, batch_size=16, verbose=False, precision="fp32", val=(X, yy))
+            a = L.fit(m, m.init(seed=0), X, yy, opt=Adam(0.01), **kw)
+            for ops, par in ((GT.Emulator(), "auto"), ([GT.Emulator(), GT.Emulator()], "data"),
+                             ([GT.Emulator() for _ in range(3)], "pipeline")):
+                b = GT.fit(m, m.init(seed=0), X, yy, opt=Adam(0.01), ops=ops, parallel=par, **kw)
+                np.testing.assert_allclose(a.history, b.history, rtol=1e-5, err_msg=f"{loss} {par}")
+                np.testing.assert_allclose(a.val_history, b.val_history, rtol=1e-5)
+        N = 40
+        g = L.graph(edges=rng.integers(0, N, (100, 2)).tolist(), n=N)
+        Xg, mask = rng.normal(size=(N, 8)), rng.random(N) < 0.5
+        for loss, yy in (("mae", rng.normal(size=(N, 2))), ("bce", (rng.random((N, 2)) < 0.5).astype(float))):
+            m = L.gcn_net(8, 16, 2, dropout=0.0)
+            kw = dict(loss=loss, epochs=3, verbose=False, precision="fp32", graph=g, mask=mask)
+            a = L.fit(m, m.init(seed=0), Xg, yy, opt=Adam(0.01), **kw)
+            b = GT.fit(m, m.init(seed=0), Xg, yy, opt=Adam(0.01), ops=GT.Emulator(), **kw)
+            np.testing.assert_allclose(a.history, b.history, rtol=1e-5)
+
+    def test_mixture_of_experts_is_exact(self):
+        """moe: the router's top-k and its softmax on the card, the rows grouped by expert, every expert on its own
+        rows, the outputs summed back by the gates: gradients equal autodiff; a moe language model trains like NumPy,
+        on one card and split across two."""
+        rng = np.random.default_rng(0)
+        X, Y = rng.normal(size=(20, 12)), rng.normal(size=(20, 12))
+        for E, k in ((4, 2), (8, 1), (3, 3)):
+            grads_match(self, L.Sequential([L.MoE(12, E, k, ff=16), L.Linear(12, 3)]), X, Y[:, :3], "mse")
+        lm = L.transformer_lm(23, d=32, heads=4, layers=2, context=12, ffn="moe", experts=4, top_k=2, norm="rms",
+                              rope=True, kv_heads=2)
+        ids = rng.integers(0, 23, (16, 12))
+        lab = np.roll(ids, -1, 1)
+        grads_match(self, lm, ids[:3], lab[:3], "cross_entropy")
+        kw = dict(loss="cross_entropy", epochs=3, batch_size=8, verbose=False, precision="fp32")
+        ref = L.fit(lm, lm.init(seed=0), ids, lab, opt=Adam(1e-2), **kw).history
+        for ops in (GT.Emulator(), [GT.Emulator(), GT.Emulator()]):
+            r = GT.fit(lm, lm.init(seed=0), ids, lab, opt=Adam(1e-2), ops=ops, parallel="pipeline", **kw).history
+            np.testing.assert_allclose(ref, r, rtol=1e-5)
+
+    def test_any_architecture_is_exact(self):
+        """dag / parallel / add / multiply / concatenate / mean, scale, identity, reshape, flatten, mean_pool and
+        cross-attention (queries from one value, keys and values from another of any length; grouped heads, rotary
+        positions and q/k norms too): the gradients equal autodiff."""
+        rng = np.random.default_rng(0)
+        X, Y = rng.normal(size=(16, 10)), rng.normal(size=(16, 4))
+        d = L.DAG([["h1", L.Linear(10, 16), "x"], ["h2", L.Sequential([L.Linear(10, 16), L.Activation("tanh")]), "x"],
+                   ["s", L.add(), ["h1", "h2"]], ["m", L.multiply(), ["s", "h2"]],
+                   ["c", L.concatenate(), ["m", "h1", "x"]], ["mean", L.Combine("mean"), ["h1", "h2"]],
+                   ["c2", L.concatenate(), ["c", "mean"]], ["sc", L.Scale(58), "c2"], ["out", L.Linear(58, 4), "sc"]],
+                  inputs=["x"], output="out")
+        grads_match(self, L.Sequential([d]), X, Y, "mse")
+        grads_match(self, L.Sequential([L.Linear(10, 8), L.Parallel([L.Linear(8, 6), L.Sequential(
+            [L.Linear(8, 6), L.Activation("relu")])], "concat"), L.Scale(12, shift=False), L.Linear(12, 4)]), X, Y, "mse")
+        grads_match(self, L.Sequential([L.Linear(10, 8), L.Parallel([L.Linear(8, 8), L.Identity()], "mul"),
+                                        L.Parallel([L.Linear(8, 8), L.Identity()], "mean"), L.Linear(8, 4)]), X, Y,
+                    "mse")
+        grads_match(self, L.Sequential([L.Reshape(2, 5), L.Linear(5, 6), L.Flatten(), L.Linear(12, 4)]), X, Y, "mse")
+        grads_match(self, L.transformer_classifier(23, 3, d=32, heads=4, layers=1, context=12),
+                    rng.integers(0, 23, (4, 12)), rng.integers(0, 3, 4), "cross_entropy")
+        for kw in (dict(), dict(kv_heads=2, rope=True, qk_norm=True), dict(causal=True, kv_heads=1)):
+            d = L.DAG([["m0", L.Linear(16, 32), "x"], ["mem", L.Reshape(14, 16), "m0"],
+                       ["ca", L.MultiHeadAttention(16, 4, **kw), ["x", "mem"]], ["r", L.add(), ["ca", "x"]],
+                       ["out", L.Linear(16, 5), "r"]], inputs=["x"], output="out")
+            grads_match(self, L.Sequential([d]), rng.normal(size=(3, 7, 16)), rng.normal(size=(3, 7, 5)), "mse")
+
+    def test_graph_networks_are_exact(self):
+        """Sparse graphs on the GPU trainer (GCN, GraphSAGE, GIN, GAT, pooling per graph; CSR kernels with no
+        atomics): node and graph tasks, masks, validation and predict equal the NumPy backend."""
+        rng = np.random.default_rng(0)
+        N = 40
+        e = rng.integers(0, N, (120, 2)).tolist()
+        g = L.graph(edges=e, n=N)
+        X, y, yr = rng.normal(size=(N, 8)), rng.integers(0, 3, N), rng.normal(size=(N, 2))
+        mask = rng.random(N) < 0.5
+        cases = (("gat", L.gat_net(8, 8, 3, dropout=0.0), "cross_entropy", y),
+                 ("gcn", L.gcn_net(8, 16, 3, dropout=0.0), "cross_entropy", y),
+                 ("sage", L.Sequential([L.SAGE(8, 16), L.Activation("mish"), L.SAGE(16, 2, "sum")]), "mse", yr),
+                 ("gin", L.Sequential([L.GIN(8, 16), L.Activation("elu"), L.GIN(16, 3)]), "cross_entropy", y),
+                 ("gat mean", L.Sequential([L.GAT(8, 4, heads=3), L.Activation("softplus"),
+                                            L.GAT(12, 2, heads=2, concat=False)]), "mse", yr))
+        for name, m, loss, yy in cases:
+            kw = dict(loss=loss, epochs=4, verbose=False, precision="fp32", graph=g, mask=mask, val=(X, yy))
+            a = L.fit(m, m.init(seed=0), X, yy, opt=Adam(0.01), **kw)
+            b = GT.fit(m, m.init(seed=0), X, yy, opt=Adam(0.01), ops=GT.Emulator(), **kw)
+            # (the float32 sums of NumPy's BLAS differ by platform; a GAT's a_dst gradient is all but zero, which Adam
+            # turns into steps of its full size: 1e-4 leaves room for both)
+            np.testing.assert_allclose(a.history, b.history, rtol=1e-4, err_msg=name)
+            np.testing.assert_allclose(a.val_history, b.val_history, rtol=1e-4, err_msg=name)
+            np.testing.assert_allclose(np.asarray(L.predict(m, a.params, X, graph=g)),
+                                       GT.predict(m, a.params, X, ops=GT.Emulator(), graph=g, precision="fp32"),
+                                       rtol=1e-4, atol=1e-5, err_msg=name)
+        from apsi import graphs as GR                               # long-range graph layers
+        gt = L.graph(edges=e, n=N, types=rng.integers(0, 3, len(e)), batch=np.repeat(np.arange(4), 10))
+        for name, m, gg in (("graph_transformer", GR.graph_transformer_net(8, 16, 3, layers=2, heads=4, relations=3,
+                                                                          global_every=1, max_keys=6), gt),
+                            ("k_hop", L.Sequential([L.Linear(8, 16), GR.GraphTransformer(16, 4, 3, max_hop=1),
+                                                    L.Linear(16, 3)]), GR.k_hop(gt, 2)),
+                            ("mix_hop", L.Sequential([GR.MixHop(8, 8, (0, 1, 2)), L.Activation("relu"),
+                                                      GR.MixHop(24, 3, (1, 3))]), gt)):
+            kw = dict(loss="cross_entropy", epochs=3, verbose=False, precision="fp32", graph=gg, mask=mask)
+            a = L.fit(m, m.init(seed=0), X, y, opt=Adam(0.01), **kw)
+            b = GT.fit(m, m.init(seed=0), X, y, opt=Adam(0.01), ops=GT.Emulator(), **kw)
+            np.testing.assert_allclose(a.history, b.history, rtol=2e-5, err_msg=name)
+        gb = L.graph(edges=e, n=N, batch=np.repeat(np.arange(8), 5))
+        for pool in ("sum", "mean"):
+            m = L.gin_net(8, 16, 2, pool=pool)
+            yg = rng.normal(size=(8, 2))
+            a = L.fit(m, m.init(seed=0), X, yg, loss="mse", opt=Adam(0.01), epochs=4, verbose=False,
+                      precision="fp32", graph=gb)
+            b = GT.fit(m, m.init(seed=0), X, yg, loss="mse", opt=Adam(0.01), epochs=4, verbose=False,
+                       precision="fp32", graph=gb, ops=GT.Emulator())
+            np.testing.assert_allclose(a.history, b.history, rtol=1e-5)
+        m = L.Sequential([L.SAGE(8, 3, "max")])             # no kernel for max: on the processor, the same training
+        a = L.fit(m, m.init(), X, y, loss="cross_entropy", epochs=2, verbose=False, graph=g, precision="fp32")
+        b = GT.fit(m, m.init(), X, y, loss="cross_entropy", epochs=2, verbose=False, graph=g, ops=GT.Emulator(),
+                   precision="fp32")
+        np.testing.assert_allclose(a.history, b.history, rtol=1e-5)
+
     def test_training_matches_the_numpy_backend(self):
         rng = np.random.default_rng(0)
         lm = L.transformer_lm(23, d=32, heads=4, layers=2, context=12)
@@ -87,6 +455,98 @@ class Trainer(unittest.TestCase):
             np.testing.assert_allclose(one.history, many.history, rtol=1e-4)
             self.assertIn("3 GPUs", many.device)
             self.assertIsNotNone(many.ema_params)
+
+    def test_one_model_split_across_cards_trains_like_one_card(self):
+        """Model parallel: the model cut into stages on several (emulated) cards, micro-batches in a pipeline, and the
+        pipeline copied when there are more cards than stages: the same weights as one card with the whole batch."""
+        from apsi.values import tree_map
+        rng = np.random.default_rng(0)
+        lm = L.transformer_lm(23, d=32, heads=4, layers=3, context=12)
+        ids = rng.integers(0, 23, (40, 12))
+        lab = np.roll(ids, -1, 1)
+        kw = dict(loss="cross_entropy", epochs=3, batch_size=8, verbose=False, precision="fp32", clip=1.0)
+        one = GT.fit(lm, lm.init(seed=0), ids, lab, opt=Adam(1e-2), ops=GT.Emulator(), **kw)
+        for cards, stages, want in ((3, None, (3, 1)), (4, 2, (2, 2)), (3, [3, 4, 3], (3, 1))):
+            r = GT.fit(lm, lm.init(seed=0), ids, lab, opt=Adam(1e-2), ops=[GT.Emulator() for _ in range(cards)],
+                       parallel="pipeline", stages=stages, val=(ids, lab), **kw)
+            self.assertEqual((len(r.stages), r.replicas), want)
+            self.assertIn("split into", r.device)
+            np.testing.assert_allclose(one.history, r.history, rtol=1e-5)
+            for a, b in zip(tree_leaves(one.params), tree_leaves(r.params)):
+                np.testing.assert_allclose(np.asarray(a), np.asarray(b), rtol=1e-4, atol=2e-5)
+            self.assertEqual(len(r.val_history), 3)
+        rng = np.random.default_rng(5)
+        X, y = rng.normal(size=(50, 6)), rng.integers(0, 3, 50)
+        for lossname, yy, last, mk in (("mse", rng.normal(size=(50, 2)), 2, lambda: Adam(0.01)),
+                                       ("cross_entropy", y, 3, lambda: adamw(lr=0.01, weight_decay=0.1)),
+                                       ("cross_entropy", y, 3, lambda: SGD(0.1, momentum=0.9))):
+            m = L.mlp([6, 16, 16, 12, last], "gelu")
+            p0 = m.init(seed=1)
+            fisher = tree_map(lambda a: np.full_like(np.asarray(a), 0.5) if isinstance(a, np.ndarray) else a, p0)
+            kw = dict(loss=lossname, epochs=3, batch_size=16, verbose=False, precision="fp32", clip=0.05,
+                      ewc=(p0, fisher, 0.3), ema=0.9)
+            one = GT.fit(m, p0, X, yy, opt=mk(), ops=GT.Emulator(), **kw)
+            for cards, stages, micro in ((3, None, None), (4, 2, 3), (2, None, 16)):
+                r = GT.fit(m, p0, X, yy, opt=mk(), ops=[GT.Emulator() for _ in range(cards)], parallel="pipeline",
+                           stages=stages, micro_batches=micro, **kw)
+                for a, b in zip(tree_leaves(one.params) + tree_leaves(one.ema_params),
+                                tree_leaves(r.params) + tree_leaves(r.ema_params)):
+                    np.testing.assert_allclose(np.asarray(a), np.asarray(b), rtol=2e-4, atol=2e-6)
+
+    def test_split_model_details(self):
+        from apsi import gpu_pipeline as GP
+        self.assertEqual(GP.partition([1, 1, 1, 1, 8, 1, 1, 1, 1], [1] * 9, 3), [4, 1, 4])
+        self.assertEqual(GP.partition([1] * 4, [10, 10, 10, 10], 2, 1.0, budget=30), [2, 2])
+        self.assertIsNone(GP.partition([1] * 4, [10, 10, 10, 10], 2, 1.0, budget=15))
+        self.assertEqual(GP.schedule(0, 3, 4), [("F", 0), ("F", 1), ("F", 2), ("B", 0), ("F", 3), ("B", 1),
+                                                ("B", 2), ("B", 3)])
+        self.assertEqual(GP.schedule(2, 3, 2), [("F", 0), ("B", 0), ("F", 1), ("B", 1)])
+        lm = L.transformer_lm(23, d=32, heads=4, layers=2, context=12)
+        self.assertEqual(len(GP.units(lm, lm.init(seed=0))), 8)    # embedding, positions, 2 x (attention, MLP), ...
+        rng = np.random.default_rng(1)
+        ids = rng.integers(0, 23, (16, 12))
+        with self.assertRaises(GT.TrainError):
+            GT.fit(lm, lm.init(seed=0), ids, ids, loss="cross_entropy", epochs=1, verbose=False,
+                   ops=[GT.Emulator(), GT.Emulator()], stages=[1, 2])
+        for prec in ("auto", "int4"):                               # mixed / low bit and dropout on a split model
+            d = L.transformer_lm(23, d=32, heads=4, layers=2, context=12, dropout=0.1)
+            r = GT.fit(d, d.init(seed=0), ids, np.roll(ids, -1, 1), loss="cross_entropy", opt=Adam(1e-2), epochs=4,
+                       batch_size=8, verbose=False, precision=prec, ops=[GT.Emulator() for _ in range(3)],
+                       parallel="pipeline")
+            self.assertLess(r.history[-1], r.history[0] - 0.2, prec)
+
+        class Broken(GT.Emulator):
+            def ce(self, *a):
+                raise RuntimeError("the last card failed")
+        with self.assertRaisesRegex(RuntimeError, "the last card failed"):     # a failure stops every card at once
+            GT.fit(lm, lm.init(seed=0), ids, ids, loss="cross_entropy", epochs=1, batch_size=8, verbose=False,
+                   ops=[GT.Emulator(), GT.Emulator(), Broken()], parallel="pipeline")
+
+    def test_split_model_cards_work_at_the_same_time(self):
+        """With cards whose products take time (the processor free meanwhile, as with real cards), four stages
+        finish a step much sooner than one card doing all of it."""
+        import time
+
+        class Card(GT.Emulator):
+            def _gemm(self, A, B, Cv, bias, M, N, K, *a, **k):
+                time.sleep(M * N * K * a[5] * a[6] * 2e-8)
+                return super()._gemm(A, B, Cv, bias, M, N, K, *a, **k)
+        rng = np.random.default_rng(0)
+        lm = L.transformer_lm(23, d=32, heads=4, layers=4, context=12)
+        ids = rng.integers(0, 23, (32, 12))
+        kw = dict(loss="cross_entropy", epochs=1, verbose=False, opt=Adam(1e-2))
+        best = []
+        for _ in range(3):                  # the best of three: a busy shared runner can stall one try
+            t = time.perf_counter()
+            GT.fit(lm, lm.init(seed=0), ids, np.roll(ids, -1, 1), ops=Card(), **kw)
+            one = time.perf_counter() - t
+            t = time.perf_counter()
+            GT.fit(lm, lm.init(seed=0), ids, np.roll(ids, -1, 1), ops=[Card() for _ in range(4)],
+                   parallel="pipeline", micro_batches=8, **kw)
+            best.append((time.perf_counter() - t) / one)
+            if best[-1] < 1 / 1.5:
+                break
+        self.assertLess(min(best), 1 / 1.5, best)
 
     def test_ema_and_ewc(self):
         """EMA of the weights (teacher weights) and EWC (keep what an earlier task needed)."""
@@ -140,7 +600,9 @@ class Trainer(unittest.TestCase):
 
     def test_unsupported_layers_say_so(self):
         self.assertIsNone(GT.supports(L.transformer_lm(30, d=16, heads=2, layers=1, context=8)))
-        self.assertIn("conv", GT.supports(L.Sequential([L.Conv2D(1, 2)])))
+        self.assertIsNone(GT.supports(L.Sequential([L.Conv2D(1, 2)])))
+        self.assertIsNone(GT.supports(L.Sequential([L.LSTMLayer(4, 8)])))
+        self.assertIsNone(GT.supports(L.Sequential([L.Bilinear(4, 4, 2)])))         # (on the processor)
 
 
 @unittest.skipIf(GT.device()[0] is None, "no NVIDIA GPU")
@@ -148,6 +610,95 @@ class RealGpu(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.g, _ = GT.device()
+
+    def test_steps_resume_and_guard_on_the_card(self):
+        """steps= with a checkpoint resumes bit for bit on the card; a batch with a NaN gradient is skipped."""
+        import tempfile
+        from apsi.values import tree_leaves
+        rng = np.random.default_rng(2)
+        lm = L.transformer_lm(40, d=64, heads=4, layers=1, context=16)
+        bs = [(rng.integers(0, 40, (8, 16)), rng.integers(0, 40, (8, 16))) for _ in range(6)]
+        kw = dict(opt=None, ops=self.g, verbose=False, precision="fp32")
+        full = GT.fit_batches(lm, lm.init(seed=0), bs, "cross_entropy", steps=9, **{**kw, "opt": Adam(1e-2)})
+        ck = os.path.join(tempfile.mkdtemp(), "c.npz")
+        GT.fit_batches(lm, lm.init(seed=0), bs, "cross_entropy", steps=4, checkpoint=ck, **{**kw, "opt": Adam(1e-2)})
+        back = GT.fit_batches(lm, lm.init(seed=0), bs, "cross_entropy", steps=9, checkpoint=ck,
+                              **{**kw, "opt": Adam(1e-2)})
+        for a, b_ in zip(tree_leaves(full.params), tree_leaves(back.params)):
+            np.testing.assert_array_equal(np.asarray(a), np.asarray(b_))
+        g = self.g
+        n = 1000
+        P, G_, M_, V_, SQ = (g.alloc(n), g.alloc(n), g.alloc(n), g.alloc(n), g.alloc(1))
+        w = rng.normal(size=n).astype(np.float32)
+        g.put(P, w)
+        g.put(G_, np.full(n, np.nan, np.float32))
+        g.fill((M_, 0), n, 0.0)
+        g.fill((V_, 0), n, 0.0)
+        g.fill((SQ, 0), 1, 0.0)
+        g.sumsq((G_, 0), n, (SQ, 0))
+        g.adam((P, 0), (G_, 0), (M_, 0), (V_, 0), (SQ, 0), n, n, 1e-2, 0.9, 0.999, 1e-8, 0.1, 0.001, 0.0, 0.0)
+        np.testing.assert_array_equal(g.get(P, n), w)               # skipped: the weights stay as they were
+        np.testing.assert_array_equal(g.get(M_, n), np.zeros(n, np.float32))
+
+    def test_reductions_are_the_same_every_run(self):
+        """Column sums, scatter-adds of rows, sums of squares, losses and split-k products: no atomic additions, so
+        the card gives the same bits every run, and the emulator's values."""
+        g, e = self.g, GT.Emulator(tc=self.g.tc)
+        rng = np.random.default_rng(5)
+
+        def run(dv):
+            def put(a, dt=np.float32):
+                a = np.ascontiguousarray(np.asarray(a, dt))
+                b_ = dv.alloc(a.size)
+                dv.put(b_, a.reshape(-1))
+                return (b_, 0)
+            M, N = 5000, 300
+            dy, x = put(rng_a), put(rng_x)
+            mean, rstd = put(np.zeros(M)), put(np.ones(M))
+            DB, DG = put(np.zeros(N)), put(np.zeros(N))
+            dv.colsum(dy, x, mean, rstd, DG, DB, M, N, 1)
+            ids = put(ids_a, np.int32)
+            DE = put(np.zeros(50 * 16))
+            dv.embed_b(put(rows_a), ids, DE, len(ids_a), 16, 50)
+            acc = put(np.zeros(1))
+            dv.sumsq(dy, M * N, acc)
+            A, B, Cm = put(big_a), put(big_b), put(np.zeros(64 * 48))
+            dv.gemm(A, B, Cm, 64, 48, 4096, 1, 64, 48, 1, 48, passes=1)        # A transposed, long k (split-k)
+            return [dv.get(v[0], n) for v, n in ((DB, N), (DG, N), (DE, 800), (acc, 1), (Cm, 64 * 48))]
+        rng_a, rng_x = rng.normal(size=(5000, 300)), rng.normal(size=(5000, 300))
+        ids_a, rows_a = rng.integers(0, 50, 3000), rng.normal(size=(3000, 16))
+        big_a, big_b = rng.normal(size=(4096, 64)), rng.normal(size=(4096, 48))
+        one, two, ref = run(g), run(g), run(e)
+        for a_, b_, r_ in zip(one, two, ref):
+            np.testing.assert_array_equal(a_, b_)
+            self.assertLess(np.abs(a_ - r_).max() / (np.abs(r_).max() + 1e-9), 1e-2)
+
+    def test_products_with_sizes_not_multiples_of_4(self):
+        """A SwiGLU width such as 2730: zero-padded copies on the tiled kernels, both layouts of each operand, bias,
+        alpha and accumulate, against the emulator; the same bits on a second run."""
+        g, e = self.g, GT.Emulator(tc=self.g.tc)
+        rng = np.random.default_rng(8)
+        M, N, K = 258, 2730, 130
+
+        def pair(a):
+            a = np.ascontiguousarray(a)
+            bg, be = g.alloc(a.size), e.alloc(a.size)
+            g.put(bg, a.reshape(-1))
+            e.put(be, a.reshape(-1))
+            return (bg, 0), (be, 0)
+        A, At = pair(rng.normal(size=(M, K))), pair(rng.normal(size=(K, M)))
+        B, Bt = pair(rng.normal(size=(K, N))), pair(rng.normal(size=(N, K)))
+        bias, c0 = pair(rng.normal(size=N)), rng.normal(size=(M, N))
+        runs = []
+        for _ in range(2):
+            C = pair(c0)
+            for dv, i in ((g, 0), (e, 1)):
+                dv.gemm(A[i], B[i], C[i], M, N, K, K, 1, N, 1, N, beta=True, bias=bias[i], passes=1)
+                dv.gemm(At[i], Bt[i], C[i], M, N, K, 1, M, 1, K, N, beta=True, alpha=0.5, passes=1)
+            a, b = g.get(C[0][0], M * N), e.get(C[1][0], M * N)
+            self.assertLess(np.abs(a - b).max() / (np.abs(b).max() + 1e-9), 2e-3)
+            runs.append(a.copy())
+        np.testing.assert_array_equal(runs[0], runs[1])
 
     def test_every_kernel_matches_the_emulator(self):
         g, e = self.g, GT.Emulator(tc=self.g.tc)
@@ -183,7 +734,7 @@ class RealGpu(unittest.TestCase):
         same(S[0], S[1], Bh * 2 * T * T, 1e-5, "batched attention product")
         n = 1000
         x, y, out = pair(rng.normal(size=n)), pair(rng.normal(size=n)), pair(np.zeros(n))
-        for kind in range(7):
+        for kind in range(12):
             g.act_f(x[0], out[0], n, kind)
             e.act_f(x[1], out[1], n, kind)
             same(out[0], out[1], n, 1e-4, f"act_f {kind}")
@@ -218,6 +769,108 @@ class RealGpu(unittest.TestCase):
             dv.ce(Lg[i], Lb[i], dL[i], loss[i], Mr, V, 0.1, 0.2)
         same(dL[0], dL[1], Mr * V, 1e-5, "ce grad")
         same(loss[0], loss[1], 1, 1e-5, "ce loss")
+        # rotary positions (forward and inverse), sparse graph kernels, dot / scale / column copies
+        rows, hd, Hh, Tt = 2 * 12 * 3, 16, 3, 12
+        Xr, CS, SN = pair(rng.normal(size=rows * hd)), pair(rng.normal(size=Tt * hd // 2)), \
+            pair(rng.normal(size=Tt * hd // 2))
+        for sign in (1.0, -1.0):
+            for dv, i in ((g, 0), (e, 1)):
+                dv.rope(Xr[i], CS[i], SN[i], rows, hd, Hh, Tt, sign)
+            same(Xr[0], Xr[1], rows * hd, 1e-5, f"rope {sign}")
+        Nn, Ee, Hh, Ff = 37, 150, 3, 5
+        dst = np.sort(rng.integers(0, Nn, Ee))
+        off = np.concatenate([[0], np.cumsum(np.bincount(dst, minlength=Nn))]).astype(np.int32)
+        col = rng.integers(0, Nn, Ee).astype(np.int32)
+        perm = rng.permutation(Ee).astype(np.int32)
+        COL, OFF, PERM, ROW = pair(col), pair(off), pair(perm), pair(dst.astype(np.int32))
+        Xg, VAL = pair(rng.normal(size=(Nn, Hh * Ff))), pair(rng.normal(size=(Ee, Hh)))
+        Yg = pair(rng.normal(size=(Nn, Hh * Ff)))
+        for vals, vp, add in ((False, False, False), (True, False, False), (True, True, True)):
+            for dv, i in ((g, 0), (e, 1)):
+                dv.spmm(Xg[i], COL[i], VAL[i] if vals else None, PERM[i] if vp else None, OFF[i], Yg[i], Nn, Hh, Ff,
+                        add)
+            same(Yg[0], Yg[1], Nn * Hh * Ff, 1e-5, f"spmm {vals} {vp} {add}")
+        DA, Sg, Ag, DS = pair(np.zeros(Ee * Hh)), pair(rng.normal(size=Ee * Hh)), pair(np.zeros(Ee * Hh)), \
+            pair(np.zeros(Ee * Hh))
+        for dv, i in ((g, 0), (e, 1)):
+            dv.edge_dot(Yg[i], Xg[i], ROW[i], COL[i], DA[i], Ee, Hh, Ff)
+            dv.seg_softmax(Sg[i], OFF[i], Ag[i], Nn, Hh, 0.2)
+            dv.seg_softmax_b(Sg[i], Ag[i], DA[i], OFF[i], DS[i], Nn, Hh, 0.2)
+        same(DA[0], DA[1], Ee * Hh, 1e-5, "edge_dot")
+        same(Ag[0], Ag[1], Ee * Hh, 1e-5, "seg_softmax")
+        same(DS[0], DS[1], Ee * Hh, 1e-4, "seg_softmax_b")
+        acc, sc1 = pair(np.zeros(1)), pair(np.array([0.3]))
+        for dv, i in ((g, 0), (e, 1)):
+            dv.dot_acc(x[i], y[i], n, acc[i])
+            dv.scale_add(out[i], x[i], sc1[i], n, 1.0)
+        same(acc[0], acc[1], 1, 1e-5, "dot_acc")
+        same(out[0], out[1], n, 1e-5, "scale_add")
+        wide, part = pair(rng.normal(size=(20, 30))), pair(rng.normal(size=(20, 7)))
+        for back in (0, 1):
+            for dv, i in ((g, 0), (e, 1)):
+                dv.cols(part[i], wide[i], 20, 7, 30, 11, back)
+            same(wide[0], wide[1], 600, 1e-6, "cols")
+            same(part[0], part[1], 140, 1e-6, "cols back")
+        Mr2, Ex, kx = 50, 7, 3
+        LG, IX, GA = pair(rng.normal(size=(Mr2, Ex))), pair(np.zeros(Mr2 * kx, np.int32)), pair(np.zeros(Mr2 * kx))
+        DGa, DLg = pair(rng.normal(size=Mr2 * kx)), pair(np.zeros(Mr2 * Ex))
+        for dv, i in ((g, 0), (e, 1)):
+            dv.topk_gate(LG[i], IX[i], GA[i], Mr2, Ex, kx)
+            dv.topk_gate_b(GA[i], DGa[i], IX[i], DLg[i], Mr2, Ex, kx)
+        np.testing.assert_array_equal(g.get(IX[0][0], Mr2 * kx).view(np.int32), e.get(IX[1][0], Mr2 * kx).view(np.int32))
+        same(GA[0], GA[1], Mr2 * kx, 1e-5, "topk_gate")
+        same(DLg[0], DLg[1], Mr2 * Ex, 1e-5, "topk_gate_b")
+        cm = pair(rng.normal(size=12))
+        for dv, i in ((g, 0), (e, 1)):
+            dv.colmul(x[i], cm[i], out[i], 996, 12)
+        same(out[0], out[1], 996, 1e-6, "colmul")
+        T1, Wm, DY1, L1 = pair(rng.random(n)), pair((rng.random(n) < 0.5).astype(float)), pair(np.zeros(n)), \
+            pair(np.zeros(1))
+        for kind in (0, 1):
+            for wv in (None, Wm):
+                for dv, i in ((g, 0), (e, 1)):
+                    dv.fill(L1[i], 1, 0.0)
+                    dv.loss_ew(x[i], T1[i], wv[i] if wv is not None else None, DY1[i], L1[i], n, 0.01, 0.02, kind)
+                same(DY1[0], DY1[1], n, 1e-4, f"loss_ew {kind} grad")
+                same(L1[0], L1[1], 1, 1e-4, f"loss_ew {kind} loss")
+        Ni, Ci, Hi, Wi, kk_, st_, pd_ = 2, 3, 9, 7, 3, 2, 1
+        OHi, OWi = (Hi + 2 * pd_ - kk_) // st_ + 1, (Wi + 2 * pd_ - kk_) // st_ + 1
+        Xi = pair(rng.normal(size=(Ni, Ci, Hi, Wi)))
+        COLi = pair(np.zeros(Ni * OHi * OWi * Ci * kk_ * kk_))
+        DXi = pair(np.zeros(Ni * Ci * Hi * Wi))
+        for dv, i in ((g, 0), (e, 1)):
+            dv.im2col(Xi[i], COLi[i], Ni, Ci, Hi, Wi, kk_, kk_, st_, pd_, OHi, OWi)
+            dv.col2im(COLi[i], DXi[i], Ni, Ci, Hi, Wi, kk_, kk_, st_, pd_, OHi, OWi)
+        same(COLi[0], COLi[1], Ni * OHi * OWi * Ci * kk_ * kk_, 1e-6, "im2col")
+        same(DXi[0], DXi[1], Ni * Ci * Hi * Wi, 1e-5, "col2im")
+        Zp, Yp, Bp = pair(rng.normal(size=(2, 15, 4))), pair(np.zeros(120)), pair(rng.normal(size=4))
+        for dv, i in ((g, 0), (e, 1)):
+            dv.perm_nc(Zp[i], Yp[i], Bp[i], 2, 4, 15, 0)
+        same(Yp[0], Yp[1], 120, 1e-6, "perm_nc")
+        for dv, i in ((g, 0), (e, 1)):
+            dv.perm_nc(Zp[i], Yp[i], None, 2, 4, 15, 1)
+        same(Zp[0], Zp[1], 120, 1e-6, "perm_nc back")
+        Xq = pair(np.round(rng.normal(size=(3, 9, 7))))
+        Yq, DYq, DXq = pair(np.zeros(3 * 12)), pair(rng.normal(size=3 * 12)), pair(np.zeros(3 * 63))
+        for mode in (0, 1):
+            for dv, i in ((g, 0), (e, 1)):
+                dv.pool_f(Xq[i], Yq[i], 3, 9, 7, 2, mode)
+                dv.pool_b(Xq[i], Yq[i], DYq[i], DXq[i], 3, 9, 7, 2, mode)
+            same(Yq[0], Yq[1], 3 * 12, 1e-6, f"pool_f {mode}")
+            same(DXq[0], DXq[1], 3 * 63, 1e-6, f"pool_b {mode}")
+        nO = 777                                                    # the optimizers, plain and compensated
+        for comp in (False, True):
+            Po, Go, Mo, Vo, SQo, Co = (pair(rng.normal(size=nO)), pair(rng.normal(size=nO)), pair(np.zeros(nO)),
+                                       pair(np.zeros(nO)), pair(np.array([4.0])), pair(np.zeros(nO)))
+            for dv, i in ((g, 0), (e, 1)):
+                dv.adam(Po[i], Go[i], Mo[i], Vo[i], SQo[i], nO, 500, 1e-3, 0.9, 0.999, 1e-8, 0.1, 0.001, 0.01, 1.0,
+                        Co[i] if comp else None)
+                dv.sgd(Po[i], Mo[i], Vo[i], SQo[i], nO, 1e-2, 0.9, 0.0, Co[i] if comp else None)
+            same(Po[0], Po[1], nO, 1e-6, f"adam + sgd, compensated={comp}")
+            if comp:                                    # weight + carried rounding error: the same exact value
+                exact = [g.get(Po[0][0], nO).astype(np.float64) + g.get(Co[0][0], nO),
+                         e.get(Po[1][0], nO).astype(np.float64) + e.get(Co[1][0], nO)]
+                self.assertLess(np.abs(exact[0] - exact[1]).max() / np.abs(exact[1]).max(), 1e-6, "compensation")
         W, WQ = pair(rng.normal(size=(70, 48))), pair(np.zeros(70 * 48))
         for kind in range(6):
             g.fakeq(W[0], WQ[0], 70, 48, kind)
@@ -340,16 +993,22 @@ class RealGpu(unittest.TestCase):
                 e.put(views[name][1][0], a)
             for name, size in (("o", n), ("L", B * H * T), ("dd", B * H * T), ("dq", n), ("dk", n), ("dv", n)):
                 views[name] = [(g.alloc(size), 0), (e.alloc(size), 0)]
-            for i, dv_ in ((0, g), (1, e)):
-                V = {k_: v_[i] for k_, v_ in views.items()}
-                dv_.flash_fwd(V["q"], V["k"], V["v"], V["o"], V["L"], B, T, H, hd, causal, 0.125)
-                dv_.flash_dot(V["do"], V["o"], V["dd"], B, T, H, hd)
-                dv_.flash_bwd(V["q"], V["k"], V["v"], V["do"], V["L"], V["dd"], V["dq"], V["dk"], V["dv"], B, T, H,
-                              hd, causal, 0.125)
-            for name, size in (("o", n), ("L", B * H * T), ("dq", n), ("dk", n), ("dv", n)):
-                a, b_ = g.get(views[name][0][0], size), e.get(views[name][1][0], size)
-                err = np.abs(a - b_).max() / (np.abs(b_).max() + 1e-9)
-                self.assertLess(err, 2e-2, (name, B, T, H, hd, causal, err))
+            runs = []
+            for det in ("0", "1", "1"):                         # atomic dQ, then the deterministic pair twice
+                with mock.patch.dict(os.environ, {"APSI_GPU_DETERMINISTIC": det}):
+                    for i, dv_ in ((0, g), (1, e)):
+                        V = {k_: v_[i] for k_, v_ in views.items()}
+                        dv_.flash_fwd(V["q"], V["k"], V["v"], V["o"], V["L"], B, T, H, hd, causal, 0.125)
+                        dv_.flash_dot(V["do"], V["o"], V["dd"], B, T, H, hd)
+                        dv_.flash_bwd(V["q"], V["k"], V["v"], V["do"], V["L"], V["dd"], V["dq"], V["dk"], V["dv"],
+                                      B, T, H, hd, causal, 0.125)
+                for name, size in (("o", n), ("L", B * H * T), ("dq", n), ("dk", n), ("dv", n)):
+                    a, b_ = g.get(views[name][0][0], size), e.get(views[name][1][0], size)
+                    err = np.abs(a - b_).max() / (np.abs(b_).max() + 1e-9)
+                    self.assertLess(err, 2e-2, (det, name, B, T, H, hd, causal, err))
+                runs.append([g.get(views[k_][0][0], n) for k_ in ("dq", "dk", "dv")])
+            for a, b_ in zip(runs[1], runs[2]):
+                np.testing.assert_array_equal(a, b_)
 
     def test_training_on_the_card_matches_the_emulator(self):
         rng = np.random.default_rng(3)
@@ -387,3 +1046,147 @@ class Kernels(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class Bf16Hidden(unittest.TestCase):
+    """The hidden layer of every MLP (linear, activation, linear) kept in bfloat16: the four products that touch it
+    use their bfloat16 builds, and the training follows the float32 one closely (APSI_BF16_HIDDEN=0)."""
+
+    def test_engaged_and_close(self):
+        import os
+        from unittest import mock
+        from apsi.stdlib import adamw
+        seen = set()
+        orig = GT._Ops.gemm
+
+        def spy(self, *a, **k):
+            if k.get("bf"):
+                seen.add((k.get("epi"), k.get("a_act")))
+            return orig(self, *a, **k)
+        rng = np.random.default_rng(0)
+        X = rng.integers(0, 50, (64, 16))
+        Y = np.roll(X, -1, 1)
+        hist = {}
+        for mode in ("1", "0"):
+            with mock.patch.dict(os.environ, {"APSI_BF16_HIDDEN": mode}), mock.patch.object(GT._Ops, "gemm", spy):
+                m = L.transformer_lm(50, d=64, heads=1, layers=2, context=16)
+                r = GT.fit(m, m.init(seed=0), X, Y, loss="cross_entropy", opt=adamw(lr=1e-3), epochs=5,
+                           batch_size=16, verbose=False, ops=GT.Emulator())
+                hist[mode] = r.history
+        self.assertEqual(seen, {(1, None), (2, None), (None, 1), (3, None)})
+        np.testing.assert_allclose(hist["1"], hist["0"], rtol=2e-3)
+
+
+class HeldOutOnCard(unittest.TestCase):
+    def test_same_loss_as_the_host(self):
+        """The held-out cross-entropy computed on the card equals the host's float64 one (to float32 sums)."""
+        from apsi.stdlib import adamw
+        rng = np.random.default_rng(0)
+        X = rng.integers(0, 50, (80, 16))
+        Y = np.roll(X, -1, 1)
+        Y[70, 3] = -1                                    # a label left out
+        m = L.transformer_lm(50, d=64, heads=1, layers=1, context=16)
+        ops = GT.Emulator()
+        net = GT.Net(ops, m, m.init(seed=0))
+        card = GT._eval_ce_on_card(net, ops, (X[64:], Y[64:]), True, 16)
+        host = GT._eval_loss_host(lambda Xa: GT._forward_batches(net, ops, Xa, 16), (X[64:], Y[64:]), True,
+                                  "cross_entropy", None)
+        self.assertAlmostEqual(card, host, places=4)
+
+
+class Bf16Twin(unittest.TestCase):
+    """A layer norm's output written with its bfloat16 twin: the products reading it take the twin (no to_bf16
+    pass); a freed buffer's twin is forgotten."""
+
+    def _gpu(self):
+        import types
+        from apsi import gpu_train as GT
+        g = GT.Gpu.__new__(GT.Gpu)
+        g.launched = []
+        g._go = lambda name, grid, block, *a: g.launched.append(name)
+        g.fn = {"to_bf16": 1, "ln_f": 1}
+        g._twin, g._wcache, g._wrange, g._wgen = {}, {}, None, 0
+        g._calls, g._scr, g.used = {}, {}, 0
+        g.dev = types.SimpleNamespace(free=lambda p: None)
+        g._scratch = lambda key, n: (types.SimpleNamespace(ptr=0x900000, n=n), 0)
+        return g, GT
+
+    def test_twin_used_and_forgotten(self):
+        import types
+        g, GT = self._gpu()
+        Y = types.SimpleNamespace(ptr=0x100000, n=64)
+        Y16 = types.SimpleNamespace(ptr=0x200000, n=32)
+        W = types.SimpleNamespace(ptr=0x300000, n=64)
+        g.ln_f((Y, 0), (W, 0), None, (Y, 0), (W, 0), (W, 0), 8, 8, 1e-5, False, Y16=(Y16, 0))
+        args = [("p", 0x100000), ("p", 0x300000)] + [("u", 0)] * 30
+        out = g._h_args(args, 8, 8, 8)
+        self.assertEqual(out[0], ("p", 0x200000))                 # the twin, no conversion of A
+        self.assertEqual(g.launched.count("to_bf16"), 1)          # only B (not a twin) converted
+        g.free(Y16)
+        self.assertEqual(g._twin, {})
+        g._h_args(args, 8, 8, 8)
+        self.assertEqual(g.launched.count("to_bf16"), 3)
+
+
+class PrecisionDefault(unittest.TestCase):
+    def test_resolve(self):
+        from unittest import mock
+        from apsi import gpu_train as GT
+        with mock.patch.dict(os.environ, {"APSI_PRECISION": ""}):
+            self.assertEqual(GT.resolve_precision(None), "bf16")
+            self.assertEqual(GT.resolve_precision("auto"), "bf16")
+            self.assertEqual(GT.resolve_precision("tf32"), "fp32")
+            self.assertEqual(GT.resolve_precision("int8"), "int8")
+        with mock.patch.dict(os.environ, {"APSI_PRECISION": "fp32"}):
+            self.assertEqual(GT.resolve_precision("auto"), "fp32")
+            self.assertEqual(GT.resolve_precision("bf16"), "bf16")      # the argument wins
+
+
+class NoInPlaceProducts(unittest.TestCase):
+    """dy W^T never writes over its own dy: the gradient buffers are shared by nodes two apart, and a linear layer
+    with a fused activation made the layer two places on one of them (wrong results on the card, worse with the
+    weight gradient on a second stream)."""
+
+    def test_mlp_stack(self):
+        from apsi.stdlib import adamw
+        seen = []
+        orig = GT._Ops.gemm
+
+        def spy(self, A, B, C, *a, **k):
+            if A[0] is C[0] or B[0] is C[0]:
+                seen.append(a[:3])
+            return orig(self, A, B, C, *a, **k)
+        m = L.Sequential([L.Linear(8, 16), L.Activation("relu"), L.Linear(16, 16), L.Activation("relu"),
+                          L.Linear(16, 16), L.Activation("gelu"), L.Linear(16, 4)])
+        X = np.random.default_rng(0).standard_normal((32, 8)).astype(np.float32)
+        Y = np.zeros((32, 4), np.float32)
+        from unittest import mock
+        with mock.patch.object(GT._Ops, "gemm", spy):
+            GT.fit(m, m.init(seed=0), X, Y, loss="mse", opt=adamw(lr=1e-3), epochs=1, batch_size=32,
+                   verbose=False, ops=GT.Emulator())
+        self.assertEqual(seen, [])
+
+
+class QkvGradsBatched(unittest.TestCase):
+    def test_same_training_one_launch(self):
+        """x^T dq, x^T dk, x^T dv as one batched product: the same losses as three products."""
+        from unittest import mock
+        from apsi.stdlib import adamw
+        rng = np.random.default_rng(0)
+        X = rng.integers(0, 50, (32, 32))
+        Y = np.roll(X, -1, 1)
+        seen, res = [], {}
+        orig = GT._Ops.gemm
+
+        def spy(self, *a, **k):
+            if k.get("batch", (1, 1)) == (1, 3):
+                seen.append(1)
+            return orig(self, *a, **k)
+        for v in ("1", "0"):
+            with mock.patch.dict(os.environ, {"APSI_QKV_GRADS": v}), mock.patch.object(GT._Ops, "gemm", spy):
+                m = L.transformer_lm(50, d=64, heads=2, layers=2, context=32)
+                res[v] = GT.fit(m, m.init(seed=0), X, Y, loss="cross_entropy", opt=adamw(lr=1e-3), epochs=2,
+                                batch_size=16, verbose=False, ops=GT.Emulator()).history
+            if v == "1":
+                self.assertTrue(seen)
+        self.assertEqual(res["1"], res["0"])

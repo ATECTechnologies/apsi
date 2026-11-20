@@ -81,7 +81,8 @@ test("install, use, upgrade and uninstall", { timeout: 300000 }, async () => {
 
 test("two versions side by side: no uninstall, each kept in its own folder", { timeout: 300000 }, async () => {
   if (process.platform === "win32") return;               // the Windows run is covered by the Windows build
-  const resNew = fake.make("2.5.0");
+  const NEW = "9.9.0";                                  // newer than any real payload this test may run with
+  const resNew = fake.make(NEW);
   const sys = await core.detectSystem(RES);
   const opts = core.defaultOptions(sys);
   opts.components.editors = false;
@@ -89,7 +90,7 @@ test("two versions side by side: no uninstall, each kept in its own folder", { t
   const root = opts.dir;
 
   const sys2 = await core.detectSystem(resNew);
-  assert.strictEqual(sys2.version, "2.5.0");
+  assert.strictEqual(sys2.version, NEW);
   assert.strictEqual(sys2.existing, null, "a new version is a new install, not a change of the old one");
   assert.deepStrictEqual(sys2.installed.versions, [sys.version], "the older version is found");
   assert.strictEqual(path.resolve(sys2.installed.root), path.resolve(root), "same Apsi folder offered");
@@ -99,19 +100,19 @@ test("two versions side by side: no uninstall, each kept in its own folder", { t
   opts2.components.editors = false;
   const r2 = await core.install(opts2, hooksFor(resNew));
   assert.ok(r2.ok, r2.log && r2.log.join("\n"));
-  for (const v of [sys.version, "2.5.0"]) assert.ok(fs.existsSync(path.join(root, v, "install.json")), v);
-  assert.deepStrictEqual(core.installedVersions(root).map((x) => x.version).sort(core.compareVersions), [sys.version, "2.5.0"]);
-  assert.strictEqual(fs.readFileSync(path.join(root, "current.txt"), "utf8").trim(), "2.5.0");
+  for (const v of [sys.version, NEW]) assert.ok(fs.existsSync(path.join(root, v, "install.json")), v);
+  assert.deepStrictEqual(core.installedVersions(root).map((x) => x.version).sort(core.compareVersions), [sys.version, NEW]);
+  assert.strictEqual(fs.readFileSync(path.join(root, "current.txt"), "utf8").trim(), NEW);
   assert.ok(fs.existsSync(path.join(root, "bin", `apsi-${sys.version}`)));
-  assert.ok(fs.existsSync(path.join(root, "bin", "apsi-2.5.0")));
+  assert.ok(fs.existsSync(path.join(root, "bin", `apsi-${NEW}`)));
   // the shared launcher runs the current version; each per-version launcher tells it which one it is
   const pv = run(path.join(root, "bin", `apsi-${sys.version}`), ["version"]);
   assert.match(pv.stdout, /Apsi \d/);
 
   // removing the newer one switches back to the older one; removing the last removes the root
-  const left = await core.uninstall(path.join(root, "2.5.0"));
+  const left = await core.uninstall(path.join(root, NEW));
   assert.deepStrictEqual(left.left, [sys.version]);
-  assert.ok(!fs.existsSync(path.join(root, "2.5.0")));
+  assert.ok(!fs.existsSync(path.join(root, NEW)));
   assert.strictEqual(fs.readFileSync(path.join(root, "current.txt"), "utf8").trim(), sys.version);
   assert.match(run(bin(root), ["version"]).stdout, /Apsi \d/);
   assert.ok(fs.existsSync(path.join(tmpHome, ".local", "bin", "apsi")));

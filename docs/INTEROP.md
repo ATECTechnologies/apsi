@@ -49,7 +49,9 @@ let c_dot = lib.fn("dot", [ptr_f64, ptr_f64, i64], f64)
 print(c_dot(a, b, len(a)))
 ```
 
-- Types: `f64 f32 i32 i64 void cstr ptr_f64 ptr_f32 ptr_i32 ptr_i64`
+- Types: `f64 f32 i32 i64 void cstr ptr_f64 ptr_f32 ptr_i32 ptr_i64`; with `use ffi` also `u8 u16 u32 u64 i8 i16`,
+  `ptr_u8` and `ptr_void` (a bytearray, a tensor or a `use layout` view: C structs byte for byte, see
+  [EMBEDDED.md](EMBEDDED.md))
 - Tensors passed as `ptr_*` are **not copied**, so C code can write its results straight into an Apsi tensor
 - C++: wrap the functions in `extern "C" { ... }`
 - Rust: `#[no_mangle] pub extern "C" fn ...`, built as a `cdylib`

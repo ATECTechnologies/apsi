@@ -2,6 +2,21 @@ import React, { useEffect, useMemo, useRef, useState } from "react";
 import { bytes, PROFILES, COMPONENTS, INTEGRATION, PACKAGES } from "./format.js";
 
 const setup = () => window.setup;
+// eslint-disable-next-line no-undef
+const SETUP_VERSION = typeof __SETUP_VERSION__ === "string" ? __SETUP_VERSION__ : "";
+
+// the steps of an installation, in order (the same keys as installer-core's STEPS)
+const STAGES = [
+  ["integrity", "Verify"], ["prepare", "Prepare"], ["runtime", "Runtime"], ["content", "Examples & docs"],
+  ["launchers", "Commands"], ["path", "PATH"], ["assoc", ".apsi files"], ["gpu", "GPU helper"], ["shortcuts", "Shortcuts"],
+  ["editors", "Editors"], ["packages", "Packages"], ["security", "Security"], ["uninstaller", "Uninstaller"],
+  ["verify", "Self-test"],
+];
+
+function elapsed(ms) {
+  const s = Math.max(0, Math.round(ms / 1000));
+  return s < 60 ? `${s} s` : `${Math.floor(s / 60)} min ${String(s % 60).padStart(2, "0")} s`;
+}
 
 const FLOW = [
   { id: "welcome", title: "Welcome" },
@@ -64,6 +79,13 @@ export default function App() {
   const [showLog, setShowLog] = useState(false);
   const [finishActions, setFinishActions] = useState({ repl: true, examples: false, docs: false });
   const logRef = useRef(null);
+  const [startedAt, setStartedAt] = useState(0);
+  const [now, setNow] = useState(Date.now());
+  useEffect(() => {
+    if (step !== "install") return undefined;
+    const t = setInterval(() => setNow(Date.now()), 1000);
+    return () => clearInterval(t);
+  }, [step]);
 
   useEffect(() => {
     (async () => {
@@ -135,6 +157,7 @@ export default function App() {
   async function start() {
     setStep("install");
     setLog([]);
+    setStartedAt(Date.now());
     setProgress({ percent: 0, label: "Starting…" });
     let r;
     if (maintenance === "uninstall") {
@@ -386,10 +409,24 @@ export default function App() {
   function Install() {
     return (
       <div className="page">
-        <h1>{maintenance === "uninstall" ? "Removing Apsi" : "Installing Apsi"}</h1>
+        <h1>{maintenance === "uninstall" ? "Removing Apsi" : `Installing Apsi ${sys ? sys.version : ""}`}</h1>
         <p className="lead">{progress.label || "Working…"}</p>
-        <div className="progress"><div style={{ width: `${progress.percent || 0}%` }} /></div>
-        <div className="progress-pct">{Math.round(progress.percent || 0)}%</div>
+        <div className="progress active"><div style={{ width: `${progress.percent || 0}%` }} /></div>
+        <div className="progress-row">
+          <span className="progress-pct">{Math.round(progress.percent || 0)}%</span>
+          {startedAt > 0 && <span className="progress-time">{elapsed(now - startedAt)}</span>}
+        </div>
+        {maintenance !== "uninstall" && (
+          <ol className="stages">
+            {STAGES.map(([key, title]) => {
+              const cur = STAGES.findIndex((x) => x[0] === progress.step);
+              const i = STAGES.findIndex((x) => x[0] === key);
+              const cls = progress.step === "done" || (cur >= 0 && i < cur) ? "done" : i === cur ? "current" : "";
+              return <li key={key} className={cls}><span className="stage-dot">{cls === "done" ? "✓" : ""}</span>{title}</li>;
+            })}
+          </ol>
+        )}
+        {log.length > 0 && <div className="last-line" title={log[log.length - 1]}>{log[log.length - 1]}</div>}
         <button className="link" onClick={() => setShowLog(!showLog)}>{showLog ? "Hide details" : "Show details"}</button>
         {showLog && <pre className="log" ref={logRef}>{log.join("\n")}</pre>}
       </div>
@@ -455,7 +492,7 @@ export default function App() {
             </li>
           ))}
         </ol>
-        <div className="side-foot">Version {sys ? sys.version : "…"}</div>
+        <div className="side-foot"><div>Apsi {sys ? sys.version : "…"}</div>{SETUP_VERSION && <div className="side-foot-sub">Setup {SETUP_VERSION}</div>}</div>
       </aside>
       <main className="content">
         <header className="titlebar">

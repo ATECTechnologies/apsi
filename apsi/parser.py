@@ -165,6 +165,16 @@ class Parser:
         if tok.type != NAME or tok.value != word:
             return False
         nxt = self.peek(1)
+        if word == "with" and nxt.type == OP and nxt.value == "(":
+            # `with (a / b).open() as f:` or `with (x as a, y as b):` against a call `with(x)`: a with statement
+            # ends its line with ':'
+            k, last = 1, None
+            while True:
+                t = self.peek(k)
+                if t.type in (NEWLINE, EOF):
+                    break
+                last, k = t, k + 1
+            return last is not None and last.type == OP and last.value == ":"
         if nxt.type == OP and nxt.value in _NOT_STMT_AFTER:
             return False
         return nxt.type not in (NEWLINE, EOF, DEDENT) or word in ("pass",)
@@ -192,6 +202,8 @@ class Parser:
             return self.class_def([])
         if self._soft("with"):
             return self.with_stmt()
+        if self._soft("enum") and self.at(NAME, k=1) and self.peek(2).type == OP and self.peek(2).value == ":":
+            return self.enum_def()
         if tok.type == NAME and tok.value == "match" and not (self.peek(1).type == OP and self.peek(1).value in
                                                                _NOT_STMT_AFTER - {"(", "["}):
             m = self.try_match()
@@ -737,6 +749,46 @@ class Parser:
             return A.FnDef(name, shape_params, ps, ret, body, True, decos, **self.pos(tok))
         body = self.block()
         return A.FnDef(name, shape_params, ps, ret, body, False, decos, **self.pos(tok))
+
+    def enum_def(self):
+        """enum Name: A, B = 5, C   or one member per line below it (with = value). Becomes
+        let Name = enum_type("Name", [("A", none), ("B", 5), …])."""
+        kw = self.next()
+        name = self.expect_name(" after 'enum'")
+        self.expect_op(":", " after the enum's name")
+        members = []
+
+        def member():
+            t = self.expect_name(" (an enum member)")
+            val = self.expr() if self.accept_op("=") else A.NoneLit(**self.pos(t))
+            members.append(A.TupleLit([A.Str(t.value, **self.pos(t)), val], **self.pos(t)))
+        if self.at(NEWLINE):
+            self.expect_eol()
+            if not self.at(INDENT):
+                self.error("an enum needs its members (on the same line or indented below it)")
+            self.next()
+            while not self.at(DEDENT) and not self.at(EOF):
+                if self.at(NEWLINE):
+                    self.next()
+                    continue
+                member()
+                while self.accept_op(","):
+                    if self.at(NEWLINE):
+                        break
+                    member()
+                self.expect_eol()
+            if self.at(DEDENT):
+                self.next()
+        else:
+            member()
+            while self.accept_op(","):
+                member()
+            self.expect_eol()
+        if not members:
+            self.error("an enum needs at least one member")
+        p = self.pos(kw)
+        call = A.Call(A.Name("enum_type", **p), [A.Str(name.value, **p), A.ListLit(members, **p)], [], **p)
+        return A.Let([name.value], None, call, False, **p)
 
     def struct_def(self):
         tok = self.next()

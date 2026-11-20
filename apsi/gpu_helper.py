@@ -72,7 +72,115 @@ def handle(lib, req, key):
         mw = max(lim["min_mw"], min(lim["default_mw"], mw))          # never above the default
         r = lib.nvmlDeviceSetPowerManagementLimit(h, ctypes.c_uint(mw))
         return {"ok": r == 0, "mw": mw, "error": None if r == 0 else f"NVML error {r}"}
+    if op in ("fan", "fan_auto"):
+        return _fan(lib, h, None if op == "fan_auto" else req.get("percent"), int(req.get("gpu", 0) or 0))
     return {"ok": False, "error": f"unknown request '{op}'"}
+
+
+class _CoolerEntry(ctypes.Structure):
+    _fields_ = [("cooler_id", ctypes.c_uint), ("level", ctypes.c_uint), ("mode", ctypes.c_uint),
+                ("reserved", ctypes.c_uint * 8)]
+
+
+class _CoolerControl(ctypes.Structure):
+    _fields_ = [("version", ctypes.c_uint), ("unknown", ctypes.c_uint), ("count", ctypes.c_uint),
+                ("reserved", ctypes.c_uint * 8), ("entries", _CoolerEntry * 32)]
+
+
+_NVAPI = None
+
+
+def _nvapi():
+    """Windows: the driver's NvAPI fan-cooler control (what the vendors' own tuning tools use), for GeForce cards
+    whose NVML refuses to set fans. (handles, count, get_control, set_control) or None."""
+    global _NVAPI
+    if _NVAPI is not None:
+        return _NVAPI or None
+    _NVAPI = False
+    if os.name != "nt":
+        return None
+    try:
+        dll = ctypes.WinDLL("nvapi64.dll")
+        qi = dll.nvapi_QueryInterface
+        qi.restype, qi.argtypes = ctypes.c_void_p, [ctypes.c_uint]
+
+        def fn(fid, *argtypes):
+            addr = qi(fid)
+            return ctypes.CFUNCTYPE(ctypes.c_int, *argtypes)(addr) if addr else None
+        init = fn(0x0150E828)
+        enum = fn(0xE5AC921F, ctypes.c_void_p, ctypes.POINTER(ctypes.c_uint))
+        getc = fn(0x814B209F, ctypes.c_void_p, ctypes.POINTER(_CoolerControl))
+        setc = fn(0xA58971A5, ctypes.c_void_p, ctypes.POINTER(_CoolerControl))
+        if not (init and enum and getc and setc) or init() != 0:
+            return None
+        handles, cnt = (ctypes.c_void_p * 64)(), ctypes.c_uint()
+        if enum(ctypes.cast(handles, ctypes.c_void_p), ctypes.byref(cnt)) != 0 or not cnt.value:
+            return None
+        _NVAPI = (handles, cnt.value, getc, setc)
+    except Exception:                                   # noqa: BLE001
+        return None
+    return _NVAPI
+
+
+def _nvapi_fan(index, percent):
+    api = _nvapi()
+    if api is None:
+        return {"ok": False, "error": "NvAPI fan control is not available"}
+    handles, count, getc, setc = api
+    if index >= count:
+        return {"ok": False, "error": f"NvAPI has no GPU {index}"}
+    c = _CoolerControl()
+    c.version = ctypes.sizeof(_CoolerControl) | (1 << 16)
+    r = getc(handles[index], ctypes.byref(c))
+    if r != 0 or not c.count:
+        return {"ok": False, "error": f"NvAPI fan control read failed ({r})"}
+    for i in range(min(c.count, 32)):
+        e = c.entries[i]
+        if percent is None:
+            e.mode = 0
+        else:
+            e.mode, e.level = 1, max(30, min(100, int(percent)))
+    r = setc(handles[index], ctypes.byref(c))
+    if r != 0:
+        return {"ok": False, "error": f"NvAPI fan control refused ({r})"}
+    chk = _CoolerControl()
+    chk.version = c.version
+    if percent is not None and (getc(handles[index], ctypes.byref(chk)) != 0 or chk.entries[0].mode != 1):
+        return {"ok": False, "error": "NvAPI accepted the fan speed but the card did not take it"}
+    return {"ok": True, "fans": int(c.count), "via": "nvapi"}
+
+
+def _fan(lib, h, percent, index=0):
+    """Every fan of the card at percent (30-100), or back to the driver's own curve (percent None): through NVML,
+    or on Windows through NvAPI when NVML refuses (GeForce cards)."""
+    r = _fan_nvml(lib, h, percent)
+    if not r.get("ok") and os.name == "nt":
+        alt = _nvapi_fan(index, percent)
+        if alt.get("ok"):
+            return alt
+        r["error"] = f"{r.get('error')}; {alt.get('error')}"
+    return r
+
+
+def _fan_nvml(lib, h, percent):
+    n = ctypes.c_uint(1)
+    try:
+        if lib.nvmlDeviceGetNumFans(h, ctypes.byref(n)) != 0:
+            n.value = 1
+    except AttributeError:
+        n.value = 1
+    errs = []
+    for i in range(max(1, n.value)):
+        try:
+            if percent is None:
+                r = lib.nvmlDeviceSetDefaultFanSpeed_v2(h, ctypes.c_uint(i))
+            else:
+                r = lib.nvmlDeviceSetFanSpeed_v2(h, ctypes.c_uint(i), ctypes.c_uint(max(30, min(100, int(percent)))))
+        except AttributeError:
+            return {"ok": False, "error": "this driver cannot set fan speeds (NVML 520 or newer is needed)"}
+        if r:
+            errs.append(f"fan {i}: NVML error {r}")
+    return {"ok": not errs, "fans": n.value, "error": "; ".join(errs) or None}
 
 
 def serve(start_limit=None):
@@ -177,6 +285,8 @@ def setup(start_limit=None):
     if sys.platform.startswith("win"):
         w = os.path.join(os.path.dirname(exe), "pythonw.exe")
         exe = w if os.path.exists(w) else exe
+        # a helper already running (from this or another Apsi version) is stopped first: one helper at a time
+        subprocess.run(["schtasks", "/End", "/TN", TASK], capture_output=True, text=True)
         user = f"{os.environ.get('USERDOMAIN', '')}\\{os.environ.get('USERNAME', '')}".strip("\\")
         cmd = ["schtasks", "/Create", "/TN", TASK, "/TR", f'"{exe}" "{script}" serve', "/SC", "ONLOGON",
                "/RL", "HIGHEST", "/RU", user, "/IT", "/F"]

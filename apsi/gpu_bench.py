@@ -1,0 +1,516 @@
+"""apsi gpu bench: how fast Apsi's own GPU trainer trains on this machine, and whether every kernel is right here.
+
+    apsi gpu bench              the 127 M-parameter GPT (10 blocks, d=1024, 16 heads, context 128, batch 32), bf16
+    apsi gpu bench 11m          the 10.9 M GPT of docs/GPU.md
+    apsi gpu bench modern       a 127 M LLaMA / Qwen3-style model (grouped heads, rotary positions, q/k norms, SwiGLU)
+    apsi gpu bench check        every new kernel and layer on this card against the exact reference (the Emulator)
+    apsi gpu bench cards        one model split across every card against one card (needs 2 cards or more)
+
+Reports tokens per second (steady, after the first steps), the time of each kind of kernel, the temperature, the
+power and the energy per token, and ends with one JSON line to send back when asking for tuning. The data is random
+tokens made here: nothing is downloaded."""
+import json
+import os
+import sys
+import threading
+import time
+
+import numpy as np
+
+CONFIGS = {
+    "127m": dict(vocab=256, d=1024, heads=16, layers=10, context=128, batch=32),
+    "11m": dict(vocab=256, d=384, heads=6, layers=6, context=128, batch=32),
+    "modern": dict(vocab=256, d=1024, heads=16, layers=10, context=128, batch=32, kv_heads=4, rope=True,
+                   qk_norm=True, norm="rms", ffn="swiglu"),
+}
+
+
+class _Sampler:
+    """Temperature and power of every card, five times a second, while a run goes on."""
+
+    def __init__(self):
+        from . import thermal
+        self.rep, self.rows, self.stop = thermal.gpu_report, [], threading.Event()
+        self.t = threading.Thread(target=self._run, daemon=True)
+
+    def _run(self):
+        while not self.stop.is_set():
+            try:
+                self.rows.append((time.perf_counter(), self.rep()))
+            except Exception:                               # noqa: BLE001
+                pass
+            self.stop.wait(0.2)
+
+    def __enter__(self):
+        self.t.start()
+        return self
+
+    def __exit__(self, *a):
+        self.stop.set()
+        self.t.join(timeout=2)
+
+    def summary(self):
+        if not self.rows:
+            return {}
+        temps = [r[0]["temperature_c"] for _, r in self.rows if r and r[0].get("temperature_c") is not None]
+        pw = [r[0]["power_w"] for _, r in self.rows if r and r[0].get("power_w")]
+        mhz = [r[0]["graphics_mhz"] for _, r in self.rows if r and r[0].get("graphics_mhz")]
+        out = {"card": self.rows[-1][1][0]["name"] if self.rows[-1][1] else None}
+        if temps:
+            out.update(temperature_c_mean=round(float(np.mean(temps)), 1), temperature_c_max=max(temps))
+        if pw:
+            out.update(power_w_mean=round(float(np.mean(pw)), 1), power_w_max=max(pw))
+        if mhz:
+            out.update(clock_mhz_mean=round(float(np.mean(mhz))))
+        return out
+
+
+def _data(cfg, steps, seed=0):
+    rng = np.random.default_rng(seed)
+    n = cfg["batch"] * steps
+    ids = rng.integers(0, cfg["vocab"], (n, cfg["context"] + 1))
+    return ids[:, :-1], ids[:, 1:]
+
+
+def bench(which="127m", steps=40, precision="auto", out=sys.stdout):
+    from . import layers as L, gpu_train as GT
+    from .stdlib import adamw
+    cfg = dict(CONFIGS[which])
+    ops, why = GT.device("cuda")
+    if ops is None:
+        print(f"no GPU: {why}", file=out)
+        return 1
+    block = {k: cfg.pop(k) for k in ("kv_heads", "rope", "qk_norm", "norm", "ffn") if k in cfg}
+    batch = cfg.pop("batch")
+    model = L.transformer_lm(cfg["vocab"], d=cfg["d"], heads=cfg["heads"], layers=cfg["layers"],
+                             context=cfg["context"], **block)
+    params = model.init(seed=0)
+    count = sum(int(np.asarray(a).size) for a in __import__("apsi.values", fromlist=["x"]).tree_leaves(params)
+                if isinstance(a, np.ndarray))
+    X, Y = _data(dict(cfg, batch=batch), steps)
+    tokens = X.size
+    print(f"{which}: {count / 1e6:.1f} M parameters, batch {batch} x {cfg['context']}, {steps} steps, "
+          f"precision {precision}, {getattr(ops, 'name', '?')}", file=out)
+    warm = 3                                                  # first steps: the products are timed and chosen
+    GT.fit(model, params, X[:warm * batch], Y[:warm * batch], loss="cross_entropy", opt=adamw(lr=1e-3), epochs=1,
+           batch_size=batch, verbose=False, precision=precision, ops=ops)
+    # a short run first: its time against the long one's leaves fit's own start and end (the weights to the card
+    # and back) out of the steady speed, the number a long training run sees
+    short = max(1, steps // 3)
+    ops.sync()
+    t0 = time.perf_counter()
+    GT.fit(model, params, X[:short * batch], Y[:short * batch], loss="cross_entropy", opt=adamw(lr=1e-3), epochs=1,
+           batch_size=batch, verbose=False, precision=precision, ops=ops)
+    ops.sync()
+    wall_short = time.perf_counter() - t0
+    with _Sampler() as smp:
+        ops.sync()
+        n0, c0 = getattr(ops, "launches", 0), time.thread_time()
+        t0 = time.perf_counter()
+        r = GT.fit(model, params, X, Y, loss="cross_entropy", opt=adamw(lr=1e-3), epochs=1, batch_size=batch,
+                   verbose=False, precision=precision, ops=ops)
+        ops.sync()
+        wall = time.perf_counter() - t0
+        cpu, nl = time.thread_time() - c0, getattr(ops, "launches", 0) - n0
+    tps = tokens / wall
+    card = smp.summary()
+    # the kernels of a few steps, timed on the card's own clock
+    prof = {}
+    try:
+        ops.start_profile()
+        GT.fit(model, r.params, X[:4 * batch], Y[:4 * batch], loss="cross_entropy", opt=adamw(lr=1e-3), epochs=1,
+               batch_size=batch, verbose=False, precision=precision, ops=ops)
+        prof = ops.stop_profile()
+    except Exception as e:                                    # noqa: BLE001
+        print(f"(no kernel profile: {e})", file=out)
+    k_total = sum(t for t, _ in prof.values())
+    k_tps = 4 * batch * cfg["context"] / k_total if k_total else None
+    steady = (steps - short) * batch * cfg["context"] / (wall - wall_short) if steps > short and wall > wall_short \
+        else None
+    print(f"\n  {tps:,.0f} tokens/s over {wall:.1f} s (loss {r.history[0]:.3f})", file=out)
+    if steady:
+        print(f"  {steady:,.0f} tokens/s steady (fit's own start and end left out: the speed of a long run)", file=out)
+    if k_tps:
+        print(f"  {k_tps:,.0f} tokens/s if the card did nothing but these kernels "
+              f"(the rest is waiting: launches, the processor, cooling)", file=out)
+    if nl:
+        print(f"  {nl / steps:.0f} kernel launches a step; the processor busy {1000 * cpu / steps:.1f} ms of each "
+              f"{1000 * wall / steps:.1f} ms step (the thread that launches)", file=out)
+    if card.get("temperature_c_mean") is not None:
+        line = f"  {card.get('card')}: {card.get('temperature_c_mean')} C mean, {card.get('temperature_c_max')} C max"
+        if card.get("power_w_mean"):
+            jt = card["power_w_mean"] / tps
+            card["joules_per_1k_tokens"] = round(1000 * jt, 2)
+            line += f", {card['power_w_mean']} W mean ({1000 * jt:.2f} J per 1,000 tokens)"
+        if card.get("clock_mhz_mean"):
+            line += f", {card['clock_mhz_mean']} MHz"
+        print(line, file=out)
+    if r.gpu_temperature:
+        print(f"  temperature control: {r.gpu_temperature}", file=out)
+    if prof:
+        groups = {}
+        for name, (t, c) in prof.items():
+            g = name.split(" ")[0]
+            gt, gc = groups.get(g, (0.0, 0))
+            groups[g] = (gt + t, gc + c)
+        print("\n  kernel                       share    ms/step", file=out)
+        for g, (t, c) in sorted(groups.items(), key=lambda kv: -kv[1][0])[:14]:
+            print(f"  {g:<28} {100 * t / k_total:5.1f} %  {1000 * t / 4:8.2f}", file=out)
+        # every product by shape and build: its speed in TFLOPS (bfloat16 tensor-core peak of an RTX 3060: ~25)
+        rows, gem_t, gem_f = [], 0.0, 0.0
+        for name, (t, c) in prof.items():
+            parts = name.split(" ")
+            if not parts[0].startswith("gemm") or len(parts) < 2:
+                continue
+            try:
+                M, N, K = (int(x) for x in parts[1].split("x"))
+            except ValueError:
+                continue
+            nb = int(parts[2][1:]) if len(parts) > 2 and parts[2].startswith("b") else 1
+            fl = 2.0 * M * N * K * nb * c
+            gem_t += t
+            gem_f += fl
+            rows.append((t, name, c, fl / t / 1e12 if t else 0.0))
+        if rows:
+            print(f"\n  products: {100 * gem_t / k_total:.1f} % of the card's time, {gem_f / gem_t / 1e12:.1f} TFLOPS "
+                  f"on average", file=out)
+            print("  product (build, M x N x K)                          launches  ms/step  TFLOPS", file=out)
+            for t, name, c, tf in sorted(rows, reverse=True)[:30]:
+                print(f"  {name:<52} {c // 4:>5} {1000 * t / 4:8.2f}  {tf:6.1f}", file=out)
+    rec = {"bench": which, "params_m": round(count / 1e6, 1), "precision": precision, "tokens_per_s": round(tps),
+           "steady_tokens_per_s": round(steady) if steady else None,
+           "kernel_tokens_per_s": round(k_tps) if k_tps else None, "card": card,
+           "kernels_ms_per_step": {g: round(1000 * t / 4, 3) for g, (t, _) in prof.items()} if prof else {},
+           "apsi": __import__("apsi").__version__}
+    print("\nsend this line back for tuning:\n" + json.dumps(rec, separators=(",", ":")), file=out)
+    return 0
+
+
+def check(out=sys.stdout):
+    """The new layers on this card against the Emulator: a short training each, the same losses expected."""
+    from . import layers as L, gpu_train as GT, graphs as GR
+    from .stdlib import Adam
+    ops, why = GT.device("cuda")
+    if ops is None:
+        print(f"no GPU: {why}", file=out)
+        return 1
+    rng = np.random.default_rng(0)
+    ids = rng.integers(0, 50, (32, 24))
+    lab = np.roll(ids, -1, 1)
+    N = 60
+    e = rng.integers(0, N, (240, 2)).tolist()
+    g = L.graph(edges=e, n=N, types=rng.integers(0, 3, 240), batch=np.repeat(np.arange(4), 15),
+                edge_features=rng.normal(size=(240, 3)))
+    Xg, yg, mask = rng.normal(size=(N, 16)), rng.integers(0, 3, N), rng.random(N) < 0.6
+    cases = [
+        ("gpt", L.transformer_lm(50, d=64, heads=4, layers=2, context=24), ids, lab, {}),
+        ("llama/qwen3 block", L.transformer_lm(50, d=64, heads=4, layers=2, context=24, kv_heads=2, rope=True,
+                                               qk_norm=True, norm="rms", ffn="swiglu"), ids, lab, {}),
+        ("mixture of experts", L.transformer_lm(50, d=64, heads=4, layers=2, context=24, ffn="moe", experts=4,
+                                                top_k=2, norm="rms"), ids, lab, {}),
+        ("gat", L.gat_net(16, 8, 3, dropout=0.0), Xg, yg, dict(graph=g, mask=mask)),
+        ("gcn / gin", L.Sequential([L.GCN(16, 32), L.Activation("elu"), L.GIN(32, 3)]), Xg, yg,
+         dict(graph=g, mask=mask)),
+        ("gine (edge features)", L.Sequential([L.GINE(16, 32, 3), L.Activation("elu"), L.GINE(32, 3, 3)]), Xg, yg,
+         dict(graph=g, mask=mask)),
+        ("graph transformer", GR.graph_transformer_net(16, 32, 3, layers=2, heads=4, relations=3, max_keys=8), Xg,
+         yg, dict(graph=g, mask=mask)),
+        ("cnn", L.cnn(3, 4, image=12, channels=(8, 8), dense_width=16), rng.normal(size=(16, 3, 12, 12)),
+         rng.integers(0, 4, 16), {}),
+        ("lstm / gru", L.Sequential([L.LSTMLayer(8, 16), L.GRULayer(16, 16, False), L.Linear(16, 3)]),
+         rng.normal(size=(16, 10, 8)), rng.integers(0, 3, 16), {}),
+    ]
+    bad = 0
+    from . import pinn, ops as aops
+    T = np.linspace(0, 2, 40)[:, None]
+
+    def osc(x, u, du, d2u):
+        r_ = d2u[:, 0, 0] + 4.0 * u[:, 0]
+        return aops.mean(r_ * r_) + 10 * ((u[0, 0] - 1) ** 2 + du[0, 0, 0] ** 2)
+    pm = L.mlp([1, 24, 24, 1], "tanh")
+    runs = [np.asarray(pinn.fit(pm, pm.init(seed=0), T, osc, epochs=30, opt=Adam(0.01), backend=be, ops_=o_,
+                                verbose=False).history) for be, o_ in (("gpu", ops), ("numpy", None))]
+    err = float(np.max(np.abs(runs[0] - runs[1]) / (np.abs(runs[1]) + 1e-6)))
+    bad += err >= 1e-3
+    print(f"  {'ok  ' if err < 1e-3 else 'FAIL'} {'physics-informed net':<22} losses {runs[0][0]:.4f} -> "
+          f"{runs[0][-1]:.4f}  (reference {runs[1][-1]:.4f}, difference {err:.1e})", file=out)
+    for name, m, X, Y, kw in cases:
+        runs = []
+        for o in (ops, GT.Emulator(tc=ops.tc)):
+            r = GT.fit(m, m.init(seed=0), X, Y, loss="cross_entropy", opt=Adam(3e-3), epochs=3,
+                       batch_size=None if kw else 8, verbose=False, precision="fp32", ops=o, **kw)
+            runs.append(np.asarray(r.history))
+        err = float(np.max(np.abs(runs[0] - runs[1]) / (np.abs(runs[1]) + 1e-6)))
+        ok = err < 1e-3
+        bad += not ok
+        print(f"  {'ok  ' if ok else 'FAIL'} {name:<22} losses {runs[0][0]:.4f} -> {runs[0][-1]:.4f}  "
+              f"(reference {runs[1][-1]:.4f}, difference {err:.1e})", file=out)
+    bad += _check_typed_graphs(ops, out)
+    bad += _check_tensors(ops, out)
+    bad += _check_flow(ops, out)
+    print("every kernel agrees on this card" if not bad else f"{bad} differ: send this output back", file=out)
+    return 1 if bad else 0
+
+
+def typed_graph_batches(sizes=(3, 2, 4, 3, 2, 3, 2, 4), seed=0):
+    """Batches of heterogeneous graphs (4 node types, 3 relations, 10 to 25 nodes each) with a class per graph that
+    depends on the graph's structure: (node features, classes, graph) for fit_batches."""
+    from . import layers as L
+    rng = np.random.default_rng(seed)
+    out = []
+    for G in sizes:
+        feats, edges, rel, ntype, batch, ys, off = [], [], [], [], [], [], 0
+        for gi in range(int(G)):
+            n = int(rng.integers(10, 26))
+            t = rng.integers(0, 4, n)
+            e = rng.integers(0, n, (2 * n, 2))
+            feats.append(rng.normal(size=(n, 8)) + t[:, None] * 0.5)
+            edges.append(e + off)
+            rel.append(rng.integers(0, 3, len(e)))
+            ntype.append(t)
+            batch.append(np.full(n, gi))
+            ys.append(int((t == 0).sum() + (t == 2).sum()) % 3)
+            off += n
+        g = L.graph(edges=np.concatenate(edges).tolist(), n=off, types=np.concatenate(rel),
+                    node_types=np.concatenate(ntype), batch=np.concatenate(batch))
+        out.append((np.concatenate(feats), np.array(ys), g))
+    return out
+
+
+def typed_graph_model():
+    """A heterogeneous graph model: two hgt layers over typed nodes and relations, global attention, a mean per
+    graph and a class per graph."""
+    from . import layers as L, graphs as GR
+    return L.Sequential([L.Linear(8, 16), GR.HGT(16, 2, types=4, relations=3), GR.HGT(16, 2, types=4, relations=3),
+                         GR.GlobalAttention(16, 2, max_keys=8), L.GraphPool("mean"), L.Linear(16, 3)])
+
+
+def typed_graph_dag():
+    """typed_graph_model as a dag of many nodes (two branches of hgt layers, a pool and a head each, joined): for
+    training split across cards, frozen parts, every optimizer."""
+    from . import layers as L, graphs as GR
+    nodes = [["inp", L.Linear(8, 16), "nodes"]]
+    for k, layers in (("a", 2), ("b", 3)):
+        last = "inp"
+        for i in range(layers):
+            nodes.append([f"h{k}{i}", GR.HGT(16, 2, types=4, relations=3), last])
+            last = f"h{k}{i}"
+        nodes += [[f"ga{k}", GR.GlobalAttention(16, 2, max_keys=8), last], [f"pool{k}", L.GraphPool("mean"), f"ga{k}"],
+                  [f"sem{k}", L.Sequential([L.Linear(16, 16), L.Activation("gelu"), L.Linear(16, 16)]), f"pool{k}"]]
+    nodes += [["both", L.Combine("concat"), ["sema", "semb"]], ["head", L.Linear(32, 3), "both"]]
+    return L.DAG(nodes, inputs=["nodes"], output="head")
+
+
+def _check_typed_graphs(ops, out):
+    """Heterogeneous graph layers (hgt, global attention, a pool per graph) with batches of graphs and exact
+    gradient sums: this card against the Emulator, and the same weights twice."""
+    from . import gpu_train as GT
+    from .stdlib import Adam
+    from .values import tree_leaves
+    m = typed_graph_model()
+    batches = typed_graph_batches()
+    kw = dict(epochs=2, verbose=False, precision="fp32", accumulate=4)
+    runs = [GT.fit_batches(m, m.init(seed=0), batches, "cross_entropy", opt=Adam(3e-3), ops=o, **kw)
+            for o in (ops, ops, GT.Emulator(tc=ops.tc))]
+    err = float(np.max(np.abs(np.asarray(runs[0].history) - runs[2].history) / (np.abs(runs[2].history) + 1e-6)))
+    same = all(np.array_equal(np.asarray(a), np.asarray(b))
+               for a, b in zip(tree_leaves(runs[0].params), tree_leaves(runs[1].params)))
+    ok = err < 1e-3 and same
+    print(f"  {'ok  ' if ok else 'FAIL'} {'hetero graphs, exact sums':<22} losses {runs[0].history[0]:.4f} -> "
+          f"{runs[0].history[-1]:.4f}  (reference {runs[2].history[-1]:.4f}, difference {err:.1e}, "
+          f"{'the same weights twice' if same else 'NOT the same weights twice'})", file=out)
+    return 0 if ok else 1
+
+
+def _check_flow(ops, out):
+    """A transformer on the fused attention (bfloat16 products): the same weights twice (no atomic additions,
+    attention's backward included), and the time a step with copies queued behind the kernels against copies that
+    wait for the card."""
+    import os
+    import time
+    from unittest import mock
+    from . import gpu_train as GT, layers as L
+    from .stdlib import Adam
+    from .values import tree_leaves
+    rng = np.random.default_rng(4)
+    lm = L.transformer_lm(256, d=128, heads=2, layers=2, context=128)
+    batches = [(rng.integers(0, 256, (8, 128)), rng.integers(0, 256, (8, 128))) for _ in range(24)]
+    kw = dict(epochs=2, verbose=False, precision="auto", ops=ops)
+    runs, secs = [], {"0": 1e9, "1": 1e9}
+    for mode in ("1", "1", "0", "1", "0"):             # the first run builds and tunes; then the best of two each
+        with mock.patch.dict(os.environ, {"APSI_GPU_ASYNC_COPY": mode}):
+            ops.drop_ring()
+            ring = ops._ring_ready() and ops._ring["made_s"]
+            ops.sync()
+            t0 = time.perf_counter()
+            runs.append(GT.fit_batches(lm, lm.init(seed=0), batches, "cross_entropy", opt=Adam(1e-3), **kw))
+            ops.sync()
+            if len(runs) > 1:
+                secs[mode] = min(secs[mode], time.perf_counter() - t0)
+    ops.drop_ring()
+    same = all(np.array_equal(np.asarray(a), np.asarray(b)) for r in runs[1:]
+               for a, b in zip(tree_leaves(runs[0].params), tree_leaves(r.params)))
+    steps = 2 * len(batches)
+    print(f"  {'ok  ' if same else 'FAIL'} {'flow (fused attention)':<22} losses {runs[0].history[0]:.4f} -> "
+          f"{runs[0].history[-1]:.4f}  ({'the same weights twice' if same else 'NOT the same weights twice'}; "
+          f"{1e3 * secs['1'] / steps:.2f} ms a step with queued copies, {1e3 * secs['0'] / steps:.2f} ms waiting; "
+          f"pinned memory in {1e3 * (ring or 0):.0f} ms)",
+          file=out)
+    return 0 if same else 1
+
+
+def _check_tensors(ops, out):
+    """gpu_tensor on this card against NumPy."""
+    from .gpu_tensor import gpu_tensor
+    rng = np.random.default_rng(1)
+    a, w, b = rng.normal(size=(64, 96)), rng.normal(size=(96, 32)), rng.normal(size=32)
+    A, W = gpu_tensor(a, "cuda"), gpu_tensor(w, "cuda")
+    z = a @ w + b
+    ref = [0.5 * z * (1 + np.tanh(np.sqrt(2 / np.pi) * (z + 0.044715 * z ** 3))), a.T @ a,
+           np.exp(z - z.max(-1, keepdims=True)) / np.exp(z - z.max(-1, keepdims=True)).sum(-1, keepdims=True),
+           a.sum(0)]
+    got = [(A @ W + b).gelu(), A.T @ A, (A @ W + b).softmax(), A.sum(0)]
+    pa = np.abs(a) + 0.1
+    P = gpu_tensor(pa, "cuda")
+    ref += [np.exp(np.clip(a, -20, 20)), np.log(pa), np.sqrt(pa), a / pa, pa ** 1.7]
+    got += [gpu_tensor(np.clip(a, -20, 20), "cuda").exp(), P.log(), P.sqrt(), A / P, P ** 1.7]
+    err = max(float(np.max(np.abs(np.asarray(g_) - r_)) / (np.max(np.abs(r_)) + 1e-12)) for g_, r_ in zip(got, ref))
+    ok = err < 1e-4
+    print(f"  {'ok  ' if ok else 'FAIL'} {'gpu_tensor':<22} products, activations, softmax, sums, exp, log, sqrt, / "
+          f"(difference {err:.1e})", file=out)
+    return 0 if ok else 1
+
+
+GEMM_SHAPES = (               # (label, M, N, K, A k-contiguous, B n-contiguous): the 127 M GPT's large products
+    ("x W      4096 x 1024 x 1024", 4096, 1024, 1024, True, True),
+    ("x W1     4096 x 4096 x 1024", 4096, 4096, 1024, True, True),
+    ("h W2     4096 x 1024 x 4096", 4096, 1024, 4096, True, True),
+    ("dy W^T   4096 x 1024 x 1024", 4096, 1024, 1024, True, False),
+    ("dy W2^T  4096 x 4096 x 1024", 4096, 4096, 1024, True, False),
+    ("x^T dy   1024 x 1024 x 4096", 1024, 1024, 4096, False, True),
+    ("x^T dy1  1024 x 4096 x 4096", 1024, 4096, 4096, False, True),
+)
+
+
+def gemm(out=sys.stdout, reps=20):
+    """apsi gpu bench gemm: every build of the matrix product on this card, for the large shapes of a 127 M GPT:
+    its error against the exact product of the same bfloat16 inputs (float64 on the processor) and its speed in
+    TFLOPS. A build whose error is above bfloat16's own is marked WRONG."""
+    from . import gpu_train as GT
+    ops, why = GT.device("cuda")
+    if ops is None:
+        print(f"no GPU: {why}", file=out)
+        return 1
+    builds = ["a", "x", "w", "v", "e", "g", "s"]
+    rng = np.random.default_rng(0)
+    print(f"{getattr(ops, 'name', '?')}: matrix products, every build (TFLOPS; error relative to the largest value)",
+          file=out)
+    print(f"  {'product':<30}" + "".join(f"{b:>14}" for b in builds), file=out)
+    bad = 0
+    for label, M, N, K, akc, bnc in GEMM_SHAPES:
+        a = rng.standard_normal((M, K)).astype(np.float32)
+        bm = (rng.standard_normal((K, N)) / np.sqrt(K)).astype(np.float32)
+
+        def bf(x):
+            u = x.view(np.uint32).astype(np.uint64)
+            u = ((u + 0x7FFF + ((u >> 16) & 1)) >> 16) << 16
+            return u.astype(np.uint32).view(np.float32)
+        ref = bf(a).astype(np.float64) @ bf(bm).astype(np.float64)
+        A, B, Cb = ops.alloc(M * K), ops.alloc(K * N), ops.alloc(M * N)
+        ops.put(A, (a if akc else np.ascontiguousarray(a.T)).reshape(-1))
+        ops.put(B, (bm if bnc else np.ascontiguousarray(bm.T)).reshape(-1))
+        sam, sak = (K, 1) if akc else (1, M)
+        sbk, sbn = (N, 1) if bnc else (1, K)
+        # as in training: B is a weight (its bfloat16 copy made once), A has its bfloat16 twin (made by the layer
+        # that wrote it), so the cp.async builds are timed without a conversion pass of their own
+        ops.weights_are(B, K * N)
+        A16 = ops.alloc((M * K + 1) // 2)
+        ops.make_twin((A, 0), M * K, (A16, 0))
+        cells = []
+        for b in builds:
+            os.environ["APSI_GEMM_VARIANT"] = b
+            ops._choice.clear()
+            try:
+                ops.gemm((A, 0), (B, 0), (Cb, 0), M, N, K, sam, sak, sbk, sbn, N)
+                ops.sync()
+                got = ops.get(Cb, M * N).reshape(M, N).astype(np.float64)
+                err = float(np.max(np.abs(got - ref)) / max(1e-12, np.max(np.abs(ref))))
+                ops.start_profile()                      # the card's own clock: the kernels alone
+                for _ in range(reps):
+                    ops.gemm((A, 0), (B, 0), (Cb, 0), M, N, K, sam, sak, sbk, sbn, N)
+                prof = ops.stop_profile()
+                kt = sum(t for name, (t, c) in prof.items() if name.startswith("gemm"))
+                tf = 2.0 * M * N * K * reps / max(kt, 1e-9) / 1e12
+                ok = np.isfinite(err) and err < 1e-2
+                bad += 0 if ok else 1
+                cells.append(f"{tf:5.1f}{'' if ok else ' WRONG'} {err:.0e}"[:13])
+            except Exception as e:                        # noqa: BLE001
+                cells.append(f"{type(e).__name__}"[:13])
+                if not getattr(gemm, "_told", False):
+                    import traceback
+                    gemm._told = True
+                    traceback.print_exc(file=out)
+            finally:
+                os.environ.pop("APSI_GEMM_VARIANT", None)
+                ops._choice.clear()
+        ops.weights_are(None, 0)
+        for x in (A, B, Cb, A16):
+            ops.free(x)
+        print(f"  {label:<30}" + "".join(f"{c:>14}" for c in cells), file=out, flush=True)
+    print(f"\n{'every build gives the exact product to bfloat16 precision' if not bad else f'{bad} WRONG results'}"
+          f" (a: base build; x, w: register builds; h, v, d, e: cp.async builds; a build a shape cannot use runs "
+          f"the base build)", file=out)
+    return 0 if not bad else 1
+
+
+def cards(out=sys.stdout):
+    """One model split across every card against the same training on one card."""
+    from . import layers as L, gpu_train as GT
+    from .stdlib import Adam
+    many = GT.devices_for("cuda:all") or []
+    if len(many) < 2:
+        print(f"{len(many)} card(s): the split needs two or more", file=out)
+        return 1
+    rng = np.random.default_rng(0)
+    m = L.transformer_lm(256, d=512, heads=8, layers=8, context=128, kv_heads=2, rope=True, norm="rms",
+                         ffn="swiglu")
+    X, Y = _data(dict(vocab=256, context=128, batch=16), 8)
+    kw = dict(loss="cross_entropy", epochs=2, batch_size=16, verbose=False, precision="fp32")
+    t0 = time.perf_counter()
+    one = GT.fit(m, m.init(seed=0), X, Y, opt=Adam(1e-3), ops=many[0], **kw)
+    t1 = time.perf_counter()
+    split = GT.fit(m, m.init(seed=0), X, Y, opt=Adam(1e-3), ops=many, parallel="pipeline", **kw)
+    t2 = time.perf_counter()
+    err = float(np.max(np.abs(np.asarray(one.history) - split.history)))
+    print(f"  one card: {one.history}  {t1 - t0:.1f} s", file=out)
+    print(f"  {split.device}: {split.history}  {t2 - t1:.1f} s", file=out)
+    print(f"  stages {split.stages}, replicas {split.replicas}, micro-batches {split.micro_batches}; "
+          f"difference {err:.1e} ({'ok' if err < 1e-3 else 'DIFFERENT'})", file=out)
+    # batches of their own with exact gradient sums: one card and every card give the same weights, bit for bit
+    from .values import tree_leaves
+    batches = [(X[i:i + 4], Y[i:i + 4]) for i in range(0, min(len(X), 64), 4)]
+    kb = dict(epochs=1, verbose=False, precision="fp32", accumulate=4)
+    t3 = time.perf_counter()
+    a = GT.fit_batches(m, m.init(seed=0), batches, "cross_entropy", opt=Adam(1e-3), ops=many[0], **kb)
+    t4 = time.perf_counter()
+    b = GT.fit_batches(m, m.init(seed=0), batches, "cross_entropy", opt=Adam(1e-3), ops=many, **kb)
+    t5 = time.perf_counter()
+    same = all(np.array_equal(np.asarray(x), np.asarray(y)) for x, y in zip(tree_leaves(a.params),
+                                                                          tree_leaves(b.params)))
+    print(f"  fit_batches, exact sums: one card {t4 - t3:.1f} s, {b.device} {t5 - t4:.1f} s: "
+          f"{'the same weights, bit for bit' if same else 'DIFFERENT weights'}", file=out)
+    return 0 if err < 1e-3 and same else 1
+
+
+def main(what="127m", precision="auto", steps=40):
+    w = str(what or "127m").lower()
+    if w == "check":
+        return check()
+    if w == "cards":
+        return cards()
+    if w == "gemm":
+        return gemm()
+    if w not in CONFIGS:
+        print(f"apsi gpu bench {what}: {', '.join(CONFIGS)}, check, gemm or cards")
+        return 2
+    return bench(w, int(steps), precision)

@@ -1,7 +1,8 @@
 @echo off
-rem Uploads Apsi 2.4.4 and newer (installers and the GPU Tuner) from your Downloads folder to apsi.dev.
+rem Uploads Apsi 2.6.0 (installers and the source code) from your Downloads folder to apsi.dev.
 rem One file: the PowerShell below this header does the work. Asks for an API token (Settings -> Developer,
-rem "release"). Files already on the site are skipped, so running it again is safe.
+rem "release"). The same file already on the site is skipped; a rebuilt file replaces it; a file of the same version that
+rem is no longer in your Downloads folder is removed (an improved 2.6.0 replaces the old 2.6.0 whole). Never duplicates.
 set "APSI_UPLOAD_SELF=%~f0"
 powershell -NoProfile -ExecutionPolicy Bypass -Command "$s = (Get-Content -LiteralPath $env:APSI_UPLOAD_SELF -Raw) -split '##[ ]PS[ ]##'; & ([scriptblock]::Create($s[1]))"
 echo.
@@ -15,19 +16,22 @@ exit /b
 # It uploads:
 #   Downloads\apsi-X.Y.Z\installer\release\ApsiSetup-X.Y.Z-x64.exe   -> Windows installer
 #   Downloads\apsi-X.Y.Z-linux.zip  (ApsiSetup-X.Y.Z-linux.sh and the .deb inside it)  -> Linux installer
-#   the Apsi GPU Tuner in that zip (gpu-tuner\: Apply / Restore for Windows and Linux) -> the Download page's
-#   "Apsi GPU Tuner" section
-# Versions: 2.4.4 and newer by default (-Version 2.4.4+); -Version 2.4.4 for one version only, -Version all for
-# every version found. Files already on the site are skipped, so running it again is safe. Files are sent in 32 MB pieces, 4 at a time (Cloudflare accepts at most 100 MB per
-# request); a broken piece is sent again.
+#   Downloads\apsi-X.Y.Z-source.zip, or source\apsi-X.Y.Z-source.zip in that zip                                           -> Source code
+# Versions: 2.6.0 and newer by default (-Version 2.6.0+); -Version 2.4.4 for one version only, -Version all for
+# every version found. A file already on the site is skipped when it is the same file (same SHA-256) and replaced
+# when it is a newer build with the same name, so running it again is safe and never makes duplicates. Files are sent in 32 MB pieces, 4 at a time (Cloudflare accepts at most 100 MB per
+# request); a broken piece is sent again. A file on the site under a version being uploaded that is not among the
+# files found here (an old build's name) is removed after the new files are up, so an improved release replaces the
+# old one whole; -Keep leaves such files alone.
 #
 # It asks for an API token once. Create it on the site: Settings -> Developer, tick "release", 30 days.
 # The token is never written to disk.
 param(
   [string]$Root = (Join-Path $HOME 'Downloads'),
   [string]$Site = 'https://apsi.dev',
-  [string]$Version = '2.4.4+',
+  [string]$Version = '2.6.0+',
   [int]$Parallel = 4,
+  [switch]$Keep,
   [switch]$DryRun
 )
 $ErrorActionPreference = 'Stop'
@@ -44,21 +48,23 @@ $tmp = Join-Path $env:TEMP ('apsi-upload-' + [guid]::NewGuid().ToString('N').Sub
 Get-ChildItem -LiteralPath $Root -Directory | ForEach-Object {
   if ($_.Name -notmatch '^apsi-(\d+\.\d+\.\d+)$') { return }
   $v = $Matches[1]
-  Get-ChildItem -LiteralPath (Join-Path $_.FullName 'installer\release') -Filter 'ApsiSetup-*-x64.exe' -ErrorAction SilentlyContinue |
+  # only this version's installer: an older ApsiSetup left in the same folder is never sent as this version
+  Get-ChildItem -LiteralPath (Join-Path $_.FullName 'installer\release') -Filter "ApsiSetup-$v-x64.exe" -ErrorAction SilentlyContinue |
     ForEach-Object { Add-Build $_.FullName $v 'windows' 'Windows installer' }
+}
+# the source code next to them: Downloads\apsi-X.Y.Z-source.zip
+Get-ChildItem -LiteralPath $Root -File -Filter 'apsi-*-source.zip' | ForEach-Object {
+  if ($_.Name -match '^apsi-(\d+\.\d+\.\d+)-source\.zip$') { Add-Build $_.FullName $Matches[1] 'source' 'Source code' }
 }
 Get-ChildItem -LiteralPath $Root -File -Filter 'apsi-*-linux.zip' | ForEach-Object {
   if ($_.Name -notmatch '^apsi-(\d+\.\d+\.\d+)-linux\.zip$') { return }
   $v = $Matches[1]
   $dir = Join-Path $tmp $v
   Expand-Archive -LiteralPath $_.FullName -DestinationPath $dir -Force
+  Get-ChildItem -LiteralPath $dir -Recurse -File -Filter 'apsi-*-source.zip' | ForEach-Object { Add-Build $_.FullName $v 'source' 'Source code' }
   Get-ChildItem -LiteralPath $dir -Recurse -File | Where-Object { -not $_.FullName.Contains('\source\') } | ForEach-Object {
     if ($_.Name -like 'ApsiSetup-*-linux.sh') { Add-Build $_.FullName $v 'linux' 'Linux installer' }
     elseif ($_.Name -like '*.deb') { Add-Build $_.FullName $v 'linux' 'Debian / Ubuntu package (.deb)' }
-    elseif ($_.Name -eq 'Apsi-GPU-Tuner-Apply.bat') { Add-Build $_.FullName $v 'windows' 'GPU Tuner: Apply recommended settings (Windows)' }
-    elseif ($_.Name -eq 'Apsi-GPU-Tuner-Restore.bat') { Add-Build $_.FullName $v 'windows' 'GPU Tuner: Restore factory defaults (Windows)' }
-    elseif ($_.Name -eq 'apsi-gpu-tuner-apply-linux.sh') { Add-Build $_.FullName $v 'linux' 'GPU Tuner: Apply recommended settings (Linux)' }
-    elseif ($_.Name -eq 'apsi-gpu-tuner-restore-linux.sh') { Add-Build $_.FullName $v 'linux' 'GPU Tuner: Restore factory defaults (Linux)' }
   }
 }
 if ($Version -match '^(\d+\.\d+\.\d+)\+$') {
@@ -98,15 +104,33 @@ function Fail($r, $what) {
 $r = Call 'GET' '/api/v1/releases?all=1' $null
 if ($r.Status -ne 200) { Fail $r 'Checking the token' }
 $have = @{}
-foreach ($x in $r.Data.releases) { $have["$($x.version)|$($x.filename)"] = $true }
+foreach ($x in $r.Data.releases) { $have["$($x.version)|$($x.filename)"] = $x }
+
+# a file listed under the wrong version (ApsiSetup-2.4.4-x64.exe under 2.6.0) is removed from that version only;
+# the same file under its own version is not touched
+foreach ($x in @($r.Data.releases)) {
+  if ($x.filename -match '(?:^|[-_])v?(\d+\.\d+\.\d+)(?=[-_.])' -and $Matches[1] -ne $x.version) {
+    Write-Host "remove  $($x.version) $($x.filename) (it is the $($Matches[1]) file, listed under $($x.version) by mistake)" -ForegroundColor Yellow
+    $d = Call 'DELETE' "/api/v1/releases/$($x.id)" $null
+    if ($d.Status -ne 200) { Fail $d 'Removing the misplaced file' }
+    $have.Remove("$($x.version)|$($x.filename)")
+  }
+}
 
 $done = 0; $skipped = 0; $failed = 0
 foreach ($it in ($items | Sort-Object Version, Platform)) {
-  if ($have["$($it.Version)|$($it.Name)"]) { Write-Host "skip  $($it.Version) $($it.Name) (already on the site)" -ForegroundColor DarkGray; $skipped++; continue }
+  $old = $have["$($it.Version)|$($it.Name)"]
   try {
     $size = (Get-Item -LiteralPath $it.Path).Length
-    Write-Host "send  $($it.Version) $($it.Name)  (checking the file)" -NoNewline
     $sha = (Get-FileHash -LiteralPath $it.Path -Algorithm SHA256).Hash.ToLower()
+    if ($old -and $old.sha256 -eq $sha) { Write-Host "skip  $($it.Version) $($it.Name) (the same file is already on the site)" -ForegroundColor DarkGray; $skipped++; continue }
+    if ($old) {
+      # a rebuilt file with the same name: the one on the site is replaced (removed, then this one is sent)
+      Write-Host "replace  $($it.Version) $($it.Name) (the site has an older build of it)" -ForegroundColor Yellow
+      $d = Call 'DELETE' "/api/v1/releases/$($old.id)" $null
+      if ($d.Status -ne 200) { Fail $d 'Removing the older build' }
+    }
+    Write-Host "send  $($it.Version) $($it.Name)" -NoNewline
     $r = Call 'POST' '/api/v1/uploads' (Json @{ purpose = 'release'; size = $size; sha256 = $sha; filename = $it.Name })
     if ($r.Status -ne 201) { Fail $r 'Starting the upload' }
     $id = $r.Data.id; $chunk = [int64]$r.Data.chunk_size
@@ -164,7 +188,21 @@ foreach ($it in ($items | Sort-Object Version, Platform)) {
     $failed++
   }
 }
+# the old release's files that the new one no longer has (removed only when every new file went up)
+$pruned = 0
+if (-not $Keep -and $failed -eq 0) {
+  $names = @{}
+  foreach ($it in $items) { $names["$($it.Version)|$($it.Name)"] = $true }
+  $versions = @($items | ForEach-Object { $_.Version } | Sort-Object -Unique)
+  foreach ($x in $have.Values) {
+    if ($versions -contains $x.version -and -not $names["$($x.version)|$($x.filename)"]) {
+      Write-Host "remove  $($x.version) $($x.filename) (not in this build of $($x.version))" -ForegroundColor Yellow
+      $d = Call 'DELETE' "/api/v1/releases/$($x.id)" $null
+      if ($d.Status -eq 200) { $pruned++ } else { Write-Host "  could not remove it ($($d.Status))" -ForegroundColor Red }
+    }
+  }
+}
 $http.Dispose()
 if (Test-Path $tmp) { Remove-Item -LiteralPath $tmp -Recurse -Force -ErrorAction SilentlyContinue }
 Write-Host ''
-Write-Host "Uploaded $done, already there $skipped, failed $failed.  See $Site/download/all" -ForegroundColor Cyan
+Write-Host "Uploaded $done, already there $skipped, removed $pruned, failed $failed.  See $Site/download/all" -ForegroundColor Cyan

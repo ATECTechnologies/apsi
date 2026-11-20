@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 # Build every Linux release file of Apsi into dist/linux/ and zip them:
+#   ApsiSetup-<v>-linux.sh                one-file installer (any distribution, no root)
 #   ApsiSetup-<v>-linux-x86_64.AppImage   setup wizard (Express/Custom, security, Apsi Guard)
 #   apsi_<v>_all.deb                      Debian/Ubuntu package (system python3 + numpy)
 #   apsi-<v>-linux-x86_64.tar.gz          portable: own Python 3.12 + numpy, unpack and run
@@ -65,8 +66,13 @@ echo "== setup wizard (AppImage)"
 cp installer/release/*.AppImage "$OUT/"
 rm -rf installer/payload
 
+echo "== one-file shell installer"
+python3 packaging/make_linux_installer.py "$OUT"
+
 cp docs/INSTALL-LINUX.md "$OUT/INSTALL-LINUX.md"
-(cd "$OUT" && sha256sum *.AppImage *.deb *.tar.gz *.whl $(ls *.vsix 2>/dev/null) > SHA256SUMS.txt)
+echo "== checking the release files"
+python3 tools/check_release.py "$OUT"/*.whl "$OUT"/*.deb "$OUT"/*.tar.gz "$P"
+(cd "$OUT" && sha256sum *.sh *.AppImage *.deb *.tar.gz *.whl $(ls *.vsix 2>/dev/null) > SHA256SUMS.txt)
 (cd "$ROOT/dist" && rm -f "apsi-$V-linux.zip" && mv linux "apsi-$V-linux" && zip -qr "apsi-$V-linux.zip" "apsi-$V-linux" \
    && mv "apsi-$V-linux" linux)
 echo "== done: dist/apsi-$V-linux.zip"; ls -lh "$OUT"

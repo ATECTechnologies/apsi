@@ -217,7 +217,7 @@ class Editors(TempDir):
         res = {x["id"]: x for x in json.loads(r.stdout)["results"]}
         for ed in ("vscode", "cursor", "sublime", "vim"):
             self.assertTrue(res[ed]["ok"], res[ed])
-        self.assertTrue(os.path.isfile(os.path.join(home, ".cursor", "extensions", "apsi.apsi-language-2.4.4", "package.json")))
+        self.assertTrue(os.path.isfile(os.path.join(home, ".cursor", "extensions", "apsi.apsi-language-2.6.0", "package.json")))
         self.assertTrue(os.path.isfile(os.path.join(home, vim, "pack", "apsi", "start", "apsi", "syntax", "apsi.vim")))
         with open(os.path.join(home, ".vscode", "extensions", "extensions.json")) as fh:
             self.assertEqual(json.load(fh)[0]["identifier"]["id"], "apsi.apsi-language")

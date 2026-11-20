@@ -166,3 +166,22 @@ h1 { font-size: 24px; font-weight: 650; letter-spacing: -.01em; margin: 10px 0 8
   .toggle { background: #334155; }
   .progress { background: #1e293b; }
 }
+
+/* install progress: moving sheen while working, elapsed time, the stages, the latest line of the log */
+.progress.active div { background-image: linear-gradient(90deg, var(--brand-600), var(--brand)), linear-gradient(110deg, transparent 30%, rgba(255,255,255,.35) 50%, transparent 70%);
+  background-size: 100% 100%, 200% 100%; background-blend-mode: screen; animation: sheen 1.6s linear infinite; }
+@keyframes sheen { from { background-position: 0 0, 200% 0; } to { background-position: 0 0, -200% 0; } }
+@media (prefers-reduced-motion: reduce) { .progress.active div { animation: none; } }
+.progress-row { display: flex; justify-content: space-between; margin: 6px 0 14px; }
+.progress-row .progress-pct { margin: 0; }
+.progress-time { color: var(--muted); font-size: 12px; font-variant-numeric: tabular-nums; }
+.stages { list-style: none; padding: 0; margin: 0 0 14px; display: grid; grid-template-columns: repeat(auto-fill, minmax(128px, 1fr)); gap: 6px 10px; }
+.stages li { display: flex; align-items: center; gap: 7px; font-size: 12.5px; color: var(--muted); }
+.stages li.done { color: inherit; }
+.stages li.current { color: var(--brand-600); font-weight: 600; }
+.stage-dot { width: 15px; height: 15px; border-radius: 99px; border: 1.5px solid #cbd5e1; display: inline-flex; align-items: center; justify-content: center; font-size: 9px; flex: none; }
+.stages li.done .stage-dot { background: var(--brand); border-color: var(--brand); color: #fff; }
+.stages li.current .stage-dot { border-color: var(--brand); box-shadow: 0 0 0 3px rgba(20, 184, 166, .18); }
+.last-line { font-size: 12px; color: var(--muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; margin-bottom: 8px; font-family: "Cascadia Code", Consolas, monospace; }
+.side-foot-sub { font-size: 11px; color: #334155; margin-top: 2px; }
+@media (prefers-color-scheme: dark) { .stage-dot { border-color: #334155; } .side-foot-sub { color: #64748b; } }

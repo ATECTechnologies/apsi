@@ -273,6 +273,7 @@ def _act(name):
         "sigmoid": torch.sigmoid, "softplus": F.softplus, "silu": F.silu, "swish": F.silu,
         "leaky_relu": lambda x: F.leaky_relu(x, 0.01), "elu": F.elu, "mish": F.mish,
         "linear": lambda x: x, "identity": lambda x: x, "softmax": lambda x: torch.softmax(x, dim=-1),
+        "sin": torch.sin, "cos": torch.cos,
     }
     return table.get(name)
 
@@ -391,17 +392,39 @@ def _register():
         mem = src if not isinstance(x, (list, tuple)) else x[1]
         B, T, D = src.shape
         S = mem.shape[1]
-        hd = D // l.h
+        keep = None
+        if getattr(l, "memory_mask", False):                   # the memory's last column: 1 read, 0 never read
+            keep, mem = mem[:, :, -1], mem[:, :, :-1]
+        h = l.h
+        kvh = getattr(l, "kvh", h)
+        hd = D // h
 
-        def split(t, n):
-            return t.reshape(B, n, l.h, hd).permute(0, 2, 1, 3)
-        q, k, v = split(_mm(src, p.Wq), T), split(_mm(mem, p.Wk), S), split(_mm(mem, p.Wv), S)
+        def split(t, n, heads):
+            return t.reshape(B, n, heads, hd).permute(0, 2, 1, 3)
+        q, k, v = split(_mm(src, p.Wq), T, h), split(_mm(mem, p.Wk), S, kvh), split(_mm(mem, p.Wv), S, kvh)
+        if getattr(l, "qk_norm", False):
+            q = q * torch.rsqrt((q * q).mean(dim=-1, keepdim=True) + l.eps) * p.q_norm
+            k = k * torch.rsqrt((k * k).mean(dim=-1, keepdim=True) + l.eps) * p.k_norm
+        if getattr(l, "rope", False):
+            def rot(t, n):
+                cos, sin = L.rope_tables(n, hd, l.rope_base)
+                cos = torch.as_tensor(cos, dtype=t.dtype, device=t.device)
+                sin = torch.as_tensor(sin, dtype=t.dtype, device=t.device)
+                t1, t2 = t[..., :hd // 2], t[..., hd // 2:]
+                return t * cos + torch.cat([-t2, t1], dim=-1) * sin
+            q, k = rot(q, T), rot(k, S)
+        if kvh != h:
+            k = k.repeat_interleave(h // kvh, dim=1)
+            v = v.repeat_interleave(h // kvh, dim=1)
         mask = ctx.get("mask")
         bias = None
         if l.causal:
             bias = torch.triu(torch.full((T, S), -1e9, device=src.device, dtype=q.dtype), diagonal=1)
         if mask is not None:
             bias = mask.to(q.dtype) if bias is None else bias + mask.to(q.dtype)
+        if keep is not None:
+            km = ((keep - 1.0) * 1e9).to(q.dtype).reshape(B, 1, 1, S)
+            bias = km if bias is None else bias + km
         sdpa = getattr(F, "scaled_dot_product_attention", None)
         if sdpa is not None:
             o = sdpa(q, k, v, attn_mask=bias)                     # fused / flash attention kernels
@@ -411,7 +434,31 @@ def _register():
                 s = s + bias
             o = torch.softmax(s, dim=-1) @ v
         o = o.permute(0, 2, 1, 3).reshape(B, T, D)
-        return _mm(o, p.Wo) + p.bo
+        y = _mm(o, p.Wo)
+        if getattr(l, "bias", True):
+            y = y + p.bo
+        return y * torch.tanh(p.gate[0]) if getattr(l, "gate", None) is not None else y
+
+    @impl(L.MoE)
+    def _moe(l, p, x, train, ctx):
+        sh = x.shape
+        xf = x.reshape(-1, l.d)
+        logits = _mm(xf, p.Wr)
+        sel, idx = torch.topk(logits, l.k, dim=-1)
+        gate = torch.softmax(sel, dim=-1)
+        out = torch.zeros_like(xf)
+        act = _act(l.act)
+        for e in range(l.E):
+            r, j = (idx == e).nonzero(as_tuple=True)
+            if r.numel():
+                xe = xf[r]
+                ye = _mm(act(_mm(xe, p.Wg[e])) * _mm(xe, p.Wu[e]), p.Wd[e])
+                out = out.index_add(0, r, ye * gate[r, j].unsqueeze(-1))
+        return out.reshape(sh)
+
+    @impl(L.SwiGLU)
+    def _swiglu(l, p, x, train, ctx):
+        return _mm(_act(l.act)(_mm(x, p.Wg)) * _mm(x, p.Wu), p.Wd)
 
     @impl(L.LayerNorm)
     def _ln(l, p, x, train, ctx):

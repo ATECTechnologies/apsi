@@ -152,6 +152,14 @@ def module(interp):
         def gated(*a, **k):
             if not trusted(interp):
                 raise PermissionErr(f"{name}() runs arbitrary code; it needs --allow-python=all")
+            if name in ("globals", "locals"):              # the caller's namespace, not this wrapper's
+                import sys
+                fr = sys._getframe(1)
+                return fr.f_globals if name == "globals" else fr.f_locals
+            if name in ("eval", "exec") and len(a) == 1 and "globals" not in k and "locals" not in k:
+                import sys
+                fr = sys._getframe(1)
+                return f(a[0], fr.f_globals, fr.f_locals)
             return f(*a, **k)
         gated.__name__ = name
         return gated

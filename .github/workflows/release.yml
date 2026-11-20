@@ -3,6 +3,7 @@ name: release
 on:
   push:
     tags: ["v*"]
+    branches: ["release/**"]
   workflow_dispatch:
 
 jobs:
@@ -15,10 +16,10 @@ jobs:
       - uses: actions/setup-node@v4
         with: { node-version: "22" }
       - name: Tools
-        run: sudo apt-get update && sudo apt-get install -y nsis zip
+        run: sudo apt-get update && sudo apt-get install -y nsis zip && python -m pip install --upgrade pip numpy build wheel
       - name: VS Code extension
         run: |
-          cd editors/vscode && npm install && npx --yes @vscode/vsce@2 package --allow-missing-repository --skip-license \
+          mkdir -p dist && cd editors/vscode && npm install && npx --yes @vscode/vsce@2 package --allow-missing-repository --skip-license \
             -o ../../dist/apsi-language-$(python -c "import json;print(json.load(open('package.json'))['version'])").vsix
       - name: Installers (wheel, .deb, Windows zip + setup.exe)
         run: sh packaging/build_all.sh
@@ -28,10 +29,11 @@ jobs:
   wizard-installer:
     # Modern Electron + React setup wizard (ApsiSetup-<v>-x64-wizard.exe / Apsi-<v>.AppImage)
     strategy:
+      fail-fast: false
       matrix:
         include:
           - { os: windows-2022, script: "dist:win", files: "installer/release/*.exe" }
-          - { os: ubuntu-22.04, script: "dist:linux", files: "installer/release/*.AppImage" }
+          - { os: ubuntu-24.04, script: "dist:linux", files: "installer/release/*.AppImage" }
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -39,11 +41,14 @@ jobs:
         with: { python-version: "3.12" }
       - uses: actions/setup-node@v4
         with: { node-version: "22" }
+      - name: Python packages
+        run: python -m pip install --upgrade pip numpy
       - name: Payload manifest
         run: python -c "from apsi.security import write_manifest; write_manifest()"
       - name: Installer core tests
         if: runner.os == 'Linux'
         run: |
+          sudo apt-get update && sudo apt-get install -y python3-numpy
           cd installer && npm ci --no-audit --no-fund && npm run payload:linux && npm test
       - name: Build wizard
         shell: bash
@@ -66,7 +71,8 @@ jobs:
           & $apsi version
           & $apsi verify
           if ($LASTEXITCODE -ne 0) { exit 1 }
-          & $apsi test (Join-Path $env:LOCALAPPDATA "Programs\Apsi\examples\05_orbit.apsi")
+          $ver = Get-ChildItem (Join-Path $env:LOCALAPPDATA "Programs\Apsi") -Directory | Where-Object { $_.Name -match '^\d+\.\d+' } | Select-Object -First 1
+          & $apsi test (Join-Path $ver.FullName "examples\05_orbit.apsi")
           if ($LASTEXITCODE -ne 0) { exit 1 }
           Start-Process $exe.FullName -ArgumentList "--uninstall","--silent" -Wait
           if (Test-Path $apsi) { Write-Error "uninstall left files"; exit 1 }
@@ -90,7 +96,7 @@ jobs:
 
   smoke-test-linux:
     needs: build
-    runs-on: ubuntu-22.04
+    runs-on: ubuntu-24.04            # the .deb needs Python 3.12 from apt
     steps:
       - uses: actions/download-artifact@v4
         with: { name: apsi-release, path: dist }
@@ -100,3 +106,50 @@ jobs:
           sudo apt-get install -y ./dist/apsi_*_all.deb
           apsi version
           apsi test /usr/share/apsi/examples/05_orbit.apsi
+
+  # Publishes the GitHub release of the version in apsi/__init__.py from a push to its release/<version> branch:
+  # moves the tag v<version> to this commit (GitHub's "Source code" archives then hold it), sets the title and notes
+  # from .github/releases.json, marks it latest, and replaces its files with the builds of this run.
+  publish:
+    if: startsWith(github.ref, 'refs/heads/release/')
+    needs: [build, wizard-installer, smoke-test-linux, smoke-test-wizard-windows]
+    runs-on: ubuntu-24.04
+    permissions: { contents: write }
+    env: { GH_TOKEN: "${{ github.token }}" }
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.12" }
+      - uses: actions/download-artifact@v4
+        with: { path: art }
+      - name: Files
+        run: |
+          python -m pip install -q numpy
+          V=$(python -c "import apsi; print(apsi.__version__)")
+          [ "refs/heads/release/$V" = "$GITHUB_REF" ] || { echo "branch is not release/$V"; exit 1; }
+          echo "V=$V" >> "$GITHUB_ENV"
+          mkdir -p up
+          cp art/apsi-wizard-Windows/ApsiSetup-$V-x64.exe up/
+          cp art/apsi-wizard-Linux/*.AppImage up/ApsiSetup-$V-linux-x86_64.AppImage
+          cp art/apsi-release/apsi_${V}_all.deb art/apsi-release/apsi-$V-py3-none-any.whl art/apsi-release/apsi-language-$V.vsix up/
+          [ -f art/apsi-release/apsi-$V-windows-x64.zip ] && cp art/apsi-release/apsi-$V-windows-x64.zip up/ || true
+          python -m pip install -q numpy
+          python packaging/make_linux_installer.py up
+          (cd up && sha256sum * > SHA256SUMS.txt && ls -l)
+      - name: Tag, notes and files
+        run: |
+          git tag -f "v$V" "$GITHUB_SHA" && git push -f origin "refs/tags/v$V"
+          python - <<'PY' > meta.env
+          import json, os
+          r = next(x for x in json.load(open(".github/releases.json")) if x["version"] == os.environ["V"])
+          print(r["title"]); print(r["notes"])
+          PY
+          TITLE=$(sed -n 1p meta.env); NOTES=$(sed -n 2p meta.env)
+          if gh release view "v$V" >/dev/null 2>&1; then
+            gh release edit "v$V" --title "$TITLE" --notes-file "$NOTES" --latest --draft=false --prerelease=false
+            for a in $(gh release view "v$V" --json assets -q '.assets[].name'); do gh release delete-asset "v$V" "$a" -y; done
+          else
+            gh release create "v$V" --title "$TITLE" --notes-file "$NOTES" --latest --verify-tag
+          fi
+          gh release upload "v$V" up/* --clobber
+          gh release view "v$V" --json url,assets -q '.url, (.assets[].name)'
