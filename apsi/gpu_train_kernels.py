@@ -18,7 +18,11 @@ LOG2E = 1.4426950408889634
 EW1 = {"exp": 0, "log": 1, "sqrt": 2, "abs": 3, "square": 4, "recip": 5, "neg": 6, "rsqrt": 7}
 EW2 = {"div": 0, "max": 1, "min": 2, "pow": 3}
 ACTS = {"relu": 0, "gelu": 1, "silu": 2, "swish": 2, "tanh": 3, "sigmoid": 4, "linear": 5, "identity": 5,
-        "leaky_relu": 6, "elu": 7, "softplus": 8, "mish": 9, "sin": 10, "cos": 11}
+        "leaky_relu": 6, "elu": 7, "softplus": 8, "mish": 9, "sin": 10, "cos": 11, "gelu_exact": 12}
+
+# erfc(|z|) = t exp(-z^2 + P(t)), t = 1 / (1 + |z| / 2): relative error below 1.2e-7 everywhere (Numerical Recipes)
+ERFC_P = (-1.26551223, 1.00002368, 0.37409196, 0.09678418, -0.18628806, 0.27886807, -1.13520398, 1.48851587,
+          -0.82215223, 0.17087277)
 FAKEQ = {"fp8": 0, "fp6": 1, "fp6_e2m3": 2, "fp4": 3, "int8": 4, "int4": 5}
 MINIFLOAT = {0: (3, 7, 448.0), 1: (2, 3, 28.0), 2: (3, 1, 7.5), 3: (1, 1, 6.0)}     # mantissa bits, bias, top
 TILE = 64
@@ -294,8 +298,20 @@ def _main_module():
         dmish = b.fadd(tsp, b.fmul(b.fmul(x, b.fsub(F(1.0), b.fmul(tsp, tsp))), s))
         red = b.fsub(x, b.fmul(F(6.283185307179586), b.call(rint_f, [b.fmul(x, F(0.15915494309189535))])))
         sn, cs = b.call(sin_f, [red]), b.call(cos_f, [red])
+        # the exact gelu: x Phi(x), Phi from erf (not the tanh approximation)
+        z = b.fmul(x, F(0.7071067811865476))
+        az = b.call(fabs_f, [z])
+        tt = b.fdiv(F(1.0), b.fadd(F(1.0), b.fmul(F(0.5), az)))
+        poly = F(ERFC_P[-1])
+        for cf in reversed(ERFC_P[:-1]):
+            poly = b.fadd(F(cf), b.fmul(tt, poly))
+        ec = b.fmul(tt, exp(k, b.fadd(b.fsub(F(0.0), b.fmul(az, az)), poly)))        # erfc(|z|)
+        erf = b.select(b.fcmp_ordered(">=", z, F(0.0)), b.fsub(F(1.0), ec), b.fsub(ec, F(1.0)))
+        phi = b.fmul(F(0.5), b.fadd(F(1.0), erf))
+        gex = b.fmul(x, phi)
+        dgex = b.fadd(phi, b.fmul(x, b.fmul(F(0.3989422804014327), exp(k, b.fmul(F(-0.5), b.fmul(x, x))))))
         vals = [(relu, drelu), (gelu, dgelu), (silu, dsilu), (th, dth), (s, dsig), (x, F(1.0)), (leaky, dleaky),
-                (elu, delu), (sp, s), (mish, dmish), (sn, cs), (cs, b.fsub(F(0.0), sn))]
+                (elu, delu), (sp, s), (mish, dmish), (sn, cs), (cs, b.fsub(F(0.0), sn)), (gex, dgex)]
         f, d = vals[-1]
         for j in range(len(vals) - 2, -1, -1):
             sel = b.icmp_unsigned("==", kind, C(j))

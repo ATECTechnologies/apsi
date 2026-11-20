@@ -325,6 +325,34 @@ class Trainer(unittest.TestCase):
         self.assertTrue(any(nd.forced for nd in net.ck))
         net.close()
 
+    def test_heterogeneous_brain_options(self):
+        """typed_graph_encoder as GLA's brains: global attention, graph context and final norm over every node
+        (scope="all"), the output projection's bias on every node of a type that receives edges (out_bias="type"),
+        the exact gelu, typed_pool with fixed-weight other types: the card equals NumPy, with and without recompute."""
+        from apsi import graphs as GR
+        rng = np.random.default_rng(5)
+        d = 16
+        m = L.DAG([["n0", L.Embedding(30, d), "nodes"],
+                   ["enc", GR.TypedGraphEncoder(d, 4, 2, [0, 1, 2], [0, 1, 2, 3], global_every=1, max_keys=5,
+                                                scope="all", out_bias="type", act="gelu_exact"), "n0"],
+                   ["pool", GR.TypedPool([0, 1, 2], init=[2.0, 1.0, 0.5], others=[3]), "enc"],
+                   ["out", L.Linear(d, 3), "pool"]], inputs=["nodes"], output="out")
+        bs = []
+        for G in (3, 2, 4):
+            sizes = rng.integers(4, 9, G)
+            N = int(sizes.sum())
+            e = rng.integers(0, N, (2 * N, 2))
+            g = L.graph(edges=e.tolist(), n=N, batch=np.repeat(np.arange(G), sizes),
+                        types=rng.integers(0, 5, len(e)), node_types=rng.integers(0, 4, N), self_loops=False)
+            bs.append((rng.integers(0, 30, N), rng.integers(0, 3, G), g))
+        a = L.fit_batches(m, m.init(seed=0), bs, "cross_entropy", opt=Adam(0.01), epochs=3, backend="numpy",
+                          verbose=False)
+        for rc in (False, True):
+            b = GT.fit_batches(m, m.init(seed=0), bs, "cross_entropy", opt=Adam(0.01), epochs=3, verbose=False,
+                               precision="fp32", ops=GT.Emulator(), recompute=rc)
+            np.testing.assert_allclose(a.history, b.history, rtol=1e-5)
+        self.assertLess(b.history[-1], b.history[0])
+
     def test_your_own_kernels_as_a_layer(self):
         """gpu_layer: @gpu kernels written in Apsi as a layer (forward, backward with parameter gradients); the GPU
         trainer calls them on its own buffers; NumPy and the card train the same; with recompute too."""

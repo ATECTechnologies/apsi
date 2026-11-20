@@ -178,8 +178,9 @@ class GlobalAttention(Layer):
     kind = "global_attention"
 
     def __init__(self, d, heads=4, max_keys=4096, ratio=1.0, learned_keys=False, bias=False, zero_init=False,
-                 types=None):
+                 types=None, dropout=0.0):
         self.d, self.h, self.max_keys = int(d), int(heads), int(max_keys)
+        self.p_drop = float(dropout)
         if self.d % self.h:
             raise ShapeError(f"global_attention: d={self.d} must be divisible by heads={self.h}")
         self.hd = self.d // self.h
@@ -241,7 +242,7 @@ class GlobalAttention(Layer):
         if not outs:
             return x
         out = segment_sum(ops.concat(outs, 0) if len(outs) > 1 else outs[0], np.concatenate(rows), N)
-        delta = out @ p.Wo + p.bo
+        delta = _drop(out @ p.Wo + p.bo, self.p_drop, train)
         return x + (delta if self.T is None else ops.where(own, delta, 0.0))
 
     def describe(self):
@@ -454,8 +455,13 @@ class HGT(Layer):
     types)."""
     kind = "hgt"
 
-    def __init__(self, d, heads=4, types=1, relations=1, ffn_mult=4):
+    def __init__(self, d, heads=4, types=1, relations=1, ffn_mult=4, dropout=0.0, out_bias="node", act="gelu"):
         self.d, self.h, self.fm = int(d), int(heads), int(ffn_mult)
+        self.p_drop = float(dropout)
+        if out_bias not in ("node", "type"):
+            raise ShapeError('hgt: out_bias is "node" (nodes with incoming edges) or "type" (every node of a type '
+                             'that has incoming edges in the batch)')
+        self.out_bias = out_bias
         self.T, self.type_ids = _owned(types)
         self.R, self.rel_ids = _owned(relations)
         if self.d % self.h:
@@ -463,7 +469,8 @@ class HGT(Layer):
         self.hd = self.d // self.h
         self.norm = TypedNorm(d, types)
         self.q, self.k, self.v, self.o = (TypedLinear(d, d, types) for _ in range(4))
-        self.ffn = Sequential([LayerNorm(d), Linear(d, d * self.fm), Activation("gelu"), Linear(d * self.fm, d)]) \
+        self.act = str(act)                              # "gelu" (tanh form) or "gelu_exact" (erf, as PyTorch's GELU)
+        self.ffn = Sequential([LayerNorm(d), Linear(d, d * self.fm), Activation(self.act), Linear(d * self.fm, d)]) \
             if self.fm > 0 else None
 
     def init(self, seed=0):
@@ -491,18 +498,34 @@ class HGT(Layer):
             a = segment_softmax(score, dst, N)
             msg = ops.reshape(ops.reshape(a, -1, H, 1) * v[src], -1, self.d)
             agg = segment_sum(msg, dst, N)
-            has_in = (np.bincount(dst, minlength=N) > 0)[:, None]
-            x = x + ops.where(has_in, self.o(p.o, agg, **ctx), 0.0)
+            x = x + ops.where(self.out_mask(g, N, dst), _drop(self.o(p.o, agg, **ctx), self.p_drop, train), 0.0)
         if self.ffn is None:
             return x
-        f = self.ffn(p.ffn, x, train=train)
+        f = _drop(self.ffn(p.ffn, x, train=train), self.p_drop, train)
         return x + ops.where(any_type, f, 0.0)
+
+    def out_mask(self, g, N, dst):
+        """The nodes the output projection is added to: those with incoming edges ("node"), or every owned node of a
+        type that receives edges somewhere in the batch ("type": its output bias reaches nodes without edges too)."""
+        if self.out_bias == "node":
+            return (np.bincount(dst, minlength=N) > 0)[:, None]
+        t = np.asarray(g.ntype if g is not None and hasattr(g, "ntype") else np.zeros(N, np.int64), np.int64)
+        recv = np.zeros(int(t.max(initial=0)) + 1, bool)
+        recv[np.unique(t[dst])] = True
+        return (recv[t] & _owned_mask(g, N, self.T, self.type_ids).reshape(-1))[:, None]
 
     def children(self):
         return [self.ffn] if self.ffn is not None else []
 
     def describe(self):
         return f"hgt(d={self.d}, heads={self.h}, {self.T} node types, {self.R} relations)"
+
+
+def _drop(x, p, train):
+    """Dropout of a branch while training (the rest of the time x)."""
+    if not train or p <= 0:
+        return x
+    return x * ((np.random.random(np.shape(ops.raw(x))) >= p) / (1.0 - p))
 
 
 def _graph_ids(g, N):
@@ -562,7 +585,7 @@ class TypedPool(Layer):
     the batch has nodes of it (a graph without any adds zeros); "graph": only the types the graph itself has."""
     kind = "typed_pool"
 
-    def __init__(self, types, init=None, presence="batch"):
+    def __init__(self, types, init=None, presence="batch", others=None):
         self.T, self.type_ids = _owned(types)
         self.w0 = [1.0] * self.T if init is None else [float(v) for v in init]
         if len(self.w0) != self.T or min(self.w0) <= 0:
@@ -570,16 +593,25 @@ class TypedPool(Layer):
         if presence not in ("batch", "graph"):
             raise ShapeError('typed_pool: presence is "batch" or "graph"')
         self.presence = presence
+        # others: more node type ids in the mix with a fixed weight of 1 (no parameter of their own)
+        self.others = tuple(int(t) for t in np.asarray(ops.raw(others)).reshape(-1)) if others is not None else ()
+        if self.others and self.type_ids is None:
+            raise ShapeError("typed_pool: others= needs types= as a list of type ids")
+        self.TT = self.T + len(self.others)
 
     def init(self, seed=0):
         return Record(log_weight=np.log(np.array(self.w0, float)))
 
+    def weights(self, log_weight):
+        w = ops.exp(log_weight)
+        return w if not self.others else ops.concat([w, np.ones(len(self.others))], 0)
+
     def plan(self, g, N):
         """(local type of each node, graph of each node, graphs, counts [G, T], which (g, t) count in the mix)."""
-        loc = local_types(g, N, self.T, self.type_ids)
+        loc = local_types(g, N, self.TT, (tuple(self.type_ids) + self.others) if self.others else self.type_ids)
         batch, G = _graph_ids(g, N)
-        cnt = np.zeros((G, self.T))
-        o = loc < self.T
+        cnt = np.zeros((G, self.TT))
+        o = loc < self.TT
         np.add.at(cnt, (batch[o], loc[o]), 1.0)
         if self.presence == "batch":
             on = np.repeat((cnt.sum(0) > 0)[None, :], G, 0).astype(float)
@@ -590,9 +622,9 @@ class TypedPool(Layer):
     def apply(self, p, x, train=False, **ctx):
         N = int(np.shape(ops.raw(x))[0])
         loc, batch, G, cnt, on = self.plan(ctx.get("graph"), N)
-        w = ops.exp(p.log_weight)                                          # [T]
+        w = self.weights(p.log_weight)                                     # [T (+ others)]
         num, den = None, None
-        for t in range(self.T):
+        for t in range(self.TT):
             if not on[:, t].any():
                 continue
             idx = np.nonzero(loc == t)[0]
@@ -617,15 +649,21 @@ class TypedGraphEncoder(Layer):
     kind = "typed_graph_encoder"
 
     def __init__(self, d, heads, layers, types, relations, global_every=1, max_keys=4096, ratio=0.5, ffn_mult=4,
-                 context=True):
+                 context=True, scope="owned", dropout=0.0, out_bias="node", act="gelu"):
         self.d, self.h, self.L = int(d), int(heads), int(layers)
         self.T, self.type_ids = _owned(types)
         self.types = list(self.type_ids) if self.type_ids is not None else self.T
         self.every, self.context = int(global_every), bool(context)
+        if scope not in ("owned", "all"):
+            raise ShapeError('typed_graph_encoder: scope is "owned" (global attention, graph context and the final '
+                             'norm over the owned nodes) or "all" (over every node of the graph)')
+        self.scope, self.p_drop = scope, float(dropout)
         self.inp = TypedLinear(d, d, self.types)
-        self.layers = [HGT(d, heads, self.types, relations, ffn_mult) for _ in range(self.L)]
+        self.act = str(act)
+        self.layers = [HGT(d, heads, self.types, relations, ffn_mult, dropout=dropout, out_bias=out_bias, act=act)
+                       for _ in range(self.L)]
         self.ga = {li: GlobalAttention(d, heads, max_keys, ratio=ratio, learned_keys=True, bias=True, zero_init=True,
-                                       types=self.types)
+                                       types=self.types if scope == "owned" else None, dropout=dropout)
                    for li in range(self.L) if self.every > 0 and (li + 1) % self.every == 0}
         self.final = LayerNorm(d)
 
@@ -648,18 +686,20 @@ class TypedGraphEncoder(Layer):
         N = int(np.shape(ops.raw(x))[0])
         own = self.own(g, N)
         batch, G = _graph_ids(g, N)
-        h = ops.where(own, ops.gelu(self.inp(p.input, x, **ctx)), x)
+        from .layers import ACTIVATIONS
+        h = ops.where(own, ACTIVATIONS[self.act](self.inp(p.input, x, **ctx)), x)
         gi = 0
         order = sorted(self.ga)
+        reach = own if self.scope == "owned" else np.ones_like(own)      # where the global parts act
         for li, layer in enumerate(self.layers):
             h = layer(p.layers[li], h, train=train, **ctx)
             if li in self.ga:
                 h = self.ga[li](p.attend[order.index(li)], h, train=train, **ctx)
                 gi += 1
             if self.context:
-                dlt = context_delta(h, own, batch, G, p.ctx_W, p.ctx_b, p.ctx_gate[li])
-                h = h + ops.where(own, dlt[batch], 0.0)
-        return ops.where(own, self.final(p.final, h), h)
+                dlt = context_delta(h, reach, batch, G, p.ctx_W, p.ctx_b, p.ctx_gate[li])
+                h = h + ops.where(reach, dlt[batch], 0.0)
+        return ops.where(reach, self.final(p.final, h), h)
 
     def children(self):
         return [self.inp] + self.layers + [self.ga[k] for k in sorted(self.ga)] + [self.final]

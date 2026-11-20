@@ -270,6 +270,10 @@ class Emulator(_Ops):
             return s, s * (1 - s)
         if kind == 5:
             return x, np.ones_like(x)
+        if kind == 12:                                  # the exact gelu (erf)
+            from math import erf
+            ph = (0.5 * (1.0 + np.vectorize(erf)(x.astype(np.float64) / np.sqrt(2.0)))).astype(np.float32)
+            return x * ph, (ph + x * np.float32(0.3989422804014327) * np.exp(-0.5 * x * x)).astype(np.float32)
         if kind == 7:
             e = np.exp(np.minimum(x, 0))
             return np.where(x > 0, x, e - 1), np.where(x > 0, np.float32(1), e).astype(np.float32)
@@ -4403,15 +4407,37 @@ class _HGT(_Node):
         self.ids = self.ids_for = None
         self.type_ids, self.rel_ids = layer.type_ids, layer.rel_ids
         self.which = "noself" if self.rel_ids is None else ("noself", self.rel_ids)
+        self.layer, self.p_drop = layer, float(getattr(layer, "p_drop", 0.0))
 
     def _ids(self, gd, f):
         key = ("hgt", id(self), self.which)
         if key not in gd.cache:
             if len(f["rel"]) and f["rel"].max() >= self.R:
                 raise TrainError(f"hgt(relations={self.R}) got a graph with relation {int(f['rel'].max())}")
-            has_in = (np.bincount(f["dst"], minlength=gd.N) > 0).astype(np.float32)
+            if getattr(self.layer, "out_bias", "node") == "type":
+                has_in = self.layer.out_mask(self.net.graph, gd.N, f["dst"]).reshape(-1).astype(np.float32)
+            else:
+                has_in = (np.bincount(f["dst"], minlength=gd.N) > 0).astype(np.float32)
             gd.cache[key] = (gd._put(f["src"] * self.R + f["rel"]), gd._put(f["src"]), gd._put(has_in, np.float32))
         return gd.cache[key]
+
+    def _drop_f(self, name, v, n):
+        """Dropout of a branch while training: a mask kept for backward (the trainer's seed sequence)."""
+        if not (self.net.train and self.p_drop > 0):
+            return v
+        o = self.net.ops
+        y, m = self.buf(name, n), self.buf(name + "_m", n)
+        self.net.seed = (self.net.seed * 1103515245 + 12345) & 0x7FFFFFFF
+        o.drop_f(v, y, m, n, self.p_drop, self.net.seed)
+        return y
+
+    def _drop_b(self, name, dy, n):
+        if not (self.net.train and self.p_drop > 0):
+            return dy
+        o = self.net.ops
+        dx = self.gbuf(name + "_d", n)
+        o.mul3(dx, dy, self.buf(name + "_m", n), n)
+        return dx
 
     def fwd(self, x, shape):
         gd = _need_graph(self.net, "hgt")
@@ -4431,7 +4457,7 @@ class _HGT(_Node):
             o.gemm(k, self.rel.w, KR, N, hd, hd, d, 1, hd, 1, R * d, batch=(R, H), sa=(0, hd),
                    sb=(H * hd * hd, hd * hd), sc=(d, hd), passes=ps)
             msg = _EdgeAttention.fwd(self, f, q, KR, v, kidx, N, H, hd, vidx=vidx)
-            om = _diag(self, "om", self.lin["o"].fwd(msg, N, grp), hasin, N, d)
+            om = _diag(self, "om", self._drop_f("do", self.lin["o"].fwd(msg, N, grp), N * d), hasin, N, d)
             o.add3(x1, x, om, N * d)
         else:
             o.pull(x1, o, x, N * d)
@@ -4439,7 +4465,7 @@ class _HGT(_Node):
         if self.ffn is None:
             return x1, shape
         fo, _ = self.ffn.fwd(x1, shape)
-        fm = _diag(self, "fm", fo, grp.known_d, N, d)
+        fm = _diag(self, "fm", self._drop_f("df", fo, N * d), grp.known_d, N, d)
         y = self.buf("y", N * d)
         o.add3(y, x1, fm, N * d)
         return y, shape
@@ -4454,7 +4480,7 @@ class _HGT(_Node):
         else:
             dfm = _diag(self, "dfm", dy, grp.known_d, N, d, grad=True)
             dx1 = self.gbuf("dx1", N * d)
-            o.add3(dx1, dy, self.ffn.bwd(dfm, True), N * d)
+            o.add3(dx1, dy, self.ffn.bwd(self._drop_b("df", dfm, N * d), True), N * d)
         dx = self.gbuf("dx", N * d)
         if not self.E:
             dxn_parts = []
@@ -4462,7 +4488,7 @@ class _HGT(_Node):
             f, _ = gd.csr(self.which)
             kidx, vidx, hasin = self._ids(gd, f)
             dom = _diag(self, "dom", dx1, hasin, N, d, grad=True)
-            dmsg = self.lin["o"].bwd(dom, N)
+            dmsg = self.lin["o"].bwd(self._drop_b("do", dom, N * d), N)
             dq, dKR, dv = _EdgeAttention.bwd(self, f, self.q, kidx, dmsg, N, H, hd, N * R, vidx=vidx, vrows=N)
             dk = self.gbuf("dk", N * d)
             for r in range(R):                             # back through the relation transforms
@@ -4585,13 +4611,22 @@ class _GlobalAttention(_Node):
             al = self._scores(c, kid, q, KR, H, hd)
             o.spmm(VR, _ofs(kid, c.e0), al, None, c.off, _ofs(self.msg, c.r0 * I), c.n, H, hd)
         y = self.buf("y", N * d)
-        if self.T is None:
+        self.dropping = self.net.train and float(getattr(self.layer, "p_drop", 0.0)) > 0
+        if self.T is None and not self.dropping:
             o.gemm(self.msg, self.Wo.w, y, N, d, I, I, 1, d, 1, d, bias=self.bo.w, passes=ps, epi=3, X2=x)
         else:
-            self.own = _put_buf(self, "own", self._own(N), np.float32)
             dl = self.buf("dl", N * d)
             o.gemm(self.msg, self.Wo.w, dl, N, d, I, I, 1, d, 1, d, bias=self.bo.w, passes=ps)
-            o.add3(y, x, _diag(self, "dlm", dl, self.own, N, d), N * d)
+            if self.dropping:                              # dropout of the layer's output (a mask kept for backward)
+                dd_, self.dmask = self.buf("dld", N * d), self.buf("dlmask", N * d)
+                self.net.seed = (self.net.seed * 1103515245 + 12345) & 0x7FFFFFFF
+                o.drop_f(dl, dd_, self.dmask, N * d, float(self.layer.p_drop), self.net.seed)
+                dl = dd_
+            if self.T is None:
+                o.add3(y, x, dl, N * d)
+            else:
+                self.own = _put_buf(self, "own", self._own(N), np.float32)
+                o.add3(y, x, _diag(self, "dlm", dl, self.own, N, d), N * d)
         return y, shape
 
     def bwd(self, dy, need_dx=True):
@@ -4599,6 +4634,10 @@ class _GlobalAttention(_Node):
         N, d, H, hd, I = self.N, self.d, self.H, self.hd, self.inner
         f, kid = self.f, self.kid
         dd = dy if self.T is None else _diag(self, "ddl", dy, self.own, N, d, grad=True)
+        if self.dropping:
+            dm_ = self.gbuf("ddrop", N * d)
+            o.mul3(dm_, dd, self.dmask, N * d)
+            dd = dm_
         o.gemm(self.msg, dd, self.Wo.g, I, d, N, 1, I, d, 1, d, beta=True, passes=ps, db=self.bo.g)
         dmsg = self.gbuf("dmsg", N * I)
         o.gemm(dd, self.Wo.w, dmsg, N, I, d, d, 1, 1, d, I, passes=ps)
@@ -4832,12 +4871,17 @@ class _TypedEncoder(_Node):
         self.final.gkey = gk + ".fn"
         self.nodes = self.layers + [self.ga[k] for k in order] + [self.final]
 
-    def _masks(self, N):
+    def _masks(self, N, reach=False):
+        """(owned, not owned, the graphs' segments over them) - reach: where the global parts act (the owned nodes,
+        or every node with scope="all")."""
         gd = _need_graph(self.net, "typed_graph_encoder")
-        k = ("typed-own", self.T, self.ids)
+        every = reach and getattr(self.layer, "scope", "owned") == "all"
+        k = ("typed-own", self.T, self.ids, every)
         if k not in gd.cache:
             from .graphs import _owned_mask
             own = _owned_mask(self.net.graph, N, self.T, self.ids).reshape(-1)
+            if every:
+                own = np.ones_like(own)
             batch = np.asarray(self.net.graph.batch, np.int64)
             G = max(int(self.net.graph.graphs), int(batch.max(initial=-1)) + 1)
             gd.cache[k] = (gd._put(own, np.float32), gd._put(~own, np.float32), _Seg(gd, np.where(own, batch, -1), G))
@@ -4846,12 +4890,13 @@ class _TypedEncoder(_Node):
     def fwd(self, x, shape):
         o = self.net.ops
         N, d = _rows(shape), self.d
-        own, notown, seg = self._masks(N)
+        own, notown, _ = self._masks(N)
+        rown, rnot, seg = self._masks(N, reach=True)
         grp = _groups(self.net, self.T, self.ids)
         self.N, self.x = N, x
         y = self.inp.fwd(x, N, grp)
         a = self.buf("a", N * d)
-        o.act_f(y, a, N * d, KS.ACTS["gelu"])
+        o.act_f(y, a, N * d, KS.ACTS[getattr(self.layer, "act", "gelu")])
         self.y = y
         h = self.buf("h0", N * d)
         o.add3(h, _diag(self, "ha", a, own, N, d), _diag(self, "hx", x, notown, N, d), N * d)
@@ -4865,15 +4910,16 @@ class _TypedEncoder(_Node):
         self.hlast = h
         f, _ = self.final.fwd(h, shape)
         out = self.buf("out", N * d)
-        o.add3(out, _diag(self, "fo", f, own, N, d), _diag(self, "fx", h, notown, N, d), N * d)
+        o.add3(out, _diag(self, "fo", f, rown, N, d), _diag(self, "fx", h, rnot, N, d), N * d)
         return out, shape
 
     def bwd(self, dy, need_dx=True):
         o = self.net.ops
         N, d = self.N, self.d
-        own, notown, seg = self._masks(N)
-        df = _diag(self, "dfo", dy, own, N, d, grad=True)
-        dh = self.final.bwd(df, True, residual=_diag(self, "dfx", dy, notown, N, d, grad=True))
+        own, notown, _ = self._masks(N)
+        rown, rnot, seg = self._masks(N, reach=True)
+        df = _diag(self, "dfo", dy, rown, N, d, grad=True)
+        dh = self.final.bwd(df, True, residual=_diag(self, "dfx", dy, rnot, N, d, grad=True))
         for li in range(len(self.layers) - 1, -1, -1):
             if self.ctx:
                 dh = self.ctx[li].bwd(dh, N, seg)
@@ -4882,7 +4928,7 @@ class _TypedEncoder(_Node):
             dh = self.layers[li].bwd(dh, True)
         da = _diag(self, "dha", dh, own, N, d, grad=True)
         dyp = self.gbuf("dy", N * d)
-        o.act_b(self.y, da, dyp, N * d, KS.ACTS["gelu"])
+        o.act_b(self.y, da, dyp, N * d, KS.ACTS[getattr(self.layer, "act", "gelu")])
         dx = self.gbuf("dx", N * d)
         o.add3(dx, self.inp.bwd(dyp, N), _diag(self, "dhx", dh, notown, N, d, grad=True), N * d)
         return dx
@@ -4991,7 +5037,7 @@ class _TypedPoolNode(_Node):
 
     def __init__(self, net, key, layer, p):
         super().__init__(net, key)
-        self.layer, self.lw, self.T = layer, net.param(p.log_weight), layer.T
+        self.layer, self.lw, self.T, self.T0 = layer, net.param(p.log_weight), layer.TT, layer.T
 
     def fwd(self, x, shape):
         o = self.net.ops
@@ -4999,14 +5045,15 @@ class _TypedPoolNode(_Node):
         gd = _need_graph(self.net, "typed_pool")
         loc, batch, G, cnt, on = self.layer.plan(self.net.graph, N)
         T = self.T
-        k = ("tpool", T, self.layer.type_ids, self.layer.presence)
+        k = ("tpool", T, self.layer.type_ids, self.layer.others, self.layer.presence)
         if k not in gd.cache:
             gd.cache[k] = _Seg(gd, np.where(loc < T, batch * T + loc, -1), G * T)
         seg = gd.cache[k]
         Mb = self.buf("M", G * T * d)
         seg.reduce(o, x, Mb, d, True)
         M = o.get(Mb[0], G * T * d, Mb[1]).reshape(G, T, d).astype(np.float64)
-        w = np.exp(o.get(self.lw.w[0], T, self.lw.w[1]).astype(np.float64))
+        w = np.ones(T)
+        w[:self.T0] = np.exp(o.get(self.lw.w[0], self.T0, self.lw.w[1]).astype(np.float64))
         wo = w[None, :] * on                                       # [G, T]
         den = np.maximum(wo.sum(1, keepdims=True), 1e-8)
         Y = (wo[:, :, None] * M).sum(1) / den
@@ -5021,9 +5068,10 @@ class _TypedPoolNode(_Node):
         coef = (w[None, :] * on) / den                              # [G, T]
         dM = coef[:, :, None] * D[:, None, :]
         dlw = (coef * ((M - Y[:, None, :]) * D[:, None, :]).sum(-1)).sum(0)
-        tmp = self.gbuf("dlw", T)
-        o.put(tmp[0], dlw.astype(np.float32), tmp[1])
-        o.axpy(self.lw.g, tmp, T, 1.0)
+        T0 = self.T0                                                # (the fixed weights of others= learn nothing)
+        tmp = self.gbuf("dlw", T0)
+        o.put(tmp[0], dlw[:T0].astype(np.float32), tmp[1])
+        o.axpy(self.lw.g, tmp, T0, 1.0)
         dMb = _put_buf(self, "dM", dM, np.float32, grad=True)
         dx = self.gbuf("dx", N * d)
         o.fill(dx, N * d, 0.0)
@@ -5447,7 +5495,7 @@ class Net:
                     # of a transformer, written once and read by the products on both sides
                     if self.passes == 1 and not self.kind and _bf16_hidden() and \
                             getattr(self.ops, "bf16_hidden_ok", lambda: True)() and \
-                            a_.N % 4 == 0 and a_.K % 4 == 0 and b_.N % 4 == 0:
+                            a_.N % 4 == 0 and a_.K % 4 == 0 and b_.N % 4 == 0 and a_.act in KS.EPI_ACTS:
                         a_.bf = b_.bf_in = True
             return _Seq(self, key, nodes)
         if isinstance(layer, L.Linear):
