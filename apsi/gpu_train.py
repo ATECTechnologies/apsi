@@ -1331,23 +1331,17 @@ class Gpu(_Ops):
 
     def adam(self, Pm, Gr, Mm, Vm, SQ, n, n_decay, lr, b1, b2, eps, c1, c2, wd, clip, COMP=None, part=None):
         # part=(i, k): call i of k that together update every weight (parameter groups, each its own learning rate):
-        # each writes its share of the bfloat16 copy, the copy is current after the last one
+        # those calls leave the bfloat16 copy alone; refresh_w16() rounds it once after the last
         i_, k_ = part if part is not None else (0, 1)
-        if i_ == 0:
-            self._wgen += 1
+        self._wgen += 1
         # the update of all the weights writes their bfloat16 copy too (the products' operand): no conversion pass
         wr, at = self._wrange, self.p(Pm)[1]
-        if k_ == 1:
-            full = self._w16 is not None and wr is not None and at == wr[0] and 4 * n == wr[1] - wr[0]
-            dst = self.p((self._w16, 0)) if full else None
-        else:
-            full = self._w16 is not None and wr is not None and wr[0] <= at and at + 4 * n <= wr[1]
-            dst = ("p", self._w16.ptr + 2 * ((at - wr[0]) // 4)) if full else None   # (bfloat16: 2 bytes each)
+        full = k_ == 1 and self._w16 is not None and wr is not None and at == wr[0] and 4 * n == wr[1] - wr[0]
         self._go("adam", self.blocks(n), 256, self.p(Pm), self.p(Gr), self.p(Mm), self.p(Vm), self.p(SQ), ("u", n),
                  ("u", n_decay), ("f", lr), ("f", b1), ("f", b2), ("f", eps), ("f", c1), ("f", c2), ("f", wd),
                  ("f", clip), self.p(COMP if COMP is not None else Pm), ("u", 1 if COMP is not None else 0),
-                 dst if full else self.p(Pm), ("u", 1 if full else 0))
-        if full and i_ == k_ - 1:
+                 self.p((self._w16, 0) if full else Pm), ("u", 1 if full else 0))
+        if full:
             self._w16_gen = self._wgen
             for bf in self._wcache.values():             # (the copies made one weight at a time before)
                 self.free(bf[1])
@@ -1622,6 +1616,18 @@ class Gpu(_Ops):
         self._w16 = self.alloc((n + 1) // 2) if buf is not None and "to_bf16" in self.fn and \
             os.environ.get("APSI_ADAM_W16", "1").strip().lower() not in ("0", "off", "no") else None
         self._w16_gen = -1
+
+    def refresh_w16(self):
+        """Round every weight to its bfloat16 copy in one pass (after updates that did not write it)."""
+        wr = self._wrange
+        if self._w16 is None or wr is None:
+            return
+        n = (wr[1] - wr[0]) // 4
+        self._go("to_bf16", self.blocks((n + 1) // 2), 256, ("p", wr[0]), self.p((self._w16, 0)), ("u", n))
+        self._w16_gen = self._wgen
+        for bf in self._wcache.values():
+            self.free(bf[1])
+        self._wcache = {}
 
     def a16_ready(self, M, N, K, epi=0):
         """Will gemm_a16 take a dense M x N x K product (k contiguous in A, B a row-major weight)? (A producer that
@@ -6409,6 +6415,8 @@ def _group_step(ops, net, opt, wd, clip, lr, t, st1, st2, COMP):
                  pick("lr", float(opt.lr)) * scale, b1, b2, pick("eps", opt.eps), 1 - b1 ** t, 1 - b2 ** t,
                  pick("weight_decay", wd), pick("clip", float(clip or 0.0)),
                  (COMP, a_) if COMP else None, part=(i, len(net.segments)))
+    if hasattr(ops, "refresh_w16"):
+        ops.refresh_w16()
 
 
 def _want_exact(exact, params):
