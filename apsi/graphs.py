@@ -314,6 +314,141 @@ class GraphMemory(Layer):
         return f"graph_memory(d={self.d}, k={self.k})"
 
 
+class NodeTextEncoder(Layer):
+    """Node features from each node's text (GLA's token-efficient encoder): the masked means of a token-id and a
+    hash-id embedding of its tokens, projected; plus a learned attention pooling of the tokens with their positions
+    (gated, starts small); plus embeddings of the language, the language family, the node type and five structural
+    codes, each with a learned mix. Input [N, 2 L + 9] integers per node: L token ids, L hash ids, the number of tokens
+    (1..L), language, family, node type, then the 5 structural codes (depth, sibling, in-degree, out-degree, line)."""
+    kind = "node_text_encoder"
+    takes_ids = True                                     # (its input is integers: on the GPU trainer they travel as bits)
+
+    def __init__(self, d, vocab=8192, hashes=4096, types=15, langs=1094, families=9, max_pos=128,
+                 struct=(32, 32, 16, 16, 32)):
+        self.d, self.V, self.Hh, self.T, self.Lg, self.F = int(d), int(vocab), int(hashes), int(types), int(langs), \
+            int(families)
+        self.P, self.struct = int(max_pos), tuple(int(v) for v in struct)
+
+    def init(self, seed=0):
+        rng = _rng(seed)
+        d = self.d
+        xav = lambda n: rng.uniform(-1, 1, (n, d)) * math.sqrt(6.0 / (n + d))      # noqa: E731
+        return Record(token_emb=xav(self.V), hash_emb=xav(self.Hh), type_emb=rng.normal(size=(self.T, d)),
+                      lang_emb=xav(self.Lg), family_emb=xav(self.F),
+                      proj=Record(W=rng.uniform(-1, 1, (2 * d, d)) / math.sqrt(2 * d), b=np.zeros(d)),
+                      pos_emb=rng.normal(size=(self.P, d)) * 0.02, pool_query=rng.normal(size=d) * 0.02,
+                      pool_out=Record(W=rng.uniform(-1, 1, (d, d)) * math.sqrt(6.0 / (2 * d)), b=np.zeros(d)),
+                      focus_gate=np.array(0.01), lang_mix=np.array(0.12), family_mix=np.array(0.08),
+                      type_mix=np.array(0.1), struct_emb=[rng.normal(size=(n, d)) * 0.02 for n in self.struct],
+                      struct_mix=np.array(0.5))
+
+    def columns(self, x):
+        a = np.asarray(ops.raw(x)).astype(np.int64)
+        L = (a.shape[1] - 9) // 2
+        return a, L
+
+    def apply(self, p, x, train=False, **ctx):
+        a, L = self.columns(x)
+        N, d = a.shape[0], self.d
+        tid, hid, ln = a[:, :L], a[:, L:2 * L], np.clip(a[:, 2 * L], 1, L)
+        lang, fam, typ, st = a[:, 2 * L + 1], a[:, 2 * L + 2], a[:, 2 * L + 3], a[:, 2 * L + 4:2 * L + 9]
+        mask = np.arange(L)[None, :] < ln[:, None]                        # [N, L]
+        rows, cols = np.nonzero(mask)
+        inv = (1.0 / ln)[rows][:, None]
+        te = segment_sum(p.token_emb[tid[rows, cols]] * inv, rows, N)
+        he = segment_sum(p.hash_emb[hid[rows, cols]] * inv, rows, N)
+        base = ops.concat([te, he], 1) @ p.proj.W + p.proj.b
+        rep = p.token_emb[tid[rows, cols]] + p.hash_emb[hid[rows, cols]] + p.pos_emb[np.minimum(cols, self.P - 1)]
+        sc = ops.sum_(rep * p.pool_query, axis=-1) / math.sqrt(d)          # [E]
+        w = segment_softmax(ops.reshape(sc, -1, 1), rows, N)                # [E, 1]
+        focus = segment_sum(rep * w, rows, N) @ p.pool_out.W + p.pool_out.b
+        out = (base + p.lang_emb[lang % self.Lg] * p.lang_mix + p.family_emb[fam % self.F] * p.family_mix
+               + focus * p.focus_gate + p.type_emb[typ] * p.type_mix)
+        se = p.struct_emb[0][st[:, 0]]
+        for k in range(1, len(self.struct)):
+            se = se + p.struct_emb[k][st[:, k]]
+        return out + se * p.struct_mix
+
+    def describe(self):
+        return f"node_text_encoder(d={self.d})"
+
+
+class MemorySlots(Layer):
+    """A decoder's memory from two sets of node states and two summaries (GLA's writer memory): of each set, the k best
+    nodes of every row (by a learned score; their projection scaled by sigmoid(score)) plus the embedding of their node
+    type and of the set's slot; each summary projected plus its slot; a learned null slot; an RMS norm over all.
+    Input [A, C, sum_a, sum_c]: A and C node states [N, d_in] of the batch's graph, sum_a / sum_c [B, d_in]. The nodes
+    each set reads and the row (0..B-1) each belongs to: graph.picks[pick_a] / [pick_a + "_row"] (and pick_c). Output
+    [B, ka + kc + 3, d + 1]: the last column says which slots are filled (multi_head_attention(memory_mask=true))."""
+    kind = "memory_slots"
+
+    def __init__(self, d_in, d, ka, kc, node_types, slots=8, pick_a="mem_a", pick_c="mem_c", eps=1e-6):
+        self.d_in, self.d, self.ka, self.kc = int(d_in), int(d), int(ka), int(kc)
+        self.nt, self.slots, self.eps = int(node_types), int(slots), float(eps)
+        self.pick_a, self.pick_c = str(pick_a), str(pick_c)
+
+    def init(self, seed=0):
+        rng = _rng(seed)
+        di, d = self.d_in, self.d
+        u = lambda i, o: rng.uniform(-1, 1, (i, o)) / math.sqrt(i)        # noqa: E731
+        return Record(score_a=Record(W=u(di, 1), b=np.zeros(1)), score_c=Record(W=u(di, 1), b=np.zeros(1)),
+                      node_proj_a=u(di, d), node_proj_c=u(di, d), sum_proj_a=u(di, d), sum_proj_c=u(di, d),
+                      type_emb=rng.normal(size=(self.nt, d)) * 0.02, slot_emb=rng.normal(size=(self.slots, d)) * 0.02,
+                      null=rng.normal(size=d) * 0.02, norm=np.ones(d))
+
+    def _rows(self, g, name):
+        picks = getattr(g, "picks", None) or {}
+        if name not in picks or name + "_row" not in picks:
+            return np.zeros(0, np.int64), np.zeros(0, np.int64)
+        return (np.asarray(picks[name], np.int64).reshape(-1), np.asarray(picks[name + "_row"], np.int64).reshape(-1))
+
+    def _nodes(self, x, sw, sb, proj, p, g, name, B, K, slot):
+        """[B, K, d] and its mask [B, K]: the K best-scoring picked nodes of every row (best first)."""
+        rows, row_of = self._rows(g, name)
+        keep = row_of < B
+        rows, row_of = rows[keep], row_of[keep]
+        valid = np.zeros((B, K))
+        if not len(rows) or K == 0:
+            return None, valid
+        xs = x[rows]
+        s = ops.reshape(xs @ sw + sb, len(rows))
+        raw = np.asarray(ops.raw(s), np.float64)
+        order = np.argsort(-raw, kind="stable")
+        order = order[np.argsort(row_of[order], kind="stable")]
+        rr = row_of[order]
+        start = np.concatenate([[0], np.cumsum(np.bincount(rr, minlength=B))])[:-1]
+        rank = np.arange(len(order)) - start[rr]
+        ok = rank < K
+        idx, rr, rank = order[ok], rr[ok], rank[ok]
+        types = np.asarray(g.ntype, np.int64)[rows[idx]] if hasattr(g, "ntype") else np.zeros(len(idx), np.int64)
+        vals = (xs[idx] @ proj) * ops.reshape(ops.sigmoid(s[idx]), -1, 1) + p.type_emb[types] + p.slot_emb[slot]
+        pos = rr * K + rank
+        valid[rr, rank] = 1.0
+        sel = np.zeros(B * K, np.int64)                    # rows of vals per slot (empty slots: any row, times 0)
+        sel[pos] = np.arange(len(pos))
+        out = ops.reshape(vals[sel], B, K, self.d) * valid[:, :, None]
+        return out, valid
+
+    def apply(self, p, x, train=False, **ctx):
+        g = ctx.get("graph")
+        A, C, sa, sc = x
+        B = int(np.shape(ops.raw(sa))[0])
+        ma, va = self._nodes(A, p.score_a.W, p.score_a.b, p.node_proj_a, p, g, self.pick_a, B, self.ka, 0)
+        mc, vc = self._nodes(C, p.score_c.W, p.score_c.b, p.node_proj_c, p, g, self.pick_c, B, self.kc, 1)
+        z = lambda K: np.zeros((B, K, self.d))                                # noqa: E731
+        sum_a = ops.reshape(sa @ p.sum_proj_a + p.slot_emb[2], B, 1, self.d)
+        sum_c = ops.reshape(sc @ p.sum_proj_c + p.slot_emb[3], B, 1, self.d)
+        null = ops.reshape(p.null + p.slot_emb[4], 1, 1, self.d) * np.ones((B, 1, 1))
+        mem = ops.concat([ma if ma is not None else z(self.ka), mc if mc is not None else z(self.kc), sum_a, sum_c,
+                          null], 1)
+        mem = mem / ops.sqrt(ops.mean(mem * mem, axis=-1, keepdims=True) + self.eps) * p.norm
+        mask = np.concatenate([va, vc, np.ones((B, 3))], 1)[:, :, None]
+        return ops.concat([mem, mask], -1)
+
+    def describe(self):
+        return f"memory_slots({self.ka} + {self.kc} nodes, 2 summaries, null; d={self.d})"
+
+
 class PickRows(Layer):
     """The rows of its input named by the graph of the batch: graph(...).picks[name] (a list of row ids, repeats
     allowed). For heads that read some nodes only - the masked words of a masked-word loss, the node pairs of a
@@ -525,7 +660,7 @@ def _drop(x, p, train):
     """Dropout of a branch while training (the rest of the time x)."""
     if not train or p <= 0:
         return x
-    return x * ((np.random.random(np.shape(ops.raw(x))) >= p) / (1.0 - p))
+    return x * ((ops._RNG[0].random(np.shape(ops.raw(x))) >= p) / (1.0 - p))
 
 
 def _graph_ids(g, N):
@@ -828,6 +963,6 @@ def graph_transformer_net(n_in, d, out, layers=4, heads=4, relations=1, global_e
 def names():
     return dict(graph_transformer=GraphTransformer, global_attention=GlobalAttention, mix_hop=MixHop,
                 graph_memory=GraphMemory, pick_rows=PickRows, hgt=HGT, typed_linear=TypedLinear, typed_norm=TypedNorm,
-                typed_graph_encoder=TypedGraphEncoder, typed_pool=TypedPool, graph_context=GraphContext, split_typed_encoder=split_typed_encoder,
+                typed_graph_encoder=TypedGraphEncoder, typed_pool=TypedPool, memory_slots=MemorySlots, node_text_encoder=NodeTextEncoder, graph_context=GraphContext, split_typed_encoder=split_typed_encoder,
                 graph_transformer_net=graph_transformer_net, k_hop=k_hop, hop_distances=hop_distances,
                 eccentricity=eccentricity)

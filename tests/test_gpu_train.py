@@ -353,6 +353,51 @@ class Trainer(unittest.TestCase):
             np.testing.assert_allclose(a.history, b.history, rtol=1e-5)
         self.assertLess(b.history[-1], b.history[0])
 
+    def test_node_text_encoder_and_memory_slots(self):
+        """node_text_encoder (token / hash means, attention pooling with positions, language / family / type /
+        structure embeddings) feeding an encoder, and memory_slots (the k best nodes of two sets per row, two
+        summaries, a null slot) read by a decoder's cross-attention: the card equals NumPy."""
+        from apsi import graphs as GR
+        from apsi.values import Record
+        rng = np.random.default_rng(6)
+        d, V, T, L_ = 16, 20, 5, 4
+        m = L.DAG([["x", GR.NodeTextEncoder(d, vocab=50, hashes=30, types=4, langs=7, families=3, max_pos=6,
+                                            struct=(4, 4, 3, 3, 4)), "nodes"],
+                   ["enc", GR.TypedGraphEncoder(d, 4, 1, [0, 1], [0, 1, 2], scope="all", out_bias="type",
+                                                act="gelu_exact"), "x"],
+                   ["sem", GR.TypedPool([0, 1], others=[2, 3]), "enc"],
+                   ["mem", GR.MemorySlots(d, d, 3, 2, 4), ["enc", "x", "sem", "sem"]],
+                   ["e", L.Embedding(V, d), "tok"],
+                   ["c", L.MultiHeadAttention(d, 4, qk_norm=True, bias=False, gate=0.25, memory_mask=True),
+                    ["e", "mem"]],
+                   ["r", L.add(), ["c", "e"]], ["out", L.Linear(d, V), "r"]], inputs=["tok", "nodes"], output="out")
+        bs = []
+        for G in (3, 2):
+            sizes = rng.integers(4, 8, G)
+            N = int(sizes.sum())
+            e = rng.integers(0, N, (2 * N, 2))
+            g = L.graph(edges=e.tolist(), n=N, batch=np.repeat(np.arange(G), sizes),
+                        types=rng.integers(0, 3, len(e)), node_types=rng.integers(0, 4, N), self_loops=False)
+            g.picks = {"mem_a": np.arange(N), "mem_a_row": g.batch, "mem_c": np.arange(0, N, 2),
+                       "mem_c_row": g.batch[::2]}
+            X = np.zeros((N, 2 * L_ + 9), np.int64)
+            for i in range(N):
+                n_ = int(rng.integers(1, L_ + 1))
+                X[i, :n_] = rng.integers(0, 50, n_)
+                X[i, L_:L_ + n_] = rng.integers(0, 30, n_)
+                X[i, 2 * L_] = n_
+            X[:, 2 * L_ + 1], X[:, 2 * L_ + 2] = rng.integers(0, 7, N), rng.integers(0, 3, N)
+            X[:, 2 * L_ + 3] = g.ntype
+            X[:, 2 * L_ + 4:] = rng.integers(0, 3, (N, 5))
+            t = rng.integers(0, V, (G, T))
+            bs.append(([t, X], np.roll(t, -1, 1), g))
+        a = L.fit_batches(m, m.init(seed=0), bs, "cross_entropy", opt=Adam(0.01), epochs=3, backend="numpy",
+                          verbose=False)
+        b = GT.fit_batches(m, m.init(seed=0), bs, "cross_entropy", opt=Adam(0.01), epochs=3, verbose=False,
+                           precision="fp32", ops=GT.Emulator())
+        np.testing.assert_allclose(a.history, b.history, rtol=1e-5)
+        self.assertLess(b.history[-1], b.history[0])
+
     def test_your_own_kernels_as_a_layer(self):
         """gpu_layer: @gpu kernels written in Apsi as a layer (forward, backward with parameter gradients); the GPU
         trainer calls them on its own buffers; NumPy and the card train the same; with recompute too."""
