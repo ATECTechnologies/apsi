@@ -3,6 +3,7 @@ name: release
 on:
   push:
     tags: ["v*"]
+    branches: ["release/**"]
   workflow_dispatch:
 
 jobs:
@@ -15,10 +16,10 @@ jobs:
       - uses: actions/setup-node@v4
         with: { node-version: "22" }
       - name: Tools
-        run: sudo apt-get update && sudo apt-get install -y nsis zip
+        run: sudo apt-get update && sudo apt-get install -y nsis zip && python -m pip install --upgrade pip numpy build wheel
       - name: VS Code extension
         run: |
-          cd editors/vscode && npm install && npx --yes @vscode/vsce@2 package --allow-missing-repository --skip-license \
+          mkdir -p dist && cd editors/vscode && npm install && npx --yes @vscode/vsce@2 package --allow-missing-repository --skip-license \
             -o ../../dist/apsi-language-$(python -c "import json;print(json.load(open('package.json'))['version'])").vsix
       - name: Installers (wheel, .deb, Windows zip + setup.exe)
         run: sh packaging/build_all.sh
@@ -39,6 +40,8 @@ jobs:
         with: { python-version: "3.12" }
       - uses: actions/setup-node@v4
         with: { node-version: "22" }
+      - name: Python packages
+        run: python -m pip install --upgrade pip numpy
       - name: Payload manifest
         run: python -c "from apsi.security import write_manifest; write_manifest()"
       - name: Installer core tests
@@ -90,7 +93,7 @@ jobs:
 
   smoke-test-linux:
     needs: build
-    runs-on: ubuntu-22.04
+    runs-on: ubuntu-24.04            # the .deb needs Python 3.12 from apt
     steps:
       - uses: actions/download-artifact@v4
         with: { name: apsi-release, path: dist }
