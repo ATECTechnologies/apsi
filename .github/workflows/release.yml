@@ -71,7 +71,8 @@ jobs:
           & $apsi version
           & $apsi verify
           if ($LASTEXITCODE -ne 0) { exit 1 }
-          & $apsi test (Join-Path $env:LOCALAPPDATA "Programs\Apsi\examples\05_orbit.apsi")
+          $ver = Get-ChildItem (Join-Path $env:LOCALAPPDATA "Programs\Apsi") -Directory | Where-Object { $_.Name -match '^\d+\.\d+' } | Select-Object -First 1
+          & $apsi test (Join-Path $ver.FullName "examples\05_orbit.apsi")
           if ($LASTEXITCODE -ne 0) { exit 1 }
           Start-Process $exe.FullName -ArgumentList "--uninstall","--silent" -Wait
           if (Test-Path $apsi) { Write-Error "uninstall left files"; exit 1 }
