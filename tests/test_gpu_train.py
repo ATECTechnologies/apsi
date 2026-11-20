@@ -201,6 +201,30 @@ class Trainer(unittest.TestCase):
         np.testing.assert_allclose(a.history, b.history, rtol=1e-5)
         self.assertLess(b.history[-1], b.history[0] - 1.0)
 
+    def test_card_loss_several_outputs(self):
+        """card_loss: a dag with a language-model output and a small head; the cross-entropy stays on the card, the
+        head's loss on the processor; training on the card equals NumPy."""
+        from apsi.values import Record
+        from apsi import ops as aops
+        rng = np.random.default_rng(0)
+        V, d, T = 20, 16, 6
+        m = L.DAG([["e", L.Embedding(V, d), "tok"],
+                   ["h", L.Residual(L.MultiHeadAttention(d, 4, causal=True), pre_norm=L.RMSNorm(d)), "e"],
+                   ["out", L.Linear(d, V), "h"], ["pool", L.MeanPool(), "h"], ["head", L.Linear(d, 1), "pool"]],
+                  inputs=["tok"], output=["out", "head"])
+        loss = L.card_loss(0, lambda outs, ys: aops.mean((aops.reshape(outs[1], -1) - ys.value) ** 2))
+        bs = []
+        for _ in range(4):
+            t = rng.integers(0, V, (3, T))
+            y = np.roll(t, -1, 1)
+            y[:, :2] = -1
+            bs.append((t, Record(labels=y, value=rng.normal(size=3))))
+        a = L.fit_batches(m, m.init(seed=0), bs, loss, opt=Adam(0.01), epochs=3, backend="numpy", verbose=False)
+        b = GT.fit_batches(m, m.init(seed=0), bs, loss, opt=Adam(0.01), epochs=3, verbose=False, precision="fp32",
+                           ops=GT.Emulator())
+        np.testing.assert_allclose(a.history, b.history, rtol=1e-5)
+        self.assertLess(b.history[-1], b.history[0])
+
     def test_any_model_split_across_cards_in_batches(self):
         """A two-input graph-and-language dag (hgt, global attention, graph memory, cross-attention, rotary positions,
         grouped heads, SwiGLU), a different batch of graphs every step, gradients of 4 batches averaged per step:

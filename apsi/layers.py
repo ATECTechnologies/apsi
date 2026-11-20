@@ -1839,6 +1839,30 @@ DAG.apply = _dag_apply_shared
 
 
 # =============================================================== training & inspection
+def card_loss(output=0, rest=None, labels="labels"):
+    """A loss over a model with several outputs (a dag with output=[...]): the cross-entropy of output `output`
+    against the targets' `labels` field (class ids, -1 left out) plus rest(outputs, targets) for everything else
+    (heads, auxiliary terms; rest must not read outputs[output]). Targets: a record, e.g.
+    record(labels=next_tokens, valid=..., issues=...). On the GPU trainer the cross-entropy stays on the card (a
+    language model's logits never leave it) and only the other outputs go to the processor; on NumPy the same loss
+    is computed on the processor."""
+    from .stdlib import cross_entropy
+    out_i, field = int(output), str(labels)
+
+    def labels_of(ys):
+        return getattr(ys, field) if isinstance(ys, Record) else ys
+
+    def rest_of(outs, ys):
+        return rest(outs, ys) if rest is not None else 0.0
+
+    def f(outs, ys):
+        outs = list(outs) if isinstance(outs, (list, tuple)) else [outs]
+        return cross_entropy(outs[out_i], labels_of(ys)) + rest_of(outs, ys)
+    f.on_card = (out_i, labels_of, rest_of)
+    f.__name__ = "card_loss"
+    return f
+
+
 def _loss_fn(loss):
     from .stdlib import mse, cross_entropy
     if callable(loss):
@@ -2251,7 +2275,7 @@ def module(interp=None):
         transformer_encoder=transformer_encoder, layer_norm_layer=LayerNorm, rms_norm_layer=RMSNorm,
         batch_norm_layer=BatchNorm, dropout_layer=Dropout, activation=activation, lambda_layer=LambdaLayer,
         scale=Scale, identity=Identity, select=Select, mean_pool=MeanPool, slice_layer=Slice,
-        tied_output=TiedOutput,
+        tied_output=TiedOutput, card_loss=card_loss,
         gcn=GCN, sage=SAGE, gat=GAT, gin=GIN, gine=GINE, batch_graphs=batch_graphs, graph_pool=GraphPool,
         # composition
         sequential=sequential, residual=residual, parallel=parallel, dag=dag, add=add, multiply=multiply,

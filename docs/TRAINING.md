@@ -135,6 +135,9 @@ The card is fastest when it never waits for the processor. In 2.6.0:
 - **Large outputs stay on the card with your own loss:** a loss function can say which of its outputs is a plain
   cross-entropy (`loss.on_card`); that part runs on the card and only the small outputs go to the processor. A
   language model's logits then never leave the card.
+  `layers.card_loss(output, rest)` builds such a loss for a dag with several outputs: the cross-entropy of
+  `output` against the targets' `labels` stays on the card, and `rest(outputs, targets)` adds the heads' losses
+  (targets: a record, e.g. `record(labels=next_tokens, valid=scores)`).
 
 Measured on an RTX 3060 (a 2-layer transformer, 128 wide, 8 × 128 tokens a step, best of several runs on a desktop
 in use): 5.3–6.0 ms a step before these changes, 4.0–4.7 ms after, with the same weights every run. Single runs vary
