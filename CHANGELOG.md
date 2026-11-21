@@ -1,6 +1,6 @@
 # Changelog
 
-## 2.6.2 — large graph and language models on one card, your own GPU kernels, parameter groups, other programs' model files (21 November 2026)
+## 2.6.2 — large graph and language models on one card, training that resumes exactly and learns from its own output, half the optimizer's memory, your own GPU kernels (21 November 2026)
 
 ### Training that resumes exactly, and batches made while it trains
 - **Exact resume of everything:** a checkpoint now keeps the random generators, the step counts of parameter groups
