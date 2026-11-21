@@ -1022,33 +1022,33 @@ class _CsvC:
     def __init__(self, lib):
         import ctypes
         self.lib, self.ct = lib, ctypes
-        lib.csv_index.restype = lib.parse_doubles.restype = lib.parse_longs.restype = ctypes.c_long
-        lib.dict_encode.restype = ctypes.c_long
+        lib.csv_index.restype = lib.parse_doubles.restype = lib.parse_longs.restype = ctypes.c_longlong
+        lib.dict_encode.restype = ctypes.c_longlong
 
     def _p(self, a):
         return a.ctypes.data_as(self.ct.c_void_p)
 
     def index(self, data, arr, sep, starts, ends, quoted, cap):
         ct = self.ct
-        rows = ct.c_long(0)
-        cells = self.lib.csv_index(ct.c_char_p(data), ct.c_long(len(data)), ct.c_char(sep.encode()), self._p(starts),
-                                   self._p(ends), self._p(quoted), ct.c_long(cap), ct.byref(rows))
+        rows = ct.c_longlong(0)
+        cells = self.lib.csv_index(ct.c_char_p(data), ct.c_longlong(len(data)), ct.c_char(sep.encode()), self._p(starts),
+                                   self._p(ends), self._p(quoted), ct.c_longlong(cap), ct.byref(rows))
         return cells
 
     def longs(self, data, arr, st, en, nrows, ncols, j, out):
         ct = self.ct
-        return self.lib.parse_longs(ct.c_char_p(data), self._p(st), self._p(en), ct.c_long(nrows), ct.c_long(ncols),
-                                    ct.c_long(j), self._p(out))
+        return self.lib.parse_longs(ct.c_char_p(data), self._p(st), self._p(en), ct.c_longlong(nrows), ct.c_longlong(ncols),
+                                    ct.c_longlong(j), self._p(out))
 
     def doubles(self, data, arr, st, en, nrows, ncols, j, out):
         ct = self.ct
-        return self.lib.parse_doubles(ct.c_char_p(data), self._p(st), self._p(en), ct.c_long(nrows),
-                                      ct.c_long(ncols), ct.c_long(j), self._p(out))
+        return self.lib.parse_doubles(ct.c_char_p(data), self._p(st), self._p(en), ct.c_longlong(nrows),
+                                      ct.c_longlong(ncols), ct.c_longlong(j), self._p(out))
 
     def encode(self, data, arr, st, en, nrows, ncols, j, codes, first, table, tsize):
         ct = self.ct
-        return self.lib.dict_encode(ct.c_char_p(data), self._p(st), self._p(en), ct.c_long(nrows), ct.c_long(ncols),
-                                    ct.c_long(j), self._p(codes), self._p(first), self._p(table), ct.c_long(tsize))
+        return self.lib.dict_encode(ct.c_char_p(data), self._p(st), self._p(en), ct.c_longlong(nrows), ct.c_longlong(ncols),
+                                    ct.c_longlong(j), self._p(codes), self._p(first), self._p(table), ct.c_longlong(tsize))
 
 
 class _CsvNative:
