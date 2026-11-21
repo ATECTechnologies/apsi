@@ -1116,7 +1116,15 @@ class Interpreter:
                 f = Function(self, item.name, item.params, item.ret, item.body, item.is_expr, menv, item.shape_params)
 
                 def method(*a, _f=f, **k):
-                    return interp.call_value(_f, list(a), k)
+                    try:
+                        return interp.call_value(_f, list(a), k)
+                    except StopIteration:
+                        raise
+                    except ApsiError as e:                 # __next__ ending an iteration: Python's own signal
+                        o = getattr(e, "original", None) or e.__cause__ or e.__context__
+                        if isinstance(o, (StopIteration, StopAsyncIteration)):
+                            raise o from None
+                        raise
                 method.__name__ = method.__qualname__ = item.name
                 m = method
                 for d in reversed(item.decorators):
