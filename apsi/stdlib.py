@@ -561,6 +561,8 @@ def _map(f, xs):
 
 
 def _filter(f, xs):
+    if f is None:                                     # filter(none, xs): the truthy items, as in Python
+        return [x for x in xs if x]
     return [x for x in xs if f(x)]
 
 

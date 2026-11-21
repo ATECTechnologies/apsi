@@ -2,6 +2,13 @@
 
 ## 2.6.6 — in development
 
+### Python habits that just work
+- **Single-quoted strings** `'text'`, `'''…'''`, `f'…'` and `b'…'`, as in Python (after a name or a closing
+  bracket `'` stays the derivative mark of `evolve`: `y' = -y / tau`).
+- **Quotes inside f-string fields**, also the f-string's own: `f"{'-'.join(xs)}"`, `f"{"x"!r}"`.
+- **`lambda x, y=1: expr`**, the same function as `fn(x, y=1) => expr`.
+- `filter(none, xs)` keeps the truthy items.
+
 ### Faster
 - **`read_csv` without a C compiler** (most Windows machines): the CSV kernels are also written in Apsi
   (`apsi/csrc/fastcsv.apsi`) and compiled by Apsi's own native compiler. A 1 M-row file: 1.21 s → 0.23 s.

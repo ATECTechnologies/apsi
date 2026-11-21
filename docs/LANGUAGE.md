@@ -153,8 +153,8 @@ Contextual (special only in one place, ordinary names elsewhere): `try`, `except
 
 | Form | Example |
 |---|---|
-| plain | `"text"` |
-| multi-line | `"""line 1` ⏎ `line 2"""` |
+| plain | `"text"` or `'text'` (the two quote characters are the same, as in Python) |
+| multi-line | `"""line 1` ⏎ `line 2"""` or `'''…'''` |
 | formatted (f-string) | `f"x = {x:.3f}, list has {len(xs)} items"` |
 | formatted, multi-line | `f"""…{expr}…"""` |
 | raw (no escapes, may span lines) | `r#"C:\dir\file "quoted" text"#` — ends at `"` followed by the same number of `#` (`r##"…"##` when the text holds `"#`) |
@@ -164,7 +164,10 @@ such as `"C:\data\x.csv"` mostly work, but `"C:\\data\\x.csv"` or `"C:/data/x.cs
 
 In f-strings, `{expression}` inserts a value and `{expression:spec}` formats it with a Python-style format spec
 (`.3f`, `>8`, `,`, `e`, `%`, …). For quantities the spec formats the number and the unit is appended:
-`f"{9.81[m/s^2]:.1f}"` → `9.8 m/s^2`. `{{` and `}}` produce literal braces.
+`f"{9.81[m/s^2]:.1f}"` → `9.8 m/s^2`. `{{` and `}}` produce literal braces. A field may hold strings in either
+quote, also the f-string's own (`f"{'-'.join(xs)}"`, `f"{"x"!r}"`), and `!r` / `!s` conversions.
+
+After a name or a closing bracket, `'` is the derivative mark of `evolve` (`y' = -y / tau`), not a string.
 
 ### 3.7 Operator characters
 
@@ -274,7 +277,7 @@ p.mass = 2kg                # field assignment (structs, records)
 
 | Level | Operators | Notes |
 |---|---|---|
-| lambda | `fn(x) => expr` | |
+| lambda | `fn(x) => expr`, or Python's `lambda x: expr` | |
 | pipe | `x \|> f` | `x \|> f` is `f(x)`; `x \|> f(a)` is `f(x, a)` |
 | conditional | `a if cond else b` | |
 | none-coalescing | `a ?? b` | `a` unless it is `none`, then `b`; `b` runs only when needed |

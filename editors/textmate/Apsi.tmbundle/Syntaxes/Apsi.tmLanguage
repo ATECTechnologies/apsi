@@ -83,11 +83,23 @@
 				</dict>
 				<dict>
 					<key>include</key>
+					<string>#string-single-triple</string>
+				</dict>
+				<dict>
+					<key>include</key>
 					<string>#fstring</string>
 				</dict>
 				<dict>
 					<key>include</key>
+					<string>#fstring-single</string>
+				</dict>
+				<dict>
+					<key>include</key>
 					<string>#string</string>
+				</dict>
+				<dict>
+					<key>include</key>
+					<string>#string-single</string>
 				</dict>
 				<dict>
 					<key>include</key>
@@ -461,16 +473,33 @@
 		</dict>
 		<key>lambda</key>
 		<dict>
-			<key>match</key>
-			<string>\b(fn)\s*(?=\()</string>
-			<key>captures</key>
-			<dict>
-				<key>1</key>
+			<key>patterns</key>
+			<array>
 				<dict>
-					<key>name</key>
-					<string>storage.type.function.lambda.apsi</string>
+					<key>match</key>
+					<string>\b(fn)\s*(?=\()</string>
+					<key>captures</key>
+					<dict>
+						<key>1</key>
+						<dict>
+							<key>name</key>
+							<string>storage.type.function.lambda.apsi</string>
+						</dict>
+					</dict>
 				</dict>
-			</dict>
+				<dict>
+					<key>match</key>
+					<string>\b(lambda)\b</string>
+					<key>captures</key>
+					<dict>
+						<key>1</key>
+						<dict>
+							<key>name</key>
+							<string>storage.type.function.lambda.apsi</string>
+						</dict>
+					</dict>
+				</dict>
+			</array>
 		</dict>
 		<key>struct-def</key>
 		<dict>
@@ -1294,6 +1323,116 @@
 							<string>#lambda</string>
 						</dict>
 					</array>
+				</dict>
+			</array>
+		</dict>
+		<key>string-single</key>
+		<dict>
+			<key>name</key>
+			<string>string.quoted.single.apsi</string>
+			<key>begin</key>
+			<string>(?&lt;![\p{L}\p{N}_)\]}'])'</string>
+			<key>end</key>
+			<string>(')|((?:[^\\\n])$)</string>
+			<key>beginCaptures</key>
+			<dict>
+				<key>0</key>
+				<dict>
+					<key>name</key>
+					<string>punctuation.definition.string.begin.apsi</string>
+				</dict>
+			</dict>
+			<key>endCaptures</key>
+			<dict>
+				<key>1</key>
+				<dict>
+					<key>name</key>
+					<string>punctuation.definition.string.end.apsi</string>
+				</dict>
+				<key>2</key>
+				<dict>
+					<key>name</key>
+					<string>invalid.illegal.newline.apsi</string>
+				</dict>
+			</dict>
+			<key>patterns</key>
+			<array>
+				<dict>
+					<key>include</key>
+					<string>#escape</string>
+				</dict>
+			</array>
+		</dict>
+		<key>string-single-triple</key>
+		<dict>
+			<key>name</key>
+			<string>string.quoted.triple.apsi</string>
+			<key>begin</key>
+			<string>'''</string>
+			<key>end</key>
+			<string>'''</string>
+			<key>beginCaptures</key>
+			<dict>
+				<key>0</key>
+				<dict>
+					<key>name</key>
+					<string>punctuation.definition.string.begin.apsi</string>
+				</dict>
+			</dict>
+			<key>endCaptures</key>
+			<dict>
+				<key>0</key>
+				<dict>
+					<key>name</key>
+					<string>punctuation.definition.string.end.apsi</string>
+				</dict>
+			</dict>
+			<key>patterns</key>
+			<array>
+				<dict>
+					<key>include</key>
+					<string>#escape</string>
+				</dict>
+			</array>
+		</dict>
+		<key>fstring-single</key>
+		<dict>
+			<key>name</key>
+			<string>string.interpolated.apsi</string>
+			<key>begin</key>
+			<string>\b(f)(')</string>
+			<key>end</key>
+			<string>'</string>
+			<key>beginCaptures</key>
+			<dict>
+				<key>1</key>
+				<dict>
+					<key>name</key>
+					<string>storage.type.string.apsi</string>
+				</dict>
+				<key>2</key>
+				<dict>
+					<key>name</key>
+					<string>punctuation.definition.string.begin.apsi</string>
+				</dict>
+			</dict>
+			<key>endCaptures</key>
+			<dict>
+				<key>0</key>
+				<dict>
+					<key>name</key>
+					<string>punctuation.definition.string.end.apsi</string>
+				</dict>
+			</dict>
+			<key>patterns</key>
+			<array>
+				<dict>
+					<key>include</key>
+					<string>#escape</string>
+				</dict>
+				<dict>
+					<key>include</key>
+					<string>#interp</string>
 				</dict>
 			</array>
 		</dict>

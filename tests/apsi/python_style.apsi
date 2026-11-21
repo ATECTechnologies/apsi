@@ -1,0 +1,32 @@
+# Python habits that work as they are: single-quoted strings, quotes inside f-string fields, lambda, filter(none, …)
+
+test "single-quoted strings":
+    assert 'hi' == "hi"
+    assert 'it\'s' == "it's"
+    assert '''a
+b''' == "a\nb"
+    assert b'AB' == bytes([65, 66])
+    assert f'{1 + 1}' == "2"
+
+test "quotes inside f-string fields":
+    let name = "apsi"
+    assert f"{'x' + name}" == "xapsi"
+    assert f"{"in"!r}" == "\"in\""
+    assert f"{name!r:>8}" == "  \"apsi\""
+    assert f"{{literal}} {len(name)}" == "{literal} 4"
+
+test "lambda":
+    assert max([3, 1, 2], key=lambda v: -v) == 1
+    assert (lambda: 7)() == 7
+    assert (lambda x, y=2: x * y)(5) == 10
+    assert (lambda *a: len(a))(1, 2, 3) == 3
+    assert sorted(["bb", "a", "ccc"], key=lambda s: len(s)) == ["a", "bb", "ccc"]
+
+test "filter with none keeps the truthy items":
+    assert filter(none, [0, 1, "", "a", none]) == [1, "a"]
+
+test "the derivative mark of evolve is unchanged":
+    var y = 1.0
+    evolve y over t in 0[s]..1[s] step 0.1[s]:
+        y' = -y / 1[s]
+    assert abs(y - 0.36788) < 1e-4

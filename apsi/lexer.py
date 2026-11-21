@@ -45,6 +45,46 @@ def _ident_char(ch):
 _TOK_MEMO = {}
 
 
+
+def _single_quote_string(src, i, prefixed=False):
+    """Is the ' at i the start of a '…' string? After a name or a closing bracket it is the derivative mark of
+    `evolve` (y' = …); otherwise it starts a string when the same line closes it."""
+    j = i - 1 if not prefixed else i - 2
+    if j >= 0 and (src[j].isalnum() or src[j] in "_)]}'"):
+        return False
+    if src.startswith("\'\'\'", i):
+        return True
+    end = src.find("\n", i + 1)
+    line_ = src[i + 1:end if end >= 0 else len(src)]
+    k = 0
+    while k < len(line_):
+        if line_[k] == "\\":
+            k += 2
+            continue
+        if line_[k] == "'":
+            if prefixed and line_[k + 1:].lstrip().startswith("=") and not line_[k + 1:].lstrip().startswith("=="):
+                return False
+            return True
+        k += 1
+    return False
+
+
+def _skip_string(src, i):
+    """The index after the string literal that starts at i (one or three quotes), or -1."""
+    qc = src[i]
+    q = qc * 3 if src.startswith(qc * 3, i) else qc
+    k = i + len(q)
+    while k < len(src):
+        if src[k] == "\\":
+            k += 2
+            continue
+        if src.startswith(q, k):
+            return k + len(q)
+        if len(q) == 1 and src[k] == "\n":
+            return -1
+        k += 1
+    return -1
+
 def tokenize(src):
     """Tokens of a source text. The last few results are remembered (the Guard scan and the parser read the
     same file); the caller gets its own list."""
@@ -208,22 +248,42 @@ def _tokenize(src):
                 i = end + len(close)
                 continue
         # strings -------------------------------------------------------
-        if c == '"' or (c in "fb" and i + 1 < n and src[i + 1] == '"'):
+        if c == '"' or (c in "fb" and i + 1 < n and src[i + 1] == '"') or \
+                (c == "'" and _single_quote_string(src, i)) or \
+                (c in "fb" and i + 1 < n and src[i + 1] == "'" and _single_quote_string(src, i + 1, prefixed=True)):
             is_f = c == "f"
             is_b = c == "b"
             if is_f or is_b:
                 i += 1
-            triple = src.startswith('"""', i)
-            q = '"""' if triple else '"'
+            qc = src[i]                                    # " or ' (Python's two quote characters)
+            triple = src.startswith(qc * 3, i)
+            q = qc * 3 if triple else qc
             i += len(q)
             buf = []
+            fdepth = 0                                      # f-strings: inside {…}, quotes belong to the expression
             while True:
                 if i >= n:
                     raise LexError("unterminated string", line, start_col)
-                if src.startswith(q, i):
+                if is_f and fdepth > 0 and src[i] in "\"'":
+                    k = _skip_string(src, i)               # a string inside a replacement field: f"{"x"!r}"
+                    if k < 0:
+                        raise LexError("unterminated string", line, start_col)
+                    buf.append(src[i:k])
+                    i = k
+                    continue
+                if fdepth == 0 and src.startswith(q, i):
                     i += len(q)
                     break
                 ch = src[i]
+                if is_f:
+                    if ch == "{":
+                        if fdepth == 0 and src.startswith("{{", i):
+                            buf.append("{{")
+                            i += 2
+                            continue
+                        fdepth += 1
+                    elif ch == "}" and fdepth > 0:
+                        fdepth -= 1
                 if ch == "\n":
                     if not triple:
                         raise LexError("unterminated string", line, start_col)

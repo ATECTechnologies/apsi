@@ -957,11 +957,29 @@ class Parser:
             ps = self.params()
             self.expect_op("=>", " in lambda (fn(x) => expr)")
             return A.Lambda(ps, self.expr(), **self.pos(tok))
+        if self.peek().type == NAME and self.peek().value == "lambda" and \
+                (self.at_op(":", 1) or self.at(NAME, k=1) or self.at_op("*", 1) or self.at_op("**", 1)):
+            return self.python_lambda()                 # lambda x, y=1: expr  (the same as fn(x, y=1) => expr)
         if self.peek().type == NAME and self.at_op(":=", 1):     # (name := value)
             tok = self.next()
             self.next()
             return A.NamedExpr(tok.value, self.expr(), **self.pos(tok))
         return self.pipe()
+
+    def python_lambda(self):
+        tok = self.next()                              # 'lambda'
+        ps = []
+        while not self.at_op(":"):
+            star = None
+            if self.at_op("*") or self.at_op("**"):
+                star = self.next().value
+            ptok = self.expect_name(" for a lambda parameter")
+            d = None if star else (self.ternary() if self.accept_op("=") else None)
+            ps.append(A.Param(ptok.value, None, d, star, **self.pos(ptok)))
+            if not self.accept_op(","):
+                break
+        self.expect_op(":", " after the parameters of lambda (lambda x: x * 2)")
+        return A.Lambda(ps, self.expr(), **self.pos(tok))
 
     def pipe(self):
         e = self.ternary()
