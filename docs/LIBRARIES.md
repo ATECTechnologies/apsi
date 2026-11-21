@@ -90,10 +90,14 @@ exclude = ["data/raw/**"]
 linalg-extra = "^1.2"
 ```
 
-A library can be split into files. Inside `src/`, `use geom` loads `src/geom.apsi`, `use shapes.circle` loads
+`apsi new NAME --template lib` starts one already split into files, with tests, an example and the `doc`,
+`pack` and `publish` tasks. A library can be split into files. Inside `src/`, `use geom` loads `src/geom.apsi`, `use shapes.circle` loads
 `src/shapes/circle.apsi`, and `from geom import Point` takes single names; the files travel in the `.apsil` with
 the entry file. Only the entry file's public names (not starting with `_`) are what `use NAME` gives other
-programs, so re-export what they should see (`from geom import Point` in the entry file does that).
+programs, so re-export what they should see (`from geom import Point` in the entry file does that), and
+`__all__ = [...]` there lists exactly what users get. Folders are packages (`__init__.apsi`), and files inside a
+package import each other relatively (`from .geom import Point`, `from ..util import fmt`). `apsi doc src --out
+API.md` writes the API documentation from the code.
 
 Libraries may be of any size and contain data files (weights, tables, datasets) next to the code; files larger than 2 GB are stored with ZIP64.
 

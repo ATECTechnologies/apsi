@@ -9,7 +9,19 @@
 - **`lambda x, y=1: expr`**, the same function as `fn(x, y=1) => expr`.
 - `filter(none, xs)` keeps the truthy items.
 - **`def name(...):`** defines a function or method, the same as `fn`.
-- Python's type names in annotations: `x: int`, `-> float`, `str`, `bool`, `list`, `tuple`, `dict`.
+- Python's type names in annotations: `x: int`, `-> float`, `str`, `bool`, `list`, `tuple`, `dict`; typing names
+  (`List[int]`, `Optional[str]`, …) and your own classes are accepted as annotations.
+- **Plain assignment declares:** `x = 1` where `x` is declared nowhere makes `x` a variable of the enclosing
+  function, module or class body, visible after the `if`/`for`/`try` it was assigned in (Python's rule). Names
+  declared with `let`/`var` keep Apsi's rules, so existing programs behave exactly as before, and reading a name
+  that was never assigned is still an error before the program runs.
+- **`import json`, `import numpy as np`, `from dataclasses import dataclass`, `from collections import Counter`:**
+  Python's import reaches the program's own files first, then Apsi libraries, then Python modules (through
+  pyimport, so `--allow-python` and the Guard apply as before; pure modules such as json, math, re, itertools,
+  functools, dataclasses and typing need no permission). `import a, b` and imports inside `try`/`if` work.
+- `None` / `True` / `False`, raw strings `r"\d+"` / `r'…'` / `rb"…"`, `...`, `x: int = 5`, `a, *rest = xs`,
+  `K.count += 1` on the program's own classes, `type(x).__name__`, `type(x) == int`, `@dataclass` classes in both
+  engines.
 
 ### Modules and libraries
 - **`use NAME` finds the program's own files:** `use helpers` loads `helpers.apsi` next to the file, `use shapes.circle`
@@ -18,14 +30,47 @@
 - **`from M import a, b as c`** (also `from "file.apsi" import …` and the parenthesised multi-line form): only the named
   public names, checked before the program runs, with a suggestion for a misspelt name.
 - `import "file.apsi"` without `as` now also brings in the file's classes and top-level `x = …` names.
+- **Packages:** a folder with `__init__.apsi` (or `main.apsi`) is a module: `import geo`, `from geo.shapes import
+  Circle`. **Relative imports** inside it: `from .util import fmt`, `from .. import core`, `from . import shapes`.
+- **`__all__ = ["a", "b"]`** lists exactly what a file gives to `use` / `import` / `from`.
+- **`apsi doc FILE|FOLDER [--out API.md]`:** Markdown API documentation of your own code: signatures as written,
+  docstrings, the `#` comments above definitions, struct fields and methods, constants.
+- **`apsi new NAME --template lib`** makes a library split into files (re-exports with `__all__`, a struct, tests
+  of errors, an example, a changelog) with `doc`, `pack` and `publish` tasks; `pack`/`publish` check and test first.
+- **Many-file programs start about 2× faster:** the code generated for each file is cached, keyed by the file, how
+  every import resolves now (and the size and time of each local file it imports) and Apsi itself; entries are
+  signed. A 300-file package: 570 ms → 265 ms from the second run. The "checked clean" marker now also covers
+  small files.
+- **`apsi build`** carries the program's packages and local modules (all the import forms above) and the installed
+  libraries it uses, so the executable runs where they are not installed; `--list` shows what went in.
 
 ### Web server
 - **About 2.4× the requests per second** on one process (hello-world JSON, 100 keep-alive connections, 2 cores:
   30k → 73k req/s): a connection that repeats its header block is parsed once, and the response head is built
   from cached status lines.
 - The header-injection guard is stricter: a header whose name or value holds CR or LF is dropped.
+- **On the internet behind Cloudflare or any proxy:** `app.trust_proxy("cloudflare", "local", "10.0.0.0/8")` takes
+  the visitor's address and https from `CF-Connecting-IP` / `X-Forwarded-For` / `X-Forwarded-Proto`, believed only
+  from the named proxies (Cloudflare's published ranges are built in), so rate limits and logs count visitors.
+  `app.allowed_hosts("example.com", "*.example.com")` answers 421 for other host names; `app.force_https()`
+  redirects with 308 and sends HSTS. `req.peer`, `req.scheme`, `req.host`, `req.url`.
+- **`app.production(domain="example.com", cloudflare=true)`:** all of it in one call, plus security headers, a
+  per-visitor rate limit, gzip, `/health` and `/ready`.
+- **`apsi tunnel server.apsi --port 8080`:** starts the program and puts it on the internet through a Cloudflare
+  Tunnel (`cloudflared`): a `https://….trycloudflare.com` address at once, or your own domain with `--name`; no
+  open port, no public IP.
+
+### GPU
+- **`apsi gpu test`:** everything Apsi does on the card in one report (`report.txt`, `report.json`), every part
+  PASS or FAIL: kernels and layers against the exact reference, every product build, an Apsi program trained,
+  stopped, resumed to the same loss, predicted with, saved and read back on the card, bfloat16 moments, gradient
+  accumulation, a graph network, the speed of three models, and the largest model that trains here.
+- **`apsi gpu bench max`:** the largest GPT (125 M … 6.7 B, context 512, bf16 with bfloat16 moments) that trains on
+  this card, its card memory and speed; sizes that cannot fit are refused before anything is allocated, and a
+  size that spills into the computer's memory ends the ladder.
 
 ### Faster
+- **`read_jsonl` about 15 % faster:** one parse of the whole file, columns built and typed at C speed.
 - **`read_csv` without a C compiler** (most Windows machines): the CSV kernels are also written in Apsi
   (`apsi/csrc/fastcsv.apsi`) and compiled by Apsi's own native compiler. A 1 M-row file: 1.21 s → 0.23 s.
 - **`read_csv` with a C compiler:** numbers with up to 15 digits are parsed in one correctly rounded operation (the

@@ -262,7 +262,12 @@ xs[0] = 5                   # element assignment (lists, dicts, tensors)
 p.mass = 2kg                # field assignment (structs, records)
 ```
 
-- A name must be declared with `let` or `var` before it is used — a typo is an error, not a new variable.
+- A name must be declared before it is read — reading a misspelt name is an error before the program runs.
+- **Python's way works too:** `x = 1` where `x` is declared nowhere (no `let`/`var`/parameter here or around)
+  declares it as a variable of the enclosing function, module or class body, visible after the `if`/`for`/`try`
+  it was assigned in. Inside a function such a name is the function's own, even if the module has one of the same
+  name (`global x` / `nonlocal x` reach the outer one). Names declared with `let`/`var` keep the rules below.
+  `x: int = 5` declares with a type.
 - A `var` that holds a physical quantity **keeps its dimension**: assigning a `Time` to a `Length` variable is an error.
 - Blocks (`if`, `for`, `while`, function bodies) open a new scope. Names declared inside are not visible outside.
 - Loop variables and function parameters are constants.
@@ -972,6 +977,12 @@ from linalg import eigh, solve as lsolve      # only these names
 from helpers import (parse_row,
                      Row)
 from "lib/geometry.apsi" import Point
+import geo                   # a package: geo/__init__.apsi (or geo/main.apsi), used as geo.name
+from geo.shapes import Circle
+from .util import fmt        # inside a package: relative to this file (.. one folder up, from . import x)
+import json                  # Python's import: your file json.apsi, an Apsi library, else the Python module
+import numpy as np
+from dataclasses import dataclass
 ```
 
 - `use NAME` brings every public name of the module into scope and, unless that name is already taken, also makes
@@ -981,8 +992,17 @@ from "lib/geometry.apsi" import Point
   [Libraries](LIBRARIES.md)). Dashes in a library name become underscores: `geom-tools` → `use geom_tools`.
 - `from M import a, b as c` brings in only the named public names, from a module, a library, one of your files
   or a quoted file path. A misspelt or private (`_`) name is an error before the program runs.
-- `import` runs another `.apsi` file once (cached) and brings in its public top-level names. The path is relative to
-  the importing file. Its `test` blocks do not run on import.
+- `import "file.apsi"` runs another `.apsi` file once (cached) and brings in its public top-level names. The path is
+  relative to the importing file. Its `test` blocks do not run on import.
+- `import NAME` (no quotes) is Python's import: it binds only `NAME` (`import a.b` binds `a`; `import a.b as c` binds
+  `c`) and looks at the program's own files and packages first, then Apsi libraries, then Python modules, then
+  Apsi's standard modules. A Python module goes through `pyimport`: pure modules (json, math, re, itertools,
+  functools, collections, dataclasses, typing, …) need no permission, others need `--allow-python`, and the Guard
+  refuses the ones that escape Apsi's permissions (os, subprocess, …) without `--allow-python=all`.
+  `from M import x` also falls back to the Python module when Apsi's `M` has no `x` (`from collections import
+  Counter`).
+- A file's public names are those not starting with `_`, or exactly the ones a top-level `__all__ = ["a", "b"]`
+  lists. `apsi doc FILE|FOLDER --out API.md` writes their documentation.
 - Circular imports are reported as errors.
 
 Standard modules: `math`, `physics`, `physics.units`, `physics.constants`, `physics.fields`, `physics.formulas`, `nn`,
