@@ -22,7 +22,7 @@ CASES = [
     ("let t = (1, 2)\nt[0] = 5\n", ["tuples cannot change"], 2),
     ("let a = [1, 2\nprint(a)\n", ["'[' is not closed", "end of line 1"], None),
     ("let x = 5\nif x = 5:\n    print(x)\n", ["to compare two values write =="], None),
-    ("def f(x):\n    return x\n", ["Apsi defines functions with 'fn'"], None),
+    ("function f(x):\n    return x\n", ["Apsi defines functions with 'fn'"], None),
     ("let x = 1\nif x > 0:\n    print(1)\nelse if x < 0:\n    print(2)\n", ["write 'elif'"], None),
     ('print "hi"\n', ["print is a function"], None),
     ("var x = 1\nx++\n", ["write x += 1"], None),

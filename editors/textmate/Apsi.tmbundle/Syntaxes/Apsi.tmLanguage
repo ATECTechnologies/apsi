@@ -217,7 +217,7 @@
 			<key>name</key>
 			<string>meta.function.apsi</string>
 			<key>begin</key>
-			<string>\b(fn)\s+([\p{L}_][\p{L}\p{N}_]*)\s*(?:(\[)([^\]]*)(\]))?\s*(\()</string>
+			<string>\b(fn|def)\s+([\p{L}_][\p{L}\p{N}_]*)\s*(?:(\[)([^\]]*)(\]))?\s*(\()</string>
 			<key>beginCaptures</key>
 			<dict>
 				<key>1</key>

@@ -557,6 +557,8 @@ fn energy(m: Mass, v: Velocity) -> Energy =     # expression body on the next li
 let double = fn(x) => x * 2                     # anonymous function (lambda)
 ```
 
+Python's spellings work too: `def area(r):` is `fn area(r):`, and `lambda x: x * 2` is `fn(x) => x * 2`.
+
 - A block body without `return` returns `none`. `return a, b` returns a tuple.
 - Parameters may have **defaults** (`b = 1.0`). Arguments may be passed by position or by name
   (`solve(1, tol=1e-6)`). Unknown names and wrong counts are reported by the checker.
@@ -570,7 +572,7 @@ Annotations on parameters, results and variables are **checked by the checker an
 
 | Annotation | Means |
 |---|---|
-| `Float`, `Int`, `Bool`, `Str`, `List`, `Tuple`, `Dict`, `Record`, `Fn`, `Any` | basic types (`Float` accepts `Int`) |
+| `Float`, `Int`, `Bool`, `Str`, `List`, `Tuple`, `Dict`, `Record`, `Fn`, `Any` | basic types (`Float` accepts `Int`); Python's `float int bool str list tuple dict` mean the same |
 | `Length`, `Mass`, `Time`, `Velocity`, `Force`, `Energy`, … | physical quantity of that dimension (list in 10.6) |
 | `[m/s]`, `[J/K]` | a dimension written as a unit |
 | `Tensor[B, T, D]` | tensor whose shape matches the symbols |

@@ -169,9 +169,14 @@ def _json_response(obj, status=200, headers=None):
         from .interop import to_py
         body = json.dumps(_clean(to_py(obj)), ensure_ascii=False, separators=(",", ":"),
                           allow_nan=False).encode("utf-8")
-    h = {"Content-Type": "application/json; charset=utf-8"}
-    h.update(headers or {})
-    return Response(body, status, h)
+    r = _new_response(Response)
+    r.status, r.body = status, body
+    r.headers = {"Content-Type": "application/json; charset=utf-8", **headers} if headers else \
+        {"Content-Type": "application/json; charset=utf-8"}
+    return r
+
+
+_new_response = object.__new__
 
 
 def _to_response(r):
@@ -881,7 +886,8 @@ class _HTTPProtocol(asyncio.Protocol):
     Fast handlers run inline on the loop — no thread hop — and the app measures every route: a route whose calls
     take more than 2 ms (or that blocks once for longer than 20 ms) moves to the worker threads for good. Pipelined
     requests are answered in order; reading pauses while a request is being handled on a worker."""
-    __slots__ = ("app", "t", "buf", "busy", "client", "timer", "closed", "first", "loop", "requests", "deadline")
+    __slots__ = ("app", "t", "buf", "busy", "client", "timer", "closed", "first", "loop", "requests", "deadline",
+                 "last_head", "last_parsed")
 
     def __init__(self, app):
         self.app = app
@@ -892,6 +898,8 @@ class _HTTPProtocol(asyncio.Protocol):
         self.timer = None
         self.deadline = 0.0
         self.requests = 0
+        self.last_head = None
+        self.last_parsed = None
 
     def connection_made(self, transport):
         self.t = transport
@@ -961,12 +969,18 @@ class _HTTPProtocol(asyncio.Protocol):
                     self._close()
                 return
             head = bytes(self.buf[:end + 4])
-            try:
-                method, target, version, headers = _parse_head(head, app.max_header)
-            except HTTPError as e:
-                self._write(_json_response({"error": e.message}, e.status), False)
-                self._close()
-                return
+            if head == self.last_head:                         # keep-alive clients repeat the same header block
+                method, target, version, headers = self.last_parsed
+                headers = headers.copy()
+            else:
+                try:
+                    parsed = _parse_head(head, app.max_header)
+                except HTTPError as e:
+                    self._write(_json_response({"error": e.message}, e.status), False)
+                    self._close()
+                    return
+                method, target, version, headers = parsed
+                self.last_head, self.last_parsed = head, (method, target, version, headers.copy())
             if headers.get("transfer-encoding", "").lower() not in ("", "identity"):
                 self._write(_json_response({"error": "chunked request bodies are not supported"}, 411), False)
                 self._close()
@@ -1086,14 +1100,18 @@ class _HTTPProtocol(asyncio.Protocol):
     def _write(self, resp, keep, head_only=False):
         h = resp.headers
         status = resp.status
-        head = f"HTTP/1.1 {status} {STATUS.get(status, 'Status')}\r\nContent-Length: {len(resp.body)}\r\n" \
-               f"{'Connection: keep-alive' if keep else 'Connection: close'}\r\n" \
-               f"{'' if 'Server' in h else 'Server: apsi' + chr(13) + chr(10)}"
+        start = _STATUS_LINES.get((status, keep))
+        if start is None:
+            start = f"HTTP/1.1 {status} {STATUS.get(status, 'Status')}\r\n" \
+                    f"{'Connection: keep-alive' if keep else 'Connection: close'}\r\n"
+            if len(_STATUS_LINES) < 256:
+                _STATUS_LINES[(status, keep)] = start
         lines = "".join([f"{k}: {v}\r\n" for k, v in h.items()])
-        if "\n" in lines.replace("\r\n", "") or lines.count("\r") != lines.count("\n"):
+        if lines.count("\n") != len(h) or lines.count("\r") != len(h):
             lines = "".join(f"{k}: {v}\r\n" for k, v in h.items()              # header injection guard
-                            if "\r" not in str(v) and "\n" not in str(v))
-        data = (head + lines + "\r\n").encode("latin-1", "replace")
+                            if "\r" not in f"{k}{v}" and "\n" not in f"{k}{v}")
+        data = f"{start}Content-Length: {len(resp.body)}\r\n{'' if 'Server' in h else 'Server: apsi' + chr(13) + chr(10)}" \
+               f"{lines}\r\n".encode("latin-1", "replace")
         self.t.write(data if head_only else data + resp.body)
 
     def _upgrade(self, method, path, qs, headers):
@@ -1150,6 +1168,7 @@ def event_loop_name():
         loop.close()
 
 
+_STATUS_LINES = {}          # (status, keep-alive) -> the first two lines of the response head
 _INLINE_AFTER = 32          # a route runs on the event loop after this many calls that each took < 0.5 ms
 
 

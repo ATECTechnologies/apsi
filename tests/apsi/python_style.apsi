@@ -30,3 +30,25 @@ test "the derivative mark of evolve is unchanged":
     evolve y over t in 0[s]..1[s] step 0.1[s]:
         y' = -y / 1[s]
     assert abs(y - 0.36788) < 1e-4
+
+def twice(x: int) -> int:
+    return x * 2
+
+class Counter:
+    count: int = 0
+    def add(self, n: int = 1):
+        self.count += n
+        return self
+
+struct Point:
+    x: float
+    y: float
+    def norm2(self) -> float:
+        return self.x * self.x + self.y * self.y
+
+test "def and Python type names":
+    assert twice(4) == 8
+    assert Counter().add().add(3).count == 4
+    assert Point(3.0, 4.0).norm2() == 25.0
+    let defined = {"def": 1}
+    assert defined["def"] == 1

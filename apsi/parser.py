@@ -26,12 +26,31 @@ def _unit_info(text, line, col):
 _QIDS = itertools.count(1)          # hidden names for `??` and `?.` (each value is computed once)
 
 
+_DEF_AFTER = (NEWLINE, INDENT, DEDENT)
+
+
+def _python_def(toks):
+    """Python's `def name(...)` at the start of a statement (or after `async`) is Apsi's `fn name(...)`."""
+    for j in range(len(toks) - 2):
+        t = toks[j]
+        if t.type == NAME and t.value == "def" and toks[j + 1].type == NAME \
+                and toks[j + 2].type == OP and toks[j + 2].value in ("(", "["):
+            p = toks[j - 1] if j else None
+            if p is None or p.type in _DEF_AFTER or p.type == NAME and p.value == "async":
+                t.type, t.value = KW, "fn"
+
+
+_PY_TYPES = {"int": "Int", "float": "Float", "str": "Str", "bool": "Bool", "list": "List", "dict": "Dict",
+             "tuple": "Tuple"}
+
+
 class Parser:
     def __init__(self, tokens):
         self.last = len(tokens) - 1
         self.t = tokens + [tokens[-1]] * 8 if tokens else tokens   # EOF padding: peek(k) needs no bounds check
         self.i = 0
         self.pyc = False             # after `use pycompat`: `^` is Python's exclusive or
+        _python_def(self.t)
 
     # -- token helpers ---------------------------------------------------
     def peek(self, k=0):
@@ -181,7 +200,7 @@ class Parser:
 
     def statement(self):
         tok = self.peek()
-        if tok.type == NAME and self.peek(1).type == NAME and tok.value in ("def", "function", "func", "fun"):
+        if tok.type == NAME and self.peek(1).type == NAME and tok.value in ("function", "func", "fun"):
             self.error(f"Apsi defines functions with 'fn': fn {self.peek(1).value}(...):")
         if tok.type == NAME and tok.value == "print" and self.peek(1).type in (STRING, FSTRING, NUMBER):
             self.error("print is a function: write print(...) with parentheses", self.peek(1))
@@ -935,7 +954,7 @@ class Parser:
                 if not self.accept_op(","):
                     break
             self.expect_op("]")
-        return A.TName(name, args, **self.pos(tok))
+        return A.TName(_PY_TYPES.get(name, name), args, **self.pos(tok))
 
     # -- expressions -----------------------------------------------------
     def tuple_expr(self):

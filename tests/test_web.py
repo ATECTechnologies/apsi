@@ -17,6 +17,13 @@ use web
 let app = server(name="t", log=false, max_body=1000, header_timeout=1[s], handler_timeout=2[s])
 app.health()
 app.static("/files", STATIC)
+@app.get("/mut")
+fn mut(req):
+    let seen = req.headers.get("x-seen") != none
+    req.headers["x-seen"] = "1"
+    return {"a": req.headers["x-a"], "seen": seen}
+@app.get("/inject")
+fn inject(req) = response("ok", headers={"X-Ok": "yes", "X-Bad": "a\\r\\nEvil: 1"})
 @app.post("/echo")
 fn echo(req) = {"got": req.json()}
 app.compress(min_size=200)
@@ -87,6 +94,18 @@ class WebServer(unittest.TestCase):
         r = self.raw(b"GET /health HTTP/1.1\r\nHost: x\r\n\r\nGET /health HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")
         self.assertEqual(r.count(b"HTTP/1.1 200"), 2)
         self.assertIn(b"X-Content-Type-Options: nosniff", r)
+
+    def test_repeated_header_block_is_parsed_once_but_isolated(self):
+        req = b"GET /mut HTTP/1.1\r\nHost: x\r\nX-A: 1\r\n\r\n"
+        r = self.raw(req * 3 + b"GET /mut HTTP/1.1\r\nHost: x\r\nX-A: 2\r\nConnection: close\r\n\r\n")
+        self.assertEqual(r.count(b'{"a":"1","seen":false}'), 3)     # the handler's change does not leak
+        self.assertEqual(r.count(b'{"a":"2","seen":false}'), 1)
+
+    def test_header_injection_dropped(self):
+        r = self.raw(b"GET /inject HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")
+        head = r.partition(b"\r\n\r\n")[0]
+        self.assertNotIn(b"Evil", head)
+        self.assertIn(b"X-Ok: yes", head)
 
     def test_json_echo(self):
         body = b'{"a": [1, 2, 3]}'

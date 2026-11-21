@@ -149,7 +149,7 @@
     },
     "fn-def": {
       "name": "meta.function.apsi",
-      "begin": "\\b(fn)\\s+([\\p{L}_][\\p{L}\\p{N}_]*)\\s*(?:(\\[)([^\\]]*)(\\]))?\\s*(\\()",
+      "begin": "\\b(fn|def)\\s+([\\p{L}_][\\p{L}\\p{N}_]*)\\s*(?:(\\[)([^\\]]*)(\\]))?\\s*(\\()",
       "beginCaptures": {
         "1": {
           "name": "storage.type.function.apsi"

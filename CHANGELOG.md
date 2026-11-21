@@ -8,6 +8,14 @@
 - **Quotes inside f-string fields**, also the f-string's own: `f"{'-'.join(xs)}"`, `f"{"x"!r}"`.
 - **`lambda x, y=1: expr`**, the same function as `fn(x, y=1) => expr`.
 - `filter(none, xs)` keeps the truthy items.
+- **`def name(...):`** defines a function or method, the same as `fn`.
+- Python's type names in annotations: `x: int`, `-> float`, `str`, `bool`, `list`, `tuple`, `dict`.
+
+### Web server
+- **About 2.4× the requests per second** on one process (hello-world JSON, 100 keep-alive connections, 2 cores:
+  30k → 73k req/s): a connection that repeats its header block is parsed once, and the response head is built
+  from cached status lines.
+- The header-injection guard is stricter: a header whose name or value holds CR or LF is dropped.
 
 ### Faster
 - **`read_csv` without a C compiler** (most Windows machines): the CSV kernels are also written in Apsi
