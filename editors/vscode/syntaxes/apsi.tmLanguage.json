@@ -672,7 +672,7 @@
         },
         {
           "name": "keyword.control.import.apsi",
-          "match": "\\b(use|import)\\b"
+          "match": "\\b(use|import|from(?=\\s+[\\p{L}_\"][^\\n]*\\bimport\\b))\\b"
         },
         {
           "name": "keyword.operator.logical.apsi",

@@ -12,7 +12,7 @@ from . import ast as A
 from . import ops
 from . import stdlib
 from .autodiff import Node
-from .errors import (ApsiError, RuntimeErr, NameErr, TypeCheckError, UnitError, ShapeError,
+from .errors import (did_you_mean, ApsiError, RuntimeErr, NameErr, TypeCheckError, UnitError, ShapeError,
                      AssertionFailed, CheckFailed)
 from .fmt import fmt, type_name
 from .parser import parse
@@ -1039,9 +1039,26 @@ class Interpreter:
         return True
 
     def ex_Use(self, s, env):
-        if s.path not in self.modules and not self.ensure_module(s.path):
-            raise NameErr(f"unknown module '{s.path}'. Available: {', '.join(sorted(self.modules))}")
+        if s.path not in self.modules:
+            from .apsil import local_module
+            local = local_module(s.path, self.dir_stack[-1])
+            if local is not None:                                   # a file of the program itself
+                members = self._file_public(local)
+                if s.names is not None:
+                    return self._bind_names(s, members, s.path, env)
+                ns = Namespace(s.path, members)
+                if s.alias:
+                    return env.define(s.alias, ns)
+                for k, v in members.items():
+                    env.define(k, v)
+                if "." not in s.path and s.path not in members and s.path not in env.vars:
+                    env.define(s.path, ns)
+                return
+            if not self.ensure_module(s.path):
+                raise NameErr(f"unknown module '{s.path}'. Available: {', '.join(sorted(self.modules))}")
         members = self.modules[s.path]
+        if s.names is not None:
+            return self._bind_names(s, members, s.path, env)
         if s.alias:
             env.define(s.alias, Namespace(s.path, members))
         else:
@@ -1050,14 +1067,18 @@ class Interpreter:
             if "." not in s.path and s.path not in members and s.path not in env.vars and s.path not in self.globals.vars:
                 env.define(s.path, Namespace(s.path, members))      # `use rl` also allows rl.ppo(...)
 
-    def ex_Import(self, s, env):
-        path = s.path
-        if not os.path.isabs(path):
-            path = os.path.join(self.dir_stack[-1], path)
-        path = os.path.abspath(os.path.normpath(path))      # one module per file, however the path is spelled
+    def _bind_names(self, s, members, what, env):
+        """`from M import a, b as c`: only the named public members."""
+        for n, a in s.names:
+            if n.startswith("_") or n not in members:
+                raise NameErr(f"'{what}' has no public name '{n}'" + did_you_mean(n, list(members)))
+            env.define(a or n, members[n])
+
+    def _file_public(self, path):
+        """Run an .apsi file once (cached) and return its public top-level names."""
         if path not in self.module_cache:
             if not os.path.exists(path):
-                raise NameErr(f"cannot find file '{s.path}'")
+                raise NameErr(f"cannot find file '{path}'")
             with open(path, encoding="utf-8-sig") as fh:
                 src = fh.read()
             self._enter_import(path)
@@ -1070,8 +1091,18 @@ class Interpreter:
             finally:
                 self.importing.pop()
             self.module_cache[path] = menv
-        menv = self.module_cache[path]
-        public = {k: v for k, v in menv.vars.items() if not k.startswith("_")}
+        return {k: v for k, v in self.module_cache[path].vars.items() if not k.startswith("_")}
+
+    def ex_Import(self, s, env):
+        path = s.path
+        if not os.path.isabs(path):
+            path = os.path.join(self.dir_stack[-1], path)
+        path = os.path.abspath(os.path.normpath(path))      # one module per file, however the path is spelled
+        if not os.path.exists(path):
+            raise NameErr(f"cannot find file '{s.path}'")
+        public = self._file_public(path)
+        if s.names is not None:
+            return self._bind_names(s, public, s.path, env)
         if s.alias:
             env.define(s.alias, Namespace(os.path.basename(path), public))
         else:

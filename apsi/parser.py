@@ -228,6 +228,9 @@ class Parser:
             m = self.try_match()
             if m is not None:
                 return m
+        if tok.type == NAME and tok.value == "from" and self.peek(1).type in (NAME, STRING) \
+                and (self.at_kw("import", 2) or self.peek(1).type == NAME and self.at_op(".", 2)):
+            return self.from_import()
         if self._soft("del"):
             self.next()
             targets = [self.postfix_target()]
@@ -892,6 +895,39 @@ class Parser:
         if parts == ["pycompat"] and alias is None:
             self.pyc = True
         return A.Use(".".join(parts), alias, **self.pos(tok))
+
+    def from_import(self):
+        """from MODULE import a, b as c   /   from "file.apsi" import a   /   from MODULE import (a, b)"""
+        tok = self.next()
+        src = self.next()
+        is_file = src.type == STRING
+        path = src.value
+        while not is_file and self.accept_op("."):
+            path += "." + self.expect_name().value
+        self.expect_kw("import", " after the module name (from MODULE import name)")
+        if self.at_op("*"):
+            self.error(f"write 'use {path}' to bring in every public name" if not is_file else
+                       f'write \'import "{path}"\' to bring in every public name')
+        paren = self.accept_op("(")
+        names = []
+        while True:
+            if paren:
+                while self.peek().type in (NEWLINE, INDENT, DEDENT):
+                    self.next()
+                if self.at_op(")"):
+                    break
+            n = self.expect_name(" to import").value
+            a = self.expect_name(" after 'as'").value if self.accept_kw("as") else None
+            names.append((n, a))
+            if not self.accept_op(","):
+                break
+        if paren:
+            while self.peek().type in (NEWLINE, INDENT, DEDENT):
+                self.next()
+            self.expect_op(")", " to close the imported names")
+        self.expect_eol()
+        node = A.Import if is_file else A.Use
+        return node(path, None, names, **self.pos(tok))
 
     def evolve_stmt(self):
         tok = self.next()

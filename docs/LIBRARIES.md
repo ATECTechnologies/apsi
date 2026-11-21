@@ -46,6 +46,8 @@ print(physics_units.version)
 
 use transformer_kit as tk
 let model = tk.gpt(layers=12, width=768)
+
+from physics_units import Orbit, period      # single names
 ```
 
 `use NAME` makes the library’s public names available directly and as `NAME.member`. Names starting with `_` are private. The checker loads the library before your program runs, so unit and type errors across library boundaries are reported as usual.
@@ -87,6 +89,11 @@ exclude = ["data/raw/**"]
 [dependencies]
 linalg-extra = "^1.2"
 ```
+
+A library can be split into files. Inside `src/`, `use geom` loads `src/geom.apsi`, `use shapes.circle` loads
+`src/shapes/circle.apsi`, and `from geom import Point` takes single names; the files travel in the `.apsil` with
+the entry file. Only the entry file's public names (not starting with `_`) are what `use NAME` gives other
+programs, so re-export what they should see (`from geom import Point` in the entry file does that).
 
 Libraries may be of any size and contain data files (weights, tables, datasets) next to the code; files larger than 2 GB are stored with ZIP64.
 

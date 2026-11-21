@@ -842,8 +842,23 @@ class CodeGen:
         self.indent -= 1
 
     def s_Use(self, s, scope):
-        self.rt.interp.ensure_module(s.path, self.rt.base_dir)
         mods = self.rt.interp.modules
+        if s.path not in mods:
+            from .apsil import local_module
+            local = local_module(s.path, self.rt.base_dir)
+            if local is not None:                                      # a file of the program itself
+                self.s_Import(A.Import(local, s.alias, s.names, line=s.line, col=s.col), scope)
+                if s.alias is None and s.names is None and "." not in s.path and scope.lookup(s.path) is None:
+                    b = self.declare(scope, s.path)
+                    self.emit(f"{b.py} = {HELPER_PREFIX}Namespace({s.path!r}, "
+                              f"{HELPER_PREFIX}import_file({local!r}))")
+                return
+        self.rt.interp.ensure_module(s.path, self.rt.base_dir)
+        if s.names is not None:
+            for n, a in s.names:
+                b = self.declare(scope, a or n)
+                self.emit(f"{b.py} = {HELPER_PREFIX}mods[{s.path!r}][{n!r}]")
+            return
         if s.alias:
             b = self.declare(scope, s.alias)
             self.emit(f"{b.py} = {HELPER_PREFIX}namespace({s.path!r})")
@@ -863,6 +878,11 @@ class CodeGen:
             self.emit(f"{b.py} = {HELPER_PREFIX}import_module({path!r})")
             return
         self.emit(f"{tmp} = {HELPER_PREFIX}import_file({path!r})")
+        if s.names is not None:
+            for n, a in s.names:
+                b = self.declare(scope, a or n)
+                self.emit(f"{b.py} = {tmp}[{n!r}]")
+            return
         if s.alias:
             b = self.declare(scope, s.alias)
             self.emit(f"{b.py} = {HELPER_PREFIX}Namespace({os.path.basename(path)!r}, {tmp})")
@@ -870,8 +890,14 @@ class CodeGen:
         with open(path, encoding="utf-8-sig") as fh:
             prog = parse(fh.read())
         for st in prog.body:
-            names = st.targets if isinstance(st, A.Let) else (
-                [st.name] if isinstance(st, (A.FnDef, A.StructDef)) else [])
+            if isinstance(st, A.Let):
+                names = [t for t in st.targets if isinstance(t, str)]
+            elif isinstance(st, A.Assign) and isinstance(st.target, A.Name):
+                names = [st.target.id]
+            elif isinstance(st, (A.FnDef, A.StructDef, A.ClassDef)):
+                names = [st.name]
+            else:
+                names = []
             for n in names:
                 if not n.startswith("_"):
                     b = self.declare(scope, n)

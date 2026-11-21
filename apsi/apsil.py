@@ -207,6 +207,15 @@ def installed(project_dir=None, include_global=True):
     return out
 
 
+def local_module(name, base):
+    """The file `use NAME` loads from the program's own folder: NAME.apsi next to the importing file (a dotted
+    name is a sub-folder: `use shapes.circle` -> shapes/circle.apsi), or None."""
+    if not base or not name or not all(p.isidentifier() for p in name.split(".")):
+        return None
+    p = os.path.join(base, *name.split(".")) + ".apsi"
+    return os.path.abspath(p) if os.path.isfile(p) else None
+
+
 def resolve_use(name, start_dir=None):
     """Entry file for `use NAME` when NAME is an installed library, else None."""
     proj = _project_dir(start_dir)

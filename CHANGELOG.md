@@ -11,6 +11,14 @@
 - **`def name(...):`** defines a function or method, the same as `fn`.
 - Python's type names in annotations: `x: int`, `-> float`, `str`, `bool`, `list`, `tuple`, `dict`.
 
+### Modules and libraries
+- **`use NAME` finds the program's own files:** `use helpers` loads `helpers.apsi` next to the file, `use shapes.circle`
+  loads `shapes/circle.apsi` (after the standard modules, before installed libraries). Libraries can be split into
+  files this way.
+- **`from M import a, b as c`** (also `from "file.apsi" import …` and the parenthesised multi-line form): only the named
+  public names, checked before the program runs, with a suggestion for a misspelt name.
+- `import "file.apsi"` without `as` now also brings in the file's classes and top-level `x = …` names.
+
 ### Web server
 - **About 2.4× the requests per second** on one process (hello-world JSON, 100 keep-alive connections, 2 cores:
   30k → 73k req/s): a connection that repeats its header block is parsed once, and the response head is built

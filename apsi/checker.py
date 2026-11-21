@@ -7,7 +7,7 @@ import os
 from fractions import Fraction
 
 from . import ast as A
-from .errors import TypeCheckError, UnitError, NameErr, ParseError, LexError
+from .errors import TypeCheckError, UnitError, NameErr, ParseError, LexError, did_you_mean
 from .units import Dim, DIMLESS, DIM_NAMES, dim_name
 from .parser import parse
 from . import ops
@@ -468,6 +468,21 @@ class Checker:
 
     def c_Use(self, s, sc, top):
         if s.path not in self.modules:
+            from .apsil import local_module
+            local = local_module(s.path, self.base_dir)
+            if local is not None:                              # a file of the program itself
+                names = self._file_names(s, local, s.path)
+                if names is None:
+                    return
+                if s.names is not None:
+                    return self._decl_names(s, names, s.path, sc)
+                if s.alias:
+                    return self._decl(sc, s.alias, Info(None, False, kind="module"), s)
+                for n, kind in names.items():
+                    sc.names[n] = Info(None, False, None, kind)
+                if "." not in s.path and s.path not in names and sc.lookup(s.path) is None:
+                    sc.names[s.path] = Info(None, False, kind="module")
+                return
             try:
                 self.interp.ensure_module(s.path, self.base_dir)
             except Exception as e:                       # noqa: BLE001 - report library load failures as errors
@@ -475,8 +490,12 @@ class Checker:
                 return
         if s.path not in self.modules:
             self.err(s, f"unknown module '{s.path}'. Available: {', '.join(sorted(self.modules))}. Install a library with: "
-                            f"apsi install {s.path}", NameErr)
+                            f"apsi install {s.path}, or put {s.path.replace('.', '/')}.apsi next to this file", NameErr)
             return
+        if s.names is not None:
+            members = self.modules[s.path]
+            return self._decl_names(s, {k: "builtin" for k in members}, s.path, sc,
+                                    lambda k: ops.dim_of(members[k]) if not callable(members[k]) else None)
         if s.alias:
             sc.names[s.alias] = Info(None, False, kind="module")
         else:
@@ -486,6 +505,37 @@ class Checker:
             if "." not in s.path and s.path not in members and sc.lookup(s.path) is None and s.path not in self.builtins:
                 sc.names[s.path] = Info(None, False, kind="module")      # `use rl` also allows rl.ppo(...)
 
+    def _decl_names(self, s, names, what, sc, dim=None):
+        for n, a in s.names:
+            if n.startswith("_") or n not in names:
+                self.err(s, f"'{what}' has no public name '{n}'" + did_you_mean(n, list(names)), NameErr)
+                continue
+            sc.names[a or n] = Info(dim(n) if dim else None, False, None, names[n])
+
+    def _file_names(self, s, path, shown):
+        """The public top-level names of an .apsi file (name -> 'struct' for types, else 'builtin'), or None."""
+        try:
+            self.deps.append(path)
+            with open(path, encoding="utf-8-sig") as fh:
+                prog = parse(fh.read(), cache=True)
+        except (ParseError, LexError) as e:
+            self.err(s, f"cannot parse '{shown}': {e.msg}")
+            return None
+        out = {}
+        for st in prog.body:
+            if isinstance(st, A.Let):
+                names = [t for t in st.targets if isinstance(t, str)]
+            elif isinstance(st, A.Assign) and isinstance(st.target, A.Name):
+                names = [st.target.id]
+            elif isinstance(st, (A.FnDef, A.StructDef, A.ClassDef)):
+                names = [st.name]
+            else:
+                names = []
+            for n in names:
+                if not n.startswith("_"):
+                    out[n] = "struct" if isinstance(st, (A.StructDef, A.ClassDef)) else "builtin"
+        return out
+
     def c_Import(self, s, sc, top):
         path = s.path if os.path.isabs(s.path) else os.path.join(self.base_dir, s.path)
         if not os.path.exists(path):
@@ -494,22 +544,13 @@ class Checker:
         if s.alias:
             self._decl(sc, s.alias, Info(None, False, kind="module"), s)
             return
-        try:
-            self.deps.append(path)
-            with open(path, encoding="utf-8-sig") as fh:
-                prog = parse(fh.read(), cache=True)
-        except (ParseError, LexError) as e:
-            self.err(s, f"cannot parse '{s.path}': {e.msg}")
+        names = self._file_names(s, path, s.path)
+        if names is None:
             return
-        for st in prog.body:
-            names = []
-            if isinstance(st, A.Let):
-                names = st.targets
-            elif isinstance(st, (A.FnDef, A.StructDef)):
-                names = [st.name]
-            for n in names:
-                if not n.startswith("_"):
-                    sc.names[n] = Info(None, False, None, "struct" if isinstance(st, A.StructDef) else "builtin")
+        if s.names is not None:
+            return self._decl_names(s, names, s.path, sc)
+        for n, kind in names.items():
+            sc.names[n] = Info(None, False, None, kind)
 
     def c_Test(self, s, sc, top):
         self.deferred.append(lambda: self.block(s.body, Scope(sc)))

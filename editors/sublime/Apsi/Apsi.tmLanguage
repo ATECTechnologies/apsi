@@ -1029,7 +1029,7 @@
 					<key>name</key>
 					<string>keyword.control.import.apsi</string>
 					<key>match</key>
-					<string>\b(use|import)\b</string>
+					<string>\b(use|import|from(?=\s+[\p{L}_"][^\n]*\bimport\b))\b</string>
 				</dict>
 				<dict>
 					<key>name</key>

@@ -964,14 +964,23 @@ use nn                       # bring every name of a module into scope, and also
 use linalg as la             # or keep them under a short name only: la.eigh(H)
 use physics.constants        # dotted module names
 use geom_tools               # an installed library (apsi install geom-tools)
+use helpers                  # helpers.apsi next to this file
+use shapes.circle            # shapes/circle.apsi next to this file
 import "mylib.apsi"          # the public names (not starting with _) of another file
 import "lib/geometry.apsi" as geo
+from linalg import eigh, solve as lsolve      # only these names
+from helpers import (parse_row,
+                     Row)
+from "lib/geometry.apsi" import Point
 ```
 
 - `use NAME` brings every public name of the module into scope and, unless that name is already taken, also makes
   the module itself available as `NAME`, so both `ppo(…)` and `rl.ppo(…)` work after `use rl`.
-- `use` finds the standard modules listed in chapter 22 and installed libraries (`.apsil`, see
+- `use` looks in this order: the standard modules listed in chapter 22, the program's own files (`NAME.apsi`
+  next to the file that says `use`; a dotted name is a sub-folder), then installed libraries (`.apsil`, see
   [Libraries](LIBRARIES.md)). Dashes in a library name become underscores: `geom-tools` → `use geom_tools`.
+- `from M import a, b as c` brings in only the named public names, from a module, a library, one of your files
+  or a quoted file path. A misspelt or private (`_`) name is an error before the program runs.
 - `import` runs another `.apsi` file once (cached) and brings in its public top-level names. The path is relative to
   the importing file. Its `test` blocks do not run on import.
 - Circular imports are reported as errors.
