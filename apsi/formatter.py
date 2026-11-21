@@ -7,6 +7,24 @@ from . import ast as A
 from .errors import ApsiError
 from .parser import parse
 
+def _annotated_item(text):
+    """The bracket item being written (from its opening bracket or the last comma at this level) has a `name:`
+    annotation at its own level."""
+    d = 0
+    for ch in reversed(text):
+        if ch in ")]}":
+            d += 1
+        elif ch in "([{":
+            if d == 0:
+                return False
+            d -= 1
+        elif d == 0 and ch == ",":
+            return False
+        elif d == 0 and ch == ":":
+            return True
+    return False
+
+
 SPACED = ["**=", "//=", "<<=", ">>=", "==", "!=", "<=", ">=", "+=", "-=", "*=", "/=", "%=", "@=", "|=", "&=",
           "^=", ":=", "->", "=>", "|>", "~=", "+/-", "±", "??", "="]
 
@@ -78,6 +96,12 @@ def _format_line(code, depth=0):
                 and not (i > 0 and code[i - 1] in "=!<>+-*/%@~|&^:"):
             while out and out[-1] == " ":
                 out.pop()
+            if _annotated_item("".join(out)):              # n: int = 1 (PEP 8: spaces with an annotation)
+                out.append(" = ")
+                i += 1
+                while i < n and code[i] == " ":
+                    i += 1
+                continue
             out.append("=")
             i += 1
             while i < n and code[i] == " ":
