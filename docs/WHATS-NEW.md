@@ -5,6 +5,43 @@ card now train there, your own GPU kernels run as layers, each part of a model c
 settings, and another program's model files load and save under their own names. Programs written for 2.6.0 run
 unchanged.
 
+## Training that resumes exactly, and batches made while it trains
+- **Exact resume of everything:** a checkpoint now keeps the random generators, the step counts of parameter groups
+  that step every batch, and your program's own state: `fit_batches(..., state=record(get=fn() => text,
+  set=fn(text) => ...))` (a replay buffer, running averages, a curriculum position). Five steps + resume + five steps
+  give the same loss as ten in one go (relative difference below 1e-10, on the card and on the processor). An epoch
+  that has nothing left after resuming is no longer reported as a loss of 0.
+- **Batches made when training reaches them:** an item `record(later=fn, end_step=false)` in the batch list is
+  called at its turn and its batches are trained there; inside it `training_params()` reads the weights of that
+  moment and `training_update(params, only=["part.sub"])` writes some back (a part trained by an optimizer of your
+  own). Reinforcement learning from the model's own samples, data that depends on the model, curricula.
+- **Steps of their own length:** `accumulate=0` ends a step at the batch whose targets say `end_step=true`; each
+  batch divides its gradient by its `step_items`. Parameter groups with `every="batch"` take their own AdamW step
+  after every batch (`hold=true` keeps the gradient for the next one): a decoder with its own optimizer inside a
+  larger model.
+- `card_loss(..., scale="field")` (a batch that counts more, less or with a negative sign) and labels `none` (the
+  whole loss in `rest`, which may then read the logits).
+
+## Less memory, the same updates
+- **`adam(state="bf16")` / `adamw(state="bf16")`:** the optimizer's two moments in bfloat16 with stochastic rounding
+  (random low bits added before cutting, so the rounding averages out): 4 bytes per weight less on the card, the
+  update computed in float32 as before. Checkpoints keep the 16-bit moments; the processor path rounds the same way.
+- A graph batch can say `eval_regions=[...]`: typed graph encoders of those regions run without dropout in that
+  batch (a view read as in evaluation).
+- `memory_slots` takes a memory made earlier (`graph.mem_given`), `brain_routing` can explore
+  (`graph.route_sample`: Gumbel top-k choices kept per row) and gives the REINFORCE gradient of its choices
+  (`rl_policy_grad`).
+
+## The language
+- **Raw strings** `r#"..."#`: no escapes, several lines, end at `"` followed by the same number of `#`
+  (`r##"..."##` when the text holds `"#`). Regular expressions, Windows paths, other languages' source.
+- **`pymodule(name, source)`:** Python source kept inside your program becomes a module (`--allow-python`), so a
+  program ships as `.apsi` files only. Its code is the program's own: its `_private` names are reachable, a
+  library's are not (`--allow-python=all` opens those too).
+- `save_safetensors` keeps 0-d tensors as scalars (shape `[]`, as other programs write them).
+- New example: `examples/47_train_your_llm.apsi` — a tokenizer, a LLaMA / Qwen3-style decoder, training and text
+  written by the model, in 40 lines.
+
 ## Models that did not fit now train
 - **Activation recompute** (`fit_batches(recompute="auto")`, the default on a card): the first step measures the
   memory; only the blocks whose activations do not fit are computed again in backward (residual / transformer

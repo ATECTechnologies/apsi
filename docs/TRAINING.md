@@ -18,6 +18,10 @@ what each one does, why it matters, and what you give up if you turn it off.
 - [11. How much card memory a model needs](#11-how-much-card-memory-a-model-needs)
 - [12. When something goes wrong](#12-when-something-goes-wrong)
 - [13. Recommended settings](#13-recommended-settings)
+- [14. Batches made while training](#14-batches-made-while-training-later-and-the-weights-of-the-moment)
+- [15. Steps of their own length](#15-steps-of-their-own-length-and-parts-that-step-every-batch)
+- [16. Half the optimizer's memory](#16-half-the-optimizers-memory-statebf16)
+- [17. Your program's own state in the checkpoint](#17-your-programs-own-state-in-the-checkpoint-state)
 
 ---
 
@@ -26,11 +30,12 @@ what each one does, why it matters, and what you give up if you turn it off.
 ```apsi
 use layers
 use data
+use nn
 
 let tok = data.train_tokenizer("corpus/*.txt", vocab_size=16000)        # your own tokenizer, in seconds
 tok.save("tokenizer.json")
 let ds = data.text_dataset("corpus/*.txt", tokenizer=tok, seq_len=512)
-let batches = [b for b in ds |> batch(16)]
+let batches = [b for b in (ds |> batch(16))]
 
 let lm = transformer_lm(tok.vocab_size, d=512, heads=8, layers=8, context=512)
 let r = fit_batches(lm, lm.init(seed=0), batches, loss="cross_entropy", opt=adamw(lr=3e-4),
@@ -274,3 +279,58 @@ When the card still runs out, the error says how much was in use; then lower the
 | Comparing two ideas fairly | the defaults (deterministic): any difference in the result comes from the idea, not from chance |
 | Fine-tuning | `train_only=` the parts to learn, a learning rate 5–10× lower than for training from scratch |
 | The fastest possible step, reproducibility not needed | `APSI_GPU_DETERMINISTIC=0` (attention's backward in one kernel); keep the guard on |
+
+## 14. Batches made while training (`later=`), and the weights of the moment
+
+A batch list may hold `record(later=fn)`: training calls `fn()` when it reaches that place and trains the batches
+it returns there. Inside, `training_params()` gives the weights as they are at that moment, so the data can depend
+on the model — samples it writes itself, scored and learned from (reinforcement learning), or a curriculum that
+follows the loss:
+
+```apsi
+fn rollouts():
+    let p = training_params()                     # the weights of this very moment
+    let answers = sample_answers(p)               # your own code: generate, score, build batches
+    return answers                                # trained right here, before the next batch of the list
+
+fn batches(epoch):
+    return [next_batch(), record(later=rollouts), next_batch()]
+
+fit_batches(model, params, batches, loss, opt=adamw(lr=3e-4), steps=10000)
+```
+
+`training_update(new_params, only=["router.gate"])` writes some weights back (a part with an optimizer of your
+own). `record(later=fn, end_step=true)` ends the optimizer step after its batches.
+
+## 15. Steps of their own length, and parts that step every batch
+
+`accumulate=0`: a step ends at the batch whose targets have `end_step=true`; every batch divides its gradient by
+its own `step_items`. A parameter group with `every="batch"` steps after every batch with its own AdamW settings
+(`hold=true` in a batch's targets keeps its gradient for the next batch):
+
+```apsi
+let groups = [record(params=["decoder"], lr=2e-4, every="batch"), record(params="*", lr=6e-4)]
+fit_batches(model, params, batches, card_loss(0, rest, weights="weights", scale="scale"), opt=adamw(lr=6e-4),
+            groups=groups, accumulate=0, steps=20000)
+```
+
+## 16. Half the optimizer's memory: `state="bf16"`
+
+`adamw(lr=3e-4, state="bf16")` keeps both moments in bfloat16 with stochastic rounding: 4 bytes per weight less on
+the card (1.3 GB less for a 330 M model), the update itself in float32. Training follows the float32 moments closely
+(the self-test checks the two loss curves within 2 %), and checkpoints keep the 16-bit moments.
+
+## 17. Your program's own state in the checkpoint: `state=`
+
+```apsi
+let store = {"buffer": []}                        # (what your batches read and add to)
+fn keep_get():
+    return json_str(store)
+fn keep_set(text):
+    store["buffer"] = json_parse(text)["buffer"]
+let keep = record(get=keep_get, set=keep_set)
+fit_batches(model, params, batches, loss, steps=50000, checkpoint="run.npz", save_every=500, state=keep)
+```
+
+With it, the random generators and the parameter groups' step counts, a resumed run continues exactly as one
+uninterrupted run, even when the batches depend on that state.
