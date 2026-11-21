@@ -107,6 +107,7 @@ class CodeGen:
         self.indent = 0
         self.uid = 0
         self.fn_names = {}       # py fn name -> apsi name (for tracebacks)
+        self.const_src = {}      # checker constant name -> the type AST it checks (gen_cache rebuilds it)
 
     # ------------------------------------------------------------- helpers
     def emit(self, text):
@@ -1465,7 +1466,9 @@ class CodeGen:
 
     # ------------------------------------------------------------- type checkers
     def checker(self, t):
-        return self.const(self.rt.make_checker(t), "C")
+        name = self.const(self.rt.make_checker(t), "C")
+        self.const_src[name] = t
+        return name
 
     # ------------------------------------------------------------- output
     def source(self):
@@ -2014,21 +2017,47 @@ def _as_unit(v, unit, line, col):
     return Quantity(v.v, v.dim, (text, scale))
 
 
+class _CachedGen:
+    """What Compiled uses of a CodeGen, from gen_cache."""
+
+    def __init__(self, rec):
+        self._source, self._linemap = rec["source"], rec["linemap"]
+        self.fn_names, self.pyc, self.consts = rec["fn_names"], rec["pyc"], rec["consts"]
+        self.trusted = False
+
+    def source(self):
+        return self._source
+
+    def linemap(self):
+        return self._linemap
+
+
 class Compiled:
     """A compiled Apsi module ready to execute."""
 
-    def __init__(self, interp, prog, filename, base_dir, tests):
+    def __init__(self, interp, prog, filename, base_dir, tests, source=None):
         from .interpreter import wrap_python_error  # noqa: F401
+        from . import gen_cache as _gc
         self.interp = interp
         self.filename = filename
         self.rt = Runtime(interp, filename, base_dir)
         builtins = dict(interp.globals.vars)
-        gen = CodeGen(self.rt, builtins.keys(), filename)
         from .pycompat import trusted as _trusted
-        gen.trusted = _trusted(interp)
+        trusted = _trusted(interp)
         module_ctx = FuncCtx(None, "module")
         module_scope = Scope(None, module_ctx)
-        gen.program(prog, module_scope)
+        gkey = _gc.key(source, filename, base_dir, interp, prog, trusted) if source is not None else None
+        cached = _gc.load(gkey, prog, self.rt)
+        if cached is not None:                          # the same file, imports and Apsi as a previous run
+            gen = _CachedGen(cached)
+            for name, (py, kind, erased_py, mutable) in cached["names"].items():
+                b = Binding(py, module_ctx, kind, erased_py, mutable)
+                module_scope.names[name] = b
+            module_ctx.used.update(cached["used"])
+        else:
+            gen = CodeGen(self.rt, builtins.keys(), filename)
+            gen.trusted = trusted
+            gen.program(prog, module_scope)
         self.gen = gen
         self.source = gen.source()
         self.linemap = gen.linemap()
@@ -2037,7 +2066,7 @@ class Compiled:
         from .debugger import register as _dbg_register
         _dbg_register(f"<apsi:{filename}>", filename, self.linemap, gen.fn_names,
                       module_ctx.used)
-        self.code = _cc.load_code(self.source, f"<apsi:{filename}>")
+        self.code = cached["code"] if cached is not None else _cc.load_code(self.source, f"<apsi:{filename}>")
         if self.code is None:
             try:
                 self.code = compile(self.source, f"<apsi:{filename}>", "exec")
@@ -2046,6 +2075,9 @@ class Compiled:
                 line, col = self.linemap[ln - 1] if 0 < ln <= len(self.linemap) else (None, None)
                 raise RuntimeErr(f"this cannot run: {e.msg}", line, col) from None
             _cc.store_code(self.source, f"<apsi:{filename}>", self.code)
+        if cached is None and gkey is not None:
+            _gc.store(gkey, prog, gen, self.code, module_ctx.used,
+                      {n: (b.py, b.kind, b.erased_py, b.mutable) for n, b in module_scope.names.items()})
         import types as _types
         modname = getattr(interp, "_next_module_name", None) or (
             "__main__" if not filename.startswith("<") or gen.pyc else "__apsi__")

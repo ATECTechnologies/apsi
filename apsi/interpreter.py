@@ -461,7 +461,7 @@ class Interpreter:
             engine = "compile"
         if env is None and engine == "compile":
             self._src_for_check = source
-            return self._run_compiled(prog, filename, check)
+            return self._run_compiled(prog, filename, check, source)
         if check:
             from .checker import Checker
             errs = Checker(self, os.path.dirname(os.path.abspath(filename))
@@ -496,13 +496,13 @@ class Interpreter:
             check_cache.remember(src, base, self, ch.deps)
         return base
 
-    def _run_compiled(self, prog, filename, check):
+    def _run_compiled(self, prog, filename, check, source=None):
         from .codegen import Compiled
         base = self._check(prog, filename) if check else (
             os.path.dirname(os.path.abspath(filename)) if not filename.startswith("<") else os.getcwd())
         self.dir_stack.append(base)
         try:
-            comp = Compiled(self, prog, filename, base, self.tests)
+            comp = Compiled(self, prog, filename, base, self.tests, source=source)
             self.last_compiled = comp
             comp.run()
         finally:

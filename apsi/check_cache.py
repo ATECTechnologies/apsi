@@ -6,7 +6,7 @@ import hmac
 import json
 import os
 
-MIN_SIZE = 5000            # small programs check faster than a disk lookup
+MIN_SIZE = 300             # tiny programs check faster than a disk lookup
 _FP = None
 
 
