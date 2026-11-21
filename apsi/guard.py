@@ -294,7 +294,7 @@ def scan_program(prog, src="", file=None):
     pyc = is_python_mode(prog)
     for line, mod in pyimports:
         if mod == "<embedded>":
-            out.append(Finding("high", "embedded-python", line,
+            out.append(Finding("medium", "embedded-python", line,
                                "pymodule() runs Python source kept in the program, with full access to the computer", file))
             continue
         if pyc and mod in PYCOMPAT_STANDINS:

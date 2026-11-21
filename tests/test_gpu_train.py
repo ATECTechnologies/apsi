@@ -1656,3 +1656,16 @@ def test_bf16_moments():
         assert np.isfinite(r.history[-1])
     finally:
         GT.device = old
+
+
+def test_pymodule_private_names_are_own():
+    """The Python a program carries in itself (pymodule) is the program's own code: its _private names are reachable;
+    a library's are not."""
+    import subprocess, sys, tempfile, os
+    d = tempfile.mkdtemp()
+    p = os.path.join(d, "t.apsi")
+    open(p, "w").write('let m = pymodule("apsi_t_own", r#"\ndef _h(x):\n    return x + 2\nclass K:\n    def __init__(self):\n'
+                       '        self._v = 5\n"#)\nprint(m._h(1))\nprint(m.K()._v)\n')
+    out = subprocess.run([sys.executable, "-m", "apsi", "run", "--allow-python", p], capture_output=True, text=True,
+                         cwd=os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    assert out.stdout.split() == ["3", "5"], out.stdout + out.stderr
