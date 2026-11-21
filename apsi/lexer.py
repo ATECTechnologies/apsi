@@ -190,6 +190,23 @@ def _tokenize(src):
                     raise LexError(e.msg, line, start_col)
             add(NUMBER, text, unit, start_col)
             continue
+        # raw strings: r#"..."# (any number of #): no escapes, may span lines, end at the quote + the same #s
+        if c == "r" and i + 1 < n and src[i + 1] == "#":
+            j = i + 1
+            while j < n and src[j] == "#":
+                j += 1
+            if j < n and src[j] == '"':
+                close = '"' + "#" * (j - i - 1)
+                end = src.find(close, j + 1)
+                if end < 0:
+                    raise LexError("unterminated raw string", line, start_col)
+                text = src[j + 1:end]
+                add(STRING, text, c=start_col)
+                line += text.count("\n")
+                if "\n" in text:
+                    line_start = j + 1 + text.rfind("\n") + 1
+                i = end + len(close)
+                continue
         # strings -------------------------------------------------------
         if c == '"' or (c in "fb" and i + 1 < n and src[i + 1] == '"'):
             is_f = c == "f"

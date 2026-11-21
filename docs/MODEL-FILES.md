@@ -92,6 +92,22 @@ takes the file, the index, the name without extension or any one shard's name, a
 `save_model` (then only `params` is set). Resuming continues exactly: the next optimizer step is bit for bit the one
 the original would have taken.
 
+### Another program's names, one file
+
+A model ported from another framework can keep that framework's file layout, so either program reads the other's
+checkpoints. `models.named_tensors(params, rows, shapes)` gives the parameter tree under the other program's names;
+each row `[name, path, index, transpose, start, end]` says that tensor `name` (its rows `start:end`, `end` -1 = all)
+is the leaf at `path` (`"encoder.layers.0.q.W"`; entry `index` of its first axis when `index >= 0`), transposed when
+`transpose` is true (PyTorch keeps a Linear weight as `[out, in]`). Several rows may fill one tensor (a fused
+`qkv` weight); `shapes` gives a tensor its own shape (a scalar for a `[1]` leaf).
+`models.from_named_tensors(like, models.load_named_tensors(path), rows)` reads it back and names any tensor that is
+missing or has the wrong shape. Text such as a tokenizer or a configuration goes in the file's metadata
+(`save_safetensors(path, tensors, metadata)`, `models.safetensors_metadata(path)`).
+
+Layers with running statistics besides their weights (`stateful = True`, with `state_get` / `state_set`) are listed
+by `model_state(model)` and restored by `set_model_state(model, states)`; `fit_batches` checkpoints save and resume
+that state with the weights.
+
 ## 2. GGUF
 
 ```apsi

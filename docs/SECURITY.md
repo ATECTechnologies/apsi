@@ -183,5 +183,5 @@ concept. Please allow up to 90 days for a fix before disclosing it. Good-faith r
 not touch other people's data or disrupt the service is welcome, and reporters are credited on
 request.
 
-Supported version: **2.6.0**. Fixes are released as `2.6.x` patch versions; older versions stay
+Supported version: **2.6.2**. Fixes are released as `2.6.x` patch versions; older versions stay
 available but are not patched.

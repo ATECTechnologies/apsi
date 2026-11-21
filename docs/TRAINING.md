@@ -1,6 +1,6 @@
 # Training that finishes: steps, checkpoints, exact results, no surprises
 
-This page explains how Apsi 2.6.0 keeps a training run **correct, repeatable and alive**: training by steps,
+This page explains how Apsi 2.6.2 keeps a training run **correct, repeatable and alive**: training by steps,
 checkpoints that resume to the exact bit, protection against crashes and bad batches, the same weights on any
 number of cards, and the settings that control all of it. Every setting has a safe default; this page tells you
 what each one does, why it matters, and what you give up if you turn it off.
@@ -18,6 +18,10 @@ what each one does, why it matters, and what you give up if you turn it off.
 - [11. How much card memory a model needs](#11-how-much-card-memory-a-model-needs)
 - [12. When something goes wrong](#12-when-something-goes-wrong)
 - [13. Recommended settings](#13-recommended-settings)
+- [14. Batches made while training](#14-batches-made-while-training-later-and-the-weights-of-the-moment)
+- [15. Steps of their own length](#15-steps-of-their-own-length-and-parts-that-step-every-batch)
+- [16. Half the optimizer's memory](#16-half-the-optimizers-memory-statebf16)
+- [17. Your program's own state in the checkpoint](#17-your-programs-own-state-in-the-checkpoint-state)
 
 ---
 
@@ -26,11 +30,12 @@ what each one does, why it matters, and what you give up if you turn it off.
 ```apsi
 use layers
 use data
+use nn
 
 let tok = data.train_tokenizer("corpus/*.txt", vocab_size=16000)        # your own tokenizer, in seconds
 tok.save("tokenizer.json")
 let ds = data.text_dataset("corpus/*.txt", tokenizer=tok, seq_len=512)
-let batches = [b for b in ds |> batch(16)]
+let batches = [b for b in (ds |> batch(16))]
 
 let lm = transformer_lm(tok.vocab_size, d=512, heads=8, layers=8, context=512)
 let r = fit_batches(lm, lm.init(seed=0), batches, loss="cross_entropy", opt=adamw(lr=3e-4),
@@ -124,7 +129,7 @@ Each setting can be turned off; section 9 says what changes.
 
 ## 6. Speed: what keeps the card busy
 
-The card is fastest when it never waits for the processor. In 2.6.0:
+The card is fastest when it never waits for the processor. In 2.6.2:
 
 - **Copies are queued, not waited for.** Inputs go through pinned memory and are queued behind the kernels already
   running (`APSI_GPU_ASYNC_COPY`, default on), so the processor prepares the next batch while the card works.
@@ -135,6 +140,9 @@ The card is fastest when it never waits for the processor. In 2.6.0:
 - **Large outputs stay on the card with your own loss:** a loss function can say which of its outputs is a plain
   cross-entropy (`loss.on_card`); that part runs on the card and only the small outputs go to the processor. A
   language model's logits then never leave the card.
+  `layers.card_loss(output, rest)` builds such a loss for a dag with several outputs: the cross-entropy of
+  `output` against the targets' `labels` stays on the card, and `rest(outputs, targets)` adds the heads' losses
+  (targets: a record, e.g. `record(labels=next_tokens, valid=scores)`).
 
 Measured on an RTX 3060 (a 2-layer transformer, 128 wide, 8 × 128 tokens a step, best of several runs on a desktop
 in use): 5.3–6.0 ms a step before these changes, 4.0–4.7 ms after, with the same weights every run. Single runs vary
@@ -210,9 +218,44 @@ For each parameter, training on the card keeps:
 
 So AdamW with every protection on needs about 28 bytes per parameter, plus the activations of one micro-batch
 (which grow with batch size × sequence length × width × layers). A 125 M-parameter model: about 3.5 GB before
-activations, comfortable on a 12 GB card. When the card runs out, the error says how much was in use; then lower the
-batch size and raise `accumulate` (the result is the same, bit for bit), or split the model with
-`device="cuda:all"`.
+activations, comfortable on a 12 GB card.
+
+### Activations: recomputed when they do not fit (`recompute=`)
+
+The activations of a deep model are usually most of the memory: a graph layer keeps, per node, its keys under every
+relation; an attention layer its scores; every block its inputs and outputs. With `recompute="auto"` (the default on
+a card), the first training step keeps only the input and the output of each block (residual and transformer blocks,
+`hgt`, `global_attention`, graph transformer layers) and runs the block's forward again in backward, in buffers that
+every recomputed block shares. That step measures what each block would keep; from the second step on, the blocks
+that fit under 85 % of the card's memory keep their activations (the last blocks first, since backward needs them
+first) and only the rest are recomputed. The memory of the largest batch in the data is what has to fit, not the
+first one's. A batch that is larger than any planned for (one made while training, `record(later=)`, or a larger
+graph) plans again before it runs: the blocks that no longer fit are recomputed from then on and their buffers go back
+to the card, so a run whose batches grow does not run out of memory. The training log says what was chosen:
+
+```
+card memory: 9.84 of 12.0 GB at the peak; 41 of 89 blocks recomputed in backward
+```
+
+The results do not change: recomputation repeats exactly the same kernels and the same dropout masks, so the losses
+and the weights are the same to the last bit as keeping everything. A recomputed block costs about a third more work
+(its forward runs twice).
+
+| Setting | What it does |
+|---|---|
+| `recompute="auto"` (default) | measure, then recompute only what does not fit |
+| `recompute=true` | recompute every block (least memory) |
+| `recompute=false` | keep every activation (fastest when it fits) |
+| `checkpoint(layer)` | this layer is always recomputed, whatever the setting |
+| `APSI_RECOMPUTE=auto/1/0` | the same, for a whole run |
+| `APSI_GPU_MEMORY_TARGET=0.85` | the share of the card's memory the plan aims for |
+
+On Windows the driver can lend the card part of the computer's memory when the card is full; the program then keeps
+running, many times slower, and the computer's memory fills up (and with it the swap file on the disk). Apsi says so
+when it happens (`note: … GB asked of a 12.0 GB card`); with the default `recompute="auto"` it should not.
+
+When the card still runs out, the error says how much was in use; then lower the batch size and raise `accumulate`
+(the result is the same, bit for bit), or split the model with `device="cuda:all"`.
 
 ## 12. When something goes wrong
 
@@ -222,7 +265,8 @@ batch size and raise `accumulate` (the result is the same, bit for bit), or spli
 | The loss is `nan` in the history | a NaN in the **loss** of a batch (the guard protects the weights, not the reported loss) | the same checks; the weights are still finite |
 | "the checkpoint … is of a model with N weights" | the file belongs to another model or another size | another `checkpoint=` path, or `resume=false` to start over |
 | "steps= and checkpoint= train on one card for now" | `device="cuda:all"` together with `steps=` / `checkpoint=` | `device="cuda:0"` with `accumulate=` for the same result, or train by `epochs=` on many cards |
-| "the card ran out of memory" | the model, the optimizer state and the activations do not fit | a smaller batch and a larger `accumulate` (the same result); several cards (`device="cuda:all"`) |
+| "the card ran out of memory" | the model, the optimizer state and the activations do not fit | `recompute=true`; a smaller batch and a larger `accumulate` (the same result); several cards (`device="cuda:all"`) |
+| Training is very slow and the computer's memory is full | Windows lent the card the computer's memory (a "note: … GB asked of a … GB card" line) | `recompute=true`, or a smaller batch with a larger `accumulate` |
 | Two runs on the card differ | `APSI_GPU_DETERMINISTIC=0`, or a different number of cards with exact sums off | turn both back on (the defaults) |
 | Training became slower over a long run | the card reached its temperature limit (77 °C) and was slowed to stay there | better airflow, or a power limit (`APSI_GPU_POWER`, `apsi gpu setup`) that keeps the speed steady |
 | A resumed run differs from one long run | the data changed between the runs (a different file list or order) | resume with the same `batches` (a function of the epoch is fine if it is deterministic) |
@@ -237,3 +281,58 @@ batch size and raise `accumulate` (the result is the same, bit for bit), or spli
 | Comparing two ideas fairly | the defaults (deterministic): any difference in the result comes from the idea, not from chance |
 | Fine-tuning | `train_only=` the parts to learn, a learning rate 5–10× lower than for training from scratch |
 | The fastest possible step, reproducibility not needed | `APSI_GPU_DETERMINISTIC=0` (attention's backward in one kernel); keep the guard on |
+
+## 14. Batches made while training (`later=`), and the weights of the moment
+
+A batch list may hold `record(later=fn)`: training calls `fn()` when it reaches that place and trains the batches
+it returns there. Inside, `training_params()` gives the weights as they are at that moment, so the data can depend
+on the model — samples it writes itself, scored and learned from (reinforcement learning), or a curriculum that
+follows the loss:
+
+```apsi
+fn rollouts():
+    let p = training_params()                     # the weights of this very moment
+    let answers = sample_answers(p)               # your own code: generate, score, build batches
+    return answers                                # trained right here, before the next batch of the list
+
+fn batches(epoch):
+    return [next_batch(), record(later=rollouts), next_batch()]
+
+fit_batches(model, params, batches, loss, opt=adamw(lr=3e-4), steps=10000)
+```
+
+`training_update(new_params, only=["router.gate"])` writes some weights back (a part with an optimizer of your
+own). `record(later=fn, end_step=true)` ends the optimizer step after its batches.
+
+## 15. Steps of their own length, and parts that step every batch
+
+`accumulate=0`: a step ends at the batch whose targets have `end_step=true`; every batch divides its gradient by
+its own `step_items`. A parameter group with `every="batch"` steps after every batch with its own AdamW settings
+(`hold=true` in a batch's targets keeps its gradient for the next batch):
+
+```apsi
+let groups = [record(params=["decoder"], lr=2e-4, every="batch"), record(params="*", lr=6e-4)]
+fit_batches(model, params, batches, card_loss(0, rest, weights="weights", scale="scale"), opt=adamw(lr=6e-4),
+            groups=groups, accumulate=0, steps=20000)
+```
+
+## 16. Half the optimizer's memory: `state="bf16"`
+
+`adamw(lr=3e-4, state="bf16")` keeps both moments in bfloat16 with stochastic rounding: 4 bytes per weight less on
+the card (1.3 GB less for a 330 M model), the update itself in float32. Training follows the float32 moments closely
+(the self-test checks the two loss curves within 2 %), and checkpoints keep the 16-bit moments.
+
+## 17. Your program's own state in the checkpoint: `state=`
+
+```apsi
+let store = {"buffer": []}                        # (what your batches read and add to)
+fn keep_get():
+    return json_str(store)
+fn keep_set(text):
+    store["buffer"] = json_parse(text)["buffer"]
+let keep = record(get=keep_get, set=keep_set)
+fit_batches(model, params, batches, loss, steps=50000, checkpoint="run.npz", save_every=500, state=keep)
+```
+
+With it, the random generators and the parameter groups' step counts, a resumed run continues exactly as one
+uninterrupted run, even when the batches depend on that state.

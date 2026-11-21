@@ -273,6 +273,76 @@ class Metrics:
                     "requests_per_s": round(self.requests / up, 1) if up > 0 else 0.0}
 
 
+_COMPRESSIBLE = ("text/", "application/json", "application/javascript", "application/xml", "image/svg+xml",
+                 "application/ld+json", "application/manifest+json")
+
+
+def _maybe_gzip(req, resp, min_size, level):
+    body = resp.body
+    if len(body) < min_size or resp.status in (204, 206, 304) or req.method == "HEAD":
+        return
+    h = resp.headers
+    if any(k.lower() == "content-encoding" for k in h):
+        return
+    ctype = next((str(v) for k, v in h.items() if k.lower() == "content-type"), "")
+    if not ctype.lower().startswith(_COMPRESSIBLE):
+        return
+    accept = req.headers.get("accept-encoding", "").lower()
+    if not any(p.split(";")[0].strip() == "gzip" and not p.replace(" ", "").endswith(";q=0")
+               for p in accept.split(",")):
+        return
+    import gzip
+    data = gzip.compress(body, compresslevel=level, mtime=0)
+    if len(data) >= len(body):
+        return
+    resp.body = data
+    h["Content-Encoding"] = "gzip"
+    vary = next((k for k in h if k.lower() == "vary"), None)
+    if vary is None:
+        h["Vary"] = "Accept-Encoding"
+    elif "accept-encoding" not in str(h[vary]).lower():
+        h[vary] = f"{h[vary]}, Accept-Encoding"
+
+
+class RouteGroup:
+    """Routes that share a path prefix (app.group("/api/v1")); registration goes to the app itself."""
+
+    def __init__(self, app, prefix):
+        self.app = app
+        self.prefix = "/" + str(prefix).strip("/") if str(prefix).strip("/") else ""
+
+    def _path(self, path):
+        rest = str(path).strip("/")
+        return (self.prefix + "/" + rest) if rest else (self.prefix or "/")
+
+    def route(self, method, path, handler=None):
+        return self.app.route(method, self._path(path), handler)
+
+    def get(self, path, handler=None):
+        return self.route("GET", path, handler)
+
+    def post(self, path, handler=None):
+        return self.route("POST", path, handler)
+
+    def put(self, path, handler=None):
+        return self.route("PUT", path, handler)
+
+    def patch(self, path, handler=None):
+        return self.route("PATCH", path, handler)
+
+    def delete(self, path, handler=None):
+        return self.route("DELETE", path, handler)
+
+    def websocket(self, path, handler=None, **kw):
+        return self.app.websocket(self._path(path), handler, **kw)
+
+    def group(self, prefix):
+        return RouteGroup(self.app, self._path(prefix))
+
+    def __repr__(self):
+        return f"<route group {self.prefix or '/'}>"
+
+
 # =========================================================================== application
 class App:
     def __init__(self, name="apsi", max_body=1 << 20, max_header=16 << 10, header_timeout=10.0,
@@ -311,6 +381,7 @@ class App:
         self._literal = None             # literal path -> routes without parameters (no regex needed)
         self.rooms = {}
         self._rooms_lock = threading.Lock()
+        self._gzip = None                # (smallest body compressed, level) once compress() is called
 
     # ------------------------------------------------------------- registration
     def route(self, method, path, handler=None):
@@ -392,8 +463,32 @@ class App:
         return self
 
     def health(self, path="/health"):
-        self.get(path, lambda req: {"status": "ok", "name": self.name})
+        self.get(path, lambda req: {"status": "ok", "name": self.name,
+                                    "uptime_s": round(time.time() - self.metrics.started, 1)})
         return self
+
+    def ready(self, path="/ready"):
+        """A readiness check for load balancers and orchestrators: 200 while serving, 503 once stop() was called
+        (the server drains: requests in flight finish, new traffic goes to another instance)."""
+        def check(req):
+            if self._stopping:
+                return Response(b'{"status":"stopping"}', 503, {"Content-Type": "application/json; charset=utf-8",
+                                                                  "Retry-After": "1"})
+            return {"status": "ready", "name": self.name}
+        self.get(path, check)
+        return self
+
+    def compress(self, min_size=1024, level=5):
+        """gzip the responses of clients that accept it: text, HTML, JSON, JavaScript, CSS, XML and SVG bodies of at
+        least min_size bytes (smaller ones gain nothing). Responses that already set Content-Encoding are left as
+        they are. level: 1 (fastest) to 9 (smallest)."""
+        self._gzip = (max(0, int(min_size)), min(9, max(1, int(level))))
+        return self
+
+    def group(self, prefix):
+        """Routes under one path prefix: api = app.group("/api/v1"); @api.get("/users") serves /api/v1/users.
+        Groups nest: api.group("/admin")."""
+        return RouteGroup(self, prefix)
 
     def expose_metrics(self, path="/metrics"):
         self.get(path, lambda req: self.metrics.snapshot())
@@ -518,6 +613,8 @@ class App:
             resp.headers = merged
         if "X-Request-Id" not in resp.headers:
             resp.headers["X-Request-Id"] = req.id
+        if self._gzip is not None:
+            _maybe_gzip(req, resp, *self._gzip)
         for hook in self.after_hooks:
             try:
                 hook(req, resp)
@@ -544,6 +641,9 @@ class App:
         resp = self.dispatch(req)
         ctype = resp.headers.get("Content-Type", "")
         data = resp.body
+        if resp.headers.get("Content-Encoding") == "gzip":   # what the client reads (the header still says gzip)
+            import gzip
+            data = gzip.decompress(data)
         if ctype.startswith("application/json") and data:
             from .interop import from_py
             data = from_py(json.loads(data.decode("utf-8")))

@@ -157,6 +157,7 @@ Contextual (special only in one place, ordinary names elsewhere): `try`, `except
 | multi-line | `"""line 1` ⏎ `line 2"""` |
 | formatted (f-string) | `f"x = {x:.3f}, list has {len(xs)} items"` |
 | formatted, multi-line | `f"""…{expr}…"""` |
+| raw (no escapes, may span lines) | `r#"C:\dir\file "quoted" text"#` — ends at `"` followed by the same number of `#` (`r##"…"##` when the text holds `"#`) |
 
 Escapes: `\n` (newline), `\t` (tab), `\r`, `\\`, `\"`, `\0`. Any other backslash is kept as it is, so Windows paths
 such as `"C:\data\x.csv"` mostly work, but `"C:\\data\\x.csv"` or `"C:/data/x.csv"` is clearer.
@@ -1343,7 +1344,7 @@ Complete reference with shapes, parameters and recipes: [`LAYERS.md`](LAYERS.md)
 `require_jwt(secret, exempt)` · `require_api_key(keys, header, exempt)`.
 
 Server methods: `get post put patch delete route(method, path)` (as calls or decorators), `before`, `after`,
-`rate_limit`, `cors`, `static`, `health`, `expose_metrics`, `stats`, `handle` (call without the network, for tests),
+`rate_limit`, `cors`, `static`, `health`, `ready`, `compress`, `group(prefix)`, `expose_metrics`, `stats`, `handle` (call without the network, for tests),
 `run(host, port, tls_cert, tls_key, processes, workers)`, `run_background(port)`.
 Requests: `req.method path params query headers header(name) body text json() client id user`.
 Full guide: [`SERVER.md`](SERVER.md).

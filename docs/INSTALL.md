@@ -17,12 +17,12 @@ After installing, run `apsi doctor` to check your machine against these targets.
 
 | System | File | How |
 |---|---|---|
-| Windows 10/11 (64-bit) | `ApsiSetup-2.6.0-x64.exe` | double-click (contains Python 3.12 + numpy; no administrator rights needed) |
-| Windows, portable | `apsi-2.6.0-windows-x64.zip` | unzip and run `apsi.cmd` (works from a USB stick) |
-| Ubuntu / Debian / Mint | `apsi_2.6.0_all.deb` | `sudo apt install ./apsi_2.6.0_all.deb` |
-| Any system with Python 3.12+ | `apsi-2.6.0-py3-none-any.whl` | `pip install apsi-2.6.0-py3-none-any.whl` |
+| Windows 10/11 (64-bit) | `ApsiSetup-2.6.2-x64.exe` | double-click (contains Python 3.12 + numpy; no administrator rights needed) |
+| Windows, portable | `apsi-2.6.2-windows-x64.zip` | unzip and run `apsi.cmd` (works from a USB stick) |
+| Ubuntu / Debian / Mint | `apsi_2.6.2_all.deb` | `sudo apt install ./apsi_2.6.2_all.deb` |
+| Any system with Python 3.12+ | `apsi-2.6.2-py3-none-any.whl` | `pip install apsi-2.6.2-py3-none-any.whl` |
 
-**Download:** the Windows installer, the Linux installer (`ApsiSetup-2.6.0-linux.sh`) and the `.deb` are on
+**Download:** the Windows installer, the Linux installer (`ApsiSetup-2.6.2-linux.sh`) and the `.deb` are on
 [apsi.dev/download](https://apsi.dev/download), each with its SHA-256. When you build Apsi yourself
 ([BUILD.md](BUILD.md)), all of these files are in the `dist/` folder.
 
@@ -45,12 +45,12 @@ After installing, run `apsi doctor` to check your machine against these targets.
 9. Registers in *Settings → Apps* so it can be removed normally. Every change is recorded and undone on uninstall;
    a failed install rolls back completely.
 
-Unattended install: `ApsiSetup-2.6.0-x64.exe --silent [--dir PATH] [--profile strict] [--no-editors] [--with-torch]`.
+Unattended install: `ApsiSetup-2.6.2-x64.exe --silent [--dir PATH] [--profile strict] [--no-editors] [--with-torch]`.
 Windows older than 10 and 32-bit Windows are not supported.
 
 ### Uninstalling
 
-*Settings → Apps → Apsi 2.6.0 → Uninstall*, or *Start → Apsi → Uninstall Apsi 2.6.0*. Other installed versions stay.
+*Settings → Apps → Apsi 2.6.2 → Uninstall*, or *Start → Apsi → Uninstall Apsi 2.6.2*. Other installed versions stay.
 
 If you set up the **GPU helper** (the installer's *GPU helper* option, or `apsi gpu setup`), it runs with administrator
 rights and keeps the files of one Apsi version open. The uninstaller turns it off first and asks for administrator

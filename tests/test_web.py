@@ -19,6 +19,10 @@ app.health()
 app.static("/files", STATIC)
 @app.post("/echo")
 fn echo(req) = {"got": req.json()}
+app.compress(min_size=200)
+let v1 = app.group("/v1")
+@v1.get("/big")
+fn big(req) = {"text": "apsi " * 400}
 use parallel
 @app.get("/slow")
 fn slow(req):
@@ -65,6 +69,19 @@ class WebServer(unittest.TestCase):
     def status(self, data, timeout=5):
         r = self.raw(data, timeout)
         return int(r.split(b" ", 2)[1]) if r else None
+
+    def test_gzip_and_groups_over_the_wire(self):
+        import gzip
+        import json
+        r = self.raw(b"GET /v1/big HTTP/1.1\r\nHost: x\r\nAccept-Encoding: gzip\r\nConnection: close\r\n\r\n")
+        head, _, body = r.partition(b"\r\n\r\n")
+        self.assertIn(b"Content-Encoding: gzip", head)
+        length = int(next(ln.split(b":")[1] for ln in head.split(b"\r\n") if ln.lower().startswith(b"content-length")))
+        self.assertEqual(length, len(body))
+        self.assertLess(length, 400)
+        self.assertEqual(json.loads(gzip.decompress(body))["text"], "apsi " * 400)
+        plain = self.raw(b"GET /v1/big HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")
+        self.assertNotIn(b"Content-Encoding", plain.partition(b"\r\n\r\n")[0])
 
     def test_basic_and_keepalive(self):
         r = self.raw(b"GET /health HTTP/1.1\r\nHost: x\r\n\r\nGET /health HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")

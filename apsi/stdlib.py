@@ -758,10 +758,25 @@ def _float_arr(g):
 
 
 class Adam:
-    def __init__(self, lr=1e-3, b1=0.9, b2=0.999, eps=1e-8):
+    def __init__(self, lr=1e-3, b1=0.9, b2=0.999, eps=1e-8, state="fp32"):
         self.lr, self.b1, self.b2, self.eps = lr, b1, b2, eps
+        self.state = str(state)
         self.m = self.v = None
         self.t = 0
+
+    def _low(self):
+        return self.state.lower() in ("bf16", "bfloat16")
+
+    def _round16(self, ms, vs):
+        """state="bf16": the moments rounded to bfloat16 stochastically (the same rounding as the card)."""
+        from .gpu_train import sround_bf16, widen_bf16
+        self._srs = (getattr(self, "_srs", 0x2545F491) * 1103515245 + 12345) & 0x7FFFFFFF
+        off = 0
+        for m, v in zip(ms, vs):
+            j = np.arange(off, off + m.size, dtype=np.uint32).reshape(m.shape)
+            m[...] = widen_bf16(sround_bf16(np.asarray(m, np.float32), j, self._srs, 0x1B873593))
+            v[...] = widen_bf16(sround_bf16(np.asarray(v, np.float32), j, self._srs, 0x68E31DA4))
+            off += m.size
 
     def step(self, params, grads):
         g_raw = tree_map(_float_arr, grads)
@@ -779,15 +794,21 @@ class Adam:
             if isinstance(p, Quantity):      # Adam steps are scale-free: update in SI units
                 return Quantity(p.v - delta, p.dim)
             return p - delta
-        return tree_map(upd, params, self.m, self.v)
+        out = tree_map(upd, params, self.m, self.v)
+        if self._low():                      # (the update read the moments in full; they are kept rounded)
+            self._round16([a for a in tree_leaves(self.m) if isinstance(a, np.ndarray)],
+                          [a for a in tree_leaves(self.v) if isinstance(a, np.ndarray)])
+        return out
 
 
 def sgd(lr=0.01, momentum=0.0):
     return SGD(lr, momentum)
 
 
-def adam(lr=1e-3, b1=0.9, b2=0.999, eps=1e-8):
-    return Adam(lr, b1, b2, eps)
+def adam(lr=1e-3, b1=0.9, b2=0.999, eps=1e-8, state="fp32"):
+    """Adam. state="bf16": its two moments kept in bfloat16 with stochastic rounding (half their memory); "fp32"
+    (the default) in float32."""
+    return Adam(lr, b1, b2, eps, state)
 
 
 def spiral_data(n_per_class=100, classes=3, noise=0.2, seed=0):
@@ -887,8 +908,8 @@ def clip_grad_norm(grads, max_norm=1.0):
 
 
 class AdamW(Adam):
-    def __init__(self, lr=1e-3, b1=0.9, b2=0.999, eps=1e-8, weight_decay=0.01):
-        super().__init__(lr, b1, b2, eps)
+    def __init__(self, lr=1e-3, b1=0.9, b2=0.999, eps=1e-8, weight_decay=0.01, state="fp32"):
+        super().__init__(lr, b1, b2, eps, state)
         self.wd = weight_decay
 
     def step(self, params, grads):
@@ -897,8 +918,107 @@ class AdamW(Adam):
         return super().step(decayed, grads)
 
 
-def adamw(lr=1e-3, b1=0.9, b2=0.999, eps=1e-8, weight_decay=0.01):
-    return AdamW(lr, b1, b2, eps, weight_decay)
+class GroupAdamW(Adam):
+    """AdamW over parameter groups (fit_batches(groups=...)): each group its own learning rate (scaled with the
+    schedule like the base optimizer's), betas, eps, weight decay (on its matrices, or on every weight with
+    decay="all"; no_decay= substrings of a path take a weight out) and gradient clipping by its own norm. The same
+    update as the card's kernels."""
+
+    def has_batch_groups(self):
+        return any(str((dict(g.fields) if hasattr(g, "fields") else dict(g)).get("every", "step")) == "batch"
+                   for g in (self.groups or []))
+
+    def step_batch(self, params, grads):
+        """The every="batch" groups' own step on one batch's (unscaled) gradient; the other weights unchanged."""
+        if self._g is None:
+            from .gpu_train import _param_groups
+            P = [a for a in tree_leaves(params) if isinstance(ops.raw(a), np.ndarray)]
+            self._g = _param_groups(self.groups, params, [np.asarray(ops.raw(a)) for a in P])
+        for g_ in {g for g in self._g["gid"] if g and self._g["specs"][g - 1].get("every") == "batch"}:
+            self._bt[g_] = self._bt.get(g_, 0) + 1
+        self._batch_call = True
+        try:
+            return self.step(params, grads)
+        finally:
+            self._batch_call = False
+
+    def batch_mask(self, params, grads):
+        """grads with the every="batch" groups' entries set to 0 (their gradient is used up by step_batch)."""
+        if self._g is None:
+            from .gpu_train import _param_groups
+            P = [a for a in tree_leaves(params) if isinstance(ops.raw(a), np.ndarray)]
+            self._g = _param_groups(self.groups, params, [np.asarray(ops.raw(a)) for a in P])
+        gid = self._g["gid"]
+        k = [0]
+
+        def f(p, a):
+            if not isinstance(ops.raw(p), np.ndarray):
+                return a
+            g_ = gid[k[0]]
+            k[0] += 1
+            return a * 0.0 if g_ and self._g["specs"][g_ - 1].get("every") == "batch" else a
+        return tree_map(f, params, grads)
+
+    def __init__(self, base, groups, clip=None):
+        self._bt = {}
+        super().__init__(base.lr, base.b1, base.b2, base.eps, getattr(base, "state", "fp32"))
+        self.lr0 = float(base.lr)
+        self.wd = float(getattr(base, "wd", 0.0)) if isinstance(base, AdamW) else 0.0
+        self.groups, self.clip, self._g = groups, clip, None
+
+    def step(self, params, grads):
+        from .gpu_train import _param_groups
+        pairs = []
+        tree_map(lambda a, g: pairs.append((a, g)), params, grads)     # (the gradient tree may hold extra leaves)
+        keep = [i for i, (a, _) in enumerate(pairs) if isinstance(ops.raw(a), np.ndarray)]
+        P = [pairs[i][0] for i in keep]
+        if self._g is None:
+            self._g = _param_groups(self.groups, params, [np.asarray(ops.raw(a)) for a in P])
+        gi, dec, specs = self._g["gid"], self._g["decay"], self._g["specs"]
+        G = [np.asarray(_float_arr(pairs[i][1]), np.float64) for i in keep]
+        if self.m is None:
+            z = lambda a: np.zeros(np.shape(ops.raw(a))) if isinstance(ops.raw(a), np.ndarray) else None  # noqa: E731
+            self.m, self.v = tree_map(z, params), tree_map(z, params)
+        M = [a for a in tree_leaves(self.m) if isinstance(a, np.ndarray)]
+        V = [a for a in tree_leaves(self.v) if isinstance(a, np.ndarray)]
+        bc = getattr(self, "_batch_call", False)
+        if not bc:
+            self.t += 1
+        scale = self.lr / self.lr0 if self.lr0 else 1.0
+        norms = {}
+        for g_, a in zip(gi, G):
+            norms[g_] = norms.get(g_, 0.0) + float(np.sum(a * a))
+        out = []
+        for i, p in enumerate(P):
+            sp = self._g["specs"][gi[i] - 1] if gi[i] else {}
+            if sp.get("every") == "batch" and not getattr(self, "_batch_call", False):
+                out.append(np.asarray(ops.raw(p), np.float64))       # (stepped after each batch: step_batch)
+                continue
+            if getattr(self, "_batch_call", False) and sp.get("every") != "batch":
+                out.append(np.asarray(ops.raw(p), np.float64))
+                continue
+            pick = lambda key, dflt: dflt if sp.get(key) is None else float(sp[key])     # noqa: E731
+            lr, b1, b2 = pick("lr", self.lr0) * scale, pick("b1", self.b1), pick("b2", self.b2)
+            eps, wd, clip = pick("eps", self.eps), pick("weight_decay", self.wd), pick("clip", self.clip or 0.0)
+            g = G[i]
+            nrm = math.sqrt(norms[gi[i]])
+            if clip and nrm > clip:
+                g = g * (clip / nrm)
+            t_ = self._bt.get(gi[i], 0) if bc else self.t
+            M[i][...] = b1 * M[i] + (1 - b1) * g
+            V[i][...] = b2 * V[i] + (1 - b2) * g * g
+            pv = np.asarray(ops.raw(p), np.float64)
+            w = pv * (1 - lr * wd) if dec[i] else pv
+            out.append(np.asarray(w - lr * (M[i] / (1 - b1 ** t_)) / (np.sqrt(V[i] / (1 - b2 ** t_)) + eps)))
+            if self._low():                  # (the update read the moments in full; they are kept rounded)
+                self._round16([M[i]], [V[i]])
+        it = iter(out)
+        return tree_map(lambda a: next(it) if isinstance(ops.raw(a), np.ndarray) else a, params)
+
+
+def adamw(lr=1e-3, b1=0.9, b2=0.999, eps=1e-8, weight_decay=0.01, state="fp32"):
+    """AdamW (decay on the matrices). state="bf16": the moments in bfloat16 with stochastic rounding (see adam)."""
+    return AdamW(lr, b1, b2, eps, weight_decay, state)
 
 
 def cosine_lr(step, total, base=1e-3, warmup=0, minimum=0.0):

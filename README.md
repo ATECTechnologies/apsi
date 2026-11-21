@@ -12,7 +12,7 @@
   <a href="https://github.com/ATECTechnologies/apsi/actions/workflows/darwin-arm64.yml"><img src="https://github.com/ATECTechnologies/apsi/actions/workflows/darwin-arm64.yml/badge.svg" alt="darwin-arm64"></a>
 </p>
 <p align="center">
-  <a href="https://apsi.dev/download"><img src="https://img.shields.io/badge/download-2.6.0-2ea44f" alt="Download Apsi 2.6.0"></a>
+  <a href="https://apsi.dev/download"><img src="https://img.shields.io/badge/download-2.6.2-2ea44f" alt="Download Apsi 2.6.2"></a>
   <img src="https://img.shields.io/badge/python-3.12%20%7C%203.13%20%7C%203.14-3776ab" alt="Python 3.12 | 3.13 | 3.14">
   <img src="https://img.shields.io/badge/native-LLVM%20%7C%20AVX2%20%7C%20AVX--512%20%7C%20NEON-555" alt="native code">
   <img src="https://img.shields.io/badge/GPU-CUDA%20%7C%20Tensor%20Cores-76b900" alt="GPU">
@@ -22,7 +22,7 @@
 <p align="center">
   <a href="https://apsi.dev">Website</a> ·
   <a href="https://apsi.dev/docs">Documentation</a> ·
-  <a href="docs/WHATS-NEW.md">What's new in 2.6.0</a> ·
+  <a href="docs/WHATS-NEW.md">What's new in 2.6.2</a> ·
   <a href="https://apsi.dev/benchmarks">Benchmarks</a> ·
   <a href="https://apsi.dev/download">Download</a>
 </p>
@@ -70,9 +70,9 @@ fn energy(x, v, k: Float) -> Float:
 
 | System | File | Install |
 |---|---|---|
-| Windows 10/11 (x64) | `ApsiSetup-2.6.0-x64.exe` | double-click (brings its own Python; no administrator rights) |
-| Any Linux, also WSL | `ApsiSetup-2.6.0-linux.sh` | `sh ApsiSetup-2.6.0-linux.sh` (no root) |
-| Ubuntu / Debian | `apsi_2.6.0_all.deb` | `sudo apt install ./apsi_2.6.0_all.deb` |
+| Windows 10/11 (x64) | `ApsiSetup-2.6.2-x64.exe` | double-click (brings its own Python; no administrator rights) |
+| Any Linux, also WSL | `ApsiSetup-2.6.2-linux.sh` | `sh ApsiSetup-2.6.2-linux.sh` (no root) |
+| Ubuntu / Debian | `apsi_2.6.2_all.deb` | `sudo apt install ./apsi_2.6.2_all.deb` |
 
 From this repository: `pip install numpy`, then `./apsi.sh run examples/01_hello.apsi` (Linux, macOS) or
 `apsi.bat run examples\01_hello.apsi` (Windows). Building the installers: [`docs/BUILD.md`](docs/BUILD.md).
@@ -88,6 +88,44 @@ apsi debug app.apsi             # breakpoints and stepping (or F5 in VS Code)
 ```
 
 Then read [Getting started](docs/GETTING-STARTED.md) (15 minutes) or [Write Apsi your way](docs/WRITE-APSI.md).
+
+## Train your own language model
+
+A tokenizer, a LLaMA / Qwen3-style decoder, training and text written by the model — the whole program
+([`examples/47_train_your_llm.apsi`](examples/47_train_your_llm.apsi)), seconds on a laptop:
+
+```apsi
+use layers
+use data
+use nn
+
+let corpus = ["The planet orbits the star once a year. " * 4, "Energy is mass times the speed of light squared. " * 4]
+let tok = data.train_tokenizer(corpus, vocab_size=300)                    # byte-level BPE, as GPT-2 / Llama 3 / Qwen
+let batches = [b for b in (data.text_dataset(corpus, tokenizer=tok, seq_len=24) |> batch(8))]
+
+let lm = transformer_lm(tok.vocab_size, d=64, heads=4, layers=2, context=24,
+                        kv_heads=2, rope=true, qk_norm=true, norm="rms", ffn="swiglu")
+let r = fit_batches(lm, lm.init(seed=0), batches, loss="cross_entropy",
+                    opt=adamw(lr=3e-3, state="bf16"), epochs=40, clip=1.0)
+print(f"loss {r.history[0]:.2f} -> {r.history[-1]:.2f}")                 # loss 6.74 -> 0.02
+```
+
+The same lines train a 127 M model on an NVIDIA card (`backend="gpu"`, `steps=`, `checkpoint=` to resume exactly
+after any stop): 16,000–18,000 tokens/s on an RTX 3060, the [measured numbers](https://apsi.dev/benchmarks).
+
+## What's new in 2.6.2
+
+* **Large models on one card.** Activation recompute measured per block (planned again when a batch grows), global
+  attention in pieces, nothing per edge kept, optimizer moments in bfloat16.
+* **Your own GPU kernels as layers** (`gpu_layer`), **parameter groups** (each part its own AdamW settings and
+  clipping), **weighted cross-entropy on the card** (`card_loss(weights=)`).
+* **Other programs' model files:** a parameter tree under another program's tensor names (`models.named_tensors` /
+  `from_named_tensors`), text metadata in `.safetensors`, running statistics of layers in checkpoints.
+* **Training that resumes exactly and learns from its own output:** batches made when training reaches them
+  (`record(later=fn)`, `training_params()`), your program's state and the random generators in the checkpoint
+  (`state=`), steps of their own length, parts with their own optimizer step every batch.
+* **Half the optimizer's memory:** `adamw(state="bf16")` (bfloat16 moments, stochastic rounding).
+* **The language:** raw strings `r#"..."#`, Python kept inside a program (`pymodule`).
 
 ## What's new in 2.6.0
 

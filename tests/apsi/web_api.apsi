@@ -1,0 +1,41 @@
+use web
+
+let app = server(name="api2", log=false)
+app.health()
+app.ready()
+app.compress(min_size=100)
+
+let api = app.group("/api/v1")
+@api.get("/users/{id:int}")
+fn user(req) = {"id": req.params["id"], "bio": "x" * 500}
+
+let admin = api.group("admin")
+@admin.get("/")
+fn admin_home(req) = "admin home"
+
+@app.get("/small")
+fn small(req) = {"a": 1}
+
+@app.get("/png")
+fn png(req) = response(b"\x89PNG" * 200, type="image/png")
+
+test "route groups put their routes under the prefix, and nest":
+    assert app.handle("GET", "/api/v1/users/7").body["id"] == 7
+    assert app.handle("GET", "/users/7").status == 404
+    assert app.handle("GET", "/api/v1/admin").body == "admin home"
+
+test "gzip for clients that accept it, only where it helps":
+    let r = app.handle("GET", "/api/v1/users/7", headers={"Accept-Encoding": "gzip, br"})
+    assert r.headers["Content-Encoding"] == "gzip"
+    assert r.headers["Vary"] == "Accept-Encoding"
+    assert r.body["id"] == 7
+    assert "Content-Encoding" not in app.handle("GET", "/api/v1/users/7").headers
+    assert "Content-Encoding" not in app.handle("GET", "/small", headers={"Accept-Encoding": "gzip"}).headers
+    assert "Content-Encoding" not in app.handle("GET", "/png", headers={"Accept-Encoding": "gzip"}).headers
+    assert "Content-Encoding" not in app.handle("GET", "/api/v1/users/7", headers={"Accept-Encoding": "gzip;q=0"}).headers
+
+test "health and readiness":
+    let h = app.handle("GET", "/health")
+    assert h.body["status"] == "ok"
+    assert h.body["uptime_s"] >= 0
+    assert app.handle("GET", "/ready").status == 200

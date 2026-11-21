@@ -58,7 +58,9 @@ nothing written (--plan). Run the same command without --plan to convert.
 
 Files that import each other are always converted together, so the converted modules import each other as Apsi
 files. A module already converted and newer than its `.py` is not converted again. With `--only`, a Python module
-kept next to the program is found by `pyimport` in the program's own folder.
+kept next to the program is found by `pyimport` in the program's own folder. To ship one file instead of two, the
+Python source can live inside the program: `let m = pymodule("helpers", r##"…python source…"##)` makes the module
+(`import helpers` in other Python code then finds it too); it needs `--allow-python` like `pyimport`.
 
 ## Jupyter notebooks
 

@@ -1,0 +1,58 @@
+# Every benchmark category of apsi.dev/benchmarks on one GitHub runner (Actions -> suite -> Run workflow):
+# benchmarks/run_suite.py (Python converted, matrix multiply, tables, web server, real time, AI, WebSocket,
+# databases), the eight heavy CPU programs in Apsi and the other languages, the same programs on the previous
+# release (input "old"), and the token benchmarks. Raw output in the "suite-results" artifact.
+name: suite
+on:
+  workflow_dispatch:
+    inputs:
+      old:
+        description: "branch of the previous release to compare with"
+        default: release/2.6.0
+jobs:
+  suite:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 240
+    env:
+      PYTHONUTF8: "1"
+      TERM: dumb
+      APSI_NATIVE_QUIET: "1"
+    steps:
+      - uses: actions/checkout@v5
+        with: { path: apsi }
+      - uses: actions/checkout@v5
+        with: { path: old, ref: "${{ inputs.old }}" }
+      - uses: actions/setup-python@v6
+        with: { python-version: "3.13" }
+      - uses: actions/setup-go@v5
+        with: { go-version: "1.23", cache: false }
+      - uses: actions/setup-node@v4
+        with: { node-version: "22" }
+      - name: Install
+        run: python -m pip install numpy llvmlite ml_dtypes pandas pytest
+      - name: Warm up (a fresh runner's first run is slower; not kept)
+        run: python apsi/benchmarks/heavy/run.py --only Apsi --out out/warm
+      - name: Heavy CPU programs, Apsi and the other languages
+        run: python apsi/benchmarks/heavy/run.py --skip Mojo --out out/heavy
+      - name: Heavy CPU programs, the previous release
+        run: python apsi/benchmarks/heavy/run.py --apsi-root old --only Apsi --label "Apsi old" --out out/heavy-old
+      - name: Token benchmarks
+        working-directory: apsi
+        env: { PYTHONPATH: "." }
+        run: |
+          mkdir -p ../out/tokens
+          python benchmarks/tokens/focus.py > ../out/tokens/focus.txt 2>&1 || true
+          python benchmarks/tokens/tokenizer.py > ../out/tokens/tokenizer.txt 2>&1 || true
+          python -m apsi run benchmarks/tokens/run.apsi > ../out/tokens/run.txt 2>&1 || true
+      - name: Every category (run_suite.py)
+        working-directory: apsi
+        run: python benchmarks/run_suite.py ../out/suite
+      - name: Results
+        if: always()
+        run: |
+          for f in out/heavy/results.json out/heavy-old/results.json out/tokens/*.txt out/suite/*.txt; do
+            [ -f "$f" ] && { echo "=====BEGIN $f"; cat "$f"; echo; echo "=====END $f"; }
+          done
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with: { name: suite-results, path: out }

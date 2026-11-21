@@ -88,8 +88,13 @@ app.after(fn(req, resp) => ...)                    # middleware after the handle
 app.rate_limit(100, per=1[s], burst=200)
 app.cors(["https://example.com"])                  # or "*"
 app.static("/assets", "public")
-app.health()            # GET /health
+app.health()            # GET /health: status, name, uptime
+app.ready()             # GET /ready: 200 while serving, 503 once app.stop() was called (load balancers drain it)
 app.expose_metrics()    # GET /metrics: requests, errors, status codes, p50/p90/p99, req/s
+app.compress(min_size=1024, level=5)               # gzip text / HTML / JSON / JS / CSS / XML / SVG for clients
+                                                   # that accept it (smaller bodies and images are sent as they are)
+let api = app.group("/api/v1")                     # routes under a prefix: @api.get("/users/{id:int}")
+let admin = api.group("admin")                     #   -> /api/v1/users/{id}; groups nest (/api/v1/admin/...)
 app.stats()             # the same numbers inside your program
 app.handle("GET", "/path", body, headers)          # call a route directly without the network (for tests)
 app.run(host, port, tls_cert, tls_key, processes, workers)

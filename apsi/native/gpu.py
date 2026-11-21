@@ -90,6 +90,16 @@ class GpuArray:
         self.dev.to_device(self.ptr, self.host.ctypes.data, self.host.nbytes)
         self.host_ok, self.dev_ok = True, True
 
+    @classmethod
+    def on_device(cls, dev, ptr, shape, dtype=np.float32):
+        """A view of memory already on the card (the GPU trainer's buffers): no copy, not owned (never freed here).
+        Its values reach the processor only if a kernel has to run there."""
+        self = cls.__new__(cls)
+        self.ptr, self.dev, self.owned = int(ptr), dev, False
+        self.host = np.empty(tuple(int(s) for s in shape), dtype)     # (pages untouched until a copy is needed)
+        self.host_ok, self.dev_ok = False, True
+        return self
+
     shape = property(lambda self: self.host.shape)
     dtype = property(lambda self: self.host.dtype)
     nbytes = property(lambda self: self.host.nbytes)
@@ -117,7 +127,7 @@ class GpuArray:
         self.dev_ok = False
 
     def free(self):
-        if getattr(self, "ptr", 0):
+        if getattr(self, "ptr", 0) and getattr(self, "owned", True):
             try:
                 self.dev.activate()
                 self.dev.free(self.ptr)

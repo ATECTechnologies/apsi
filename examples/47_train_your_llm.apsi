@@ -1,0 +1,38 @@
+# 47_train_your_llm.apsi — your own language model from plain text: a tokenizer, a modern decoder (RoPE, grouped-query
+# attention, q/k norm, SwiGLU), training that resumes by itself, and text written by the model. Runs in seconds on the
+# processor; the same lines train on an NVIDIA card (backend="gpu") at full size.
+#   apsi run examples/47_train_your_llm.apsi
+use layers
+use data
+use nn
+
+# 1. text: any files, folders, globs, JSONL / chat records - or, as here, strings
+let corpus = ["The planet orbits the star once a year. " * 4, "A function returns the sum of its two numbers. " * 4,
+              "Energy is mass times the speed of light squared. " * 4, "The model reads the text and writes more. " * 4]
+
+# 2. your own byte-level BPE tokenizer (the kind GPT-2, Llama 3 and Qwen use)
+let tok = data.train_tokenizer(corpus, vocab_size=300)
+
+# 3. training windows: each position predicts the next token
+let ds = data.text_dataset(corpus, tokenizer=tok, seq_len=24)
+let batches = [b for b in (ds |> batch(8))]
+
+# 4. a LLaMA / Qwen3-style decoder in one line
+let lm = transformer_lm(tok.vocab_size, d=64, heads=4, layers=2, context=24, kv_heads=2, rope=true, qk_norm=true,
+                        norm="rms", ffn="swiglu")
+let r = fit_batches(lm, lm.init(seed=0), batches, loss="cross_entropy", opt=adamw(lr=3e-3, state="bf16"),
+                    epochs=40, clip=1.0, backend="numpy", verbose=false)
+print(f"loss {r.history[0]:.2f} -> {r.history[-1]:.2f}")
+
+# 5. the model writes: the likeliest next token, again and again
+fn write(prompt, n):
+    var ids = tok.encode(prompt)
+    for k in 0..n:
+        let logits = predict(lm, r.params, tensor([ids]))
+        ids.append(int(argmax(logits[0, len(ids) - 1])))
+    return tok.decode(ids)
+
+print(write("The planet", 14))
+
+test "the model learned its text":
+    assert r.history[-1] < 0.5 * r.history[0]

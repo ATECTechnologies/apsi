@@ -54,11 +54,58 @@ class Buf:
         self.ptr, self.n, self.a = ptr, n, a
 
 
+class Buf16(Buf):
+    """n16 bfloat16 values (an optimizer's moments kept at half the memory) in a buffer of (n16 + 1) // 2 float32."""
+    __slots__ = ("n16",)
+
+
+def _sr_mix(x):
+    """The 32-bit hash of the card's adam16 kernel (NumPy uint32, element by element)."""
+    x = x ^ (x >> np.uint32(16))
+    x = x * np.uint32(0x85EBCA6B)
+    x = x ^ (x >> np.uint32(13))
+    x = x * np.uint32(0xC2B2AE35)
+    return x ^ (x >> np.uint32(16))
+
+
+def sround_bf16(v, j, seed, salt):
+    """float32 values -> their bfloat16 bits, stochastically rounded exactly as the adam16 kernel does (element j)."""
+    with np.errstate(over="ignore"):
+        r = _sr_mix((np.asarray(j, np.uint32) * np.uint32(0x9E3779B1)) ^ np.uint32(seed & 0xFFFFFFFF) ^ np.uint32(salt))
+        u = np.asarray(v, np.float32).view(np.uint32) + (r & np.uint32(0xFFFF))
+    return (u >> np.uint32(16)).astype(np.uint16)
+
+
+def widen_bf16(h):
+    return (np.asarray(h, np.uint16).astype(np.uint32) << np.uint32(16)).view(np.float32)
+
+
 # ============================================================================== devices
 class _Ops:
     """Kernel launches in terms of (buffer, offset) views; sizes in float32 elements."""
 
     tc = False
+
+    def alloc16(self, n16):
+        b = self.alloc((int(n16) + 1) // 2)
+        b16 = Buf16(b.ptr, b.n, b.a)
+        b16.n16 = int(n16)
+        return b16
+
+    def get16(self, b, n16):
+        """The bfloat16 bits of a Buf16 (uint16)."""
+        w = self.get(b, (int(n16) + 1) // 2)
+        return np.ascontiguousarray(w).view(np.uint16)[:int(n16)].copy()
+
+    def put16(self, b, h):
+        h = np.asarray(h, np.uint16)
+        if h.size % 2:
+            h = np.concatenate([h, np.zeros(1, np.uint16)])
+        self.put(b, h.view(np.float32))
+
+    def _sr_seed(self):
+        self._srs = (getattr(self, "_srs", 0x2545F491) * 1103515245 + 12345) & 0x7FFFFFFF
+        return self._srs
 
     def _ring_ready(self):                               # pinned staging memory: the real card only
         return False
@@ -66,6 +113,9 @@ class _Ops:
     def drop_ring(self):
         pass
     _db = None
+
+    def forget(self, b):                                 # (bfloat16 twins: the real card only)
+        pass
 
     def _bf_gemm(self, A, B, Cv, bias, M, N, K, sam, sak, sbk, sbn, ldc, alpha, beta, epi, X2, act, a_act, tmp):
         return _bf_gemm_composite(self, A, B, Cv, bias, M, N, K, sam, sak, sbk, sbn, ldc, alpha, beta, epi, X2, act,
@@ -194,6 +244,7 @@ class Emulator(_Ops):
 
     def alloc(self, n):
         self.used += 4 * n
+        self.peak = max(getattr(self, "peak", 0), self.used)
         return Buf(0, n, np.zeros(max(1, n), np.float32))
 
     def free(self, b):
@@ -216,6 +267,9 @@ class Emulator(_Ops):
 
     def fill(self, view, n, value):
         self.v(view, n)[:] = value
+
+    def copy(self, dst, src, n):
+        self.v(dst, n)[:] = self.v(src, n)
 
     def axpy(self, Y, X, n, a=1.0):
         y = self.v(Y, n)
@@ -263,6 +317,10 @@ class Emulator(_Ops):
             return s, s * (1 - s)
         if kind == 5:
             return x, np.ones_like(x)
+        if kind == 12:                                  # the exact gelu (erf)
+            from math import erf
+            ph = (0.5 * (1.0 + np.vectorize(erf)(x.astype(np.float64) / np.sqrt(2.0)))).astype(np.float32)
+            return x * ph, (ph + x * np.float32(0.3989422804014327) * np.exp(-0.5 * x * x)).astype(np.float32)
         if kind == 7:
             e = np.exp(np.minimum(x, 0))
             return np.where(x > 0, x, e - 1), np.where(x > 0, np.float32(1), e).astype(np.float32)
@@ -394,7 +452,9 @@ class Emulator(_Ops):
         c[:] = (t - p) - y
         p[:] = t
 
-    def adam(self, Pm, Gr, Mm, Vm, SQ, n, n_decay, lr, b1, b2, eps, c1, c2, wd, clip, COMP=None):
+    def adam(self, Pm, Gr, Mm, Vm, SQ, n, n_decay, lr, b1, b2, eps, c1, c2, wd, clip, COMP=None, part=None):
+        if isinstance(Mm[0], Buf16):
+            return self._adam16(Pm, Gr, Mm, Vm, SQ, n, n_decay, lr, b1, b2, eps, c1, c2, wd, clip, COMP)
         if not np.isfinite(self.v(SQ, 1)[0]):              # a non-finite gradient: the step is skipped
             self.v(Gr, n)[:] = 0.0
             return
@@ -409,6 +469,30 @@ class Emulator(_Ops):
         dec[:n_decay] = p[:n_decay] * np.float32(lr * wd)
         self._kahan(p, w - upd, -(dec + upd), COMP, n)
         self.v(Gr, n)[:] = 0.0                    # the kernel clears the gradient it used
+
+    def _adam16(self, Pm, Gr, Mm, Vm, SQ, n, n_decay, lr, b1, b2, eps, c1, c2, wd, clip, COMP):
+        seed = self._sr_seed()
+        if not np.isfinite(self.v(SQ, 1)[0]):
+            self.v(Gr, n)[:] = 0.0
+            return
+        h16m = Mm[0].a.view(np.uint16)
+        h16v = Vm[0].a.view(np.uint16)
+        j = np.arange(Mm[1], Mm[1] + n, dtype=np.uint32)
+        f = np.float32
+        g = self.v(Gr, n) * self._clip(SQ, clip)
+        p = self.v(Pm, n)
+        m0, v0 = widen_bf16(h16m[Mm[1]:Mm[1] + n]), widen_bf16(h16v[Vm[1]:Vm[1] + n])
+        w = p.copy()
+        w[:n_decay] *= f(1 - lr * wd)
+        m = f(b1) * m0 + (f(1) - f(b1)) * g
+        v = f(b2) * v0 + (f(1) - f(b2)) * g * g
+        upd = f(lr) * (m / f(c1)) / (np.sqrt(v / f(c2)) + f(eps))
+        dec = np.zeros_like(p)
+        dec[:n_decay] = p[:n_decay] * f(lr * wd)
+        h16m[Mm[1]:Mm[1] + n] = sround_bf16(m, j, seed, 0x1B873593)
+        h16v[Vm[1]:Vm[1] + n] = sround_bf16(v, j, seed, 0x68E31DA4)
+        self._kahan(p, w - upd, -(dec + upd), COMP, n)
+        self.v(Gr, n)[:] = 0.0
 
     def sgd(self, Pm, Gr, VEL, SQ, n, lr, mom, clip, COMP=None):
         if not np.isfinite(self.v(SQ, 1)[0]):
@@ -1043,13 +1127,23 @@ class Gpu(_Ops):
                              "shorter context, or more cards "
                              "(device=\"cuda:all\" splits the model across them)") from None
         self.used += 4 * n
+        self.peak = max(getattr(self, "peak", 0), self.used)
+        if self.used > self.dev.memory and not getattr(self, "_spill_said", False):
+            self._spill_said = True                      # Windows lets the driver spill into the computer's memory
+            print(f"note: {self.used / 2 ** 30:.1f} GB asked of a {self.dev.memory / 2 ** 30:.1f} GB card: the rest "
+                  "spills into the computer's memory, which is many times slower (recompute=true, a smaller "
+                  "batch_size with accumulate=, or a shorter context keep it on the card)")
         return Buf(p, n)
 
     def free(self, b):
         self.used -= 4 * b.n
         self.dev.free(b.ptr)
         self._calls.clear()
-        if self._twin:                                   # a twin of (or in) freed memory is no longer one
+        self.forget(b)                                   # a twin of (or in) freed memory is no longer one
+
+    def forget(self, b):
+        """b will hold other values: no bfloat16 twin of (or in) it, no value of it that exists only as a twin."""
+        if self._twin or self._only16:
             lo, hi = b.ptr, b.ptr + 4 * max(1, b.n)
             self._twin = {k: v for k, v in self._twin.items() if not (lo <= k < hi or lo <= v[1][1] < hi)}
             self._only16 = {k for k in self._only16 if not lo <= k < hi}
@@ -1161,7 +1255,9 @@ class Gpu(_Ops):
         source must be finished (the caller syncs it)."""
         self.dev.ensure()
         dptr, sptr = self.p(dst)[1], src_ops.p(src)[1]
-        self._wgen += 1                                  # (the weights may be what changes)
+        wr = self._wrange
+        if wr is None or wr[0] <= dptr < wr[1]:
+            self._wgen += 1                              # the weights change: their bfloat16 copies are stale
         if src_ops is self or src_ops.dev is self.dev:
             self.dev.drv.check(self._lib.cuMemcpyDtoDAsync_v2(ctypes.c_uint64(dptr), ctypes.c_uint64(sptr),
                                                               ctypes.c_size_t(4 * n), None), "cuMemcpyDtoDAsync")
@@ -1173,6 +1269,19 @@ class Gpu(_Ops):
             r = 1
         if r != 0:                                       # no peer copy: through the host
             self.put(dst[0], src_ops.get(src[0], n, src[1]), dst[1])
+
+    def copy(self, dst, src, n):
+        """dst <- src on this card (activations: the weights' bfloat16 copies stay valid)."""
+        d_, s_ = self.p(dst)[1], self.p(src)[1]
+        if d_ == s_ or n <= 0:
+            return
+        wr = self._wrange
+        if wr is not None and wr[0] <= d_ < wr[1]:
+            self._wgen += 1
+        self._twin.pop(d_, None)                         # dst holds new values: an old twin of it is stale
+        self._only16.discard(d_)
+        self.dev.drv.check(self._lib.cuMemcpyDtoDAsync_v2(ctypes.c_uint64(d_), ctypes.c_uint64(s_),
+                                                          ctypes.c_size_t(4 * n), None), "cuMemcpyDtoDAsync")
 
     def add3(self, Z, X, Y, n):
         self._go("add3", self.blocks(n), 256, self.p(Z), self.p(X), self.p(Y), ("u", n))
@@ -1219,7 +1328,7 @@ class Gpu(_Ops):
         """view's bfloat16 twin in dst (one pass), registered for the products that read view until drop_twin or
         until view is written with a new twin. For a buffer read by several products (two or more conversions
         before): one."""
-        self._go("to_bf16", self.blocks((n + 1) // 2), 256, self.p(view), self.p(dst), ("u", n))
+        self._to_bf16(self.p(view), self.p(dst), n)
         self._twin[self.p(view)[1]] = (n, self.p(dst))
 
     def drop_twin(self, view):
@@ -1293,11 +1402,24 @@ class Gpu(_Ops):
         part = self._scratch("sumsq_part", nb)
         self._go("sumsq", nb, 256, self.p(X), ("u", n), self.p(ACC), self.p(part), self._cnt())
 
-    def adam(self, Pm, Gr, Mm, Vm, SQ, n, n_decay, lr, b1, b2, eps, c1, c2, wd, clip, COMP=None):
+    def adam(self, Pm, Gr, Mm, Vm, SQ, n, n_decay, lr, b1, b2, eps, c1, c2, wd, clip, COMP=None, part=None):
+        if isinstance(Mm[0], Buf16):                     # bfloat16 moments, stochastically rounded
+            i_, k_ = part if part is not None else (0, 1)
+            self._wgen += 1
+            self._go("adam16", self.blocks(n), 256, self.p(Pm), self.p(Gr), ("p", Mm[0].ptr), ("p", Vm[0].ptr),
+                     self.p(SQ), ("u", n), ("u", n_decay), ("f", lr), ("f", b1), ("f", b2), ("f", eps), ("f", c1),
+                     ("f", c2), ("f", wd), ("f", clip), self.p(COMP if COMP is not None else Pm),
+                     ("u", 1 if COMP is not None else 0), ("u", Mm[1]), ("i", int(np.int32(self._sr_seed()))))
+            if k_ == 1 and hasattr(self, "refresh_w16"):
+                self.refresh_w16()
+            return
+        # part=(i, k): call i of k that together update every weight (parameter groups, each its own learning rate):
+        # those calls leave the bfloat16 copy alone; refresh_w16() rounds it once after the last
+        i_, k_ = part if part is not None else (0, 1)
         self._wgen += 1
         # the update of all the weights writes their bfloat16 copy too (the products' operand): no conversion pass
         wr, at = self._wrange, self.p(Pm)[1]
-        full = self._w16 is not None and wr is not None and at == wr[0] and 4 * n == wr[1] - wr[0]
+        full = k_ == 1 and self._w16 is not None and wr is not None and at == wr[0] and 4 * n == wr[1] - wr[0]
         self._go("adam", self.blocks(n), 256, self.p(Pm), self.p(Gr), self.p(Mm), self.p(Vm), self.p(SQ), ("u", n),
                  ("u", n_decay), ("f", lr), ("f", b1), ("f", b2), ("f", eps), ("f", c1), ("f", c2), ("f", wd),
                  ("f", clip), self.p(COMP if COMP is not None else Pm), ("u", 1 if COMP is not None else 0),
@@ -1578,6 +1700,26 @@ class Gpu(_Ops):
             os.environ.get("APSI_ADAM_W16", "1").strip().lower() not in ("0", "off", "no") else None
         self._w16_gen = -1
 
+    def _to_bf16(self, src, dst, n):
+        """bfloat16 copy of n floats (src, dst: ("p", address)); to_bf16 has no grid-stride loop, so a long array goes
+        in launches of at most 65536 blocks of 256 threads (two values each)."""
+        step = 2 * 65536 * 256
+        for a in range(0, int(n), step):
+            k = min(step, int(n) - a)
+            self._go("to_bf16", self.blocks((k + 1) // 2), 256, ("p", src[1] + 4 * a), ("p", dst[1] + 2 * a), ("u", k))
+
+    def refresh_w16(self):
+        """Round every weight to its bfloat16 copy in one pass (after updates that did not write it)."""
+        wr = self._wrange
+        if self._w16 is None or wr is None:
+            return
+        n = (wr[1] - wr[0]) // 4
+        self._to_bf16(("p", wr[0]), ("p", self._w16.ptr), n)
+        self._w16_gen = self._wgen
+        for bf in self._wcache.values():
+            self.free(bf[1])
+        self._wcache = {}
+
     def a16_ready(self, M, N, K, epi=0):
         """Will gemm_a16 take a dense M x N x K product (k contiguous in A, B a row-major weight)? (A producer that
         writes only a bfloat16 output for it asks first.)"""
@@ -1622,7 +1764,7 @@ class Gpu(_Ops):
                 hit = self._wcache.get((ptr, n))
                 if hit is None or hit[0] != self._wgen:
                     dst = hit[1] if hit is not None else self.alloc((n + 1) // 2)
-                    self._go("to_bf16", self.blocks((n + 1) // 2), 256, args[i], self.p((dst, 0)), ("u", n))
+                    self._to_bf16(args[i], self.p((dst, 0)), n)
                     self._wcache[(ptr, n)] = hit = (self._wgen, dst)
                 out[i] = self.p((hit[1], 0))
                 continue
@@ -1631,7 +1773,7 @@ class Gpu(_Ops):
                 out[i] = tw[1]
                 continue
             dst = self._scratch(key, (n + 1) // 2)
-            self._go("to_bf16", self.blocks((n + 1) // 2), 256, args[i], self.p(dst), ("u", n))
+            self._to_bf16(args[i], self.p(dst), n)
             out[i] = self.p(dst)
         return out
 
@@ -1828,8 +1970,11 @@ class Gpu(_Ops):
             if ldc != N or f"{name}_e{epi}" + (f"a{act}" if epi in (1, 2) else "") not in self.fn:
                 return False
         lo_a, lo_b = self._scratch("lo_a", M * K), self._scratch("lo_b", K * N)
-        self._go("bf_lo", self.blocks(M * K), 256, self.p(A), self.p(lo_a), ("u", M * K))
-        self._go("bf_lo", self.blocks(K * N), 256, self.p(B), self.p(lo_b), ("u", K * N))
+        for src, dst, cnt in ((A, lo_a, M * K), (B, lo_b, K * N)):
+            ps, pd = self.p(src)[1], self.p(dst)[1]
+            for a in range(0, cnt, 65536 * 256):         # (one value per thread, no grid-stride loop)
+                k = min(65536 * 256, cnt - a)
+                self._go("bf_lo", self.blocks(k), 256, ("p", ps + 4 * a), ("p", pd + 4 * a), ("u", k))
         common = (M, N, K, sam, sak, sbk, sbn, ldc, 1, 1, sa, sb, sc, alpha)
         self._gemm(A, B, Cv, bias, *common, beta, 1)
         self._gemm(lo_a, B, Cv, None, *common, True, 1)
@@ -2108,6 +2253,142 @@ def _rows(shape):
     return int(np.prod(shape[:-1])) if len(shape) > 1 else 1
 
 
+class _SharedArena:
+    """The arena seen by a recomputed layer: its buffers are named by their place inside the layer, not by the layer,
+    so every recomputed layer of the same kind writes the same buffers (only one runs at a time)."""
+
+    def __init__(self, base):
+        self.base, self.keys, self.prefix, self.gprefix, self.track = base, set(), None, None, None
+
+    @property
+    def ops(self):
+        return self.base.ops
+
+    @property
+    def bufs(self):
+        return self.base.bufs
+
+    def _map(self, key):
+        if isinstance(key, tuple) and key:
+            k0 = key[0]
+            if k0 == "g" and len(key) > 1 and isinstance(key[1], str) and key[1].startswith(self.gprefix):
+                return ("ck", self.kind, "g", key[1][len(self.gprefix):]) + key[2:]
+            if isinstance(k0, str) and k0.startswith(self.prefix):
+                return ("ck", self.kind, k0[len(self.prefix):]) + key[1:]
+        return None
+
+    def get(self, key, n):
+        k = self._map(key)
+        if k is None:
+            return self.base.get(key, n)
+        self.keys.add(k)
+        if self.track is not None:
+            self.track[k] = max(self.track.get(k, 0), n)
+        return self.base.get(k, n)
+
+    def close(self):
+        pass
+
+
+class _Recompute(_Node):
+    """Activation recomputation (gradient checkpointing) of one layer: forward keeps only the layer's input and output;
+    backward runs the layer's forward again (into buffers every recomputed layer shares), then its backward. The
+    activations of a deep model take the memory of one layer instead of all of them, for about a third more work.
+    live: the layer keeps its activations like any other (chosen per layer while they fit in the card's memory)."""
+
+    def __init__(self, net, key, inner, prefix, gprefix):
+        super().__init__(net, key)
+        self.inner, self.prefix, self.gprefix = inner, prefix, gprefix
+        self.kind = type(inner).__name__
+        self.live, self.foot, self.rows = False, 0, 0
+        self.nodes = [inner]
+
+    def _enter(self):
+        net = self.net
+        sa, sg = net._ck_arena, net._ck_garena
+        self._saved = (net.arena, net.garena)
+        for a in {id(sa): sa, id(sg): sg}.values():
+            a.prefix, a.gprefix, a.kind = self.prefix, self.gprefix, self.kind
+            for k in a.keys:                             # the shared buffers hold another layer's values now
+                b = a.base.bufs.get(k)
+                if b is not None:
+                    net.ops.forget(b)
+        net.arena, net.garena = sa, sg
+
+    def _leave(self):
+        self.net.arena, self.net.garena = self._saved
+
+    def fwd(self, x, shape):
+        self.x, self.shape = x, shape
+        if self.live:
+            return self.inner.fwd(x, shape)
+        net, o = self.net, self.net.ops
+        s0 = net.seed
+        self._enter()
+        try:
+            y, ys = self.inner.fwd(x, shape)
+        finally:
+            self._leave()
+        self.seeds = (s0, net.seed)
+        n = int(np.prod(ys))
+        out = self.buf("out", n)
+        o.copy(out, y, n)
+        self.rows = max(self.rows, _rows(shape))
+        return out, ys
+
+    def bwd(self, dy, need_dx=True):
+        if self.live:
+            return self.inner.bwd(dy, need_dx)
+        net, o = self.net, self.net.ops
+        s0, s1 = self.seeds[0], net.seed
+        net.seed = s0                                    # the same dropout masks as the first time
+        track = {} if not self.foot else None
+        net._ck_arena.track = net._ck_garena.track = track
+        self._enter()
+        try:
+            self.inner.fwd(self.x, self.shape)
+            dx = self.inner.bwd(dy, need_dx)
+        finally:
+            self._leave()
+            net._ck_arena.track = net._ck_garena.track = None
+            net.seed = s1
+        if track:
+            self.foot = 4 * sum(track.values())        # what the layer's own buffers would take
+        if dx is None:
+            return None
+        m = int(np.prod(self.shape))
+        d = self.gbuf("dx", m)
+        o.copy(d, dx, m)
+        return d
+
+
+def _recompute_mode(v, ops):
+    """recompute=: "auto" (the GPU trainer measures the first step and recomputes only the layers that do not fit),
+    true (every block), false (none). APSI_RECOMPUTE overrides."""
+    env = os.environ.get("APSI_RECOMPUTE", "").strip().lower()
+    if env:
+        v = env
+    if v is None:
+        v = "auto"
+    if isinstance(v, str):
+        v = v.strip().lower()
+        if v in ("0", "false", "no", "off", "none"):
+            return False
+        if v in ("1", "true", "yes", "on", "all"):
+            return True
+        if v == "auto":
+            return "auto" if getattr(getattr(ops, "dev", None), "memory", 0) or os.environ.get("APSI_GPU_MEMORY_MB") \
+                else False
+        raise TrainError(f"recompute={v!r}: auto, true or false")
+    return bool(v)
+
+
+def _recomputable(layer):
+    from . import layers as L
+    from . import graphs as GR
+    return isinstance(layer, (L.Residual, L.TransformerBlock, GR.HGT, GR.GlobalAttention, GR.GraphTransformer))
+
+
 class _Linear(_Node):
     def __init__(self, net, key, layer, p):
         super().__init__(net, key)
@@ -2155,10 +2436,16 @@ class _Linear(_Node):
                    bias=self.b.w if self.b else None, passes=self.net.passes, epi=1, X2=self.h, act=self.act,
                    **({"y16": self.y16, "y16_only": self.y16_only} if self.y16 is not None else {}))
         elif self.x_pre is not None and getattr(self.x_pre, "y16_only", False):   # x only in bfloat16 (its twin)
-            if not o.gemm_a16(self.x_pre.y16, self.W.w, y, M, self.N, self.K, self.K, 1, self.N, 1, self.N,
-                              bias=self.b.w if self.b else None, epi=3 if residual else 0, X2=residual):
-                raise TrainError("internal: the bfloat16-only input found no product (APSI_Y16_ONLY=0)")
-            o.drop_twin(x)
+            if o.gemm_a16(self.x_pre.y16, self.W.w, y, M, self.N, self.K, self.K, 1, self.N, 1, self.N,
+                          bias=self.b.w if self.b else None, epi=3 if residual else 0, X2=residual):
+                o.drop_twin(x)
+            else:
+                # no bfloat16-input build for this shape: act(h) in float32 from the kept pre-activation, then the
+                # usual product (the twin stays for the weight gradient)
+                o.act_f(self.x_pre.h, x, M * self.K, self.x_pre.act)
+                o.gemm(x, self.W.w, y, M, self.N, self.K, self.K, 1, self.N, 1, self.N,
+                       bias=self.b.w if self.b else None, passes=self.net.passes, epi=3 if residual else 0,
+                       X2=residual)
         else:                                           # y = x W + b (+ the residual input); x in bfloat16 if bf_in
             o.gemm(x, self.W.w, y, M, self.N, self.K, self.K, 1, self.N, 1, self.N,
                    bias=self.b.w if self.b else None, passes=self.net.passes, epi=3 if residual else 0, X2=residual,
@@ -3016,6 +3303,25 @@ class _DAG(_Node):
                     G.add(s_, dx)
 
 
+class _GradScale(_Node):
+    """grad_scale: the input itself going forward; alpha times the gradient going backward."""
+
+    def __init__(self, net, key, alpha):
+        super().__init__(net, key)
+        self.alpha = float(alpha)
+
+    def fwd(self, x, shape):
+        self.n = int(np.prod(shape))
+        return x, shape
+
+    def bwd(self, dy, need_dx=True):
+        dx = self.gbuf("dx", self.n)
+        self.net.ops.fill(dx, self.n, 0.0)
+        if self.alpha:
+            self.net.ops.axpy(dx, dy, self.n, self.alpha)
+        return dx
+
+
 class _TiedOutput(_Node):
     """tied_output: x @ E^T with the table E of an embedding of the same dag (one parameter, two users: both add
     their gradients into it)."""
@@ -3257,7 +3563,10 @@ class _HostLayer(_Node):
         from . import ops as aops
         self.rng = aops._RNG[0].bit_generator.state
         p = self._params()
+        stateful = getattr(self.layer, "stateful", False)
+        self.st_pre = self.layer.state_get() if stateful else None      # running statistics: replayed in backward
         y = self.layer(p, xs if self.multi else xs[0], train=self.net.train, **self._ctx())
+        self.st_post = self.layer.state_get() if stateful else None
         y = np.asarray(aops.raw(y), np.float32)
         self.pnow, self.out_shape = p, tuple(y.shape)
         out = self.buf("y", max(1, y.size))
@@ -3291,6 +3600,8 @@ class _HostLayer(_Node):
             return aops.sum_(y * dyh)
         g0 = aops._RNG[0].bit_generator.state
         aops._RNG[0].bit_generator.state = self.rng       # the same random numbers as the forward pass
+        if self.st_pre is not None:
+            layer.state_set(self.st_pre)                  # the same running statistics as the forward pass
         ids = getattr(layer, "takes_ids", False)
         isid = [ids is True or (isinstance(ids, (list, tuple)) and i < len(ids) and bool(ids[i]))
                 for i in range(len(self.xs))]
@@ -3299,6 +3610,8 @@ class _HostLayer(_Node):
             _, g = value_and_grad(f, wrt=wrt)(p, *self.xs)
         finally:
             aops._RNG[0].bit_generator.state = g0
+            if self.st_post is not None:
+                layer.state_set(self.st_post)
         g = list(g) if isinstance(g, (list, tuple)) and len(wrt) > 1 else [g]
         gp, rest = g[0], list(g[1:])
         gxs = [None if isid[i] else rest.pop(0) for i in range(len(self.xs))]
@@ -4228,15 +4541,37 @@ class _HGT(_Node):
         self.ids = self.ids_for = None
         self.type_ids, self.rel_ids = layer.type_ids, layer.rel_ids
         self.which = "noself" if self.rel_ids is None else ("noself", self.rel_ids)
+        self.layer, self.p_drop = layer, float(getattr(layer, "p_drop", 0.0))
 
     def _ids(self, gd, f):
         key = ("hgt", id(self), self.which)
         if key not in gd.cache:
             if len(f["rel"]) and f["rel"].max() >= self.R:
                 raise TrainError(f"hgt(relations={self.R}) got a graph with relation {int(f['rel'].max())}")
-            has_in = (np.bincount(f["dst"], minlength=gd.N) > 0).astype(np.float32)
+            if getattr(self.layer, "out_bias", "node") == "type":
+                has_in = self.layer.out_mask(self.net.graph, gd.N, f["dst"]).reshape(-1).astype(np.float32)
+            else:
+                has_in = (np.bincount(f["dst"], minlength=gd.N) > 0).astype(np.float32)
             gd.cache[key] = (gd._put(f["src"] * self.R + f["rel"]), gd._put(f["src"]), gd._put(has_in, np.float32))
         return gd.cache[key]
+
+    def _drop_f(self, name, v, n):
+        """Dropout of a branch while training: a mask kept for backward (the trainer's seed sequence)."""
+        if not (self.net.train and self.p_drop > 0):
+            return v
+        o = self.net.ops
+        y, m = self.buf(name, n), self.buf(name + "_m", n)
+        self.net.seed = (self.net.seed * 1103515245 + 12345) & 0x7FFFFFFF
+        o.drop_f(v, y, m, n, self.p_drop, self.net.seed)
+        return y
+
+    def _drop_b(self, name, dy, n):
+        if not (self.net.train and self.p_drop > 0):
+            return dy
+        o = self.net.ops
+        dx = self.gbuf(name + "_d", n)
+        o.mul3(dx, dy, self.buf(name + "_m", n), n)
+        return dx
 
     def fwd(self, x, shape):
         gd = _need_graph(self.net, "hgt")
@@ -4256,7 +4591,7 @@ class _HGT(_Node):
             o.gemm(k, self.rel.w, KR, N, hd, hd, d, 1, hd, 1, R * d, batch=(R, H), sa=(0, hd),
                    sb=(H * hd * hd, hd * hd), sc=(d, hd), passes=ps)
             msg = _EdgeAttention.fwd(self, f, q, KR, v, kidx, N, H, hd, vidx=vidx)
-            om = _diag(self, "om", self.lin["o"].fwd(msg, N, grp), hasin, N, d)
+            om = _diag(self, "om", self._drop_f("do", self.lin["o"].fwd(msg, N, grp), N * d), hasin, N, d)
             o.add3(x1, x, om, N * d)
         else:
             o.pull(x1, o, x, N * d)
@@ -4264,7 +4599,7 @@ class _HGT(_Node):
         if self.ffn is None:
             return x1, shape
         fo, _ = self.ffn.fwd(x1, shape)
-        fm = _diag(self, "fm", fo, grp.known_d, N, d)
+        fm = _diag(self, "fm", self._drop_f("df", fo, N * d), grp.known_d, N, d)
         y = self.buf("y", N * d)
         o.add3(y, x1, fm, N * d)
         return y, shape
@@ -4279,7 +4614,7 @@ class _HGT(_Node):
         else:
             dfm = _diag(self, "dfm", dy, grp.known_d, N, d, grad=True)
             dx1 = self.gbuf("dx1", N * d)
-            o.add3(dx1, dy, self.ffn.bwd(dfm, True), N * d)
+            o.add3(dx1, dy, self.ffn.bwd(self._drop_b("df", dfm, N * d), True), N * d)
         dx = self.gbuf("dx", N * d)
         if not self.E:
             dxn_parts = []
@@ -4287,7 +4622,7 @@ class _HGT(_Node):
             f, _ = gd.csr(self.which)
             kidx, vidx, hasin = self._ids(gd, f)
             dom = _diag(self, "dom", dx1, hasin, N, d, grad=True)
-            dmsg = self.lin["o"].bwd(dom, N)
+            dmsg = self.lin["o"].bwd(self._drop_b("do", dom, N * d), N)
             dq, dKR, dv = _EdgeAttention.bwd(self, f, self.q, kidx, dmsg, N, H, hd, N * R, vidx=vidx, vrows=N)
             dk = self.gbuf("dk", N * d)
             for r in range(R):                             # back through the relation transforms
@@ -4329,12 +4664,10 @@ class _GlobalAttention(_Node):
         if self.learned:
             self.ksw, self.ksb = net.param(p.ks_w), net.param(p.ks_b)
         self.T, self.type_ids = getattr(layer, "T", None), getattr(layer, "type_ids", None)
+        self.masked = self.T is not None
 
     def _own(self, N):
-        if self.T is None:
-            return np.ones(N, bool)
-        from .graphs import _owned_mask
-        return _owned_mask(self.net.graph, N, self.T, self.type_ids).reshape(-1)
+        return self.layer.own(self.net.graph, N).reshape(-1)
 
     def _gd(self, N):
         g = self.net.graph
@@ -4365,10 +4698,14 @@ class _GlobalAttention(_Node):
             s_, d_ = src[order], dst[order]
             E = len(s_)
             put = lambda name, a: _put_buf(self, name, a)              # noqa: E731
-            f = dict(col=put("e_col", s_), off=put("e_off", np.concatenate([[0], np.cumsum(np.bincount(
-                d_, minlength=N))])), row=put("e_row", d_), ids=put("e_ids", np.arange(E)),
-                eoff=put("e_eoff", np.arange(E + 1)), n=N, E=E, src=s_, dst=d_)
-            return gd, f, put("e_kid", s_)
+            ar = ("ga-arange", E)                          # 0..E: the same for every layer of this batch
+            if ar not in gd.cache:
+                gd.cache[ar] = gd._put(np.arange(E + 1))
+            col = put("e_col", s_)                         # (the key of each edge is its column: one buffer)
+            f = dict(col=col, off=put("e_off", np.concatenate([[0], np.cumsum(np.bincount(
+                d_, minlength=N))])), row=put("e_row", d_), ids=gd.cache[ar], eoff=gd.cache[ar], n=N, E=E, src=s_,
+                dst=d_, cached=False)
+            return gd, f, col
         f = gd.custom(("global", self.max_keys, self.type_ids), src, dst)
         ck = ("ga", self.max_keys, self.type_ids)
         if ck not in gd.cache:
@@ -4396,27 +4733,47 @@ class _GlobalAttention(_Node):
             self.VR = VR
             VR = _diag(self, "vrs", VR, self.s2, N, I)
         gd, f, kid = self._edges(N, score)
-        self.f, self.kid, self.q = f, kid, q
-        self.msg = _EdgeAttention.fwd(self, f, q, KR, VR, kid, N, H, hd)
+        self.f, self.kid, self.q, self.gdv = f, kid, q, gd
+        self.KR, self.VRs = KR, VR
+        # lean edge attention: nothing per edge is kept between forward and backward (the scores and weights are
+        # made again in backward, in buffers every global_attention layer shares), and the keys / values are read
+        # through their row ids instead of being copied per edge: memory grows with the nodes, not nodes x keys
+        self.msg = self.buf("msg", N * I)
+        for c in self._chunks(f, N, H):                    # rows in pieces: per-edge buffers of one piece at a time
+            al = self._scores(c, kid, q, KR, H, hd)
+            o.spmm(VR, _ofs(kid, c.e0), al, None, c.off, _ofs(self.msg, c.r0 * I), c.n, H, hd)
         y = self.buf("y", N * d)
-        if self.T is None:
+        self.dropping = self.net.train and float(getattr(self.layer, "p_drop", 0.0)) > 0
+        if not self.masked and not self.dropping:
             o.gemm(self.msg, self.Wo.w, y, N, d, I, I, 1, d, 1, d, bias=self.bo.w, passes=ps, epi=3, X2=x)
         else:
-            self.own = _put_buf(self, "own", self._own(N), np.float32)
             dl = self.buf("dl", N * d)
             o.gemm(self.msg, self.Wo.w, dl, N, d, I, I, 1, d, 1, d, bias=self.bo.w, passes=ps)
-            o.add3(y, x, _diag(self, "dlm", dl, self.own, N, d), N * d)
+            if self.dropping:                              # dropout of the layer's output (a mask kept for backward)
+                dd_, self.dmask = self.buf("dld", N * d), self.buf("dlmask", N * d)
+                self.net.seed = (self.net.seed * 1103515245 + 12345) & 0x7FFFFFFF
+                o.drop_f(dl, dd_, self.dmask, N * d, float(self.layer.p_drop), self.net.seed)
+                dl = dd_
+            if not self.masked:
+                o.add3(y, x, dl, N * d)
+            else:
+                self.own = _put_buf(self, "own", self._own(N), np.float32)
+                o.add3(y, x, _diag(self, "dlm", dl, self.own, N, d), N * d)
         return y, shape
 
     def bwd(self, dy, need_dx=True):
         o, ps = self.net.ops, self.net.passes
         N, d, H, hd, I = self.N, self.d, self.H, self.hd, self.inner
         f, kid = self.f, self.kid
-        dd = dy if self.T is None else _diag(self, "ddl", dy, self.own, N, d, grad=True)
+        dd = dy if not self.masked else _diag(self, "ddl", dy, self.own, N, d, grad=True)
+        if self.dropping:
+            dm_ = self.gbuf("ddrop", N * d)
+            o.mul3(dm_, dd, self.dmask, N * d)
+            dd = dm_
         o.gemm(self.msg, dd, self.Wo.g, I, d, N, 1, I, d, 1, d, beta=True, passes=ps, db=self.bo.g)
         dmsg = self.gbuf("dmsg", N * I)
         o.gemm(dd, self.Wo.w, dmsg, N, I, d, d, 1, 1, d, I, passes=ps)
-        dq, dK, dV = _EdgeAttention.bwd(self, f, self.q, kid, dmsg, N, H, hd, N)
+        dq, dK, dV = self._lean_bwd(f, kid, dmsg, N, H, hd)
         dh = self.gbuf("dh", N * d)
         if self.learned:                                   # v = v_raw 2 sigmoid(s): back to v_raw and to s
             dvs = self.gbuf("dvs", max(1, N))
@@ -4435,6 +4792,93 @@ class _GlobalAttention(_Node):
         if self.learned:
             o.gemm(dsc, self.ksw.w, dh, N, d, 1, 1, 1, 1, 1, d, beta=True, passes=3)
         return self.n.bwd(dh, True, residual=dy)
+
+    class _Piece:
+        __slots__ = ("r0", "n", "e0", "E", "off", "k0", "nk", "krow", "kperm", "koff")
+
+    def _chunks(self, f, N, H):
+        """The edges in pieces of whole rows (targets), each with its rows' offsets and its edges grouped by key (for
+        the keys' and values' gradients without a copy per edge): the per-edge buffers (scores, weights and their
+        gradients) hold one piece, not every edge. APSI_GA_PIECE: the largest piece, in edges x heads."""
+        budget = max(1, int(os.environ.get("APSI_GA_PIECE", str(1 << 24))) // max(H, 1))
+        key = ("ga_pieces", id(f), budget)
+        cached = f.get("cached", True)
+        hit = self.gdv.cache.get(key) if cached else None
+        if hit is not None and hit[0] is f:
+            return hit[1]
+        s_, d_ = np.asarray(f["src"], np.int64), np.asarray(f["dst"], np.int64)
+        offh = np.concatenate([[0], np.cumsum(np.bincount(d_, minlength=N))]).astype(np.int64)
+        spans, r0 = [], 0
+        while r0 < N:
+            r1 = int(np.searchsorted(offh, offh[r0] + budget, side="right")) - 1
+            r1 = min(N, max(r1, r0 + 1))
+            spans.append((r0, r1))
+            r0 = r1
+        offs, krows, kperms, koffs, meta = [], [], [], [], []
+        po = pk = 0
+        for r0, r1 in spans:
+            e0, e1 = int(offh[r0]), int(offh[r1])
+            ks = s_[e0:e1]
+            k0 = int(ks.min()) if e1 > e0 else 0
+            nk = (int(ks.max()) - k0 + 1) if e1 > e0 else 0
+            perm = np.argsort(ks, kind="stable")
+            offs.append(offh[r0:r1 + 1] - e0)
+            krows.append(d_[e0:e1][perm])
+            kperms.append(perm)
+            koffs.append(np.concatenate([[0], np.cumsum(np.bincount(ks - k0, minlength=nk))]) if nk else
+                         np.zeros(1, np.int64))
+            meta.append((r0, r1 - r0, e0, e1 - e0, po, k0, nk, pk))
+            po += r1 - r0 + 1
+            pk += nk + 1 if nk else 1
+        cat = lambda xs: np.concatenate(xs) if xs else np.zeros(1, np.int64)    # noqa: E731
+        if cached:
+            put = self.gdv._put
+            OFF, KROW, KPERM, KOFF = (put(cat(offs)), put(cat(krows)), put(cat(kperms)), put(cat(koffs)))
+        else:
+            put = lambda name, a: _put_buf(self, name, a)                     # noqa: E731
+            OFF, KROW, KPERM, KOFF = (put("p_off", cat(offs)), put("p_krow", cat(krows)),
+                                      put("p_kperm", cat(kperms)), put("p_koff", cat(koffs)))
+        out = []
+        for r0, n, e0, E, po, k0, nk, pk in meta:
+            c = self._Piece()
+            c.r0, c.n, c.e0, c.E, c.k0, c.nk = r0, n, e0, E, k0, nk
+            c.off, c.krow, c.kperm, c.koff = _ofs(OFF, po), _ofs(KROW, e0), _ofs(KPERM, e0), _ofs(KOFF, pk)
+            out.append(c)
+        if cached:
+            self.gdv.cache[key] = (f, out)
+        return out
+
+    def _scores(self, c, kid, q, KR, H, hd):
+        """The attention weights of one piece's edges, in the shared buffer (made again in backward)."""
+        o, E = self.net.ops, c.E
+        sc = self.net.arena.get(("shared", "ga_sc"), max(1, E * H))
+        al = self.net.arena.get(("shared", "ga_al"), max(1, E * H))
+        o.edge_dot(q, KR, _ofs(self.f["row"], c.e0), _ofs(kid, c.e0), sc, E, H, hd)   # q[target] . k[key]
+        o.axpy(sc, sc, E * H, 1.0 / math.sqrt(hd) - 1.0)
+        o.seg_softmax(sc, c.off, al, c.n, H, 1.0)
+        self._sc = sc
+        return al
+
+    def _lean_bwd(self, f, kid, dmsg, N, H, hd):
+        o = self.net.ops
+        I = H * hd
+        dq = self.gbuf("dq", N * I)
+        dK, dV = self.gbuf("dkr", N * I), self.gbuf("dvr", N * I)
+        o.fill(dK, N * I, 0.0)
+        o.fill(dV, N * I, 0.0)
+        for c in self._chunks(f, N, H):
+            E = c.E
+            al = self._scores(c, kid, self.q, self.KR, H, hd)             # the forward's weights, made again
+            dal = self.net.arena.get(("shared", "ga_dal"), max(1, E * H))
+            o.edge_dot(dmsg, self.VRs, _ofs(f["row"], c.e0), _ofs(kid, c.e0), dal, E, H, hd)
+            ds = self.net.arena.get(("shared", "ga_ds"), max(1, E * H))
+            o.seg_softmax_b(self._sc, al, dal, c.off, ds, c.n, H, 1.0)
+            o.axpy(ds, ds, E * H, 1.0 / math.sqrt(hd) - 1.0)
+            o.spmm(self.KR, _ofs(kid, c.e0), ds, None, c.off, _ofs(dq, c.r0 * I), c.n, H, hd)
+            if c.nk:                                       # the keys of this piece: their gradients added
+                o.spmm(self.q, c.krow, ds, c.kperm, c.koff, _ofs(dK, c.k0 * I), c.nk, H, hd, add=True)
+                o.spmm(dmsg, c.krow, al, c.kperm, c.koff, _ofs(dV, c.k0 * I), c.nk, H, hd, add=True)
+        return dq, dK, dV
 
     def n_ids(self, N):
         gd = self.net.gdev
@@ -4538,6 +4982,8 @@ class _GraphMemory(_Node):
         g = self.net.graph
         batch = np.asarray(g.batch, np.int64) if g is not None else np.zeros(N, np.int64)
         G = int(batch.max()) + 1 if N else 0
+        lead = getattr(g, "leading", None) if g is not None else None
+        G = min(G, int(lead)) if lead is not None else G                   # graph(leading=n): the first n only
         sc = self.buf("sc", max(1, N))
         o.gemm(x, self.w.w, sc, N, 1, d, d, 1, 1, 1, 1, bias=self.b.w, passes=3)
         raw = o.get(sc[0], N, sc[1]).astype(np.float64)
@@ -4583,6 +5029,51 @@ class _GraphMemory(_Node):
         return dx
 
 
+class _PickRows(_Node):
+    """pick_rows: the rows named by the batch's graph (graph.picks[name]) gathered in one sparse product; their
+    gradient added back to the picked rows the same way (a row picked twice gets both)."""
+
+    def __init__(self, net, key, layer):
+        super().__init__(net, key)
+        self.layer = layer
+
+    def fwd(self, x, shape):
+        N, F = _rows(shape), int(shape[-1])
+        sel = self.layer.rows(self.net.graph)
+        self.empty = not len(sel)
+        if self.empty:                                   # nothing picked: one row of zeros (as NumPy), no gradient
+            self.N, self.R, self.F = N, 1, F
+            y = self.buf("y", F)
+            self.net.ops.fill(y, F, 0.0)
+            return y, (1, F)
+        R = len(sel)
+        order = np.argsort(sel, kind="stable")
+        put = lambda name, a, dt=np.int32: _put_buf(self, name, a, dt)   # noqa: E731
+        self.sel = put("sel", sel)
+        self.ids = put("ids", np.arange(R + 1))
+        self.tcol = put("tcol", order)
+        self.toff = put("toff", np.concatenate([[0], np.cumsum(np.bincount(sel, minlength=N))]))
+        self.N, self.R, self.F = N, R, F
+        y = self.buf("y", max(1, R * F))
+        self.net.ops.spmm(x, self.sel, None, None, self.ids, y, R, 1, F)
+        return y, (R, F)
+
+    def bwd(self, dy, need_dx=True):
+        if not need_dx:
+            return None
+        dx = self.gbuf("dx", self.N * self.F)
+        if self.empty:
+            self.net.ops.fill(dx, self.N * self.F, 0.0)
+            return dx
+        self.net.ops.spmm(dy, self.tcol, None, None, self.toff, dx, self.N, 1, self.F)
+        return dx
+
+
+def aops_raw(v):
+    from . import ops as aops
+    return aops.raw(v)
+
+
 def _put_buf(node, name, a, dtype=np.int32, grad=False):
     a = np.ascontiguousarray(np.asarray(a).astype(dtype).reshape(-1))
     b = (node.gbuf if grad else node.buf)(name, max(1, a.size))
@@ -4614,6 +5105,69 @@ class _GraphPool(_Node):
         dx = self.gbuf("dx", self.M * self.D)
         self.net.ops.spmm(dy, t["col"], f["val"], t["vperm"] if f["val"] is not None else None, t["off"], dx,
                           self.M, 1, self.D)
+        return dx
+
+
+class _KernelLayer(_Node):
+    """gpu_layer: your own @gpu kernels called on the trainer's buffers, on the card, with no copy (the processor
+    runs them on the emulator). Each call waits for the trainer's work first; a kernel the card cannot run falls back
+    to the processor and its results are written back to the card."""
+
+    def __init__(self, net, key, layer, p):
+        super().__init__(net, key)
+        self.layer = layer
+        self.ps = [net.param(a) for a in layer.params_of(p)]
+
+    def _view(self, v, shape):
+        o = self.net.ops
+        n = int(np.prod(shape)) if shape else 1
+        dev = getattr(getattr(o, "dev", None), "activate", None) and o.dev
+        if not dev:                                       # the emulator: the buffer itself
+            return o.v(v, n).reshape(shape)
+        from .native.gpu import GpuArray
+        return GpuArray.on_device(dev, o.p(v)[1], shape, np.float32)
+
+    def _call(self, fn, views):
+        o = self.net.ops
+        o.sync()                                          # the trainer's kernels first
+        try:
+            fn(*views)
+        except TrainError:
+            raise
+        except Exception as e:                            # noqa: BLE001
+            raise TrainError(f"gpu_layer '{self.layer.name}': {type(e).__name__}: {e}") from None
+        for v in views:                                   # fell back to the processor: its results to the card
+            if hasattr(v, "dev_ok") and not v.dev_ok:
+                v.device_ptr()
+        if hasattr(o, "dev"):
+            o.dev.sync()
+
+    def fwd(self, x, shape):
+        self.x, self.shape = x, tuple(shape)
+        ys = self.ys = self.layer.out_shape(shape)
+        y = self.y = self.buf("y", int(np.prod(ys)))
+        self._call(self.layer.forward, [self._view(x, self.shape), self._view(y, ys)] +
+                   [self._view(p.w, p.shape) for p in self.ps])
+        return y, ys
+
+    def bwd(self, dy, need_dx=True):
+        if self.layer.backward is None:
+            raise TrainError(f"gpu_layer '{self.layer.name}': give backward= to train it")
+        o = self.net.ops
+        n = int(np.prod(self.shape))
+        dx = self.gbuf("dx", n)
+        o.fill(dx, n, 0.0)
+        dps = []
+        for i, p in enumerate(self.ps):
+            b = self.gbuf(f"dp{i}", p.n)
+            o.fill(b, p.n, 0.0)
+            dps.append(b)
+        self._call(self.layer.backward,
+                   [self._view(self.x, self.shape), self._view(self.y, self.ys), self._view(dy, self.ys),
+                    self._view(dx, self.shape)] + [self._view(p.w, p.shape) for p in self.ps] +
+                   [self._view(b, p.shape) for b, p in zip(dps, self.ps)])
+        for b, p in zip(dps, self.ps):
+            o.axpy(p.g, b, p.n, 1.0)
         return dx
 
 
@@ -4664,15 +5218,86 @@ class _SwiGLU(_Node):
         return dx
 
 
+def _leaf_paths(tree, pre=""):
+    """The dotted path of every array leaf, in tree_leaves order."""
+    from .values import Record
+    if isinstance(tree, Record):
+        items = tree.fields.items()
+    elif isinstance(tree, dict):
+        items = tree.items()
+    elif isinstance(tree, (list, tuple)):
+        items = ((str(i), v) for i, v in enumerate(tree))
+    else:
+        return [pre.rstrip(".")] if isinstance(tree, np.ndarray) else []
+    out = []
+    for k, v in items:
+        out += _leaf_paths(v, f"{pre}{k}.")
+    return out
+
+
+def _param_groups(groups, params, leaves):
+    """Parameter groups (each its own learning rate, betas, eps, weight decay and clipping): a list of records with
+    params = names of parts (a leaf belongs to the first group with a name equal to its path or a prefix of it at a
+    dot; "*" = every leaf no other group takes), and any of lr, b1, b2, eps, weight_decay, clip, decay ("matrices",
+    the default, "all", "none" or a list of the parts that decay), every ("step", the default, or "batch": the group
+    takes its own optimizer step after every batch, on that batch's gradient alone, as a part trained by its own
+    optimizer would) and no_decay (substrings of a path that take a weight out of decay). Leaves of no group
+    form group 0 with the optimizer's own settings."""
+    if not groups:
+        return None
+    from .values import Record
+    specs = []
+    for g in groups:
+        d = dict(g.fields) if isinstance(g, Record) else dict(g)
+        names = d.get("params", "*")
+        names = [names] if isinstance(names, str) else list(names)
+        dec = d.get("decay", "matrices")
+        dec = str(dec) if isinstance(dec, str) else [str(x) for x in dec]
+        specs.append(dict(names=[str(x) for x in names], lr=d.get("lr"), b1=d.get("b1"), b2=d.get("b2"),
+                          eps=d.get("eps"), weight_decay=d.get("weight_decay"), clip=d.get("clip"),
+                          decay=dec, no_decay=[str(x) for x in d.get("no_decay", [])],
+                          every=str(d.get("every", "step"))))
+    paths = _leaf_paths(params)
+    if len(paths) != len(leaves):
+        raise TrainError("parameter groups: the parameter tree has leaves that are not arrays")
+    gid, decay = [], []
+    for path, a in zip(paths, leaves):
+        g_, rest = 0, None
+        for j, sp in enumerate(specs):
+            if "*" in sp["names"] and rest is None:
+                rest = j + 1
+            if any(path == nm or path.startswith(nm + ".") for nm in sp["names"] if nm != "*"):
+                g_ = j + 1
+                break
+        if g_ == 0 and rest is not None:
+            g_ = rest
+        sp = specs[g_ - 1] if g_ else None
+        how = "matrices" if sp is None else sp["decay"]
+        if isinstance(how, list):                        # exactly these parts decay
+            dec = any(path == nm or path.startswith(nm + ".") for nm in how)
+        else:
+            dec = {"all": True, "none": False}.get(how, a.ndim >= 2)
+        if sp is not None and any(h in path.lower() for h in sp["no_decay"]):
+            dec = False
+        gid.append(g_)
+        decay.append(dec)
+    return dict(specs=specs, gid=gid, decay=decay)
+
+
 class Net:
     """A model compiled for the device: parameters in one flat array, a tree of nodes."""
 
-    def __init__(self, ops, model, params, precision="auto", graph=None):
+    def __init__(self, ops, model, params, precision="auto", graph=None, recompute=None, groups=None):
         from . import lowbit
         self.ops = ops
         self.graph, self.gdev, self.gkeep = graph, None, {}
         self.arena = _Arena(ops)
         self.garena = self.arena                        # the backward pass's buffers (the same arena on one card)
+        self.recompute = _recompute_mode(recompute, ops)
+        self.ck, self._in_ck, self._planned = [], False, False
+        self._ck_arena = self._ck_garena = _SharedArena(self.arena)
+        self.mem_fixed, self.size_ratio = None, 1.0
+        self._size0, self._plan_used = None, None       # the first trained batch's size, the memory then in use
         self.owned = []
         self.train = True
         self.seed = 12345
@@ -4680,28 +5305,59 @@ class Net:
         self.kind = lowbit.parse(prec) if prec not in PRECISIONS else None
         self.passes = 3 if prec == "fp32" else 1
         leaves = [a for a in tree_leaves(params) if isinstance(a, np.ndarray)]
-        # matrices first (weight decay and low-bit rounding apply to them), then vectors
-        order = sorted(range(len(leaves)), key=lambda i: leaves[i].ndim < 2)
-        self.offsets, off = {}, 0
+        # matrices first (weight decay and low-bit rounding apply to them), then vectors; with parameter groups,
+        # group by group, each with its decayed weights first
+        self.groups = _param_groups(groups, params, leaves)
+        if self.groups is None:
+            gid, decay = [0] * len(leaves), [a.ndim >= 2 for a in leaves]
+        else:
+            gid, decay = self.groups["gid"], self.groups["decay"]
+        order = sorted(range(len(leaves)), key=lambda i: (gid[i], not decay[i]))
+        # every matrix starts at a multiple of 8 elements (32 bytes): the tiled and bfloat16 products need aligned
+        # operands, and one matrix of an odd size (a 66 x 1 head, say) would otherwise misalign all that follow
+        self.offsets, off, self.n_decay = {}, 0, 0
+        seg = {}                                         # group -> [start, decayed end, end]
         for i in order:
+            off = -(-off // 8) * 8                       # every parameter starts on a 32-byte boundary
+            sg = seg.setdefault(gid[i], [off, off, off])
             self.offsets[id(leaves[i])] = off
             off += leaves[i].size
-        self.n = off
-        self.n_decay = sum(a.size for a in leaves if a.ndim >= 2)
+            sg[2] = off
+            if decay[i]:
+                sg[1] = -(-off // 8) * 8
+                self.n_decay = sg[1]                     # the matrices (weight decay, low bit) end here
+        self.n = max(off, self.n_decay)
+        if self.groups is not None:
+            if lowbit.parse(resolve_precision(precision)) if resolve_precision(precision) not in PRECISIONS else None:
+                raise TrainError("parameter groups do not work with low-bit training (precision=...)")
+            ks = sorted(seg)
+            self.segments = []                           # [start, length, decayed length, group]
+            for j, g_ in enumerate(ks):
+                a_, d_, e_ = seg[g_]
+                e_ = (seg[ks[j + 1]][0] if j + 1 < len(ks) else self.n)
+                self.segments.append([a_, e_ - a_, max(0, min(d_, e_) - a_), g_])
+        else:
+            self.segments = None
         self.leaves, self.params_tree = leaves, params
         self.P, self.G = ops.alloc(self.n), ops.alloc(self.n)
         if hasattr(ops, "weights_are"):
             ops.weights_are(self.P, self.n)
         # to the card in pieces of about 64 MB: the computer never holds a second whole copy of the model
-        piece, buf, start = 1 << 24, [], 0
+        piece, buf, start, pos = 1 << 24, [], 0, 0
         for i in order:
             a = leaves[i]
+            o_ = self.offsets[id(a)]
+            if o_ > pos:                                 # (the alignment gap: zeros)
+                buf.append(np.zeros(o_ - pos, np.float32))
             buf.append(np.asarray(a, np.float32).reshape(-1))
+            pos = o_ + a.size
             if sum(x.size for x in buf) >= piece or i == order[-1]:
                 chunk = np.concatenate(buf) if len(buf) > 1 else buf[0]
                 ops.put(self.P, chunk, start)
                 start += chunk.size
                 buf = []
+        if self.n > pos:
+            ops.fill((self.P, pos), self.n - pos, 0.0)
         self.mats = [(self.offsets[id(a)], a.shape) for a in leaves if a.ndim >= 2]
         self.qoff = {}
         if self.kind:
@@ -4727,7 +5383,28 @@ class Net:
         return _Param(self, a.shape, self.offsets[id(a)])
 
     def compile(self, layer, p, key, gk=None):
-        nd = self._compile(layer, p, key, gk or key)
+        gk = gk or key
+        from . import layers as L
+        forced = isinstance(layer, L.Checkpoint)         # checkpoint(layer): always recomputed
+        if forced:
+            if self._in_ck:
+                return self.compile(layer.inner, p, key, gk)
+            layer = layer.inner
+        if (forced or (self.recompute and _recomputable(layer))) and not self._in_ck:
+            self._in_ck = True
+            try:
+                inner = self._compile(layer, p, key + ".r", gk + ".r")
+            finally:
+                self._in_ck = False
+            if getattr(inner, "gkey", None) is None:
+                inner.gkey = gk + ".r"
+            if isinstance(inner, _HostLayer):
+                return inner
+            nd = _Recompute(self, key, inner, key + ".r", gk + ".r")
+            nd.gkey, nd.forced = gk, forced
+            self.ck.append(nd)
+            return nd
+        nd = self._compile(layer, p, key, gk)
         if getattr(nd, "gkey", None) is None:
             nd.gkey = gk or key
         return nd
@@ -4763,7 +5440,7 @@ class Net:
                     # of a transformer, written once and read by the products on both sides
                     if self.passes == 1 and not self.kind and _bf16_hidden() and \
                             getattr(self.ops, "bf16_hidden_ok", lambda: True)() and \
-                            a_.N % 4 == 0 and a_.K % 4 == 0 and b_.N % 4 == 0:
+                            a_.N % 4 == 0 and a_.K % 4 == 0 and b_.N % 4 == 0 and a_.act in KS.EPI_ACTS:
                         a_.bf = b_.bf_in = True
             return _Seq(self, key, nodes)
         if isinstance(layer, L.Linear):
@@ -4793,10 +5470,14 @@ class Net:
         if isinstance(layer, L.MultiHeadAttention) and (getattr(layer, "gate", None) is None or
                                                         not getattr(layer, "bias", True)):
             return _Attention(self, key, layer, p)
+        if isinstance(layer, L.GradScale):
+            return _GradScale(self, key, layer.alpha)
         if isinstance(layer, L.TiedOutput):
             return _TiedOutput(self, key, layer, self.dag_params)
         if isinstance(layer, L.SwiGLU):
             return _SwiGLU(self, key, layer, p)
+        if isinstance(layer, L.KernelLayer):
+            return _KernelLayer(self, key, layer, p)
         if isinstance(layer, L.MoE):
             return _MoE(self, key, layer, p)
         if isinstance(layer, L.DAG):
@@ -4836,6 +5517,8 @@ class Net:
             return _MixHop(self, key, layer, p)
         if isinstance(layer, GR.GraphMemory):
             return _GraphMemory(self, key, layer, p)
+        if isinstance(layer, GR.PickRows):
+            return _PickRows(self, key, layer)
         if isinstance(layer, GR.HGT):
             return _HGT(self, key, layer, p, gk)
         if isinstance(layer, GR.TypedLinear):
@@ -4873,6 +5556,74 @@ class Net:
 
     def backward(self, dy):
         self.root.bwd(dy, False)
+        if not self._planned:
+            self._planned = True
+            self.plan_recompute()
+
+    def plan_recompute(self):
+        """After the first backward pass (every recomputed layer measured): the layers whose activations fit in the
+        card's memory keep them, the last layers first (backward needs them first); the rest are recomputed. The
+        memory of the largest batch is what has to fit (size_ratio: its inputs over the first batch's)."""
+        if self.recompute != "auto" or not any(not nd.forced for nd in self.ck):
+            return
+        mem = getattr(getattr(self.ops, "dev", None), "memory", 0) or int(os.environ.get("APSI_GPU_MEMORY_MB", "0")) \
+            * 2 ** 20
+        if not mem:
+            return
+        frac = float(os.environ.get("APSI_GPU_MEMORY_TARGET", "0.85"))
+        fixed = self.mem_fixed if self.mem_fixed is not None else 0
+        if self._plan_used is None:
+            self._plan_used = self.ops.used
+        r = max(1.0, float(self.size_ratio))
+        room = frac * mem - (fixed + r * (self._plan_used - fixed))
+        live = 0
+        for nd in reversed(self.ck):
+            if nd.forced:
+                continue
+            need = r * nd.foot
+            if need <= room:
+                nd.live, room, live = True, room - need, live + 1
+        self.recompute_plan = (live, len(self.ck))
+        if live == len(self.ck):  # (no forced one either)                         # everything fits: the shared buffers go
+            for k in list(self._ck_arena.keys):
+                b = self.arena.bufs.pop(k, None)
+                if b is not None:
+                    self.ops.free(b)
+            self._ck_arena.keys = set()
+
+    def replan(self, ratio):
+        """A batch larger than any planned for (a batch made while training, a larger graph): the layers that keep
+        their activations are chosen again for it, the last layers first, and those that no longer fit are recomputed
+        from now on (their buffers go back to the card). Only ever fewer layers keep theirs, so the plan settles."""
+        if self.recompute != "auto" or not self._planned or self._plan_used is None:
+            return False
+        mem = getattr(getattr(self.ops, "dev", None), "memory", 0) or int(os.environ.get("APSI_GPU_MEMORY_MB", "0")) \
+            * 2 ** 20
+        if not mem:
+            return False
+        self.size_ratio = r = max(float(self.size_ratio), float(ratio))
+        frac = float(os.environ.get("APSI_GPU_MEMORY_TARGET", "0.85"))
+        fixed = self.mem_fixed if self.mem_fixed is not None else 0
+        room = frac * mem - (fixed + r * (self._plan_used - fixed))
+        dropped = []
+        for nd in reversed(self.ck):
+            if nd.forced or not nd.live:
+                continue
+            need = r * nd.foot
+            if need <= room:
+                room -= need
+            else:
+                nd.live = False
+                dropped.append(nd)
+        for nd in dropped:                               # its own buffers: the shared ones serve it from now on
+            for k in list(self.arena.bufs.keys()):
+                if isinstance(k, tuple) and k and isinstance(k[0], str) and (
+                        k[0] == nd.prefix or k[0].startswith(nd.prefix + ".") or
+                        (k[0] == "g" and len(k) > 1 and isinstance(k[1], str) and
+                         (k[1] == nd.gprefix or k[1].startswith(nd.gprefix + ".")))):
+                    self.ops.free(self.arena.bufs.pop(k))
+        self.recompute_plan = (sum(1 for nd in self.ck if nd.live), len(self.ck))
+        return bool(dropped)
 
     def set_graph(self, g, keep=False):
         """Another graph for the next steps (a batch of graphs): its forms on the card are made when needed. keep:
@@ -4920,6 +5671,27 @@ class Net:
             return a
         return tree_map(back, self.params_tree)
 
+    def set_params(self, tree, only=None):
+        """Write weights back onto the card mid-training: the leaves of `tree` (same layout as the model's) whose
+        dotted path starts with one of `only` (every leaf when only is None)."""
+        from .models import _flatten
+        mine, new = _flatten(self.params_tree), _flatten(tree)
+        pre = None if only is None else [str(o) for o in only]
+        wrote = 0
+        for k, a in mine.items():
+            if pre is not None and not any(k == o or k.startswith(o + ".") for o in pre):
+                continue
+            if k not in new or not isinstance(a, np.ndarray) or id(a) not in self.offsets:
+                continue
+            v = np.asarray(aops_raw(new[k]), np.float32).reshape(-1)
+            if v.size != a.size:
+                raise TrainError(f"set_params: {k} has {v.size} values, the model {a.size}")
+            self.ops.put(self.P, v, self.offsets[id(a)])
+            wrote += v.size
+        if wrote and hasattr(self.ops, "refresh_w16"):
+            self.ops.refresh_w16()
+        return wrote
+
     def close(self):
         self.arena.close()
         self.clear_graphs()
@@ -4961,6 +5733,16 @@ def _inputs(X, ids):
     return np.ascontiguousarray(a.astype(np.float32))
 
 
+_STEP_END = object()                                   # (a made list of batches that ends the step)
+
+
+def _is_later(item):
+    """A batch made only when training reaches it: record(later=fn [, end_step=true]); fn() -> a list of batches
+    (with the weights as they are at that moment, through training_params())."""
+    from .values import Record as _R
+    return isinstance(item, _R) and "later" in item.fields
+
+
 def _batch_parts(item):
     """(inputs, targets, graph) of one batch given as (inputs, targets) or (inputs, targets, graph) or a record."""
     if hasattr(item, "inputs") or hasattr(item, "x"):
@@ -4989,7 +5771,7 @@ def _raw_of(a):
 def fit_batches(model, params, batches, loss="cross_entropy", opt=None, epochs=1, verbose=True, clip=None,
                 schedule=None, device="cuda", precision="auto", ops=None, compensated=None, every=None,
                 accumulate=1, stages=None, freeze=None, train_only=None, exact_sums=None, steps=None,
-                checkpoint=None, save_every=None, resume=True, callback=None):
+                checkpoint=None, save_every=None, resume=True, callback=None, recompute=None, groups=None, state=None):
     """Train on batches that each bring their own shapes: batches is a list of (inputs, targets[, graph]) or a
     function epoch -> such a list. inputs may be a list (a dag with several inputs: token ids, node features, ...);
     each batch may have its own graph (a batch of graphs), its own number of rows and its own lengths. One card."""
@@ -5021,15 +5803,22 @@ def fit_batches(model, params, batches, loss="cross_entropy", opt=None, epochs=1
     adam = isinstance(opt, Adam)
     wd = float(getattr(opt, "wd", 0.0)) if isinstance(opt, AdamW) else 0.0
     E = int(epochs)
-    net = Net(ops, model, params, precision)
+    net = Net(ops, model, params, precision, recompute=recompute, groups=groups)
+    if net.segments and not (adam and native_opt(opt)):
+        raise TrainError("parameter groups= need adam() or adamw()")
     n = net.n
-    st1, st2, SQ = ops.alloc(n), (ops.alloc(n) if adam else None), ops.alloc(1)
+    m16 = adam and str(getattr(opt, "state", "fp32")).lower() in ("bf16", "bfloat16")
+    if m16:                                              # the moments in bfloat16 (stochastic rounding): half the memory
+        st1, st2 = ops.alloc16(n), ops.alloc16(n)
+    else:
+        st1, st2 = ops.alloc(n), (ops.alloc(n) if adam else None)
+    SQ = ops.alloc(1)
     COMP = ops.alloc(n) if _want_comp(compensated, params, precision) else None
     LOSS1 = ops.alloc(1)
     LOSSB = None                                         # each batch's loss, read once an epoch (no wait a batch)
     for b_ in (st1, st2, COMP):
         if b_ is not None:
-            ops.fill((b_, 0), n, 0.0)
+            ops.fill((b_, 0), (n + 1) // 2 if isinstance(b_, Buf16) else n, 0.0)
     ops.fill((net.G, 0), n, 0.0)
     history, t, step = [], int(getattr(opt, "t", 0)), 0
     every = int(every or max(1, E // 10))
@@ -5042,19 +5831,26 @@ def fit_batches(model, params, batches, loss="cross_entropy", opt=None, epochs=1
     net.exact = EXACT
     want = int(steps) if steps else None                 # a number of optimizer steps instead of epochs
     start_ep, skip = 0, 0
+    CKPT_STATE[0] = state
     if checkpoint and resume and os.path.exists(str(checkpoint)):
-        t, step, start_ep, skip = _ckpt_load(str(checkpoint), ops, net, st1, st2, COMP)
+        t, step, start_ep, skip = _ckpt_load(str(checkpoint), ops, net, st1, st2, COMP, model)
         opt.t = t
         if verbose:
             print(f"resumed from {checkpoint}: step {step}, epoch {start_ep}, batch {skip}")
     last = start_ep + E if want is None else 1 << 30
     pos = [start_ep, skip]                               # where the next step starts (epoch, batch)
+    net.mem_fixed = ops.used                             # weights, gradients, the optimizer: before any activation
 
     def saved():
-        _ckpt_save(str(checkpoint), ops, net, st1, st2, COMP, t, step, pos[0], pos[1])
+        _ckpt_save(str(checkpoint), ops, net, st1, st2, COMP, t, step, pos[0], pos[1], model)
+
+    step0 = step
+    LIVE.append(_Live(lambda: net.params(), lambda tree, only=None: net.set_params(tree, only)))
 
     def after_step(ep_, bi_):                            # True: stop here (steps reached)
         pos[0], pos[1] = ep_, bi_ + 1
+        if verbose and step == step0 + 2:                 # the second step runs with the plan the first one made
+            _say_memory(ops, net)
         if checkpoint and save_every and step % int(save_every) == 0:
             saved()
         return want is not None and step >= want
@@ -5066,6 +5862,8 @@ def fit_batches(model, params, batches, loss="cross_entropy", opt=None, epochs=1
             items = list(batches(ep) if callable(batches) else batches)
             if not items:
                 raise TrainError("no batches")
+            if not net._planned and net.recompute == "auto":
+                net.size_ratio = _size_ratio(items, skip if ep == start_ep else 0)
             tot, rows_all = 0.0, 0
             if LOSSB is None or LOSSB.n < len(items):
                 if LOSSB is not None:
@@ -5074,18 +5872,57 @@ def fit_batches(model, params, batches, loss="cross_entropy", opt=None, epochs=1
             ops.fill((LOSSB, 0), len(items), 0.0)
             on_card = []                                 # the batches whose loss is in LOSSB
             A = max(1, int(accumulate or 1))
+            VAR = accumulate is not None and int(accumulate) == 0
             want_forms = locals().get("want_forms") or []
-            for bi, item in enumerate(items):
+            items = list(items)
+            bi = -1
+            while True:
+                bi += 1
+                if bi >= len(items):
+                    break
+                item = items[bi]
                 if ep == start_ep and bi < skip:             # resumed: these batches were already trained on
                     continue
-                group = min(A, len(items) - (bi // A) * A)       # the batches of this step
+                if _is_later(item):                          # made now, with the weights as they are at this point
+                    made = list(item.later() or [])
+                    if bool(getattr(item, "end_step", False)):
+                        made.append(_STEP_END)
+                    items[bi:bi + 1] = made
+                    if LOSSB.n < len(items):
+                        old_b = LOSSB
+                        LOSSB = ops.alloc(len(items))
+                        ops.fill((LOSSB, 0), len(items), 0.0)
+                        if on_card:
+                            vals = ops.get(old_b, old_b.n)
+                            ops.put(LOSSB, np.asarray(vals, np.float32), 0)
+                        ops.free(old_b)
+                    bi -= 1
+                    continue
+                if item is _STEP_END:                         # a made batch list that ends the step
+                    t, step = _apply_step(ops, net, opt, adam, wd, clip, schedule, step, t, st1, st2, SQ, COMP, n)
+                    if after_step(ep, bi):
+                        stop = True
+                        break
+                    continue
                 X, Y, g = _batch_parts(item)
+                if net.recompute == "auto":                 # a batch larger than the plan was made for: plan again
+                    sz = _batch_size(item)
+                    if net._size0 is None:
+                        net._size0 = sz
+                    elif net._planned and sz is not None and net._size0 is not None:
+                        rr = _ratio_of(sz, net._size0)
+                        if rr > float(net.size_ratio) * 1.02:
+                            net.replan(rr)
+                if VAR:                                     # steps of their own length (accumulate=0)
+                    group = max(1, int(getattr(Y, "step_items", 1)))
+                else:
+                    group = min(A, len(items) - (bi // A) * A)       # the batches of this step
                 multi = isinstance(X, (list, tuple))
                 xs = [_as_input(a) for a in (X if multi else [X])]
                 if net.gdev is not None:                    # the forms the layers asked of the last graph
                     want_forms = [k for k in net.gdev.cache if k[0] in ("csr", "pool")] or want_forms
                 net.set_graph(g)
-                if want_forms and bi + 1 < len(items):      # the next graph's, made meanwhile on another core
+                if want_forms and bi + 1 < len(items) and not _is_later(items[bi + 1]) and items[bi + 1] is not _STEP_END:
                     _prefetch_graph(_batch_parts(items[bi + 1])[2], want_forms)
                 net.train = True
                 net.round_weights()
@@ -5104,11 +5941,19 @@ def fit_batches(model, params, batches, loss="cross_entropy", opt=None, epochs=1
                         raise TrainError("a model with several outputs trains with a loss function of your own")
                     lv, dout = _multi_loss(ops, net, out, shape, loss_fn, Yr, group)
                     net.backward(dout)
+                    _sp = getattr(loss_fn, "on_card", None)
+                    _s = float(_sp[4](Yr)) if (_sp is not None and len(_sp) > 4) else 1.0
+                    if _s == 0:                          # (a batch of weight 0 takes no step of its own)
+                        _batch_group_clear(ops, net)
+                    elif not bool(getattr(Yr, "hold", False)):   # hold: its gradient joins the next batch's step
+                        _batch_group_step(ops, net, opt, wd, clip, float(aops.raw(schedule(step)))
+                                          if schedule is not None else float(opt.lr), st1, st2, COMP, group)
                     if EXACT is not None:                         # this batch's gradients, summed exactly
                         ops.acc2((EXACT[0], 0), (EXACT[1], 0), (net.G, 0), n)
                     tot += lv
                     rows_all += 1
-                    if (bi + 1) % A and bi + 1 < len(items):
+                    if (VAR and not bool(getattr(Y, "end_step", True))) or \
+                            (not VAR and (bi + 1) % A and bi + 1 < len(items)):
                         continue
                     t, step = _apply_step(ops, net, opt, adam, wd, clip, schedule, step, t, st1, st2, SQ, COMP, n)
                     if after_step(ep, bi):
@@ -5145,7 +5990,8 @@ def fit_batches(model, params, batches, loss="cross_entropy", opt=None, epochs=1
                 if lv is not None:
                     tot += lv
                 rows_all += 1
-                if (bi + 1) % A and bi + 1 < len(items):
+                if (VAR and not bool(getattr(Y, "end_step", True))) or \
+                        (not VAR and (bi + 1) % A and bi + 1 < len(items)):
                     continue                                 # gradients add up until the step's last batch
                 t, step = _apply_step(ops, net, opt, adam, wd, clip, schedule, step, t, st1, st2, SQ, COMP, n)
                 if after_step(ep, bi):
@@ -5157,11 +6003,13 @@ def fit_batches(model, params, batches, loss="cross_entropy", opt=None, epochs=1
                 lb = ops.get(LOSSB, len(items))
                 for i in on_card:
                     tot += float(lb[i])
+            if rows_all == 0:                            # (resumed after this epoch's last batch: nothing left)
+                continue
             history.append(tot / max(rows_all, 1))
             if callback is not None:
                 callback(Record(epoch=ep, step=step, loss=history[-1]))
             if verbose and (ep % every == 0 or ep == last - 1 or stop):
-                print(f"epoch {ep:4}  loss {history[-1]:.5f}  ({len(items)} batches, step {step}, GPU)")
+                print(f"epoch {ep:4}  loss {history[-1]:.5f}  ({rows_all} batches, step {step}, GPU)")
         opt.t = t
         out_params = net.params()
         if checkpoint:
@@ -5177,6 +6025,8 @@ def fit_batches(model, params, batches, loss="cross_entropy", opt=None, epochs=1
                 pass
         raise
     finally:
+        if LIVE:
+            LIVE.pop()
         for b_ in (st1, st2, SQ, COMP, LOSS1, LOSSB):
             if b_ is not None:
                 ops.free(b_)
@@ -5184,36 +6034,141 @@ def fit_batches(model, params, batches, loss="cross_entropy", opt=None, epochs=1
         for b_ in (EXACT or ()):
             ops.free(b_)
         net.close()
-    return Record(params=out_params, history=history, device=getattr(ops, "name", "?"))
+    return Record(params=out_params, history=history, device=getattr(ops, "name", "?"),
+                  gpu_memory_mb=round(getattr(ops, "peak", ops.used) / 2 ** 20),
+                  recomputed=sum(1 for nd in net.ck if not nd.live), blocks=len(net.ck))
 
 
-def _ckpt_save(path, ops, net, st1, st2, COMP, t, step, epoch, batch=0):
+class _Live:
+    """The weights of the training that is running, for code that runs between its steps (the batches function):
+    get() the current tree, set(tree, only) write some of it back."""
+
+    def __init__(self, get, put):
+        self.get, self.put = get, put
+
+
+LIVE = []                                              # a stack: the innermost training that is running
+
+
+def _say_memory(ops, net):
+    mem = getattr(getattr(ops, "dev", None), "memory", 0)
+    if not mem or not net.ck:
+        return
+    rc = sum(1 for nd in net.ck if not nd.live)
+    print(f"card memory: {getattr(ops, 'peak', ops.used) / 2 ** 30:.2f} of {mem / 2 ** 30:.1f} GB at the peak; "
+          f"{rc} of {len(net.ck)} blocks recomputed in backward")
+
+
+def _batch_size(it):
+    """A batch's size for the memory plan: the elements of each input and the graph's nodes (None: odd batches)."""
+    try:
+        X, _, g = _batch_parts(it)
+        xs = X if isinstance(X, (list, tuple)) else [X]
+        parts = [int(np.prod(np.shape(_raw_of(a)))) for a in xs]
+        if g is not None:
+            parts.append(int(np.asarray(getattr(g, "batch", ())).size))
+        return parts
+    except Exception:                                    # noqa: BLE001
+        return None
+
+
+def _ratio_of(s, f):
+    """How much larger batch size s is than f, by its largest part (1.0 when they do not compare)."""
+    if not s or not f or len(s) != len(f):
+        return 1.0
+    return max(s[i] / max(f[i], 1) for i in range(len(f)))
+
+
+def _size_ratio(items, first):
+    """How much larger the largest batch is than the first one trained on (inputs and graph nodes): the memory the
+    first step measured, scaled to the largest."""
+    try:
+        sizes = [_batch_size(it) for it in items if not _is_later(it) and it is not _STEP_END]
+        f = sizes[min(first, len(sizes) - 1)]
+        return max(_ratio_of(s_, f) for s_ in sizes)
+    except Exception:                                    # noqa: BLE001 - odd batches: no scaling
+        return 1.0
+
+
+def _layout_of(net):
+    """Where each weight sits in the flat array (offset and size, in tree order): a checkpoint is only read back
+    into the same layout."""
+    return np.array([[net.offsets[id(a)], a.size] for a in net.leaves], np.int64).reshape(-1, 2)
+
+
+def _extra_save(data, bt, state):
+    """What a resumed run needs besides the weights: the random generators, the step counts of the parameter groups
+    that step every batch, and the program's own state (state=record(get=fn() -> text, set=fn(text)))."""
+    import json
+    from . import ops as aops
+    data["RNG"] = np.frombuffer(json.dumps(aops._RNG[0].bit_generator.state).encode(), np.uint8)
+    if bt:
+        data["BT"] = np.array([[int(k), int(v)] for k, v in bt.items()], np.int64)
+    if state is not None:
+        data["XSTATE"] = np.frombuffer(str(state.get()).encode("utf-8"), np.uint8)
+
+
+def _extra_load(z, state):
+    """-> the parameter groups' step counts; puts back the random generators and the program's state."""
+    import json
+    from . import ops as aops
+    if "RNG" in z.files:
+        aops._RNG[0].bit_generator.state = json.loads(bytes(z["RNG"]).decode())
+    if state is not None and "XSTATE" in z.files:
+        state.set(bytes(z["XSTATE"]).decode("utf-8"))
+    return {int(k): int(v) for k, v in z["BT"]} if "BT" in z.files else {}
+
+
+CKPT_STATE = [None]                                   # the state= of the fit_batches that is running
+
+
+def _ckpt_save(path, ops, net, st1, st2, COMP, t, step, epoch, batch=0, model=None):
     """The flat weights, the optimizer's moments and the carried rounding error, written atomically."""
     n = net.n
-    data = {"P": ops.get(net.P, n), "meta": np.array([n, t, step, epoch, batch], np.int64)}
+    data = {"P": ops.get(net.P, n), "meta": np.array([n, t, step, epoch, batch], np.int64),
+            "layout": _layout_of(net)}
     for name, b_ in (("M", st1), ("V", st2), ("C", COMP)):
         if b_ is not None:
-            data[name] = ops.get(b_, n)
+            data[name] = ops.get16(b_, n) if isinstance(b_, Buf16) else ops.get(b_, n)
     master = getattr(net, "master", None)
     if master is not None:
         arrs = [np.asarray(a, np.float64).reshape(-1) for a in tree_leaves(master) if isinstance(a, np.ndarray)]
         data["P64"] = np.concatenate(arrs) if arrs else np.zeros(0)   # the float64 master copy, in tree order
+    if model is not None:
+        from .layers import state_arrays
+        data.update(state_arrays(model))                 # running statistics of stateful layers
+    _extra_save(data, net.__dict__.get("_bt"), CKPT_STATE[0])
     tmp = f"{path}.tmp.npz"
     np.savez(tmp, **data)
     os.replace(tmp, path)
 
 
-def _ckpt_load(path, ops, net, st1, st2, COMP):
+def _ckpt_load(path, ops, net, st1, st2, COMP, model=None):
     with np.load(path) as z:
+        net._bt = _extra_load(z, CKPT_STATE[0])
+        if model is not None:
+            from .layers import restore_state_arrays
+            restore_state_arrays(model, z)
         meta = [int(v) for v in z["meta"]] + [0]
         n, t, step, epoch, batch = meta[:5]
         if n != net.n:
             raise TrainError(f"the checkpoint {path} is of a model with {n:,} weights, this one has {net.n:,}: "
                              "a different model (delete the file or give another checkpoint=)")
+        if ("layout" in z.files and not np.array_equal(z["layout"], _layout_of(net))) or \
+                ("layout" not in z.files and getattr(net, "segments", None)):
+            raise TrainError(f"the checkpoint {path} keeps its weights in another order (another model, other "
+                             "parameter groups= or an older Apsi): delete the file or give another checkpoint=")
         ops.put(net.P, z["P"].astype(np.float32))
         for name, b_ in (("M", st1), ("V", st2), ("C", COMP)):
             if b_ is not None and name in z.files:
-                ops.put(b_, z[name].astype(np.float32))
+                a = z[name]
+                if isinstance(b_, Buf16):                # bfloat16 moments: their bits (from float32 values: rounded)
+                    ops.put16(b_, a if a.dtype == np.uint16 else
+                              (np.asarray(a, np.float32).view(np.uint32) + np.uint32(0x7FFF) +
+                               ((np.asarray(a, np.float32).view(np.uint32) >> np.uint32(16)) & np.uint32(1))
+                               >> np.uint32(16)).astype(np.uint16))
+                else:
+                    ops.put(b_, (widen_bf16(a) if a.dtype == np.uint16 else a).astype(np.float32))
         if "P64" in z.files:
             flat = z["P64"]
             leaves, off = [], 0
@@ -5239,7 +6194,9 @@ def _multi_loss(ops, net, outs, shapes, loss_fn, Yr, group, arena=None):
     douts, fn, card, lossv = [None] * len(outs), loss_fn, set(), None
     spec = getattr(loss_fn, "on_card", None)
     if spec is not None:
-        i_ce, labels_of, rest = spec
+        i_ce, labels_of, rest = spec[:3]
+        weights_of = spec[3] if len(spec) > 3 else None
+        sc_ = float(spec[4](Yr)) if len(spec) > 4 else 1.0
         lab = labels_of(Yr)
         if lab is not None:
             lab = np.ascontiguousarray(np.asarray(lab).reshape(-1).astype(np.int32))
@@ -5251,8 +6208,29 @@ def _multi_loss(ops, net, outs, shapes, loss_fn, Yr, group, arena=None):
             d = arena.get(("dout", i_ce), rows * V)
             lossv = arena.get("ce_loss", 1)
             ops.fill(lossv, 1, 0.0)
-            w = 1.0 / max(int((lab >= 0).sum()), 1)
-            ops.ce(outs[i_ce], yd, d, lossv, rows, V, w / group, w)
+            wts = weights_of(Yr) if weights_of is not None else None
+            if wts is None:
+                w = sc_ / max(int((lab >= 0).sum()), 1)
+                ops.ce(outs[i_ce], yd, d, lossv, rows, V, w / group, w)
+            else:
+                # sum(w ce) / sum(w): every row at 1 / sum(w), then each row of another weight once more, at
+                # (w - 1) / sum(w), its gradient added to that row's
+                wv = np.asarray(wts, np.float64).reshape(-1)
+                if wv.size != rows:
+                    raise TrainError(f"cross_entropy weights: {wv.size} for {rows} rows")
+                ok = lab >= 0
+                w = sc_ / max(float(wv[ok].sum()), 1e-12)
+                ops.ce(outs[i_ce], yd, d, lossv, rows, V, w / group, w)
+                extra = [int(r) for r in np.nonzero(ok & (wv != 1.0))[0]]
+                if extra:
+                    tmp = arena.get("ce_extra", V)
+                    zero = arena.get("ce_zero", 1)
+                    ops.fill(zero, 1, 0.0)
+                    o0 = outs[i_ce]
+                    for r in extra:
+                        c_ = float(wv[r] - 1.0) * w
+                        ops.ce((o0[0], o0[1] + r * V), (yd[0], yd[1] + r), tmp, lossv, 1, V, c_ / group, c_)
+                        ops.scale_add((d[0], d[1] + r * V), tmp, zero, V, 1.0)
             douts[i_ce], fn, card = d, rest, {i_ce}
     keep = [i for i in range(len(outs)) if i not in card]
     hs = [ops.get(outs[i][0], int(np.prod(shapes[i])), outs[i][1]).reshape(shapes[i]).astype(np.float64)
@@ -5401,6 +6379,8 @@ def _apply_step(ops, net, opt, adam, wd, clip, schedule, step, t, st1, st2, SQ, 
 
 
 def _native_step(ops, net, opt, adam, wd, clip, lr, t, st1, st2, SQ, COMP, n):
+    if getattr(net, "segments", None) and adam:
+        return _group_step(ops, net, opt, wd, clip, lr, t, st1, st2, COMP)
     ops.fill((SQ, 0), 1, 0.0)
     if clip or _guard():
         ops.sumsq((net.G, 0), n, (SQ, 0))
@@ -5410,6 +6390,74 @@ def _native_step(ops, net, opt, adam, wd, clip, lr, t, st1, st2, SQ, COMP, n):
     else:
         ops.sgd((net.P, 0), (net.G, 0), (st1, 0), (SQ, 0), n, lr, float(opt.momentum), float(clip or 0.0),
                 (COMP, 0) if COMP else None)
+
+
+def _group_step(ops, net, opt, wd, clip, lr, t, st1, st2, COMP):
+    """AdamW over parameter groups: each group its own learning rate (scaled with the schedule like the
+    optimizer's), betas, eps, weight decay and gradient clipping (by the norm of its own gradients)."""
+    specs = net.groups["specs"]
+    gs = sorted({s_[3] for s_ in net.segments})
+    SQ = getattr(net, "_gsq", None)
+    if SQ is None or net._gsq_n < len(gs):
+        SQ = net._gsq = ops.alloc(max(8, len(gs)))
+        net._gsq_n = max(8, len(gs))
+    slot = {g_: i for i, g_ in enumerate(gs)}
+    ops.fill((SQ, 0), len(gs), 0.0)
+    for a_, k_, _d, g_ in net.segments:
+        ops.sumsq((net.G, a_), k_, (SQ, slot[g_]))
+    scale = lr / float(opt.lr) if float(opt.lr) else 1.0
+    segs = [s_ for s_ in net.segments if not (s_[3] and specs[s_[3] - 1].get("every") == "batch")]
+    for i, (a_, k_, d_, g_) in enumerate(segs):
+        sp = specs[g_ - 1] if g_ else {}
+        pick = lambda key, dflt: dflt if sp.get(key) is None else float(sp[key])     # noqa: E731
+        b1, b2 = pick("b1", opt.b1), pick("b2", opt.b2)
+        ops.adam((net.P, a_), (net.G, a_), (st1, a_), (st2, a_), (SQ, slot[g_]), k_, d_,
+                 pick("lr", float(opt.lr)) * scale, b1, b2, pick("eps", opt.eps), 1 - b1 ** t, 1 - b2 ** t,
+                 pick("weight_decay", wd), pick("clip", float(clip or 0.0)),
+                 (COMP, a_) if COMP else None, part=(i, len(segs)))
+    if hasattr(ops, "refresh_w16"):
+        ops.refresh_w16()
+
+
+def _batch_group_step(ops, net, opt, wd, clip, lr, st1, st2, COMP, group):
+    """The groups with every="batch": their own AdamW step on this batch's gradient (the trainer scaled it by
+    1 / group; eps and the clipping norm are scaled the same way, so the update is the one of the unscaled
+    gradient), their own step count; their gradient is then cleared."""
+    if not getattr(net, "segments", None):
+        return False
+    specs = net.groups["specs"]
+    segs = [s_ for s_ in net.segments if s_[3] and specs[s_[3] - 1].get("every") == "batch"]
+    if not segs:
+        return False
+    SQ = getattr(net, "_bsq", None)
+    if SQ is None:
+        SQ = net._bsq = ops.alloc(8)
+    tb = net.__dict__.setdefault("_bt", {})
+    scale = lr / float(opt.lr) if float(opt.lr) else 1.0
+    for i, (a_, k_, d_, g_) in enumerate(segs):
+        sp = specs[g_ - 1]
+        pick = lambda key, dflt: dflt if sp.get(key) is None else float(sp[key])     # noqa: E731
+        tb[g_] = tb.get(g_, 0) + 1
+        t_ = tb[g_]
+        b1, b2 = pick("b1", opt.b1), pick("b2", opt.b2)
+        ops.fill((SQ, 0), 1, 0.0)
+        ops.sumsq((net.G, a_), k_, (SQ, 0))
+        ops.adam((net.P, a_), (net.G, a_), (st1, a_), (st2, a_), (SQ, 0), k_, d_, pick("lr", float(opt.lr)) * scale,
+                 b1, b2, pick("eps", opt.eps) / group, 1 - b1 ** t_, 1 - b2 ** t_, pick("weight_decay", wd),
+                 pick("clip", float(clip or 0.0)) / group, (COMP, a_) if COMP else None, part=(i, len(segs)))
+    if hasattr(ops, "refresh_w16"):
+        ops.refresh_w16()
+    return True
+
+
+def _batch_group_clear(ops, net):
+    """The every="batch" groups' gradient of a batch that takes no step: cleared."""
+    if not getattr(net, "segments", None):
+        return
+    specs = net.groups["specs"]
+    for a_, k_, _d, g_ in net.segments:
+        if g_ and specs[g_ - 1].get("every") == "batch":
+            ops.fill((net.G, a_), k_, 0.0)
 
 
 def _want_exact(exact, params):
@@ -6121,8 +7169,26 @@ def predict(model, params, X, device="cuda", precision="auto", batch_size=64, op
         if ops is None:
             raise TrainError(f"no GPU: {why}")
     first = model.layers[0] if isinstance(model, L.Sequential) and model.layers else model
-    net = Net(ops, model, params, precision, graph)
+    net = Net(ops, model, params, precision, graph, recompute=False)
     try:
+        if isinstance(X, (list, tuple)) or getattr(model, "kind", "") == "dag":
+            # several inputs (token ids, node features ...) and / or several outputs: one pass, as given
+            xs = [_as_input(a) for a in (X if isinstance(X, (list, tuple)) else [X])]
+            net.train = False
+            net.set_graph(graph)
+            net.round_weights()
+            views = []
+            for i, a in enumerate(xs):
+                v = net.arena.get(("in", i), a.size)
+                ops.put(v[0], a.reshape(-1), v[1])
+                views.append(v)
+            if len(xs) > 1:
+                out, shape = net.forward(views, [a.shape for a in xs])
+            else:
+                out, shape = net.forward(views[0], xs[0].shape)
+            if isinstance(out, list):
+                return [ops.get(o_[0], int(np.prod(s_)), o_[1]).reshape(s_) for o_, s_ in zip(out, shape)]
+            return ops.get(out[0], int(np.prod(shape)), out[1]).reshape(shape)
         return _forward_batches(net, ops, _inputs(aops.raw(X), isinstance(first, L.Embedding)),
                                 int(batch_size) if graph is None else 1 << 62)
     finally:

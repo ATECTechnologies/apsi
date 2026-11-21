@@ -101,7 +101,7 @@ class Hub:
         hops = 0
         while True:
             self._check(url)
-            h = {"User-Agent": "apsi-hub/2.6.0"}
+            h = {"User-Agent": "apsi-hub/2.6.2"}
             if headers:
                 h.update(headers)
             tok = _token(token)

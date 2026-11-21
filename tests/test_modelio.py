@@ -216,3 +216,54 @@ class ModelFiles(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+def test_named_tensors_round_trip_and_layer_state(tmp_path):
+    """Another program's names for a parameter tree (fused weights, transposes, scalars), saved in one
+    .safetensors file and read back; the running state of a stateful layer goes through checkpoints."""
+    import numpy as np
+    from apsi.models import named_tensors, from_named_tensors, save_safetensors, load_named_tensors, \
+        safetensors_metadata
+    from apsi.values import Record
+    from apsi import layers as L
+    rng = np.random.default_rng(0)
+    p = Record(attn=Record(Wq=rng.normal(size=(4, 3)), Wk=rng.normal(size=(4, 3))),
+               typed=Record(W=rng.normal(size=(2, 4, 5))), gate=np.array([0.25]))
+    rows = [["qk.weight", "attn.Wq", -1, True, 0, 3], ["qk.weight", "attn.Wk", -1, True, 3, 6],
+            ["proj.a.weight", "typed.W", 0, True, 0, -1], ["proj.b.weight", "typed.W", 1, True, 0, -1],
+            ["gate", "gate", -1, False, 0, -1]]
+    t = named_tensors(p, rows, {"gate": []})
+    assert t["qk.weight"].shape == (6, 4) and t["proj.b.weight"].shape == (5, 4) and t["gate"].shape == ()
+    f = tmp_path / "m.safetensors"
+    save_safetensors(str(f), t, {"note": "hello"})
+    back = from_named_tensors(Record(attn=Record(Wq=np.zeros((4, 3)), Wk=np.zeros((4, 3))),
+                                     typed=Record(W=np.zeros((2, 4, 5))), gate=np.zeros(1)),
+                              load_named_tensors(str(f)), rows)
+    for a, b in ((back.attn.Wq, p.attn.Wq), (back.typed.W, p.typed.W), (back.gate, p.gate)):
+        assert np.allclose(a, b, atol=1e-6)
+    assert safetensors_metadata(str(f))["note"] == "hello"
+
+    class Counter(L.Layer):
+        kind, stateful = "counter", True
+
+        def __init__(self):
+            self.st = {"seen": np.zeros(2), "n": 0.0}
+
+        def state_get(self):
+            return {k: (np.array(v) if isinstance(v, np.ndarray) else v) for k, v in self.st.items()}
+
+        def state_set(self, st):
+            self.st = dict(st)
+
+        def init(self, seed=0):
+            return Record()
+
+        def apply(self, params, x, train=False, **ctx):
+            return x
+    m = L.Sequential([L.Linear(2, 2), Counter()])
+    m.layers[1].st = {"seen": np.array([1.0, 2.0]), "n": 3.0}
+    arrs = L.state_arrays(m)
+    m.layers[1].st = {"seen": np.zeros(2), "n": 0.0}
+    L.restore_state_arrays(m, arrs)
+    assert m.layers[1].st["n"] == 3.0 and list(m.layers[1].st["seen"]) == [1.0, 2.0]
+    assert len(L.model_state(m)) == 1

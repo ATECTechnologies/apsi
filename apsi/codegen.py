@@ -2130,10 +2130,25 @@ def own_class(cls):
     return cls
 
 
+def _own_module(mod):
+    """A Python module the program carries in itself (pymodule): its source is the program's own code."""
+    import sys as _sys
+    m = mod if isinstance(mod, type(_sys)) else _sys.modules.get(mod) if isinstance(mod, str) else None
+    return m is not None and getattr(m, "__apsi_source__", None) is not None
+
+
 def is_own(obj):
+    """Objects whose _private names are the program's own business: instances of classes an Apsi program defined,
+    and the Python code a program carries in itself (pymodule): the module, its functions, classes and instances."""
+    if _own_module(obj):
+        return True
     t = obj if isinstance(obj, type) else type(obj)
     try:
-        return any(c in OWN_CLASSES for c in t.__mro__)
+        if any(c in OWN_CLASSES for c in t.__mro__):
+            return True
+        mods = {getattr(obj, "__module__", None)} if callable(obj) else set()
+        mods |= {c.__module__ for c in t.__mro__}
+        return any(isinstance(m_, str) and _own_module(m_) for m_ in mods)
     except Exception:                      # noqa: BLE001
         return False
 

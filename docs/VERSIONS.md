@@ -1,6 +1,6 @@
 # Versions: what each one can do
 
-| | **2.6.0** (current) | **2.4.4** | **2.0.0** | **1.10.0** |
+| | **2.6.2** (current) | **2.4.4** | **2.0.0** | **1.10.0** |
 |---|---|---|---|---|
 | Released | 13 November 2026 | 10 November 2026 | November 2026 | 8 November 2026 |
 | AI training on the card | exact on any number of cards, the same weights every run, `steps=`, checkpoints that resume bit for bit, a NaN guard, any optimizer / loss / layer, `gpu_tensor`, physics-informed networks | Apsi's own kernels, faster than PyTorch on the models it supports | — | — |
@@ -22,11 +22,11 @@
 | Fewer AI tokens | `use tokens`, plus `focus` / `fit_chat` (built on code and text graphs) | `use tokens` (exactly reversible) | — | — |
 | Tables, databases | as 2.4.4 | `use dataframe`, `use db` (PostgreSQL, MySQL, MongoDB, Redis, SQLite) | — | — |
 | WebSocket, `.env`, debugger | as 2.4.4 | yes | — | — |
-| Documentation | [2.6.0 docs](/docs) | [2.4.4 docs](/docs/2.4.4) | [2.0.0 docs](/docs/2.0.0) | [1.10.0 docs](/docs/1.10.0) |
+| Documentation | [2.6.2 docs](/docs) | [2.4.4 docs](/docs/2.4.4) | [2.0.0 docs](/docs/2.0.0) | [1.10.0 docs](/docs/1.10.0) |
 
 ## Which one should I use?
 
-**2.6.0** for everything new. Programs written for 2.4.4, 2.0.0 and 1.10.0 run on 2.6.0 unchanged — each version
+**2.6.2** for everything new (a patch of 2.6.0: programs for 2.6.0 run unchanged). Programs written for 2.4.4, 2.0.0 and 1.10.0 run on 2.6.2 unchanged — each version
 only adds.
 
 Keep **2.0.0** or **1.10.0** only if a machine cannot install 2.0.0's native compiler dependency (`llvmlite`); even then 2.0.0

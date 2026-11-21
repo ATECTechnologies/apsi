@@ -12,7 +12,7 @@ import secrets
 
 from .errors import RuntimeErr
 
-_HASHES = {"sha256", "sha512", "sha3_256", "sha3_512", "blake2b", "blake2s"}
+_HASHES = {"sha256", "sha512", "sha3_256", "sha3_512", "blake2b", "blake2s", "md5", "sha1"}   # md5 / sha1: ids, not security
 
 
 def _bytes(x):
@@ -27,6 +27,18 @@ def hash(data, algo="sha256"):
     if algo not in _HASHES:
         raise RuntimeErr(f"unknown hash '{algo}'; use one of {', '.join(sorted(_HASHES))}")
     return hashlib.new(algo, _bytes(data)).hexdigest()
+
+
+def crc32(data):
+    """The CRC-32 of a text (as zlib computes it): a stable 32-bit number for bucketing, not security."""
+    import zlib
+    return zlib.crc32(_bytes(data)) & 0xFFFFFFFF
+
+
+def hash_int(data, algo="sha256", mod=None):
+    """The hash of a text as an integer (optionally % mod): stable ids / buckets for strings."""
+    v = int(hash(data, algo), 16)
+    return v % int(mod) if mod else v
 
 
 def hmac_sign(key, message, algo="sha256"):
@@ -131,4 +143,4 @@ def module():
             "secure_equal": secure_equal, "random_token": random_token,
             "random_hex": random_bytes_hex, "secure_randint": secure_randint,
             "password_hash": password_hash, "password_verify": password_verify,
-            "b64encode": b64encode, "b64decode": b64decode}
+            "b64encode": b64encode, "b64decode": b64decode, "crc32": crc32, "hash_int": hash_int}

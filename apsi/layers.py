@@ -148,12 +148,14 @@ class Graph:
 
 
 def graph(edges=None, n=None, src=None, dst=None, self_loops=True, undirected=False, batch=None, types=None,
-          reverse=False, node_types=None, edge_features=None):
+          reverse=False, node_types=None, edge_features=None, leading=None):
     """graph(edges=[[0, 1], [1, 2]], n=3) or graph(src=tensor, dst=tensor, n=…). `batch` assigns nodes to
     separate graphs for graph-level tasks (used by graph_pool). `types` gives every edge a relation (0, 1, …) for
     graph_transformer layers; reverse=true adds each edge backwards as its own relation, so information flows both
     ways with separate weights (use -> definition as well as definition -> use). edge_features: a row of numbers
-    per edge [E, F] (bond types, distances, …), read by gine; self loops get zeros, reversed edges a copy."""
+    per edge [E, F] (bond types, distances, …), read by gine; self loops get zeros, reversed edges a copy.
+    leading=n: only the first n graphs of the batch go into graph_memory (the ones a decoder reads, one per row of
+    its batch); the graphs after them are encoded and pooled too (e.g. the targets of a contrastive loss)."""
     if edges is not None:
         e = np.asarray(ops.raw(edges)).astype(np.int64).reshape(-1, 2) if len(edges) else np.zeros((0, 2), int)
         src, dst = e[:, 0], e[:, 1]
@@ -171,6 +173,7 @@ def graph(edges=None, n=None, src=None, dst=None, self_loops=True, undirected=Fa
     g = Graph(src, dst, n, self_loops=self_loops, undirected=undirected, rel=rel, efeat=ef)
     g.batch = _ids(batch) if batch is not None else np.zeros(g.n, dtype=np.int64)
     g.graphs = int(g.batch.max()) + 1 if g.n else 0
+    g.leading = int(leading) if leading is not None else None
     if node_types is not None:                       # a type per node (heterogeneous graphs: typed_linear, hgt)
         g.ntype = _ids(node_types)
         if len(g.ntype) != g.n:
@@ -759,6 +762,22 @@ class Slice(Layer):
         return f"slice({self.start}:{self.stop})"
 
 
+class GradScale(Layer):
+    """Identity going forward; going backward the gradient is multiplied by `alpha` (0: no gradient, 1: all of it): a
+    controlled share of one objective's gradient reaches the layers before it (a soft bridge, e.g. alpha 0.08)."""
+    kind = "grad_scale"
+
+    def __init__(self, alpha=0.08):
+        self.alpha = float(alpha)
+
+    def apply(self, p, x, train=False, **ctx):
+        from .stdlib import stop_gradient
+        return x * self.alpha + stop_gradient(x) * (1.0 - self.alpha)
+
+    def describe(self):
+        return f"grad_scale({self.alpha})"
+
+
 class TiedOutput(Layer):
     """Logits with the weights of an embedding of the same dag (tied embeddings): x @ E^T, E the table of node
     `owner`. No weights of its own."""
@@ -1315,7 +1334,7 @@ def _freeze_keep(old, new, paths):
 def fit_batches(model, params, batches, loss="cross_entropy", opt=None, epochs=1, backend="auto", device="cuda",
                 verbose=True, clip=None, schedule=None, precision="auto", compensated=None, every=None, accumulate=1,
                 stages=None, freeze=None, train_only=None, steps=None, checkpoint=None, save_every=None, resume=True,
-                callback=None):
+                callback=None, recompute=None, exact_sums=None, groups=None, state=None):
     """Train on batches that each bring their own shapes and graph: a list of (inputs, targets[, graph]) or a function
     epoch -> such a list. inputs may be a list (a dag with several inputs, e.g. token ids and node features). Each
     step is `accumulate` batches (their gradients averaged); the history is the mean loss of each epoch. backend: "auto"
@@ -1324,11 +1343,19 @@ def fit_batches(model, params, batches, loss="cross_entropy", opt=None, epochs=1
     freeze= / train_only=: parts of the model by name ("enca", "w*", a function of the path) that stay as they
     are / the only parts that learn. Any optimizer: adam, adamw and sgd have kernels of their own, the others step on
     the processor.
+    state=record(get=fn() -> text, set=fn(text)): the program's own training state, saved in the checkpoint and put
+    back on resume (with the random generators and the parameter groups' step counts).
     steps=N: train for N optimizer steps (over as many epochs as that takes) instead of `epochs`. checkpoint="run.npz"
     with save_every=K: the weights, the optimizer's state and the position in the data are saved every K steps, at the
     end and when training stops on an error or Ctrl+C; running the same call again resumes exactly where it stopped
     (resume=false starts over). callback(record(epoch, step, loss)) after every epoch. A step whose gradient is not
-    finite (inf / NaN) is skipped, so one bad batch cannot ruin the weights (APSI_GPU_GUARD=0 turns this off)."""
+    finite (inf / NaN) is skipped, so one bad batch cannot ruin the weights (APSI_GPU_GUARD=0 turns this off).
+    groups=[record(params=[names of parts], lr=, b1=, b2=, eps=, weight_decay=, clip=, decay="matrices"|"all"|"none"|[parts],
+    no_decay=[substrings of a path]), ...]: parameter groups, each with its own AdamW settings and its own gradient
+    clipping (params="*": every weight no other group takes); weights of no group use opt's settings and clip.
+    recompute="auto" (the default on a card): the first step measures the memory; the blocks whose activations do not fit
+    in the card's memory (residual / transformer blocks, hgt, global attention, graph transformer layers) are computed
+    again in backward instead of kept, the rest keep them. true: every block; false: none."""
     from .stdlib import Adam, value_and_grad
     opt = opt or Adam(1e-3)
     which = str(backend or "auto").lower()
@@ -1340,20 +1367,28 @@ def fit_batches(model, params, batches, loss="cross_entropy", opt=None, epochs=1
                                       precision, compensated=compensated, every=every, accumulate=accumulate,
                                       stages=stages, freeze=freeze, train_only=train_only, steps=steps,
                                       checkpoint=checkpoint, save_every=save_every, resume=resume,
-                                      callback=callback)
+                                      callback=callback, recompute=recompute, exact_sums=exact_sums, groups=groups,
+                                      state=state)
             except GT.TrainError as e:
                 raise RuntimeErr(f"backend=\"gpu\": {e}") from None
     lf = loss if callable(loss) else _loss_fn(loss)
+    if groups:                                           # parameter groups: one AdamW, each group its own settings
+        from .stdlib import GroupAdamW
+        if not isinstance(opt, Adam):
+            raise RuntimeErr("fit_batches: groups= need adam() or adamw()")
+        opt, clip = GroupAdamW(opt, groups, clip), None
     E = int(epochs)
     every = int(every or max(1, E // 10))
     history, step = [], 0
     still = frozen_paths(params, freeze, train_only)
-    from .gpu_train import _batch_parts
+    from .gpu_train import _batch_parts, LIVE, _Live, _is_later
     A = max(1, int(accumulate or 1))
     want = int(steps) if steps else None
     start_ep, skip = 0, 0
+    from .gpu_train import CKPT_STATE
+    CKPT_STATE[0] = state
     if checkpoint and resume and os.path.exists(str(checkpoint)):
-        params, step, start_ep, skip = _np_ckpt_load(str(checkpoint), params, opt)
+        params, step, start_ep, skip = _np_ckpt_load(str(checkpoint), params, opt, model)
         if verbose:
             print(f"resumed from {checkpoint}: step {step}, epoch {start_ep}, batch {skip}")
     last = start_ep + E if want is None else 1 << 30
@@ -1364,35 +1399,58 @@ def fit_batches(model, params, batches, loss="cross_entropy", opt=None, epochs=1
         for ep in range(start_ep, last):
             if stop:
                 break
-            items = list(batches(ep) if callable(batches) else batches)
+            if callable(batches):
+                box = [params]
+                LIVE.append(_Live(lambda: box[0], lambda tree, only=None: box.__setitem__(0, _np_set(box[0], tree, only))))
+                try:
+                    items = list(batches(ep))
+                finally:
+                    LIVE.pop()
+                params = box[0]
+            else:
+                items = list(batches)
             tot, seen = 0.0, 0
-            for s0 in range(0, len(items), A):
+            if accumulate is not None and int(accumulate) == 0:   # steps of their own length: targets.end_step
+                starts, cur = [], 0
+                for j, it_ in enumerate(items):
+                    if (bool(getattr(it_, "end_step", False)) if _is_later(it_) else
+                            bool(getattr(_batch_parts(it_)[1], "end_step", True))):
+                        starts.append((cur, j + 1))
+                        cur = j + 1
+                if cur < len(items):
+                    starts.append((cur, len(items)))
+            else:
+                starts = [(s0, min(s0 + A, len(items))) for s0 in range(0, len(items), A)]
+            for s0, s1 in starts:
                 if ep == start_ep and s0 < skip:
                     continue
-                chunk = items[s0:s0 + A]
-                params, lv_sum, ok = _np_step(model, params, chunk, loss, lf, opt, schedule, step, clip, still, guard)
+                chunk = items[s0:s1]
+                params, lv_sum, ok, n_done = _np_step(model, params, chunk, loss, lf, opt, schedule, step, clip, still,
+                                                      guard)
                 tot += lv_sum
-                seen += len(chunk)
+                seen += n_done
                 step += 1
-                pos[0], pos[1] = ep, s0 + A
+                pos[0], pos[1] = ep, s1
                 if checkpoint and save_every and step % int(save_every) == 0:
-                    _np_ckpt_save(str(checkpoint), params, opt, step, pos)
+                    _np_ckpt_save(str(checkpoint), params, opt, step, pos, model)
                 if want is not None and step >= want:
                     stop = True
                     break
             if not stop:
                 pos[0], pos[1] = ep + 1, 0
+            if seen == 0:                                # (resumed after this epoch's last batch: nothing left)
+                continue
             history.append(tot / max(1, seen))
             if callback is not None:
                 callback(Record(epoch=ep, step=step, loss=history[-1]))
             if verbose and (ep % every == 0 or ep == last - 1 or stop):
-                print(f"epoch {ep:4}  loss {history[-1]:.5f}  ({len(items)} batches, step {step})")
+                print(f"epoch {ep:4}  loss {history[-1]:.5f}  ({seen} batches, step {step})")
         if checkpoint:
-            _np_ckpt_save(str(checkpoint), params, opt, step, pos)
+            _np_ckpt_save(str(checkpoint), params, opt, step, pos, model)
     except BaseException:
         if checkpoint:
             try:
-                _np_ckpt_save(str(checkpoint), params, opt, step, pos)
+                _np_ckpt_save(str(checkpoint), params, opt, step, pos, model)
                 if verbose:
                     print(f"training stopped at step {step}; saved to {checkpoint} (run again to resume)")
             except Exception:                            # noqa: BLE001
@@ -1401,34 +1459,118 @@ def fit_batches(model, params, batches, loss="cross_entropy", opt=None, epochs=1
     return Record(params=params, history=history, device="processor")
 
 
+def training_params():
+    """Inside a running fit_batches (in its batches function): the weights as they are now (a tree like the model's
+    params). none when no training is running."""
+    from .gpu_train import LIVE
+    return LIVE[-1].get() if LIVE else None
+
+
+def training_update(params, only=None):
+    """Inside a running fit_batches (in its batches function): write weights back into the training, e.g. a part
+    updated by an optimizer of your own. only=[dotted paths]: just those parts (and what is under them)."""
+    from .gpu_train import LIVE
+    if not LIVE:
+        raise RuntimeErr("training_update(): no training is running")
+    LIVE[-1].put(params, None if only is None else list(ops.raw(only) if not isinstance(only, (list, tuple)) else only))
+    return None
+
+
+def _np_set(params, tree, only):
+    """params with the leaves of `tree` whose dotted path starts with one of `only` (all when None) put in."""
+    pre = None if only is None else [str(o) for o in only]
+
+    def walk(a, b, path):
+        if isinstance(a, Record):
+            return Record(**{k: walk(v, _get(b, k), path + (k,)) for k, v in a.fields.items()})
+        if isinstance(a, dict):
+            return {k: walk(v, _get(b, k), path + (str(k),)) for k, v in a.items()}
+        if isinstance(a, (list, tuple)):
+            return type(a)(walk(v, _get(b, i), path + (str(i),)) for i, v in enumerate(a))
+        k = ".".join(path)
+        if b is None or (pre is not None and not any(k == o or k.startswith(o + ".") for o in pre)):
+            return a
+        return np.asarray(ops.raw(b), np.asarray(a).dtype).reshape(np.shape(a))
+
+    def _get(b, k):
+        if b is None:
+            return None
+        if isinstance(b, Record):
+            return b.fields.get(k)
+        if isinstance(b, dict):
+            return b.get(k)
+        if isinstance(b, (list, tuple)):
+            return b[k] if isinstance(k, int) and k < len(b) else None
+        return None
+    return walk(params, tree, ())
+
+
 def _np_step(model, params, chunk, loss, lf, opt, schedule, step, clip, still, guard):
     """One optimizer step over the batches of `chunk` (their gradients averaged): (params, summed loss, taken?)."""
     from .stdlib import value_and_grad
-    from .gpu_train import _batch_parts
+    from .gpu_train import _batch_parts, _is_later, LIVE, _Live
     acc, tot = None, 0.0
-    for item in chunk:
+    if schedule is not None:
+        opt.lr = float(ops.raw(schedule(step)))
+    chunk = list(chunk)
+    n_done = 0
+    while chunk:
+        item = chunk.pop(0)
+        if _is_later(item):                              # made now, with the weights as they are at this point
+            box = [params]
+            LIVE.append(_Live(lambda: box[0], lambda tree, only=None: box.__setitem__(0, _np_set(box[0], tree, only))))
+            try:
+                made = list(item.later() or [])
+            finally:
+                LIVE.pop()
+            params = box[0]
+            chunk = made + chunk
+            continue
+        n_done += 1
         X, Y, g = _batch_parts(item)
         ctx = {"graph": g} if g is not None else {}
         if not callable(loss) or not isinstance(Y, Record):
             Y = np.asarray(ops.raw(Y))                  # a loss of your own may take a record of targets
         lv, gr = value_and_grad(lambda p: lf(model(p, X, train=True, **ctx), Y))(params)
-        gr = tree_map(lambda a: a / len(chunk) if isinstance(a, np.ndarray) else a, gr)
+        if getattr(opt, "has_batch_groups", None) and opt.has_batch_groups():
+            sp = getattr(lf, "on_card", None)
+            s_ = float(sp[4](Y)) if (sp is not None and len(sp) > 4) else 1.0
+            hold = bool(getattr(Y, "hold", False)) if isinstance(Y, Record) else False
+            if s_ != 0 and not hold:                     # parts with their own step after every batch
+                held = getattr(opt, "_held", None)
+                g_all = gr if held is None else tree_map(lambda a, b: a + b, held, gr)
+                opt._held = None
+                params = opt.step_batch(params, g_all)
+                gr = opt.batch_mask(params, gr)
+            elif s_ != 0 and hold:                       # its gradient joins the next batch's step
+                bm = opt.batch_mask(params, gr)
+                part = tree_map(lambda a, b: a - b, gr, bm)
+                opt._held = part if getattr(opt, "_held", None) is None else tree_map(lambda a, b: a + b, opt._held, part)
+                gr = bm
+            else:
+                gr = opt.batch_mask(params, gr)
+        div = int(getattr(Y, "step_items", 0) or 0) if isinstance(Y, Record) else 0
+        div = div or (n_done + len(chunk))
+        gr = tree_map(lambda a, d_=div: a / d_ if isinstance(a, (np.ndarray, np.floating, float)) else a, gr)
         acc = gr if acc is None else tree_map(lambda a, b: a + b, acc, gr)
         tot += float(ops.raw(lv))
+    if acc is None:                                      # (nothing to train on in this step)
+        acc = tree_map(lambda a: np.zeros_like(np.asarray(ops.raw(a)), np.float64)
+                       if isinstance(ops.raw(a), np.ndarray) else a, params)
     gr = _freeze_grads(acc, still)                       # frozen weights: no gradient (and kept exactly below)
     if guard and not all(np.all(np.isfinite(np.asarray(ops.raw(a)))) for a in tree_leaves(gr)
                          if isinstance(ops.raw(a), np.ndarray)):
-        return params, tot, False                       # a non-finite gradient: this step is skipped
+        return params, tot, False, n_done               # a non-finite gradient: this step is skipped
     if schedule is not None:
         opt.lr = float(ops.raw(schedule(step)))
     if clip:
         norm = math.sqrt(sum(float(np.sum(np.asarray(ops.raw(a)) ** 2)) for a in tree_leaves(gr)))
         if norm > clip:
             gr = tree_map(lambda a: a * (clip / norm), gr)
-    return _freeze_keep(params, opt.step(params, gr), still), tot, True
+    return _freeze_keep(params, opt.step(params, gr), still), tot, True, n_done
 
 
-def _np_ckpt_save(path, params, opt, step, pos):
+def _np_ckpt_save(path, params, opt, step, pos, model=None):
     leaves = [np.asarray(ops.raw(a)) for a in tree_leaves(params) if isinstance(ops.raw(a), np.ndarray)]
     data = {f"p{i}": a for i, a in enumerate(leaves)}
     for name in ("m", "v", "vel", "velocity"):
@@ -1437,13 +1579,19 @@ def _np_ckpt_save(path, params, opt, step, pos):
             for i, a in enumerate(x for x in tree_leaves(tree) if isinstance(x, np.ndarray)):
                 data[f"{name}{i}"] = a
     data["meta"] = np.array([step, pos[0], pos[1], int(getattr(opt, "t", 0)), len(leaves)], np.int64)
+    if model is not None:
+        data.update(state_arrays(model))                 # running statistics of stateful layers
+    from .gpu_train import _extra_save, CKPT_STATE
+    _extra_save(data, getattr(opt, "_bt", None), CKPT_STATE[0])
     tmp = f"{path}.tmp.npz"
     np.savez(tmp, **data)
     os.replace(tmp, path)
 
 
-def _np_ckpt_load(path, params, opt):
+def _np_ckpt_load(path, params, opt, model=None):
     with np.load(path) as z:
+        if model is not None:
+            restore_state_arrays(model, z)
         step, ep, bi, t, nleaf = (int(v) for v in z["meta"])
         arrays = [a for a in tree_leaves(params) if isinstance(ops.raw(a), np.ndarray)]
         if nleaf != len(arrays) or any(z[f"p{i}"].shape != np.shape(ops.raw(a)) for i, a in enumerate(arrays)):
@@ -1457,6 +1605,10 @@ def _np_ckpt_load(path, params, opt):
                 setattr(opt, name, tree_map(lambda a: next(it2) if isinstance(ops.raw(a), np.ndarray) else a, params))
         if hasattr(opt, "t"):
             opt.t = t
+        from .gpu_train import _extra_load, CKPT_STATE
+        bt = _extra_load(z, CKPT_STATE[0])
+        if bt and hasattr(opt, "_bt"):
+            opt._bt = bt
     return params, step, ep, bi
 
 
@@ -1549,6 +1701,63 @@ class CustomLayer(Layer):
         return self.name
 
 
+class KernelLayer(Layer):
+    """A layer made of your own GPU kernels (@gpu functions): the trainer calls them on its own buffers, on the card,
+    with no copy. forward(x, y, *params) writes the output y; backward(x, y, dy, dx, *params, *grads) writes the
+    input's gradient dx and the parameters' gradients (each starts at zero; the trainer adds them to the step's).
+    params: the leaves of init(seed)'s record, in its field order. out(shape) -> the output's shape (default: the
+    input's). Without a card (or on the NumPy backend) the same functions run on the processor, so a model with
+    kernel layers trains, checks and predicts everywhere."""
+    kind = "gpu_layer"
+
+    def __init__(self, forward, backward=None, init=None, out=None, name="gpu_layer"):
+        self.forward, self.backward, self.init_fn, self.out_fn = forward, backward, init, out
+        self.name = str(name)
+
+    def init(self, seed=0):
+        if self.init_fn is None:
+            return Record()
+        return self.init_fn(seed=0 if seed is None else int(seed))
+
+    def out_shape(self, shape):
+        if self.out_fn is None:
+            return tuple(int(s) for s in shape)
+        return tuple(int(s) for s in ops.raw(self.out_fn(list(int(s) for s in shape))))
+
+    def params_of(self, p):
+        from .values import tree_leaves
+        return [a for a in tree_leaves(p) if a is not None and not isinstance(a, (str, bool))]
+
+    def apply(self, p, x, train=False, **ctx):
+        from . import autodiff as AD
+        leaves = self.params_of(p)
+        xv = np.asarray(AD._v(x), np.float64)
+        pv = [np.ascontiguousarray(np.asarray(AD._v(a), np.float64)) for a in leaves]
+        y = np.zeros(self.out_shape(xv.shape), np.float64)
+        xv = np.ascontiguousarray(xv)
+        self.forward(xv, y, *pv)
+        if not any(isinstance(a, AD.Node) for a in [x] + leaves):
+            return y
+        if self.backward is None:
+            raise RuntimeErr(f"gpu_layer '{self.name}': give backward= to train it")
+
+        def vjp(g, outv, need, *raw):
+            dy = np.ascontiguousarray(np.asarray(AD._v(g), np.float64))
+            dx = np.zeros(xv.shape, np.float64)
+            dps = [np.zeros(a.shape, np.float64) for a in pv]
+            self.backward(xv, y, dy, dx, *pv, *dps)
+            return (dx, *dps)
+        return AD.Node(y, (x, *leaves), vjp)
+
+    def describe(self):
+        return f"gpu_layer({self.name})"
+
+
+def gpu_layer(forward, backward=None, init=None, out=None, name="gpu_layer"):
+    """A layer from your own @gpu kernels, run by the GPU trainer on its buffers (see KernelLayer)."""
+    return KernelLayer(forward, backward, init, out, name)
+
+
 class Checkpoint(Layer):
     """Wraps a layer so that its activations are recomputed in the backward pass instead of stored."""
     kind = "checkpoint"
@@ -1573,6 +1782,62 @@ class Checkpoint(Layer):
 def checkpoint(layer):
     """Gradient checkpointing: checkpoint(layer) gives the same results with much less activation memory."""
     return Checkpoint(layer)
+
+
+def stateful_layers(model):
+    """The layers of a model that carry state besides their weights (running statistics; persistent = true: state
+    the layer trains itself, such as a head with its own optimizer), in a fixed order."""
+    out, seen = [], set()
+
+    def walk(l):
+        if id(l) in seen or not isinstance(l, Layer):
+            return
+        seen.add(id(l))
+        if getattr(l, "stateful", False) or getattr(l, "persistent", False):
+            out.append(l)
+        for c in l.children():
+            walk(c)
+    walk(model)
+    return out
+
+
+def model_state(model):
+    """The state of every stateful layer of the model (a list of records), to save next to the weights."""
+    return [Record(**l.state_get()) for l in stateful_layers(model)]
+
+
+def set_model_state(model, states):
+    """Put back the state model_state() returned (e.g. read from a file)."""
+    layers = stateful_layers(model)
+    states = list(states)
+    if len(states) != len(layers):
+        raise RuntimeErr(f"set_model_state: {len(states)} states for {len(layers)} stateful layers")
+    for l, st in zip(layers, states):
+        d = dict(st.fields) if isinstance(st, Record) else dict(st)
+        l.state_set({k: (np.asarray(ops.raw(v), np.float64) if np.ndim(ops.raw(v)) else float(ops.raw(v)))
+                     for k, v in d.items()})
+
+
+def state_arrays(model, prefix="S"):
+    """The model's layer state as flat arrays (name -> array), for checkpoints."""
+    out = {}
+    for i, l in enumerate(stateful_layers(model)):
+        for k, v in l.state_get().items():
+            out[f"{prefix}{i}:{k}"] = np.asarray(v, np.float64)
+    return out
+
+
+def restore_state_arrays(model, data, prefix="S"):
+    """Put back state_arrays() (data: a mapping such as an open .npz); missing names keep the layer's state."""
+    files = set(getattr(data, "files", None) or list(data.keys()))
+    for i, l in enumerate(stateful_layers(model)):
+        st = l.state_get()
+        for k, v in list(st.items()):
+            key = f"{prefix}{i}:{k}"
+            if key in files:
+                a = np.asarray(data[key], np.float64)
+                st[k] = a if np.ndim(v) else float(a)
+        l.state_set(st)
 
 
 def custom_layer(init, forward, name="model", parts=None):
@@ -1839,6 +2104,55 @@ DAG.apply = _dag_apply_shared
 
 
 # =============================================================== training & inspection
+def card_loss(output=0, rest=None, labels="labels", weights=None, scale=None):
+    """A loss over a model with several outputs (a dag with output=[...]): the cross-entropy of output `output`
+    against the targets' `labels` field (class ids, -1 left out) plus rest(outputs, targets) for everything else
+    (heads, auxiliary terms; rest must not read outputs[output]). Targets: a record, e.g.
+    record(labels=next_tokens, valid=..., issues=...). On the GPU trainer the cross-entropy stays on the card (a
+    language model's logits never leave it) and only the other outputs go to the processor; on NumPy the same loss
+    is computed on the processor. weights="field": a weight per label (same shape), the cross-entropy then being
+    sum(w * ce) / sum(w) over the labelled rows (e.g. a token that counts double). scale="field": the
+    cross-entropy of that batch multiplied by the targets' field (a batch that counts more or less in its step)."""
+    from .stdlib import cross_entropy
+    out_i, field, wfield = int(output), str(labels), (str(weights) if weights else None)
+    sfield = str(scale) if scale else None
+
+    def scale_of(ys):
+        v = getattr(ys, sfield, None) if (sfield and isinstance(ys, Record)) else None
+        return 1.0 if v is None else float(ops.raw(v))
+
+    def labels_of(ys):
+        return getattr(ys, field) if isinstance(ys, Record) else ys
+
+    def weights_of(ys):
+        return getattr(ys, wfield, None) if (wfield and isinstance(ys, Record)) else None
+
+    def rest_of(outs, ys):
+        return rest(outs, ys) if rest is not None else 0.0
+
+    def f(outs, ys):
+        outs = list(outs) if isinstance(outs, (list, tuple)) else [outs]
+        if labels_of(ys) is None:                       # no cross-entropy for this batch: rest is the whole loss
+            return rest_of(outs, ys)                     # (and it may read outputs[output])
+        w = weights_of(ys)
+        if w is None:
+            return scale_of(ys) * cross_entropy(outs[out_i], labels_of(ys)) + rest_of(outs, ys)
+        logits = outs[out_i]
+        lab = np.asarray(ops.raw(labels_of(ys))).reshape(-1).astype(np.int64)
+        wv = np.asarray(ops.raw(w), np.float64).reshape(-1)
+        V = int(np.shape(ops.raw(logits))[-1])
+        lg = ops.reshape(logits, -1, V)
+        ok = lab >= 0
+        lsm = ops.log_softmax(lg, axis=-1)
+        rows = np.nonzero(ok)[0]
+        picked = lsm[rows, lab[rows]] if len(rows) else 0.0
+        ce = -ops.sum_(picked * wv[rows]) / max(float(wv[rows].sum()), 1e-12) if len(rows) else 0.0
+        return scale_of(ys) * ce + rest_of(outs, ys)
+    f.on_card = (out_i, labels_of, rest_of, weights_of, scale_of)
+    f.__name__ = "card_loss"
+    return f
+
+
 def _loss_fn(loss):
     from .stdlib import mse, cross_entropy
     if callable(loss):
@@ -2127,7 +2441,7 @@ def predict(model, params, X, backend="numpy", device="auto", precision="auto", 
     if which == "gpu":
         from . import gpu_train
         dev = "cuda" if str(device).lower() in ("auto", "gpu", "cuda") else device
-        return gpu_train.predict(model, params, X, device=dev, precision=precision)
+        return gpu_train.predict(model, params, X, device=dev, precision=precision, graph=ctx.get("graph"))
     if which == "torch":
         from . import torch_backend
         return torch_backend.predict(model, params, X, device=device, precision=precision, **ctx)
@@ -2250,12 +2564,12 @@ def module(interp=None):
         apply_rope=apply_rope, moe=MoE, fit_batches=fit_batches, pinn_fit=_pinn_fit, pinn_derivatives=_pinn_derivatives,
         transformer_encoder=transformer_encoder, layer_norm_layer=LayerNorm, rms_norm_layer=RMSNorm,
         batch_norm_layer=BatchNorm, dropout_layer=Dropout, activation=activation, lambda_layer=LambdaLayer,
-        scale=Scale, identity=Identity, select=Select, mean_pool=MeanPool, slice_layer=Slice,
-        tied_output=TiedOutput,
+        scale=Scale, identity=Identity, select=Select, mean_pool=MeanPool, slice_layer=Slice, grad_scale=GradScale,
+        tied_output=TiedOutput, card_loss=card_loss, training_params=training_params, training_update=training_update,
         gcn=GCN, sage=SAGE, gat=GAT, gin=GIN, gine=GINE, batch_graphs=batch_graphs, graph_pool=GraphPool,
         # composition
         sequential=sequential, residual=residual, parallel=parallel, dag=dag, add=add, multiply=multiply,
-        concatenate=concatenate, custom_layer=custom_layer, checkpoint=checkpoint, diagnose=diagnose, load_torch_weights=load_torch_weights,
+        concatenate=concatenate, custom_layer=custom_layer, model_state=model_state, set_model_state=set_model_state, gpu_layer=gpu_layer, checkpoint=checkpoint, diagnose=diagnose, load_torch_weights=load_torch_weights,
         # model zoo
         mlp=mlp, resnet_mlp=resnet_mlp, cnn=cnn, lstm_classifier=lstm_classifier, transformer_lm=transformer_lm,
         transformer_classifier=transformer_classifier, autoencoder=autoencoder, vae=vae, vae_loss=vae_loss,

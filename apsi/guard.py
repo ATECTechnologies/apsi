@@ -235,6 +235,8 @@ def scan_program(prog, src="", file=None):
                 lit = first.value if isinstance(first, A.Str) else None
                 if nm in ("pyimport", "pyfrom"):
                     pyimports.append((line, lit))
+                elif nm == "pymodule":
+                    pyimports.append((line, "<embedded>"))
                 elif nm == "cload":
                     cloads.append((line, lit))
         elif isinstance(n, (A.For, A.While)):
@@ -291,6 +293,10 @@ def scan_program(prog, src="", file=None):
     from .checker import is_python_mode
     pyc = is_python_mode(prog)
     for line, mod in pyimports:
+        if mod == "<embedded>":
+            out.append(Finding("medium", "embedded-python", line,
+                               "pymodule() runs Python source kept in the program, with full access to the computer", file))
+            continue
         if pyc and mod in PYCOMPAT_STANDINS:
             continue                       # `use pycompat` gives permission-checked stand-ins (pysafe.py)
         if mod is None:

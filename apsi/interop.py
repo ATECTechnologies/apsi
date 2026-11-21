@@ -263,6 +263,28 @@ def install(interp):
                 if d in _sys.path:
                     _sys.path.remove(d)
 
+    def pymodule(name, source):
+        """A Python module made from source text kept in the program (e.g. a raw string r#"..."#): registered under
+        `name`, so Python code (and pyimport(name)) imports it like a file. The same source again: the same module."""
+        _need(interp, "python", f"pymodule(\"{name}\")")
+        import sys as _sys, types as _types, hashlib as _hl
+        name, source = str(name), str(source)
+        digest = _hl.sha256(source.encode("utf-8")).hexdigest()
+        old = _sys.modules.get(name)
+        if old is not None and getattr(old, "__apsi_source__", None) == digest:
+            return old
+        mod = _types.ModuleType(name)
+        here = interp.dir_stack[-1] if getattr(interp, "dir_stack", None) else os.getcwd()
+        mod.__file__ = os.path.join(here, f"<{name}>")
+        mod.__apsi_source__ = digest
+        _sys.modules[name] = mod
+        try:
+            exec(compile(source, f"<{name}>", "exec"), mod.__dict__)
+        except BaseException:
+            _sys.modules.pop(name, None)
+            raise
+        return mod
+
     def to_torch(x, device=None):
         _need(interp, "python", "to_torch()")
         try:
@@ -386,7 +408,7 @@ def install(interp):
         from .values import Record
         return Record(**interp.policy.describe())
 
-    funcs = dict(exists=exists, library_path=library_path, pyimport=pyimport, to_torch=to_torch, from_torch=from_torch, to_py=to_py,
+    funcs = dict(exists=exists, library_path=library_path, pyimport=pyimport, pymodule=pymodule, to_torch=to_torch, from_torch=from_torch, to_py=to_py,
                  from_py=from_py, cload=cload, read_text=read_text, write_text=write_text,
                  load_json=load_json, save_json=save_json, load_csv=load_csv, save_csv=save_csv,
                  http_get=http_get, http_post_json=http_post_json, json_parse=json_parse,
@@ -402,6 +424,6 @@ def install(interp):
                              "ptr_i32": g["ptr_i32"], "ptr_i64": g["ptr_i64"], "ptr_u8": g["ptr_u8"],
                              "ptr_void": g["ptr_void"], "void": g["void"],
                              **{t: Dtype(t, None) for t in ("u8", "u16", "u32", "u64", "i8", "i16", "i32", "i64", "f32", "f64")}}
-    interp.modules["python"] = {"pyimport": pyimport, "to_torch": to_torch, "from_torch": from_torch,
+    interp.modules["python"] = {"pyimport": pyimport, "pymodule": pymodule, "to_torch": to_torch, "from_torch": from_torch,
                                 "to_py": to_py, "from_py": from_py}
     interp.modules["net"] = {"http_get": http_get, "http_post_json": http_post_json}
