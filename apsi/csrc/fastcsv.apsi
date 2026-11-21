@@ -1,0 +1,219 @@
+# The CSV kernels of `use dataframe` in Apsi itself (the same work as fastcsv.c), compiled by the native compiler
+# when no C compiler is installed (the usual case on Windows). Bytes come in as a uint8 tensor.
+
+@native("fast", "strict")
+fn csv_index(b, n: Int, sep: Int, starts, ends, quoted, cap: Int, rows) -> Int:
+    # Split a CSV buffer into cells; starts / ends are byte offsets, quoted[c] = 1 when the cell had quotes.
+    # Returns the number of cells, or -1 when cap was too small; rows[0] receives the number of records.
+    var i = 0
+    var c = 0
+    var r = 0
+    while i < n:
+        var more = true
+        while more:
+            if c >= cap:
+                return -1
+            if i < n and b[i] == 34:
+                i += 1
+                let s = i
+                var open = true
+                while open and i < n:
+                    if b[i] == 34:
+                        if i + 1 < n and b[i + 1] == 34:
+                            i += 2
+                        else:
+                            open = false
+                    else:
+                        i += 1
+                starts[c] = s
+                ends[c] = i
+                quoted[c] = 1
+                c += 1
+                if i < n:
+                    i += 1
+                while i < n and b[i] != sep and b[i] != 10:
+                    i += 1
+            else:
+                let s = i
+                while i < n and b[i] != sep and b[i] != 10:
+                    i += 1
+                var e = i
+                if e > s and b[e - 1] == 13:
+                    e -= 1
+                starts[c] = s
+                ends[c] = e
+                quoted[c] = 0
+                c += 1
+            if i >= n:
+                r += 1
+                more = false
+            elif b[i] == sep:
+                i += 1
+            else:
+                i += 1
+                r += 1
+                more = false
+    rows[0] = r
+    return c
+
+
+@native("fast", "strict")
+fn parse_longs(b, starts, ends, nrows: Int, ncols: Int, col: Int, out) -> Int:
+    # Column `col` as 64-bit integers. Returns 0, or the first bad (or empty) row + 1.
+    for r in 0..nrows:
+        let k = r * ncols + col
+        let s = starts[k]
+        let e = ends[k]
+        if e <= s:
+            return r + 1
+        var i = s
+        var neg = false
+        if b[i] == 45 or b[i] == 43:
+            neg = b[i] == 45
+            i += 1
+        if i >= e or e - i > 18:
+            return r + 1
+        var v = 0
+        while i < e:
+            let d = b[i] - 48
+            if d < 0 or d > 9:
+                return r + 1
+            v = v * 10 + d
+            i += 1
+        if neg:
+            out[r] = -v
+        else:
+            out[r] = v
+    return 0
+
+
+@native("fast", "strict")
+fn parse_doubles(b, starts, ends, nrows: Int, ncols: Int, col: Int, out, slow) -> Int:
+    # Column `col` as doubles, exactly as strtod rounds them: a decimal with at most 15 significant digits and a
+    # power of ten up to 22 is one correctly rounded operation (m * 10^k or m / 10^k); anything else is marked in
+    # `slow` for the processor's own parser. Empty cells are NaN. Returns 0, or the first bad row + 1.
+    for r in 0..nrows:
+        let k = r * ncols + col
+        let s = starts[k]
+        let e = ends[k]
+        slow[r] = 0
+        if e <= s:
+            out[r] = 0.0 / 0.0
+        else:
+            var i = s
+            var neg = false
+            if b[i] == 45 or b[i] == 43:
+                neg = b[i] == 45
+                i += 1
+            var m = 0
+            var digits = 0
+            var frac = 0
+            var seen = false
+            var ok = true
+            while i < e and b[i] >= 48 and b[i] <= 57:
+                if digits > 0 or b[i] != 48:
+                    digits += 1
+                if digits <= 18:
+                    m = m * 10 + (b[i] - 48)
+                else:
+                    ok = false
+                seen = true
+                i += 1
+            if i < e and b[i] == 46:
+                i += 1
+                while i < e and b[i] >= 48 and b[i] <= 57:
+                    if digits > 0 or b[i] != 48:
+                        digits += 1
+                    if digits <= 18:
+                        m = m * 10 + (b[i] - 48)
+                        frac += 1
+                    else:
+                        ok = false
+                    seen = true
+                    i += 1
+            var ex = 0
+            if i < e and (b[i] == 101 or b[i] == 69):
+                i += 1
+                var eneg = false
+                if i < e and (b[i] == 45 or b[i] == 43):
+                    eneg = b[i] == 45
+                    i += 1
+                var ed = 0
+                while i < e and b[i] >= 48 and b[i] <= 57:
+                    if ex < 100000:
+                        ex = ex * 10 + (b[i] - 48)
+                    ed += 1
+                    i += 1
+                if ed == 0:
+                    ok = false
+                if eneg:
+                    ex = -ex
+            if i != e or not seen:
+                slow[r] = 1                       # inf, nan, hex, or not a number: the processor decides
+            elif not ok or digits > 15:
+                slow[r] = 1
+            else:
+                let p = ex - frac
+                if p < -22 or p > 22:
+                    slow[r] = 1
+                else:
+                    var t = 1.0
+                    var q = p
+                    if q < 0:
+                        q = -q
+                    for j in 0..q:
+                        t = t * 10.0
+                    var v = 1.0 * m
+                    if p < 0:
+                        v = v / t
+                    else:
+                        v = v * t
+                    if neg:
+                        v = -v
+                    out[r] = v
+    return 0
+
+
+@native("fast", "strict")
+fn dict_encode(b, starts, ends, nrows: Int, ncols: Int, col: Int, codes, first_row, table, tsize: Int) -> Int:
+    # Dictionary-encode column `col`: codes[r] = id of the cell's text, first_row[id] = a row holding it.
+    # Open addressing in `table` (a power of two). Returns the number of ids, or -1 when the table became half full
+    # (call again with a larger one).
+    var nuniq = 0
+    for t in 0..tsize:
+        table[t] = -1
+    for r in 0..nrows:
+        let k = r * ncols + col
+        let s = starts[k]
+        let e = ends[k]
+        var h = 7
+        for i in s..e:
+            h = (h * 131 + b[i]) % 1099511627689
+        var slot = h % tsize
+        var looking = true
+        while looking:
+            let id = table[slot]
+            if id < 0:
+                if 2 * (nuniq + 1) > tsize:
+                    return -1
+                table[slot] = nuniq
+                first_row[nuniq] = r
+                codes[r] = nuniq
+                nuniq += 1
+                looking = false
+            else:
+                let fr = first_row[id] * ncols + col
+                let fs = starts[fr]
+                let fe = ends[fr]
+                var same = fe - fs == e - s
+                var j = 0
+                while same and j < e - s:
+                    if b[fs + j] != b[s + j]:
+                        same = false
+                    j += 1
+                if same:
+                    codes[r] = id
+                    looking = false
+                else:
+                    slot = (slot + 1) % tsize
+    return nuniq

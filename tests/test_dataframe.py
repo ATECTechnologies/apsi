@@ -72,5 +72,62 @@ class DataFrameTest(unittest.TestCase):
             self.assertEqual(back["s"].tolist(), big["s"].tolist())
 
 
+class CsvBackends(unittest.TestCase):
+    """read_csv gives the same table, value for value, through the C kernels, the kernels Apsi compiles itself
+    (no C compiler, as on most Windows machines) and Python's csv module."""
+
+    def _file(self, d):
+        rng = np.random.default_rng(7)
+        n = 40000
+        nums = [repr(float(x)) for x in rng.normal(scale=1e3, size=n)]
+        tricky = ["0.1", "-0", "1e-5", "2.5E+3", "123456789012345678", "0.000000000000000000001", "1e400", "inf",
+                  "-nan", "17", "-3.25", "9007199254740993", "4.35"]
+        for i, t in enumerate(tricky):
+            nums[i * 97] = t
+        ints = rng.integers(-10**12, 10**12, n).tolist()
+        rows = ["id,name,val,count,note"]
+        for i in range(n):
+            note = '"say ""hi"", ok"' if i % 101 == 0 else ("" if i % 13 == 0 else f"n{i}")
+            rows.append(f"{i},c{i % 977},{nums[i]},{ints[i]},{note}")
+        path = os.path.join(d, "t.csv")
+        with open(path, "w", newline="") as fh:
+            fh.write("\r\n".join(rows) + "\r\n")
+        return path
+
+    def _read(self, path, backend):
+        saved = list(D._CSV_BACKEND)
+        D._CSV_BACKEND.clear()
+        os.environ["APSI_CSV_BACKEND"] = backend
+        try:
+            return D.read_csv(path), D._CSV_BACKEND[0]
+        finally:
+            del os.environ["APSI_CSV_BACKEND"]
+            D._CSV_BACKEND[:] = saved
+
+    def _same(self, a, b):
+        self.assertEqual(a.dtypes, b.dtypes)
+        for c in a.columns:
+            x, y = a[c].tolist(), b[c].tolist()
+            if a.dtypes[c] == "float":
+                np.testing.assert_array_equal(np.asarray(x, float), np.asarray(y, float))   # bit for bit, NaN = NaN
+            else:
+                self.assertEqual(x, y, c)
+
+    def test_every_backend_reads_the_same_table(self):
+        with tempfile.TemporaryDirectory() as d:
+            path = self._file(d)
+            ref, be = self._read(path, "python")
+            self.assertIsNone(be)
+            got, be = self._read(path, "c")
+            if be is not None:
+                self._same(ref, got)
+            from apsi import native
+            if not native.available():
+                self.skipTest("the native compiler needs llvmlite")
+            got, be = self._read(path, "native")
+            self.assertEqual(type(be).__name__, "_CsvNative")
+            self._same(ref, got)
+
+
 if __name__ == "__main__":
     unittest.main()

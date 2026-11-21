@@ -1,6 +1,6 @@
 """Apsi — a language for AI and physics with units, shapes and autodiff built in."""
-__version__ = "2.6.2"
-__label__ = "Improved version"                   # shown after the number: Apsi 2.6.2 (Improved version)
+__version__ = "2.6.6"
+__label__ = ""                                   # shown after the number when set: Apsi X.Y.Z (label)
 
 import sys as _sys
 

@@ -1,7 +1,7 @@
 @echo off
-rem Apsi 2.6.2: the short release check on this computer's NVIDIA card (about 15 minutes).
+rem Apsi 2.6.6: the short release check on this computer's NVIDIA card (about 15 minutes).
 rem   Double-click it. Close games and other heavy programs first: the card must be idle.
-rem The results go to test-results-2.6.2\summary.txt in the Apsi folder (send that file back).
+rem The results go to test-results-2.6.6\summary.txt in the Apsi folder (send that file back).
 rem What it runs:
 rem   1. the machine:             apsi doctor
 rem   2. correctness on the card: every GPU kernel against the exact reference (apsi gpu bench check)
@@ -16,10 +16,10 @@ set "APSI=%CD%"
 set "PYTHONPATH=%APSI%"
 set "PYTHONUTF8=1"
 set "APSI_NATIVE_QUIET=1"
-set "OUT=%APSI%\test-results-2.6.2"
+set "OUT=%APSI%\test-results-2.6.6"
 if not exist "%OUT%" mkdir "%OUT%"
 set "LOG=%OUT%\summary.txt"
-echo Apsi 2.6.2 release check on this computer, %DATE% %TIME% > "%LOG%"
+echo Apsi 2.6.6 release check on this computer, %DATE% %TIME% > "%LOG%"
 set "PY=%APSI%\.venv\Scripts\python.exe"
 if not exist "!PY!" set "PY="
 if not defined PY (

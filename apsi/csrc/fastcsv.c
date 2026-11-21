@@ -43,12 +43,50 @@ long csv_index(const char *b, long n, char sep, long *starts, long *ends, unsign
     return c;
 }
 
+/* A decimal with at most 15 significant digits and a power of ten up to 22: one correctly rounded operation
+   (m * 10^k or m / 10^k), the same double strtod gives. Returns 1 when it parsed the whole cell, 0 otherwise. */
+static const double P10[23] = {1e0, 1e1, 1e2, 1e3, 1e4, 1e5, 1e6, 1e7, 1e8, 1e9, 1e10, 1e11, 1e12, 1e13, 1e14, 1e15,
+                               1e16, 1e17, 1e18, 1e19, 1e20, 1e21, 1e22};
+static int quick_double(const char *b, long s, long e, double *out) {
+    long i = s; int neg = 0, digits = 0, frac = 0, seen = 0;
+    unsigned long long m = 0;
+    if (i < e && (b[i] == '-' || b[i] == '+')) { neg = b[i] == '-'; i++; }
+    for (; i < e && (unsigned)(b[i] - '0') <= 9; i++) {
+        if (digits || b[i] != '0') digits++;
+        if (digits > 15) return 0;
+        m = m * 10 + (unsigned)(b[i] - '0'); seen = 1;
+    }
+    if (i < e && b[i] == '.') {
+        for (i++; i < e && (unsigned)(b[i] - '0') <= 9; i++) {
+            if (digits || b[i] != '0') digits++;
+            if (digits > 15) return 0;
+            m = m * 10 + (unsigned)(b[i] - '0'); frac++; seen = 1;
+        }
+    }
+    int ex = 0;
+    if (i < e && (b[i] == 'e' || b[i] == 'E')) {
+        int eneg = 0, ed = 0; i++;
+        if (i < e && (b[i] == '-' || b[i] == '+')) { eneg = b[i] == '-'; i++; }
+        for (; i < e && (unsigned)(b[i] - '0') <= 9; i++, ed++) if (ex < 100000) ex = ex * 10 + (b[i] - '0');
+        if (!ed) return 0;
+        if (eneg) ex = -ex;
+    }
+    if (i != e || !seen) return 0;
+    int p = ex - frac;
+    if (p < -22 || p > 22) return 0;
+    double v = (double)m;
+    v = p < 0 ? v / P10[-p] : v * P10[p];
+    *out = neg ? -v : v;
+    return 1;
+}
+
 /* Parse column `col` of a table with `ncols` columns as doubles (empty → NaN). Returns 0 or the first bad row+1. */
 long parse_doubles(const char *b, const long *starts, const long *ends, long nrows, long ncols, long col, double *out) {
     char tmp[64];
     for (long r = 0; r < nrows; r++) {
         long k = r * ncols + col, s = starts[k], e = ends[k], len = e - s;
         if (len <= 0) { out[r] = NAN; continue; }
+        if (quick_double(b, s, e, &out[r])) continue;
         if (len >= 63) return r + 1;
         memcpy(tmp, b + s, len); tmp[len] = 0;
         char *end;
@@ -78,7 +116,8 @@ long parse_longs(const char *b, const long *starts, const long *ends, long nrows
 }
 
 /* Dictionary-encode column `col`: codes[r] = id of the cell's text; first_row[id] = a row holding that text.
-   Uses an open-addressing hash table of size `tsize` (a power of two ≥ 2 × nrows). Returns the number of ids. */
+   Uses an open-addressing hash table of size `tsize` (a power of two). Returns the number of ids, or -1 when the
+   table became half full (call again with a larger one: small tables stay in the processor's cache). */
 long dict_encode(const char *b, const long *starts, const long *ends, long nrows, long ncols, long col,
                  int *codes, long *first_row, long *table, long tsize) {
     long nuniq = 0, mask = tsize - 1;
@@ -91,6 +130,7 @@ long dict_encode(const char *b, const long *starts, const long *ends, long nrows
         for (;;) {
             long id = table[slot];
             if (id < 0) {
+                if (2 * (nuniq + 1) > tsize) return -1;
                 table[slot] = nuniq; first_row[nuniq] = r; codes[r] = (int)nuniq; nuniq++;
                 break;
             }

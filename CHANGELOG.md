@@ -1,5 +1,14 @@
 # Changelog
 
+## 2.6.6 — in development
+
+### Faster
+- **`read_csv` without a C compiler** (most Windows machines): the CSV kernels are also written in Apsi
+  (`apsi/csrc/fastcsv.apsi`) and compiled by Apsi's own native compiler. A 1 M-row file: 1.21 s → 0.23 s.
+- **`read_csv` with a C compiler:** numbers with up to 15 digits are parsed in one correctly rounded operation (the
+  same double `strtod` gives), and the string dictionary starts in a table that fits the processor's cache. On a
+  GitHub runner: 0.14 s for 1 M rows, against pandas' 0.155 s.
+
 ## 2.6.2 — large graph and language models on one card, training that resumes exactly and learns from its own output, half the optimizer's memory, your own GPU kernels (21 November 2026)
 
 ### Training that resumes exactly, and batches made while it trains

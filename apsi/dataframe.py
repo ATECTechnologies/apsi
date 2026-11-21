@@ -17,6 +17,7 @@ are evaluated column-wise without Python loops.
 """
 import csv
 import io
+import os
 
 import numpy as np
 
@@ -989,23 +990,117 @@ def read_csv(path, sep=",", columns=None, interp=None):
     return from_csv_text(data.decode("utf-8"), sep, columns)
 
 
+class _CsvC:
+    """The CSV kernels compiled from csrc/fastcsv.c (a C compiler is installed)."""
+
+    def __init__(self, lib):
+        import ctypes
+        self.lib, self.ct = lib, ctypes
+        lib.csv_index.restype = lib.parse_doubles.restype = lib.parse_longs.restype = ctypes.c_long
+        lib.dict_encode.restype = ctypes.c_long
+
+    def _p(self, a):
+        return a.ctypes.data_as(self.ct.c_void_p)
+
+    def index(self, data, arr, sep, starts, ends, quoted, cap):
+        ct = self.ct
+        rows = ct.c_long(0)
+        cells = self.lib.csv_index(ct.c_char_p(data), ct.c_long(len(data)), ct.c_char(sep.encode()), self._p(starts),
+                                   self._p(ends), self._p(quoted), ct.c_long(cap), ct.byref(rows))
+        return cells
+
+    def longs(self, data, arr, st, en, nrows, ncols, j, out):
+        ct = self.ct
+        return self.lib.parse_longs(ct.c_char_p(data), self._p(st), self._p(en), ct.c_long(nrows), ct.c_long(ncols),
+                                    ct.c_long(j), self._p(out))
+
+    def doubles(self, data, arr, st, en, nrows, ncols, j, out):
+        ct = self.ct
+        return self.lib.parse_doubles(ct.c_char_p(data), self._p(st), self._p(en), ct.c_long(nrows),
+                                      ct.c_long(ncols), ct.c_long(j), self._p(out))
+
+    def encode(self, data, arr, st, en, nrows, ncols, j, codes, first, table, tsize):
+        ct = self.ct
+        return self.lib.dict_encode(ct.c_char_p(data), self._p(st), self._p(en), ct.c_long(nrows), ct.c_long(ncols),
+                                    ct.c_long(j), self._p(codes), self._p(first), self._p(table), ct.c_long(tsize))
+
+
+class _CsvNative:
+    """The same kernels written in Apsi (csrc/fastcsv.apsi) and compiled by Apsi's native compiler: CSV at C speed
+    on machines without a C compiler (most Windows installations)."""
+
+    def __init__(self, fns):
+        self.f = fns
+
+    def index(self, data, arr, sep, starts, ends, quoted, cap):
+        rows = np.zeros(1, dtype=np.int64)
+        return int(self.f["csv_index"](arr, len(arr), ord(sep), starts, ends, quoted, cap, rows))
+
+    def longs(self, data, arr, st, en, nrows, ncols, j, out):
+        return int(self.f["parse_longs"](arr, st, en, nrows, ncols, j, out))
+
+    def doubles(self, data, arr, st, en, nrows, ncols, j, out):
+        slow = np.zeros(nrows, dtype=np.uint8)
+        bad = int(self.f["parse_doubles"](arr, st, en, nrows, ncols, j, out, slow))
+        if bad:
+            return bad
+        for r in np.flatnonzero(slow).tolist():          # inf, nan, long or unusual numbers: Python's exact parser
+            k = r * ncols + j
+            try:
+                out[r] = float(data[st[k]:en[k]].decode("ascii"))
+            except (ValueError, UnicodeDecodeError):
+                return r + 1
+        return 0
+
+    def encode(self, data, arr, st, en, nrows, ncols, j, codes, first, table, tsize):
+        return int(self.f["dict_encode"](arr, st, en, nrows, ncols, j, codes, first, table, tsize))
+
+
+_CSV_BACKEND = []
+
+
+def _csv_backend():
+    """C kernels when a compiler is installed, else the same kernels compiled by Apsi's native compiler, else None
+    (the csv module). APSI_CSV_BACKEND=c|native|python chooses."""
+    if _CSV_BACKEND:
+        return _CSV_BACKEND[0]
+    want = os.environ.get("APSI_CSV_BACKEND", "").strip().lower()
+    be = None
+    if want in ("", "c"):
+        from . import fastc
+        lib = fastc.load("fastcsv")
+        be = _CsvC(lib) if lib is not None else None
+    if be is None and want in ("", "native"):
+        try:
+            from . import native as _nat
+            if _nat.available():
+                from .interpreter import Interpreter
+                src = open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "csrc", "fastcsv.apsi"),
+                           encoding="utf-8").read()
+                env = Interpreter().run(src, "<fastcsv.apsi>")
+                be = _CsvNative({k: env.vars[k] for k in ("csv_index", "parse_longs", "parse_doubles",
+                                                         "dict_encode")})
+        except Exception:                                      # noqa: BLE001 - the csv module still works
+            be = None
+    _CSV_BACKEND.append(be)
+    return be
+
+
 def _fast_csv(data, sep, columns):
-    """The C path: index every cell once, parse number columns in C, strings through the dictionary."""
-    from . import fastc
-    lib = fastc.load("fastcsv")
-    if lib is None or len(sep) != 1:
+    """Index every cell once, parse number columns in compiled code, strings through a dictionary."""
+    be = _csv_backend()
+    if be is None or len(sep) != 1:
         return None
-    import ctypes
+    arr = np.frombuffer(data, dtype=np.uint8)
     n = len(data)
     cap = max(16, data.count(b"\n") + 2) * (data.split(b"\n", 1)[0].count(sep.encode()) + 1) + 16
     starts = np.empty(cap, dtype=np.int64)
     ends = np.empty(cap, dtype=np.int64)
     quoted = np.empty(cap, dtype=np.uint8)
-    rows = ctypes.c_long(0)
-    P = lambda a: a.ctypes.data_as(ctypes.c_void_p)
-    lib.csv_index.restype = ctypes.c_long
-    cells = lib.csv_index(ctypes.c_char_p(data), ctypes.c_long(n), ctypes.c_char(sep.encode()), P(starts), P(ends),
-                          P(quoted), ctypes.c_long(cap), ctypes.byref(rows))
+    try:
+        cells = be.index(data, arr, sep, starts, ends, quoted, cap)
+    except Exception:                                          # noqa: BLE001 - the csv module reports it
+        return None
     if cells < 0:
         return None
     first_end = data.find(b"\n")
@@ -1016,30 +1111,29 @@ def _fast_csv(data, sep, columns):
         return None                                           # ragged rows: let the csv module report them
     nrows = cells // ncols - 1
     st, en, qt = starts[ncols:cells], ends[ncols:cells], quoted[ncols:cells]
-    lib.parse_doubles.restype = lib.parse_longs.restype = ctypes.c_long
     out = {}
     for j, name in enumerate(header):
         if columns and name not in columns:
             continue
         if not qt[j::ncols].any():
             iv = np.empty(nrows, dtype=np.int64)
-            if lib.parse_longs(ctypes.c_char_p(data), P(st), P(en), ctypes.c_long(nrows), ctypes.c_long(ncols),
-                               ctypes.c_long(j), P(iv)) == 0:
+            if be.longs(data, arr, st, en, nrows, ncols, j, iv) == 0:
                 out[name] = iv
                 continue
             fv = np.empty(nrows, dtype=np.float64)
-            if lib.parse_doubles(ctypes.c_char_p(data), P(st), P(en), ctypes.c_long(nrows), ctypes.c_long(ncols),
-                                 ctypes.c_long(j), P(fv)) == 0:
+            if be.doubles(data, arr, st, en, nrows, ncols, j, fv) == 0:
                 out[name] = fv
                 continue
         if not qt[j::ncols].any() and nrows:
-            tsize = 1 << max(4, (2 * nrows).bit_length())
             codes = np.empty(nrows, dtype=np.int32)
             first = np.empty(nrows, dtype=np.int64)
-            table = np.empty(tsize, dtype=np.int64)
-            lib.dict_encode.restype = ctypes.c_long
-            k = lib.dict_encode(ctypes.c_char_p(data), P(st), P(en), ctypes.c_long(nrows), ctypes.c_long(ncols),
-                                ctypes.c_long(j), P(codes), P(first), P(table), ctypes.c_long(tsize))
+            tsize, top = 1 << 14, 1 << max(4, (2 * nrows).bit_length())
+            while True:                                    # a table that fits the cache, larger only when needed
+                table = np.empty(tsize, dtype=np.int64)
+                k = be.encode(data, arr, st, en, nrows, ncols, j, codes, first, table, tsize)
+                if k >= 0 or tsize >= top:
+                    break
+                tsize = min(top, tsize * 8)
             if k <= nrows // 2 or k < 100000:              # repetitive text: keep it dictionary-encoded
                 cs = (first[:k] * ncols + j).tolist()
                 values = [data[st[c]:en[c]].decode("utf-8") for c in cs]
