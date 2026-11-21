@@ -80,7 +80,8 @@ Return = _node("Return", "value")
 Break = _node("Break")
 Continue = _node("Continue")
 Pass = _node("Pass")
-Use = _node("Use", "path", "alias", "names")          # names: None, or [(name, alias)] for `from M import a, b as c`
+Use = _node("Use", "path", "alias", "names", "py")    # names: None, or [(name, alias)] for `from M import a, b as c`
+# py: Python's `import M` (the program's file M.apsi, an installed library, else the Python module M)
 Import = _node("Import", "path", "alias", "names")
 Test = _node("Test", "name", "body")
 Assert = _node("Assert", "cond", "msg")
@@ -96,6 +97,7 @@ Del = _node("Del", "targets")
 Global = _node("Global", "names", "nonlocal_")
 Match = _node("Match", "subject", "cases")         # cases: [(pattern, guard | None, body)]
 AsyncIter = _node("AsyncIter", "value")             # `async for` inside a comprehension
+Declare = _node("Declare", "names")              # Python-style locals: names first bound by a plain `x = …`
 Program = _node("Program", "body")
 
 

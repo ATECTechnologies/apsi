@@ -93,14 +93,27 @@ class LazyModules(dict):
         return dict.__len__(self) + len(self._lazy)
 
 
+def _py_exists(path):
+    """A Python module of this name can be imported (without importing it)."""
+    import importlib.util
+    try:
+        return importlib.util.find_spec(path.split(".")[0]) is not None
+    except (ImportError, ValueError):
+        return False
+
+
+_PENDING = [False]          # any A.Declare ran (then block-level definitions look for Python-style locals)
+
+
 class Env:
-    __slots__ = ("vars", "consts", "parent", "module")
+    __slots__ = ("vars", "consts", "parent", "module", "pending")
 
     def __init__(self, parent=None):
         self.vars = {}
         self.consts = set()
         self.parent = parent
         self.module = None
+        self.pending = None          # Python-style locals of this scope that are not bound yet (A.Declare)
 
     def lookup(self, name):
         e = self
@@ -112,6 +125,15 @@ class Env:
         raise KeyError(name)
 
     def define(self, name, value, const=False):
+        if _PENDING[0] and self.pending is None:              # an import in a block binds the Python-style local
+            e = self.parent
+            while e is not None:
+                if e.pending is not None:
+                    if name in e.pending:
+                        e.vars[name] = value
+                        return
+                    break
+                e = e.parent
         self.vars[name] = value
         if const:
             self.consts.add(name)
@@ -125,6 +147,9 @@ class Env:
                 if name in e.consts:
                     raise RuntimeErr(f"cannot assign to '{name}': it is a constant "
                                      f"(declared with let or a parameter); use var")
+                e.vars[name] = value
+                return
+            if e.pending is not None and name in e.pending:   # first assignment of a Python-style local
                 e.vars[name] = value
                 return
             e = e.parent
@@ -325,6 +350,7 @@ class Interpreter:
         core = stdlib.core_builtins()
         self.globals.vars.update(core)
         self.globals.vars["testing"] = lambda: self.testing
+        self.globals.vars.setdefault("Ellipsis", Ellipsis)
         from .helpers import builtins as _helper_builtins
         for _k, _v in _helper_builtins().items():
             self.globals.vars.setdefault(_k, _v)
@@ -402,6 +428,8 @@ class Interpreter:
         self.importing = []          # files being imported right now (detects import cycles)
         self._handling = []          # errors being handled by `except` blocks (for a bare `raise`)
         self.dir_stack = [os.getcwd()]
+        self._libraries = set()                  # installed libraries loaded by `use`
+        self._ran = set()                        # program files run so far (a file never imports itself)
         self._ev = {}
         self._ex = {}
         for cls in A.ALL:
@@ -421,6 +449,8 @@ class Interpreter:
 
     def run(self, source, filename="<main>", check=True, env=None, engine=None):
         prog = parse(source, cache=not filename.startswith("<"))
+        if not filename.startswith("<"):
+            self._ran.add(os.path.abspath(filename))
         if getattr(self, "_main_dir", None) is None:
             self._main_dir = os.path.dirname(os.path.abspath(filename)) if not filename.startswith("<") else \
                 os.getcwd()
@@ -788,6 +818,8 @@ class Interpreter:
             obj.fields[name] = v
         elif isinstance(obj, Record):
             obj.fields[name] = v
+        elif isinstance(obj, type) and self._own_object(obj):
+            setattr(obj, name, v)                           # a class the program defined: K.count += 1
         else:
             from .stdlib import _safe_setattr
             _safe_setattr(obj, name, v)                     # refuses modules, classes, functions, built-ins
@@ -932,11 +964,18 @@ class Interpreter:
     def ex_Global(self, s, env):
         pass
 
+    def ex_Declare(self, s, env):
+        _PENDING[0] = True
+        env.pending = set(s.names) if env.pending is None else env.pending | set(s.names)
+
     def ex_ClassDef(self, s, env):
         """A real Python class whose methods are Apsi functions."""
         bases = tuple(self.eval(b, env) for b in s.bases)
         kw = {k: self.eval(v, env) for k, v in s.kwargs if k is not None}
         ns = {"__module__": "__apsi__", "__qualname__": s.name}
+        if "__apsi__" not in sys.modules:                  # dataclasses, typing and pickle look the module up
+            import types as _types
+            sys.modules["__apsi__"] = _types.ModuleType("__apsi__")
         cenv = Env(env)
         menv_all = []
         annotations = {}
@@ -1036,36 +1075,85 @@ class Interpreter:
             self.importing.pop()
             self.tests = saved
         self.modules[name] = {k: v for k, v in menv.vars.items() if not k.startswith("_")}
+        self._libraries.add(name)
         return True
 
+    def import_target(self, path, base, names=None, py=False):
+        """Where `use`/`from`/`import` finds a module: ("module", name) a standard module or an installed library,
+        ("local", file) one of the program's own files, ("python", name) a Python module, or (None, None).
+        `use M` / `from M import …`: standard modules, the program's files, libraries, then (for `from`) Python.
+        Python's `import M`: the program's files, libraries, Python modules, then Apsi's standard modules."""
+        from .apsil import local_module
+        local = local_module(path, base)
+        if local is not None and local in self._ran and local not in self.module_cache:
+            local = None                                       # json.apsi saying `import json`: Python's json
+        if py:
+            if local is not None:
+                return "local", local
+            if path in self._libraries or (path not in self.modules and self.ensure_module(path, base)):
+                return "module", path
+            if _py_exists(path):
+                return "python", path
+            if path in self.modules:
+                return "module", path
+            return None, None
+        if path in self.modules:
+            mem = self.modules[path]
+            if names and any(n not in mem for n, _ in names) and path not in self._libraries and _py_exists(path):
+                return "python", path
+            return "module", path
+        if local is not None:
+            return "local", local
+        if self.ensure_module(path, base):
+            return "module", path
+        if names is not None and _py_exists(path):
+            return "python", path
+        return None, None
+
+    def py_import(self, path, top=False):
+        """A Python module, through pyimport (its permission checks); top=True: the top package (`import a.b`)."""
+        pyimport = self.modules["python"]["pyimport"]
+        mod = pyimport(path)
+        return pyimport(path.split(".")[0]) if top and "." in path else mod
+
+    def py_member(self, mod, path, name):
+        try:
+            return getattr(mod, name)
+        except AttributeError:
+            pass
+        try:
+            return self.py_import(f"{path}.{name}")
+        except Exception:                                      # noqa: BLE001
+            raise NameErr(f"Python module '{path}' has no name '{name}'") from None
+
     def ex_Use(self, s, env):
-        if s.path not in self.modules:
-            from .apsil import local_module
-            local = local_module(s.path, self.dir_stack[-1])
-            if local is not None:                                   # a file of the program itself
-                members = self._file_public(local)
-                if s.names is not None:
-                    return self._bind_names(s, members, s.path, env)
-                ns = Namespace(s.path, members)
-                if s.alias:
-                    return env.define(s.alias, ns)
-                for k, v in members.items():
-                    env.define(k, v)
-                if "." not in s.path and s.path not in members and s.path not in env.vars:
-                    env.define(s.path, ns)
+        kind, where = self.import_target(s.path, self.dir_stack[-1], s.names, s.py)
+        if kind is None:
+            raise NameErr(f"unknown module '{s.path}'. Available: {', '.join(sorted(self.modules))}")
+        if kind == "python":
+            if s.names is not None:
+                mod = self.py_import(s.path)
+                for n, a in s.names:
+                    env.define(a or n, self.py_member(mod, s.path, n))
                 return
-            if not self.ensure_module(s.path):
-                raise NameErr(f"unknown module '{s.path}'. Available: {', '.join(sorted(self.modules))}")
-        members = self.modules[s.path]
+            if s.alias:
+                return env.define(s.alias, self.py_import(s.path))
+            return env.define(s.path.split(".")[0], self.py_import(s.path, top=True))
+        members = self._file_public(where) if kind == "local" else self.modules[s.path]
         if s.names is not None:
             return self._bind_names(s, members, s.path, env)
+        ns = Namespace(s.path, members)
         if s.alias:
-            env.define(s.alias, Namespace(s.path, members))
-        else:
-            for k, v in members.items():
-                env.define(k, v)
-            if "." not in s.path and s.path not in members and s.path not in env.vars and s.path not in self.globals.vars:
-                env.define(s.path, Namespace(s.path, members))      # `use rl` also allows rl.ppo(...)
+            return env.define(s.alias, ns)
+        if s.py:                                               # Python's import: only the module's name
+            if "." in s.path:
+                raise NameErr(f"write `import {s.path} as name` (or `use {s.path}`) for an Apsi module")
+            return env.define(s.path, ns)
+        for k, v in members.items():
+            env.define(k, v)
+        if "." not in s.path and s.path not in members and s.path not in env.vars and (
+                kind == "local" or s.path not in self.globals.vars):
+            env.define(s.path, ns)                             # `use rl` also allows rl.ppo(...)
 
     def _bind_names(self, s, members, what, env):
         """`from M import a, b as c`: only the named public members."""
@@ -1860,6 +1948,14 @@ class Interpreter:
             if isinstance(v, StructInstance) and v.type is st:
                 return v
             raise TypeCheckError(f"{what} must be a {name}, got {type_name(v)}")
+        if isinstance(st, type):                               # a class: Python's isinstance
+            if isinstance(v, st):
+                return v
+            raise TypeCheckError(f"{what} must be a {name}, got {type_name(v)}")
+        if st is not None or name in ("set", "frozenset", "bytes", "object", "complex", "Set", "Callable",
+                                      "Optional", "Union", "Iterable", "Iterator", "Sequence", "Mapping",
+                                      "type", "Type"):
+            return v                                           # typing constructs: documentation only
         raise TypeCheckError(f"unknown type '{name}'")
 
     def _describe(self, v):

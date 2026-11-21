@@ -17,6 +17,8 @@ ZERO = "ZERO"          # literal 0: compatible with any unit in + and -
 TENSOR_TYPES = {"Tensor", "Vec", "Mat", "Matrix", "Vec2", "Vec3", "Vec4"}
 DTYPE_NAMES = {"f16", "f32", "f64", "i32", "i64", "bool", "bf16", "fp8_e4m3", "fp8_e5m2", "fp6_e3m2",
                "fp6_e2m3", "fp4_e2m1", "int8", "int4", "fp8", "bf8", "fp4", "fp6"}
+_PY_ANNOTATIONS = {"set", "frozenset", "bytes", "object", "complex", "Set", "Callable", "Optional", "Union",
+                   "Iterable", "Iterator", "Sequence", "Mapping", "type", "Type"}
 PLAIN_TYPES = {"Bool", "Str", "List", "Tuple", "Dict", "Any", "Fn", "Record", "None"}
 NUM_TYPES = {"Float", "Number", "Real", "Int", "f64", "f32", "f16", "bf16"}   # f32 …: a Float in that precision
 
@@ -120,6 +122,8 @@ class Checker:
             return None
         if n in self.struct_names or (sc.lookup(n) is not None and sc.lookup(n).kind == "struct"):
             return None
+        if sc.lookup(n) is not None or n in _PY_ANNOTATIONS:
+            return None                                # a class or typing name in scope (Optional, Iterable …)
         self.err(t, f"unknown type '{n}'")
         return None
 
@@ -406,6 +410,11 @@ class Checker:
             else:
                 self.infer(t, sc)
 
+    def c_Declare(self, s, sc, top):
+        for n in s.names:
+            if n not in sc.names:
+                sc.names[n] = Info(None, True)
+
     def c_Global(self, s, sc, top):
         for n in s.names:
             if self.lookup(n, sc, None) is None:
@@ -467,43 +476,47 @@ class Checker:
             self.block(s.else_body, Scope(sc))
 
     def c_Use(self, s, sc, top):
-        if s.path not in self.modules:
-            from .apsil import local_module
-            local = local_module(s.path, self.base_dir)
-            if local is not None:                              # a file of the program itself
-                names = self._file_names(s, local, s.path)
-                if names is None:
-                    return
-                if s.names is not None:
-                    return self._decl_names(s, names, s.path, sc)
-                if s.alias:
-                    return self._decl(sc, s.alias, Info(None, False, kind="module"), s)
-                for n, kind in names.items():
-                    sc.names[n] = Info(None, False, None, kind)
-                if "." not in s.path and s.path not in names and sc.lookup(s.path) is None:
-                    sc.names[s.path] = Info(None, False, kind="module")
-                return
-            try:
-                self.interp.ensure_module(s.path, self.base_dir)
-            except Exception as e:                       # noqa: BLE001 - report library load failures as errors
-                self.err(s, f"library '{s.path}' failed to load: {getattr(e, 'msg', e)}", NameErr)
-                return
-        if s.path not in self.modules:
-            self.err(s, f"unknown module '{s.path}'. Available: {', '.join(sorted(self.modules))}. Install a library with: "
-                            f"apsi install {s.path}, or put {s.path.replace('.', '/')}.apsi next to this file", NameErr)
+        try:
+            kind, where = self.interp.import_target(s.path, self.base_dir, s.names, s.py)
+        except Exception as e:                       # noqa: BLE001 - report library load failures as errors
+            self.err(s, f"library '{s.path}' failed to load: {getattr(e, 'msg', e)}", NameErr)
             return
-        if s.names is not None:
-            members = self.modules[s.path]
-            return self._decl_names(s, {k: "builtin" for k in members}, s.path, sc,
-                                    lambda k: ops.dim_of(members[k]) if not callable(members[k]) else None)
-        if s.alias:
-            sc.names[s.alias] = Info(None, False, kind="module")
+        if kind is None:
+            self.err(s, f"unknown module '{s.path}'. Available: {', '.join(sorted(self.modules))}. Install a library "
+                        f"with: apsi install {s.path}, or put {s.path.replace('.', '/')}.apsi next to this file",
+                     NameErr)
+            return
+        if kind == "python":
+            if s.names is not None:
+                for n, a in s.names:
+                    sc.names[a or n] = Info(None, False, None, "builtin")
+            else:
+                sc.names[s.alias or s.path.split(".")[0]] = Info(None, False, kind="module")
+            return
+        if kind == "local":
+            names = self._file_names(s, where, s.path)
+            if names is None:
+                return
+            dim = None
         else:
             members = self.modules[s.path]
-            for k, v in members.items():
-                sc.names[k] = Info(ops.dim_of(v) if not callable(v) else None, False, None, "builtin")
-            if "." not in s.path and s.path not in members and sc.lookup(s.path) is None and s.path not in self.builtins:
-                sc.names[s.path] = Info(None, False, kind="module")      # `use rl` also allows rl.ppo(...)
+            names = {k: "builtin" for k in members}
+
+            def dim(k):
+                return ops.dim_of(members[k]) if not callable(members[k]) else None
+        if s.names is not None:
+            return self._decl_names(s, names, s.path, sc, dim)
+        if s.alias or s.py:
+            if s.py and not s.alias and "." in s.path:
+                self.err(s, f"write `import {s.path} as name` (or `use {s.path}`) for an Apsi module", NameErr)
+                return
+            sc.names[s.alias or s.path] = Info(None, False, kind="module")
+            return
+        for k, kd in names.items():
+            sc.names[k] = Info(dim(k) if dim else None, False, None, kd)
+        if "." not in s.path and s.path not in names and sc.lookup(s.path) is None and (
+                kind == "local" or s.path not in self.builtins):
+            sc.names[s.path] = Info(None, False, kind="module")      # `use rl` also allows rl.ppo(...)
 
     def _decl_names(self, s, names, what, sc, dim=None):
         for n, a in s.names:

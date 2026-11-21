@@ -247,6 +247,9 @@ def scan_program(prog, src="", file=None):
             loops_with.append((line, s))
         elif isinstance(n, A.Use):
             calls.setdefault(f"use {n.path}", line)
+            if getattr(n, "py", None) or (n.names is not None and n.path.split(".")[0] in ESCAPE_MODULES
+                                          and n.path.split(".")[0] not in ("sys", "io")):
+                pyimports.append((line, n.path))              # Python's import M: as pyimport("M")
         for fld in n._fields:
             walk(getattr(n, fld), line)
 

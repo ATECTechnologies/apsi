@@ -69,10 +69,11 @@ class FuncCtx:
 
 
 class Binding:
-    __slots__ = ("py", "ctx", "kind", "erased_py", "mutable")
+    __slots__ = ("py", "ctx", "kind", "erased_py", "mutable", "pydecl")
 
     def __init__(self, py, ctx, kind="var", erased_py=None, mutable=False):
         self.py, self.ctx, self.kind, self.erased_py, self.mutable = py, ctx, kind, erased_py, mutable
+        self.pydecl = False             # a Python-style local (A.Declare): blocks bind it, not a new name
 
 
 class Scope:
@@ -126,6 +127,16 @@ class CodeGen:
 
     def declare(self, scope, name, kind="var", mutable=False, is_param=False, exact=False):
         ctx = scope.ctx
+        if not is_param:
+            s = scope.parent
+            while s is not None and s.ctx is ctx:
+                b = s.names.get(name)
+                if b is not None:
+                    if b.pydecl:
+                        scope.names[name] = b
+                        return b
+                    break
+                s = s.parent
         if ctx.kind == "class":
             exact = True
         if self.pyc and not is_param and not exact:
@@ -306,6 +317,8 @@ class CodeGen:
                 self.emit(f"{HELPER_PREFIX}setattr({self.expr(t.obj, scope)}, {t.name!r}, {val})")
         elif isinstance(t, A.Index):
             self.emit(self._setidx(t.obj, t.index, val, scope))
+        elif isinstance(t, (A.TupleLit, A.ListLit)) and any(isinstance(x, A.Spread) for x in t.items):
+            self.emit(f"{self.pytarget(t, scope)} = {val}")          # a, *rest = xs
         elif isinstance(t, A.TupleLit) and any(not isinstance(x, A.Name) for x in t.items):
             tmp = self.fresh("t")
             self.emit(f"{tmp} = {HELPER_PREFIX}unpack({val}, {len(t.items)})")
@@ -671,6 +684,12 @@ class CodeGen:
     def s_Del(self, s, scope):
         self.emit("del " + ", ".join(self.pytarget(t, scope) for t in s.targets))
 
+    def s_Declare(self, s, scope):
+        for n in s.names:
+            if n not in scope.names:
+                self.declare(scope, n, mutable=True).pydecl = True
+        self.emit("pass")
+
     def s_Global(self, s, scope):
         for n in s.names:
             b = scope.lookup(n)
@@ -842,33 +861,46 @@ class CodeGen:
         self.indent -= 1
 
     def s_Use(self, s, scope):
-        mods = self.rt.interp.modules
-        if s.path not in mods:
-            from .apsil import local_module
-            local = local_module(s.path, self.rt.base_dir)
-            if local is not None:                                      # a file of the program itself
-                self.s_Import(A.Import(local, s.alias, s.names, line=s.line, col=s.col), scope)
-                if s.alias is None and s.names is None and "." not in s.path and scope.lookup(s.path) is None:
-                    b = self.declare(scope, s.path)
-                    self.emit(f"{b.py} = {HELPER_PREFIX}Namespace({s.path!r}, "
-                              f"{HELPER_PREFIX}import_file({local!r}))")
+        interp = self.rt.interp
+        mods = interp.modules
+        kind, where = interp.import_target(s.path, self.rt.base_dir, s.names, s.py)
+        H = HELPER_PREFIX
+        if kind == "python":
+            if s.names is not None:
+                tmp = self.fresh("m")
+                self.emit(f"{tmp} = {H}pyimp({s.path!r}, False)")
+                for n, a in s.names:
+                    b = self.declare(scope, a or n)
+                    self.emit(f"{b.py} = {H}pymem({tmp}, {s.path!r}, {n!r})")
                 return
-        self.rt.interp.ensure_module(s.path, self.rt.base_dir)
+            b = self.declare(scope, s.alias or s.path.split(".")[0])
+            self.emit(f"{b.py} = {H}pyimp({s.path!r}, {not s.alias})")
+            return
+        if kind == "local":
+            if s.py or s.alias:
+                b = self.declare(scope, s.alias or s.path)
+                self.emit(f"{b.py} = {H}Namespace({s.path!r}, {H}import_file({where!r}))")
+                return
+            self.s_Import(A.Import(where, None, s.names, line=s.line, col=s.col), scope)
+            if s.names is None and "." not in s.path and scope.lookup(s.path) is None:
+                b = self.declare(scope, s.path)
+                self.emit(f"{b.py} = {H}Namespace({s.path!r}, {H}import_file({where!r}))")
+            return
         if s.names is not None:
             for n, a in s.names:
                 b = self.declare(scope, a or n)
-                self.emit(f"{b.py} = {HELPER_PREFIX}mods[{s.path!r}][{n!r}]")
+                self.emit(f"{b.py} = {H}mods[{s.path!r}][{n!r}]")
             return
-        if s.alias:
-            b = self.declare(scope, s.alias)
-            self.emit(f"{b.py} = {HELPER_PREFIX}namespace({s.path!r})")
+        if s.alias or s.py:
+            b = self.declare(scope, s.alias or s.path)
+            self.emit(f"{b.py} = {H}namespace({s.path!r})")
             return
         for name in mods[s.path]:
             b = self.declare(scope, name)
-            self.emit(f"{b.py} = {HELPER_PREFIX}mods[{s.path!r}][{name!r}]")
-        if "." not in s.path and s.path not in mods[s.path] and scope.lookup(s.path) is None and s.path not in self.rt.interp.globals.vars:
+            self.emit(f"{b.py} = {H}mods[{s.path!r}][{name!r}]")
+        if "." not in s.path and s.path not in mods[s.path] and scope.lookup(s.path) is None and s.path not in interp.globals.vars:
             b = self.declare(scope, s.path)                            # `use rl` also allows rl.ppo(...)
-            self.emit(f"{b.py} = {HELPER_PREFIX}namespace({s.path!r})")
+            self.emit(f"{b.py} = {H}namespace({s.path!r})")
 
     def s_Import(self, s, scope):
         path = s.path if os.path.isabs(s.path) else os.path.join(self.rt.base_dir, s.path)
@@ -1583,11 +1615,15 @@ class Runtime:
         self._checkers = {}                 # id(type AST) -> (type AST, checker): one checker per annotation
         self._plans = {}                    # id(struct) -> (struct, [(field, checker, message)])
         structs = self.structs
+        self.lookup_global = None           # set by Compiled: a module-level name of the program (classes in annotations)
+        rt = self
 
         class _Env:
             def lookup(self, name):
                 if name in structs:
                     return structs[name]
+                if rt.lookup_global is not None:
+                    return rt.lookup_global(name)
                 raise KeyError(name)
         self._env = _Env()
 
@@ -2061,12 +2097,20 @@ class Compiled:
             f"{HELPER_PREFIX}namespace": lambda p: Namespace(p, interp.modules[p]),
             f"{HELPER_PREFIX}Namespace": Namespace,
             f"{HELPER_PREFIX}import_file": lambda p: interp.import_compiled(p),
+            f"{HELPER_PREFIX}pyimp": interp.py_import, f"{HELPER_PREFIX}pymem": interp.py_member,
             f"{HELPER_PREFIX}struct": rt.struct, f"{HELPER_PREFIX}shape_bind": rt.shape_bind,
             f"{HELPER_PREFIX}evolve": rt.evolve,
             f"{HELPER_PREFIX}add_test": lambda name, fn, line: tests.append((name, fn, line)),
             f"{HELPER_PREFIX}builtins": __import__("builtins"),     # built-in types in case patterns
         })
         self.globals = g
+
+        def lookup_global(name):
+            b = self.module_scope.names.get(name)
+            if b is None or b.py not in g:
+                raise KeyError(name)
+            return g[b.py]
+        self.rt.lookup_global = lookup_global
 
     def run(self):
         if self.module.__name__ == "__main__":

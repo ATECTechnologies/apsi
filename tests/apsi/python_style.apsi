@@ -52,3 +52,67 @@ test "def and Python type names":
     assert Point(3.0, 4.0).norm2() == 25.0
     let defined = {"def": 1}
     assert defined["def"] == 1
+
+import json
+import collections as col
+from dataclasses import dataclass, field
+from typing import List, Optional
+from functools import reduce
+
+@dataclass
+class Item:
+    name: str
+    price: float = 0.0
+    tags: list = field(default_factory=list)
+
+def total(items: List[Item], extra: Optional[float] = None) -> float:
+    t = 0.0
+    for it in items:
+        t += it.price
+    if extra is not None:
+        t += extra
+    return t
+
+class Registry:
+    count = 0
+    def __init__(self):
+        Registry.count += 1
+
+test "Python imports, dataclasses and typing":
+    assert json.loads(json.dumps({"a": [1, 2]}))["a"] == [1, 2]
+    assert col.Counter("aab")["a"] == 2
+    assert reduce(lambda a, b: a + b, [1, 2, 3]) == 6
+    assert total([Item("a", 1.5), Item("b", 2.0)], extra=0.5) == 4.0
+    assert Item("x").tags == []
+    Registry()
+    Registry()
+    assert Registry.count == 2
+
+test "plain assignment declares like Python":
+    x = 1
+    if x > 0:
+        y = "pos"
+    else:
+        y = "neg"
+    assert y == "pos"
+    a, *rest = [1, 2, 3]
+    assert rest == [2, 3]
+    n: int = 5
+    n += 1
+    assert n == 6
+    assert None is none and True == true and False == false
+    assert type(3).__name__ == "int" and type("s") == str and type(Item("q")).__name__ == "Item"
+    assert r"\d+" == "\\d+"
+
+def stub(self): ...
+
+test "a function local does not touch a module name of the same spelling":
+    assert counter_after() == 0
+
+counter = 0
+def bump():
+    counter = 5
+    return counter
+def counter_after():
+    bump()
+    return counter

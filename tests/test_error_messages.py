@@ -26,13 +26,13 @@ CASES = [
     ("let x = 1\nif x > 0:\n    print(1)\nelse if x < 0:\n    print(2)\n", ["write 'elif'"], None),
     ('print "hi"\n', ["print is a function"], None),
     ("var x = 1\nx++\n", ["write x += 1"], None),
-    ("let a = True\n", ["Apsi writes 'true'"], None),
+    ("let a = nil\n", ["Apsi writes 'none'"], None),
     ("let b = null\n", ["Apsi writes 'none'"], None),
     ("let a = 1\nif a > 0 && a < 3:\n    print(1)\n", ["Apsi writes 'and'"], None),
     ("let v = 3[m]\nprint(v + 1)\n", ["give the number a unit too, e.g. 1[m]"], None),
     ("fn f(a, b=1, c):\n    return a\n", ["parameter 'c' needs a default value"], None),
     ('let d = {"a": 1}\nfor k, v in d:\n    print(k)\n', ["d.items()"], None),
-    ("import os\n", ["use os"], None),
+    ("import os\n", ["needs permission 'python'"], None),
 ]
 
 

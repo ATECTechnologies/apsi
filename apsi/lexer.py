@@ -247,6 +247,34 @@ def _tokenize(src):
                     line_start = j + 1 + text.rfind("\n") + 1
                 i = end + len(close)
                 continue
+        # Python raw strings: r"…" r'…' rb"…" br"…" (and triple-quoted): backslashes stay as they are
+        if c in "rRbB" and (i == 0 or not (src[i - 1].isalnum() or src[i - 1] == "_")):
+            k = i + 1
+            if k < n and src[k] in "rRbB" and src[k].lower() != c.lower():
+                k += 1
+            pre = src[i:k].lower()
+            if "r" in pre and k < n and (src[k] == '"' or (src[k] == "'" and _single_quote_string(src, k, True))):
+                qc = src[k]
+                q = qc * 3 if src.startswith(qc * 3, k) else qc
+                j = k + len(q)
+                while j < n and not src.startswith(q, j):
+                    if src[j] == "\\":
+                        j += 1
+                    elif src[j] == "\n" and len(q) == 1:
+                        raise LexError("unterminated string", line, start_col)
+                    j += 1
+                if j >= n:
+                    raise LexError("unterminated string", line, start_col)
+                text = src[k + len(q):j]
+                if "b" in pre:
+                    add(BYTES, text.encode("latin-1", "backslashreplace"), c=start_col)
+                else:
+                    add(STRING, text, c=start_col)
+                line += text.count("\n")
+                if "\n" in text:
+                    line_start = k + len(q) + text.rfind("\n") + 1
+                i = j + len(q)
+                continue
         # strings -------------------------------------------------------
         if c == '"' or (c in "fb" and i + 1 < n and src[i + 1] == '"') or \
                 (c == "'" and _single_quote_string(src, i)) or \

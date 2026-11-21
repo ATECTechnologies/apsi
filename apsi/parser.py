@@ -27,10 +27,17 @@ _QIDS = itertools.count(1)          # hidden names for `??` and `?.` (each value
 
 
 _DEF_AFTER = (NEWLINE, INDENT, DEDENT)
+_BLOCK_WORDS = {"try", "finally", "except", "else", "with", "match", "case", "class", "async", "elif", "while",
+                "for", "if", "def", "lambda", "default"}
+_PY_CONSTS = {"None": "none", "True": "true", "False": "false"}
 
 
 def _python_def(toks):
     """Python's `def name(...)` at the start of a statement (or after `async`) is Apsi's `fn name(...)`."""
+    for j, t in enumerate(toks):                       # Python's None / True / False
+        if t.type == NAME and t.value in _PY_CONSTS and not (j and toks[j - 1].type == OP
+                                                             and toks[j - 1].value in (".", "?.")):
+            t.type, t.value = KW, _PY_CONSTS[t.value]
     for j in range(len(toks) - 2):
         t = toks[j]
         if t.type == NAME and t.value == "def" and toks[j + 1].type == NAME \
@@ -44,12 +51,107 @@ _PY_TYPES = {"int": "Int", "float": "Float", "str": "Str", "bool": "Bool", "list
              "tuple": "Tuple"}
 
 
+def _target_names(t, out):
+    if isinstance(t, A.Name):
+        out.append(t.id)
+    elif isinstance(t, (A.TupleLit, A.ListLit)):
+        for x in t.items:
+            _target_names(x.value if isinstance(x, A.Spread) else x, out)
+
+
+def _pattern_names(p, out):
+    if isinstance(p, str):
+        out.append(p)
+    elif isinstance(p, tuple):
+        out.append(p[1])
+    elif isinstance(p, list):
+        for x in p:
+            _pattern_names(x, out)
+
+
+def _scan_scope(stmts, explicit, assigned, glob, nested, depth=0):
+    """One scope's statements (not the bodies of nested functions and classes, which go to `nested`)."""
+    for s in stmts:
+        k = type(s)
+        if k is A.Assign:
+            for t in [s.target] + list(s.more or ()):
+                _target_names(t, assigned)
+        elif k is A.Let:
+            _pattern_names(list(s.targets), explicit)
+        elif k in (A.FnDef, A.StructDef, A.ClassDef):
+            explicit.append(s.name)
+            nested.append(s)
+        elif k is A.Global:
+            glob.extend(s.names)
+        elif k in (A.Use, A.Import):
+            got = explicit if depth == 0 else assigned        # an import inside a block: visible after it (Python)
+            if s.alias:
+                got.append(s.alias)
+            elif getattr(s, "py", None):
+                got.append(s.path.split(".")[0])
+            for n, a in s.names or ():
+                got.append(a or n)
+        elif k is A.Test:
+            nested.append(s)
+        elif k is A.If:
+            for _c, body in s.branches:
+                _scan_scope(body, explicit, assigned, glob, nested, depth + 1)
+            _scan_scope(s.else_body or (), explicit, assigned, glob, nested, depth + 1)
+        elif k in (A.While, A.For):
+            _scan_scope(s.body, explicit, assigned, glob, nested, depth + 1)
+            _scan_scope(s.else_body or (), explicit, assigned, glob, nested, depth + 1)
+        elif k is A.Try:
+            _scan_scope(s.body, explicit, assigned, glob, nested, depth + 1)
+            for _kinds, _name, body in s.handlers:
+                _scan_scope(body, explicit, assigned, glob, nested, depth + 1)
+            _scan_scope(s.else_body or (), explicit, assigned, glob, nested, depth + 1)
+            _scan_scope(s.final_body or (), explicit, assigned, glob, nested, depth + 1)
+        elif k is A.With:
+            _scan_scope(s.body, explicit, assigned, glob, nested, depth + 1)
+        elif k is A.Match:
+            for _p, _g, body in s.cases:
+                _scan_scope(body, explicit, assigned, glob, nested, depth + 1)
+
+
+def _python_locals(body, outer, params, is_class=False):
+    """Python's rule for plain assignments: `x = 1` where x is declared nowhere (no let/var/parameter here or in an
+    enclosing scope) makes x a variable of the enclosing function (or module, or class body), visible after the
+    block it was assigned in. Names declared with let/var keep Apsi's rules. Inserts an A.Declare at the top."""
+    explicit, assigned, glob, nested = list(params), [], [], []
+    _scan_scope(body, explicit, assigned, glob, nested)
+    known = set(explicit) | set(glob) | set(outer)
+    new = []
+    for n in assigned:
+        if n not in known:
+            known.add(n)
+            new.append(n)
+    if new:
+        at = 1 if body and isinstance(body[0], A.ExprStmt) and isinstance(body[0].expr, A.Str) else 0
+        line = body[at].line if at < len(body) else 0
+        body.insert(at, A.Declare(new, line=line, col=1))
+    # only explicit declarations reach inside; a class body's names do not reach its methods (Python's rule)
+    inner = tuple(outer) if is_class else tuple(set(outer) | set(explicit) | set(glob))
+    for s in nested:
+        if isinstance(s, A.FnDef):
+            if not s.is_expr and isinstance(s.body, list):
+                _python_locals(s.body, inner, {p.name for p in s.params if p.name})
+        elif isinstance(s, A.ClassDef):
+            _python_locals(s.body, inner, set(), is_class=True)
+        elif isinstance(s, A.StructDef):
+            for m in s.methods:
+                if isinstance(m, A.FnDef) and not m.is_expr and isinstance(m.body, list):
+                    _python_locals(m.body, inner, {p.name for p in m.params if p.name})
+        elif isinstance(s, A.Test):
+            _python_locals(s.body, inner, set())
+
+
 class Parser:
     def __init__(self, tokens):
         self.last = len(tokens) - 1
         self.t = tokens + [tokens[-1]] * 8 if tokens else tokens   # EOF padding: peek(k) needs no bounds check
         self.i = 0
         self.pyc = False             # after `use pycompat`: `^` is Python's exclusive or
+        self.queued = []             # more statements from one line (`import a, b`)
         _python_def(self.t)
 
     # -- token helpers ---------------------------------------------------
@@ -157,6 +259,8 @@ class Parser:
             if self.peek().type == INDENT:
                 self.error("unexpected indentation")
             body.append(self.statement())
+            body.extend(self._drain())
+        _python_locals(body, (), set())
         return A.Program(body, line=1, col=1)
 
     def block(self):
@@ -172,10 +276,17 @@ class Parser:
                     self.next()
                     continue
                 body.append(self.statement())
+                body.extend(self._drain())
             if self.peek().type == DEDENT:
                 self.next()
             return body
-        return [self.statement()]
+        return [self.statement()] + self._drain()
+
+    def _drain(self):
+        if not self.queued:
+            return []
+        out, self.queued = self.queued, []
+        return out
 
     # -- statements ------------------------------------------------------
     def _soft(self, word):
@@ -209,6 +320,9 @@ class Parser:
                 and self.peek(3).type in (NEWLINE, EOF):
             op = self.peek(1).value
             self.error(f"Apsi has no {op}{op}: write {tok.value} {op}= 1", self.peek(1))
+        if tok.type == NAME and self.at_op(":", 1) and tok.value not in _BLOCK_WORDS \
+                and self.peek(2).type not in (NEWLINE, EOF, INDENT):
+            return self.annotated_assign()                     # Python's x: int = 5
         if tok.type == OP and tok.value == "@":
             return self.decorated()
         if tok.type == NAME and tok.value == "async" and (self.at_kw("fn", 1) or self.at_word("with", 1)
@@ -282,10 +396,11 @@ class Parser:
                 return self.use_stmt()
             if v == "import":
                 self.next()
+                if self.peek().type == NAME:
+                    return self.python_import(tok)
                 if self.peek().type != STRING:
-                    nm = self.peek()
-                    hint = f"; to load a module write: use {nm.value}" if nm.type == NAME else ""
-                    self.error('expected a file path string after import, e.g. import "lib.apsi"' + hint)
+                    self.error('expected a module name or a file path string after import, e.g. import json or '
+                               'import "lib.apsi"')
                 path = self.next().value
                 alias = None
                 if self.accept_kw("as"):
@@ -643,6 +758,7 @@ class Parser:
                     self.next()
                     continue
                 body.append(self.class_item())
+                body.extend(self._drain())
             if self.peek().type == DEDENT:
                 self.next()
         else:
@@ -895,6 +1011,32 @@ class Parser:
         if parts == ["pycompat"] and alias is None:
             self.pyc = True
         return A.Use(".".join(parts), alias, **self.pos(tok))
+
+    def annotated_assign(self):
+        tok = self.next()
+        self.next()
+        t = self.type_expr()
+        if self.accept_op("="):
+            val = self.rhs()
+            self.expect_eol()
+            return A.Let([tok.value], t, val, True, **self.pos(tok))
+        self.expect_eol()
+        return A.Declare([tok.value], **self.pos(tok))
+
+    def python_import(self, tok):
+        """import json / import os.path / import numpy as np / import a, b — Python's import (see A.Use.py)."""
+        nodes = []
+        while True:
+            parts = [self.expect_name(" after 'import'").value]
+            while self.accept_op("."):
+                parts.append(self.expect_name().value)
+            alias = self.expect_name(" after 'as'").value if self.accept_kw("as") else None
+            nodes.append(A.Use(".".join(parts), alias, None, True, **self.pos(tok)))
+            if not self.accept_op(","):
+                break
+        self.expect_eol()
+        self.queued.extend(nodes[1:])
+        return nodes[0]
 
     def from_import(self):
         """from MODULE import a, b as c   /   from "file.apsi" import a   /   from MODULE import (a, b)"""
@@ -1367,6 +1509,11 @@ class Parser:
             if tok.value == "fn":
                 return self.expr()
         if tok.type == OP:
+            if tok.value == ".." and self.at_op(".", 1) and self.peek(1).line == tok.line \
+                    and self.peek(1).col == tok.col + 2:
+                self.next()
+                self.next()
+                return A.Name("Ellipsis", **p)                 # Python's `...`
             if tok.value == "(":
                 self.next()
                 if self.accept_op(")"):

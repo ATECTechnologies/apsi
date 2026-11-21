@@ -424,6 +424,53 @@ def _setattr(obj, name, value):
         _safe_setattr(obj, name, value)
 
 
+class TypeName(str):
+    """What type(x) returns: Apsi's type name ("Int", "Account", …), which also behaves like Python's type object
+    for Python habits: type(x).__name__, type(self)(args), type(x) == int."""
+    __slots__ = ("py",)
+
+    def __new__(cls, name, py):
+        o = str.__new__(cls, name)
+        o.py = py
+        return o
+
+    @property
+    def __name__(self):
+        return self.py.__name__ if isinstance(self.py, type) and self.py.__module__ != "builtins" or \
+            self.py in (int, float, str, bool, list, dict, tuple, set, bytes, type(None)) else str(self)
+
+    def __call__(self, *a, **k):
+        return self.py(*a, **k)
+
+    def __eq__(self, other):
+        if isinstance(other, type):
+            return self.py is other
+        if callable(other) and not isinstance(other, str):     # Apsi's str/int/float/list conversions
+            return getattr(other, "__module__", "") == __name__ and \
+                getattr(other, "__name__", "") == "_" + getattr(self.py, "__name__", "")
+        return str.__eq__(self, other)
+
+    def __ne__(self, other):
+        return not self.__eq__(other)
+
+    __hash__ = str.__hash__
+
+
+def _type_of(v):
+    if isinstance(v, (bool, np.bool_)):
+        py = bool
+    elif isinstance(v, (int, np.integer)):
+        py = int
+    elif isinstance(v, (float, np.floating)):
+        py = float
+    else:
+        py = type(v)
+    name = type_name(v)
+    if name == "Fn" and not isinstance(v, type) and getattr(type(v), "__module__", "") in ("__apsi__", "__main__"):
+        name = type(v).__name__                       # an instance of a class with __call__
+    return TypeName(name, py)
+
+
 def _safe_setattr(obj, name, value):
     """Setting a public attribute of an ordinary object (decimal's context.prec = 50, a dataclass field…).
     Modules, classes, functions and built-in objects stay read-only, so the sandbox cannot be bent."""
@@ -1404,7 +1451,7 @@ def core_builtins():
         "shr": _bitop("shr"), "bnot": _bnot, "set": set, "frozenset": frozenset,
         # io & conversion
         "print": _print, "str": _str, "int": _int, "float": _float, "bool": bool,
-        "len": _len, "range": _range, "type": type_name, "error": _error,
+        "len": _len, "range": _range, "type": _type_of, "error": _error,
         "native": _native, "native_threads": _native_threads, "native_info": _native_info,
         "gpu": _gpu, "gpu_info": _gpu_info, "to_gpu": _to_gpu, "to_host": _to_host,
         "gpu_tensor": _gpu_tensor, "gpu_device": _gpu_device,

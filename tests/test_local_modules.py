@@ -58,7 +58,7 @@ class LocalModules(unittest.TestCase):
         for engine in ("compile", "interp"):
             for src, msg in (("from geom import _hidden\n", "no public name '_hidden'"),
                              ("from geom import ORIGN\n", "did you mean 'ORIGIN'"),
-                             ("from math import sqrtt\n", "no public name 'sqrtt'"),
+                             ("from math import sqrtt\n", "no name 'sqrtt'"),
                              ("use nowhere\n", "put nowhere.apsi next to this file")):
                 with self.assertRaises((ApsiError, CheckFailed)) as cm:
                     self.run_file("bad.apsi", src, engine)
