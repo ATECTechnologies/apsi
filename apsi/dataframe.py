@@ -92,8 +92,19 @@ def _col(x, n=None):
     return _infer(list(x))
 
 
+_FAST_KINDS = {int: "int", float: "float", bool: "bool", str: "str", type(None): "null"}
+
+
 def _infer(items):
     """A typed column from Python values (ints → int64, floats → float64, bools, strings → dictionary)."""
+    types = set(map(type, items))                            # C speed; the loop below only for other types
+    if types <= _FAST_KINDS.keys():
+        kinds = {_FAST_KINDS[t] for t in types}
+        if float in types and "null" not in kinds and any(v != v for v in items):
+            kinds.add("null")
+        elif float in types and "null" in kinds:
+            pass
+        return _from_kinds(items, kinds)
     kinds = set()
     for v in items:
         if v is None or (isinstance(v, float) and v != v):
@@ -108,6 +119,10 @@ def _infer(items):
             kinds.add("str")
         if len(kinds) > 2:
             break
+    return _from_kinds(items, kinds)
+
+
+def _from_kinds(items, kinds):
     k = kinds - {"null"}
     if k == {"bool"} and "null" not in kinds:
         return np.array(items, dtype=bool)
@@ -436,8 +451,19 @@ class DataFrame:
             self._cols = dict(data._cols)
             return
         if isinstance(data, list) and data and isinstance(data[0], dict):
-            keys = list(dict.fromkeys(k for r in data for k in r))
-            data = {k: [r.get(k) for r in data] for k in keys}
+            first = list(data[0])
+            n0 = len(first)
+            k0 = data[0].keys()
+            if all(isinstance(r, dict) for r in data) and all(map(k0.__eq__, map(dict.keys, data))):
+                if n0 == 1:
+                    data = {first[0]: [r[first[0]] for r in data]}
+                else:                                        # every row has the same keys: one C-speed pass
+                    import operator
+                    cols = zip(*map(operator.itemgetter(*first), data))
+                    data = dict(zip(first, map(list, cols)))
+            else:
+                keys = list(dict.fromkeys(k for r in data for k in r))
+                data = {k: [r.get(k) for r in data] for k in keys}
         elif isinstance(data, list) and columns:
             data = {c: [r[i] for r in data] for i, c in enumerate(columns)}
         n = None
@@ -1177,12 +1203,20 @@ def read_jsonl(path, interp=None):
     if it is not None:
         from .security import check_path
         path = check_path(it, path, "read", "read_jsonl()")
-    rows = []
-    with open(path, encoding="utf-8-sig") as f:
-        for line in f:
-            line = line.strip()
-            if line:
-                rows.append(json.loads(line))
+    with open(path, "rb") as f:
+        data = f.read()
+    if data.startswith(b"\xef\xbb\xbf"):
+        data = data[3:]
+    lines = [ln for ln in data.split(b"\n") if ln.strip()]
+    try:                                                     # one parse of the whole file: much faster
+        rows = json.loads(b"[" + b",".join(lines) + b"]")
+    except ValueError:
+        rows = []
+        for i, ln in enumerate(lines):                      # find the bad line for the message
+            try:
+                rows.append(json.loads(ln))
+            except ValueError as e:
+                raise RuntimeErr(f"read_jsonl(): record {i + 1} (not counting empty lines) is not valid JSON ({e})") from None
     return DataFrame(rows) if rows else DataFrame()
 
 
