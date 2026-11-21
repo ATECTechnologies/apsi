@@ -179,15 +179,52 @@ test "greet says hello":
 ''',
     },
     "lib": {
-        "desc": "a reusable library that other files import",
-        "main": '''# {name} — library. Other programs use it with:  use {ident}   (after: apsi pack, apsi publish, apsi install {name})
+        "desc": "a reusable library that other files import (split into files, with tests, an example and API docs)",
+        "main": '''"""{name} — a library. Other programs use it with `use {ident}` or `from {ident} import clamp`
+(after: apsi pack, then apsi publish or apsi install dist/<file>.apsil)."""
 
+# The public API: what `use {ident}` gives. The code lives in the files next to this one.
+from .numeric import clamp, lerp, mean_of
+from .stats import Summary, summarize
+
+__all__ = ["clamp", "lerp", "mean_of", "Summary", "summarize", "VERSION"]
+
+VERSION = "0.1.0"
+''',
+        "files": {
+            "src/numeric.apsi": '''# Small numeric helpers. Units work: lerp(0m, 10m, 0.25) is 2.5 m.
+
+# x limited to the range lo..hi.
 fn clamp(x, lo, hi) = min(max(x, lo), hi)
 
+# The point a fraction t of the way from a to b.
 fn lerp(a, b, t: Float) = a + (b - a) * t
 
-fn mean_of(xs: List) = sum(xs) / len(xs)
+# The arithmetic mean of a non-empty list.
+fn mean_of(xs: List):
+    if len(xs) == 0:
+        raise ValueError("mean_of() of an empty list")
+    return sum(xs) / len(xs)
 ''',
+            "src/stats.apsi": '''from .numeric import mean_of
+
+# Count, mean, smallest and largest value of a list.
+struct Summary:
+    count: Int
+    mean: Float
+    low: Float
+    high: Float
+    fn to_str(self) = f"n={{self.count}} mean={{self.mean:.3g}} range={{self.low}}..{{self.high}}"
+
+fn summarize(xs: List) -> Summary = Summary(len(xs), mean_of(xs), min(xs), max(xs))
+''',
+            "examples/basic.apsi": '''import "../src/main.apsi"
+
+print(clamp(12, 0, 10))
+print(summarize([3.0, 1.0, 4.0, 1.0, 5.0]))
+''',
+            "CHANGELOG.md": "# Changelog\n\n## 0.1.0\n\n- First version.\n",
+        },
         "test": '''import "../src/main.apsi"
 
 test "clamp keeps values in range":
@@ -196,6 +233,18 @@ test "clamp keeps values in range":
 
 test "lerp works with units":
     assert lerp(0m, 10m, 0.25) ~= 2.5m
+
+test "summary of a list":
+    let s = summarize([1.0, 2.0, 3.0])
+    assert s.count == 3 and s.mean == 2.0 and s.low == 1.0 and s.high == 3.0
+
+test "mean of an empty list is an error":
+    var failed = false
+    try:
+        mean_of([])
+    except ValueError:
+        failed = true
+    assert failed
 ''',
     },
     "physics": {
@@ -331,8 +380,9 @@ test = "apsi test tests"
 check = "apsi check src"
 fmt = "apsi fmt src tests"
 ci = ["apsi check src", "apsi fmt --check src tests", "apsi test tests"]
-''' + (f'''pack = "apsi pack"
-publish = ["apsi pack", "apsi publish"]
+''' + (f'''doc = "apsi doc src --out API.md"
+pack = ["apsi check src", "apsi test tests", "apsi pack"]
+publish = ["apsi check src", "apsi test tests", "apsi pack", "apsi publish"]
 
 [package]                       # `apsi pack` builds dist/NAME-VERSION.apsil; `apsi publish` uploads it
 entry = "{main}"                # what `use NAME` loads
@@ -340,7 +390,7 @@ summary = ""
 license = ""
 authors = []
 keywords = []
-include = ["src/**", "README*", "LICENSE*", "examples/**"]
+include = ["src/**", "README*", "LICENSE*", "CHANGELOG*", "API.md", "examples/**"]
 
 [dependencies]                  # other libraries: name = "^1.2"
 ''' if template == "lib" else "")
@@ -355,12 +405,14 @@ def scaffold(root, name, template="app", vscode=True, force=False):
     files = {
         CONFIG: _toml(name, main, template),
         main: t["main"].format(name=name, ident=ident),
-        "README.md": f"# {name}\n\nAn [Apsi](https://github.com/apsi-lang/apsi) project.\n\n"
+        "README.md": f"# {name}\n\nAn [Apsi](https://github.com/ATECTechnologies/apsi) project.\n\n"
                      "```\napsi run            # run src/main.apsi\napsi test           # run tests/\n"
                      "apsi task           # list project tasks\napsi watch src      # re-run on every save\n```\n",
         ".gitignore": GITIGNORE,
         ".editorconfig": EDITORCONFIG,
     }
+    for rel, text in t.get("files", {}).items():
+        files[rel] = text.format(name=name, ident=ident)
     if t["test"]:
         files["tests/main_test.apsi"] = t["test"]
     else:

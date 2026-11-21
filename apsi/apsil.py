@@ -208,12 +208,23 @@ def installed(project_dir=None, include_global=True):
 
 
 def local_module(name, base):
-    """The file `use NAME` loads from the program's own folder: NAME.apsi next to the importing file (a dotted
-    name is a sub-folder: `use shapes.circle` -> shapes/circle.apsi), or None."""
-    if not base or not name or not all(p.isidentifier() for p in name.split(".")):
+    """The file `use NAME` loads from the program's own folder: NAME.apsi next to the importing file, or a folder
+    NAME/ with __init__.apsi or main.apsi in it (a package). A dotted name is a sub-folder: `use shapes.circle` ->
+    shapes/circle.apsi. Leading dots are relative to the importing file's folder: `.geom` next to it, `..util` one
+    folder up. None when there is no such file."""
+    if not base or not name:
         return None
-    p = os.path.join(base, *name.split(".")) + ".apsi"
-    return os.path.abspath(p) if os.path.isfile(p) else None
+    rest = name.lstrip(".")
+    dots = len(name) - len(rest)
+    for _ in range(max(0, dots - 1)):
+        base = os.path.dirname(base)
+    if not rest or not all(p.isidentifier() for p in rest.split(".")):
+        return None
+    p = os.path.join(base, *rest.split("."))
+    for cand in (p + ".apsi", os.path.join(p, "__init__.apsi"), os.path.join(p, "main.apsi")):
+        if os.path.isfile(cand):
+            return os.path.abspath(cand)
+    return None
 
 
 def resolve_use(name, start_dir=None):

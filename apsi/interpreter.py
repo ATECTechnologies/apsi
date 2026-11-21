@@ -655,7 +655,11 @@ class Interpreter:
             pm = _sys.modules.get(parent) if parent else None
             if pm is not None and getattr(pm, leaf, None) is None:
                 setattr(pm, leaf, mod)          # importing pkg.sub makes it pkg's attribute (also when loaded first)
-        return {k: v for k, v in self.module_cache[path].vars.items() if not k.startswith("_")}
+        vars_ = self.module_cache[path].vars
+        listed = vars_.get("__all__")
+        if isinstance(listed, (list, tuple)):
+            return {k: vars_[k] for k in listed if k in vars_}
+        return {k: v for k, v in vars_.items() if not k.startswith("_")}
 
     def run_tests(self, report=print):
         passed, failed = 0, []
@@ -1087,6 +1091,8 @@ class Interpreter:
         local = local_module(path, base)
         if local is not None and local in self._ran and local not in self.module_cache:
             local = None                                       # json.apsi saying `import json`: Python's json
+        if path.startswith("."):                               # relative: only the program's own files
+            return ("local", local) if local is not None else (None, None)
         if py:
             if local is not None:
                 return "local", local
@@ -1179,7 +1185,11 @@ class Interpreter:
             finally:
                 self.importing.pop()
             self.module_cache[path] = menv
-        return {k: v for k, v in self.module_cache[path].vars.items() if not k.startswith("_")}
+        vars_ = self.module_cache[path].vars
+        listed = vars_.get("__all__")
+        if isinstance(listed, (list, tuple)):
+            return {k: vars_[k] for k in listed if k in vars_}
+        return {k: v for k, v in vars_.items() if not k.startswith("_")}
 
     def ex_Import(self, s, env):
         path = s.path

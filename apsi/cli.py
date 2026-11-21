@@ -941,9 +941,11 @@ def _parser(light=False):
     perm_flags(p)
     p.set_defaults(fn=lambda a: _tools.cmd_bench(a, _make_interp, _read, _report))
 
-    p = sub.add_parser("doc", help="documentation for built-ins and modules (apsi doc nn, apsi doc sqrt)")
+    p = sub.add_parser("doc", help="documentation for built-ins and modules (apsi doc nn, apsi doc sqrt), or the API "
+                                   "of your own code (apsi doc src --out API.md)")
     p.add_argument("name", nargs="?")
     p.add_argument("filter", nargs="?", help="only list names containing this text")
+    p.add_argument("--out", help="with a file or folder: write the Markdown here")
     p.set_defaults(fn=_tools.cmd_doc)
 
     p = sub.add_parser("completion", help="print a shell completion script (bash, zsh, fish, powershell)")

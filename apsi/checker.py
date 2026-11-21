@@ -527,6 +527,7 @@ class Checker:
 
     def _file_names(self, s, path, shown):
         """The public top-level names of an .apsi file (name -> 'struct' for types, else 'builtin'), or None."""
+        from .parser import static_public
         try:
             self.deps.append(path)
             with open(path, encoding="utf-8-sig") as fh:
@@ -534,20 +535,7 @@ class Checker:
         except (ParseError, LexError) as e:
             self.err(s, f"cannot parse '{shown}': {e.msg}")
             return None
-        out = {}
-        for st in prog.body:
-            if isinstance(st, A.Let):
-                names = [t for t in st.targets if isinstance(t, str)]
-            elif isinstance(st, A.Assign) and isinstance(st.target, A.Name):
-                names = [st.target.id]
-            elif isinstance(st, (A.FnDef, A.StructDef, A.ClassDef)):
-                names = [st.name]
-            else:
-                names = []
-            for n in names:
-                if not n.startswith("_"):
-                    out[n] = "struct" if isinstance(st, (A.StructDef, A.ClassDef)) else "builtin"
-        return out
+        return static_public(prog)
 
     def c_Import(self, s, sc, top):
         path = s.path if os.path.isabs(s.path) else os.path.join(self.base_dir, s.path)

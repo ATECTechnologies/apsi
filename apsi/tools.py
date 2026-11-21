@@ -161,9 +161,20 @@ def _kind(v):
 def cmd_doc(args):
     from .interpreter import Interpreter
     from .repl import _signature, _docstring
+    name = args.name
+    if name and (name.endswith(".apsi") or os.path.isdir(name)):
+        from .apidoc import document
+        text = document(name)
+        out = getattr(args, "out", None)
+        if out:
+            with open(out, "w", encoding="utf-8") as fh:
+                fh.write(text)
+            print(f"wrote {out}")
+        else:
+            print(text)
+        return 0
     it = Interpreter()
     mods = it.modules
-    name = args.name
     if not name:
         print("Modules (use NAME to import with `use NAME`):")
         for m in sorted(mods):

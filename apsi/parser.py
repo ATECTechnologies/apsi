@@ -145,6 +145,34 @@ def _python_locals(body, outer, params, is_class=False):
             _python_locals(s.body, inner, set())
 
 
+def static_public(prog):
+    """The public top-level names of a parsed file, name -> "struct" (types) or "builtin": what `import "f.apsi"`
+    and `use f` bring in. A top-level `__all__ = ["a", "b"]` lists them exactly."""
+    out, listed = {}, None
+    for st in prog.body:
+        if isinstance(st, A.Let):
+            names = [t for t in st.targets if isinstance(t, str)]
+        elif isinstance(st, A.Assign) and isinstance(st.target, A.Name):
+            names = [st.target.id]
+        elif isinstance(st, (A.FnDef, A.StructDef, A.ClassDef)):
+            names = [st.name]
+        elif isinstance(st, A.Use) and st.names is not None:
+            names = [a or n for n, a in st.names]
+        else:
+            names = []
+        if names == ["__all__"]:
+            v = st.value
+            if isinstance(v, (A.ListLit, A.TupleLit)) and all(isinstance(x, A.Str) for x in v.items):
+                listed = [x.value for x in v.items]
+            continue
+        for n in names:
+            if not n.startswith("_"):
+                out[n] = "struct" if isinstance(st, (A.StructDef, A.ClassDef)) else "builtin"
+    if listed is not None:
+        return {n: out.get(n, "builtin") for n in listed}
+    return out
+
+
 class Parser:
     def __init__(self, tokens):
         self.last = len(tokens) - 1
@@ -342,8 +370,10 @@ class Parser:
             m = self.try_match()
             if m is not None:
                 return m
-        if tok.type == NAME and tok.value == "from" and self.peek(1).type in (NAME, STRING) \
-                and (self.at_kw("import", 2) or self.peek(1).type == NAME and self.at_op(".", 2)):
+        if tok.type == NAME and tok.value == "from" and (
+                self.peek(1).type in (NAME, STRING) and (self.at_kw("import", 2) or self.peek(1).type == NAME
+                                                         and self.at_op(".", 2))
+                or self.peek(1).type == OP and self.peek(1).value in (".", "..")):
             return self.from_import()
         if self._soft("del"):
             self.next()
@@ -1041,9 +1071,26 @@ class Parser:
     def from_import(self):
         """from MODULE import a, b as c   /   from "file.apsi" import a   /   from MODULE import (a, b)"""
         tok = self.next()
+        dots = ""
+        while self.at_op(".") or self.at_op(".."):
+            dots += self.next().value
+        if dots and self.at_kw("import"):                      # from . import geom, shapes as sh
+            self.next()
+            nodes = []
+            while True:
+                n = self.expect_name(" to import").value
+                a = self.expect_name(" after 'as'").value if self.accept_kw("as") else None
+                nodes.append(A.Use(dots + n, a or n, None, True, **self.pos(tok)))
+                if not self.accept_op(","):
+                    break
+            self.expect_eol()
+            self.queued.extend(nodes[1:])
+            return nodes[0]
         src = self.next()
-        is_file = src.type == STRING
-        path = src.value
+        is_file = src.type == STRING and not dots
+        if src.type != NAME and not is_file:
+            self.error("expected a module name after 'from'", src)
+        path = dots + src.value
         while not is_file and self.accept_op("."):
             path += "." + self.expect_name().value
         self.expect_kw("import", " after the module name (from MODULE import name)")

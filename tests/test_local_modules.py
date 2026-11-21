@@ -82,3 +82,53 @@ class LocalModules(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class Packages(unittest.TestCase):
+    """Folders as packages, relative imports, __all__, and apsi doc for your own code."""
+
+    def setUp(self):
+        self.dir = tempfile.mkdtemp()
+        files = {
+            "mylib/__init__.apsi": 'from .shapes.circle import area\nfrom .util import fmt2\nfrom . import shapes\n'
+                                   '__all__ = ["area", "fmt2", "shapes", "VERSION"]\nVERSION = "1.0"\nhidden = 2\n',
+            "mylib/shapes/__init__.apsi": "from .circle import area, Circle\n",
+            "mylib/shapes/circle.apsi": "from ..util import fmt2\n# A circle.\nclass Circle:\n"
+                                        "    def __init__(self, r):\n        self.r = r\n"
+                                        "    def describe(self):\n        return fmt2(area(self.r))\n"
+                                        "def area(r):\n    \"\"\"pi r squared\"\"\"\n    return 3.0 * r * r\n",
+            "mylib/util.apsi": 'def fmt2(x):\n    return f"{x:.2f}"\n',
+            "main.apsi": "import mylib\nfrom mylib import area, VERSION\nfrom mylib.shapes import Circle\n"
+                         "let result = [mylib.fmt2(area(1.0)), VERSION, Circle(2.0).describe(), mylib.shapes.area(1.0)]\n",
+        }
+        for rel, src in files.items():
+            path = os.path.join(self.dir, rel)
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            with open(path, "w", encoding="utf-8") as fh:
+                fh.write(src)
+
+    def tearDown(self):
+        shutil.rmtree(self.dir, ignore_errors=True)
+
+    def test_packages_both_engines(self):
+        path = os.path.join(self.dir, "main.apsi")
+        for engine in ("compile", "interp"):
+            with open(path, encoding="utf-8") as fh:
+                env = Interpreter().run(fh.read(), path, engine=engine)
+            self.assertEqual(list(env.vars["result"]), ["3.00", "1.0", "12.00", 3.0], engine)
+
+    def test_all_limits_the_public_names(self):
+        path = os.path.join(self.dir, "bad.apsi")
+        with open(path, "w") as fh:
+            fh.write("from mylib import hidden\n")
+        with self.assertRaises((ApsiError, CheckFailed)) as cm:
+            Interpreter().run("from mylib import hidden\n", path)
+        self.assertIn("no public name 'hidden'", _text(cm.exception))
+
+    def test_api_doc(self):
+        from apsi.apidoc import document
+        md = document(os.path.join(self.dir, "mylib"))
+        self.assertIn("### class `Circle`", md)
+        self.assertIn("pi r squared", md)
+        self.assertIn("A circle.", md)
+        self.assertIn("def fmt2(x)", md)

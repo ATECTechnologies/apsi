@@ -919,21 +919,12 @@ class CodeGen:
             b = self.declare(scope, s.alias)
             self.emit(f"{b.py} = {HELPER_PREFIX}Namespace({os.path.basename(path)!r}, {tmp})")
             return
+        from .parser import static_public
         with open(path, encoding="utf-8-sig") as fh:
             prog = parse(fh.read())
-        for st in prog.body:
-            if isinstance(st, A.Let):
-                names = [t for t in st.targets if isinstance(t, str)]
-            elif isinstance(st, A.Assign) and isinstance(st.target, A.Name):
-                names = [st.target.id]
-            elif isinstance(st, (A.FnDef, A.StructDef, A.ClassDef)):
-                names = [st.name]
-            else:
-                names = []
-            for n in names:
-                if not n.startswith("_"):
-                    b = self.declare(scope, n)
-                    self.emit(f"{b.py} = {tmp}[{n!r}]")
+        for n in static_public(prog):
+            b = self.declare(scope, n)
+            self.emit(f"{b.py} = {tmp}[{n!r}]")
 
     def s_Test(self, s, scope):
         fname = self.fresh("test")
