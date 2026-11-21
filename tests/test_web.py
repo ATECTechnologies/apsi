@@ -165,3 +165,61 @@ class WebServer(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class Proxies(unittest.TestCase):
+    """trust_proxy / allowed_hosts / force_https / production (Cloudflare and local tunnels)."""
+
+    def make(self, **kw):
+        from apsi import web
+        app = web.App(log=False)
+        app.get("/ip", lambda r: {"client": r.client, "scheme": r.scheme, "peer": r.peer})
+        app.production(**kw)
+        return app
+
+    def call(self, app, headers, peer):
+        return app.handle("GET", "/ip", headers=headers, client=peer)
+
+    def test_cloudflare_edge_is_believed(self):
+        app = self.make(domain="example.com", cloudflare=True)
+        r = self.call(app, {"Host": "example.com", "CF-Connecting-IP": "1.2.3.4", "X-Forwarded-Proto": "https"},
+                      "173.245.48.5")
+        self.assertEqual(r.status, 200)
+        self.assertEqual(r.body["client"], "1.2.3.4")
+        self.assertIn("Strict-Transport-Security", r.headers)
+
+    def test_spoofed_headers_from_anyone_else_are_ignored(self):
+        app = self.make(domain="example.com", cloudflare=True)
+        r = self.call(app, {"Host": "example.com", "CF-Connecting-IP": "1.2.3.4", "X-Forwarded-Proto": "https"},
+                      "8.8.8.8")
+        self.assertEqual(r.status, 308)                     # still plain http: sent to https
+        self.assertEqual(r.headers["Location"], "https://example.com/ip")
+        app2 = self.make(cloudflare=True)
+        r = self.call(app2, {"Host": "x", "X-Forwarded-For": "1.2.3.4"}, "8.8.8.8")
+        self.assertEqual(r.body["client"], "8.8.8.8")
+
+    def test_local_tunnel_forwarded_for(self):
+        app = self.make(domain="example.com", cloudflare=True)
+        r = self.call(app, {"Host": "www.example.com", "X-Forwarded-For": "9.9.9.9, 127.0.0.1",
+                            "X-Forwarded-Proto": "https"}, "127.0.0.1")
+        self.assertEqual((r.status, r.body["client"], r.body["scheme"]), (200, "9.9.9.9", "https"))
+
+    def test_other_host_names_refused(self):
+        app = self.make(domain="example.com")
+        self.assertEqual(self.call(app, {"Host": "evil.com"}, "127.0.0.1").status, 421)
+        self.assertEqual(self.call(app, {"Host": "localhost:8080"}, "127.0.0.1").status, 200)
+
+    def test_rate_limit_counts_the_visitor_not_the_proxy(self):
+        app = self.make(cloudflare=True, rate=2)
+        codes = [self.call(app, {"Host": "x", "CF-Connecting-IP": f"1.1.1.{i % 2}"}, "173.245.48.5").status
+                 for i in range(8)]
+        self.assertEqual(codes.count(429), 0)               # two visitors, bursts of 4 each
+        codes = [self.call(app, {"Host": "x", "CF-Connecting-IP": "2.2.2.2"}, "173.245.48.5").status
+                 for _ in range(8)]
+        self.assertIn(429, codes)
+
+    def test_tunnel_command(self):
+        from apsi.tunnel import tunnel_command
+        self.assertEqual(tunnel_command("cf", 8080), ["cf", "tunnel", "--no-autoupdate", "--url",
+                                                       "http://127.0.0.1:8080"])
+        self.assertEqual(tunnel_command("cf", 8080, "site")[-2:], ["run", "site"])

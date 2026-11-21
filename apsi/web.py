@@ -47,7 +47,7 @@ for _ext, _type in ((".mjs", "text/javascript"), (".jsx", "text/javascript"), ("
     mimetypes.add_type(_type, _ext)
 
 STATUS = {200: "OK", 201: "Created", 202: "Accepted", 204: "No Content", 301: "Moved Permanently",
-          302: "Found", 304: "Not Modified", 400: "Bad Request", 401: "Unauthorized", 403: "Forbidden",
+          302: "Found", 304: "Not Modified", 307: "Temporary Redirect", 308: "Permanent Redirect", 421: "Misdirected Request", 400: "Bad Request", 401: "Unauthorized", 403: "Forbidden",
           404: "Not Found", 405: "Method Not Allowed", 408: "Request Timeout", 409: "Conflict",
           413: "Payload Too Large", 415: "Unsupported Media Type", 422: "Unprocessable Entity",
           429: "Too Many Requests", 431: "Request Header Fields Too Large", 500: "Internal Server Error",
@@ -73,16 +73,41 @@ def _next_id():
     return f"{_ID_PREFIX}{next(_ID_COUNT):06x}"
 
 
+CLOUDFLARE_RANGES = (                       # https://www.cloudflare.com/ips (2026-11)
+    "173.245.48.0/20", "103.21.244.0/22", "103.22.200.0/22", "103.31.4.0/22", "141.101.64.0/18",
+    "108.162.192.0/18", "190.93.240.0/20", "188.114.96.0/20", "197.234.240.0/22", "198.41.128.0/17",
+    "162.158.0.0/15", "104.16.0.0/13", "104.24.0.0/14", "172.64.0.0/13", "131.0.72.0/22",
+    "2400:cb00::/32", "2606:4700::/32", "2803:f800::/32", "2405:b500::/32", "2405:8100::/32", "2a06:98c0::/29",
+    "2c0f:f248::/32")
+LOCAL_RANGES = ("127.0.0.0/8", "::1/128")
+
+
 class Request:
-    __slots__ = ("method", "path", "query", "headers", "body", "params", "client", "id", "started", "user")
+    __slots__ = ("method", "path", "query", "headers", "body", "params", "client", "id", "started", "user",
+                 "peer", "scheme")
 
     def __init__(self, method, path, query, headers, body, client):
         self.method, self.path, self.query, self.headers = method, path, query, headers
         self.body, self.client = body, client
+        self.peer = client               # the TCP peer; client is the real visitor once a trusted proxy says so
+        self.scheme = "http"
         self.params = {}
         self.id = _next_id()
         self.started = time.perf_counter()
         self.user = None
+
+    @property
+    def host(self):
+        """The Host header without the port, lower case."""
+        h = self.headers.get("host", "")
+        if h.startswith("["):
+            return h[1:h.find("]")].lower() if "]" in h else h.lower()
+        return h.rsplit(":", 1)[0].lower() if h.count(":") == 1 else h.lower()
+
+    @property
+    def url(self):
+        q = "&".join(f"{k}={v}" for k, v in self.query.items()) if self.query else ""
+        return f"{self.scheme}://{self.headers.get('host', '')}{self.path}{'?' + q if q else ''}"
 
     @property
     def text(self):
@@ -387,6 +412,11 @@ class App:
         self.rooms = {}
         self._rooms_lock = threading.Lock()
         self._gzip = None                # (smallest body compressed, level) once compress() is called
+        self._trusted = None             # trust_proxy(): networks whose forwarding headers are believed
+        self._trust_cache = {}
+        self._hosts = None               # allowed_hosts()
+        self._force_https = False
+        self._hsts = False
 
     # ------------------------------------------------------------- registration
     def route(self, method, path, handler=None):
@@ -454,6 +484,104 @@ class App:
         self.limiter = RateLimiter(rate, per, burst)
         return self
 
+    def trust_proxy(self, *proxies):
+        """Take the visitor's address and https from a proxy in front of this server: "cloudflare" (Cloudflare's
+        published address ranges, CF-Connecting-IP), "local" (a proxy or tunnel on this machine: cloudflared,
+        nginx, Caddy), or address ranges such as "10.0.0.0/8". Only a request whose TCP peer is in these ranges is
+        believed; anyone else's X-Forwarded-For / CF-Connecting-IP headers are ignored. Rate limits and logs then
+        use the real visitor (req.client), and req.scheme is "https" when the proxy says so."""
+        import ipaddress
+        nets = list(self._trusted or ())
+        for p in proxies or ("local",):
+            p = str(p).strip().lower()
+            ranges = CLOUDFLARE_RANGES if p == "cloudflare" else LOCAL_RANGES if p in ("local", "loopback") else [p]
+            for r in ranges:
+                nets.append(ipaddress.ip_network(r, strict=False))
+        self._trusted = tuple(nets)
+        self._trust_cache = {}
+        return self
+
+    def allowed_hosts(self, *hosts):
+        """Answer only requests for these host names (Host header): others get 421. "*.example.com" matches the
+        subdomains. Stops host-header attacks and traffic for names that are not yours."""
+        hs = []
+        for h in hosts:
+            hs.extend(h if isinstance(h, (list, tuple)) else [h])
+        self._hosts = tuple(str(h).lower().strip() for h in hs)
+        return self
+
+    def force_https(self, hsts=True):
+        """Redirect plain-http requests to https (308) and send Strict-Transport-Security on https answers. Behind a
+        proxy (Cloudflare, a tunnel) call trust_proxy first so the server knows which requests came in over https."""
+        self._force_https = True
+        self._hsts = bool(hsts)
+        self._sec_headers = None
+        return self
+
+    def production(self, domain=None, cloudflare=False, rate=None, per=1.0, compress=True):
+        """One call for a public server: security headers, request/connection limits as configured, gzip, a rate
+        limit per visitor (default 50 requests/s, bursts of 100), /health and /ready, and, with a domain, only
+        that domain (and its www.) with https enforced. cloudflare=True trusts Cloudflare's ranges and a local
+        tunnel (cloudflared) for the visitor's address and scheme."""
+        self.security_headers = True
+        if cloudflare:
+            self.trust_proxy("cloudflare", "local")
+        if domain:
+            d = str(domain).lower().strip()
+            self.allowed_hosts(d, "www." + d if not d.startswith("www.") else d[4:], "localhost", "127.0.0.1")
+            self.force_https()
+        if self.limiter is None:
+            self.rate_limit(rate or 50, per, burst=(rate or 50) * 2)
+        if compress and self._gzip is None:
+            self.compress()
+        names = {r.pattern for r in self.routes}
+        if "/health" not in names:
+            self.health()
+        if "/ready" not in names:
+            self.ready()
+        return self
+
+    def _from_proxy(self, req):
+        """req.client / req.scheme from a trusted proxy's headers (see trust_proxy)."""
+        peer = req.peer
+        ok = self._trust_cache.get(peer)
+        if ok is None:
+            import ipaddress
+            try:
+                ip = ipaddress.ip_address(peer)
+                ok = any(ip in n for n in self._trusted)
+            except ValueError:
+                ok = False
+            if len(self._trust_cache) < 4096:
+                self._trust_cache[peer] = ok
+        if not ok:
+            return
+        h = req.headers
+        real = h.get("cf-connecting-ip") or h.get("true-client-ip")
+        if not real:
+            fwd = h.get("x-forwarded-for")
+            if fwd:                                     # the right-most address that is not a trusted proxy
+                import ipaddress
+                for part in reversed([x.strip() for x in fwd.split(",") if x.strip()]):
+                    try:
+                        ip = ipaddress.ip_address(part)
+                    except ValueError:
+                        break
+                    real = part
+                    if not any(ip in n for n in self._trusted):
+                        break
+        if real:
+            try:
+                import ipaddress
+                req.client = str(ipaddress.ip_address(real.strip()))
+            except ValueError:
+                pass
+        proto = h.get("x-forwarded-proto", "").split(",")[0].strip().lower()
+        if not proto and "cf-visitor" in h:
+            proto = "https" if '"https"' in h["cf-visitor"] else "http"
+        if proto in ("http", "https"):
+            req.scheme = proto
+
     def cors(self, origins="*"):
         """Allow cross-origin browser calls from the given origins ("*" or a list)."""
         self.cors_origins = origins if origins == "*" else list(origins)
@@ -506,6 +634,18 @@ class App:
     def dispatch(self, req):
         """Route a parsed request to its handler; always returns a Response."""
         try:
+            if self.tls:
+                req.scheme = "https"
+            if self._trusted is not None:
+                self._from_proxy(req)
+            if self._hosts is not None:
+                host = req.host
+                if not any(host == h or (h.startswith("*.") and host.endswith(h[1:])) for h in self._hosts):
+                    raise HTTPError(421, "this server does not answer for that host name")
+            if self._force_https and req.scheme != "https" and req.host not in ("localhost", "127.0.0.1", "::1"):
+                q = "&".join(f"{k}={v}" for k, v in req.query.items()) if req.query else ""
+                loc = f"https://{req.headers.get('host', '')}{req.path}{'?' + q if q else ''}"
+                return self._finish(req, Response(b"", 308, {"Location": loc}))
             if self.limiter is not None:
                 ok, wait = self.limiter.allow(req.client)
                 if not ok:
@@ -611,6 +751,8 @@ class App:
                 if self.tls:
                     sec["Strict-Transport-Security"] = "max-age=63072000; includeSubDomains"
                 self._sec_headers = sec
+            if self._hsts and req.scheme == "https" and "Strict-Transport-Security" not in sec:
+                sec = dict(sec, **{"Strict-Transport-Security": "max-age=63072000; includeSubDomains"})
             h = resp.headers
             merged = sec.copy()                         # defaults first, the handler's own headers win
             if h:

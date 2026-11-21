@@ -865,6 +865,9 @@ def _parser(light=False):
     perm_flags(p)
     p.set_defaults(fn=cmd_serve)
 
+    from . import tunnel as _tunnel
+    _tunnel.add_parser(sub)
+
     p = sub.add_parser("ast", help="print the syntax tree of a file")
     p.add_argument("file")
     p.set_defaults(fn=cmd_ast)

@@ -72,8 +72,43 @@ python tools/loadtest.py http://127.0.0.1:8080/health --requests 20000 --concurr
 | Passwords | `use crypto` → `password_hash` (scrypt, or PBKDF2 with 600k rounds) |
 | TLS | `app.run(tls_cert="cert.pem", tls_key="key.pem")` — TLS 1.2 or newer |
 | Program permissions | opening a port needs `--allow-net`; serving files needs the `fs` permission |
+| Spoofed visitor address | `app.trust_proxy(...)`: forwarding headers are believed only from the proxies you name |
+| Host-header attacks | `app.allowed_hosts("example.com", "*.example.com")` → 421 for any other name |
+| Plain http | `app.force_https()` → 308 to https, HSTS on https answers (also behind a proxy) |
 
 Socket-level tests for all of this live in `tests/test_web.py`.
+
+## On the internet: Cloudflare, proxies, one call for production
+
+```apsi
+use web
+let app = server(name="site")
+app.get("/", fn(req) => {"hello": req.client})
+app.production(domain="example.com", cloudflare=true)
+app.run(port=8080)
+```
+
+`app.production(domain, cloudflare, rate, per, compress)` turns on, in one call: security headers, a rate limit
+per visitor (50 requests/s, bursts of 100, unless you set one), gzip, `/health` and `/ready`, with a domain only
+that domain (and `www.`) plus localhost, and https enforced. `cloudflare=true` believes Cloudflare's published
+address ranges (`CF-Connecting-IP`) and a tunnel on this machine (`X-Forwarded-For` from 127.0.0.1), so rate
+limits and logs see each visitor and `req.scheme` says `"https"`.
+
+**Without opening a port: Cloudflare Tunnel.** `apsi tunnel` runs Cloudflare's `cloudflared`
+(`winget install --id Cloudflare.cloudflared` on Windows, `brew install cloudflared` on macOS):
+
+```
+apsi tunnel server.apsi --port 8080                 # starts the program and gives a https://….trycloudflare.com address
+apsi tunnel --port 8080                             # a server that is already running
+apsi tunnel server.apsi --name my-site --setup      # the one-time steps for your own domain (a named tunnel)
+apsi tunnel server.apsi --name my-site              # then: your domain -> this machine, no open port, no public IP
+```
+
+**The pieces on their own:** `app.trust_proxy("cloudflare", "local", "10.0.0.0/8")`,
+`app.allowed_hosts("example.com", "*.example.com")`, `app.force_https(hsts=true)`. A request whose TCP peer is not
+a trusted proxy keeps its real address: nobody can pick their own `req.client` by sending headers.
+`req.peer` is the TCP peer, `req.client` the visitor, `req.scheme` `"http"`/`"https"`, `req.host` the host name,
+`req.url` the full address.
 
 ## API
 
@@ -91,6 +126,10 @@ app.static("/assets", "public")
 app.health()            # GET /health: status, name, uptime
 app.ready()             # GET /ready: 200 while serving, 503 once app.stop() was called (load balancers drain it)
 app.expose_metrics()    # GET /metrics: requests, errors, status codes, p50/p90/p99, req/s
+app.production(domain="example.com", cloudflare=true)   # everything a public server needs (above)
+app.trust_proxy("cloudflare", "local")             # visitor address and https from these proxies only
+app.allowed_hosts("example.com", "*.example.com")  # other Host names -> 421
+app.force_https()                                  # http -> 308 https, HSTS
 app.compress(min_size=1024, level=5)               # gzip text / HTML / JSON / JS / CSS / XML / SVG for clients
                                                    # that accept it (smaller bodies and images are sent as they are)
 let api = app.group("/api/v1")                     # routes under a prefix: @api.get("/users/{id:int}")
@@ -104,7 +143,8 @@ app.run_background(port=0)                         # run on a separate thread; r
 **Path patterns:** `/users/{id:int}`, `/files/{rest:path}`, `/x/{v:float}`, `/name/{s}`
 
 **Request:** `req.method`, `req.path`, `req.params`, `req.query`, `req.headers`, `req.header(name)`,
-`req.body` (bytes), `req.text`, `req.json()`, `req.client`, `req.id`, `req.user` (set by `require_jwt`)
+`req.body` (bytes), `req.text`, `req.json()`, `req.client`, `req.peer`, `req.scheme`, `req.host`, `req.url`, `req.id`,
+`req.user` (set by `require_jwt`)
 
 **Handler return values:** dict / list / tensor / quantity → JSON; `Str` → text;
 `response(body, status, headers, type)`; `redirect(url)`; `abort(status, message)` to stop with an error; `none` → 204
