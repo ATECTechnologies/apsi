@@ -463,7 +463,7 @@ def _windows_job_limit(limit):
 
 # ------------------------------------------------------------------ static capability audit
 CAPABILITIES = {
-    "pyimport": ("python", "imports Python modules"), "to_torch": ("python", "uses PyTorch"),
+    "pyimport": ("python", "imports Python modules"), "pymodule": ("python", "runs Python source kept in the program"), "to_torch": ("python", "uses PyTorch"),
     "from_torch": ("python", "uses PyTorch"), "onnx_model": ("python", "runs ONNX models"),
     "hf_pipeline": ("python", "runs Hugging Face models"), "torch_load": ("python", "loads PyTorch files"),
     "cload": ("ffi", "loads native libraries"),

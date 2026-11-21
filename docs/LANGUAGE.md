@@ -157,6 +157,7 @@ Contextual (special only in one place, ordinary names elsewhere): `try`, `except
 | multi-line | `"""line 1` ⏎ `line 2"""` |
 | formatted (f-string) | `f"x = {x:.3f}, list has {len(xs)} items"` |
 | formatted, multi-line | `f"""…{expr}…"""` |
+| raw (no escapes, may span lines) | `r#"C:\dir\file "quoted" text"#` — ends at `"` followed by the same number of `#` (`r##"…"##` when the text holds `"#`) |
 
 Escapes: `\n` (newline), `\t` (tab), `\r`, `\\`, `\"`, `\0`. Any other backslash is kept as it is, so Windows paths
 such as `"C:\data\x.csv"` mostly work, but `"C:\\data\\x.csv"` or `"C:/data/x.csv"` is clearer.

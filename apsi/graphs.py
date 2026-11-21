@@ -1173,6 +1173,9 @@ class TypedGraphEncoder(Layer):
 
     def apply(self, p, x, train=False, **ctx):
         g = _graph(ctx)
+        er = getattr(g, "eval_regions", None)
+        if er is not None and self.region is not None and self.region in [int(v) for v in er]:
+            train = False                               # (this batch reads this encoder's region as in evaluation)
         N = int(np.shape(ops.raw(x))[0])
         own = self.own(g, N)
         batch, G = _graph_ids(g, N)

@@ -1334,7 +1334,7 @@ def _freeze_keep(old, new, paths):
 def fit_batches(model, params, batches, loss="cross_entropy", opt=None, epochs=1, backend="auto", device="cuda",
                 verbose=True, clip=None, schedule=None, precision="auto", compensated=None, every=None, accumulate=1,
                 stages=None, freeze=None, train_only=None, steps=None, checkpoint=None, save_every=None, resume=True,
-                callback=None, recompute=None, exact_sums=None, groups=None):
+                callback=None, recompute=None, exact_sums=None, groups=None, state=None):
     """Train on batches that each bring their own shapes and graph: a list of (inputs, targets[, graph]) or a function
     epoch -> such a list. inputs may be a list (a dag with several inputs, e.g. token ids and node features). Each
     step is `accumulate` batches (their gradients averaged); the history is the mean loss of each epoch. backend: "auto"
@@ -1343,6 +1343,8 @@ def fit_batches(model, params, batches, loss="cross_entropy", opt=None, epochs=1
     freeze= / train_only=: parts of the model by name ("enca", "w*", a function of the path) that stay as they
     are / the only parts that learn. Any optimizer: adam, adamw and sgd have kernels of their own, the others step on
     the processor.
+    state=record(get=fn() -> text, set=fn(text)): the program's own training state, saved in the checkpoint and put
+    back on resume (with the random generators and the parameter groups' step counts).
     steps=N: train for N optimizer steps (over as many epochs as that takes) instead of `epochs`. checkpoint="run.npz"
     with save_every=K: the weights, the optimizer's state and the position in the data are saved every K steps, at the
     end and when training stops on an error or Ctrl+C; running the same call again resumes exactly where it stopped
@@ -1365,7 +1367,8 @@ def fit_batches(model, params, batches, loss="cross_entropy", opt=None, epochs=1
                                       precision, compensated=compensated, every=every, accumulate=accumulate,
                                       stages=stages, freeze=freeze, train_only=train_only, steps=steps,
                                       checkpoint=checkpoint, save_every=save_every, resume=resume,
-                                      callback=callback, recompute=recompute, exact_sums=exact_sums, groups=groups)
+                                      callback=callback, recompute=recompute, exact_sums=exact_sums, groups=groups,
+                                      state=state)
             except GT.TrainError as e:
                 raise RuntimeErr(f"backend=\"gpu\": {e}") from None
     lf = loss if callable(loss) else _loss_fn(loss)
@@ -1378,10 +1381,12 @@ def fit_batches(model, params, batches, loss="cross_entropy", opt=None, epochs=1
     every = int(every or max(1, E // 10))
     history, step = [], 0
     still = frozen_paths(params, freeze, train_only)
-    from .gpu_train import _batch_parts, LIVE, _Live
+    from .gpu_train import _batch_parts, LIVE, _Live, _is_later
     A = max(1, int(accumulate or 1))
     want = int(steps) if steps else None
     start_ep, skip = 0, 0
+    from .gpu_train import CKPT_STATE
+    CKPT_STATE[0] = state
     if checkpoint and resume and os.path.exists(str(checkpoint)):
         params, step, start_ep, skip = _np_ckpt_load(str(checkpoint), params, opt, model)
         if verbose:
@@ -1408,7 +1413,8 @@ def fit_batches(model, params, batches, loss="cross_entropy", opt=None, epochs=1
             if accumulate is not None and int(accumulate) == 0:   # steps of their own length: targets.end_step
                 starts, cur = [], 0
                 for j, it_ in enumerate(items):
-                    if bool(getattr(_batch_parts(it_)[1], "end_step", True)):
+                    if (bool(getattr(it_, "end_step", False)) if _is_later(it_) else
+                            bool(getattr(_batch_parts(it_)[1], "end_step", True))):
                         starts.append((cur, j + 1))
                         cur = j + 1
                 if cur < len(items):
@@ -1419,9 +1425,10 @@ def fit_batches(model, params, batches, loss="cross_entropy", opt=None, epochs=1
                 if ep == start_ep and s0 < skip:
                     continue
                 chunk = items[s0:s1]
-                params, lv_sum, ok = _np_step(model, params, chunk, loss, lf, opt, schedule, step, clip, still, guard)
+                params, lv_sum, ok, n_done = _np_step(model, params, chunk, loss, lf, opt, schedule, step, clip, still,
+                                                      guard)
                 tot += lv_sum
-                seen += len(chunk)
+                seen += n_done
                 step += 1
                 pos[0], pos[1] = ep, s1
                 if checkpoint and save_every and step % int(save_every) == 0:
@@ -1431,11 +1438,13 @@ def fit_batches(model, params, batches, loss="cross_entropy", opt=None, epochs=1
                     break
             if not stop:
                 pos[0], pos[1] = ep + 1, 0
+            if seen == 0:                                # (resumed after this epoch's last batch: nothing left)
+                continue
             history.append(tot / max(1, seen))
             if callback is not None:
                 callback(Record(epoch=ep, step=step, loss=history[-1]))
             if verbose and (ep % every == 0 or ep == last - 1 or stop):
-                print(f"epoch {ep:4}  loss {history[-1]:.5f}  ({len(items)} batches, step {step})")
+                print(f"epoch {ep:4}  loss {history[-1]:.5f}  ({seen} batches, step {step})")
         if checkpoint:
             _np_ckpt_save(str(checkpoint), params, opt, step, pos, model)
     except BaseException:
@@ -1499,11 +1508,25 @@ def _np_set(params, tree, only):
 def _np_step(model, params, chunk, loss, lf, opt, schedule, step, clip, still, guard):
     """One optimizer step over the batches of `chunk` (their gradients averaged): (params, summed loss, taken?)."""
     from .stdlib import value_and_grad
-    from .gpu_train import _batch_parts
+    from .gpu_train import _batch_parts, _is_later, LIVE, _Live
     acc, tot = None, 0.0
     if schedule is not None:
         opt.lr = float(ops.raw(schedule(step)))
-    for item in chunk:
+    chunk = list(chunk)
+    n_done = 0
+    while chunk:
+        item = chunk.pop(0)
+        if _is_later(item):                              # made now, with the weights as they are at this point
+            box = [params]
+            LIVE.append(_Live(lambda: box[0], lambda tree, only=None: box.__setitem__(0, _np_set(box[0], tree, only))))
+            try:
+                made = list(item.later() or [])
+            finally:
+                LIVE.pop()
+            params = box[0]
+            chunk = made + chunk
+            continue
+        n_done += 1
         X, Y, g = _batch_parts(item)
         ctx = {"graph": g} if g is not None else {}
         if not callable(loss) or not isinstance(Y, Record):
@@ -1527,21 +1550,24 @@ def _np_step(model, params, chunk, loss, lf, opt, schedule, step, clip, still, g
             else:
                 gr = opt.batch_mask(params, gr)
         div = int(getattr(Y, "step_items", 0) or 0) if isinstance(Y, Record) else 0
-        div = div or len(chunk)
+        div = div or (n_done + len(chunk))
         gr = tree_map(lambda a, d_=div: a / d_ if isinstance(a, (np.ndarray, np.floating, float)) else a, gr)
         acc = gr if acc is None else tree_map(lambda a, b: a + b, acc, gr)
         tot += float(ops.raw(lv))
+    if acc is None:                                      # (nothing to train on in this step)
+        acc = tree_map(lambda a: np.zeros_like(np.asarray(ops.raw(a)), np.float64)
+                       if isinstance(ops.raw(a), np.ndarray) else a, params)
     gr = _freeze_grads(acc, still)                       # frozen weights: no gradient (and kept exactly below)
     if guard and not all(np.all(np.isfinite(np.asarray(ops.raw(a)))) for a in tree_leaves(gr)
                          if isinstance(ops.raw(a), np.ndarray)):
-        return params, tot, False                       # a non-finite gradient: this step is skipped
+        return params, tot, False, n_done               # a non-finite gradient: this step is skipped
     if schedule is not None:
         opt.lr = float(ops.raw(schedule(step)))
     if clip:
         norm = math.sqrt(sum(float(np.sum(np.asarray(ops.raw(a)) ** 2)) for a in tree_leaves(gr)))
         if norm > clip:
             gr = tree_map(lambda a: a * (clip / norm), gr)
-    return _freeze_keep(params, opt.step(params, gr), still), tot, True
+    return _freeze_keep(params, opt.step(params, gr), still), tot, True, n_done
 
 
 def _np_ckpt_save(path, params, opt, step, pos, model=None):
@@ -1555,6 +1581,8 @@ def _np_ckpt_save(path, params, opt, step, pos, model=None):
     data["meta"] = np.array([step, pos[0], pos[1], int(getattr(opt, "t", 0)), len(leaves)], np.int64)
     if model is not None:
         data.update(state_arrays(model))                 # running statistics of stateful layers
+    from .gpu_train import _extra_save, CKPT_STATE
+    _extra_save(data, getattr(opt, "_bt", None), CKPT_STATE[0])
     tmp = f"{path}.tmp.npz"
     np.savez(tmp, **data)
     os.replace(tmp, path)
@@ -1577,6 +1605,10 @@ def _np_ckpt_load(path, params, opt, model=None):
                 setattr(opt, name, tree_map(lambda a: next(it2) if isinstance(ops.raw(a), np.ndarray) else a, params))
         if hasattr(opt, "t"):
             opt.t = t
+        from .gpu_train import _extra_load, CKPT_STATE
+        bt = _extra_load(z, CKPT_STATE[0])
+        if bt and hasattr(opt, "_bt"):
+            opt._bt = bt
     return params, step, ep, bi
 
 
@@ -2100,6 +2132,8 @@ def card_loss(output=0, rest=None, labels="labels", weights=None, scale=None):
 
     def f(outs, ys):
         outs = list(outs) if isinstance(outs, (list, tuple)) else [outs]
+        if labels_of(ys) is None:                       # no cross-entropy for this batch: rest is the whole loss
+            return rest_of(outs, ys)                     # (and it may read outputs[output])
         w = weights_of(ys)
         if w is None:
             return scale_of(ys) * cross_entropy(outs[out_i], labels_of(ys)) + rest_of(outs, ys)

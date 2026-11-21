@@ -28,7 +28,7 @@ MINIFLOAT = {0: (3, 7, 448.0), 1: (2, 3, 28.0), 2: (3, 1, 7.5), 3: (1, 1, 6.0)} 
 TILE = 64
 
 MAIN = ("apsi_kernel", "axpy", "add3", "mul3", "act_f", "act_b", "colsum", "ln_f", "ln_b", "embed_f", "embed_b",
-        "pos_f", "pos_b", "softmax_f", "softmax_b", "ce", "mse", "sumsq", "adam", "sgd", "drop_f", "fakeq",
+        "pos_f", "pos_b", "softmax_f", "softmax_b", "ce", "mse", "sumsq", "adam", "adam16", "sgd", "drop_f", "fakeq",
         "gemm_simt", "gather", "rope", "spmm", "edge_dot", "seg_softmax", "seg_softmax_b", "dot_acc", "scale_add",
         "cols", "colmul", "topk_gate", "topk_gate_b", "loss_ew", "im2col", "col2im", "perm_nc", "pool_f", "pool_b",
         "lstm_f", "lstm_b", "gru_a", "gru_b", "gru_b1", "gru_b2", "taylor_f", "taylor_b", "rowbias", "acc2",
@@ -1512,6 +1512,55 @@ def _main_module():
             b.store(h16, k.gep(p["W16"], i), align=2)
         k.st(F(0.0), p["G"], i)                       # the gradient is used up: cleared for the next step here
     k.grid_loop(p["n"], adam)
+    k.ret()
+
+    # adam with bfloat16 moments: the moments read widened to float32, the update in float32, the
+    # moments written back with stochastic rounding (random low 16 bits added, then cut): the rounding error averages
+    # out over the steps. M / V: the moments' 16-bit array, element moff + i; seed: this update's random stream.
+    I16 = ir.IntType(16)
+    k = K("adam16", [("P", G(f32)), ("G", G(f32)), ("M", G(I16)), ("V", G(I16)), ("SQ", G(f32)), ("n", i32),
+                     ("n_decay", i32), ("lr", f32), ("b1", f32), ("b2", f32), ("eps", f32), ("c1", f32), ("c2", f32),
+                     ("wd", f32), ("clip", f32), ("COMP", G(f32)), ("hasc", i32), ("moff", i32), ("seed", i32)])
+    b, p = k.b, k.p
+    sc = clip_scale(k, p)
+    ok = finite_sq(k, p)
+
+    def widen(h):
+        return b.bitcast(b.shl(b.zext(h, i32), C(16)), f32)
+
+    def mix(x):
+        # (a 32-bit integer hash: the random 16 bits of one element of one update)
+        x = b.xor(x, b.lshr(x, C(16)))
+        x = b.mul(x, C(0x85EBCA6B - (1 << 32)))
+        x = b.xor(x, b.lshr(x, C(13)))
+        x = b.mul(x, C(0xC2B2AE35 - (1 << 32)))
+        return b.xor(x, b.lshr(x, C(16)))
+
+    def sround(v, j, salt):
+        r = mix(b.xor(b.mul(j, C(0x9E3779B1 - (1 << 32))), b.xor(p["seed"], C(salt))))
+        u = b.add(b.bitcast(v, i32), b.and_(r, C(0xFFFF)))
+        return b.trunc(b.lshr(u, C(16)), I16)
+
+    def adam16(i):
+        j = b.add(i, p["moff"])
+        g0, w = k.ld(p["G"], i), k.ld(p["P"], i)
+        mh = b.load(k.gep(p["M"], j), align=2)
+        vh = b.load(k.gep(p["V"], j), align=2)
+        m0, v0 = widen(mh), widen(vh)
+        w_old = w
+        gr = b.fmul(g0, sc)
+        w = b.select(b.icmp_unsigned("<", i, p["n_decay"]), b.fmul(w, b.fsub(F(1.0), b.fmul(p["lr"], p["wd"]))), w)
+        m_ = b.fadd(b.fmul(p["b1"], m0), b.fmul(b.fsub(F(1.0), p["b1"]), gr))
+        v_ = b.fadd(b.fmul(p["b2"], v0), b.fmul(b.fsub(F(1.0), p["b2"]), b.fmul(gr, gr)))
+        upd = b.fdiv(b.fmul(p["lr"], b.fdiv(m_, p["c1"])),
+                     b.fadd(b.call(sqrt_f, [b.fdiv(v_, p["c2"])]), p["eps"]))
+        b.store(b.select(ok, sround(m_, j, 0x1B873593), mh), k.gep(p["M"], j), align=2)
+        b.store(b.select(ok, sround(v_, j, 0x68E31DA4), vh), k.gep(p["V"], j), align=2)
+        dec = b.select(b.icmp_unsigned("<", i, p["n_decay"]), b.fmul(w_old, b.fmul(p["lr"], p["wd"])), F(0.0))
+        w_new = kahan(k, p, w_old, b.fsub(F(0.0), b.fadd(dec, upd)), b.fsub(w, upd), i, ok)
+        k.st(w_new, p["P"], i)
+        k.st(F(0.0), p["G"], i)
+    k.grid_loop(p["n"], adam16)
     k.ret()
 
     k = K("sgd", [("P", G(f32)), ("G", G(f32)), ("VEL", G(f32)), ("SQ", G(f32)), ("n", i32), ("lr", f32),

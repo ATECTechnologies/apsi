@@ -1593,3 +1593,66 @@ def test_training_params_and_update():
             assert not np.allclose(np.asarray(r.params[0].W), np.asarray(p[0].W))
         finally:
             GT.device = old
+
+
+def test_raw_strings_and_pymodule():
+    """r#"..."# raw strings (no escapes, several lines) and pymodule(name, source)."""
+    from apsi.interpreter import Interpreter
+    from apsi.security import Policy
+    src = 'let s = r##"a\\\\n "q" """d"""\nb"##\nlet m = pymodule("apsi_t_mod", r#"\ndef f(x):\n    return x + 1\n"#)\nlet v = m.f(1)\n'
+    I = Interpreter()
+    I.policy = Policy.from_set({"python"})
+    env = I.run(src, "<t>")
+    assert env.lookup("s") == 'a\\\\n "q" """d"""\nb'
+    assert env.lookup("v") == 2
+    import pytest
+    I2 = Interpreter()
+    with pytest.raises(Exception):
+        I2.run('let m = pymodule("apsi_t_mod2", "x = 1")\n', "<t>")
+
+
+def test_bf16_moments():
+    """adamw(state="bf16"): moments in bfloat16 with stochastic rounding on the card (half their memory), the same
+    rule on the processor; training follows the float32 moments closely; a checkpoint keeps the 16-bit moments."""
+    import numpy as np, os, tempfile
+    from apsi import layers as L
+    from apsi import gpu_train as GT
+    from apsi.stdlib import adamw
+    rng = np.random.default_rng(0)
+    X = rng.normal(size=(64, 6))
+    Y = (X[:, 0] > 0).astype(np.int64)
+    m = L.sequential([L.Linear(6, 16), L.Linear(16, 2)])
+    runs = {}
+    for st in ("fp32", "bf16"):
+        for be in ("numpy", "gpu"):
+            old = GT.device
+            GT.device = lambda *a, **k: (GT.Emulator(), None)
+            try:
+                r = L.fit_batches(m, m.init(seed=1), [(X, Y)] * 4, opt=adamw(lr=0.01, state=st), epochs=6, backend=be,
+                                  precision="fp32", verbose=False)
+            finally:
+                GT.device = old
+            runs[(st, be)] = r.history
+    np.testing.assert_allclose(runs[("bf16", "gpu")], runs[("bf16", "numpy")], rtol=2e-3)
+    np.testing.assert_allclose(runs[("bf16", "gpu")], runs[("fp32", "gpu")], rtol=2e-2)
+    em = GT.Emulator()
+    b = em.alloc16(5)
+    em.put16(b, np.array([1, 2, 3, 4, 5], np.uint16))
+    assert list(em.get16(b, 5)) == [1, 2, 3, 4, 5]
+    h = GT.sround_bf16(np.full(20000, 1.0 + 2 ** -10, np.float32), np.arange(20000, dtype=np.uint32), 7, 1)
+    mean = float(GT.widen_bf16(h).astype(np.float64).mean())
+    assert abs(mean - (1.0 + 2 ** -10)) < 2e-5          # stochastic rounding: unbiased on average
+    d = tempfile.mkdtemp()
+    ck = os.path.join(d, "c.npz")
+    old = GT.device
+    GT.device = lambda *a, **k: (GT.Emulator(), None)
+    try:
+        L.fit_batches(m, m.init(seed=1), [(X, Y)] * 4, opt=adamw(lr=0.01, state="bf16"), steps=4, backend="gpu",
+                      checkpoint=ck, save_every=4, verbose=False)
+        with np.load(ck) as z:
+            assert z["M"].dtype == np.uint16
+        r = L.fit_batches(m, m.init(seed=1), [(X, Y)] * 4, opt=adamw(lr=0.01, state="bf16"), steps=8, backend="gpu",
+                          checkpoint=ck, save_every=4, verbose=False)
+        assert np.isfinite(r.history[-1])
+    finally:
+        GT.device = old

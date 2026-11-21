@@ -758,10 +758,25 @@ def _float_arr(g):
 
 
 class Adam:
-    def __init__(self, lr=1e-3, b1=0.9, b2=0.999, eps=1e-8):
+    def __init__(self, lr=1e-3, b1=0.9, b2=0.999, eps=1e-8, state="fp32"):
         self.lr, self.b1, self.b2, self.eps = lr, b1, b2, eps
+        self.state = str(state)
         self.m = self.v = None
         self.t = 0
+
+    def _low(self):
+        return self.state.lower() in ("bf16", "bfloat16")
+
+    def _round16(self, ms, vs):
+        """state="bf16": the moments rounded to bfloat16 stochastically (the same rounding as the card)."""
+        from .gpu_train import sround_bf16, widen_bf16
+        self._srs = (getattr(self, "_srs", 0x2545F491) * 1103515245 + 12345) & 0x7FFFFFFF
+        off = 0
+        for m, v in zip(ms, vs):
+            j = np.arange(off, off + m.size, dtype=np.uint32).reshape(m.shape)
+            m[...] = widen_bf16(sround_bf16(np.asarray(m, np.float32), j, self._srs, 0x1B873593))
+            v[...] = widen_bf16(sround_bf16(np.asarray(v, np.float32), j, self._srs, 0x68E31DA4))
+            off += m.size
 
     def step(self, params, grads):
         g_raw = tree_map(_float_arr, grads)
@@ -779,15 +794,21 @@ class Adam:
             if isinstance(p, Quantity):      # Adam steps are scale-free: update in SI units
                 return Quantity(p.v - delta, p.dim)
             return p - delta
-        return tree_map(upd, params, self.m, self.v)
+        out = tree_map(upd, params, self.m, self.v)
+        if self._low():                      # (the update read the moments in full; they are kept rounded)
+            self._round16([a for a in tree_leaves(self.m) if isinstance(a, np.ndarray)],
+                          [a for a in tree_leaves(self.v) if isinstance(a, np.ndarray)])
+        return out
 
 
 def sgd(lr=0.01, momentum=0.0):
     return SGD(lr, momentum)
 
 
-def adam(lr=1e-3, b1=0.9, b2=0.999, eps=1e-8):
-    return Adam(lr, b1, b2, eps)
+def adam(lr=1e-3, b1=0.9, b2=0.999, eps=1e-8, state="fp32"):
+    """Adam. state="bf16": its two moments kept in bfloat16 with stochastic rounding (half their memory); "fp32"
+    (the default) in float32."""
+    return Adam(lr, b1, b2, eps, state)
 
 
 def spiral_data(n_per_class=100, classes=3, noise=0.2, seed=0):
@@ -887,8 +908,8 @@ def clip_grad_norm(grads, max_norm=1.0):
 
 
 class AdamW(Adam):
-    def __init__(self, lr=1e-3, b1=0.9, b2=0.999, eps=1e-8, weight_decay=0.01):
-        super().__init__(lr, b1, b2, eps)
+    def __init__(self, lr=1e-3, b1=0.9, b2=0.999, eps=1e-8, weight_decay=0.01, state="fp32"):
+        super().__init__(lr, b1, b2, eps, state)
         self.wd = weight_decay
 
     def step(self, params, grads):
@@ -940,7 +961,7 @@ class GroupAdamW(Adam):
 
     def __init__(self, base, groups, clip=None):
         self._bt = {}
-        super().__init__(base.lr, base.b1, base.b2, base.eps)
+        super().__init__(base.lr, base.b1, base.b2, base.eps, getattr(base, "state", "fp32"))
         self.lr0 = float(base.lr)
         self.wd = float(getattr(base, "wd", 0.0)) if isinstance(base, AdamW) else 0.0
         self.groups, self.clip, self._g = groups, clip, None
@@ -989,12 +1010,15 @@ class GroupAdamW(Adam):
             pv = np.asarray(ops.raw(p), np.float64)
             w = pv * (1 - lr * wd) if dec[i] else pv
             out.append(np.asarray(w - lr * (M[i] / (1 - b1 ** t_)) / (np.sqrt(V[i] / (1 - b2 ** t_)) + eps)))
+            if self._low():                  # (the update read the moments in full; they are kept rounded)
+                self._round16([M[i]], [V[i]])
         it = iter(out)
         return tree_map(lambda a: next(it) if isinstance(ops.raw(a), np.ndarray) else a, params)
 
 
-def adamw(lr=1e-3, b1=0.9, b2=0.999, eps=1e-8, weight_decay=0.01):
-    return AdamW(lr, b1, b2, eps, weight_decay)
+def adamw(lr=1e-3, b1=0.9, b2=0.999, eps=1e-8, weight_decay=0.01, state="fp32"):
+    """AdamW (decay on the matrices). state="bf16": the moments in bfloat16 with stochastic rounding (see adam)."""
+    return AdamW(lr, b1, b2, eps, weight_decay, state)
 
 
 def cosine_lr(step, total, base=1e-3, warmup=0, minimum=0.0):

@@ -54,11 +54,58 @@ class Buf:
         self.ptr, self.n, self.a = ptr, n, a
 
 
+class Buf16(Buf):
+    """n16 bfloat16 values (an optimizer's moments kept at half the memory) in a buffer of (n16 + 1) // 2 float32."""
+    __slots__ = ("n16",)
+
+
+def _sr_mix(x):
+    """The 32-bit hash of the card's adam16 kernel (NumPy uint32, element by element)."""
+    x = x ^ (x >> np.uint32(16))
+    x = x * np.uint32(0x85EBCA6B)
+    x = x ^ (x >> np.uint32(13))
+    x = x * np.uint32(0xC2B2AE35)
+    return x ^ (x >> np.uint32(16))
+
+
+def sround_bf16(v, j, seed, salt):
+    """float32 values -> their bfloat16 bits, stochastically rounded exactly as the adam16 kernel does (element j)."""
+    with np.errstate(over="ignore"):
+        r = _sr_mix((np.asarray(j, np.uint32) * np.uint32(0x9E3779B1)) ^ np.uint32(seed & 0xFFFFFFFF) ^ np.uint32(salt))
+        u = np.asarray(v, np.float32).view(np.uint32) + (r & np.uint32(0xFFFF))
+    return (u >> np.uint32(16)).astype(np.uint16)
+
+
+def widen_bf16(h):
+    return (np.asarray(h, np.uint16).astype(np.uint32) << np.uint32(16)).view(np.float32)
+
+
 # ============================================================================== devices
 class _Ops:
     """Kernel launches in terms of (buffer, offset) views; sizes in float32 elements."""
 
     tc = False
+
+    def alloc16(self, n16):
+        b = self.alloc((int(n16) + 1) // 2)
+        b16 = Buf16(b.ptr, b.n, b.a)
+        b16.n16 = int(n16)
+        return b16
+
+    def get16(self, b, n16):
+        """The bfloat16 bits of a Buf16 (uint16)."""
+        w = self.get(b, (int(n16) + 1) // 2)
+        return np.ascontiguousarray(w).view(np.uint16)[:int(n16)].copy()
+
+    def put16(self, b, h):
+        h = np.asarray(h, np.uint16)
+        if h.size % 2:
+            h = np.concatenate([h, np.zeros(1, np.uint16)])
+        self.put(b, h.view(np.float32))
+
+    def _sr_seed(self):
+        self._srs = (getattr(self, "_srs", 0x2545F491) * 1103515245 + 12345) & 0x7FFFFFFF
+        return self._srs
 
     def _ring_ready(self):                               # pinned staging memory: the real card only
         return False
@@ -406,6 +453,8 @@ class Emulator(_Ops):
         p[:] = t
 
     def adam(self, Pm, Gr, Mm, Vm, SQ, n, n_decay, lr, b1, b2, eps, c1, c2, wd, clip, COMP=None, part=None):
+        if isinstance(Mm[0], Buf16):
+            return self._adam16(Pm, Gr, Mm, Vm, SQ, n, n_decay, lr, b1, b2, eps, c1, c2, wd, clip, COMP)
         if not np.isfinite(self.v(SQ, 1)[0]):              # a non-finite gradient: the step is skipped
             self.v(Gr, n)[:] = 0.0
             return
@@ -420,6 +469,30 @@ class Emulator(_Ops):
         dec[:n_decay] = p[:n_decay] * np.float32(lr * wd)
         self._kahan(p, w - upd, -(dec + upd), COMP, n)
         self.v(Gr, n)[:] = 0.0                    # the kernel clears the gradient it used
+
+    def _adam16(self, Pm, Gr, Mm, Vm, SQ, n, n_decay, lr, b1, b2, eps, c1, c2, wd, clip, COMP):
+        seed = self._sr_seed()
+        if not np.isfinite(self.v(SQ, 1)[0]):
+            self.v(Gr, n)[:] = 0.0
+            return
+        h16m = Mm[0].a.view(np.uint16)
+        h16v = Vm[0].a.view(np.uint16)
+        j = np.arange(Mm[1], Mm[1] + n, dtype=np.uint32)
+        f = np.float32
+        g = self.v(Gr, n) * self._clip(SQ, clip)
+        p = self.v(Pm, n)
+        m0, v0 = widen_bf16(h16m[Mm[1]:Mm[1] + n]), widen_bf16(h16v[Vm[1]:Vm[1] + n])
+        w = p.copy()
+        w[:n_decay] *= f(1 - lr * wd)
+        m = f(b1) * m0 + (f(1) - f(b1)) * g
+        v = f(b2) * v0 + (f(1) - f(b2)) * g * g
+        upd = f(lr) * (m / f(c1)) / (np.sqrt(v / f(c2)) + f(eps))
+        dec = np.zeros_like(p)
+        dec[:n_decay] = p[:n_decay] * f(lr * wd)
+        h16m[Mm[1]:Mm[1] + n] = sround_bf16(m, j, seed, 0x1B873593)
+        h16v[Vm[1]:Vm[1] + n] = sround_bf16(v, j, seed, 0x68E31DA4)
+        self._kahan(p, w - upd, -(dec + upd), COMP, n)
+        self.v(Gr, n)[:] = 0.0
 
     def sgd(self, Pm, Gr, VEL, SQ, n, lr, mom, clip, COMP=None):
         if not np.isfinite(self.v(SQ, 1)[0]):
@@ -1330,6 +1403,16 @@ class Gpu(_Ops):
         self._go("sumsq", nb, 256, self.p(X), ("u", n), self.p(ACC), self.p(part), self._cnt())
 
     def adam(self, Pm, Gr, Mm, Vm, SQ, n, n_decay, lr, b1, b2, eps, c1, c2, wd, clip, COMP=None, part=None):
+        if isinstance(Mm[0], Buf16):                     # bfloat16 moments, stochastically rounded
+            i_, k_ = part if part is not None else (0, 1)
+            self._wgen += 1
+            self._go("adam16", self.blocks(n), 256, self.p(Pm), self.p(Gr), ("p", Mm[0].ptr), ("p", Vm[0].ptr),
+                     self.p(SQ), ("u", n), ("u", n_decay), ("f", lr), ("f", b1), ("f", b2), ("f", eps), ("f", c1),
+                     ("f", c2), ("f", wd), ("f", clip), self.p(COMP if COMP is not None else Pm),
+                     ("u", 1 if COMP is not None else 0), ("u", Mm[1]), ("i", int(np.int32(self._sr_seed()))))
+            if k_ == 1 and hasattr(self, "refresh_w16"):
+                self.refresh_w16()
+            return
         # part=(i, k): call i of k that together update every weight (parameter groups, each its own learning rate):
         # those calls leave the bfloat16 copy alone; refresh_w16() rounds it once after the last
         i_, k_ = part if part is not None else (0, 1)
@@ -4939,7 +5022,31 @@ class _TypedEncoder(_Node):
             gd.cache[k] = (gd._put(own, np.float32), gd._put(~own, np.float32), _Seg(gd, np.where(own, batch, -1), G))
         return gd.cache[k]
 
+    def _eval_here(self):
+        """graph.eval_regions holds this encoder's region: it runs as in evaluation (no dropout) in this batch."""
+        er = getattr(self.net.graph, "eval_regions", None)
+        r = getattr(self.layer, "region", None)
+        return er is not None and r is not None and int(r) in [int(v) for v in er]
+
     def fwd(self, x, shape):
+        tr = self.net.train
+        if self._eval_here():
+            self.net.train = False
+        try:
+            return self._fwd(x, shape)
+        finally:
+            self.net.train = tr
+
+    def bwd(self, dy, need_dx=True):
+        tr = self.net.train
+        if self._eval_here():
+            self.net.train = False
+        try:
+            return self._bwd(dy, need_dx)
+        finally:
+            self.net.train = tr
+
+    def _fwd(self, x, shape):
         o = self.net.ops
         N, d = _rows(shape), self.d
         own, notown, _ = self._masks(N)
@@ -4965,7 +5072,7 @@ class _TypedEncoder(_Node):
         o.add3(out, _diag(self, "fo", f, rown, N, d), _diag(self, "fx", h, rnot, N, d), N * d)
         return out, shape
 
-    def bwd(self, dy, need_dx=True):
+    def _bwd(self, dy, need_dx=True):
         o = self.net.ops
         N, d = self.N, self.d
         own, notown, _ = self._masks(N)
@@ -5920,6 +6027,16 @@ def _inputs(X, ids):
     return np.ascontiguousarray(a.astype(np.float32))
 
 
+_STEP_END = object()                                   # (a made list of batches that ends the step)
+
+
+def _is_later(item):
+    """A batch made only when training reaches it: record(later=fn [, end_step=true]); fn() -> a list of batches
+    (with the weights as they are at that moment, through training_params())."""
+    from .values import Record as _R
+    return isinstance(item, _R) and "later" in item.fields
+
+
 def _batch_parts(item):
     """(inputs, targets, graph) of one batch given as (inputs, targets) or (inputs, targets, graph) or a record."""
     if hasattr(item, "inputs") or hasattr(item, "x"):
@@ -5948,7 +6065,7 @@ def _raw_of(a):
 def fit_batches(model, params, batches, loss="cross_entropy", opt=None, epochs=1, verbose=True, clip=None,
                 schedule=None, device="cuda", precision="auto", ops=None, compensated=None, every=None,
                 accumulate=1, stages=None, freeze=None, train_only=None, exact_sums=None, steps=None,
-                checkpoint=None, save_every=None, resume=True, callback=None, recompute=None, groups=None):
+                checkpoint=None, save_every=None, resume=True, callback=None, recompute=None, groups=None, state=None):
     """Train on batches that each bring their own shapes: batches is a list of (inputs, targets[, graph]) or a
     function epoch -> such a list. inputs may be a list (a dag with several inputs: token ids, node features, ...);
     each batch may have its own graph (a batch of graphs), its own number of rows and its own lengths. One card."""
@@ -5984,13 +6101,18 @@ def fit_batches(model, params, batches, loss="cross_entropy", opt=None, epochs=1
     if net.segments and not (adam and native_opt(opt)):
         raise TrainError("parameter groups= need adam() or adamw()")
     n = net.n
-    st1, st2, SQ = ops.alloc(n), (ops.alloc(n) if adam else None), ops.alloc(1)
+    m16 = adam and str(getattr(opt, "state", "fp32")).lower() in ("bf16", "bfloat16")
+    if m16:                                              # the moments in bfloat16 (stochastic rounding): half the memory
+        st1, st2 = ops.alloc16(n), ops.alloc16(n)
+    else:
+        st1, st2 = ops.alloc(n), (ops.alloc(n) if adam else None)
+    SQ = ops.alloc(1)
     COMP = ops.alloc(n) if _want_comp(compensated, params, precision) else None
     LOSS1 = ops.alloc(1)
     LOSSB = None                                         # each batch's loss, read once an epoch (no wait a batch)
     for b_ in (st1, st2, COMP):
         if b_ is not None:
-            ops.fill((b_, 0), n, 0.0)
+            ops.fill((b_, 0), (n + 1) // 2 if isinstance(b_, Buf16) else n, 0.0)
     ops.fill((net.G, 0), n, 0.0)
     history, t, step = [], int(getattr(opt, "t", 0)), 0
     every = int(every or max(1, E // 10))
@@ -6003,6 +6125,7 @@ def fit_batches(model, params, batches, loss="cross_entropy", opt=None, epochs=1
     net.exact = EXACT
     want = int(steps) if steps else None                 # a number of optimizer steps instead of epochs
     start_ep, skip = 0, 0
+    CKPT_STATE[0] = state
     if checkpoint and resume and os.path.exists(str(checkpoint)):
         t, step, start_ep, skip = _ckpt_load(str(checkpoint), ops, net, st1, st2, COMP, model)
         opt.t = t
@@ -6045,8 +6168,35 @@ def fit_batches(model, params, batches, loss="cross_entropy", opt=None, epochs=1
             A = max(1, int(accumulate or 1))
             VAR = accumulate is not None and int(accumulate) == 0
             want_forms = locals().get("want_forms") or []
-            for bi, item in enumerate(items):
+            items = list(items)
+            bi = -1
+            while True:
+                bi += 1
+                if bi >= len(items):
+                    break
+                item = items[bi]
                 if ep == start_ep and bi < skip:             # resumed: these batches were already trained on
+                    continue
+                if _is_later(item):                          # made now, with the weights as they are at this point
+                    made = list(item.later() or [])
+                    if bool(getattr(item, "end_step", False)):
+                        made.append(_STEP_END)
+                    items[bi:bi + 1] = made
+                    if LOSSB.n < len(items):
+                        old_b = LOSSB
+                        LOSSB = ops.alloc(len(items))
+                        ops.fill((LOSSB, 0), len(items), 0.0)
+                        if on_card:
+                            vals = ops.get(old_b, old_b.n)
+                            ops.put(LOSSB, np.asarray(vals, np.float32), 0)
+                        ops.free(old_b)
+                    bi -= 1
+                    continue
+                if item is _STEP_END:                         # a made batch list that ends the step
+                    t, step = _apply_step(ops, net, opt, adam, wd, clip, schedule, step, t, st1, st2, SQ, COMP, n)
+                    if after_step(ep, bi):
+                        stop = True
+                        break
                     continue
                 X, Y, g = _batch_parts(item)
                 if VAR:                                     # steps of their own length (accumulate=0)
@@ -6058,7 +6208,7 @@ def fit_batches(model, params, batches, loss="cross_entropy", opt=None, epochs=1
                 if net.gdev is not None:                    # the forms the layers asked of the last graph
                     want_forms = [k for k in net.gdev.cache if k[0] in ("csr", "pool")] or want_forms
                 net.set_graph(g)
-                if want_forms and bi + 1 < len(items):      # the next graph's, made meanwhile on another core
+                if want_forms and bi + 1 < len(items) and not _is_later(items[bi + 1]) and items[bi + 1] is not _STEP_END:
                     _prefetch_graph(_batch_parts(items[bi + 1])[2], want_forms)
                 net.train = True
                 net.round_weights()
@@ -6139,11 +6289,13 @@ def fit_batches(model, params, batches, loss="cross_entropy", opt=None, epochs=1
                 lb = ops.get(LOSSB, len(items))
                 for i in on_card:
                     tot += float(lb[i])
+            if rows_all == 0:                            # (resumed after this epoch's last batch: nothing left)
+                continue
             history.append(tot / max(rows_all, 1))
             if callback is not None:
                 callback(Record(epoch=ep, step=step, loss=history[-1]))
             if verbose and (ep % every == 0 or ep == last - 1 or stop):
-                print(f"epoch {ep:4}  loss {history[-1]:.5f}  ({len(items)} batches, step {step}, GPU)")
+                print(f"epoch {ep:4}  loss {history[-1]:.5f}  ({rows_all} batches, step {step}, GPU)")
         opt.t = t
         out_params = net.params()
         if checkpoint:
@@ -6209,7 +6361,7 @@ def _size_ratio(items, first):
             parts.append(int(np.asarray(getattr(g, "batch", ())).size))
         return parts
     try:
-        sizes = [size(it) for it in items]
+        sizes = [size(it) for it in items if not _is_later(it) and it is not _STEP_END]
         f = sizes[min(first, len(sizes) - 1)]
         return max(max((s_[i] / max(f[i], 1)) for s_ in sizes) for i in range(len(f)))
     except Exception:                                    # noqa: BLE001 - odd batches: no scaling
@@ -6222,6 +6374,32 @@ def _layout_of(net):
     return np.array([[net.offsets[id(a)], a.size] for a in net.leaves], np.int64).reshape(-1, 2)
 
 
+def _extra_save(data, bt, state):
+    """What a resumed run needs besides the weights: the random generators, the step counts of the parameter groups
+    that step every batch, and the program's own state (state=record(get=fn() -> text, set=fn(text)))."""
+    import json
+    from . import ops as aops
+    data["RNG"] = np.frombuffer(json.dumps(aops._RNG[0].bit_generator.state).encode(), np.uint8)
+    if bt:
+        data["BT"] = np.array([[int(k), int(v)] for k, v in bt.items()], np.int64)
+    if state is not None:
+        data["XSTATE"] = np.frombuffer(str(state.get()).encode("utf-8"), np.uint8)
+
+
+def _extra_load(z, state):
+    """-> the parameter groups' step counts; puts back the random generators and the program's state."""
+    import json
+    from . import ops as aops
+    if "RNG" in z.files:
+        aops._RNG[0].bit_generator.state = json.loads(bytes(z["RNG"]).decode())
+    if state is not None and "XSTATE" in z.files:
+        state.set(bytes(z["XSTATE"]).decode("utf-8"))
+    return {int(k): int(v) for k, v in z["BT"]} if "BT" in z.files else {}
+
+
+CKPT_STATE = [None]                                   # the state= of the fit_batches that is running
+
+
 def _ckpt_save(path, ops, net, st1, st2, COMP, t, step, epoch, batch=0, model=None):
     """The flat weights, the optimizer's moments and the carried rounding error, written atomically."""
     n = net.n
@@ -6229,7 +6407,7 @@ def _ckpt_save(path, ops, net, st1, st2, COMP, t, step, epoch, batch=0, model=No
             "layout": _layout_of(net)}
     for name, b_ in (("M", st1), ("V", st2), ("C", COMP)):
         if b_ is not None:
-            data[name] = ops.get(b_, n)
+            data[name] = ops.get16(b_, n) if isinstance(b_, Buf16) else ops.get(b_, n)
     master = getattr(net, "master", None)
     if master is not None:
         arrs = [np.asarray(a, np.float64).reshape(-1) for a in tree_leaves(master) if isinstance(a, np.ndarray)]
@@ -6237,6 +6415,7 @@ def _ckpt_save(path, ops, net, st1, st2, COMP, t, step, epoch, batch=0, model=No
     if model is not None:
         from .layers import state_arrays
         data.update(state_arrays(model))                 # running statistics of stateful layers
+    _extra_save(data, net.__dict__.get("_bt"), CKPT_STATE[0])
     tmp = f"{path}.tmp.npz"
     np.savez(tmp, **data)
     os.replace(tmp, path)
@@ -6244,6 +6423,7 @@ def _ckpt_save(path, ops, net, st1, st2, COMP, t, step, epoch, batch=0, model=No
 
 def _ckpt_load(path, ops, net, st1, st2, COMP, model=None):
     with np.load(path) as z:
+        net._bt = _extra_load(z, CKPT_STATE[0])
         if model is not None:
             from .layers import restore_state_arrays
             restore_state_arrays(model, z)
@@ -6259,7 +6439,14 @@ def _ckpt_load(path, ops, net, st1, st2, COMP, model=None):
         ops.put(net.P, z["P"].astype(np.float32))
         for name, b_ in (("M", st1), ("V", st2), ("C", COMP)):
             if b_ is not None and name in z.files:
-                ops.put(b_, z[name].astype(np.float32))
+                a = z[name]
+                if isinstance(b_, Buf16):                # bfloat16 moments: their bits (from float32 values: rounded)
+                    ops.put16(b_, a if a.dtype == np.uint16 else
+                              (np.asarray(a, np.float32).view(np.uint32) + np.uint32(0x7FFF) +
+                               ((np.asarray(a, np.float32).view(np.uint32) >> np.uint32(16)) & np.uint32(1))
+                               >> np.uint32(16)).astype(np.uint16))
+                else:
+                    ops.put(b_, (widen_bf16(a) if a.dtype == np.uint16 else a).astype(np.float32))
         if "P64" in z.files:
             flat = z["P64"]
             leaves, off = [], 0
