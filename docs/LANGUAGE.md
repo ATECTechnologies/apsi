@@ -1082,7 +1082,9 @@ value. Run-time errors always point back to the line and column in the `.apsi` f
 
 Parsed programs are kept in a signed compile cache, and native machine code in a signed machine-code cache, so an
 unchanged program starts without recompiling; `apsi build` turns a program into an executable (`.exe`). Both are
-described under *Executables and the compile cache* in chapter 24. Neural networks built with `use layers` can also
+described under *Executables and the compile cache* in chapter 24. The code generated for each file is cached
+too (keyed by the file, how its imports resolve and Apsi itself), so a program of hundreds of files starts about
+twice as fast from the second run. Neural networks built with `use layers` can also
 run on PyTorch (CPU or GPU) — see [`BACKENDS.md`](BACKENDS.md).
 
 ---
@@ -1510,9 +1512,12 @@ apsi build train.apsi --allow-python -o dist     # the permissions are fixed whe
 apsi build app.apsi --standalone                 # Windows: dist folder with its own Python, for PCs without Apsi
 apsi build server.apsi --windowed --allow-net    # no console window
 apsi build app.apsi --add data                   # pack a data folder (it sits next to the program when it runs)
+apsi build app.apsi --list                       # also list the program files that went in
 ```
 
-The executable contains the program and every `.apsi` file it imports, the already parsed and checked program,
+The executable contains the program and every `.apsi` file it imports (`import "f.apsi"`, `use helpers`,
+`import pkg`, `from .x import y`, packages), the installed libraries it uses (so it runs where they are not
+installed), the already parsed and checked program,
 Apsi itself compiled to bytecode (so it runs exactly the Apsi version it was built with) and the permissions given
 to `apsi build`. A program with check errors is never built. Arguments given to the executable go to the program
 (`args()`), all of them — `app.exe --verbose x` passes `["--verbose", "x"]`. On the first start the program's

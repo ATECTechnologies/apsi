@@ -375,6 +375,37 @@ class BuildAndCompile(TempDir):
         self.assertIn('hello world ["a", "--flag"]', r.stdout)
         self.assertIn("1.5 m/s", r.stdout)
 
+    @unittest.skipIf(os.name == "nt", "the Windows .exe launcher is exercised by running it on Windows")
+    def test_build_carries_packages_and_installed_libraries(self):
+        lib = os.path.join(self.dir, "kit")
+        rc, _, err = self.run_apsi("new", lib, "--template", "lib", "--no-vscode")
+        self.assertEqual(rc, 0, err)
+        r = subprocess.run([sys.executable, "-m", "apsi", "pack"], cwd=lib, capture_output=True, text=True,
+                           env=self.env, timeout=120)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        apsil = [f for f in os.listdir(os.path.join(lib, "dist")) if f.endswith(".apsil")][0]
+        rc, _, err = self.run_apsi("install", os.path.join(lib, "dist", apsil))
+        self.assertEqual(rc, 0, err)
+        pkg = os.path.join(self.dir, "proj", "geo")
+        os.makedirs(pkg)
+        with open(os.path.join(pkg, "__init__.apsi"), "w") as fh:
+            fh.write("from .core import area\n")
+        with open(os.path.join(pkg, "core.apsi"), "w") as fh:
+            fh.write("def area(r):\n    return 3 * r * r\n")
+        main = os.path.join(self.dir, "proj", "main.apsi")
+        with open(main, "w") as fh:
+            fh.write("import geo\nfrom kit import clamp\nprint(geo.area(2), clamp(9, 0, 4))\n")
+        out = os.path.join(self.dir, "out3")
+        rc, so, err = self.run_apsi("build", main, "-o", out)
+        self.assertEqual(rc, 0, err)
+        self.assertIn("libraries: kit", so)
+        env = dict(self.env, APSI_HOME=os.path.join(self.dir, "fresh-home"))     # the library is not installed there
+        env.pop("PYTHONPATH", None)
+        r = subprocess.run([os.path.join(out, "main")], capture_output=True, text=True, cwd=tempfile.gettempdir(),
+                           env=env, timeout=60)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("12 4", r.stdout)
+
     def test_build_refuses_programs_with_errors(self):
         bad = os.path.join(self.dir, "bad.apsi")
         with open(bad, "w", encoding="utf-8") as fh:

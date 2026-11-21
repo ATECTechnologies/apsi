@@ -59,9 +59,15 @@ def _imports(prog):
     return out
 
 
-def collect(entry):
-    """The entry file and every .apsi file it imports, recursively: {absolute path: source}."""
+def collect(entry, libraries=None):
+    """The entry file and every .apsi file it imports, recursively: {absolute path: source}. Follows
+    `import "file.apsi"`, `use NAME` / `import NAME` / `from NAME import …` of the program's own files and
+    packages, and relative imports. Installed libraries it uses go into `libraries` ({name: folder}) when given."""
+    from .interpreter import Interpreter
     from .parser import parse
+    from . import ast as A
+    from .gen_cache import _walk
+    it = Interpreter()
     files, todo, notes = {}, [os.path.abspath(entry)], []
     while todo:
         path = os.path.normpath(todo.pop())
@@ -75,14 +81,34 @@ def collect(entry):
         except Exception as e:
             e.build_file, e.build_source = path, src
             raise
-        for imp in _imports(prog):
-            if os.path.isabs(imp):
-                notes.append(f"{os.path.basename(path)}: import \"{imp}\" is an absolute path; it is read from "
-                             f"that location when the program runs")
-                continue
-            target = os.path.join(os.path.dirname(path), imp)
-            if os.path.exists(target):
-                todo.append(target)
+        here = os.path.dirname(path)
+        for node in _walk(prog):
+            if isinstance(node, A.Import):
+                imp = node.path
+                if os.path.isabs(imp):
+                    notes.append(f"{os.path.basename(path)}: import \"{imp}\" is an absolute path; it is read "
+                                 f"from that location when the program runs")
+                    continue
+                target = os.path.join(here, imp)
+                if os.path.exists(target):
+                    todo.append(target)
+            elif isinstance(node, A.Use):
+                try:
+                    kind, where = it.import_target(node.path, here, node.names, node.py)
+                except Exception:                                  # noqa: BLE001 - the checker reports it
+                    continue
+                if kind == "local":
+                    todo.append(where)
+                elif kind == "module" and node.path in it._libraries and libraries is not None:
+                    from .apsil import resolve_use
+                    lib_entry = resolve_use(node.path, here)
+                    if lib_entry:
+                        folder = lib_entry
+                        while folder and not os.path.isfile(os.path.join(folder, "apsil.json")):
+                            parent = os.path.dirname(folder)
+                            folder = parent if parent != folder else None
+                        if folder:
+                            libraries[node.path] = folder
     return files, notes
 
 
@@ -255,8 +281,9 @@ def cmd_build(args):
         return 2
     t0 = time.perf_counter()
     from .cli import _report
+    libraries = {}
     try:
-        files, notes = collect(entry)
+        files, notes = collect(entry, libraries)
     except ApsiError as e:
         _report(e, getattr(e, "build_source", ""), getattr(e, "build_file", args.file))
         return 1
@@ -311,6 +338,20 @@ def cmd_build(args):
                 data = fh.read()
             digest.update(data)
             zf.writestr("app/" + os.path.relpath(p, root).replace("\\", "/"), data)
+        for lib, folder in sorted(libraries.items()):          # installed libraries travel with the program
+            version = os.path.basename(folder)
+            pkg_name = os.path.basename(os.path.dirname(folder))
+            base = f"app/apsi_packages/{pkg_name}"
+            zf.writestr(f"{base}/current", version)
+            for d, _dirs, fs in os.walk(folder):
+                for f in sorted(fs):
+                    full = os.path.join(d, f)
+                    with open(full, "rb") as fh:
+                        data = fh.read()
+                    digest.update(data)
+                    zf.writestr(f"{base}/{version}/" + os.path.relpath(full, folder).replace("\\", "/"), data)
+        if libraries and not os.path.isfile(os.path.join(root, "apsi.toml")):
+            zf.writestr("app/apsi.toml", f'[project]\nname = "{name}"\n')   # so `use` finds apsi_packages/
         zf.writestr("parsed.pickle", pickle.dumps(parsed, protocol=pickle.HIGHEST_PROTOCOL))
         digest.update(__version__.encode() + json.dumps(meta["flags"]).encode())
         meta["id"] = digest.hexdigest()[:16]
@@ -336,8 +377,12 @@ def cmd_build(args):
     size = os.path.getsize(target)
     for n in notes:
         say(f"  note: {n}")
-    say(f"✓ built {target}  ({size / 1024:.0f} KB, {len(files)} file{'s' if len(files) != 1 else ''}, "
-        f"{time.perf_counter() - t0:.1f} s)")
+    say(f"✓ built {target}  ({size / 1024:.0f} KB, {len(files)} file{'s' if len(files) != 1 else ''}"
+        + (f", libraries: {', '.join(sorted(libraries))}" if libraries else "")
+        + f", {time.perf_counter() - t0:.1f} s)")
+    if getattr(args, "list", False):
+        for p in sorted(files):
+            say(f"  {os.path.relpath(p, root)}")
     if meta["flags"]:
         say(f"  permissions: {' '.join(meta['flags'])}")
     if not args.standalone:
@@ -441,6 +486,7 @@ def register(sub, perm_flags):
     p.add_argument("--include", action="append", metavar="PKG",
                    help="with --standalone: also bundle this Python package (pyimport/torch use is detected)")
     p.add_argument("--add", action="append", metavar="PATH", help="also pack this data file or folder")
+    p.add_argument("--list", action="store_true", help="list the program files that went in")
     p.add_argument("--windowed", action="store_true", help="Windows: no console window (GUI / server programs)")
     p.add_argument("-q", "--quiet", action="store_true")
     perm_flags(p)
