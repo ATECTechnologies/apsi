@@ -635,7 +635,7 @@
     "constant": {
       "patterns": [
         {
-          "match": "\\b(true|false|none)\\b",
+          "match": "\\b(true|false|none|True|False|None)\\b",
           "name": "constant.language.apsi"
         },
         {
