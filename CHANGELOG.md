@@ -23,6 +23,14 @@
   `K.count += 1` on the program's own classes, `type(x).__name__`, `type(x) == int`, `@dataclass` classes in both
   engines.
 
+### Fixed
+- `match` with a class pattern (`case Point(x, y):`) inside a function failed in compiled code ("cannot be used in a
+  case pattern"); the reference interpreter now runs `match` too, and Enum classes and `__name__`.
+- `a, *rest = xs` in compiled code.
+- `read_csv` with a C compiler on Windows: the kernels used 32-bit offsets there (`long`), now 64-bit everywhere.
+- Setting an attribute of the program's own class (`Counter.count += 1`) was refused.
+- Classes used as parameter types (`def f(a: Account)`) were unknown to compiled code's run-time check.
+
 ### Modules and libraries
 - **`use NAME` finds the program's own files:** `use helpers` loads `helpers.apsi` next to the file, `use shapes.circle`
   loads `shapes/circle.apsi` (after the standard modules, before installed libraries). Libraries can be split into

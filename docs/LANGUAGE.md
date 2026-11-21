@@ -1089,7 +1089,7 @@ Full details: [`SECURITY.md`](SECURITY.md).
 |---|---|---|
 | **native** (`@native`, `@gpu`, `apsi run --native`) | each function is specialised on its argument types and units, compiled through LLVM to machine code for the exact CPU (AVX2/AVX-512), cached on disk; `parallel for` uses all cores, `@gpu` the GPUs | numeric code: loops, tensors, physics, simulation — typically 100–3,500× faster than bytecode, on par with C/C++/Rust ([`NATIVE.md`](NATIVE.md)) |
 | `compile` (default for everything else) | the checked program is compiled to Python bytecode: scopes resolved at compile time, specialized type checks, and an **erased twin** of every function used in hot loops | everything; code the native compiler does not handle (strings, lists, records, I/O) |
-| `interp` | the tree-walking reference interpreter that defines the language's meaning | cross-checking the engines; the REPL |
+| `interp` | the tree-walking reference interpreter that defines the language's meaning (everything but `async`/`await`, which run on `compile`) | cross-checking the engines; the REPL |
 
 The engines work together in one program: native functions and bytecode functions call each other freely, and
 `evolve` calls native right-hand sides from its integration loop. A `@native` function that uses something the

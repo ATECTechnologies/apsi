@@ -614,7 +614,8 @@ class CodeGen:
         parts = dotted.split(".")
         if len(parts) == 1 and parts[0] in _PATTERN_TYPES and scope.lookup(parts[0]) is None:
             return f"{HELPER_PREFIX}builtins.{parts[0]}"         # case str(): / case int(x): the built-in type
-        code = self.load(parts[0], scope)
+        b = scope.lookup(parts[0])
+        code = b.py if b is not None else parts[0]               # the name itself (no unit stripping in patterns)
         if not code.replace("_", "a").isidentifier():           # constants and helpers are not valid in patterns
             raise RuntimeErr(f"'{dotted}' cannot be used in a case pattern")
         return ".".join([code] + parts[1:])

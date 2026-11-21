@@ -468,7 +468,9 @@ class Interpreter:
                            if not filename.startswith("<") else os.getcwd()).check(prog)
             if errs:
                 raise CheckFailed(errs)
-        env = env or Env(self.globals)
+        if env is None:
+            env = Env(self.globals)
+            env.vars["__name__"] = os.path.splitext(os.path.basename(filename))[0] if self.importing else "__main__"
         base = os.path.dirname(os.path.abspath(filename)) if not filename.startswith("<") else os.getcwd()
         self.dir_stack.append(base)
         try:
@@ -968,6 +970,123 @@ class Interpreter:
     def ex_Global(self, s, env):
         pass
 
+    def ex_Match(self, s, env):
+        """Python's match statement (the same meaning as the compiled engine's)."""
+        subject = self.eval(s.subject, env)
+        for pat, guard, body in s.cases:
+            binds = {}
+            if self._match(pat, subject, binds, env):
+                cenv = Env(env)
+                cenv.vars.update(binds)
+                if guard is not None and not self.truthy(self.eval(guard, cenv)):
+                    continue
+                self.exec_block(body, cenv)
+                return
+
+    def _pattern_class(self, dotted, env):
+        import builtins as _b
+        from .codegen import _PATTERN_TYPES
+        parts = dotted.split(".")
+        try:
+            v = env.lookup(parts[0])
+        except Exception:                                      # noqa: BLE001
+            v = None
+        if len(parts) == 1 and parts[0] in _PATTERN_TYPES and not isinstance(v, type):
+            return getattr(_b, parts[0])                       # case str(): the built-in type
+        if v is None:
+            raise NameErr(f"'{parts[0]}' is not defined")
+        for p in parts[1:]:
+            v = self.get_attr(v, p)
+        return v
+
+    def _pat_value(self, node, env):
+        if isinstance(node, tuple) and node[0] == "value":
+            return self._pattern_class(node[1], env)
+        return self.eval(node, env)
+
+    def _match(self, p, v, binds, env):
+        from collections.abc import Mapping, Sequence
+        k = p[0]
+        if k == "wild":
+            return True
+        if k == "capture":
+            binds[p[1]] = v
+            return True
+        if k == "as":
+            if self._match(p[1], v, binds, env):
+                binds[p[2]] = v
+                return True
+            return False
+        if k == "or":
+            for alt in p[1]:
+                trial = dict(binds)
+                if self._match(alt, v, trial, env):
+                    binds.update(trial)
+                    return True
+            return False
+        if k in ("value", "lit"):
+            want = self._pat_value(p[1], env) if k == "lit" else self._pattern_class(p[1], env)
+            if want is None or isinstance(want, bool):
+                return v is want
+            return v == want
+        if k == "seq":
+            if isinstance(v, (str, bytes, bytearray)) or not isinstance(v, Sequence):
+                return False
+            items = list(v)
+            pats = p[1]
+            star = [i for i, x in enumerate(pats) if x[0] == "star"]
+            if not star:
+                if len(items) != len(pats):
+                    return False
+                return all(self._match(x, y, binds, env) for x, y in zip(pats, items))
+            i = star[0]
+            after = len(pats) - i - 1
+            if len(items) < len(pats) - 1:
+                return False
+            for x, y in zip(pats[:i], items[:i]):
+                if not self._match(x, y, binds, env):
+                    return False
+            for x, y in zip(pats[i + 1:], items[len(items) - after:]):
+                if not self._match(x, y, binds, env):
+                    return False
+            if pats[i][1]:
+                binds[pats[i][1]] = items[i:len(items) - after]
+            return True
+        if k == "map":
+            if not isinstance(v, Mapping):
+                return False
+            used = set()
+            for key, sub in p[1]:
+                kv = self._pat_value(key, env)
+                if kv not in v or not self._match(sub, v[kv], binds, env):
+                    return False
+                used.add(kv)
+            if p[2]:
+                binds[p[2]] = {a: b for a, b in v.items() if a not in used}
+            return True
+        if k == "class":
+            cls = self._pattern_class(p[1], env)
+            if not isinstance(cls, type) or not isinstance(v, cls):
+                return False
+            pos, kws = p[2], p[3]
+            if pos:
+                names = getattr(cls, "__match_args__", None)
+                if names is None:
+                    if len(pos) == 1 and cls in (bool, bytearray, bytes, dict, float, frozenset, int, list, set, str,
+                                                 tuple):
+                        return self._match(pos[0], v, binds, env)
+                    raise RuntimeErr(f"{cls.__name__}() accepts no positional sub-patterns")
+                if len(pos) > len(names):
+                    raise RuntimeErr(f"{cls.__name__}() accepts {len(names)} positional sub-patterns")
+                for name, sub in zip(names, pos):
+                    if not hasattr(v, name) or not self._match(sub, getattr(v, name), binds, env):
+                        return False
+            for name, sub in kws:
+                if not hasattr(v, name) or not self._match(sub, getattr(v, name), binds, env):
+                    return False
+            return True
+        raise RuntimeErr(f"unknown pattern {k}")
+
     def ex_Declare(self, s, env):
         _PENDING[0] = True
         env.pending = set(s.names) if env.pending is None else env.pending | set(s.names)
@@ -976,7 +1095,11 @@ class Interpreter:
         """A real Python class whose methods are Apsi functions."""
         bases = tuple(self.eval(b, env) for b in s.bases)
         kw = {k: self.eval(v, env) for k, v in s.kwargs if k is not None}
-        ns = {"__module__": "__apsi__", "__qualname__": s.name}
+        meta = kw.pop("metaclass", type(bases[0]) if bases else type)
+        prep = getattr(meta, "__prepare__", None)
+        ns = prep(s.name, bases or (object,), **kw) if prep is not None else {}     # Enum's namespace, …
+        ns["__module__"] = "__apsi__"
+        ns["__qualname__"] = s.name
         if "__apsi__" not in sys.modules:                  # dataclasses, typing and pickle look the module up
             import types as _types
             sys.modules["__apsi__"] = _types.ModuleType("__apsi__")
@@ -1008,10 +1131,11 @@ class Interpreter:
                 ns["__doc__"] = item.expr.value
             else:
                 self.exec_stmt(item, cenv) if hasattr(self, "exec_stmt") else self.exec_block([item], cenv)
-                ns.update({k: v for k, v in cenv.vars.items() if k not in ns})
+                for k, v in cenv.vars.items():
+                    if k not in ns:
+                        ns[k] = v
         if annotations:
             ns["__annotations__"] = annotations
-        meta = kw.pop("metaclass", type(bases[0]) if bases else type)
         cls = meta(s.name, bases or (object,), ns, **kw)
         for menv in menv_all:
             menv.vars["__class__"] = cls

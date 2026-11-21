@@ -116,3 +116,34 @@ def bump():
 def counter_after():
     bump()
     return counter
+
+@dataclass
+class Pt:
+    x: int
+    y: int
+
+def shape_of(v):
+    match v:
+        case 0 | 1:
+            return "small"
+        case [a, *rest] if a > 5:
+            return f"big head {a} {rest}"
+        case [a, b]:
+            return f"pair {a} {b}"
+        case {"k": kv, **others}:
+            return f"map {kv} {others}"
+        case Pt(x=0, y=yy):
+            return f"on axis {yy}"
+        case Pt(xx, yy):
+            return f"point {xx} {yy}"
+        case str() as s:
+            return f"text {s}"
+        case None:
+            return "none"
+        case _:
+            return "other"
+
+test "match with classes, sequences, mappings, guards (both engines)":
+    let got = [shape_of(v) for v in [0, [9, 1, 2], [1, 2], {"k": 1, "z": 2}, Pt(0, 3), Pt(1, 2), "hi", None, 3.5]]
+    assert got == ["small", "big head 9 [1, 2]", "pair 1 2", 'map 1 {"z": 2}', "on axis 3", "point 1 2", "text hi",
+                   "none", "other"]
