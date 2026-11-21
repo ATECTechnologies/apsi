@@ -459,7 +459,7 @@ class BrainRouting(Layer):
         h2 = _ln(seq, c.norm2.w, c.norm2.b)
         return seq + g * (ops.gelu_exact(h2 @ c.f1.W + c.f1.b) @ c.f2.W + c.f2.b)
 
-    def _route(self, r, x, task, train):
+    def _route(self, r, x, task, train, sample=None):
         B, E, k = int(np.shape(ops.raw(x))[0]), self.E, self.k
         st = self.st
         logits = _ln(x, r.pre_norm.w, r.pre_norm.b) @ r.gate.W + r.gate.b + r.task_bias[task]
@@ -469,6 +469,17 @@ class BrainRouting(Layer):
         pd = np.asarray(ops.raw(probs), np.float64)
         pick = pd + st["route_bias"][None, :] if train else pd
         sel = np.argsort(-pick, axis=1, kind="stable")[:, :k]                # [B, k]
+        if sample is not None and not train:            # exploring: Gumbel top-k (Plackett-Luce), the choices kept
+            s0, recs = sample
+            if s0 < B:
+                u = np.clip(ops._RNG[0].random(size=(B - s0, E)), 1e-9, 1.0 - 1e-9)
+                lg = np.asarray(ops.raw(logits), np.float64)[s0:]
+                sel = sel.copy()
+                sel[s0:] = np.argsort(-(lg - np.log(-np.log(u))), axis=1, kind="stable")[:, :k]
+                xr = np.asarray(ops.raw(x), np.float64)
+                for i in range(s0, B):
+                    if sum(1 for r_ in recs if r_[3] == i) < 16:
+                        recs.append([xr[i:i + 1].copy(), int(task), [int(v) for v in sel[i]], i])
         rows = np.arange(B)[:, None]
         sv = probs[rows, sel]
         w = sv / ops.where(np.asarray(ops.raw(ops.sum_(sv, axis=1, keepdims=True))) > 1e-9,
@@ -540,11 +551,14 @@ class BrainRouting(Layer):
             train = False                                # (a batch that must not touch the running statistics)
         sc, sa, sb = x
         B = int(np.shape(ops.raw(sa))[0])
-        rc, ac = self._route(p.router, sc, 2, train)
-        ra, aa = self._route(p.router, sa, 0, train)
+        smp = getattr(g, "route_sample", None) if g is not None else None   # a list: explore, the choices kept
+        if smp is not None:                             # rows from graph.route_sample_from on (the first: as usual)
+            smp = (int(getattr(g, "route_sample_from", 0) or 0), smp)
+        rc, ac = self._route(p.router, sc, 2, train, smp)
+        ra, aa = self._route(p.router, sa, 0, train, smp)
         fa = self._bridge(p.bridge, rc, ra)
         ea = self._ewc(rc)
-        rb, ab = self._route(p.router, sb, 1, train)
+        rb, ab = self._route(p.router, sb, 1, train, smp)
         fb = self._bridge(p.bridge, fa, rb)
         eb = self._ewc(fa)
         if train:                                       # the bridge's reward: a running mean of cos(a, fused)
@@ -592,6 +606,47 @@ class BrainRouting(Layer):
         aux = sum(auxs[1:], auxs[0]) / len(auxs) if (train and auxs) else 0.0
         one = np.ones((R, 1))
         return ops.concat([rc, fa, np.zeros((R, self.d)), np.zeros((R, 1)), np.zeros((R, 1)), one * aux], 1)
+
+    def rl_policy_grad(self, p, items, entropy=0.01):
+        """REINFORCE on the router's choice (Plackett-Luce): items = [[records of one sample, advantage], ...], a
+        record [input [1, d], task, chosen experts, row] as route_sample keeps them. -> (loss, gradient) for the router's
+        pre_norm, gate and task_bias (a tree like p.router with zeros elsewhere)."""
+        from .stdlib import value_and_grad
+        r0 = p.router
+
+        def loss(pre_w, pre_b, gw, gb, tb):
+            terms = []
+            for recs, adv in items:
+                adv = float(adv)
+                if not recs or abs(adv) < 1e-8:
+                    continue
+                lp_sum, ent_sum = 0.0, 0.0
+                for rec in recs:
+                    xr, tid, sel = rec[0], rec[1], rec[2]
+                    lg = ops.reshape(_ln(np.asarray(xr, np.float64), pre_w, pre_b) @ gw + gb + tb[int(tid)], -1)
+                    rem = np.ones(self.E, bool)
+                    lp = 0.0
+                    for j in [int(v) for v in sel]:
+                        m = np.where(rem, 0.0, -1e30)
+                        z = lg + m
+                        mx = float(np.max(np.asarray(ops.raw(z))))
+                        lse = ops.log(ops.sum_(ops.exp(z - mx))) + mx
+                        lp = lp + lg[j] - lse
+                        rem = rem.copy()
+                        rem[j] = False
+                    pr = ops.softmax(lg, axis=-1)
+                    ent = -ops.sum_(pr * ops.log_softmax(lg, axis=-1))
+                    lp_sum = lp_sum + lp
+                    ent_sum = ent_sum + ent
+                n = float(len(recs))
+                terms.append(-(adv * lp_sum / n) - entropy * ent_sum / n)
+            if not terms:
+                return 0.0 * ops.sum_(gb)
+            return sum(terms[1:], terms[0]) / len(terms)
+        f = lambda *a: loss(*a)                                              # noqa: E731
+        lv, g = value_and_grad(f, wrt=(0, 1, 2, 3, 4))(r0.pre_norm.w, r0.pre_norm.b, r0.gate.W, r0.gate.b,
+                                                         r0.task_bias)
+        return float(ops.raw(lv)), Record(pre_norm=Record(w=g[0], b=g[1]), gate=Record(W=g[2], b=g[3]), task_bias=g[4])
 
     def describe(self):
         return f"brain_routing(d={self.d}, {self.E} experts, top {self.k})"
@@ -711,6 +766,9 @@ class MemorySlots(Layer):
     def apply(self, p, x, train=False, **ctx):
         g = ctx.get("graph")
         A, C, sa, sc = x
+        given = getattr(g, "mem_given", None) if g is not None else None
+        if given is not None:                           # a memory made earlier (e.g. while sampling): as given,
+            return np.asarray(ops.raw(given), np.float64)   # no gradient back
         if getattr(g, "mem_a_const", False):            # the A nodes and summary as given, no gradient back
             A = np.asarray(ops.raw(A), np.float64)
             sa = np.asarray(ops.raw(sa), np.float64)

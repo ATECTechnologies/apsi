@@ -5858,6 +5858,27 @@ class Net:
             return a
         return tree_map(back, self.params_tree)
 
+    def set_params(self, tree, only=None):
+        """Write weights back onto the card mid-training: the leaves of `tree` (same layout as the model's) whose
+        dotted path starts with one of `only` (every leaf when only is None)."""
+        from .models import _flatten
+        mine, new = _flatten(self.params_tree), _flatten(tree)
+        pre = None if only is None else [str(o) for o in only]
+        wrote = 0
+        for k, a in mine.items():
+            if pre is not None and not any(k == o or k.startswith(o + ".") for o in pre):
+                continue
+            if k not in new or not isinstance(a, np.ndarray) or id(a) not in self.offsets:
+                continue
+            v = np.asarray(aops_raw(new[k]), np.float32).reshape(-1)
+            if v.size != a.size:
+                raise TrainError(f"set_params: {k} has {v.size} values, the model {a.size}")
+            self.ops.put(self.P, v, self.offsets[id(a)])
+            wrote += v.size
+        if wrote and hasattr(self.ops, "refresh_w16"):
+            self.ops.refresh_w16()
+        return wrote
+
     def close(self):
         self.arena.close()
         self.clear_graphs()
@@ -5995,6 +6016,7 @@ def fit_batches(model, params, batches, loss="cross_entropy", opt=None, epochs=1
         _ckpt_save(str(checkpoint), ops, net, st1, st2, COMP, t, step, pos[0], pos[1], model)
 
     step0 = step
+    LIVE.append(_Live(lambda: net.params(), lambda tree, only=None: net.set_params(tree, only)))
 
     def after_step(ep_, bi_):                            # True: stop here (steps reached)
         pos[0], pos[1] = ep_, bi_ + 1
@@ -6137,6 +6159,8 @@ def fit_batches(model, params, batches, loss="cross_entropy", opt=None, epochs=1
                 pass
         raise
     finally:
+        if LIVE:
+            LIVE.pop()
         for b_ in (st1, st2, SQ, COMP, LOSS1, LOSSB):
             if b_ is not None:
                 ops.free(b_)
@@ -6147,6 +6171,22 @@ def fit_batches(model, params, batches, loss="cross_entropy", opt=None, epochs=1
     return Record(params=out_params, history=history, device=getattr(ops, "name", "?"),
                   gpu_memory_mb=round(getattr(ops, "peak", ops.used) / 2 ** 20),
                   recomputed=sum(1 for nd in net.ck if not nd.live), blocks=len(net.ck))
+
+
+def aops_raw(v):
+    from . import ops as aops
+    return aops.raw(v)
+
+
+class _Live:
+    """The weights of the training that is running, for code that runs between its steps (the batches function):
+    get() the current tree, set(tree, only) write some of it back."""
+
+    def __init__(self, get, put):
+        self.get, self.put = get, put
+
+
+LIVE = []                                              # a stack: the innermost training that is running
 
 
 def _say_memory(ops, net):

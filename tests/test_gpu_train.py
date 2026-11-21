@@ -1559,3 +1559,37 @@ class QkvGradsBatched(unittest.TestCase):
             if v == "1":
                 self.assertTrue(seen)
         self.assertEqual(res["1"], res["0"])
+
+
+def test_training_params_and_update():
+    """training_params() / training_update() inside a running fit_batches, on both backends."""
+    import numpy as np
+    from apsi import layers as L
+    from apsi.values import Record
+    for be in ("numpy", "gpu"):
+        from apsi import gpu_train as GT
+        old = GT.device
+        if be == "gpu":
+            GT.device = lambda *a, **k: (GT.Emulator(), None)
+        try:
+            m = L.sequential([L.Linear(3, 4), L.Linear(4, 2)])
+            p = m.init(seed=1)
+            seen = []
+            X = np.ones((5, 3))
+            Y = np.zeros(5, np.int64)
+
+            def batches(ep):
+                cur = L.training_params()
+                seen.append(np.array(cur[0].W, copy=True))
+                new = [Record(W=np.full((3, 4), 0.5), b=np.zeros(4)), cur[1]]
+                L.training_update(new, only=["0.W"])
+                return [(X, Y)]
+            r = L.fit_batches(m, p, batches, opt=L.__dict__.get("SGD", None) and None, epochs=2, backend=be,
+                              verbose=False)
+            assert len(seen) == 2
+            assert np.allclose(seen[0], np.asarray(p[0].W))
+            assert np.abs(seen[1] - 0.5).max() < 0.1    # the weights written back were trained on
+            assert L.training_params() is None
+            assert not np.allclose(np.asarray(r.params[0].W), np.asarray(p[0].W))
+        finally:
+            GT.device = old

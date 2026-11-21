@@ -1378,7 +1378,7 @@ def fit_batches(model, params, batches, loss="cross_entropy", opt=None, epochs=1
     every = int(every or max(1, E // 10))
     history, step = [], 0
     still = frozen_paths(params, freeze, train_only)
-    from .gpu_train import _batch_parts
+    from .gpu_train import _batch_parts, LIVE, _Live
     A = max(1, int(accumulate or 1))
     want = int(steps) if steps else None
     start_ep, skip = 0, 0
@@ -1394,7 +1394,16 @@ def fit_batches(model, params, batches, loss="cross_entropy", opt=None, epochs=1
         for ep in range(start_ep, last):
             if stop:
                 break
-            items = list(batches(ep) if callable(batches) else batches)
+            if callable(batches):
+                box = [params]
+                LIVE.append(_Live(lambda: box[0], lambda tree, only=None: box.__setitem__(0, _np_set(box[0], tree, only))))
+                try:
+                    items = list(batches(ep))
+                finally:
+                    LIVE.pop()
+                params = box[0]
+            else:
+                items = list(batches)
             tot, seen = 0.0, 0
             if accumulate is not None and int(accumulate) == 0:   # steps of their own length: targets.end_step
                 starts, cur = [], 0
@@ -1441,6 +1450,52 @@ def fit_batches(model, params, batches, loss="cross_entropy", opt=None, epochs=1
     return Record(params=params, history=history, device="processor")
 
 
+def training_params():
+    """Inside a running fit_batches (in its batches function): the weights as they are now (a tree like the model's
+    params). none when no training is running."""
+    from .gpu_train import LIVE
+    return LIVE[-1].get() if LIVE else None
+
+
+def training_update(params, only=None):
+    """Inside a running fit_batches (in its batches function): write weights back into the training, e.g. a part
+    updated by an optimizer of your own. only=[dotted paths]: just those parts (and what is under them)."""
+    from .gpu_train import LIVE
+    if not LIVE:
+        raise RuntimeErr("training_update(): no training is running")
+    LIVE[-1].put(params, None if only is None else list(ops.raw(only) if not isinstance(only, (list, tuple)) else only))
+    return None
+
+
+def _np_set(params, tree, only):
+    """params with the leaves of `tree` whose dotted path starts with one of `only` (all when None) put in."""
+    pre = None if only is None else [str(o) for o in only]
+
+    def walk(a, b, path):
+        if isinstance(a, Record):
+            return Record(**{k: walk(v, _get(b, k), path + (k,)) for k, v in a.fields.items()})
+        if isinstance(a, dict):
+            return {k: walk(v, _get(b, k), path + (str(k),)) for k, v in a.items()}
+        if isinstance(a, (list, tuple)):
+            return type(a)(walk(v, _get(b, i), path + (str(i),)) for i, v in enumerate(a))
+        k = ".".join(path)
+        if b is None or (pre is not None and not any(k == o or k.startswith(o + ".") for o in pre)):
+            return a
+        return np.asarray(ops.raw(b), np.asarray(a).dtype).reshape(np.shape(a))
+
+    def _get(b, k):
+        if b is None:
+            return None
+        if isinstance(b, Record):
+            return b.fields.get(k)
+        if isinstance(b, dict):
+            return b.get(k)
+        if isinstance(b, (list, tuple)):
+            return b[k] if isinstance(k, int) and k < len(b) else None
+        return None
+    return walk(params, tree, ())
+
+
 def _np_step(model, params, chunk, loss, lf, opt, schedule, step, clip, still, guard):
     """One optimizer step over the batches of `chunk` (their gradients averaged): (params, summed loss, taken?)."""
     from .stdlib import value_and_grad
@@ -1458,13 +1513,13 @@ def _np_step(model, params, chunk, loss, lf, opt, schedule, step, clip, still, g
             sp = getattr(lf, "on_card", None)
             s_ = float(sp[4](Y)) if (sp is not None and len(sp) > 4) else 1.0
             hold = bool(getattr(Y, "hold", False)) if isinstance(Y, Record) else False
-            if s_ > 0 and not hold:                      # parts with their own step after every batch
+            if s_ != 0 and not hold:                     # parts with their own step after every batch
                 held = getattr(opt, "_held", None)
                 g_all = gr if held is None else tree_map(lambda a, b: a + b, held, gr)
                 opt._held = None
                 params = opt.step_batch(params, g_all)
                 gr = opt.batch_mask(params, gr)
-            elif s_ > 0 and hold:                        # its gradient joins the next batch's step
+            elif s_ != 0 and hold:                       # its gradient joins the next batch's step
                 bm = opt.batch_mask(params, gr)
                 part = tree_map(lambda a, b: a - b, gr, bm)
                 opt._held = part if getattr(opt, "_held", None) is None else tree_map(lambda a, b: a + b, opt._held, part)
@@ -2476,7 +2531,7 @@ def module(interp=None):
         transformer_encoder=transformer_encoder, layer_norm_layer=LayerNorm, rms_norm_layer=RMSNorm,
         batch_norm_layer=BatchNorm, dropout_layer=Dropout, activation=activation, lambda_layer=LambdaLayer,
         scale=Scale, identity=Identity, select=Select, mean_pool=MeanPool, slice_layer=Slice, grad_scale=GradScale,
-        tied_output=TiedOutput, card_loss=card_loss,
+        tied_output=TiedOutput, card_loss=card_loss, training_params=training_params, training_update=training_update,
         gcn=GCN, sage=SAGE, gat=GAT, gin=GIN, gine=GINE, batch_graphs=batch_graphs, graph_pool=GraphPool,
         # composition
         sequential=sequential, residual=residual, parallel=parallel, dag=dag, add=add, multiply=multiply,
