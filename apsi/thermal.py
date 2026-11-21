@@ -872,16 +872,19 @@ def _calibrate_all(index=None):
 def add_parser(sub):
     p = sub.add_parser("gpu", help="the NVIDIA cards now: temperature, power, clocks; set a power limit")
     p.add_argument("what", nargs="?", default="status",
-                   choices=["status", "power", "watch", "setup", "remove", "hold", "bench", "calibrate"])
+                   choices=["status", "power", "watch", "setup", "remove", "hold", "bench", "calibrate", "test"])
     p.add_argument("value", nargs="?", default=None,
                    help="bench gemm: every build of the matrix product, its error and TFLOPS; calibrate: measures each card's power and fan settings for training (setup does it too); "
                         "for power: 80%% (of the default), 130W or default; for hold: the ceiling (79); for bench: "
-                        "127m (default), 11m, modern, check (every kernel against the reference) or cards")
+                        "127m (default), 11m, modern, check (every kernel against the reference), cards or max (the largest "
+                        "model that trains here); test: everything on the card in one report")
     p.add_argument("--no-calibrate", action="store_true",
                    help="setup: do not measure the card now (training uses safe defaults; apsi gpu calibrate later)")
     p.add_argument("--precision", default="auto", help="bench: auto (bf16), fp32, fp8, fp4, ...")
     p.add_argument("--steps", type=int, default=40, help="bench: training steps to time")
     p.add_argument("--gpu", type=int, default=None)
+    p.add_argument("--out", default="apsi-gpu-test", help="test: the folder of the report")
+    p.add_argument("--quick", action="store_true", help="test: the checks only, no speed runs")
     p.set_defaults(fn=_cmd)
 
 
@@ -897,6 +900,9 @@ def _cmd(args):
         return _calibrate_all(args.gpu)
     if args.what == "hold":
         return hold(float(args.value or 79), args.gpu or 0)
+    if args.what == "test":
+        from . import gpu_suite
+        return gpu_suite.run(args.out, args.quick)
     if args.what == "bench":
         from . import gpu_bench
         return gpu_bench.main(args.value or "127m", args.precision, args.steps)

@@ -5,6 +5,8 @@
     apsi gpu bench modern       a 127 M LLaMA / Qwen3-style model (grouped heads, rotary positions, q/k norms, SwiGLU)
     apsi gpu bench check        every new kernel and layer on this card against the exact reference (the Emulator)
     apsi gpu bench cards        one model split across every card against one card (needs 2 cards or more)
+    apsi gpu bench max          the largest GPT (125 M … 6.7 B) that trains on this card: memory and speed
+    apsi gpu test [--out DIR]   all of the above and an Apsi program trained, resumed and saved on the card: one report
 
 Reports tokens per second (steady, after the first steps), the time of each kind of kernel, the temperature, the
 power and the energy per token, and ends with one JSON line to send back when asking for tuning. The data is random
@@ -502,15 +504,95 @@ def cards(out=sys.stdout):
     return 0 if err < 1e-3 and same else 1
 
 
+MAX_LADDER = [  # GPT sizes tried by `apsi gpu bench max`, smallest first (vocab 32000, context 512)
+    ("125m", dict(d=768, heads=12, layers=12)),
+    ("350m", dict(d=1024, heads=16, layers=24)),
+    ("760m", dict(d=1536, heads=16, layers=24)),
+    ("1.3b", dict(d=2048, heads=16, layers=24)),
+    ("2.7b", dict(d=2560, heads=32, layers=32)),
+    ("6.7b", dict(d=4096, heads=32, layers=32)),
+]
+
+
+def largest(out=sys.stdout, context=512, batch=4, steps=2, vocab=32000):
+    """apsi gpu bench max: the largest GPT of MAX_LADDER that trains on this card (bf16, AdamW with bfloat16
+    moments, recompute where it must), trying each size for a few real steps; reports its card memory and speed."""
+    from . import layers as L, gpu_train as GT
+    from .stdlib import adamw
+    from .values import tree_leaves
+    ops, why = GT.device("cuda")
+    if ops is None:
+        print(f"no GPU: {why}", file=out)
+        return 1, None
+    card_bytes = getattr(getattr(ops, "dev", None), "memory", None)
+    total_mb = round(card_bytes / 2 ** 20) if card_bytes else None
+    print(f"{getattr(ops, 'name', '?')}: the largest GPT that trains here (context {context}, batch {batch}, bf16, "
+          f"AdamW with bfloat16 moments, recompute auto)", file=out)
+    rng = np.random.default_rng(0)
+    X = rng.integers(0, vocab, (batch * steps, context))
+    Y = np.roll(X, -1, 1)
+    best = None
+    for name, cfg in MAX_LADDER:
+        d, nl = cfg["d"], cfg["layers"]
+        est = 12 * nl * d * d + 2 * vocab * d + context * d        # parameters, before making any
+        if card_bytes and est * 12 > 0.97 * card_bytes:             # weight, gradient, 2 bf16 moments: 12 bytes each
+            print(f"  stop  {name:>5}: ~{est / 1e6:,.0f} M parameters need ~{est * 12 / 2 ** 30:.1f} GB before any "
+                  f"activation; the card has {card_bytes / 2 ** 30:.1f} GB (device=\"cuda:all\" splits a model "
+                  f"across cards)", file=out)
+            break
+        model = L.transformer_lm(vocab, context=context, **cfg)
+        try:
+            params = model.init(seed=0)
+            n = sum(int(np.asarray(a).size) for a in tree_leaves(params) if isinstance(a, np.ndarray))
+            t0 = time.perf_counter()
+            r = GT.fit(model, params, X, Y, loss="cross_entropy", opt=adamw(lr=1e-4, state="bf16"), epochs=1,
+                       batch_size=batch, verbose=False, precision="bf16", ops=ops)
+            dt = time.perf_counter() - t0
+            params = None
+            ok = all(np.isfinite(r.history))
+            print(f"  {'ok  ' if ok else 'FAIL'} {name:>5}: {n / 1e6:,.0f} M parameters, card memory "
+                  f"{r.gpu_memory_mb:,} MB{'' if total_mb is None else f' of {total_mb:,}'}, {steps} steps in "
+                  f"{dt:.1f} s ({batch * steps * context / dt:,.0f} tokens/s incl. start), loss {r.history[0]:.3f}",
+                  file=out)
+            if not ok:
+                break
+            if card_bytes and r.gpu_memory_mb * 2 ** 20 > card_bytes:
+                print(f"  stop  {name:>5}: it needed more than the card's memory (the rest spilled into the "
+                      f"computer's memory: it runs, many times slower)", file=out)
+                break
+            best = {"size": name, "params_m": round(n / 1e6), "gpu_memory_mb": r.gpu_memory_mb,
+                    "tokens_per_s_incl_start": round(batch * steps * context / dt)}
+        except MemoryError as e:
+            print(f"  stop  {name:>5}: does not fit ({str(e).splitlines()[0][:160]})", file=out)
+            break
+        except Exception as e:                              # noqa: BLE001 - out of card memory shows up as errors
+            msg = str(e).splitlines()[0][:200] if str(e) else type(e).__name__
+            print(f"  stop  {name:>5}: {msg}", file=out)
+            break
+        finally:
+            import gc
+            gc.collect()
+            try:
+                ops.sync()
+            except Exception:                               # noqa: BLE001
+                pass
+    if best:
+        print(f"largest that trains: {best['size']} ({best['params_m']:,} M parameters, {best['gpu_memory_mb']:,} MB)",
+              file=out)
+    return (0 if best else 1), best
+
+
 def main(what="127m", precision="auto", steps=40):
     w = str(what or "127m").lower()
     if w == "check":
         return check()
+    if w == "max":
+        return largest()[0]
     if w == "cards":
         return cards()
     if w == "gemm":
         return gemm()
     if w not in CONFIGS:
-        print(f"apsi gpu bench {what}: {', '.join(CONFIGS)}, check, gemm or cards")
+        print(f"apsi gpu bench {what}: {', '.join(CONFIGS)}, check, gemm, cards or max")
         return 2
     return bench(w, int(steps), precision)

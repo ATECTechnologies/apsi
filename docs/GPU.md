@@ -208,6 +208,13 @@ the temperature, the power and the energy per 1,000 tokens, then one JSON line t
 on the card and on the exact reference and compares, `apsi gpu bench cards` splits a model across all the cards and
 compares with one card.
 
+**Everything at once: `apsi gpu test`** — one report (`apsi-gpu-test/report.txt` and `report.json`) with every
+part PASS or FAIL: the card, every kernel and layer against the exact reference, every matrix-product build, an Apsi
+program trained on the card (stopped and resumed to the same loss as one run, predicted with, saved and read back,
+bfloat16 moments, gradient accumulation, a graph network), the speed of the 11 M, 127 M and LLaMA / Qwen3-style
+models, and **`apsi gpu bench max`**: the largest GPT (125 M, 350 M, 760 M, 1.3 B, 2.7 B, 6.7 B; context 512, bf16,
+bfloat16 moments) that trains on this card, with its memory and speed. `--quick` leaves the speed runs out.
+
 **Several cards** — `fit(…, backend="gpu", device="cuda:all")` (or `device="cuda:0,1,2,3"`): data-parallel
 training for any model the trainer supports. Every card holds the model and takes its share of each batch; then each
 card sums only *its slice* of the gradient, pulled from all the others at the same time (reduce-scatter; NVLink /
