@@ -6310,8 +6310,12 @@ def fit_batches(model, params, batches, loss="cross_entropy", opt=None, epochs=1
                         print(f"    ({title}: {e_})", flush=True)
                         continue
                     print(f"  the processor, {title}:", flush=True)
-                    for ln in [ln for ln in buf.getvalue().splitlines() if ln.strip()][:60]:
-                        print("    " + ln.rstrip()[:170], flush=True)
+                    pre = (os.path.dirname(os.path.dirname(os.path.abspath(__file__))) + os.sep, os.path.dirname(
+                        os.__file__) + os.sep)
+                    for ln in [ln for ln in buf.getvalue().splitlines() if ln.strip()][:80]:
+                        for pp in pre:                       # short names: the callers fit on the line
+                            ln = ln.replace(pp, "")
+                        print("    " + " ".join(ln.split())[:240], flush=True)
             elif step == step0 + 6 and "t" in prof:
                 k = ops.stop_profile()
                 wall = time.perf_counter() - prof["t"]
