@@ -82,6 +82,11 @@
   really has (tens of times on graphs with many relation kinds); results unchanged.
 - **`global_attention` with learned keys:** its edges are made in int32, already in order, with offsets from each
   node's key count — no sort and no count over every edge on the processor in each pass.
+- **`global_attention` with learned keys, pieces without sorting:** each piece's edges grouped by key are made from
+  the graph blocks (every node of a graph has the same keys) by arithmetic instead of a stable sort and a count of
+  every edge, three times a layer (forward, recompute, backward); the same arrays, checked against the sort.
+- When the card is full, the trainer prints its largest buffers (and which the current batch uses) before stopping,
+  and with `verbose` a 3-step profile of the processor's own time per function follows the card's.
 - **`fit_batches(…, prefetch=true)`:** the next epoch's batches are made on a second thread while the card trains,
   for data pipelines that build graphs or tokenize on the processor.
 - **`apsi gpu test`:** everything Apsi does on the card in one report (`report.txt`, `report.json`), every part

@@ -1122,6 +1122,7 @@ class Gpu(_Ops):
         except Exception as e:                           # noqa: BLE001
             if "OUT_OF_MEMORY" not in str(e).upper() and "out of memory" not in str(e).lower():
                 raise
+            _say_largest(self)
             raise TrainError(f"the card ran out of memory ({self.used / 2 ** 30:.2f} GB in use, "
                              f"{4 * n / 2 ** 20:.0f} MB more asked, {self.dev.memory / 2 ** 30:.1f} GB on the card): "
                              "a smaller batch_size (with accumulate= for the same step), fewer or narrower layers, a "
@@ -2277,6 +2278,32 @@ class _StepTimes:
         return out
 
 
+_ARENAS = []                                             # (weak) every arena, for the report when the card is full
+
+
+def _say_largest(ops):
+    """When the card is full: the largest buffers and what holds them (printed once)."""
+    if getattr(ops, "_said_largest", False):
+        return
+    ops._said_largest = True
+    try:
+        rows = []
+        for ref in list(_ARENAS):
+            a = ref()
+            if a is None or a.ops is not ops:
+                continue
+            for k, b in a.bufs.items():
+                rows.append((4 * b.n, str(k)[:110], a.seen.get(k, -1) == a.tick))
+        rows.sort(reverse=True)
+        tot = sum(r[0] for r in rows)
+        print(f"  the card is full: {ops.used / 2 ** 30:.2f} GB in use, {tot / 2 ** 30:.2f} GB of it in named buffers; "
+              "the largest (* = used by this batch):", flush=True)
+        for nb, k, now in rows[:25]:
+            print(f"    {nb / 2 ** 20:9.1f} MB {'*' if now else ' '} {k}", flush=True)
+    except Exception:                                    # noqa: BLE001 - a report only
+        pass
+
+
 def _base_arena(net):
     """The net's own _Arena (not the view a recomputed layer sees), or None."""
     a = getattr(net, "arena", None)
@@ -2314,6 +2341,8 @@ class _Arena:
         self.ops, self.bufs, self.seen, self.tick = ops, {}, {}, 0
         self.pools = []                                  # lists of spare buffers that may be given back too
         self.trimmed = 0                                 # bytes given back to stay inside the budget
+        import weakref
+        _ARENAS.append(weakref.ref(self))
 
     def next_item(self):
         self.tick += 1
@@ -4803,6 +4832,57 @@ class _HGT(_Node):
         return dx
 
 
+def _block_pieces(blocks, offh, N, budget):
+    """The pieces of _GlobalAttention._chunks for edges made of graph blocks (each target of a block has the block's
+    keys, rows and blocks in ascending order, keys unique in a block): the same arrays as sorting every piece's edges
+    by key (stable), made by arithmetic. None when the blocks do not have that form."""
+    for idx, keys in blocks:
+        if len(keys) and len(np.unique(keys)) != len(keys):
+            return None
+    spans, r0 = [], 0
+    while r0 < N:
+        r1 = int(np.searchsorted(offh, offh[r0] + budget, side="right")) - 1
+        r1 = min(N, max(r1, r0 + 1))
+        spans.append((r0, r1))
+        r0 = r1
+    sorted_keys = [(idx, keys, np.argsort(keys, kind="stable")) for idx, keys in blocks]
+    offs, krows, kperms, koffs, meta = [], [], [], [], []
+    po = pk = 0
+    for r0, r1 in spans:
+        e0, e1 = int(offh[r0]), int(offh[r1])
+        offs.append(offh[r0:r1 + 1] - e0)
+        kp, kr, cnt_keys, cnt_n = [], [], [], []
+        for idx, keys, order in sorted_keys:
+            a, b = np.searchsorted(idx, r0), np.searchsorted(idx, r1)
+            if b <= a or not len(keys):
+                continue
+            rows = idx[a:b]
+            k = len(keys)
+            base = int(offh[rows[0]]) - e0
+            kp.append((base + np.arange(b - a, dtype=np.int64)[None, :] * k + order[:, None]).reshape(-1))
+            kr.append(np.tile(rows, k))
+            cnt_keys.append(keys[order])
+            cnt_n.append(b - a)
+        if kp:
+            perm, krow = np.concatenate(kp), np.concatenate(kr)
+            allk = np.concatenate(cnt_keys)
+            k0, nk = int(allk.min()), int(allk.max()) - int(allk.min()) + 1
+            counts = np.zeros(nk, np.int64)
+            for ks, n_ in zip(cnt_keys, cnt_n):
+                counts[ks - k0] += n_
+            koff = np.concatenate([[0], np.cumsum(counts)])
+        else:
+            perm = krow = np.zeros(0, np.int64)
+            k0, nk, koff = 0, 0, np.zeros(1, np.int64)
+        kperms.append(perm)
+        krows.append(krow)
+        koffs.append(koff)
+        meta.append((r0, r1 - r0, e0, e1 - e0, po, k0, nk, pk))
+        po += r1 - r0 + 1
+        pk += nk + 1 if nk else 1
+    return offs, krows, kperms, koffs, meta
+
+
 class _GlobalAttention(_Node):
     """global_attention: x + attention of every node over the nodes of its graph, as edges on the card. Options as
     the layer: fewer heads than the model (ratio), biases on q / k / v, learned keys (every value scaled by
@@ -4848,6 +4928,7 @@ class _GlobalAttention(_Node):
         src, dst, picked = [], [], False
         in_order, last = True, -1
         per_node = np.zeros(N, np.int64)                   # each node's number of keys: the CSR offsets
+        blocks = []
         for b_ in np.unique(batch[own]):
             idx = np.nonzero((batch == b_) & own)[0]
             if len(idx):                                   # (each graph's nodes ascending; graphs one after another)
@@ -4857,6 +4938,7 @@ class _GlobalAttention(_Node):
                 idx if len(idx) <= self.max_keys else idx[np.linspace(0, len(idx) - 1, self.max_keys).astype(int)])
             picked = picked or (self.learned and len(keys) < len(idx))
             per_node[idx] = len(keys)
+            blocks.append((np.asarray(idx, np.int64), np.asarray(keys, np.int64)))
             src.append(np.tile(np.asarray(keys, np.int32), len(idx)))
             dst.append(np.repeat(np.asarray(idx, np.int32), len(keys)))
         src = np.concatenate(src) if src else np.zeros(0, np.int64)
@@ -4876,7 +4958,7 @@ class _GlobalAttention(_Node):
                 gd.cache[ar] = gd._put(np.arange(E + 1))
             col = put("e_col", s_)                         # (the key of each edge is its column: one buffer)
             f = dict(col=col, off=put("e_off", offs), row=put("e_row", d_), ids=gd.cache[ar], eoff=gd.cache[ar], n=N,
-                     E=E, src=s_, dst=d_, cached=False)
+                     E=E, src=s_, dst=d_, cached=False, offh=offs, blocks=blocks if in_order else None)
             return gd, f, col
         f = gd.custom(("global", self.max_keys, self.type_ids), src, dst)
         ck = ("ga", self.max_keys, self.type_ids)
@@ -4978,6 +5060,10 @@ class _GlobalAttention(_Node):
         hit = self.gdv.cache.get(key) if cached else None
         if hit is not None and hit[0] is f:
             return hit[1]
+        if f.get("blocks") is not None:                     # learned keys: made from the graph blocks, no sort
+            got = _block_pieces(f["blocks"], np.asarray(f["offh"], np.int64), N, budget)
+            if got is not None:
+                return self._pieces_up(f, cached, key, *got)
         s_, d_ = np.asarray(f["src"], np.int64), np.asarray(f["dst"], np.int64)
         offh = np.concatenate([[0], np.cumsum(np.bincount(d_, minlength=N))]).astype(np.int64)
         spans, r0 = [], 0
@@ -5002,6 +5088,9 @@ class _GlobalAttention(_Node):
             meta.append((r0, r1 - r0, e0, e1 - e0, po, k0, nk, pk))
             po += r1 - r0 + 1
             pk += nk + 1 if nk else 1
+        return self._pieces_up(f, cached, key, offs, krows, kperms, koffs, meta)
+
+    def _pieces_up(self, f, cached, key, offs, krows, kperms, koffs, meta):
         cat = lambda xs: np.concatenate(xs) if xs else np.zeros(1, np.int64)    # noqa: E731
         if cached:
             put = self.gdv._put
@@ -6046,6 +6135,22 @@ def fit_batches(model, params, batches, loss="cross_entropy", opt=None, epochs=1
                 ops.sync()
                 ops.start_profile()
                 prof["t"], prof["l"] = time.perf_counter(), ops.launches
+            elif step == step0 + 7 and "host" not in prof:  # where the processor's time goes: three steps
+                import cProfile
+                prof["host"] = cProfile.Profile()
+                prof["host"].enable()
+            elif step == step0 + 10 and prof.get("host") is not None:
+                import io as _io
+                import pstats
+                prof["host"].disable()
+                buf = _io.StringIO()
+                st = pstats.Stats(prof["host"], stream=buf)
+                st.sort_stats("tottime").print_stats(30)
+                prof["host"] = None
+                lines = [ln for ln in buf.getvalue().splitlines() if ln.strip()]
+                print("  the processor over 3 steps (own time of each function):", flush=True)
+                for ln in lines[:46]:
+                    print("    " + ln.rstrip()[:150], flush=True)
             elif step == step0 + 6 and "t" in prof:
                 k = ops.stop_profile()
                 wall = time.perf_counter() - prof["t"]
