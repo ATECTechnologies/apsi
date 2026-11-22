@@ -117,6 +117,10 @@ class _Ops:
     def forget(self, b):                                 # (bfloat16 twins: the real card only)
         pass
 
+    def forget_many(self, bufs):
+        for b in bufs:
+            self.forget(b)
+
     def _bf_gemm(self, A, B, Cv, bias, M, N, K, sam, sak, sbk, sbn, ldc, alpha, beta, epi, X2, act, a_act, tmp):
         return _bf_gemm_composite(self, A, B, Cv, bias, M, N, K, sam, sak, sbk, sbn, ldc, alpha, beta, epi, X2, act,
                                   a_act, tmp)
@@ -1151,6 +1155,26 @@ class Gpu(_Ops):
             lo, hi = b.ptr, b.ptr + 4 * max(1, b.n)
             self._twin = {k: v for k, v in self._twin.items() if not (lo <= k < hi or lo <= v[1][1] < hi)}
             self._only16 = {k for k in self._only16 if not lo <= k < hi}
+
+    def forget_many(self, bufs):
+        """forget() of every buffer in bufs, in one pass over the twins."""
+        if not (self._twin or self._only16):
+            return
+        import bisect
+        rs = sorted((b.ptr, b.ptr + 4 * max(1, b.n)) for b in bufs)
+        if not rs:
+            return
+        los = [r[0] for r in rs]
+        his = [r[1] for r in rs]
+        top = list(his)
+        for i in range(1, len(top)):                     # running maximum: overlapping ranges stay correct
+            top[i] = max(top[i], top[i - 1])
+
+        def inside(x):
+            i = bisect.bisect_right(los, x) - 1
+            return i >= 0 and x < top[i]
+        self._twin = {k: v for k, v in self._twin.items() if not (inside(k) or inside(v[1][1]))}
+        self._only16 = {k for k in self._only16 if not inside(k)}
 
     RING = 64 << 20                                      # pinned staging memory for copies to the card
 
@@ -2517,10 +2541,8 @@ class _Recompute(_Node):
         self._saved = (net.arena, net.garena)
         for a in {id(sa): sa, id(sg): sg}.values():
             a.prefix, a.gprefix, a.kind = self.prefix, self.gprefix, self.kind
-            for k in a.keys:                             # the shared buffers hold another layer's values now
-                b = a.base.bufs.get(k)
-                if b is not None:
-                    net.ops.forget(b)
+            bs = [a.base.bufs.get(k) for k in a.keys]    # the shared buffers hold another layer's values now
+            net.ops.forget_many([b for b in bs if b is not None])
         net.arena, net.garena = sa, sg
 
     def _leave(self):

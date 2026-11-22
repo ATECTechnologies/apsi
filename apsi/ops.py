@@ -385,6 +385,9 @@ def argmin(x, axis=None):
 
 
 # ------------------------------------------------------------- construction
+_PLAIN_NUMBERS = frozenset((int, float, bool, np.float64, np.float32, np.int64, np.int32, np.bool_))
+
+
 def tensor(x, dtype=None):
     dt = _np_dtype(dtype)
     if isinstance(x, Quantity):
@@ -396,6 +399,8 @@ def tensor(x, dtype=None):
     if isinstance(x, RangeVal):
         x = list(x)
     if isinstance(x, (list, tuple)):
+        if x and all(type(e) in _PLAIN_NUMBERS for e in x):     # a row of plain numbers: one numpy call
+            return np.array(x, dtype=dt)
         elems = [tensor(e) if isinstance(e, (list, tuple)) else e for e in x]
         if any(isinstance(e, (Quantity, Node)) for e in elems):
             return stack(elems)
