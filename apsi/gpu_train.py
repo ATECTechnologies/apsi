@@ -2222,29 +2222,36 @@ def _rss_bytes():
         return 0
 
 
+_HOST_LOSS = [0.0]                                       # seconds of losses computed on the processor (_multi_loss)
+
+
 class _StepTimes:
     """Where a step's time goes (fit_batches, verbose): making the batches (data, graphs: on the processor), batches
     made during training (generation, `later`), and the rest (the card, and the processor launching its work)."""
 
-    def __init__(self):
+    def __init__(self, ops=None):
         self.t0 = time.perf_counter()
         self.build = self.later = 0.0
         self.steps = 0
         self.kinds = {}                                  # kind of batch -> [seconds, batches, largest card GB]
         self.cur = None
+        self.ops = ops if ops is not None else getattr(self, "ops", None)
+        self.l0 = getattr(self.ops, "launches", 0) if self.ops is not None else 0
+        self.h0 = _HOST_LOSS[0]
 
-    def start(self, kind, ops):
+    def start(self, kind, ops, size=0):
         ops.peak_item = ops.used
-        self.cur = (kind, time.perf_counter(), ops.used)
+        self.cur = (kind, time.perf_counter(), ops.used, size)
 
     def end(self, ops):
         if self.cur is None:
             return
-        kind, t0, _u0 = self.cur
-        k = self.kinds.setdefault(kind, [0.0, 0, 0.0])
+        kind, t0, _u0, size = self.cur
+        k = self.kinds.setdefault(kind, [0.0, 0, 0.0, 0])
         k[0] += time.perf_counter() - t0
         k[1] += 1
         k[2] = max(k[2], getattr(ops, "peak_item", ops.used) / 2 ** 30)
+        k[3] += int(size or 0)
         self.cur = None
 
     def line(self, step, ops, net):
@@ -2258,11 +2265,15 @@ class _StepTimes:
                f"{getattr(ops, 'peak', ops.used) / gb:.2f} at the peak"
                + (f" (budget {budget / gb:.1f} GB, {_base_arena(net).trimmed / gb:.2f} GB given back)" if budget else "")
                + (f" | RAM {_rss_bytes() / gb:.1f} GB" if _rss_bytes() else ""))
+        launches = getattr(ops, "launches", 0) - self.l0
+        host = _HOST_LOSS[0] - self.h0
+        out += f"\n    per step: {launches / n:,.0f} kernel launches, loss on the processor {host / n:.2f} s"
         if self.kinds:
             parts = sorted(self.kinds.items(), key=lambda kv: -kv[1][0])
-            out += "\n    batches: " + "; ".join(f"{k}: {v[1]} x {v[0] / max(1, v[1]):.2f} s (card up to {v[2]:.2f} GB)"
+            out += "\n    batches: " + "; ".join(f"{k}: {v[1]} x {v[0] / max(1, v[1]):.2f} s (card up to {v[2]:.2f} GB"
+                                              + (f", {v[3] / max(1, v[1]):,.0f} graph nodes" if v[3] else "") + ")"
                                               for k, v in parts[:6])
-        self.__init__()
+        self.__init__(ops)
         return out
 
 
@@ -5986,7 +5997,8 @@ def fit_batches(model, params, batches, loss="cross_entropy", opt=None, epochs=1
     step0 = step
     LIVE.append(_Live(lambda: net.params(), lambda tree, only=None: net.set_params(tree, only)))
 
-    times = _StepTimes()
+    times = _StepTimes(ops)
+    prof = {}
     ahead, pool = {}, None
     if prefetch and callable(batches):
         from concurrent.futures import ThreadPoolExecutor
@@ -5997,6 +6009,19 @@ def fit_batches(model, params, batches, loss="cross_entropy", opt=None, epochs=1
         times.steps += 1
         if verbose and (step % every == 0 or step == step0 + 1):
             print(times.line(step, ops, net), flush=True)
+        if verbose and hasattr(ops, "start_profile") and os.environ.get("APSI_GPU_PROFILE", "1") != "0":
+            if step == step0 + 3:                        # three steps on the card's own clock, once a run
+                ops.sync()
+                ops.start_profile()
+                prof["t"], prof["l"] = time.perf_counter(), ops.launches
+            elif step == step0 + 6 and "t" in prof:
+                k = ops.stop_profile()
+                wall = time.perf_counter() - prof["t"]
+                busy = sum(v[0] for v in k.values())
+                print(f"  the card over 3 steps: busy {busy:.1f} s of {wall:.1f} s ({100 * busy / max(wall, 1e-9):.0f} %), "
+                      f"{ops.launches - prof['l']:,} launches; the kernels that took the most:", flush=True)
+                for name, (sec, cnt) in sorted(k.items(), key=lambda kv: -kv[1][0])[:15]:
+                    print(f"    {sec:7.2f} s  {cnt:7,} x  {name}", flush=True)
         if verbose and step == step0 + 2:                 # the second step runs with the plan the first one made
             _say_memory(ops, net)
         if checkpoint and save_every and step % int(save_every) == 0:
@@ -6079,7 +6104,7 @@ def fit_batches(model, params, batches, loss="cross_entropy", opt=None, epochs=1
                 multi = isinstance(X, (list, tuple))
                 xs = [_as_input(a) for a in (X if multi else [X])]
                 times.start(str(getattr(Y, "kind", "") or getattr(Y, "mode", "") or
-                                f"{len(xs)} input{'s' if len(xs) != 1 else ''}"), ops)
+                                f"{len(xs)} input{'s' if len(xs) != 1 else ''}"), ops, getattr(g, "n", 0) or 0)
                 if net.gdev is not None:                    # the forms the layers asked of the last graph
                     want_forms = [k for k in net.gdev.cache if k[0] in ("csr", "pool")] or want_forms
                 net.set_graph(g)
@@ -6406,7 +6431,9 @@ def _multi_loss(ops, net, outs, shapes, loss_fn, Yr, group, arena=None):
         for j, i in enumerate(keep):
             full[i] = os_[j]
         return fn(full, Yr)
+    _t0 = time.perf_counter()
     lv, gh = value_and_grad(f, wrt=tuple(range(len(hs))))(*hs)
+    _HOST_LOSS[0] += time.perf_counter() - _t0
     gh = gh if isinstance(gh, (list, tuple)) else [gh]
     for i, g_ in zip(keep, gh):
         a = np.asarray(aops.raw(g_), np.float32).reshape(-1) / group
