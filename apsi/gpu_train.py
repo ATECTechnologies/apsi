@@ -1136,6 +1136,7 @@ class Gpu(_Ops):
             print(f"note: {self.used / 2 ** 30:.1f} GB asked of a {self.dev.memory / 2 ** 30:.1f} GB card: the rest "
                   "spills into the computer's memory, which is many times slower (recompute=true, a smaller "
                   "batch_size with accumulate=, or a shorter context keep it on the card)")
+            _say_largest(self)                           # what holds the card at that moment
         return Buf(p, n)
 
     def free(self, b):
