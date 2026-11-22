@@ -1804,7 +1804,12 @@ class Gpu(_Ops):
             return f"{name}#{force}" if f"{name}#{force}" in cands else base
         if force == "a" or len(cands) == 1:
             return base
-        key = (name, h_only, grid, tuple(cands), tuple(a for a in args if a[0] != "p"))
+        # rows in size classes (an eighth of an octave): the builds compute the same products whatever the row
+        # count, and a graph or text batch brings a new count nearly every time (each was timed with the card
+        # stopped). The other sizes, strides and modes stay exact.
+        mcls = _row_class(M)
+        key = (name, h_only, mcls, tuple(cands),
+               tuple(("M",) if (a[0] != "p" and a[1] == M) else a for a in args if a[0] != "p"))
         pick = self._choice.get(key)
         if pick is not None:
             return pick
@@ -1882,10 +1887,18 @@ class Gpu(_Ops):
         except (OSError, ValueError, ImportError):
             pass
 
-    def _save_choice(self, key, pick):
+    def _save_choice(self, key, pick, now=False):
         if self._choice_file is None:
             return
         self._saved[key] = pick
+        t = time.monotonic()
+        if not now and t - getattr(self, "_saved_at", 0.0) < 60.0:   # at most once a minute (and at exit)
+            if not getattr(self, "_save_pending", False):
+                self._save_pending = True
+                import atexit
+                atexit.register(lambda: self._save_choice(key, pick, now=True) if self._save_pending else None)
+            return
+        self._saved_at, self._save_pending = t, False
         try:
             os.makedirs(os.path.dirname(self._choice_file), exist_ok=True)
             tmp = self._choice_file + f".{os.getpid()}.tmp"
@@ -2302,6 +2315,15 @@ def _say_largest(ops):
             print(f"    {nb / 2 ** 20:9.1f} MB {'*' if now else ' '} {k}", flush=True)
     except Exception:                                    # noqa: BLE001 - a report only
         pass
+
+
+def _row_class(M):
+    """M rounded up to its size class: 8 classes per power of two (at most 12.5 % above)."""
+    M = int(M)
+    if M <= 64:
+        return M
+    e = M.bit_length() - 4
+    return ((M + (1 << e) - 1) >> e) << e
 
 
 def _base_arena(net):
@@ -6151,6 +6173,19 @@ def fit_batches(model, params, batches, loss="cross_entropy", opt=None, epochs=1
                 print("  the processor over 3 steps (own time of each function):", flush=True)
                 for ln in lines[:46]:
                     print("    " + ln.rstrip()[:150], flush=True)
+                for title, how in (("cumulative", lambda st_: st_.sort_stats("cumulative").print_stats(25)),
+                                   ("who waits for the card (reads back, frees) and sorts",
+                                    lambda st_: st_.sort_stats("tottime").print_callers(r"to_host|cuda.py.*\(free\)|sorted|ufunc|acquire"))):
+                    buf = _io.StringIO()
+                    st.stream = buf
+                    try:
+                        how(st)
+                    except Exception as e_:                  # the report never stops training
+                        print(f"    ({title}: {e_})", flush=True)
+                        continue
+                    print(f"  the processor, {title}:", flush=True)
+                    for ln in [ln for ln in buf.getvalue().splitlines() if ln.strip()][:60]:
+                        print("    " + ln.rstrip()[:170], flush=True)
             elif step == step0 + 6 and "t" in prof:
                 k = ops.stop_profile()
                 wall = time.perf_counter() - prof["t"]
