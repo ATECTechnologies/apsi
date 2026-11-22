@@ -1807,7 +1807,26 @@ class Gpu(_Ops):
 
     def _variant(self, name, grid, args, M, N, ldc, nb):
         """Which build of a tiled product runs: the one the card itself measured faster for this shape (each is
-        timed twice on scratch outputs the first time the shape comes; APSI_GEMM_VARIANT=a or x fixes it)."""
+        timed twice on scratch outputs the first time the shape comes; APSI_GEMM_VARIANT=a or x fixes it). A shape
+        seen before (with the same alignment of its operands and the same twins) is one lookup."""
+        o16 = self._only16
+        fk = (name, getattr(self, "_h_only", False), getattr(self, "_no_h", False), nb, _row_class(M),
+              args[0][1] & 15, args[1][1] & 15,
+              bool(o16) and (args[0][1] in o16 or args[1][1] in o16),
+              self._bf16_free(args, M, N, args[6][1], nb) if nb != 1 else None,
+              tuple(("M",) if (a[0] != "p" and a[1] == M) else a for a in args if a[0] != "p"),
+              os.environ.get("APSI_GEMM_VARIANT"))
+        fast = self.__dict__.setdefault("_vfast", {})
+        hit = fast.get(fk)
+        if hit is not None:
+            return hit
+        pick = self._variant_full(name, grid, args, M, N, ldc, nb)
+        if len(fast) > 65536:
+            fast.clear()
+        fast[fk] = pick
+        return pick
+
+    def _variant_full(self, name, grid, args, M, N, ldc, nb):
         K = args[6][1]
         h_only = getattr(self, "_h_only", False)        # A is bfloat16 in memory: only the cp.async builds read it
         if not h_only and self._only16 and (args[0][1] in self._only16 or args[1][1] in self._only16):
@@ -3785,9 +3804,22 @@ class _HostLayer(_Node):
             return np.ascontiguousarray(a).view(np.int32).astype(np.int64)
         return a.astype(np.float64)
 
+    def _tname(self):
+        return getattr(self.layer, "name", None) or type(self.layer).__name__ + ":" + str(self.key)[-24:]
+
+    def _tick(self, part, t0):
+        d = self.net.__dict__.setdefault("_host_times", {})
+        k = (self._tname(), part)
+        c, t = d.get(k, (0, 0.0))
+        d[k] = (c + 1, t + time.perf_counter() - t0)
+
     def _run(self, xs):
-        with _HOST_LOCK:
-            return self._run_locked(xs)
+        t0 = time.perf_counter()
+        try:
+            with _HOST_LOCK:
+                return self._run_locked(xs)
+        finally:
+            self._tick("forward", t0)
 
     def _run_locked(self, xs):
         from . import ops as aops
@@ -3814,8 +3846,12 @@ class _HostLayer(_Node):
         return self._run(self.xs)
 
     def _grads(self, dy):
-        with _HOST_LOCK:
-            return self._grads_locked(dy)
+        t0 = time.perf_counter()
+        try:
+            with _HOST_LOCK:
+                return self._grads_locked(dy)
+        finally:
+            self._tick("backward", t0)
 
     def _grads_locked(self, dy):
         from . import ops as aops
@@ -4473,9 +4509,40 @@ class _EdgeAttention:
     q[target] . k / sqrt(hd) (+ bias[e, head]); msg [N, d] = the weighted sum of the values."""
 
     @staticmethod
-    def fwd(node, f, q, KR, VR, kidx, N, H, hd, bias_parts=(), vidx=None):
+    def lean():
+        return os.environ.get("APSI_EDGE_LEAN", "1").strip().lower() not in ("0", "off", "no")
+
+    @staticmethod
+    def by_key(gd, key, idx, row, nrows):
+        """The edges grouped by key row (for the keys' and values' gradients as sums): (target of each edge in key
+        order, its edge number, offsets per key row), once per graph."""
+        hit = gd.cache.get(key)
+        if hit is None:
+            idx = np.asarray(idx, np.int64).reshape(-1)
+            perm = np.argsort(idx, kind="stable")
+            off = np.concatenate([[0], np.cumsum(np.bincount(idx, minlength=nrows))]).astype(np.int64)
+            hit = gd.cache[key] = (gd._put(np.asarray(row, np.int64)[perm]), gd._put(perm), gd._put(off), nrows)
+        return hit
+
+    @staticmethod
+    def fwd(node, f, q, KR, VR, kidx, N, H, hd, bias_parts=(), vidx=None, groups=None):
         o, E = node.net.ops, f["E"]
         d = H * hd
+        if groups is not None:                          # lean: keys and values read through their row ids
+            sc = node.buf("sc", E * H)
+            o.edge_dot(q, KR, f["row"], kidx, sc, E, H, hd)                 # q[target] . k[kidx]
+            o.axpy(sc, sc, E * H, 1.0 / math.sqrt(hd) - 1.0)
+            if bias_parts:
+                tmp = node.buf("sb", E * H)
+                for table, ids in bias_parts:
+                    o.gather(table, ids, tmp, E, H, 0)
+                    o.add3(sc, sc, tmp, E * H)
+            al = node.buf("al", E * H)
+            o.seg_softmax(sc, f["off"], al, N, H, 1.0)
+            msg = node.buf("msg", N * d)
+            o.spmm(VR, kidx if vidx is None else vidx, al, None, f["off"], msg, N, H, hd)
+            node.ea = ("lean", KR, VR, sc, al, groups)
+            return msg
         KE, VE = node.buf("ke", E * d), node.buf("ve", E * d)
         o.gather(KR, kidx, KE, E, d, 0)
         o.gather(VR, kidx if vidx is None else vidx, VE, E, d, 0)
@@ -4499,6 +4566,22 @@ class _EdgeAttention:
         """(dq, dKR, dVR): dKR / dVR [rows, d] (rows of the key / value tables)."""
         o, E = node.net.ops, f["E"]
         d = H * hd
+        if node.ea[0] == "lean":
+            _, KR, VR, sc, al, (kg, vg) = node.ea
+            dal = node.gbuf("dal", E * H)
+            o.edge_dot(dmsg, VR, f["row"], kidx if vidx is None else vidx, dal, E, H, hd)
+            ds = node.gbuf("ds", E * H)
+            o.seg_softmax_b(sc, al, dal, f["off"], ds, N, H, 1.0)
+            for gtable, ids, rows_ in bias_grads:
+                o.embed_b(ds, ids, gtable, E, H, rows_)
+            o.axpy(ds, ds, E * H, 1.0 / math.sqrt(hd) - 1.0)
+            dq = node.gbuf("dq", N * d)
+            o.spmm(KR, kidx, ds, None, f["off"], dq, N, H, hd)
+            vrows = rows if vrows is None else vrows
+            dKR, dVR = node.gbuf("dkr", rows * d), node.gbuf("dvr", vrows * d)
+            o.spmm(q, kg[0], ds, kg[1], kg[2], dKR, rows, H, hd)            # each key row: its edges' ds q[target]
+            o.spmm(dmsg, vg[0], al, vg[1], vg[2], dVR, vrows, H, hd)        # each value row: alpha dmsg[target]
+            return dq, dKR, dVR
         KE, VE, sc, al = node.ea
         dVE = node.gbuf("dve", E * d)                                     # each edge's value: alpha dmsg[target]
         o.spmm(dmsg, f["row"], al, None, f["eoff"], dVE, E, H, hd)
@@ -4567,7 +4650,13 @@ class _GraphTransformer(_Node):
             for W, out in ((self.Wk, KR), (self.Wv, VR)):               # every node's key / value in every relation
                 o.gemm(h, W.w, out, N, d, d, d, 1, d, 1, R * d, batch=(1, R), sa=(0, 0), sb=(0, d * d), sc=(0, d),
                        passes=ps)
-            self.msg = _EdgeAttention.fwd(self, f, q, KR, VR, kidx, N, H, hd, ((self.rb.w, rid), (self.hb.w, hid)))
+            egrp = None
+            if _EdgeAttention.lean():
+                kh = np.asarray(f["src"], np.int64) * R + np.asarray(f["rel"], np.int64)
+                kg = _EdgeAttention.by_key(gd, ("gt-kg", id(self)), kh, f["dst"], N * R)
+                egrp = (kg, kg)
+            self.msg = _EdgeAttention.fwd(self, f, q, KR, VR, kidx, N, H, hd, ((self.rb.w, rid), (self.hb.w, hid)),
+                                          groups=egrp)
             o.gemm(self.msg, self.Wo.w, x1, N, d, d, d, 1, d, 1, d, bias=self.bo.w, passes=ps, epi=3, X2=x)
         else:
             o.pull(x1, o, x, N * d)
@@ -4866,7 +4955,9 @@ class _HGT(_Node):
             pos[order] = np.arange(len(order))
             us = uniq[order]
             counts = np.bincount(us % self.R, minlength=self.R)
-            gd.cache[key] = (gd._put((pos[inv.reshape(-1)]).astype(np.int64)), gd._put(f["src"]),
+            kh = (pos[inv.reshape(-1)]).astype(np.int64)
+            gd.cache[("hgt-kh",) + key[1:]] = kh
+            gd.cache[key] = (gd._put(kh), gd._put(f["src"]),
                              gd._put(has_in, np.float32), gd._put((us // self.R).astype(np.int64)),
                              [int(c) for c in counts], len(us))
         return gd.cache[key]
@@ -4931,7 +5022,12 @@ class _HGT(_Node):
                            hd, 1, d, batch=(1, H), sa=(0, hd), sb=(0, hd * hd), sc=(0, hd), passes=ps)
                 r0 += c
             self.kg = KG
-            msg = _EdgeAttention.fwd(self, f, q, KR, v, kidx, N, H, hd, vidx=vidx)
+            egrp = None
+            if _EdgeAttention.lean():
+                kh = gd.cache[("hgt-kh", id(self), self.which)]
+                egrp = (_EdgeAttention.by_key(gd, ("hgt-kg", id(self), self.which), kh, f["dst"], U),
+                       _EdgeAttention.by_key(gd, ("csr-vg", self.which), f["src"], f["dst"], N))
+            msg = _EdgeAttention.fwd(self, f, q, KR, v, kidx, N, H, hd, vidx=vidx, groups=egrp)
             om = _diag(self, "om", self._drop_f("do", self.lin["o"].fwd(msg, N, grp), N * d), hasin, N, d)
             o.add3(x1, x, om, N * d)
         else:
@@ -6306,6 +6402,7 @@ def fit_batches(model, params, batches, loss="cross_entropy", opt=None, epochs=1
                 ops.start_profile()
                 prof["t"], prof["l"] = time.perf_counter(), ops.launches
             elif step == step0 + 7 and "host" not in prof:  # where the processor's time goes: three steps
+                net.__dict__["_host_times"] = {}
                 import cProfile
                 prof["host"] = cProfile.Profile()
                 prof["host"].enable()
@@ -6318,6 +6415,11 @@ def fit_batches(model, params, batches, loss="cross_entropy", opt=None, epochs=1
                 st.sort_stats("tottime").print_stats(30)
                 prof["host"] = None
                 lines = [ln for ln in buf.getvalue().splitlines() if ln.strip()]
+                ht = net.__dict__.get("_host_times") or {}
+                if ht:
+                    print("  layers on the processor (no card kernel), over these 3 steps: " + ", ".join(
+                        f"{k[0]} {k[1]} {v[0]} x {1000 * v[1] / max(v[0], 1):.1f} ms" for k, v in
+                        sorted(ht.items(), key=lambda kv: -kv[1][1])[:12]), flush=True)
                 print("  the processor over 3 steps (own time of each function):", flush=True)
                 for ln in lines[:46]:
                     print("    " + ln.rstrip()[:150], flush=True)
