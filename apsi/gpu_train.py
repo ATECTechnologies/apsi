@@ -245,6 +245,7 @@ class Emulator(_Ops):
     def alloc(self, n):
         self.used += 4 * n
         self.peak = max(getattr(self, "peak", 0), self.used)
+        self.peak_item = max(getattr(self, "peak_item", 0), self.used)
         return Buf(0, n, np.zeros(max(1, n), np.float32))
 
     def free(self, b):
@@ -1128,6 +1129,7 @@ class Gpu(_Ops):
                              "(device=\"cuda:all\" splits the model across them)") from None
         self.used += 4 * n
         self.peak = max(getattr(self, "peak", 0), self.used)
+        self.peak_item = max(getattr(self, "peak_item", 0), self.used)
         if self.used > self.dev.memory and not getattr(self, "_spill_said", False):
             self._spill_said = True                      # Windows lets the driver spill into the computer's memory
             print(f"note: {self.used / 2 ** 30:.1f} GB asked of a {self.dev.memory / 2 ** 30:.1f} GB card: the rest "
@@ -2199,24 +2201,151 @@ def device(name="cuda"):
 
 
 # ============================================================================== the network on the device
+def _rss_bytes():
+    """This process's resident memory (RAM) in bytes, or 0."""
+    try:
+        if os.name == "nt":
+            class PMC(ctypes.Structure):
+                _fields_ = [("cb", ctypes.c_ulong), ("PageFaultCount", ctypes.c_ulong),
+                            ("PeakWorkingSetSize", ctypes.c_size_t), ("WorkingSetSize", ctypes.c_size_t),
+                            ("QuotaPeakPagedPoolUsage", ctypes.c_size_t), ("QuotaPagedPoolUsage", ctypes.c_size_t),
+                            ("QuotaPeakNonPagedPoolUsage", ctypes.c_size_t), ("QuotaNonPagedPoolUsage", ctypes.c_size_t),
+                            ("PagefileUsage", ctypes.c_size_t), ("PeakPagefileUsage", ctypes.c_size_t)]
+            c = PMC()
+            c.cb = ctypes.sizeof(PMC)
+            k32, psapi = ctypes.windll.kernel32, ctypes.windll.psapi
+            psapi.GetProcessMemoryInfo(k32.GetCurrentProcess(), ctypes.byref(c), c.cb)
+            return int(c.WorkingSetSize)
+        with open("/proc/self/statm") as fh:
+            return int(fh.read().split()[1]) * os.sysconf("SC_PAGE_SIZE")
+    except Exception:                                    # noqa: BLE001
+        return 0
+
+
+class _StepTimes:
+    """Where a step's time goes (fit_batches, verbose): making the batches (data, graphs: on the processor), batches
+    made during training (generation, `later`), and the rest (the card, and the processor launching its work)."""
+
+    def __init__(self):
+        self.t0 = time.perf_counter()
+        self.build = self.later = 0.0
+        self.steps = 0
+        self.kinds = {}                                  # kind of batch -> [seconds, batches, largest card GB]
+        self.cur = None
+
+    def start(self, kind, ops):
+        ops.peak_item = ops.used
+        self.cur = (kind, time.perf_counter(), ops.used)
+
+    def end(self, ops):
+        if self.cur is None:
+            return
+        kind, t0, _u0 = self.cur
+        k = self.kinds.setdefault(kind, [0.0, 0, 0.0])
+        k[0] += time.perf_counter() - t0
+        k[1] += 1
+        k[2] = max(k[2], getattr(ops, "peak_item", ops.used) / 2 ** 30)
+        self.cur = None
+
+    def line(self, step, ops, net):
+        wall = time.perf_counter() - self.t0
+        n = max(1, self.steps)
+        card = max(0.0, wall - self.build - self.later)
+        gb = 2 ** 30
+        budget = _card_budget(ops)
+        out = (f"  time: {wall / n:.2f} s a step over the last {n} = data {self.build / n:.2f} s + made during "
+               f"training {self.later / n:.2f} s + card {card / n:.2f} s | card memory {ops.used / gb:.2f} GB now, "
+               f"{getattr(ops, 'peak', ops.used) / gb:.2f} at the peak"
+               + (f" (budget {budget / gb:.1f} GB, {_base_arena(net).trimmed / gb:.2f} GB given back)" if budget else "")
+               + (f" | RAM {_rss_bytes() / gb:.1f} GB" if _rss_bytes() else ""))
+        if self.kinds:
+            parts = sorted(self.kinds.items(), key=lambda kv: -kv[1][0])
+            out += "\n    batches: " + "; ".join(f"{k}: {v[1]} x {v[0] / max(1, v[1]):.2f} s (card up to {v[2]:.2f} GB)"
+                                              for k, v in parts[:6])
+        self.__init__()
+        return out
+
+
+def _base_arena(net):
+    """The net's own _Arena (not the view a recomputed layer sees), or None."""
+    a = getattr(net, "arena", None)
+    while a is not None and not isinstance(a, _Arena):
+        a = getattr(a, "base", None)
+    return a
+
+
+def _card_budget(ops):
+    """The bytes the trainer lets itself use on the card: APSI_GPU_BUDGET_GB, else 94 % of the card (Windows would
+    otherwise spill the rest into the computer's memory, many times slower)."""
+    b = getattr(ops, "_budget", None)
+    if b is None:
+        env = os.environ.get("APSI_GPU_BUDGET_GB", "").strip()
+        mem = getattr(getattr(ops, "dev", None), "memory", None)
+        try:
+            b = float(env) * 2 ** 30 if env else (0.94 * mem if mem else 0)
+        except ValueError:
+            b = 0.94 * mem if mem else 0
+        ops._budget = b
+    return b
+
+
 class _Arena:
-    """Activation and gradient buffers by name, kept across steps (grown when a larger batch comes)."""
+    """Activation and gradient buffers by name, kept across steps (grown when a larger batch comes).
+
+    Batches of different shapes and kinds (graphs of every size, language batches, generation) each need their own
+    buffers; kept forever, the arena would hold the largest of every buffer of every kind at once and outgrow the
+    card. So every buffer remembers the batch that last used it (next_item() starts a batch), and when a new or
+    larger buffer would pass the card's budget, the buffers this batch has not used are given back first (and the
+    net's pool of graph buffers). A buffer that must grow grows by a quarter more than asked, so slowly growing
+    batches do not free and allocate (each free waits for the card) every time."""
 
     def __init__(self, ops):
-        self.ops, self.bufs = ops, {}
+        self.ops, self.bufs, self.seen, self.tick = ops, {}, {}, 0
+        self.pools = []                                  # lists of spare buffers that may be given back too
+        self.trimmed = 0                                 # bytes given back to stay inside the budget
+
+    def next_item(self):
+        self.tick += 1
 
     def get(self, key, n):
         b = self.bufs.get(key)
+        self.seen[key] = self.tick
         if b is None or b.n < n:
+            want = n if b is None else max(n, b.n + b.n // 4)
             if b is not None:
                 self.ops.free(b)
-            b = self.bufs[key] = self.ops.alloc(n)
+                del self.bufs[key]
+            self.make_room(4 * want)
+            b = self.bufs[key] = self.ops.alloc(want)
         return (b, 0)
+
+    def make_room(self, nbytes):
+        budget = _card_budget(self.ops)
+        if not budget or self.ops.used + nbytes <= budget:
+            return
+        for pool in self.pools:                          # spare graph buffers first: nothing uses them
+            for size in list(pool):
+                while pool[size] and self.ops.used + nbytes > budget:
+                    b = pool[size].pop()
+                    self.trimmed += 4 * b.n
+                    self.ops.free(b)
+        if self.ops.used + nbytes <= budget:
+            return
+        stale = sorted((k for k in self.bufs if self.seen.get(k, -1) < self.tick),
+                       key=lambda k: -self.bufs[k].n)    # the largest first
+        for k in stale:
+            if self.ops.used + nbytes <= budget:
+                break
+            b = self.bufs.pop(k)
+            self.seen.pop(k, None)
+            self.trimmed += 4 * b.n
+            self.ops.free(b)
 
     def close(self):
         for b in self.bufs.values():
             self.ops.free(b)
         self.bufs = {}
+        self.seen = {}
 
 
 class _Param:
@@ -5371,8 +5500,17 @@ class Net:
         """A card buffer of at least n slots from the net's pool (sizes in powers of two): a new graph every batch
         reuses the buffers of the last one instead of allocating and freeing (each free waits for the card)."""
         size = 1 << max(10, int(n - 1).bit_length())
-        free = self.__dict__.setdefault("_pool", {}).setdefault(size, [])
-        return free.pop() if free else self.ops.alloc(size)
+        pools = self.__dict__.setdefault("_pool", {})
+        base = _base_arena(self)
+        if not getattr(self, "_pool_known", False) and base is not None:
+            base.pools.append(pools)                     # the arena may give spare ones back under pressure
+            self._pool_known = True
+        free = pools.setdefault(size, [])
+        if free:
+            return free.pop()
+        if base is not None:
+            base.make_room(4 * size)
+        return self.ops.alloc(size)
 
     def pool_put(self, b):
         self.__dict__.setdefault("_pool", {}).setdefault(b.n, []).append(b)
@@ -5771,7 +5909,8 @@ def _raw_of(a):
 def fit_batches(model, params, batches, loss="cross_entropy", opt=None, epochs=1, verbose=True, clip=None,
                 schedule=None, device="cuda", precision="auto", ops=None, compensated=None, every=None,
                 accumulate=1, stages=None, freeze=None, train_only=None, exact_sums=None, steps=None,
-                checkpoint=None, save_every=None, resume=True, callback=None, recompute=None, groups=None, state=None):
+                checkpoint=None, save_every=None, resume=True, callback=None, recompute=None, groups=None, state=None,
+                prefetch=False):
     """Train on batches that each bring their own shapes: batches is a list of (inputs, targets[, graph]) or a
     function epoch -> such a list. inputs may be a list (a dag with several inputs: token ids, node features, ...);
     each batch may have its own graph (a batch of graphs), its own number of rows and its own lengths. One card."""
@@ -5847,8 +5986,17 @@ def fit_batches(model, params, batches, loss="cross_entropy", opt=None, epochs=1
     step0 = step
     LIVE.append(_Live(lambda: net.params(), lambda tree, only=None: net.set_params(tree, only)))
 
+    times = _StepTimes()
+    ahead, pool = {}, None
+    if prefetch and callable(batches):
+        from concurrent.futures import ThreadPoolExecutor
+        pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="apsi-batches")
+
     def after_step(ep_, bi_):                            # True: stop here (steps reached)
         pos[0], pos[1] = ep_, bi_ + 1
+        times.steps += 1
+        if verbose and (step % every == 0 or step == step0 + 1):
+            print(times.line(step, ops, net), flush=True)
         if verbose and step == step0 + 2:                 # the second step runs with the plan the first one made
             _say_memory(ops, net)
         if checkpoint and save_every and step % int(save_every) == 0:
@@ -5859,7 +6007,15 @@ def fit_batches(model, params, batches, loss="cross_entropy", opt=None, epochs=1
         for ep in range(start_ep, last):
             if stop:
                 break
-            items = list(batches(ep) if callable(batches) else batches)
+            _tb = time.perf_counter()
+            if prefetch and callable(batches):            # made on a second thread while the card trains
+                fut = ahead.pop(ep, None)
+                items = list(fut.result() if fut is not None else batches(ep))
+                if ep + 1 < last:
+                    ahead[ep + 1] = pool.submit(batches, ep + 1)
+            else:
+                items = list(batches(ep) if callable(batches) else batches)
+            times.build += time.perf_counter() - _tb
             if not items:
                 raise TrainError("no batches")
             if not net._planned and net.recompute == "auto":
@@ -5884,7 +6040,9 @@ def fit_batches(model, params, batches, loss="cross_entropy", opt=None, epochs=1
                 if ep == start_ep and bi < skip:             # resumed: these batches were already trained on
                     continue
                 if _is_later(item):                          # made now, with the weights as they are at this point
+                    _tl = time.perf_counter()
                     made = list(item.later() or [])
+                    times.later += time.perf_counter() - _tl
                     if bool(getattr(item, "end_step", False)):
                         made.append(_STEP_END)
                     items[bi:bi + 1] = made
@@ -5905,6 +6063,7 @@ def fit_batches(model, params, batches, loss="cross_entropy", opt=None, epochs=1
                         break
                     continue
                 X, Y, g = _batch_parts(item)
+                _base_arena(net).next_item()
                 if net.recompute == "auto":                 # a batch larger than the plan was made for: plan again
                     sz = _batch_size(item)
                     if net._size0 is None:
@@ -5919,6 +6078,8 @@ def fit_batches(model, params, batches, loss="cross_entropy", opt=None, epochs=1
                     group = min(A, len(items) - (bi // A) * A)       # the batches of this step
                 multi = isinstance(X, (list, tuple))
                 xs = [_as_input(a) for a in (X if multi else [X])]
+                times.start(str(getattr(Y, "kind", "") or getattr(Y, "mode", "") or
+                                f"{len(xs)} input{'s' if len(xs) != 1 else ''}"), ops)
                 if net.gdev is not None:                    # the forms the layers asked of the last graph
                     want_forms = [k for k in net.gdev.cache if k[0] in ("csr", "pool")] or want_forms
                 net.set_graph(g)
@@ -5941,6 +6102,7 @@ def fit_batches(model, params, batches, loss="cross_entropy", opt=None, epochs=1
                         raise TrainError("a model with several outputs trains with a loss function of your own")
                     lv, dout = _multi_loss(ops, net, out, shape, loss_fn, Yr, group)
                     net.backward(dout)
+                    times.end(ops)
                     _sp = getattr(loss_fn, "on_card", None)
                     _s = float(_sp[4](Yr)) if (_sp is not None and len(_sp) > 4) else 1.0
                     if _s == 0:                          # (a batch of weight 0 takes no step of its own)
@@ -5985,6 +6147,7 @@ def fit_batches(model, params, batches, loss="cross_entropy", opt=None, epochs=1
                     on_card.append(bi)
                     lv = None
                 net.backward(dout)
+                times.end(ops)
                 if EXACT is not None:                         # this batch's gradients, summed exactly
                     ops.acc2((EXACT[0], 0), (EXACT[1], 0), (net.G, 0), n)
                 if lv is not None:
@@ -6025,6 +6188,8 @@ def fit_batches(model, params, batches, loss="cross_entropy", opt=None, epochs=1
                 pass
         raise
     finally:
+        if pool is not None:
+            pool.shutdown(wait=True, cancel_futures=True)
         if LIVE:
             LIVE.pop()
         for b_ in (st1, st2, SQ, COMP, LOSS1, LOSSB):

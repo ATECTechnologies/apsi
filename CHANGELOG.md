@@ -69,6 +69,16 @@
   open port, no public IP.
 
 ### GPU
+- **Training with batches of many shapes stays inside the card:** the trainer's buffers remember the batch that last
+  used them, and before a new or larger buffer would pass the card's budget (94 %, or `APSI_GPU_BUDGET_GB`) the ones
+  the current batch does not use are given back. Before, a run mixing graph sizes and batch kinds kept the largest
+  of every buffer at once, outgrew the card and spilled into the computer's memory (or stopped). A buffer that
+  grows takes a quarter more than asked, so slowly growing batches do not reallocate every time.
+- **Where the time goes:** with `verbose`, `fit_batches` prints every `every` steps the seconds a step spends making
+  batches, in batches made during training (`later`) and on the card, card memory now / at the peak, what was given
+  back, the process's RAM, and per kind of batch (the targets' `mode` / `kind`) the time and card memory.
+- **`fit_batches(…, prefetch=true)`:** the next epoch's batches are made on a second thread while the card trains,
+  for data pipelines that build graphs or tokenize on the processor.
 - **`apsi gpu test`:** everything Apsi does on the card in one report (`report.txt`, `report.json`), every part
   PASS or FAIL: kernels and layers against the exact reference, every product build, an Apsi program trained,
   stopped, resumed to the same loss, predicted with, saved and read back on the card, bfloat16 moments, gradient

@@ -267,6 +267,41 @@ class Trainer(unittest.TestCase):
         for w_, g_ in zip(want, got):
             np.testing.assert_allclose(np.asarray(w_), g_, rtol=1e-4, atol=1e-5)
 
+    def test_prefetch_gives_the_same_training(self):
+        """prefetch=True: the next epoch's batches are made on a second thread; the training is the same."""
+        from apsi import layers as L
+        from apsi.stdlib import adamw
+        lm = L.transformer_lm(40, d=16, heads=2, layers=1, context=32)
+
+        def run(pf):
+            rng = np.random.default_rng(3)
+
+            def batches(ep):
+                x = rng.integers(0, 40, (3, 12))
+                return [(x, np.roll(x, -1, 1)), (x[:2], np.roll(x[:2], -1, 1))]
+            return GT.fit_batches(lm, lm.init(seed=0), batches, loss="cross_entropy", opt=adamw(lr=1e-3), steps=6,
+                                  accumulate=2, verbose=False, ops=GT.Emulator(), prefetch=pf).history
+        self.assertEqual(run(False), run(True))
+
+    def test_arena_stays_inside_the_budget(self):
+        """Buffers the current batch has not used are given back before the card's budget would be passed; a
+        buffer that grows takes a quarter more than asked."""
+        ops = GT.Emulator()
+        ops._budget = 4 * 1500
+        a = GT._Arena(ops)
+        a.next_item()
+        a.get("A", 1000)
+        a.get("C", 100)
+        a.next_item()
+        a.get("C", 100)
+        a.get("B", 1000)
+        self.assertEqual(sorted(a.bufs), ["B", "C"])
+        self.assertEqual(a.trimmed, 4000)
+        a.next_item()
+        a.get("C", 100)
+        a.get("B", 1100)
+        self.assertEqual(a.bufs["B"].n, 1250)
+
     def test_recompute_is_exact(self):
         """recompute: the blocks run their forward again in backward (buffers shared between blocks, dropout masks
         repeated) - the same losses and weights to the last bit as keeping every activation; checkpoint(layer) always

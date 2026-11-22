@@ -1334,7 +1334,7 @@ def _freeze_keep(old, new, paths):
 def fit_batches(model, params, batches, loss="cross_entropy", opt=None, epochs=1, backend="auto", device="cuda",
                 verbose=True, clip=None, schedule=None, precision="auto", compensated=None, every=None, accumulate=1,
                 stages=None, freeze=None, train_only=None, steps=None, checkpoint=None, save_every=None, resume=True,
-                callback=None, recompute=None, exact_sums=None, groups=None, state=None):
+                callback=None, recompute=None, exact_sums=None, groups=None, state=None, prefetch=False):
     """Train on batches that each bring their own shapes and graph: a list of (inputs, targets[, graph]) or a function
     epoch -> such a list. inputs may be a list (a dag with several inputs, e.g. token ids and node features). Each
     step is `accumulate` batches (their gradients averaged); the history is the mean loss of each epoch. backend: "auto"
@@ -1353,6 +1353,8 @@ def fit_batches(model, params, batches, loss="cross_entropy", opt=None, epochs=1
     groups=[record(params=[names of parts], lr=, b1=, b2=, eps=, weight_decay=, clip=, decay="matrices"|"all"|"none"|[parts],
     no_decay=[substrings of a path]), ...]: parameter groups, each with its own AdamW settings and its own gradient
     clipping (params="*": every weight no other group takes); weights of no group use opt's settings and clip.
+    prefetch=true (the GPU trainer, batches a function): the next epoch's batches are made on a second thread while
+    the card trains on these (the function must not depend on the weights; batches made with them go in `later`).
     recompute="auto" (the default on a card): the first step measures the memory; the blocks whose activations do not fit
     in the card's memory (residual / transformer blocks, hgt, global attention, graph transformer layers) are computed
     again in backward instead of kept, the rest keep them. true: every block; false: none."""
@@ -1368,7 +1370,7 @@ def fit_batches(model, params, batches, loss="cross_entropy", opt=None, epochs=1
                                       stages=stages, freeze=freeze, train_only=train_only, steps=steps,
                                       checkpoint=checkpoint, save_every=save_every, resume=resume,
                                       callback=callback, recompute=recompute, exact_sums=exact_sums, groups=groups,
-                                      state=state)
+                                      state=state, prefetch=prefetch)
             except GT.TrainError as e:
                 raise RuntimeErr(f"backend=\"gpu\": {e}") from None
     lf = loss if callable(loss) else _loss_fn(loss)
