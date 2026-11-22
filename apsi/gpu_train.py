@@ -2377,6 +2377,22 @@ def _say_largest(ops):
         pass
 
 
+def _gc_tune():
+    """(see the training loop) once per process."""
+    import gc
+    if os.environ.get("APSI_GC_TUNE", "1").strip().lower() in ("0", "off", "no") or getattr(gc, "_apsi_tuned", False):
+        return
+    try:
+        gc.collect()
+        if hasattr(gc, "freeze"):
+            gc.freeze()
+        t0, t1, t2 = gc.get_threshold()
+        gc.set_threshold(max(t0, 50000), max(t1, 20), max(t2, 20))
+        gc._apsi_tuned = True
+    except Exception:  # noqa: BLE001  (a tuning only)
+        pass
+
+
 def _row_class(M):
     """M rounded up to its size class: 8 classes per power of two (at most 12.5 % above)."""
     M = int(M)
@@ -6480,6 +6496,7 @@ def fit_batches(model, params, batches, loss="cross_entropy", opt=None, epochs=1
     wd = float(getattr(opt, "wd", 0.0)) if isinstance(opt, AdamW) else 0.0
     E = int(epochs)
     net = Net(ops, model, params, precision, recompute=recompute, groups=groups)
+    _gc_tune()
     if net.segments and not (adam and native_opt(opt)):
         raise TrainError("parameter groups= need adam() or adamw()")
     n = net.n
