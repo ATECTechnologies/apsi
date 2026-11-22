@@ -4577,8 +4577,33 @@ class _TypeGroups:
         inv[perm] = np.arange(len(perm))
         self.counts = [int(c) for c in np.bincount(np.minimum(t, T), minlength=T + 1)[:T]]
         self.perm, self.inv = gd._put(perm), gd._put(inv)
+        self._gd, self._t, self._inv, self.T, self._dense = gd, t, inv, T, None
         self.known = (t < T).astype(np.float32)
         self.known_d = gd._put(self.known, np.float32)
+
+
+    def dense(self):
+        """(sel, nk) for the one-product typed layers: the nk rows of the layer's types come first in perm; row i of
+        the output is row sel[i] of the [nk, T, F] products (its position among them x T + its type), a node of
+        another type the zero row nk x T."""
+        if self._dense is None:
+            t, T = self._t, self.T
+            known = t < T
+            nk = int(known.sum())
+            pos = self._inv if nk < len(t) else np.arange(len(t))
+            self._dense = (self._gd._put(np.where(known, pos * T + np.minimum(t, T - 1), nk * T)), nk)
+        return self._dense
+
+
+def _typed_dense():
+    return os.environ.get("APSI_TYPED_DENSE", "1").strip().lower() not in ("0", "off", "no")
+
+
+def _typed_scratch(nd, name, n):
+    """Scratch shared by every typed layer of the net (used only inside one call: one set, not one per layer)."""
+    o = nd.net.ops
+    a = _base_arena(nd.net) or nd.net.arena
+    return a.get(("typed-scratch", name, getattr(o, "cur", None) is not None), n)
 
 
 def _groups(net, T, ids=None):
@@ -4607,6 +4632,9 @@ class _TypedLin:
         self.node, self.tag, self.W, self.b, self.K, self.F, self.T = node, tag, W, b, K, F, T
 
     def fwd(self, x, N, grp):
+        self.dense = _typed_dense()
+        if self.dense:
+            return self._fwd_dense(x, N, grp)
         nd, o, K, F = self.node, self.node.net.ops, self.K, self.F
         xs, ys = nd.buf(self.tag + "xs", N * K), nd.buf(self.tag + "ys", N * F)
         o.gather(x, grp.perm, xs, N, K, 0)
@@ -4624,7 +4652,56 @@ class _TypedLin:
         o.gather(ys, grp.inv, y, N, F, 0)
         return y
 
+    def _fwd_dense(self, x, N, grp):
+        nd, o, K, F, T = self.node, self.node.net.ops, self.K, self.F, self.T
+        ps = nd.net.passes
+        sel, nk = grp.dense()
+        self.grp, self.sel, self.nk = grp, sel, nk
+        y = nd.buf(self.tag + "y", N * F)
+        if nk == 0:
+            o.fill(y, N * F, 0.0)
+            self.xs = None
+            return y
+        if nk < N:                                       # the rows of the layer's types (first in perm)
+            xs = nd.buf(self.tag + "xs", nk * K)
+            o.gather(x, grp.perm, xs, nk, K, 0)
+        else:
+            xs = x
+        Y = _typed_scratch(nd, "Y", (nk * T + 1) * F)
+        o.fill(_ofs(Y, nk * T * F), F, 0.0)              # the zero row of the other types' nodes
+        o.gemm(xs, self.W.w, Y, nk, F, K, K, 1, F, 1, T * F, batch=(1, T), sb=(0, K * F), sc=(0, F), passes=ps)
+        if self.b is not None:
+            o.rowbias(Y, self.b.w, nk, T * F)            # b is [T, F]: row r of [nk, T x F] gets every type's bias
+        o.gather(Y, sel, y, N, F, 0)
+        self.xs = xs
+        return y
+
+    def _bwd_dense(self, dy, N):
+        nd, o, K, F, T = self.node, self.node.net.ops, self.K, self.F, self.T
+        ps = nd.net.passes
+        sel, nk = self.sel, self.nk
+        dx = nd.gbuf(self.tag + "dx", N * K)
+        if nk == 0:
+            o.fill(dx, N * K, 0.0)
+            return dx
+        R = nk * T + 1
+        dY = _typed_scratch(nd, "dY", R * F)
+        o.fill(dY, R * F, 0.0)
+        o.embed_b(dy, sel, dY, N, F, R)                  # each row's gradient to its type's place (others stay zero)
+        o.gemm(self.xs, dY, self.W.g, K, F, nk, 1, K, T * F, 1, F, beta=True, batch=(1, T), sb=(0, F),
+               sc=(0, K * F), passes=ps)                 # dW_t += xs^T dY_t
+        if self.b is not None:
+            o.colsum(dY, None, None, None, None, self.b.g, nk, T * F, 0)
+        dX = _typed_scratch(nd, "dX", R * K)
+        o.fill(_ofs(dX, nk * T * K), K, 0.0)
+        o.gemm(dY, self.W.w, dX, nk, K, F, T * F, 1, 1, F, T * K, batch=(1, T), sa=(0, F), sb=(0, K * F),
+               sc=(0, K), passes=ps)                     # dY_t W_t^T for every type: a row's own type is its dx
+        o.gather(dX, sel, dx, N, K, 0)
+        return dx
+
     def bwd(self, dy, N):
+        if getattr(self, "dense", False):
+            return self._bwd_dense(dy, N)
         nd, o, K, F, grp = self.node, self.node.net.ops, self.K, self.F, self.grp
         dys, dxs = nd.gbuf(self.tag + "dys", N * F), nd.gbuf(self.tag + "dxs", N * K)
         o.gather(dy, grp.perm, dys, N, F, 0)
@@ -4755,6 +4832,19 @@ class _HGT(_Node):
                              [int(c) for c in counts], len(us))
         return gd.cache[key]
 
+    def _rel_dense(self, gd, f, U, counts):
+        """Row u of the pairs (grouped by relation) is row u x R + its relation of the [U, R, d] products, or None:
+        one product per relation (APSI_HGT_DENSE=0, or the products would take more than APSI_HGT_DENSE_MB)."""
+        if os.environ.get("APSI_HGT_DENSE", "1").strip().lower() in ("0", "off", "no") or not _typed_dense():
+            return None
+        if 4 * (U * self.R + 1) * self.d > float(os.environ.get("APSI_HGT_DENSE_MB", "128")) * 2 ** 20:
+            return None
+        key = ("hgt-dense", id(self), self.which)
+        if key not in gd.cache:
+            rel = np.repeat(np.arange(self.R), counts)
+            gd.cache[key] = gd._put(np.arange(U) * self.R + rel)
+        return gd.cache[key]
+
     def _drop_f(self, name, v, n):
         """Dropout of a branch while training: a mask kept for backward (the trainer's seed sequence)."""
         if not (self.net.train and self.p_drop > 0):
@@ -4789,8 +4879,14 @@ class _HGT(_Node):
             kidx, vidx, hasin, usrc, counts, U = self._ids(gd, f)
             KG, KR = self.buf("kg", U * d), self.buf("kr", U * d)
             o.gather(k, usrc, KG, U, d, 0)                       # the key rows of the pairs, grouped by relation
+            self.rsel = self._rel_dense(gd, f, U, counts)
+            if self.rsel is not None:                          # every relation at once, each row's own gathered
+                KA = _typed_scratch(self, "KR", (U * R + 1) * d)
+                o.gemm(KG, self.rel.w, KA, U, hd, hd, d, 1, hd, 1, R * d, batch=(R, H), sa=(0, hd),
+                       sb=(H * hd * hd, hd * hd), sc=(d, hd), passes=ps)
+                o.gather(KA, self.rsel, KR, U, d, 0)
             r0 = 0
-            for r, c in enumerate(counts):
+            for r, c in enumerate(counts if self.rsel is None else ()):
                 if c:
                     o.gemm(_ofs(KG, r0 * d), _ofs(self.rel.w, r * H * hd * hd), _ofs(KR, r0 * d), c, hd, hd, d, 1,
                            hd, 1, d, batch=(1, H), sa=(0, hd), sb=(0, hd * hd), sc=(0, hd), passes=ps)
@@ -4831,6 +4927,19 @@ class _HGT(_Node):
             dmsg = self.lin["o"].bwd(self._drop_b("do", dom, N * d), N)
             dq, dKR, dv = _EdgeAttention.bwd(self, f, self.q, kidx, dmsg, N, H, hd, U, vidx=vidx, vrows=N)
             dKG = self.gbuf("dkg", U * d)
+            if getattr(self, "rsel", None) is not None:
+                RR = U * R + 1
+                dA = _typed_scratch(self, "dKR", RR * d)
+                o.fill(dA, RR * d, 0.0)
+                o.embed_b(dKR, self.rsel, dA, U, d, RR)    # each pair's gradient at its own relation, others zero
+                o.gemm(self.kg, dA, self.rel.g, hd, hd, U, 1, d, R * d, 1, hd, beta=True, batch=(R, H),
+                       sa=(0, hd), sb=(d, hd), sc=(H * hd * hd, hd * hd), passes=ps)
+                gA = _typed_scratch(self, "dKG", RR * d)
+                o.fill(_ofs(gA, U * R * d), d, 0.0)
+                o.gemm(dA, self.rel.w, gA, U, hd, hd, R * d, 1, 1, hd, R * d, batch=(R, H), sa=(d, hd),
+                       sb=(H * hd * hd, hd * hd), sc=(d, hd), passes=ps)
+                o.gather(gA, self.rsel, dKG, U, d, 0)
+                counts = ()
             r0 = 0
             for r, c in enumerate(counts):                 # back through the relation transforms, pair by pair
                 if c:
