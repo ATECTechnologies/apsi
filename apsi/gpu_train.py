@@ -3786,9 +3786,31 @@ class _HostLayer(_Node):
         self.leaves = [a for a in tree_leaves(p) if isinstance(a, np.ndarray) and id(a) in net.offsets]
         net.host_layers = getattr(net, "host_layers", 0) + 1
 
+    def _span(self):
+        """(lo, hi, params): the stretch of the flat weights that holds this layer's weights, or None (rounded
+        low-bit weights, or weights far apart)."""
+        if "_sp" in self.__dict__:
+            return self._sp
+        net = self.net
+        ps = [net.param(a) for a in self.leaves]
+        sp = None
+        if ps and not any(net.qoff.get(q.off) is not None for q in ps):
+            lo, hi = min(q.off for q in ps), max(q.off + q.n for q in ps)
+            if hi - lo <= 2 * sum(q.n for q in ps) + 4096:
+                sp = (lo, hi, ps)
+        self._sp = sp
+        return sp
+
     def _params(self):
         o, net = self.net.ops, self.net
         now = {}
+        sp = self._span()
+        if sp is not None:                               # one read for all of them
+            lo, hi, ps = sp
+            flat = o.get(net.P, hi - lo, lo).astype(np.float64)
+            for a, q in zip(self.leaves, ps):
+                now[id(a)] = flat[q.off - lo:q.off - lo + q.n].reshape(a.shape)
+            return tree_map(lambda a: now.get(id(a), a) if isinstance(a, np.ndarray) else a, self.p)
         for a in self.leaves:
             w = net.param(a).w
             now[id(a)] = o.get(w[0], a.size, w[1]).reshape(a.shape).astype(np.float64)
@@ -3884,6 +3906,20 @@ class _HostLayer(_Node):
         o, net = self.net.ops, self.net
         flat = {id(a): t for a, t in zip(tree_leaves(p), tree_leaves(gp))}
         orig = {id(b_): a for a, b_ in zip(tree_leaves(self.p), tree_leaves(p))}
+        sp = self._span()
+        if sp is not None:                               # one copy and one addition for all the gradients
+            lo, hi, _ = sp
+            gh = np.zeros(hi - lo, np.float32)
+            for b_id, t in flat.items():
+                a = orig.get(b_id)
+                if a is None or not isinstance(a, np.ndarray) or id(a) not in net.offsets:
+                    continue
+                q = net.param(a)
+                gh[q.off - lo:q.off - lo + q.n] += np.asarray(aops.raw(t), np.float32).reshape(-1)
+            tmp = self.gbuf("pg_all", hi - lo)
+            o.put(tmp[0], gh, tmp[1])
+            o.axpy((net.G, lo), tmp, hi - lo, 1.0)
+            flat = {}
         for b_id, t in flat.items():
             a = orig.get(b_id)
             if a is None or not isinstance(a, np.ndarray) or id(a) not in net.offsets:
