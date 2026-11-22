@@ -2598,6 +2598,58 @@ class _Recompute(_Node):
         self.rows = max(self.rows, _rows(shape))
         return out, ys
 
+    def fwd_multi(self, ins):
+        """Several inputs (cross-attention: the queries' input and the memory): the same, the inputs kept."""
+        self.ins = list(ins)
+        if self.live:
+            return _fwd_multi(self.inner, self.ins)
+        net, o = self.net, self.net.ops
+        s0 = net.seed
+        self._enter()
+        try:
+            y, ys = _fwd_multi(self.inner, self.ins)
+        finally:
+            self._leave()
+        self.seeds = (s0, net.seed)
+        n = int(np.prod(ys))
+        out = self.buf("out", n)
+        o.copy(out, y, n)
+        self.rows = max(self.rows, _rows(self.ins[0][1]))
+        return out, ys
+
+    def bwd_multi(self, dy):
+        if self.live:
+            return _bwd_multi(self.inner, dy)
+        net, o = self.net, self.net.ops
+        s0, s1 = self.seeds[0], net.seed
+        net.seed = s0
+        track = {} if not self.foot else None
+        net._ck_arena.track = net._ck_garena.track = track
+        self._enter()
+        try:
+            net._replay = True
+            try:
+                _fwd_multi(self.inner, self.ins)
+            finally:
+                net._replay = False
+            gs = _bwd_multi(self.inner, dy)
+        finally:
+            self._leave()
+            net._ck_arena.track = net._ck_garena.track = None
+            net.seed = s1
+        if track:
+            self.foot = 4 * sum(track.values())
+        outs = []
+        for i, (g_, (_, s_)) in enumerate(zip(gs, self.ins)):
+            if g_ is None:
+                outs.append(None)
+                continue
+            m = int(np.prod(s_))
+            d = self.gbuf(("dx", i), m)
+            o.copy(d, g_, m)
+            outs.append(d)
+        return outs
+
     def bwd(self, dy, need_dx=True):
         if self.live:
             return self.inner.bwd(dy, need_dx)
@@ -2648,6 +2700,8 @@ def _recompute_mode(v, ops):
 def _recomputable(layer):
     from . import layers as L
     from . import graphs as GR
+    if isinstance(layer, L.MultiHeadAttention):
+        return os.environ.get("APSI_RECOMPUTE_ATTENTION", "1").strip().lower() not in ("0", "off", "no")
     return isinstance(layer, (L.Residual, L.TransformerBlock, GR.HGT, GR.GlobalAttention, GR.GraphTransformer))
 
 
@@ -3029,10 +3083,16 @@ class _Attention(_Node):
             raise TrainError(f"cross-attention: the memory is {tuple(mem[1])}, the query {tuple(shape)}")
         self.mb = None
         if self.mmask and mem is not None:              # split the memory: its features, and a bias row per batch
-            a = o.get(xm[0], B * S * Dm, xm[1]).reshape(B * S, Dm)
-            xm = _put_buf(self, "xmf", a[:, :D], np.float32)
-            self.mb = _put_buf(self, "mb", (a[:, D].astype(np.float64) - 1.0) * 1e9, np.float32)
-            self.ones = _put_buf(self, "ones", np.ones(T), np.float32)
+            Mk_ = B * S                                  # (on the card: no read back)
+            xf, mc = self.buf("xmf", Mk_ * D), self.buf("mcol", Mk_)
+            o.cols(xf, xm, Mk_, D, Dm, 0, True)
+            o.cols(mc, xm, Mk_, 1, Dm, D, True)
+            self.mb = self.buf("mb", Mk_)
+            o.fill(self.mb, Mk_, -1e9)
+            o.axpy(self.mb, mc, Mk_, 1e9)                # (mask - 1) 1e9: 0 or -1e9
+            self.ones = self.buf("ones", T)
+            o.fill(self.ones, T, 1.0)
+            xm = xf
         hd = D // h
         M, Mk, Dkv = B * T, B * S, kvh * hd
         self.x, self.xm, self.cross, self.B, self.T, self.S = x, xm, mem is not None, B, T, S
@@ -3119,10 +3179,11 @@ class _Attention(_Node):
         out = self._bwd(dy, need_dx)
         if self.cross and self.mmask:                   # the memory's gradient: none for its last column
             dx, dm = out
-            Mk, D = self.B * self.S, self.D
-            a = np.zeros((Mk, D + 1), np.float32)
-            a[:, :D] = self.net.ops.get(dm[0], Mk * D, dm[1]).reshape(Mk, D)
-            return dx, _put_buf(self, "dmem1", a, np.float32, grad=True)
+            Mk, D, o = self.B * self.S, self.D, self.net.ops
+            d1 = self.gbuf("dmem1", Mk * (D + 1))
+            o.fill(d1, Mk * (D + 1), 0.0)
+            o.cols(dm, d1, Mk, D, D + 1, 0, False)
+            return dx, d1
         return out
 
     def _bwd(self, dy, need_dx=True):

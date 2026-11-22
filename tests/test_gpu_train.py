@@ -356,7 +356,7 @@ class Trainer(unittest.TestCase):
         np.testing.assert_allclose(a.history, c.history, rtol=1e-5)
         net = GT.Net(GT.Emulator(), m, m.init(seed=0), "fp32", recompute=True)
         kinds = sorted({nd.kind for nd in net.ck})
-        self.assertEqual(kinds, ["_GlobalAttention", "_HGT", "_Residual"])
+        self.assertEqual(kinds, ["_Attention", "_GlobalAttention", "_HGT", "_Residual"])
         self.assertTrue(any(nd.forced for nd in net.ck))
         net.close()
 
