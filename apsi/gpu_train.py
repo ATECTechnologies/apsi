@@ -2313,6 +2313,22 @@ def _say_largest(ops):
               "the largest (* = used by this batch):", flush=True)
         for nb, k, now in rows[:25]:
             print(f"    {nb / 2 ** 20:9.1f} MB {'*' if now else ' '} {k}", flush=True)
+        by_layer, by_name = {}, {}
+        for ref in list(_ARENAS):
+            a = ref()
+            if a is None or a.ops is not ops:
+                continue
+            for k, b in a.bufs.items():
+                kk = k if isinstance(k, tuple) else (k,)
+                kk = kk[1:] if kk and kk[0] in ("g", "ck") else kk
+                lay = str(kk[0]).split(".")[0] + ("." + str(kk[0]).split(".")[1][:3] if "." in str(kk[0]) else "") \
+                    if kk else "?"
+                by_layer[lay] = by_layer.get(lay, 0) + 4 * b.n
+                nm = str(kk[-1]) if kk else "?"
+                by_name[nm] = by_name.get(nm, 0) + 4 * b.n
+        for title, d_ in (("by layer", by_layer), ("by buffer name", by_name)):
+            top = sorted(d_.items(), key=lambda kv: -kv[1])[:20]
+            print(f"  {title}: " + ", ".join(f"{k} {v / 2 ** 20:.0f} MB" for k, v in top), flush=True)
     except Exception:                                    # noqa: BLE001 - a report only
         pass
 
@@ -3015,7 +3031,7 @@ class _Attention(_Node):
             o.gemm(att, self.Wo.w, y, M, D, D, D, 1, D, 1, D, bias=self.bo.w if self.bo else None, passes=ps, epi=3 if residual else 0,
                    X2=residual)
             return y, shape
-        Sc, P = self.buf("s", B * h * T * S), self.buf("p", B * h * T * S)
+        Sc, P = _typed_scratch(self, "att-s", B * h * T * S), self.buf("p", B * h * T * S)
         # S[b, h](t, s) = q[b, t, h, :] . k[b, s, h, :] * sc
         o.gemm(q, k, Sc, T, S, hd, D, 1, 1, D, S, alpha=sc, batch=(B, h), sa=(T * D, hd), sb=(S * D, hd),
                sc=(h * T * S, T * S), passes=ps)
@@ -3080,13 +3096,13 @@ class _Attention(_Node):
                 dq, dk, dv = self.gbuf("dq", M * D), self.gbuf("dk", M * D), self.gbuf("dv", M * D)
             o.flash_bwd(self.q, self.k, self.v, datt, self.L, dd, dq, dk, dv, B, T, h, hd, self.causal, sc)
             return self._grads_in(dq, dk, dv, M, D, ps)
-        dP = self.gbuf("dp", B * h * T * S)               # dP = datt v^T
+        dP = _typed_scratch(self, "att-dp", B * h * T * S)   # dP = datt v^T
         o.gemm(datt, self.v, dP, T, S, hd, D, 1, 1, D, S, batch=(B, h), sa=(T * D, hd), sb=(S * D, hd),
                sc=(h * T * S, T * S), passes=ps)
         dv = self.gbuf("dv", Mk * D)                      # dv = P^T datt
         o.gemm(self.P, datt, dv, S, hd, T, 1, S, D, 1, D, batch=(B, h), sa=(h * T * S, T * S), sb=(T * D, hd),
                sc=(S * D, hd), passes=ps)
-        dS = self.gbuf("ds", B * h * T * S)
+        dS = _typed_scratch(self, "att-ds", B * h * T * S)
         o.softmax_b(self.P, dP, dS, B * h * T, S)
         dq, dk = self.gbuf("dq", M * D), self.gbuf("dk", Mk * D)
         o.gemm(dS, self.k, dq, T, hd, S, S, 1, D, 1, D, alpha=sc, batch=(B, h), sa=(h * T * S, T * S),
