@@ -4692,7 +4692,16 @@ class _HGT(_Node):
                 has_in = self.layer.out_mask(self.net.graph, gd.N, f["dst"]).reshape(-1).astype(np.float32)
             else:
                 has_in = (np.bincount(f["dst"], minlength=gd.N) > 0).astype(np.float32)
-            gd.cache[key] = (gd._put(f["src"] * self.R + f["rel"]), gd._put(f["src"]), gd._put(has_in, np.float32))
+            pair = f["src"].astype(np.int64) * self.R + f["rel"]
+            uniq, inv = np.unique(pair, return_inverse=True)      # the (node, relation) pairs the edges use
+            order = np.argsort(uniq % self.R, kind="stable")      # grouped by relation: one product per relation
+            pos = np.empty(len(order), np.int64)
+            pos[order] = np.arange(len(order))
+            us = uniq[order]
+            counts = np.bincount(us % self.R, minlength=self.R)
+            gd.cache[key] = (gd._put((pos[inv.reshape(-1)]).astype(np.int64)), gd._put(f["src"]),
+                             gd._put(has_in, np.float32), gd._put((us // self.R).astype(np.int64)),
+                             [int(c) for c in counts], len(us))
         return gd.cache[key]
 
     def _drop_f(self, name, v, n):
@@ -4726,10 +4735,16 @@ class _HGT(_Node):
         self.q, self.k = q, k
         x1 = self.buf("x1", N * d)
         if self.E:
-            kidx, vidx, hasin = self._ids(gd, f)
-            KR = self.buf("kr", N * R * d)
-            o.gemm(k, self.rel.w, KR, N, hd, hd, d, 1, hd, 1, R * d, batch=(R, H), sa=(0, hd),
-                   sb=(H * hd * hd, hd * hd), sc=(d, hd), passes=ps)
+            kidx, vidx, hasin, usrc, counts, U = self._ids(gd, f)
+            KG, KR = self.buf("kg", U * d), self.buf("kr", U * d)
+            o.gather(k, usrc, KG, U, d, 0)                       # the key rows of the pairs, grouped by relation
+            r0 = 0
+            for r, c in enumerate(counts):
+                if c:
+                    o.gemm(_ofs(KG, r0 * d), _ofs(self.rel.w, r * H * hd * hd), _ofs(KR, r0 * d), c, hd, hd, d, 1,
+                           hd, 1, d, batch=(1, H), sa=(0, hd), sb=(0, hd * hd), sc=(0, hd), passes=ps)
+                r0 += c
+            self.kg = KG
             msg = _EdgeAttention.fwd(self, f, q, KR, v, kidx, N, H, hd, vidx=vidx)
             om = _diag(self, "om", self._drop_f("do", self.lin["o"].fwd(msg, N, grp), N * d), hasin, N, d)
             o.add3(x1, x, om, N * d)
@@ -4760,16 +4775,23 @@ class _HGT(_Node):
             dxn_parts = []
         else:
             f, _ = gd.csr(self.which)
-            kidx, vidx, hasin = self._ids(gd, f)
+            kidx, vidx, hasin, usrc, counts, U = self._ids(gd, f)
             dom = _diag(self, "dom", dx1, hasin, N, d, grad=True)
             dmsg = self.lin["o"].bwd(self._drop_b("do", dom, N * d), N)
-            dq, dKR, dv = _EdgeAttention.bwd(self, f, self.q, kidx, dmsg, N, H, hd, N * R, vidx=vidx, vrows=N)
+            dq, dKR, dv = _EdgeAttention.bwd(self, f, self.q, kidx, dmsg, N, H, hd, U, vidx=vidx, vrows=N)
+            dKG = self.gbuf("dkg", U * d)
+            r0 = 0
+            for r, c in enumerate(counts):                 # back through the relation transforms, pair by pair
+                if c:
+                    o.gemm(_ofs(dKR, r0 * d), _ofs(self.rel.w, r * H * hd * hd), _ofs(dKG, r0 * d), c, hd, hd, d,
+                           1, 1, hd, d, batch=(1, H), sa=(0, hd), sb=(0, hd * hd), sc=(0, hd), passes=ps)
+                    o.gemm(_ofs(self.kg, r0 * d), _ofs(dKR, r0 * d), _ofs(self.rel.g, r * H * hd * hd), hd, hd, c,
+                           1, d, d, 1, hd, beta=True, batch=(1, H), sa=(0, hd), sb=(0, hd), sc=(0, hd * hd),
+                           passes=ps)
+                r0 += c
             dk = self.gbuf("dk", N * d)
-            for r in range(R):                             # back through the relation transforms
-                o.gemm(_ofs(dKR, r * d), _ofs(self.rel.w, r * H * hd * hd), dk, N, hd, hd, R * d, 1, 1, hd, d,
-                       beta=r > 0, batch=(1, H), sa=(0, hd), sb=(0, hd * hd), sc=(0, hd), passes=ps)
-            o.gemm(self.k, dKR, self.rel.g, hd, hd, N, 1, d, R * d, 1, hd, beta=True, batch=(R, H), sa=(0, hd),
-                   sb=(d, hd), sc=(H * hd * hd, hd * hd), passes=ps)
+            o.fill(dk, N * d, 0.0)
+            o.embed_b(dKG, usrc, dk, U, d, N)              # each pair's key gradient back to its node
             dxn_parts = [self.lin["q"].bwd(dq, N), self.lin["k"].bwd(dk, N), self.lin["v"].bwd(dv, N)]
         if dxn_parts:
             dxn = self.gbuf("dxn", N * d)
@@ -4824,27 +4846,37 @@ class _GlobalAttention(_Node):
         gd, batch = self._gd(N)
         own = self._own(N)
         src, dst, picked = [], [], False
+        in_order, last = True, -1
+        per_node = np.zeros(N, np.int64)                   # each node's number of keys: the CSR offsets
         for b_ in np.unique(batch[own]):
             idx = np.nonzero((batch == b_) & own)[0]
+            if len(idx):                                   # (each graph's nodes ascending; graphs one after another)
+                in_order = in_order and int(idx[0]) > last
+                last = int(idx[-1])
             keys = self.layer.keys_of(idx, score) if hasattr(self.layer, "keys_of") else (
                 idx if len(idx) <= self.max_keys else idx[np.linspace(0, len(idx) - 1, self.max_keys).astype(int)])
             picked = picked or (self.learned and len(keys) < len(idx))
-            src.append(np.tile(keys, len(idx)))
-            dst.append(np.repeat(idx, len(keys)))
+            per_node[idx] = len(keys)
+            src.append(np.tile(np.asarray(keys, np.int32), len(idx)))
+            dst.append(np.repeat(np.asarray(idx, np.int32), len(keys)))
         src = np.concatenate(src) if src else np.zeros(0, np.int64)
         dst = np.concatenate(dst) if dst else np.zeros(0, np.int64)
         if picked:                                         # keys chosen by this step's scores: edges of this pass
-            order = np.argsort(dst, kind="stable")
-            s_, d_ = src[order], dst[order]
+            if in_order:                                   # already sorted by target: the stable sort is the identity
+                s_, d_ = src, dst
+            else:
+                order = np.argsort(dst, kind="stable")
+                s_, d_ = src[order], dst[order]
             E = len(s_)
+            offs = np.zeros(N + 1, np.int64)
+            np.cumsum(per_node, out=offs[1:])
             put = lambda name, a: _put_buf(self, name, a)              # noqa: E731
             ar = ("ga-arange", E)                          # 0..E: the same for every layer of this batch
             if ar not in gd.cache:
                 gd.cache[ar] = gd._put(np.arange(E + 1))
             col = put("e_col", s_)                         # (the key of each edge is its column: one buffer)
-            f = dict(col=col, off=put("e_off", np.concatenate([[0], np.cumsum(np.bincount(
-                d_, minlength=N))])), row=put("e_row", d_), ids=gd.cache[ar], eoff=gd.cache[ar], n=N, E=E, src=s_,
-                dst=d_, cached=False)
+            f = dict(col=col, off=put("e_off", offs), row=put("e_row", d_), ids=gd.cache[ar], eoff=gd.cache[ar], n=N,
+                     E=E, src=s_, dst=d_, cached=False)
             return gd, f, col
         f = gd.custom(("global", self.max_keys, self.type_ids), src, dst)
         ck = ("ga", self.max_keys, self.type_ids)

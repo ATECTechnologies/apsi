@@ -77,6 +77,11 @@
 - **Where the time goes:** with `verbose`, `fit_batches` prints every `every` steps the seconds a step spends making
   batches, in batches made during training (`later`) and on the card, card memory now / at the peak, what was given
   back, the process's RAM, and per kind of batch (the targets' `mode` / `kind`) the time and card memory.
+- **`hgt` on the card computes keys only for the (node, relation) pairs the edges use**, not for every node and
+  every relation: memory and work of that step fall by about the number of relations over the relations a node
+  really has (tens of times on graphs with many relation kinds); results unchanged.
+- **`global_attention` with learned keys:** its edges are made in int32, already in order, with offsets from each
+  node's key count — no sort and no count over every edge on the processor in each pass.
 - **`fit_batches(…, prefetch=true)`:** the next epoch's batches are made on a second thread while the card trains,
   for data pipelines that build graphs or tokenize on the processor.
 - **`apsi gpu test`:** everything Apsi does on the card in one report (`report.txt`, `report.json`), every part
