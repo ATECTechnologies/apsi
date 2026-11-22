@@ -3645,6 +3645,33 @@ class _GradScale(_Node):
         return dx
 
 
+class _Slice(_Node):
+    """slice(start, stop): columns of the last axis, copied on the card; backward the gradient into those columns
+    (zeros elsewhere)."""
+
+    def __init__(self, net, key, layer):
+        super().__init__(net, key)
+        self.a, self.b = int(layer.start), int(layer.stop)
+
+    def fwd(self, x, shape):
+        W = int(shape[-1])
+        a, b = max(0, min(self.a, W)), max(0, min(self.b, W))
+        b = max(a, b)
+        self.rows, self.W, self.lo, self.w = _rows(shape), W, a, b - a
+        y = self.buf("y", max(1, self.rows * self.w))
+        if self.w:
+            self.net.ops.cols(y, x, self.rows, self.w, W, a, True)
+        return y, tuple(shape[:-1]) + (self.w,)
+
+    def bwd(self, dy, need_dx=True):
+        o, n = self.net.ops, self.rows * self.W
+        dx = self.gbuf("dx", n)
+        o.fill(dx, n, 0.0)
+        if self.w:
+            o.cols(dy, dx, self.rows, self.w, self.W, self.lo, False)
+        return dx
+
+
 class _TiedOutput(_Node):
     """tied_output: x @ E^T with the table E of an embedding of the same dag (one parameter, two users: both add
     their gradients into it)."""
@@ -6118,6 +6145,8 @@ class Net:
             return _Attention(self, key, layer, p)
         if isinstance(layer, L.GradScale):
             return _GradScale(self, key, layer.alpha)
+        if isinstance(layer, L.Slice) and layer.start >= 0 and layer.stop >= 0:
+            return _Slice(self, key, layer)
         if isinstance(layer, L.TiedOutput):
             return _TiedOutput(self, key, layer, self.dag_params)
         if isinstance(layer, L.SwiGLU):
