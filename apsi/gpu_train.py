@@ -2462,6 +2462,19 @@ class _Arena:
             self.seen.pop(k, None)
             self.trimmed += 4 * b.n
             self.ops.free(b)
+        if self.ops.used + nbytes <= budget:
+            return
+        for ref in list(_ARENAS):                        # the other nets on this card: their stale buffers
+            a = ref()
+            if a is None or a is self or a.ops is not self.ops:
+                continue
+            for k in sorted((k for k in a.bufs if a.seen.get(k, -1) < a.tick), key=lambda k: -a.bufs[k].n):
+                if self.ops.used + nbytes <= budget:
+                    return
+                b = a.bufs.pop(k)
+                a.seen.pop(k, None)
+                a.trimmed += 4 * b.n
+                self.ops.free(b)
 
     def close(self):
         for b in self.bufs.values():
@@ -6528,6 +6541,9 @@ def fit_batches(model, params, batches, loss="cross_entropy", opt=None, epochs=1
                     continue
                 if _is_later(item):                          # made now, with the weights as they are at this point
                     _tl = time.perf_counter()
+                    _ba = _base_arena(net)
+                    if _ba is not None:
+                        _ba.next_item()
                     made = list(item.later() or [])
                     times.later += time.perf_counter() - _tl
                     if bool(getattr(item, "end_step", False)):
