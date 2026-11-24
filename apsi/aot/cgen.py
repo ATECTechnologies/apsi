@@ -104,6 +104,7 @@ class Scope:
         self.free = []           # names this function reads from an enclosing function (its cells, in order)
         self.loop_names = []     # while walking: the immutable names declared by the loops around (a stack of sets)
         self.snap = set()        # a lambda's names captured by value (per-iteration closures)
+        self.is_gen = False      # a generator function (it yields)
 
     def bind(self, name):
         if name not in self.bound:
@@ -262,6 +263,10 @@ class Analyzer:
         elif k == "Raise":
             if s.value is not None:
                 self.expr(s.value, sc)
+        elif k == "Yield":
+            sc.fn_scope().is_gen = True
+            if s.value is not None:
+                self.expr(s.value, sc)
         elif k == "Assert":
             self.expr(s.cond, sc)
             if s.msg is not None:
@@ -389,8 +394,12 @@ class Analyzer:
         elif k == "NamedExpr":
             sc.bind(e.name)
             self.expr(e.value, sc)
-        elif k in ("YieldExpr", "Await"):
-            raise NativeError("generators and async are not supported by the native backend yet", e)
+        elif k == "YieldExpr":
+            sc.fn_scope().is_gen = True
+            if e.value is not None:
+                self.expr(e.value, sc)
+        elif k == "Await":
+            raise NativeError("async is not supported by the native backend yet", e)
         elif k == "FStr":
             for p in e.parts:
                 if isinstance(p, tuple):
@@ -781,7 +790,14 @@ class CGen:
             t = self.tmp()
             self.emit(f"{t} = {v};")
             dvals.append(t)
-        self.function_body(cname, scope, name, params, body, expr_body)
+        if scope.is_gen:
+            self.function_body(cname + "_body", scope, name, params, body, expr_body)
+            wrap = Fn(cname, scope, name)
+            wrap.text = [f"static AV {cname}(AFunc *self, int n, AV *args, ADict *kw) {{",
+                         f"    return a_gen_new(self, {cname}_body, n, args, kw);", "}"]
+            self.fns.append(wrap)
+        else:
+            self.function_body(cname, scope, name, params, body, expr_body)
         t = self.tmp()
         self.emit(f"{t} = a_func({cstr(name)}, {cname}, {len(scope.free)}, {len(defaults)});")
         for i, nm in enumerate(scope.free):
@@ -1145,6 +1161,24 @@ class CGen:
             self.emit(f"{t2} = a_call({dv}, 1, &{c}, NULL);")
             self.store(s.name, t2)
 
+    def s_Yield(self, s):
+        if s.from_:
+            src = self.hold(self.expr(s.value))
+            it = self.tmp()
+            cur = self.tmp()
+            self.emit(f"{it} = a_iter({src});")
+            self.emit(f"while (a_next({it}, &{cur})) a_yield({cur});")
+            return
+        v = self.expr(s.value) if s.value is not None else "A_NONE"
+        self.emit(f"a_yield({v});")
+
+    def e_YieldExpr(self, e):
+        if e.from_:
+            self.s_Yield(A.Yield(e.value, True))
+            return "A_NONE"
+        v = self.expr(e.value) if e.value is not None else "A_NONE"
+        return self.hold(f"a_yield({v})")
+
     def s_Raise(self, s):
         if s.value is None:
             self.emit("a_raise(a_exc);")
@@ -1222,7 +1256,7 @@ class CGen:
         self.emit(f"{exc} = a_exc;")
         first = True
         for kinds, name, body in s.handlers:
-            if kinds is None:
+            if not kinds:
                 cond = "1"
             else:
                 ks = kinds if isinstance(kinds, list) else [kinds]

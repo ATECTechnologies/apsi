@@ -17,7 +17,7 @@ typedef struct AV {
 
 typedef enum {
     O_STR = 1, O_LIST, O_TUPLE, O_DICT, O_SET, O_FUNC, O_CLASS, O_INST, O_BOUND, O_RANGE, O_ITER, O_CELL, O_BUILTIN,
-    O_SLICE, O_QTY
+    O_SLICE, O_QTY, O_GEN
 } AKind;
 
 typedef struct AObj { struct AObj *gcnext; uint8_t kind, mark; } AObj;
@@ -134,6 +134,8 @@ AV a_range_val(AV start, AV end, int inclusive);
 void a_unpack_star(AV v, int before, int after, AV *out);   /* a, *b, c = v */
 AV a_gundef(const char *name);
 AV a_fmt_spec(AV v, AV spec);
+AV a_gen_new(AFunc *fn, AFnCode body, int n, AV *args, ADict *kw);   /* a generator function's call */
+AV a_yield(AV v);                                                   /* yield v: the value sent back in */
 AV a_module(const char *name, int n, const char **names, AV *vals);
 uint64_t a_rand_u64(void); double a_rand_f(void); double a_rand_n(void); void a_seed(uint64_t x);
 extern AV (*a_tensor_random)(int kind, int n, AV *shape, AV lo, AV hi);           /* o.name, AttributeError if missing */

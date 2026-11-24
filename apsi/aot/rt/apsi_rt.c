@@ -57,9 +57,10 @@ static const char *a_exc_names[A_NEXC] = {
     "UnicodeError", "MemoryError", "EOFError", "ImportError", "ShapeError", "UserError", "IsADirectoryError",
     "ModuleNotFoundError"};
 static const int a_exc_base[A_NEXC] = {-1, 0, 1, 2, 2, 1, 1, 1, 7, 7, 1, 1, 1, 12, 1, 1, 5, 1, 12, 0,
-    2, 17, 17, 17, 17, 17, 5, 1, 1, 1, 5, 1, 17, 29};
+    2, 17, 17, 17, 17, 17, 5, 1, 1, 1, 5, 12, 17, 29};
 
 static void mark(AV v);
+struct AGen; static void gen_mark(struct AGen *g); static void gen_free(struct AGen *g); static const char *gen_name(AObj *o);
 static void mark_obj(AObj *o) {
     while (o && !o->mark) {
         o->mark = 1;
@@ -95,6 +96,7 @@ static void mark_obj(AObj *o) {
         case O_ITER: { AIter *it = (AIter *)o; mark(it->src); mark(it->aux); return; }
         case O_SLICE: { ASlice *s = (ASlice *)o; mark(s->lo); mark(s->hi); mark(s->step); return; }
         case O_QTY: o = (AObj *)((AQty *)o)->dtext; continue;
+        case O_GEN: gen_mark((struct AGen *)o); return;
         default: return;
         }
     }
@@ -107,6 +109,7 @@ static void free_obj(AObj *o) {
     case O_DICT: case O_SET: free(((ADict *)o)->e); free(((ADict *)o)->idx); break;
     case O_FUNC: free(((AFunc *)o)->cells); free(((AFunc *)o)->defaults); break;
     case O_CLASS: free(((AClass *)o)->fields); break;
+    case O_GEN: gen_free((struct AGen *)o); break;
     default: break;
     }
     free(o);
@@ -317,12 +320,21 @@ static int exc_index(const char *type) {
     for (int i = 0; i < A_NEXC; i++) if (!strcmp(a_exc_names[i], type)) return i;
     return 12;   /* RuntimeError */
 }
+static AStr *exc_kind(AClass *c) {            /* the nearest built-in kind; Exception, Error and a raised text: RuntimeError */
+    for (; c; c = c->base)
+        for (int i = 0; i < A_NEXC; i++) if ((AObj *)c == a_exc_classes[i].o) {
+            if (i == 0 || i == 1 || i == 31) return ((AClass *)a_exc_classes[12].o)->name;
+            return c->name;
+        }
+    return ((AClass *)a_exc_classes[12].o)->name;
+}
 static AV make_exc(AV cls, AV msg) {
     AV e = new_inst((AClass *)cls.o);
     AInst *s = (AInst *)e.o;
     AV args = a_tuple(1, &msg);
     a_dict_set(s->attrs, a_str("args"), args);
     a_dict_set(s->attrs, a_str("message"), msg);
+    a_dict_set(s->attrs, a_str("kind"), a_obj(exc_kind(s->cls)));
     return e;
 }
 static void print_source_line(int line, int col) {
@@ -602,6 +614,7 @@ static void repr_into(SB *b, AV v, int repr) {
         sb_puts(b, "<__main__."); sb_puts(b, ec->name->s); sb_puts(b, t); return;
     }
     case O_BOUND: sb_puts(b, "<bound method>"); return;
+    case O_GEN: sb_puts(b, "<generator "); sb_puts(b, gen_name(v.o)); sb_puts(b, ">"); return;
     case O_QTY: qty_text(b, (AQty *)v.o, NULL); return;
     default: sb_puts(b, "<object>"); return;
     }
@@ -1112,6 +1125,137 @@ void a_delitem(AV o, AV i) {
     a_error("TypeError", "'%s' object does not support item deletion", tname(o));
 }
 
+
+/* =================================================================== generators: each runs on a stack of its own */
+#ifdef _WIN32
+#include <windows.h>
+#else
+#include <ucontext.h>
+#endif
+typedef struct AGen {
+    AObj h;
+    AFunc *fn; AFnCode body; AV args, kw;     /* what to run */
+    AV value;                                 /* the value yielded (or sent in) */
+    int state;                                /* 0 new, 1 suspended, 2 running, 3 finished */
+    int failed; AV exc;                       /* the body raised: re-raised in the caller */
+    AFrame *top, *base;                       /* the generator's frames while it is suspended */
+    AFrame *caller_frame; AHandler *caller_handler, *handler; int caller_ntmp;
+    struct AGen *outer;
+#ifdef _WIN32
+    void *fiber, *caller_fiber;
+#else
+    ucontext_t ctx, caller; char *stack;
+#endif
+} AGen;
+static AGen *a_cur_gen = NULL;
+static const char *gen_name(AObj *o) { return ((AGen *)o)->fn->name; }
+#define GEN_STACK (512 * 1024)
+
+static void gen_mark(AGen *g) {
+    mark_obj((AObj *)g->fn); mark(g->args); mark(g->kw); mark(g->value); mark(g->exc);
+    if (g->state == 1) for (AFrame *f = g->top; f; f = f->prev) { for (int i = 0; i < f->n; i++) mark(f->slots[i]); if (f == g->base) break; }
+}
+static void gen_free(AGen *g) {
+#ifdef _WIN32
+    if (g->fiber) DeleteFiber(g->fiber);
+#else
+    free(g->stack);
+#endif
+}
+static void gen_switch_out(AGen *g) {         /* from the generator back to its caller */
+#ifdef _WIN32
+    SwitchToFiber(g->caller_fiber);
+#else
+    swapcontext(&g->ctx, &g->caller);
+#endif
+}
+static void gen_run(AGen *g) {
+    AHandler h;
+    g->base = NULL;
+    if (!A_TRY(h)) {
+        AV r = g->body(g->fn, (int)LIST(g->args)->len, LIST(g->args)->v, g->kw.t == T_NONE ? NULL : DICT(g->kw));
+        (void)r;
+        a_handler = h.prev;
+    } else { g->failed = 1; g->exc = a_exc; }
+    g->state = 3;
+    gen_switch_out(g);
+}
+#ifdef _WIN32
+static void __stdcall gen_entry(void *p) { gen_run((AGen *)p); }
+#else
+static AGen *gen_starting;
+static void gen_entry(void) { gen_run(gen_starting); }
+#endif
+AV a_gen_new(AFunc *fn, AFnCode body, int n, AV *args, ADict *kw) {
+    AGen *g = (AGen *)a_alloc(sizeof(AGen), O_GEN);
+    g->fn = fn; g->body = body; g->args = A_NONE; g->kw = A_NONE; g->value = A_NONE; g->exc = A_NONE;
+    int sp = a_ntmp; A_PUSH(a_obj(g));
+    g->args = a_tuple(n, args);
+    if (kw) g->kw = a_obj(kw);
+    a_ntmp = sp;
+    return a_obj(g);
+}
+static int gen_resume(AGen *g, AV send, AV *out) {
+    if (g->state == 3) return 0;
+    if (g->state == 2) a_error("RuntimeError", "generator already running");
+    g->caller_frame = a_frame; g->caller_handler = a_handler; g->caller_ntmp = a_ntmp;
+    g->outer = a_cur_gen; a_cur_gen = g;
+    g->value = send;
+    if (g->state == 0) {
+        g->state = 2;
+        a_handler = NULL;
+#ifdef _WIN32
+        g->caller_fiber = GetCurrentFiber();
+        if (!g->caller_fiber || g->caller_fiber == (void *)0x1E00) g->caller_fiber = ConvertThreadToFiber(NULL);
+        g->fiber = CreateFiber(GEN_STACK, gen_entry, g);
+        SwitchToFiber(g->fiber);
+#else
+        g->stack = (char *)xmalloc(GEN_STACK);
+        getcontext(&g->ctx);
+        g->ctx.uc_stack.ss_sp = g->stack; g->ctx.uc_stack.ss_size = GEN_STACK; g->ctx.uc_link = NULL;
+        gen_starting = g;
+        makecontext(&g->ctx, gen_entry, 0);
+        swapcontext(&g->caller, &g->ctx);
+#endif
+    } else {
+        g->state = 2;
+        g->base->prev = g->caller_frame;          /* the generator's frames sit on its caller's while it runs */
+        a_frame = g->top; a_handler = g->handler;
+#ifdef _WIN32
+        g->caller_fiber = GetCurrentFiber();
+        SwitchToFiber(g->fiber);
+#else
+        swapcontext(&g->caller, &g->ctx);
+#endif
+    }
+    a_cur_gen = g->outer;
+    a_frame = g->caller_frame; a_handler = g->caller_handler; a_ntmp = g->caller_ntmp;
+    if (g->state == 3) {
+        gen_free(g);
+#ifdef _WIN32
+        g->fiber = NULL;
+#else
+        g->stack = NULL;
+#endif
+        if (g->failed) { g->failed = 0; AV e = g->exc; g->exc = A_NONE; a_raise(e); }
+        return 0;
+    }
+    *out = g->value;
+    return 1;
+}
+AV a_yield(AV v) {
+    AGen *g = a_cur_gen;
+    if (!g) a_error("RuntimeError", "yield outside a generator");
+    /* the generator's outermost frame is the one right above its caller's */
+    AFrame *f = a_frame;
+    while (f && f->prev != g->caller_frame) f = f->prev;
+    g->base = f; g->top = a_frame; g->handler = a_handler;
+    g->value = v; g->state = 1;
+    gen_switch_out(g);
+    return g->value;                              /* what the caller sent (none for next()) */
+}
+static AV m_gen_send(int n, AV *a, ADict *kw, AV s) { (void)kw; AV v; if (!gen_resume((AGen *)s.o, n ? a[0] : A_NONE, &v)) a_error("StopIteration", ""); return v; }
+
 /* =================================================================== iteration */
 enum { IT_SEQ = 1, IT_STR, IT_DICT, IT_RANGE, IT_INST, IT_ENUM, IT_ZIP, IT_MAP, IT_FILTER, IT_REV };
 static AV new_iter(int kind, AV src) {
@@ -1130,7 +1274,7 @@ AV a_iter(AV o) {
         ((AIter *)it.o)->pos = r->start; ((AIter *)it.o)->end = r->stop; ((AIter *)it.o)->step = r->step;
         return it;
     }
-    case O_ITER: return o;
+    case O_ITER: case O_GEN: return o;
     case O_INST: {
         AV f = a_getattr(o, "__iter__");
         if (f.t != 255) { AV r = a_call(f, 0, NULL, NULL); if (a_is(r, O_ITER)) return r; AV it = new_iter(IT_INST, r); return it; }
@@ -1141,6 +1285,7 @@ AV a_iter(AV o) {
     a_error("TypeError", "'%s' object is not iterable", tname(o));
 }
 int a_next(AV itv, AV *out) {
+    if (itv.o->kind == O_GEN) return gen_resume((AGen *)itv.o, A_NONE, out);
     AIter *it = (AIter *)itv.o;
     switch (it->kind) {
     case IT_SEQ: { AList *l = LIST(it->src); if (it->pos >= l->len) return 0; *out = l->v[it->pos++]; return 1; }
@@ -1263,6 +1408,7 @@ AV a_call(AV f, int n, AV *args, ADict *kw) {
             AInst *s = (AInst *)self.o;
             a_dict_set(s->attrs, a_str("args"), a_tuple(n, args));
             a_dict_set(s->attrs, a_str("message"), m);
+            a_dict_set(s->attrs, a_str("kind"), a_obj(exc_kind(c)));
             return self;
         }
         /* a struct: its fields in order, by position or by name, defaults from the class */
@@ -1484,6 +1630,7 @@ static AV method_of(AV o, const char *name) {
         M("pop", m_dict_pop); M("setdefault", m_dict_setdefault); M("update", m_dict_update); M("clear", m_list_clear);
         M("copy", m_list_copy);
         break;
+    case O_GEN: M("send", m_gen_send); break;
     case O_SET: M("add", m_set_add); M("discard", m_set_discard); M("remove", m_dict_pop); M("clear", m_list_clear); M("copy", m_list_copy); break;
     default: break;
     }
@@ -1904,6 +2051,17 @@ AV a_global_builtin(const char *name) {
     AV v; v.t = 255; v.i = 0; return v;
 }
 
+static AV exc_init_code(AFunc *f, int n, AV *args, ADict *kw) {
+    (void)f; (void)kw;
+    AInst *s = (AInst *)args[0].o;
+    AV m = n > 1 ? a_to_str(args[1]) : a_str("");
+    int sp = a_ntmp; A_PUSH(m);
+    a_dict_set(s->attrs, a_str("args"), a_tuple(n - 1, args + 1));
+    a_dict_set(s->attrs, a_str("message"), m);
+    a_dict_set(s->attrs, a_str("kind"), a_obj(exc_kind(s->cls)));
+    a_ntmp = sp;
+    return A_NONE;
+}
 void a_init(int argc, char **argv) {
     (void)argc; (void)argv;
     a_exc = A_NONE;
@@ -1911,6 +2069,7 @@ void a_init(int argc, char **argv) {
         AV base = a_exc_base[i] >= 0 ? a_exc_classes[a_exc_base[i]] : A_NONE;
         a_exc_classes[i] = a_class(a_exc_names[i], base, 0, 0, NULL);
     }
+    a_dict_set(((AClass *)a_exc_classes[0].o)->attrs, a_str("__init__"), a_func("BaseException.__init__", exc_init_code, 0, 0));
 }
 
 /* =================================================================== helpers the compiler calls */
