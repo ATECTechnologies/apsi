@@ -1,0 +1,5 @@
+let SCALE = 3
+fn greet(n):
+    return f"hi {n}"
+fn twice(x):
+    return x * SCALE * 2 / 3

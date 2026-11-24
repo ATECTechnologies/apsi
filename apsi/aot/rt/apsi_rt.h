@@ -17,7 +17,7 @@ typedef struct AV {
 
 typedef enum {
     O_STR = 1, O_LIST, O_TUPLE, O_DICT, O_SET, O_FUNC, O_CLASS, O_INST, O_BOUND, O_RANGE, O_ITER, O_CELL, O_BUILTIN,
-    O_SLICE
+    O_SLICE, O_QTY
 } AKind;
 
 typedef struct AObj { struct AObj *gcnext; uint8_t kind, mark; } AObj;
@@ -41,6 +41,12 @@ typedef struct ARange { AObj h; int64_t start, stop, step; } ARange;
 typedef struct ASlice { AObj h; AV lo, hi, step; } ASlice;
 typedef AV (*ABuiltinFn)(int n, AV *args, ADict *kw, AV self);
 typedef struct ABuiltin { AObj h; const char *name; ABuiltinFn fn; AV self; } ABuiltin;
+/* a quantity with a unit: the value in SI base units, the 7 SI exponents (in 60ths), the unit it shows in */
+typedef struct AQty { AObj h; double v; int16_t dim[7]; struct AStr *dtext; double dscale; } AQty;
+typedef struct AUnitName { int16_t dim[7]; const char *name; } AUnitName;
+void a_unit_names(const AUnitName *names, int n);
+AV a_qty(double v, const int16_t *dim, const char *text, double scale);   /* a dimensionless one is a plain float */
+AV a_as_unit(AV v, const int16_t *dim, const char *text, double scale);
 typedef struct AIter { AObj h; int kind; AV src; int64_t pos, end, step; AV aux; } AIter;
 
 /* ------------------------------------------------------------------ values */
@@ -127,7 +133,10 @@ AV a_inplace(int op, AV a, AV b);            /* a op= b: lists and dicts change 
 AV a_range_val(AV start, AV end, int inclusive);
 void a_unpack_star(AV v, int before, int after, AV *out);   /* a, *b, c = v */
 AV a_gundef(const char *name);
-AV a_fmt_spec(AV v, AV spec);           /* o.name, AttributeError if missing */
+AV a_fmt_spec(AV v, AV spec);
+AV a_module(const char *name, int n, const char **names, AV *vals);
+uint64_t a_rand_u64(void); double a_rand_f(void); double a_rand_n(void); void a_seed(uint64_t x);
+extern AV (*a_tensor_random)(int kind, int n, AV *shape, AV lo, AV hi);           /* o.name, AttributeError if missing */
 
 enum { OP_ADD = 1, OP_SUB, OP_MUL, OP_DIV, OP_FLOORDIV, OP_MOD, OP_POW, OP_MATMUL, OP_AND, OP_OR, OP_XOR, OP_SHL, OP_SHR,
        OP_NEG, OP_POS, OP_NOT, OP_INV,

@@ -31,6 +31,40 @@ def _builtin_names():
 
 
 BUILTINS = _builtin_names()
+PRELUDE = os.path.join(os.path.dirname(__file__), "prelude.apsi")
+
+
+def _prelude_names():
+    from ..parser import parse, static_public
+    with open(PRELUDE, encoding="utf-8") as fh:
+        return set(static_public(parse(fh.read()))) - BUILTINS
+
+
+_PRELUDE_NAMES = None
+
+
+def prelude_names():
+    global _PRELUDE_NAMES
+    if _PRELUDE_NAMES is None:
+        _PRELUDE_NAMES = _prelude_names()
+    return _PRELUDE_NAMES
+
+def _same(*names):
+    return {n: n for n in names}
+
+
+# the standard modules the native runtime has: module member -> built-in function
+NATIVE_MODULES = {
+    "math": _same("abs", "acos", "asin", "atan", "atan2", "cbrt", "ceil", "comb", "cos", "cosh", "e", "erf", "erfc",
+                  "exp", "factorial", "floor", "gamma", "inf", "lgamma", "log", "log10", "log2", "nan", "pi",
+                  "round", "sin", "sinh", "sqrt", "tan", "tanh", "tau", "beta", "hypot", "expm1", "log1p"),
+    "random": _same("seed", "rand", "randint", "randn", "permutation"),
+    "io": _same("exists", "read_text", "write_text", "json_parse", "json_str", "load_json", "save_json"),
+    "sys": _same("cpu_threads"),
+    "collections": _same("first", "last", "fold", "scan", "partition", "flat_map", "take_while", "drop_while",
+                         "max_by", "min_by", "sum_by", "frequencies", "distinct_by", "interleave", "zip_longest",
+                         "compose", "partial"),
+}
 
 BINOPS = {"+": "OP_ADD", "-": "OP_SUB", "*": "OP_MUL", "/": "OP_DIV", "//": "OP_FLOORDIV", "%": "OP_MOD",
           "**": "OP_POW", "@": "OP_MATMUL", "&": "OP_AND", "|": "OP_OR", "^": "OP_XOR", "<<": "OP_SHL",
@@ -86,9 +120,10 @@ class Analyzer:
     """Walks the tree once: finds each function's bound and used names, renames comprehension variables apart,
     then works out cells and free variables."""
 
-    def __init__(self):
+    def __init__(self, use_names=None):
         self.scopes = {}
         self.comp_n = 0
+        self.use_names = use_names or (lambda s: [])
 
     def run(self, prog):
         mod = Scope(prog, None, "module")
@@ -243,7 +278,8 @@ class Analyzer:
                     self.bind_pattern(t, sc) if not isinstance(t, A.AST) else self.bind_target(t, sc)
             self.block(s.body, sc)
         elif k == "Use":
-            raise NativeError("modules (use / import) are not supported by the native backend yet", s)
+            for n in self.use_names(s):
+                sc.bind(n)
         else:
             raise NativeError(f"'{k}' is not supported by the native backend yet", s)
 
@@ -449,6 +485,11 @@ class CGen:
         self.fn_n = 0
         self.mod_scope = None
         self.analyzer = None
+        self.mod_id = 0              # which file's globals: 0 the program, 1.. its modules
+        self.base_dir = os.path.dirname(os.path.abspath(filename)) if filename else "."
+        self.local_mods = {}         # path -> (id, init function, public names)
+        self.compiling = set()       # module files being compiled now
+        self.n_mods = 0
 
     # ---- output helpers
     def emit(self, s):
@@ -479,10 +520,101 @@ class CGen:
             self.const_init.append(f"K[{self.consts[key]}] = a_global_builtin({cstr(name)});")
         return f"K[{self.consts[key]}]"
 
-    def gslot(self, name):
-        if name not in self.globals:
-            self.globals[name] = len(self.globals)
-        return self.globals[name]
+    def gslot(self, name, mod=None):
+        key = (self.mod_id if mod is None else mod, name)
+        if key not in self.globals:
+            self.globals[key] = len(self.globals)
+        return self.globals[key]
+
+    # ---- modules
+    def resolve_use(self, s):
+        """('native', module, {name: builtin}) | ('local', path)"""
+        from ..apsil import local_module
+        if s.path in NATIVE_MODULES and not s.py:
+            return ("native", s.path, NATIVE_MODULES[s.path])
+        local = local_module(s.path, self.base_dir)
+        if local is not None:
+            return ("local", local)
+        if s.path in NATIVE_MODULES:
+            return ("native", s.path, NATIVE_MODULES[s.path])
+        raise NativeError(f"module '{s.path}' is not available to the native backend yet "
+                          f"(native modules: {', '.join(sorted(NATIVE_MODULES))}, and the program's own files)", s)
+
+    def use_names(self, s):
+        r = self.resolve_use(s)
+        if s.names is not None:
+            return [a or n for n, a in s.names]
+        if s.alias:
+            return [s.alias]
+        if r[0] == "native":
+            return list(r[2]) + ([s.path] if "." not in s.path else [])
+        from ..parser import parse, static_public
+        with open(r[1], encoding="utf-8-sig") as fh:
+            names = list(static_public(parse(fh.read())))
+        return names + ([s.path] if "." not in s.path and s.path not in names else [])
+
+    def local_module(self, path):
+        if path in self.local_mods:
+            return self.local_mods[path]
+        from ..parser import parse, static_public
+        with open(path, encoding="utf-8-sig") as fh:
+            prog = parse(fh.read())
+        self.n_mods += 1
+        mid = self.n_mods
+        cname = f"mod{mid}_body"
+        pub = list(static_public(prog))
+        self.local_mods[path] = (mid, cname, pub)
+        self.compiling.add(path)
+        saved = (self.fn, self.mod_scope, self.analyzer, self.mod_id, self.base_dir)
+        self.fn = None
+        self.mod_id = mid
+        self.base_dir = os.path.dirname(path)
+        self.analyzer = Analyzer(self.use_names)
+        self.mod_scope = self.analyzer.run(prog)
+        self.function_body(cname, self.mod_scope, f"<module {os.path.basename(path)}>", None, prog.body, None)
+        self.fn, self.mod_scope, self.analyzer, self.mod_id, self.base_dir = saved
+        self.compiling.discard(path)
+        return self.local_mods[path]
+
+    def s_Use(self, s):
+        r = self.resolve_use(s)
+        if r[0] == "native":
+            members = r[2]
+            if s.names is not None:
+                for n, a in s.names:
+                    if n not in members:
+                        raise NativeError(f"module '{s.path}' has no '{n}' natively", s)
+                    self.store(a or n, self.k_builtin(members[n]))
+                return
+            if s.alias or "." not in s.path:
+                mod = self.module_obj(s.path, [(n, self.k_builtin(b)) for n, b in members.items()])
+                self.store(s.alias or s.path, mod)
+                if s.alias:
+                    return
+            for n, b in members.items():
+                self.store(n, self.k_builtin(b))
+            return
+        mid, cname, pub = self.local_module(r[1])
+        self.emit(f"if (!M[{mid}]) {{ M[{mid}] = 1; {cname}(NULL, 0, NULL, NULL); }}")
+        vals = [(n, f"a_gload(G[{self.gslot(n, mid)}], {cstr(n)})") for n in pub]
+        if s.names is not None:
+            for n, a in s.names:
+                self.store(a or n, f"a_gload(G[{self.gslot(n, mid)}], {cstr(n)})")
+            return
+        if s.alias:
+            self.store(s.alias, self.module_obj(s.path, vals))
+            return
+        for n, v in vals:
+            self.store(n, v)
+        if "." not in s.path and s.path not in pub:
+            self.store(s.path, self.module_obj(s.path, vals))
+
+    def module_obj(self, name, items):
+        base = self.block_of([v for _, v in items]) if items else "S[0]"
+        arr = ", ".join(cstr(n) for n, _ in items) or "NULL"
+        t = self.tmp()
+        self.emit(f"{{ static const char *nm[] = {{{arr}}}; {t} = a_module({cstr(name)}, {len(items)}, nm, &{base}); }}")
+        return t
 
     # ---- name access
     def where(self, name):
@@ -500,6 +632,9 @@ class CGen:
             return ("global", self.gslot(name))
         if name in BUILTINS:
             return ("builtin", self.k_builtin(name))
+        if name in prelude_names() and os.path.abspath(PRELUDE) not in self.compiling:
+            mid = self.local_module(os.path.abspath(PRELUDE))[0]
+            return ("prelude", mid, self.gslot(name, mid))
         return ("global", self.gslot(name))      # bound at run time later (or a NameError then)
 
     def load(self, name, node=None):
@@ -512,6 +647,9 @@ class CGen:
             return f"self->cells[{w[1]}]->v"
         if w[0] == "global":
             return f"a_gload(G[{w[1]}], {cstr(name)})"
+        if w[0] == "prelude":
+            self.emit(f"if (!M[{w[1]}]) {{ M[{w[1]}] = 1; mod{w[1]}_body(NULL, 0, NULL, NULL); }}")
+            return f"G[{w[2]}]"
         return w[1]
 
     def store(self, name, val):
@@ -529,12 +667,13 @@ class CGen:
 
     # ---- program
     def program(self, prog):
-        self.analyzer = Analyzer()
+        self.analyzer = Analyzer(self.use_names)
         self.mod_scope = self.analyzer.run(prog)
         main = self.function_body("apsi_main", self.mod_scope, "<module>", None, prog.body, None)
         out = ['#include "apsi_rt.h"', "#include <stdio.h>", ""]
         out.append(f"static AV G[{max(1, len(self.globals))}];")
         out.append(f"static AV K[{max(1, len(self.consts))}];")
+        out.append(f"static char M[{self.n_mods + 1}];")
         for fn in self.fns:
             out.append(f"static AV {fn.cname}(AFunc *self, int n, AV *args, ADict *kw);")
         out.append("")
@@ -545,6 +684,10 @@ class CGen:
         out.append("    a_init(argc, argv);")
         out.append(f"    a_file = {cstr(self.filename)};")
         out.append(f"    a_source = {cstr(self.source)};")
+        from ..units import _DISPLAY_MAP
+        names = [f"{{{self.dim_c(d)}, {cstr(n)}}}" for d, n in _DISPLAY_MAP.items()]
+        out.append(f"    static const AUnitName un[] = {{{', '.join(names)}}};")
+        out.append(f"    a_unit_names(un, {len(names)});")
         out.append(f"    for (int i = 0; i < {max(1, len(self.globals))}; i++) {{ G[i].t = 255; G[i].i = 0; }}")
         out.append(f"    a_root(G, {max(1, len(self.globals))});")
         out.append(f"    a_root(K, {max(1, len(self.consts))});")
@@ -1128,9 +1271,14 @@ class CGen:
         v = e.value
         if e.unit is not None:
             text, scale, dim = e.unit
-            if not getattr(dim, "dimensionless", False):
-                raise NativeError("quantities with units are not supported by the native backend yet", e)
-            return f"a_float({float(v * scale)!r})"
+            if dim.dimensionless:
+                return f"a_float({float(v * scale)!r})"
+            key = ("q", float(v * scale), self.dim_c(dim), text, float(scale))
+            if key not in self.consts:
+                self.consts[key] = len(self.consts)
+                self.const_init.append(f"K[{self.consts[key]}] = a_qty({float(v * scale)!r}, "
+                                       f"(const int16_t[]){self.dim_c(dim)}, {cstr(text)}, {float(scale)!r});")
+            return f"K[{self.consts[key]}]"
         if isinstance(v, bool):
             return f"a_bool({int(v)})"
         if isinstance(v, int):
@@ -1143,6 +1291,21 @@ class CGen:
         if f in (float("inf"), float("-inf")):
             return "a_float(INFINITY)" if f > 0 else "a_float(-INFINITY)"
         return f"a_float({f!r})"
+
+    @staticmethod
+    def dim_c(dim):
+        out = []
+        for x in dim:
+            y = x * 60
+            if y.denominator != 1:
+                raise NativeError("a unit exponent must be a multiple of 1/60 natively")
+            out.append(str(int(y)))
+        return "{" + ", ".join(out) + "}"
+
+    def e_As(self, e):
+        v = self.expr(e.expr)
+        text, scale, dim = e.unit
+        return self.hold(f"a_as_unit({v}, (const int16_t[]){self.dim_c(dim)}, {cstr(text)}, {float(scale)!r})")
 
     def e_Str(self, e):
         return self.k_str(e.value)
@@ -1328,6 +1491,8 @@ class CGen:
         for k, v in e.pairs:
             if k is None or isinstance(k, A.Spread):          # **other
                 src = v if k is None else k.value
+                if isinstance(src, A.Spread):
+                    src = src.value
                 sv = self.expr(src)
                 self.emit(f"a_inplace(OP_OR, {t}, {sv});")
                 continue
@@ -1425,12 +1590,15 @@ class CGen:
             fv = self.hold(f"a_super_attr({self.load(self_name)}, {self.load(cls_name)}, {cstr(f.name)})")
         else:
             fv = self.hold(self.expr(f))
-        spread = any(isinstance(a, A.Spread) for a in e.args) or any(k is None for k, _ in e.kwargs)
+        dspread = [a.value for a in e.args if isinstance(a, A.Spread) and a.double]
+        pargs = [a for a in e.args if not (isinstance(a, A.Spread) and a.double)]
+        spread = any(isinstance(a, A.Spread) for a in pargs) or any(k is None for k, _ in e.kwargs) or dspread
         if spread:
-            lst = self.seq([a for a in e.args], "a_tuple") if e.args else self.hold("a_tuple(0, NULL)")
+            lst = self.seq(pargs, "a_tuple") if pargs else self.hold("a_tuple(0, NULL)")
             kw = "A_NONE"
-            if e.kwargs:
-                kw = self.e_DictLit(A.DictLit([(None if k is None else A.Str(k), v) for k, v in e.kwargs]))
+            if e.kwargs or dspread:
+                pairs = [(None if k is None else A.Str(k), v) for k, v in e.kwargs] + [(None, d) for d in dspread]
+                kw = self.e_DictLit(A.DictLit(pairs))
             return self.hold(f"a_call_spread({fv}, {lst}, {kw})")
         kw = "NULL"
         if e.kwargs:

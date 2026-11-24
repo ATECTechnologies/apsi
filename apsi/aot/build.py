@@ -17,8 +17,30 @@ def find_cc():
     raise NativeError("no C compiler found (clang or gcc); set APSI_CC")
 
 
+class CheckError(NativeError):
+    def __init__(self, err, src, path):
+        super().__init__(str(err))
+        self.err, self.src, self.path = err, src, path
+
+
+def check(src, path):
+    """The checker runs first, as for apsi run: a built program has no check errors."""
+    from ..checker import Checker
+    from ..errors import ApsiError
+    from ..interpreter import Interpreter, CheckFailed
+    from ..parser import parse
+    try:
+        prog = parse(src)
+        errs = Checker(Interpreter(), os.path.dirname(os.path.abspath(path))).check(prog)
+    except ApsiError as e:
+        raise CheckError(e, src, path)
+    if errs:
+        raise CheckError(CheckFailed(errs), src, path)
+
+
 def build(path, out=None, opt="-O2", keep_c=False, target=None):
     src = open(path, encoding="utf-8").read()
+    check(src, path)
     c = compile_c(src, path)
     if out is None:
         out = os.path.splitext(path)[0] + (".exe" if os.name == "nt" or (target or "").endswith("windows-msvc")
@@ -53,6 +75,10 @@ def main(argv=None):
     a = p.parse_args(argv)
     try:
         out = build(a.file, a.out, "-O" + a.opt, a.emit_c, a.target)
+    except CheckError as e:
+        from ..cli import _report
+        _report(e.err, e.src, e.path)
+        return 1
     except NativeError as e:
         print(f"apsi build: {e}", file=sys.stderr)
         return 1

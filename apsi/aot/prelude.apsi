@@ -1,0 +1,316 @@
+# The part of Apsi's standard library written in Apsi itself. The native backend compiles the functions a
+# program uses together with the program; nothing here needs anything but the runtime's built-ins.
+
+fn first(xs, pred=none, default=none):
+    for x in xs:
+        if pred == none or pred(x):
+            return x
+    return default
+
+fn last(xs, pred=none, default=none):
+    var out = default
+    for x in xs:
+        if pred == none or pred(x):
+            out = x
+    return out
+
+fn partition(xs, pred):
+    var yes = []
+    var no = []
+    for x in xs:
+        if pred(x):
+            yes.append(x)
+        else:
+            no.append(x)
+    return (yes, no)
+
+fn take_while(xs, pred):
+    var out = []
+    for x in xs:
+        if not pred(x):
+            break
+        out.append(x)
+    return out
+
+fn drop_while(xs, pred):
+    var out = []
+    var dropping = true
+    for x in xs:
+        if dropping and pred(x):
+            continue
+        dropping = false
+        out.append(x)
+    return out
+
+fn scan(xs, f, init=none):
+    var out = []
+    var acc = init
+    var started = init != none
+    if started:
+        out.append(acc)
+    for x in xs:
+        if not started:
+            acc = x
+            started = true
+        else:
+            acc = f(acc, x)
+        out.append(acc)
+    return out
+
+fn fold(xs, f, init):
+    var acc = init
+    for x in xs:
+        acc = f(acc, x)
+    return acc
+
+fn flat_map(xs, f):
+    var out = []
+    for x in xs:
+        out.extend(f(x))
+    return out
+
+fn zip_longest(*xss, fill=none):
+    var n = 0
+    for xs in xss:
+        n = max(n, len(xs))
+    var out = []
+    for i in 0..n:
+        out.append(tuple([xs[i] if i < len(xs) else fill for xs in xss]))
+    return out
+
+fn interleave(*xss):
+    var n = 0
+    for xs in xss:
+        n = max(n, len(xs))
+    var out = []
+    for i in 0..n:
+        for xs in xss:
+            if i < len(xs):
+                out.append(xs[i])
+    return out
+
+fn distinct_by(xs, key):
+    var seen = set()
+    var out = []
+    for x in xs:
+        let k = key(x)
+        if k not in seen:
+            seen.add(k)
+            out.append(x)
+    return out
+
+fn min_by(xs, key, default=none):
+    let v = list(xs)
+    return min(v, key=key) if len(v) > 0 else default
+
+fn max_by(xs, key, default=none):
+    let v = list(xs)
+    return max(v, key=key) if len(v) > 0 else default
+
+fn sum_by(xs, key):
+    var total = 0
+    for x in xs:
+        total = total + key(x)
+    return total
+
+fn frequencies(xs):
+    var counts = {}
+    for x in xs:
+        counts[x] = counts.get(x, 0) + 1
+    let order = sorted(list(counts.items()), key=fn(kv) => -kv[1])
+    var out = {}
+    for kv in order:
+        out[kv[0]] = kv[1]
+    return out
+
+fn compose(*fs):
+    if len(fs) == 0:
+        raise TypeError("compose() needs at least one function")
+    fn composed(*args, **kwargs):
+        var r = fs[len(fs) - 1](*args, **kwargs)
+        var i = len(fs) - 2
+        while i >= 0:
+            r = fs[i](r)
+            i -= 1
+        return r
+    return composed
+
+fn partial(f, *args, **kwargs):
+    fn bound(*more, **kw):
+        var all_kw = dict(kwargs)
+        all_kw.update(kw)
+        return f(*(list(args) + list(more)), **all_kw)
+    return bound
+
+fn chunks(xs, n):
+    if n < 1:
+        raise ValueError("chunks(): n must be at least 1")
+    let v = list(xs)
+    return [v[i:i + n] for i in range(0, len(v), n)]
+
+fn windows(xs, n):
+    let v = list(xs)
+    return [v[i:i + n] for i in range(0, max(0, len(v) - n + 1))]
+
+fn pairwise(xs):
+    let v = list(xs)
+    return [(v[i], v[i + 1]) for i in range(0, len(v) - 1)]
+
+fn group_by(xs, key):
+    var out = {}
+    for x in xs:
+        let k = key(x)
+        if k not in out:
+            out[k] = []
+        out[k].append(x)
+    return out
+
+fn count_by(xs, key=none):
+    var out = {}
+    for x in xs:
+        let k = key(x) if key != none else x
+        out[k] = out.get(k, 0) + 1
+    return out
+
+fn product(*lists, repeat=1):
+    var pools = []
+    for _ in 0..repeat:
+        for l in lists:
+            pools.append(list(l))
+    var out = [[]]
+    for pool in pools:
+        out = [r + [y] for r in out for y in pool]
+    return [tuple(r) for r in out]
+
+fn combinations(xs, k):
+    let pool = list(xs)
+    let n = len(pool)
+    if k > n:
+        return []
+    var idx = list(range(k))
+    var out = [tuple([pool[i] for i in idx])]
+    while true:
+        var i = k - 1
+        while i >= 0 and idx[i] == i + n - k:
+            i -= 1
+        if i < 0:
+            return out
+        idx[i] += 1
+        for j in i + 1..k:
+            idx[j] = idx[j - 1] + 1
+        out.append(tuple([pool[t] for t in idx]))
+
+fn permutations(xs, k=none):
+    let pool = list(xs)
+    let n = len(pool)
+    let r = n if k == none else k
+    if r > n:
+        return []
+    var out = []
+    fn go(prefix, used):
+        if len(prefix) == r:
+            out.append(tuple([pool[i] for i in prefix]))
+            return
+        for i in 0..n:
+            if not used[i]:
+                used[i] = true
+                go(prefix + [i], used)
+                used[i] = false
+    go([], [false] * n)
+    return out
+
+fn argsort(xs, reverse=false):
+    let v = list(xs)
+    return sorted(list(range(len(v))), key=fn(i) => v[i], reverse=reverse)
+
+fn median(xs):
+    let v = sorted(list(xs))
+    let n = len(v)
+    if n == 0:
+        raise ValueError("no median for empty data")
+    if n % 2 == 1:
+        return v[n // 2]
+    return (v[n // 2 - 1] + v[n // 2]) / 2
+
+fn mode(xs):
+    var counts = {}
+    var best = none
+    var best_n = 0
+    for x in xs:
+        counts[x] = counts.get(x, 0) + 1
+        if counts[x] > best_n:
+            best = x
+            best_n = counts[x]
+    return best
+
+fn clamp(x, lo, hi):
+    return lo if x < lo else (hi if x > hi else x)
+
+fn lerp(a, b, t):
+    return a + (b - a) * t
+
+fn safe_div(a, b, default=0.0):
+    return default if b == 0 else a / b
+
+fn logsumexp(xs):
+    let v = list(xs)
+    var m = max(v)
+    if isnan(m) or m == inf or m == -inf:
+        m = 0.0
+    var s = 0.0
+    for x in v:
+        s += exp(x - m)
+    return log(s) + m
+
+fn keys(d):
+    return list(d.keys())
+
+fn chars(s):
+    return [c for c in s]
+
+fn flatten(xs):
+    var out = []
+    for x in xs:
+        if isinstance(x, list) or isinstance(x, tuple):
+            out.extend(flatten(x))
+        else:
+            out.append(x)
+    return out
+
+fn chain_lists(*xss):
+    var out = []
+    for xs in xss:
+        out.extend(xs)
+    return out
+
+fn unique(xs):
+    var seen = set()
+    var out = []
+    for x in xs:
+        if x not in seen:
+            seen.add(x)
+            out.append(x)
+    return sorted(out)
+
+fn fsum(xs):
+    var s = 0.0
+    var c = 0.0
+    for x in xs:
+        let y = x - c
+        let t = s + y
+        c = (t - s) - y
+        s = t
+    return s
+
+fn approx(a, b, rel=1e-9, abs_tol=0.0):
+    return abs(a - b) <= max(rel * max(abs(a), abs(b)), abs_tol)
+
+fn timeit(f, repeat=5, warmup=1):
+    for _ in 0..warmup:
+        f()
+    var runs = []
+    for _ in 0..repeat:
+        let t = clock()
+        f()
+        runs.append(clock() - t)
+    return {"best": min(runs), "median": median(runs), "mean": sum(runs) / len(runs), "runs": runs}

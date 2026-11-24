@@ -94,6 +94,7 @@ static void mark_obj(AObj *o) {
         case O_BUILTIN: mark(((ABuiltin *)o)->self); return;
         case O_ITER: { AIter *it = (AIter *)o; mark(it->src); mark(it->aux); return; }
         case O_SLICE: { ASlice *s = (ASlice *)o; mark(s->lo); mark(s->hi); mark(s->step); return; }
+        case O_QTY: o = (AObj *)((AQty *)o)->dtext; continue;
         default: return;
         }
     }
@@ -130,6 +131,14 @@ static void a_collect(void) {
 void a_gc_safe(void) { if (a_allocated > a_threshold) a_collect(); }
 
 static _Noreturn void a_key_error(AV k);
+#define QTY(v) ((AQty *)(v).o)
+static int same_dim(const int16_t *a, const int16_t *b);
+static int is_zero_num(AV v);
+struct SB;
+static void qty_text(struct SB *b, AQty *q, const char *spec);
+static AV qty_binop(int op, AV a, AV b);
+static double qty_same(AV a, AV b, const char *verb, int *ok);
+static int num(AV v); static double fval(AV v); static const char *tname(AV v); static const char *opname(int op);
 /* =================================================================== strings */
 static uint64_t fnv(const char *s, int64_t n) {
     uint64_t h = 1469598103934665603ull;
@@ -162,7 +171,7 @@ static int64_t str_off(AStr *s, int64_t i) {
     return s->len;
 }
 
-typedef struct { char *p; int64_t n, cap; } SB;
+typedef struct SB { char *p; int64_t n, cap; } SB;
 static void sb_put(SB *b, const char *s, int64_t n) {
     if (b->n + n + 1 > b->cap) { b->cap = (b->n + n + 1) * 2 + 16; b->p = (char *)xrealloc(b->p, (size_t)b->cap); }
     memcpy(b->p + b->n, s, (size_t)n); b->n += n; b->p[b->n] = 0;
@@ -396,6 +405,10 @@ uint64_t a_hash(AV v) {
 static int num(AV v) { return v.t == T_INT || v.t == T_BOOL || v.t == T_FLOAT; }
 static double fval(AV v) { return v.t == T_FLOAT ? v.f : (double)v.i; }
 int a_eq(AV a, AV b) {
+    if (a_is(a, O_QTY) != a_is(b, O_QTY)) {
+        AV q = a_is(a, O_QTY) ? a : b, o = a_is(a, O_QTY) ? b : a;
+        return is_zero_num(o) && ((AQty *)q.o)->v == 0.0;
+    }
     if (num(a) && num(b)) {
         if (a.t == T_FLOAT || b.t == T_FLOAT) return fval(a) == fval(b);
         return a.i == b.i;
@@ -429,6 +442,7 @@ int a_eq(AV a, AV b) {
         return 0;
     }
     case O_RANGE: { ARange *x = (ARange *)a.o, *y = (ARange *)b.o; return x->start == y->start && x->stop == y->stop && x->step == y->step; }
+    case O_QTY: return same_dim(QTY(a)->dim, QTY(b)->dim) && QTY(a)->v == QTY(b)->v;
     default: return 0;
     }
 }
@@ -444,6 +458,7 @@ int a_truthy(AV v) {
     case O_LIST: case O_TUPLE: return LIST(v)->len != 0;
     case O_DICT: case O_SET: return DICT(v)->len != 0;
     case O_RANGE: return a_len(v) != 0;
+    case O_QTY: return ((AQty *)v.o)->v != 0.0;
     case O_INST: {
         AV f = a_getattr(v, "__bool__");
         if (f.t != 255) return a_truthy(a_call(f, 0, NULL, NULL));
@@ -582,10 +597,12 @@ static void repr_into(SB *b, AV v, int repr) {
             }
             sb_puts(b, ")"); return;
         }
+        if (!strncmp(ec->name->s, "module:", 7)) { sb_puts(b, "<module "); sb_puts(b, ec->name->s + 7); sb_puts(b, ">"); return; }
         snprintf(t, sizeof t, " object at %p>", (void *)v.o);
         sb_puts(b, "<__main__."); sb_puts(b, ec->name->s); sb_puts(b, t); return;
     }
     case O_BOUND: sb_puts(b, "<bound method>"); return;
+    case O_QTY: qty_text(b, (AQty *)v.o, NULL); return;
     default: sb_puts(b, "<object>"); return;
     }
 }
@@ -597,6 +614,7 @@ AV a_repr(AV v) { SB b = {0}; repr_into(&b, v, 1); return sb_done(&b); }
 
 AV a_format(AV v, const char *spec) {
     if (!spec || !*spec) return a_to_str(v);
+    if (a_is(v, O_QTY)) { SB b = {0}; qty_text(&b, (AQty *)v.o, spec); return sb_done(&b); }
     /* [[fill]align][sign][0][width][,][.precision][type] */
     char fill = ' ', align = 0, sign = '-', type = 0; int width = -1, prec = -1, comma = 0, zero = 0;
     const char *p = spec;
@@ -665,6 +683,103 @@ AV a_concat_strs(int n, AV *parts) {
     return sb_done(&b);
 }
 
+
+/* =================================================================== quantities with units */
+static const AUnitName *unit_names; static int n_unit_names;
+void a_unit_names(const AUnitName *names, int n) { unit_names = names; n_unit_names = n; }
+static int dimless(const int16_t *d) { for (int i = 0; i < 7; i++) if (d[i]) return 0; return 1; }
+static int same_dim(const int16_t *a, const int16_t *b) { return !memcmp(a, b, sizeof(int16_t) * 7); }
+AV a_qty(double v, const int16_t *dim, const char *text, double scale) {
+    if (dimless(dim)) return a_float(text ? v / scale : v);
+    AQty *q = (AQty *)a_alloc(sizeof(AQty), O_QTY);
+    q->v = v; memcpy(q->dim, dim, sizeof q->dim);
+    q->dtext = text ? STR(a_str(text)) : NULL; q->dscale = text ? scale : 1.0;
+    return a_obj(q);
+}
+static void exp_str(SB *b, int e) {            /* an exponent in 60ths */
+    char t[32];
+    if (e % 60 == 0) snprintf(t, sizeof t, "%d", e / 60);
+    else { int g = 60, x = e < 0 ? -e : e; while (x) { int r = g % x; g = x; x = r; } snprintf(t, sizeof t, "(%d/%d)", e / g, 60 / g); }
+    sb_puts(b, t);
+}
+static void unit_string(SB *b, const int16_t *d) {
+    for (int i = 0; i < n_unit_names; i++) if (same_dim(unit_names[i].dim, d)) { sb_puts(b, unit_names[i].name); return; }
+    static const char *base[7] = {"m", "kg", "s", "A", "K", "mol", "cd"};
+    int nnum = 0, nden = 0;
+    for (int i = 0; i < 7; i++) { if (d[i] > 0) nnum++; else if (d[i] < 0) nden++; }
+    if (!nnum) sb_puts(b, "1");
+    int k = 0;
+    for (int i = 0; i < 7; i++) if (d[i] > 0) { if (k++) sb_puts(b, "\302\267"); sb_puts(b, base[i]); if (d[i] != 60) { sb_puts(b, "^"); exp_str(b, d[i]); } }
+    if (nden) {
+        sb_puts(b, "/"); if (nden > 1) sb_puts(b, "(");
+        k = 0;
+        for (int i = 0; i < 7; i++) if (d[i] < 0) { if (k++) sb_puts(b, "\302\267"); sb_puts(b, base[i]); if (d[i] != -60) { sb_puts(b, "^"); exp_str(b, -d[i]); } }
+        if (nden > 1) sb_puts(b, ")");
+    }
+}
+static const char *dim_desc(const int16_t *d, char *buf, size_t n) {
+    if (dimless(d)) { snprintf(buf, n, "a dimensionless number"); return buf; }
+    SB b = {0}; unit_string(&b, d); snprintf(buf, n, "[%s]", b.p); free(b.p); return buf;
+}
+static void qty_text(SB *b, AQty *q, const char *spec) {
+    double val = q->dtext ? q->v / q->dscale : q->v;
+    AV s = spec && *spec ? a_format(a_float(val), spec) : a_to_str(a_float(val));
+    sb_put(b, STR(s)->s, STR(s)->len); sb_puts(b, " ");
+    if (q->dtext) sb_put(b, q->dtext->s, q->dtext->len); else unit_string(b, q->dim);
+}
+static int is_zero_num(AV v) { return (v.t == T_INT && v.i == 0) || (v.t == T_FLOAT && v.f == 0.0); }
+static double qty_same(AV a, AV b, const char *verb, int *ok) {   /* b's value when a and b share a's dimension */
+    AQty *q = QTY(a); char x[96], y[96];
+    *ok = 1;
+    if (a_is(b, O_QTY)) {
+        if (!same_dim(q->dim, QTY(b)->dim)) a_error("UnitError", "cannot %s %s and %s", verb, dim_desc(q->dim, x, sizeof x), dim_desc(QTY(b)->dim, y, sizeof y));
+        return QTY(b)->v;
+    }
+    if (is_zero_num(b)) return 0.0;
+    a_error("UnitError", "cannot %s %s and a dimensionless number", verb, dim_desc(q->dim, x, sizeof x));
+}
+static AV qty_binop(int op, AV a, AV b) {
+    int16_t d[7]; int ok;
+    int qa = a_is(a, O_QTY), qb = a_is(b, O_QTY);
+    double x = qa ? QTY(a)->v : (a.t == T_FLOAT ? a.f : (a.t == T_INT || a.t == T_BOOL) ? (double)a.i : NAN);
+    double y = qb ? QTY(b)->v : (b.t == T_FLOAT ? b.f : (b.t == T_INT || b.t == T_BOOL) ? (double)b.i : NAN);
+    if (isnan(x) && !(a.t == T_FLOAT)) a_error("TypeError", "unsupported operand types: '%s' and a quantity", a.t == T_OBJ ? "object" : "none");
+    if (isnan(y) && !(b.t == T_FLOAT)) a_error("TypeError", "unsupported operand types: a quantity and '%s'", b.t == T_OBJ ? "object" : "none");
+    switch (op) {
+    case OP_ADD: case OP_SUB: case OP_MOD: {
+        const char *verb = op == OP_ADD ? "add" : op == OP_SUB ? "subtract" : "take modulo of";
+        const int16_t *dim;
+        if (qa) { y = qty_same(a, b, verb, &ok); dim = QTY(a)->dim; } else { x = qty_same(b, a, verb, &ok); dim = QTY(b)->dim; }
+        double r = op == OP_ADD ? x + y : op == OP_SUB ? x - y : fmod(x, y);
+        if (op == OP_MOD && r != 0 && ((r < 0) != (y < 0))) r += y;
+        return a_qty(r, dim, NULL, 1);
+    }
+    case OP_MUL: case OP_DIV:
+        for (int i = 0; i < 7; i++) d[i] = (int16_t)((qa ? QTY(a)->dim[i] : 0) + (op == OP_MUL ? 1 : -1) * (qb ? QTY(b)->dim[i] : 0));
+        if (op == OP_DIV && y == 0.0) a_error("ZeroDivisionError", "float division by zero");
+        return a_qty(op == OP_MUL ? x * y : x / y, d, NULL, 1);
+    case OP_FLOORDIV: if (qa) y = qty_same(a, b, "floor-divide", &ok); else x = qty_same(b, a, "floor-divide", &ok); return a_float(floor(x / y));
+    case OP_POW: {
+        if (qb) a_error("UnitError", "exponent must be dimensionless");
+        double p = y, e = p * 60.0;
+        if (fabs(e - nearbyint(e)) > 1e-9) a_error("UnitError", "a unit can only be raised to a power in 60ths");
+        for (int i = 0; i < 7; i++) d[i] = (int16_t)nearbyint(QTY(a)->dim[i] * p);
+        return a_qty(pow(x, p), d, NULL, 1);
+    }
+    default: a_error("TypeError", "unsupported operand types for %s with a quantity", opname(op));
+    }
+}
+AV a_as_unit(AV v, const int16_t *dim, const char *text, double scale) {
+    char x[96], y[96];
+    if (a_is(v, O_QTY)) {
+        if (!same_dim(QTY(v)->dim, dim)) a_error("UnitError", "cannot express %s in [%s] (%s)", dim_desc(QTY(v)->dim, x, sizeof x), text, dim_desc(dim, y, sizeof y));
+        return a_qty(QTY(v)->v, dim, text, scale);
+    }
+    if (!num(v)) a_error("TypeError", "cannot convert %s to [%s]", tname(v), text);
+    if (!dimless(dim)) a_error("UnitError", "cannot express a dimensionless number in [%s] (%s)", text, dim_desc(dim, y, sizeof y));
+    return a_float(fval(v) / scale);
+}
+
 /* =================================================================== arithmetic */
 static int64_t floordiv_i(int64_t a, int64_t b) {
     if (b == 0) a_error("ZeroDivisionError", "integer division by zero");
@@ -719,6 +834,7 @@ static const char *tname(AV v) {
     }
 }
 AV a_binop(int op, AV a, AV b) {
+    if (a_is(a, O_QTY) || a_is(b, O_QTY)) return qty_binop(op, a, b);
     if ((a.t == T_INT || a.t == T_BOOL) && (b.t == T_INT || b.t == T_BOOL)) {
         int64_t x = a.i, y = b.i, r;
         switch (op) {
@@ -800,17 +916,23 @@ AV a_unop(int op, AV a) {
     switch (op) {
     case OP_NOT: return a_bool(!a_truthy(a));
     case OP_NEG:
+        if (a_is(a, O_QTY)) return a_qty(-QTY(a)->v, QTY(a)->dim, NULL, 1);
         if (a.t == T_INT || a.t == T_BOOL) { if (a.i == INT64_MIN) a_error("OverflowError", "integer overflow in -"); return a_int(-a.i); }
         if (a.t == T_FLOAT) return a_float(-a.f);
         if (a_is(a, O_INST)) { AV f = a_getattr(a, "__neg__"); if (f.t != 255) return a_call(f, 0, NULL, NULL); }
         break;
-    case OP_POS: if (num(a)) return a.t == T_BOOL ? a_int(a.i) : a; break;
+    case OP_POS: if (a_is(a, O_QTY)) return a; if (num(a)) return a.t == T_BOOL ? a_int(a.i) : a; break;
     case OP_INV: if (a.t == T_INT || a.t == T_BOOL) return a_int(~a.i); break;
     default: break;
     }
     a_error("TypeError", "bad operand type for unary operator: '%s'", tname(a));
 }
 static int cmp_order(AV a, AV b) {   /* <0, 0, >0 */
+    if (a_is(a, O_QTY) || a_is(b, O_QTY)) {
+        int ok; double x, y;
+        if (a_is(a, O_QTY)) { x = QTY(a)->v; y = qty_same(a, b, "compare", &ok); } else { y = QTY(b)->v; x = qty_same(b, a, "compare", &ok); }
+        return x < y ? -1 : x > y;
+    }
     if (num(a) && num(b)) {
         if (a.t != T_FLOAT && b.t != T_FLOAT) return a.i < b.i ? -1 : a.i > b.i;
         double x = fval(a), y = fval(b);
@@ -1433,7 +1555,7 @@ static AV b_dict(int n, AV *a, ADict *kw, AV self) {
     return d;
 }
 static AV b_set(int n, AV *a, ADict *kw, AV self) { (void)kw; (void)self; AV s = a_set(); if (n) { int sp = a_ntmp; A_PUSH(s); AV it = a_iter(a[0]), x; A_PUSH(it); while (a_next(it, &x)) a_dict_set(DICT(s), x, A_NONE); a_ntmp = sp; } return s; }
-static AV b_abs(int n, AV *a, ADict *kw, AV self) { (void)n; (void)kw; (void)self; if (a[0].t == T_FLOAT) return a_float(fabs(a[0].f)); if (a[0].t == T_INT || a[0].t == T_BOOL) return a_int(a[0].i < 0 ? -a[0].i : a[0].i); a_error("TypeError", "abs() of %s", tname(a[0])); }
+static AV b_abs(int n, AV *a, ADict *kw, AV self) { (void)n; (void)kw; (void)self; if (a_is(a[0], O_QTY)) return a_qty(fabs(QTY(a[0])->v), QTY(a[0])->dim, NULL, 1); if (a[0].t == T_FLOAT) return a_float(fabs(a[0].f)); if (a[0].t == T_INT || a[0].t == T_BOOL) return a_int(a[0].i < 0 ? -a[0].i : a[0].i); a_error("TypeError", "abs() of %s", tname(a[0])); }
 static AV minmax(int n, AV *a, ADict *kw, int mx) {
     AV key = kwarg(kw, "key", A_NONE), best = A_NONE, bestk = A_NONE; int have = 0;
     int sp = a_ntmp; AV src = n == 1 ? a_iter(a[0]) : A_NONE; int i = 0; AV x;
@@ -1503,12 +1625,243 @@ static AV b_input(int n, AV *a, ADict *kw, AV self) {
 static AV b_hash(int n, AV *a, ADict *kw, AV self) { (void)n; (void)kw; (void)self; return a_int((int64_t)(a_hash(a[0]) >> 1)); }
 static AV b_divmod(int n, AV *a, ADict *kw, AV self) { (void)n; (void)kw; (void)self; AV p[2] = {a_binop(OP_FLOORDIV, a[0], a[1]), a_binop(OP_MOD, a[0], a[1])}; return a_tuple(2, p); }
 static AV b_pow(int n, AV *a, ADict *kw, AV self) { (void)n; (void)kw; (void)self; return a_binop(OP_POW, a[0], a[1]); }
-#define MATH1(nm, fn) static AV b_##nm(int n, AV *a, ADict *kw, AV self) { (void)n; (void)kw; (void)self; if (!num(a[0])) a_error("TypeError", #nm "() needs a number"); return a_float(fn(fval(a[0]))); }
-static double mysqrt(double x) { if (x < 0) a_error("ValueError", "math domain error: sqrt of %g", x); return sqrt(x); }
+#define MATH1(nm, fn) static AV b_##nm(int n, AV *a, ADict *kw, AV self) { (void)n; (void)kw; (void)self; if (a_is(a[0], O_QTY)) a_error("UnitError", #nm "() needs a dimensionless number"); if (!num(a[0])) a_error("TypeError", #nm "() needs a number"); return a_float(fn(fval(a[0]))); }
+static AV b_sqrt(int n, AV *a, ADict *kw, AV self) {
+    (void)n; (void)kw; (void)self;
+    if (a_is(a[0], O_QTY)) return qty_binop(OP_POW, a[0], a_float(0.5));
+    if (!num(a[0])) a_error("TypeError", "sqrt() needs a number");
+    double x = fval(a[0]); if (x < 0) a_error("ValueError", "math domain error: sqrt of %g", x); return a_float(sqrt(x));
+}
 static double mylog(double x) { if (x <= 0) a_error("ValueError", "math domain error: log of %g", x); return log(x); }
-MATH1(sqrt, mysqrt) MATH1(sin, sin) MATH1(cos, cos) MATH1(tan, tan) MATH1(exp, exp) MATH1(log, mylog)
+MATH1(sin, sin) MATH1(cos, cos) MATH1(tan, tan) MATH1(exp, exp) MATH1(log, mylog)
 MATH1(log10, log10) MATH1(log2, log2) MATH1(atan, atan) MATH1(asin, asin) MATH1(acos, acos) MATH1(tanh, tanh)
 MATH1(sinh, sinh) MATH1(cosh, cosh)
+
+/* ---- more mathematics */
+static AV b_cbrt(int n, AV *a, ADict *kw, AV self) { (void)n; (void)kw; (void)self; if (a_is(a[0], O_QTY)) return qty_binop(OP_POW, a[0], a_float(1.0 / 3.0)); return a_float(cbrt(fval(a[0]))); }
+MATH1(erf, erf) MATH1(erfc, erfc) MATH1(expm1, expm1) MATH1(log1p, log1p) MATH1(lgamma, lgamma)
+static AV b_gamma(int n, AV *a, ADict *kw, AV self) { (void)n; (void)kw; (void)self; return a_float(tgamma(fval(a[0]))); }
+static AV b_beta(int n, AV *a, ADict *kw, AV self) { (void)n; (void)kw; (void)self; double x = fval(a[0]), y = fval(a[1]); return a_float(exp(lgamma(x) + lgamma(y) - lgamma(x + y))); }
+static AV b_factorial(int n, AV *a, ADict *kw, AV self) {
+    (void)n; (void)kw; (void)self;
+    if (a[0].t == T_INT) { if (a[0].i < 0) a_error("ValueError", "factorial() not defined for negative values"); int64_t r = 1; for (int64_t i = 2; i <= a[0].i; i++) if (__builtin_mul_overflow(r, i, &r)) a_error("OverflowError", "factorial(%lld) does not fit in 64 bits", (long long)a[0].i); return a_int(r); }
+    return a_float(tgamma(fval(a[0]) + 1));
+}
+static AV b_comb(int n, AV *a, ADict *kw, AV self) {
+    (void)n; (void)kw; (void)self;
+    if (a[0].t == T_INT && a[1].t == T_INT) {
+        int64_t N = a[0].i, k = a[1].i; if (k < 0 || k > N) return a_int(0); if (k > N - k) k = N - k;
+        __int128 r = 1; for (int64_t i = 1; i <= k; i++) { r = r * (N - k + i) / i; if (r > INT64_MAX) a_error("OverflowError", "comb() does not fit in 64 bits"); }
+        return a_int((int64_t)r);
+    }
+    double N = fval(a[0]), k = fval(a[1]); return a_float(exp(lgamma(N + 1) - lgamma(k + 1) - lgamma(N - k + 1)));
+}
+
+/* ---- random numbers: xoshiro256** */
+static uint64_t rng_s[4] = {0x9E3779B97F4A7C15ull, 0xBF58476D1CE4E5B9ull, 0x94D049BB133111EBull, 0x2545F4914F6CDD1Dull};
+static uint64_t rotl(uint64_t x, int k) { return (x << k) | (x >> (64 - k)); }
+uint64_t a_rand_u64(void) {
+    uint64_t r = rotl(rng_s[1] * 5, 7) * 9, t = rng_s[1] << 17;
+    rng_s[2] ^= rng_s[0]; rng_s[3] ^= rng_s[1]; rng_s[1] ^= rng_s[2]; rng_s[0] ^= rng_s[3]; rng_s[2] ^= t; rng_s[3] = rotl(rng_s[3], 45);
+    return r;
+}
+double a_rand_f(void) { return (double)(a_rand_u64() >> 11) * 0x1.0p-53; }
+double a_rand_n(void) {
+    static int have = 0; static double keep;
+    if (have) { have = 0; return keep; }
+    double u, v, s;
+    do { u = 2 * a_rand_f() - 1; v = 2 * a_rand_f() - 1; s = u * u + v * v; } while (s >= 1 || s == 0);
+    double m = sqrt(-2 * log(s) / s); keep = v * m; have = 1; return u * m;
+}
+void a_seed(uint64_t x) {
+    for (int i = 0; i < 4; i++) { x += 0x9E3779B97F4A7C15ull; uint64_t z = x; z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9ull; z = (z ^ (z >> 27)) * 0x94D049BB133111EBull; rng_s[i] = z ^ (z >> 31); }
+}
+static AV b_seed(int n, AV *a, ADict *kw, AV self) { (void)n; (void)kw; (void)self; a_seed((uint64_t)a[0].i); return A_NONE; }
+AV (*a_tensor_random)(int kind, int n, AV *shape, AV lo, AV hi) = NULL;   /* set by the tensor runtime */
+static AV rand_shaped(int kind, int n, AV *a, AV lo, AV hi) {
+    if (!a_tensor_random) a_error("NotImplementedError", "tensors are not linked into this program");
+    return a_tensor_random(kind, n, a, lo, hi);
+}
+static AV b_rand(int n, AV *a, ADict *kw, AV self) { (void)kw; (void)self; if (n) return rand_shaped(0, n, a, A_NONE, A_NONE); return a_float(a_rand_f()); }
+static AV b_randn(int n, AV *a, ADict *kw, AV self) { (void)kw; (void)self; if (n) return rand_shaped(1, n, a, A_NONE, A_NONE); return a_float(a_rand_n()); }
+static AV b_randint(int n, AV *a, ADict *kw, AV self) {
+    (void)kw; (void)self;
+    if (n > 2) return rand_shaped(2, n - 2, a + 2, a[0], a[1]);
+    int64_t lo = a[0].i, hi = a[1].i; if (hi <= lo) a_error("ValueError", "randint(): high must be above low");
+    return a_int(lo + (int64_t)(a_rand_u64() % (uint64_t)(hi - lo)));
+}
+static AV b_permutation(int n, AV *a, ADict *kw, AV self) {
+    (void)n; (void)kw; (void)self;
+    int64_t m = a[0].i; AList *l = new_list(m, O_LIST);
+    for (int64_t i = 0; i < m; i++) l->v[i] = a_int(i);
+    for (int64_t i = m - 1; i > 0; i--) { int64_t j = (int64_t)(a_rand_u64() % (uint64_t)(i + 1)); AV t = l->v[i]; l->v[i] = l->v[j]; l->v[j] = t; }
+    return a_obj(l);
+}
+
+/* ---- files */
+static AV b_exists(int n, AV *a, ADict *kw, AV self) { (void)n; (void)kw; (void)self; FILE *f = fopen(STR(a_to_str(a[0]))->s, "rb"); if (f) fclose(f); return a_bool(f != NULL); }
+static AV b_read_text(int n, AV *a, ADict *kw, AV self) {
+    (void)n; (void)kw; (void)self;
+    const char *p = STR(a_to_str(a[0]))->s; FILE *f = fopen(p, "rb");
+    if (!f) a_error("FileNotFoundError", "no such file: '%s'", p);
+    SB b = {0}; char buf[65536]; size_t k;
+    while ((k = fread(buf, 1, sizeof buf, f)) > 0) sb_put(&b, buf, (int64_t)k);
+    fclose(f);
+    if (b.n >= 3 && (unsigned char)b.p[0] == 0xEF && (unsigned char)b.p[1] == 0xBB && (unsigned char)b.p[2] == 0xBF) { memmove(b.p, b.p + 3, (size_t)b.n - 2); b.n -= 3; }
+    return sb_done(&b);
+}
+static AV b_write_text(int n, AV *a, ADict *kw, AV self) {
+    (void)n; (void)kw; (void)self;
+    const char *p = STR(a_to_str(a[0]))->s; FILE *f = fopen(p, "wb");
+    if (!f) a_error("OSError", "cannot write '%s'", p);
+    AV s = a_to_str(a[1]); fwrite(STR(s)->s, 1, (size_t)STR(s)->len, f); fclose(f);
+    return A_NONE;
+}
+
+/* ---- JSON */
+static void json_out(SB *b, AV v, int indent, int depth) {
+    char t[64];
+    switch (v.t) {
+    case T_NONE: sb_puts(b, "null"); return;
+    case T_BOOL: sb_puts(b, v.i ? "true" : "false"); return;
+    case T_INT: snprintf(t, sizeof t, "%lld", (long long)v.i); sb_puts(b, t); return;
+    case T_FLOAT: if (isnan(v.f)) sb_puts(b, "NaN"); else if (isinf(v.f)) sb_puts(b, v.f > 0 ? "Infinity" : "-Infinity"); else { float_repr(v.f, t, sizeof t); sb_puts(b, t); } return;
+    default: break;
+    }
+    #define NL() do { if (indent) { sb_puts(b, "\n"); for (int _i = 0; _i < indent * (depth + 1); _i++) sb_puts(b, " "); } } while (0)
+    #define NLEND() do { if (indent) { sb_puts(b, "\n"); for (int _i = 0; _i < indent * depth; _i++) sb_puts(b, " "); } } while (0)
+    switch (v.o->kind) {
+    case O_STR: {
+        AStr *s = STR(v); sb_puts(b, "\"");
+        for (int64_t i = 0; i < s->len; i++) {
+            unsigned char ch = (unsigned char)s->s[i];
+            if (ch == '"') sb_puts(b, "\\\""); else if (ch == '\\') sb_puts(b, "\\\\"); else if (ch == '\n') sb_puts(b, "\\n");
+            else if (ch == '\t') sb_puts(b, "\\t"); else if (ch == '\r') sb_puts(b, "\\r");
+            else if (ch < 0x20) { snprintf(t, sizeof t, "\\u%04x", ch); sb_puts(b, t); }
+            else sb_put(b, (char *)&ch, 1);
+        }
+        sb_puts(b, "\""); return;
+    }
+    case O_LIST: case O_TUPLE: {
+        AList *l = LIST(v); sb_puts(b, "[");
+        if (!l->len) { sb_puts(b, "]"); return; }
+        for (int64_t i = 0; i < l->len; i++) { if (i) sb_puts(b, indent ? "," : ", "); NL(); json_out(b, l->v[i], indent, depth + 1); }
+        NLEND(); sb_puts(b, "]"); return;
+    }
+    case O_DICT: {
+        ADict *d = DICT(v); int first = 1; sb_puts(b, "{");
+        if (!d->len) { sb_puts(b, "}"); return; }
+        for (int64_t i = 0; i < d->nent; i++) {
+            if (!d->e[i].used) continue;
+            if (!first) sb_puts(b, indent ? "," : ", ");
+            first = 0; NL();
+            json_out(b, a_to_str(d->e[i].k), indent, depth + 1); sb_puts(b, ": "); json_out(b, d->e[i].v, indent, depth + 1);
+        }
+        NLEND(); sb_puts(b, "}"); return;
+    }
+    default: a_error("TypeError", "cannot write a %s as JSON", tname(v));
+    }
+    #undef NL
+    #undef NLEND
+}
+typedef struct { const char *p; } JP;
+static void jws(JP *j) { while (*j->p == ' ' || *j->p == '\n' || *j->p == '\t' || *j->p == '\r') j->p++; }
+static AV json_in(JP *j) {
+    jws(j);
+    char c = *j->p;
+    if (c == '{') {
+        j->p++; int sp = a_ntmp; AV d = a_dict(); A_PUSH(d); jws(j);
+        if (*j->p == '}') { j->p++; a_ntmp = sp; return d; }
+        for (;;) {
+            jws(j); AV k = json_in(j); A_PUSH(k); jws(j);
+            if (*j->p++ != ':') a_error("ValueError", "JSON: expected ':'");
+            AV v = json_in(j); a_dict_set(DICT(d), k, v); a_ntmp--;
+            jws(j);
+            if (*j->p == ',') { j->p++; continue; }
+            if (*j->p == '}') { j->p++; break; }
+            a_error("ValueError", "JSON: expected ',' or '}'");
+        }
+        a_ntmp = sp; return d;
+    }
+    if (c == '[') {
+        j->p++; int sp = a_ntmp; AV l = a_list(0, NULL); A_PUSH(l); jws(j);
+        if (*j->p == ']') { j->p++; a_ntmp = sp; return l; }
+        for (;;) {
+            AV v = json_in(j); a_list_append(LIST(l), v); jws(j);
+            if (*j->p == ',') { j->p++; continue; }
+            if (*j->p == ']') { j->p++; break; }
+            a_error("ValueError", "JSON: expected ',' or ']'");
+        }
+        a_ntmp = sp; return l;
+    }
+    if (c == '"') {
+        j->p++; SB b = {0};
+        while (*j->p && *j->p != '"') {
+            if (*j->p == '\\') {
+                j->p++; char e = *j->p++;
+                switch (e) {
+                case 'n': sb_puts(&b, "\n"); break; case 't': sb_puts(&b, "\t"); break; case 'r': sb_puts(&b, "\r"); break;
+                case 'b': sb_puts(&b, "\b"); break; case 'f': sb_puts(&b, "\f"); break;
+                case 'u': {
+                    unsigned cp = (unsigned)strtoul((char[]){j->p[0], j->p[1], j->p[2], j->p[3], 0}, NULL, 16); j->p += 4;
+                    if (cp >= 0xD800 && cp < 0xDC00 && j->p[0] == '\\' && j->p[1] == 'u') { unsigned lo = (unsigned)strtoul((char[]){j->p[2], j->p[3], j->p[4], j->p[5], 0}, NULL, 16); j->p += 6; cp = 0x10000 + ((cp - 0xD800) << 10) + (lo - 0xDC00); }
+                    AV ch = b_chr(1, (AV[]){a_int(cp)}, NULL, A_NONE); sb_put(&b, STR(ch)->s, STR(ch)->len); break;
+                }
+                default: sb_put(&b, &e, 1);
+                }
+            } else sb_put(&b, j->p++, 1);
+        }
+        if (*j->p != '"') a_error("ValueError", "JSON: unterminated string");
+        j->p++; return sb_done(&b);
+    }
+    if (!strncmp(j->p, "true", 4)) { j->p += 4; return a_bool(1); }
+    if (!strncmp(j->p, "false", 5)) { j->p += 5; return a_bool(0); }
+    if (!strncmp(j->p, "null", 4)) { j->p += 4; return A_NONE; }
+    if (!strncmp(j->p, "NaN", 3)) { j->p += 3; return a_float(NAN); }
+    if (!strncmp(j->p, "Infinity", 8)) { j->p += 8; return a_float(INFINITY); }
+    if (!strncmp(j->p, "-Infinity", 9)) { j->p += 9; return a_float(-INFINITY); }
+    char *end; const char *s = j->p; int isf = 0;
+    for (const char *q = s; *q && strchr("+-0123456789.eE", *q); q++) if (*q == '.' || *q == 'e' || *q == 'E') isf = 1;
+    if (isf) { double d = strtod(s, &end); if (end == s) a_error("ValueError", "JSON: bad value"); j->p = end; return a_float(d); }
+    long long i = strtoll(s, &end, 10); if (end == s) a_error("ValueError", "JSON: bad value near '%.10s'", s); j->p = end; return a_int(i);
+}
+static AV b_json_str(int n, AV *a, ADict *kw, AV self) { (void)self; AV ind = kwarg(kw, "indent", n > 1 ? a[1] : A_NONE); SB b = {0}; json_out(&b, a[0], ind.t == T_INT ? (int)ind.i : 0, 0); return sb_done(&b); }
+static AV b_json_parse(int n, AV *a, ADict *kw, AV self) { (void)n; (void)kw; (void)self; JP j = {STR(a_to_str(a[0]))->s}; AV v = json_in(&j); jws(&j); if (*j.p) a_error("ValueError", "JSON: extra data"); return v; }
+static AV b_load_json(int n, AV *a, ADict *kw, AV self) { (void)n; (void)kw; AV t = b_read_text(1, a, NULL, self); int sp = a_ntmp; A_PUSH(t); AV r = b_json_parse(1, &t, NULL, self); a_ntmp = sp; return r; }
+static AV b_save_json(int n, AV *a, ADict *kw, AV self) { (void)n; (void)kw; SB b = {0}; json_out(&b, a[1], 2, 0); AV s = sb_done(&b); AV w[2] = {a[0], s}; return b_write_text(2, w, NULL, self); }
+
+/* ---- the system */
+#ifdef _WIN32
+#include <windows.h>
+static int ncpu(void) { SYSTEM_INFO si; GetSystemInfo(&si); return (int)si.dwNumberOfProcessors; }
+#else
+#include <unistd.h>
+static int ncpu(void) { long n = sysconf(_SC_NPROCESSORS_ONLN); return n > 0 ? (int)n : 1; }
+#endif
+#include <time.h>
+static AV b_cpu_threads(int n, AV *a, ADict *kw, AV self) { (void)n; (void)a; (void)kw; (void)self; return a_int(ncpu()); }
+static AV b_clock(int n, AV *a, ADict *kw, AV self) {
+    (void)n; (void)a; (void)kw; (void)self;
+    struct timespec ts; timespec_get(&ts, TIME_UTC); return a_float((double)ts.tv_sec + ts.tv_nsec * 1e-9);
+}
+static AV b_getenv(int n, AV *a, ADict *kw, AV self) { (void)kw; (void)self; const char *v = getenv(STR(a_to_str(a[0]))->s); return v ? a_str(v) : (n > 1 ? a[1] : A_NONE); }
+static AV b_write_out(int n, AV *a, ADict *kw, AV self) { (void)kw; (void)self; for (int i = 0; i < n; i++) { AV s = a_to_str(a[i]); fwrite(STR(s)->s, 1, (size_t)STR(s)->len, stdout); } return A_NONE; }
+static AV b_write_err(int n, AV *a, ADict *kw, AV self) { (void)kw; (void)self; fflush(stdout); for (int i = 0; i < n; i++) { AV s = a_to_str(a[i]); fwrite(STR(s)->s, 1, (size_t)STR(s)->len, stderr); } return A_NONE; }
+static AV b_flush_out(int n, AV *a, ADict *kw, AV self) { (void)n; (void)a; (void)kw; (void)self; fflush(stdout); return A_NONE; }
+static AV b_isnan(int n, AV *a, ADict *kw, AV self) { (void)n; (void)kw; (void)self; return a_bool(a[0].t == T_FLOAT && isnan(a[0].f)); }
+static AV b_isfinite(int n, AV *a, ADict *kw, AV self) { (void)n; (void)kw; (void)self; return a_bool(a[0].t != T_FLOAT || isfinite(a[0].f)); }
+static AV b_hex(int n, AV *a, ADict *kw, AV self) { (void)n; (void)kw; (void)self; char t[40]; long long v = a[0].i; snprintf(t, sizeof t, "%s0x%llx", v < 0 ? "-" : "", v < 0 ? -v : v); return a_str(t); }
+static AV b_oct(int n, AV *a, ADict *kw, AV self) { (void)n; (void)kw; (void)self; char t[40]; long long v = a[0].i; snprintf(t, sizeof t, "%s0o%llo", v < 0 ? "-" : "", v < 0 ? -v : v); return a_str(t); }
+static AV b_bin(int n, AV *a, ADict *kw, AV self) { (void)n; (void)kw; (void)self; AV s = a_format(a_int(a[0].i < 0 ? -a[0].i : a[0].i), "b"); SB b = {0}; sb_puts(&b, a[0].i < 0 ? "-0b" : "0b"); sb_put(&b, STR(s)->s, STR(s)->len); return sb_done(&b); }
+static AV b_callable(int n, AV *a, ADict *kw, AV self) { (void)n; (void)kw; (void)self; return a_bool(a[0].t == T_OBJ && (a[0].o->kind == O_FUNC || a[0].o->kind == O_BUILTIN || a[0].o->kind == O_BOUND || a[0].o->kind == O_CLASS)); }
+static AV b_getattr(int n, AV *a, ADict *kw, AV self) { (void)kw; (void)self; AV v = a_getattr(a[0], STR(a_to_str(a[1]))->s); if (v.t == 255) { if (n > 2) return a[2]; a_error("AttributeError", "'%s' object has no attribute '%s'", tname(a[0]), STR(a[1])->s); } return v; }
+static AV b_hasattr(int n, AV *a, ADict *kw, AV self) { (void)n; (void)kw; (void)self; return a_bool(a_getattr(a[0], STR(a_to_str(a[1]))->s).t != 255); }
+static AV b_setattr(int n, AV *a, ADict *kw, AV self) { (void)n; (void)kw; (void)self; a_setattr(a[0], STR(a_to_str(a[1]))->s, a[2]); return A_NONE; }
+static AV b_iter(int n, AV *a, ADict *kw, AV self) { (void)n; (void)kw; (void)self; return a_iter(a[0]); }
+static AV b_next(int n, AV *a, ADict *kw, AV self) { (void)kw; (void)self; AV v; if (a_next(a[0], &v)) return v; if (n > 1) return a[1]; a_error("StopIteration", ""); }
+static AV b_set_recursion_limit(int n, AV *a, ADict *kw, AV self) { (void)n; (void)a; (void)kw; (void)self; return A_NONE; }
+static AV b_error(int n, AV *a, ADict *kw, AV self) { (void)kw; (void)self; a_raise(n ? a_to_str(a[0]) : a_str("error")); }
+
 static AV b_floor(int n, AV *a, ADict *kw, AV self) { (void)n; (void)kw; (void)self; if (a[0].t == T_INT) return a[0]; return a_int((int64_t)floor(fval(a[0]))); }
 static AV b_ceil(int n, AV *a, ADict *kw, AV self) { (void)n; (void)kw; (void)self; if (a[0].t == T_INT) return a[0]; return a_int((int64_t)ceil(fval(a[0]))); }
 static AV b_atan2(int n, AV *a, ADict *kw, AV self) { (void)n; (void)kw; (void)self; return a_float(atan2(fval(a[0]), fval(a[1]))); }
@@ -1526,6 +1879,16 @@ static const BEnt a_builtins[] = {
     {"cos", b_cos}, {"tan", b_tan}, {"exp", b_exp}, {"log", b_log}, {"log10", b_log10}, {"log2", b_log2},
     {"atan", b_atan}, {"asin", b_asin}, {"acos", b_acos}, {"tanh", b_tanh}, {"sinh", b_sinh}, {"cosh", b_cosh},
     {"floor", b_floor}, {"ceil", b_ceil}, {"atan2", b_atan2}, {"hypot", b_hypot}, {"exit", b_exit},
+    {"cbrt", b_cbrt}, {"erf", b_erf}, {"erfc", b_erfc}, {"expm1", b_expm1}, {"log1p", b_log1p}, {"lgamma", b_lgamma},
+    {"gamma", b_gamma}, {"beta", b_beta}, {"factorial", b_factorial}, {"comb", b_comb}, {"seed", b_seed},
+    {"rand", b_rand}, {"randn", b_randn}, {"randint", b_randint}, {"permutation", b_permutation},
+    {"exists", b_exists}, {"read_text", b_read_text}, {"write_text", b_write_text}, {"json_str", b_json_str},
+    {"json_parse", b_json_parse}, {"load_json", b_load_json}, {"save_json", b_save_json},
+    {"cpu_threads", b_cpu_threads}, {"clock", b_clock}, {"getenv", b_getenv}, {"write_out", b_write_out},
+    {"write_err", b_write_err}, {"flush_out", b_flush_out}, {"isnan", b_isnan}, {"isfinite", b_isfinite},
+    {"hex", b_hex}, {"oct", b_oct}, {"bin", b_bin}, {"callable", b_callable}, {"getattr", b_getattr},
+    {"hasattr", b_hasattr}, {"setattr", b_setattr}, {"iter", b_iter}, {"next", b_next},
+    {"set_recursion_limit", b_set_recursion_limit}, {"error", b_error},
     {NULL, NULL}};
 
 AV a_global_builtin(const char *name) {
@@ -1533,6 +1896,7 @@ AV a_global_builtin(const char *name) {
     if (!strcmp(name, "Error")) return a_exc_classes[31];
     if (!strcmp(name, "IOError") || !strcmp(name, "EnvironmentError")) return a_exc_classes[17];
     if (!strcmp(name, "pi")) return a_float(3.141592653589793);
+    if (!strcmp(name, "tau")) return a_float(6.283185307179586);
     if (!strcmp(name, "e")) return a_float(2.718281828459045);
     if (!strcmp(name, "inf")) return a_float(INFINITY);
     if (!strcmp(name, "nan")) return a_float(NAN);
@@ -1594,3 +1958,11 @@ void a_unpack_star(AV v, int before, int after, AV *out) {
 }
 AV a_gundef(const char *name) { a_error("NameError", "name '%s' is not defined", name); }
 AV a_fmt_spec(AV v, AV spec) { return a_format(v, STR(a_to_str(spec))->s); }
+
+AV a_module(const char *name, int n, const char **names, AV *vals) {
+    char t[256]; snprintf(t, sizeof t, "module:%s", name);
+    AV cls = a_class(t, A_NONE, 0, 0, NULL); int sp = a_ntmp; A_PUSH(cls);
+    AV m = new_inst((AClass *)cls.o);
+    for (int i = 0; i < n; i++) a_dict_set(((AInst *)m.o)->attrs, a_str(names[i]), vals[i]);
+    a_ntmp = sp; return m;
+}

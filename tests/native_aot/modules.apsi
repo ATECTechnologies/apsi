@@ -1,0 +1,12 @@
+use math
+use mylib
+use mylib as ml
+print(factorial(10), math.pi, comb(10, 3), gamma(5.0), math.sqrt(2.0))
+print(greet("x"), ml.SCALE, twice(4))
+print(chunks([1,2,3,4,5], 2), pairwise([1,2,3]), group_by([1,2,3,4], fn(x) => x % 2), count_by("abca"))
+print(fold([1,2,3], fn(a, x) => a + x, 0), scan([1,2,3], fn(a, x) => a * x), combinations([1,2,3], 2), permutations("ab"))
+print(median([3,1,2]), clamp(5, 0, 3), argsort([3,1,2]), product([1,2], "ab"), frequencies("aabbbc"))
+print(json_str({"a": [1, 2.5, none, true], "b": "x\"y"}), json_parse("{\"k\": [1, 2.0, \"s\"]}"))
+let add = fn(a, b) => a + b
+let inc = partial(add, 1)
+print(inc(41), compose(fn(x) => x * 2, fn(x) => x + 1)(3), ml)
