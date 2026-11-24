@@ -7,7 +7,7 @@ Apsi has two ways to turn a program into machine code:
 - **`@native` functions** inside `apsi run`: single numeric functions compiled with LLVM while the rest of the
   program runs on the Python host.
 
-## Native programs: `apsi build --native`
+## Native programs
 
 ```bash
 apsi build --native app.apsi             # -> app.exe (Windows) / app (Linux, macOS)

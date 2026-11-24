@@ -8,7 +8,7 @@ This page covers the problems people most often hit right after installing Apsi,
 - [A function prints "runs on the bytecode engine"](#a-function-prints-runs-on-the-bytecode-engine)
 - [`Apsi 2.6.2 needs Python 3.12 or newer`](#apsi-262-needs-python-312-or-newer)
 - [A converted PyTorch program reports notes](#a-converted-pytorch-program-reports-notes)
-- [GPU: no card found, slow answers, out of memory, a hot card, training and serving](GPU.md#6-troubleshooting)
+- [GPU: no card found, slow answers, out of memory, a hot card, training and serving](GPU.md#7-troubleshooting)
 
 ---
 
@@ -215,5 +215,5 @@ started an older Python.
 
 `apsi convert` turns PyTorch programs into native Apsi and lists, with line numbers, the few things it cannot
 translate exactly (for example learning-rate schedulers or `nn.MultiheadAttention`). The rest of the program is
-complete and runs without Python. Review the listed lines; [`PYTHON.md`](PYTHON.md#pytorch-programs--native-apsi)
+complete and runs without Python. Review the listed lines; [`PYTHON.md`](PYTHON.md#--idiomatic-pytorch-programs--native-apsi-no-python-no-pytorch)
 explains each one.

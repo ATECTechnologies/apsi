@@ -69,7 +69,7 @@ compiler is used. Linux and macOS use the system's `clang` or `gcc`.
 **Tested against `apsi run`.** Every native test program must print exactly what `apsi run` prints, gradients are
 checked against numerical derivatives, and the runtime runs clean under AddressSanitizer and UBSan.
 
-See [Native programs](NATIVE.md#native-programs-apsi-build---native) for the details.
+See [Native programs](NATIVE.md#native-programs) for the details.
 
 ## C and C++ next to Apsi
 

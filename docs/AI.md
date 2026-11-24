@@ -188,7 +188,7 @@ let hf_weights = load_safetensors("model.safetensors", dtype=int8)   # no extra 
 Existing PyTorch/numpy code can be translated with `apsi convert model.py`: `nn.Module` models, losses,
 optimizers, data loaders and training loops become native Apsi that runs without Python or PyTorch, with the same
 outputs and gradients as PyTorch for the same weights. `load_torch_weights(model, params, state_dict)` imports
-pretrained weights (see [`PYTHON.md`](PYTHON.md#pytorch-programs--native-apsi)).
+pretrained weights (see [`PYTHON.md`](PYTHON.md#--idiomatic-pytorch-programs--native-apsi-no-python-no-pytorch)).
 Any other Python library: `pyimport("module")`, then `to_torch` / `from_torch` to move tensors back and forth
 (after `use layers`, `torch_module(model, params)` turns a whole Apsi model into a `torch.nn.Module`).
 `apsi pkg install ai` installs ONNX Runtime, PyTorch and Transformers into Apsi's own runtime.

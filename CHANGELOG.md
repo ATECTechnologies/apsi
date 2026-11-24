@@ -1,6 +1,6 @@
 # Changelog
 
-## 2.6.6 — in development
+## 2.6.6 — a new architecture: native programs with Apsi's own runtime, C and C++ next to Apsi, Python habits that just work
 
 ### A new architecture: native programs
 - **`apsi build --native`:** a program compiled to C and machine code with Apsi's own runtime (values, collector,

@@ -74,7 +74,7 @@ apsi build --native mandel.apsi     # -> mandel.exe on Windows, mandel on Linux 
 ```
 
 On Windows the C toolchain comes with Apsi, so there is nothing to install. See
-[Native programs](NATIVE.md#native-programs-apsi-build---native).
+[Native programs](NATIVE.md#native-programs).
 
 ## 4. Train a model
 
