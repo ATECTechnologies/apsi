@@ -2220,6 +2220,7 @@ static AV b_iter(int n, AV *a, ADict *kw, AV self) { (void)n; (void)kw; (void)se
 static AV b_next(int n, AV *a, ADict *kw, AV self) { (void)kw; (void)self; AV v; if (a_next(a[0], &v)) return v; if (n > 1) return a[1]; a_error("StopIteration", ""); }
 static AV b_set_recursion_limit(int n, AV *a, ADict *kw, AV self) { (void)n; (void)a; (void)kw; (void)self; return A_NONE; }
 static AV b_identity(int n, AV *a, ADict *kw, AV self) { (void)kw; (void)self; if (n == 1 && !kw) return a[0]; return a_builtin("decorator", b_identity, A_NONE); }
+static AV b_cload_dyn(int n, AV *a, ADict *kw, AV self) { (void)n; (void)kw; (void)self; return a_cload(STR(a_to_str(a[0]))->s); }
 static AV b_si_magnitude(int n, AV *a, ADict *kw, AV self) { (void)n; (void)kw; (void)self; return qval(a[0]); }
 static AV b_to_plain(int n, AV *a, ADict *kw, AV self) {     /* a dimensionless value (or a quantity's SI magnitude) as a number */
     (void)n; (void)kw; (void)self; AV v = qval(a[0]);
@@ -2274,6 +2275,9 @@ AV a_global_builtin(const char *name) {
         {"f16", "float32"}, {"fp16", "float32"}, {"bf16", "float32"}, {"i64", "int64"}, {"i32", "int64"}, {"int8", "int64"},
         {"uint8", "int64"}, {"int4", "int64"}};
     for (size_t i = 0; i < sizeof dtypes / sizeof *dtypes; i++) if (!strcmp(name, dtypes[i][0])) return a_str(dtypes[i][1]);
+    static const char *ctypes_[] = {"ptr_f64", "ptr_f32", "ptr_i64", "ptr_i32", "ptr_u8", "ptr_void", "void", "cstr", "u8", "u16", "u32", "u64", "i8", "i16"};
+    for (size_t i = 0; i < sizeof ctypes_ / sizeof *ctypes_; i++) if (!strcmp(name, ctypes_[i])) return a_str(ctypes_[i]);
+    if (!strcmp(name, "cload")) return a_builtin("cload", b_cload_dyn, A_NONE);
     if (!strcmp(name, "e")) return a_float(2.718281828459045);
     if (!strcmp(name, "inf")) return a_float(INFINITY);
     if (!strcmp(name, "nan")) return a_float(NAN);
@@ -2382,3 +2386,43 @@ AV a_match_field(AV v, int i) {        /* the i-th positional field: a struct's 
     a_error("TypeError", "%s has no positional field %d", c->name->s, i);
 }
 AV a_list_of(AV v) { if (a_is(v, O_LIST)) return v; AV l = a_list(0, NULL); int sp = a_ntmp; A_PUSH(l); AV it = a_iter(v), x; A_PUSH(it); while (a_next(it, &x)) a_list_append(LIST(l), x); a_ntmp = sp; return l; }
+
+/* ---- C libraries: cload() and the values that cross into C */
+#ifdef _WIN32
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <windows.h>
+#else
+#include <dlfcn.h>
+#endif
+AV a_cload(const char *path) {          /* NULL: the C sources built into this program */
+    void *h;
+#ifdef _WIN32
+    h = path ? (void *)LoadLibraryA(path) : (void *)GetModuleHandleA(NULL);
+#else
+    h = dlopen(path, RTLD_NOW | RTLD_GLOBAL);
+#endif
+    if (!h) a_error("OSError", "cannot load C library '%s'", path ? path : "(this program)");
+    static AV cls; static int made = 0;
+    if (!made) { cls = a_class("CLibrary", A_NONE, 0, 0, NULL); a_root(&cls, 1); made = 1; }
+    AV lib = a_call(cls, 0, NULL, NULL);
+    int sp = a_ntmp; A_PUSH(lib);
+    a_dict_set(((AInst *)lib.o)->attrs, a_str("handle"), a_int((int64_t)(intptr_t)h));
+    a_dict_set(((AInst *)lib.o)->attrs, a_str("path"), a_str(path ? path : "(this program)"));
+    a_ntmp = sp; return lib;
+}
+void *a_csym(AV lib, const char *name) {
+    AV h = a_attr(lib, "handle");
+    void *f;
+#ifdef _WIN32
+    f = (void *)GetProcAddress((HMODULE)(intptr_t)h.i, name);
+#else
+    f = dlsym((void *)(intptr_t)h.i, name);
+#endif
+    if (!f) a_error("AttributeError", "C function '%s' not found in %s", name, STR(a_attr(lib, "path"))->s);
+    return f;
+}
+double a_c_f64(AV v) { if (v.t == T_FLOAT) return v.f; if (v.t == T_INT || v.t == T_BOOL) return (double)v.i; if (a_is(v, O_QTY)) a_error("TypeError", "a quantity goes to C as x.magnitude (choose the unit)"); return a_tensor_float(v); }
+int64_t a_c_i64(AV v) { if (v.t == T_INT || v.t == T_BOOL) return v.i; if (v.t == T_FLOAT) return (int64_t)v.f; a_error("TypeError", "a C integer needs a whole number"); }
+const char *a_c_str(AV v) { if (v.t == T_NONE) return NULL; return STR(a_to_str(v))->s; }

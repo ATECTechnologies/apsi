@@ -36,3 +36,15 @@ def test_gpu_kernels_emulated(tmp_path, monkeypatch):
     assert lines[0] == "true" and lines[1].startswith("gpu [[6., 6.],")
     assert lines[-1] == "true"
     assert lines[-2].startswith("0.0002282") and lines[-2].endswith("gpu")
+
+
+@pytest.mark.skipif(CC is None, reason="no C compiler")
+def test_c_and_cpp_sources(tmp_path):
+    """cload("x.c") / cload("y.cpp"): built into a native program, and built once for apsi run."""
+    from apsi.aot.build import build
+    prog = os.path.join(HERE, "native_ffi", "app.apsi")
+    exe = build(prog, str(tmp_path / "app"))
+    want = subprocess.run([sys.executable, "-m", "apsi", "run", prog, "--allow-ffi"], capture_output=True, text=True,
+                          cwd=os.path.dirname(HERE))
+    got = subprocess.run([exe], capture_output=True, text=True)
+    assert got.stdout == want.stdout == "32.0\n[10., 20., 30.]\n5\n3.0\n5.0\n"

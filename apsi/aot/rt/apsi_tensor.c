@@ -2173,3 +2173,16 @@ void a_tensor_mark(AObj *o) {
 }
 void a_tensor_free(AObj *o) { if (o->kind == O_TENSOR) tfree(o); }
 void a_tensor_init(void) { a_tensor_random = t_random; (void)tmark; }
+
+/* ---- C functions: a tensor's buffer handed to C without a copy (C may write into it) */
+void *a_tensor_ptr(AV v, int kind, const char *what) {
+    /* kind: 0 f64, 1 f32, 2 i64, 3 i32, 4 u8 / void (any) */
+    if (a_is(v, O_STR) && kind == 4) return ((AStr *)v.o)->s;
+    if (!is_t(v)) a_error("TypeError", "%s takes a tensor", what);
+    ATensor *t = TT(v);
+    if (t->dev) a_error("TypeError", "%s: this tensor is on the GPU; to_host() it first", what);
+    int want = kind == 0 ? DT_F64 : kind == 1 ? DT_F32 : kind == 2 ? DT_I64 : -1;
+    if (kind == 3) a_error("TypeError", "%s: int32 tensors are not available natively; use ptr_i64", what);
+    if (want >= 0 && t->dt != want) a_error("TypeError", "%s needs a %s tensor, not %s", what, dt_name[want], dt_name[t->dt]);
+    return t->p;
+}

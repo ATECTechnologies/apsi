@@ -298,6 +298,13 @@ def install(interp):
 
     def cload(path):
         _need(interp, "ffi", f"cload(\"{path}\")")
+        from .aot.csource import is_source, compile_shared
+        if is_source(path):                    # a C / C++ source file: built once with Apsi's toolchain
+            src = path if os.path.isabs(path) else os.path.join(interp.dir_stack[-1], path)
+            try:
+                return CLibrary(compile_shared(src))
+            except (OSError, RuntimeError) as e:
+                raise RuntimeErr(f"cannot build '{path}': {e}")
         found = resolve_library(path, interp.dir_stack[-1])
         from .guard import check_native
         found = check_native(interp.policy, found) if os.path.exists(found) else found

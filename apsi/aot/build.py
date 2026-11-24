@@ -42,7 +42,8 @@ def check(src, path):
 def build(path, out=None, opt="-O3", keep_c=False, target=None):
     src = open(path, encoding="utf-8").read()
     check(src, path)
-    c = compile_c(src, path)
+    extra = []
+    c = compile_c(src, path, extra)
     if out is None:
         out = os.path.splitext(path)[0] + (".exe" if os.name == "nt" or (target or "").endswith("windows-msvc")
                                            else "")
@@ -69,6 +70,32 @@ def build(path, out=None, opt="-O3", keep_c=False, target=None):
         cmd += ["-lm", "-lpthread", "-ldl"]
     elif "msvc" not in (target or "") and not cc.lower().endswith("cl.exe"):
         cmd += ["-static", "-lm"]               # MinGW: one file with nothing to install beside it
+    if extra:                                   # C / C++ files the program cload()s: built into it, symbols exported
+        from .csource import CXX_SUFFIXES, cxx_of
+        objs, any_cxx = [], False
+        for i, f in enumerate(extra):
+            if f.lower().endswith(CXX_SUFFIXES):
+                any_cxx = True
+                o = os.path.join(work, f"cxx{i}.o")
+                rc = subprocess.run([cxx_of(cc), opt, "-std=c++17", "-I", os.path.dirname(f), "-c", f, "-o", o]
+                                    + (["-fPIC"] if os.name != "nt" else []), capture_output=True, text=True)
+                if rc.returncode != 0:
+                    shutil.rmtree(work, ignore_errors=True)
+                    raise NativeError(f"compiling {os.path.basename(f)} failed:\n" + rc.stderr[-3000:])
+                objs.append(o)
+            else:
+                cmd.insert(cmd.index("-o"), f)
+        if any_cxx:
+            cmd[0] = cxx_of(cc)
+            first = cmd.index(cfile)
+            cmd[first:first] = ["-x", "c"]
+            cmd.insert(cmd.index("-o"), "-x")
+            cmd.insert(cmd.index("-o"), "none")
+            cmd[cmd.index("-std=gnu11")] = "-std=gnu11"
+        for o in objs:
+            cmd.insert(cmd.index("-o"), o)
+        windows_t = os.name == "nt" or "windows" in (target or "") or "mingw" in (target or "")
+        cmd += ["-Wl,--export-all-symbols"] if windows_t else (["-rdynamic"] if sys.platform != "darwin" else [])
     r = subprocess.run(cmd, capture_output=True, text=True)
     shutil.rmtree(work, ignore_errors=True)
     if r.returncode != 0:

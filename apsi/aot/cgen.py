@@ -29,7 +29,8 @@ def _builtin_names():
     names |= set(re.findall(r'\{"([A-Za-z_0-9]+)", tb_[A-Za-z_0-9]+\}', tsrc))
     exc = re.search(r"a_exc_names\[A_NEXC\] = \{(.*?)\};", src, re.S).group(1)
     names |= set(re.findall(r'"([A-Za-z]+)"', exc))
-    return names | {"pi", "e", "inf", "nan", "Error", "IOError", "EnvironmentError", "f64", "fp64", "f32", "fp32",
+    return names | {"cload", "ptr_f64", "ptr_f32", "ptr_i64", "ptr_i32", "ptr_u8", "ptr_void", "void", "cstr", "u8",
+                    "u16", "u32", "u64", "i8", "i16"} | {"pi", "e", "inf", "nan", "Error", "IOError", "EnvironmentError", "f64", "fp64", "f32", "fp32",
                     "f16", "fp16", "bf16", "i64", "i32", "int8", "uint8", "int4"}
 
 
@@ -67,6 +68,23 @@ NATIVE_MODULES = {
     "collections": _same("first", "last", "fold", "scan", "partition", "flat_map", "take_while", "drop_while",
                          "max_by", "min_by", "sum_by", "frequencies", "distinct_by", "interleave", "zip_longest",
                          "compose", "partial"),
+}
+
+# C types in cload(...).fn(name, [types], result): C spelling, AV -> C, C -> AV
+FFI = {
+    "f64": ("double", "a_c_f64({})", "a_float({})"), "f32": ("float", "(float)a_c_f64({})", "a_float({})"),
+    "i64": ("int64_t", "a_c_i64({})", "a_int({})"), "i32": ("int32_t", "(int32_t)a_c_i64({})", "a_int({})"),
+    "i16": ("int16_t", "(int16_t)a_c_i64({})", "a_int({})"), "i8": ("int8_t", "(int8_t)a_c_i64({})", "a_int({})"),
+    "u64": ("uint64_t", "(uint64_t)a_c_i64({})", "a_int((int64_t){})"), "u32": ("uint32_t", "(uint32_t)a_c_i64({})", "a_int({})"),
+    "u16": ("uint16_t", "(uint16_t)a_c_i64({})", "a_int({})"), "u8": ("uint8_t", "(uint8_t)a_c_i64({})", "a_int({})"),
+    "cstr": ("const char *", "a_c_str({})", "a_str({0} ? {0} : \"\")"), "str": ("const char *", "a_c_str({})", "a_str({0} ? {0} : \"\")"),
+    "ptr_f64": ("double *", "(double *)a_tensor_ptr({}, 0, \"ptr_f64\")", None),
+    "ptr_f32": ("float *", "(float *)a_tensor_ptr({}, 1, \"ptr_f32\")", None),
+    "ptr_i64": ("int64_t *", "(int64_t *)a_tensor_ptr({}, 2, \"ptr_i64\")", None),
+    "ptr_i32": ("int32_t *", "(int32_t *)a_tensor_ptr({}, 3, \"ptr_i32\")", None),
+    "ptr_u8": ("uint8_t *", "(uint8_t *)a_tensor_ptr({}, 4, \"ptr_u8\")", None),
+    "ptr_void": ("void *", "a_tensor_ptr({}, 4, \"ptr_void\")", None),
+    "void": ("void", None, None),
 }
 
 BINOPS = {"+": "OP_ADD", "-": "OP_SUB", "*": "OP_MUL", "/": "OP_DIV", "//": "OP_FLOORDIV", "%": "OP_MOD",
@@ -615,6 +633,8 @@ class CGen:
         self.base_dir = os.path.dirname(os.path.abspath(filename)) if filename else "."
         self.local_mods = {}         # path -> (id, init function, public names)
         self.compiling = set()       # module files being compiled now
+        self.c_sources = []          # C / C++ files cload() builds into the program
+        self.thunks = []             # C code: one caller per C function signature
         self.n_mods = 0
 
     # ---- output helpers
@@ -805,6 +825,8 @@ class CGen:
         out.append(f"static char M[{self.n_mods + 1}];")
         for fn in self.fns:
             out.append(f"static AV {fn.cname}(AFunc *self, int n, AV *args, ADict *kw);")
+        out.append("#include <stdint.h>")
+        out.extend(self.thunks)
         out.append("")
         for fn in self.fns:
             out.extend(fn.text)
@@ -1877,8 +1899,47 @@ class CGen:
     def e_Slice(self, e):
         return self.index(e)
 
+    def ffi_types(self, node):
+        return isinstance(node, A.Name) and node.id in FFI and self.where(node.id)[0] in ("builtin", "global") \
+            and node.id not in self.mod_scope.bound
+
     def e_Call(self, e):
         f = e.func
+        # cload("file.c"): a C / C++ source next to the program is compiled into it
+        if isinstance(f, A.Name) and f.id == "cload" and "cload" not in self.mod_scope.bound and len(e.args) == 1 \
+                and isinstance(e.args[0], A.Str):
+            from .csource import is_source
+            path = e.args[0].value
+            if is_source(path):
+                full = path if os.path.isabs(path) else os.path.join(self.base_dir, path)
+                if not os.path.isfile(full):
+                    raise NativeError(f"cload: no such C/C++ file '{path}'", e)
+                if full not in self.c_sources:
+                    self.c_sources.append(os.path.abspath(full))
+                return self.hold("a_cload(NULL)")
+            return self.hold(f"a_cload({cstr(path)})")
+        # lib.fn("name", [types], result): a typed C caller made at compile time (the C compiler gets the ABI right)
+        if isinstance(f, A.Attr) and f.name == "fn" and len(e.args) >= 2 and isinstance(e.args[0], A.Str) and \
+                isinstance(e.args[1], A.ListLit) and all(self.ffi_types(x) for x in e.args[1].items) and \
+                (len(e.args) < 3 or self.ffi_types(e.args[2])):
+            argt = [x.id for x in e.args[1].items]
+            rett = e.args[2].id if len(e.args) >= 3 else "f64"
+            if any(t == "void" for t in argt):
+                raise NativeError("void is only a result type", e)
+            k = len(self.thunks)
+            proto = ", ".join(FFI[t][0] for t in argt) or "void"
+            conv = ", ".join(FFI[t][1].format(f"a[{i}]") for i, t in enumerate(argt))
+            name = e.args[0].value
+            lines = [f"static AV cthunk{k}(int n, AV *a, ADict *kw, AV self) {{",
+                     f"    (void)kw; if (n != {len(argt)}) a_error(\"TypeError\", \"{name}() takes {len(argt)} arguments, %d given\", n);",
+                     f"    {FFI[rett][0]} (*fp)({proto}) = ({FFI[rett][0]} (*)({proto}))(intptr_t)self.i;"]
+            if rett == "void":
+                lines += [f"    fp({conv});", "    return A_NONE;", "}"]
+            else:
+                lines += [f"    {FFI[rett][0]} r = fp({conv});", f"    return {FFI[rett][2].format('r')};", "}"]
+            self.thunks.append("\n".join(lines))
+            lib = self.hold(self.expr(f.obj))
+            return self.hold(f"a_builtin({cstr(name)}, cthunk{k}, a_int((int64_t)(intptr_t)a_csym({lib}, {cstr(name)})))")
         # super().name(...) inside a method
         if isinstance(f, A.Attr) and isinstance(f.obj, A.Call) and isinstance(f.obj.func, A.Name) and \
                 f.obj.func.id == "super" and not f.obj.args:
@@ -1929,7 +1990,11 @@ class CGen:
         raise NativeError("*x is only allowed in calls and literals", e)
 
 
-def compile_c(src, filename="<program>"):
+def compile_c(src, filename="<program>", sources_out=None):
     from ..parser import parse
     prog = parse(src)
-    return CGen(filename, src).program(prog)
+    g = CGen(filename, src)
+    c = g.program(prog)
+    if sources_out is not None:
+        sources_out.extend(g.c_sources)
+    return c

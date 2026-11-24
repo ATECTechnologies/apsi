@@ -164,6 +164,10 @@ AV a_yield(AV v);                                                   /* yield v: 
 int a_match_type(AV v, const char *t);
 AV a_match_field(AV v, int i);
 AV a_list_of(AV v);
+AV a_cload(const char *path);
+void *a_csym(AV lib, const char *name);
+double a_c_f64(AV v); int64_t a_c_i64(AV v); const char *a_c_str(AV v);
+void *a_tensor_ptr(AV v, int kind, const char *what);
 AV a_module(const char *name, int n, const char **names, AV *vals);
 uint64_t a_rand_u64(void); double a_rand_f(void); double a_rand_n(void); void a_seed(uint64_t x);
 extern AV (*a_tensor_random)(int kind, int n, AV *shape, AV lo, AV hi);           /* o.name, AttributeError if missing */
