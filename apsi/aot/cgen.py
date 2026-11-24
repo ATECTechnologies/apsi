@@ -29,7 +29,8 @@ def _builtin_names():
     names |= set(re.findall(r'\{"([A-Za-z_0-9]+)", tb_[A-Za-z_0-9]+\}', tsrc))
     exc = re.search(r"a_exc_names\[A_NEXC\] = \{(.*?)\};", src, re.S).group(1)
     names |= set(re.findall(r'"([A-Za-z]+)"', exc))
-    return names | {"pi", "e", "inf", "nan", "Error", "IOError", "EnvironmentError"}
+    return names | {"pi", "e", "inf", "nan", "Error", "IOError", "EnvironmentError", "f64", "fp64", "f32", "fp32",
+                    "f16", "fp16", "bf16", "i64", "i32", "int8", "uint8", "int4"}
 
 
 BUILTINS = _builtin_names()
@@ -307,6 +308,8 @@ class Analyzer:
             if p.default is not None:
                 self.expr(p.default, sc)
             fs.bind(p.name)
+        for sp in getattr(node, "shape_params", None) or []:
+            fs.bind(sp)
         if body is not None:
             self.block(body, fs)
         else:
@@ -720,12 +723,22 @@ class CGen:
         self.fn = fn
         self.fns.append(fn)
         self.params(params or [])
+        for sp in getattr(scope.node, "shape_params", None) or []:     # fn f[B](x: Tensor[B, _]): B from x's shape
+            for p in params or []:
+                args = getattr(p.type, "args", None) or []
+                hit = [i for i, a in enumerate(args) if getattr(a, "name", None) == sp]
+                if hit:
+                    shp = self.hold(f"a_call({self.k_builtin('shape')}, 1, &{self.load(p.name)}, NULL)")
+                    self.store(sp, f"a_getitem({shp}, a_int({hit[0]}))")
+                    break
         if scope.kind == "fn":
             for nm in scope.bound:          # cells exist from the start, so closures made early see later values
                 if nm in scope.cells and nm not in {p.name for p in (params or [])}:
                     self.emit(f"S[{fn.local(nm)}] = a_obj(a_cell(A_NONE));")
         self.emit("a_gc_safe();")
         if expr_body is not None:
+            if getattr(expr_body, "line", 0):
+                self.emit(f"fr.pos = {(expr_body.line << 12) | min(getattr(expr_body, 'col', 0) or 0, 4095)};")
             v = self.expr(expr_body)
             self.ret(v)
         else:

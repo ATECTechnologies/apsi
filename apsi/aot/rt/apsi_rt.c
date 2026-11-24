@@ -994,12 +994,18 @@ static int cmp_order(AV a, AV b) {   /* <0, 0, >0 */
     }
     a_error("TypeError", "'<' not supported between '%s' and '%s'", tname(a), tname(b));
 }
+static int tensor_cmp_applies(int op, AV a, AV b) {
+    if (op == OP_IN || op == OP_NOTIN || op == OP_IS || op == OP_ISNOT) return 0;
+    if (!(a_is_tn(a) || a_is_tn(b))) return 0;
+    if ((op == OP_EQ || op == OP_NE) && (a.t == T_NONE || b.t == T_NONE || a_is(a, O_STR) || a_is(b, O_STR))) return 0;
+    return 1;
+}
 AV a_cmp_slow(int op, AV a, AV b) {
-    if ((a_is_tn(a) || a_is_tn(b)) && op != OP_IN && op != OP_NOTIN && op != OP_IS && op != OP_ISNOT) return a_tensor_cmp(op, a, b);
+    if (tensor_cmp_applies(op, a, b)) return a_tensor_cmp(op, a, b);
     return a_bool(a_compare(op, a, b));
 }
 int a_compare(int op, AV a, AV b) {
-    if ((a_is_tn(a) || a_is_tn(b)) && op != OP_IN && op != OP_NOTIN && op != OP_IS && op != OP_ISNOT) return a_tensor_truthy(a_tensor_cmp(op, a, b));
+    if (tensor_cmp_applies(op, a, b)) return a_tensor_truthy(a_tensor_cmp(op, a, b));
     switch (op) {
     case OP_EQ: return a_eq(a, b);
     case OP_NE: return !a_eq(a, b);
@@ -2069,6 +2075,7 @@ static AV b_setattr(int n, AV *a, ADict *kw, AV self) { (void)n; (void)kw; (void
 static AV b_iter(int n, AV *a, ADict *kw, AV self) { (void)n; (void)kw; (void)self; return a_iter(a[0]); }
 static AV b_next(int n, AV *a, ADict *kw, AV self) { (void)kw; (void)self; AV v; if (a_next(a[0], &v)) return v; if (n > 1) return a[1]; a_error("StopIteration", ""); }
 static AV b_set_recursion_limit(int n, AV *a, ADict *kw, AV self) { (void)n; (void)a; (void)kw; (void)self; return A_NONE; }
+static AV b_identity(int n, AV *a, ADict *kw, AV self) { (void)kw; (void)self; if (n == 1 && !kw) return a[0]; return a_builtin("decorator", b_identity, A_NONE); }
 static AV b_error(int n, AV *a, ADict *kw, AV self) { (void)kw; (void)self; a_raise(n ? a_to_str(a[0]) : a_str("error")); }
 
 static AV b_floor(int n, AV *a, ADict *kw, AV self) { if (n && a_is_tn(a[0])) return a_tensor_builtin("floor", 1)(n, a, kw, self); (void)n; (void)kw; (void)self; if (a[0].t == T_INT) return a[0]; return a_int((int64_t)floor(fval(a[0]))); }
@@ -2098,6 +2105,7 @@ static const BEnt a_builtins[] = {
     {"hex", b_hex}, {"oct", b_oct}, {"bin", b_bin}, {"callable", b_callable}, {"getattr", b_getattr},
     {"hasattr", b_hasattr}, {"setattr", b_setattr}, {"iter", b_iter}, {"next", b_next},
     {"set_recursion_limit", b_set_recursion_limit}, {"error", b_error},
+    {"native", b_identity}, {"gpu", b_identity}, {"memo", b_identity},
     {NULL, NULL}};
 
 AV a_global_builtin(const char *name) {
@@ -2106,6 +2114,10 @@ AV a_global_builtin(const char *name) {
     if (!strcmp(name, "IOError") || !strcmp(name, "EnvironmentError")) return a_exc_classes[17];
     if (!strcmp(name, "pi")) return a_float(3.141592653589793);
     if (!strcmp(name, "tau")) return a_float(6.283185307179586);
+    static const char *dtypes[][2] = {{"f64", "float64"}, {"fp64", "float64"}, {"f32", "float32"}, {"fp32", "float32"},
+        {"f16", "float32"}, {"fp16", "float32"}, {"bf16", "float32"}, {"i64", "int64"}, {"i32", "int64"}, {"int8", "int64"},
+        {"uint8", "int64"}, {"int4", "int64"}};
+    for (size_t i = 0; i < sizeof dtypes / sizeof *dtypes; i++) if (!strcmp(name, dtypes[i][0])) return a_str(dtypes[i][1]);
     if (!strcmp(name, "e")) return a_float(2.718281828459045);
     if (!strcmp(name, "inf")) return a_float(INFINITY);
     if (!strcmp(name, "nan")) return a_float(NAN);

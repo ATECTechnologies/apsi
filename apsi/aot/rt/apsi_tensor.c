@@ -582,7 +582,7 @@ static AV permute(AV v, const int *perm) {
     }
     return a_obj(o);
 }
-static AV transpose2(AV v) {
+static __attribute__((unused)) AV transpose2(AV v) {
     ATensor *a = TT(v);
     if (a->nd < 2) return v;
     int perm[MAXD]; for (int i = 0; i < a->nd; i++) perm[i] = i;
@@ -745,7 +745,22 @@ static AV host_index(AV index) {
     }
     return index;
 }
+static AV nd_index(AV index) {          /* a block of positions with 2 or more axes (NumPy: the result takes its shape) */
+    if (a_is(index, O_LIST)) { int sp = a_ntmp; AV t = t_from(index, -1); a_ntmp = sp; if (TT(t)->nd >= 2 && TT(t)->dt != DT_BOOL) return t; return A_NONE; }
+    if (is_t(index) && TT(index)->nd >= 2 && TT(index)->dt != DT_BOOL) return index;
+    return A_NONE;
+}
 static AV t_getitem(AV v, AV index) {
+    AV ndi = nd_index(index);
+    if (ndi.t != T_NONE) {
+        int sp = a_ntmp; A_PUSH(ndi);
+        int64_t flat[1] = {TT(ndi)->n}; AV f = reshape(ndi, 1, flat); A_PUSH(f);
+        AV r = t_getitem(v, f); A_PUSH(r);
+        ATensor *R = TT(r), *I = TT(ndi); int64_t sh[MAXD]; int nd = 0;
+        for (int i = 0; i < I->nd; i++) sh[nd++] = I->sh[i];
+        for (int i = 1; i < R->nd; i++) sh[nd++] = R->sh[i];
+        AV out = reshape(r, nd, sh); a_ntmp = sp; return out;
+    }
     int sp = a_ntmp;
     AV hi = host_index(index); A_PUSH(hi);
     if (!on_dev(v)) { AV r = t_getitem_host(v, hi); a_ntmp = sp; return r; }
@@ -794,6 +809,18 @@ static AV t_getitem_host(AV v, AV index) {
 }
 static void t_setitem_host(AV v, AV index, AV val, int add);
 static void t_setitem(AV v, AV index, AV val, int add) {
+    AV ndi = nd_index(index);
+    if (ndi.t != T_NONE) {
+        int sp = a_ntmp; A_PUSH(ndi);
+        int64_t flat[1] = {TT(ndi)->n}; AV f = reshape(ndi, 1, flat); A_PUSH(f);
+        AV tv = as_tensor(val); A_PUSH(tv);
+        if (TT(tv)->n > 1) {
+            int64_t sh[MAXD]; int nd = 0; sh[nd++] = TT(ndi)->n;
+            for (int i = TT(ndi)->nd; i < TT(tv)->nd; i++) sh[nd++] = TT(tv)->sh[i];
+            tv = reshape(tv, nd, sh); A_PUSH(tv);
+        }
+        t_setitem(v, f, tv, add); a_ntmp = sp; return;
+    }
     int sp = a_ntmp;
     AV hi = host_index(index); A_PUSH(hi);
     AV hv = on_dev(val) ? to_host(val) : val; A_PUSH(hv);
@@ -1023,15 +1050,27 @@ static AV gv_mul(AV a, AV b) { return a_binop(OP_MUL, a, b); }
 static AV gv_div(AV a, AV b) { return a_binop(OP_DIV, a, b); }
 static AV gv_neg(AV a) { return a_unop(OP_NEG, a); }
 
+static AV deepval(AV v) { while (is_n(v)) v = ND(v)->val; return v; }
+static AV red(int op, int n, AV *a, ADict *kw);
+static AV t_reshape_any(AV x, int nd, int64_t *sh);
+static AV t_permute_any(AV x, int nd, const int *perm);
+static AV t_transpose_any(AV x);
+static AV rsum(AV g, AV axis, int keep) {          /* a sum that is itself recorded when g is being differentiated */
+    if (!is_n(g)) return reduce(R_SUM, g, axis, keep, 0);
+    int sp = a_ntmp; AV kwd = a_dict(); A_PUSH(kwd);
+    a_dict_set((ADict *)kwd.o, a_str("keepdims"), a_bool(keep));
+    AV r = red(R_SUM, 2, (AV[]){g, axis}, (ADict *)kwd.o); a_ntmp = sp; return r;
+}
 /* a gradient for a value of a smaller shape: summed over the broadcast axes */
 static AV unbroadcast(AV g, AV like) {
-    if (!is_t(g)) return g;
-    if (!is_t(like)) return reduce(R_SUM, g, A_NONE, 0, 0);
-    ATensor *G = TT(g), *L = TT(like);
-    if (G->nd == L->nd) { int same = 1; for (int i = 0; i < G->nd; i++) if (G->sh[i] != L->sh[i]) same = 0; if (same) return g; }
+    AV gv = deepval(g), lv = deepval(like);
+    if (!is_t(gv)) return g;
+    if (!is_t(lv)) return rsum(g, A_NONE, 0);
+    ATensor *L = TT(lv);
+    if (TT(gv)->nd == L->nd) { int same = 1; for (int i = 0; i < L->nd; i++) if (TT(gv)->sh[i] != L->sh[i]) same = 0; if (same) return g; }
     int sp = a_ntmp; A_PUSH(g);
-    while (TT(g)->nd > L->nd) { g = reduce(R_SUM, g, a_int(0), 0, 0); a_tmp[sp] = g; }
-    for (int i = 0; i < L->nd; i++) if (L->sh[i] == 1 && TT(g)->sh[i] != 1) { g = reduce(R_SUM, g, a_int(i), 1, 0); a_tmp[sp] = g; }
+    while (TT(deepval(g))->nd > L->nd) { g = rsum(g, a_int(0), 0); a_tmp[sp] = g; }
+    for (int i = 0; i < L->nd; i++) if (L->sh[i] == 1 && TT(deepval(g))->sh[i] != 1) { g = rsum(g, a_int(i), 1); a_tmp[sp] = g; }
     a_ntmp = sp;
     return g;
 }
@@ -1094,18 +1133,16 @@ static AV unary_grad(int u, AV x, AV y, AV g) {     /* d op(x) / dx times g, fro
     return r;
 }
 static AV expand_axis(AV g, AV like, AV axis, int keep) {   /* the gradient of a reduction, back to the input's shape */
-    if (!is_t(like)) return g;
-    ATensor *L = TT(like);
-    if (axis.t != T_NONE && !keep && is_t(g)) {
-        int ax = norm_axis((int)axis.i, L->nd); int64_t sh[MAXD]; int nd = 0;
-        for (int i = 0; i < L->nd; i++) sh[nd++] = i == ax ? 1 : L->sh[i];
-        g = reshape(g, nd, sh);
-    } else if (axis.t != T_NONE && !keep) {
-        int ax = norm_axis((int)axis.i, L->nd); int64_t sh[MAXD]; int nd = 0;
-        for (int i = 0; i < L->nd; i++) sh[nd++] = i == ax ? 1 : L->sh[i];
-        g = reshape(as_tensor(g), nd, sh);
-    }
+    AV lv = deepval(like);
+    if (!is_t(lv)) return g;
+    ATensor *L = TT(lv);
     int sp = a_ntmp; A_PUSH(g);
+    if (axis.t != T_NONE && !keep) {
+        int ax = norm_axis((int)axis.i, L->nd); int64_t sh[MAXD]; int nd = 0;
+        for (int i = 0; i < L->nd; i++) sh[nd++] = i == ax ? 1 : L->sh[i];
+        g = is_t(deepval(g)) ? t_reshape_any(g, nd, sh) : t_reshape_any(is_n(g) ? g : as_tensor(g), nd, sh);
+        A_PUSH(g);
+    }
     AV z = a_obj(t_like(L, L->dt == DT_F32 ? DT_F32 : DT_F64)); A_PUSH(z);
     AV r = a_binop(OP_ADD, z, g);
     a_ntmp = sp;
@@ -1114,6 +1151,7 @@ static AV expand_axis(AV g, AV like, AV axis, int keep) {   /* the gradient of a
 static AV t_softmax(AV v, int ax, int logsm);
 static void backward_one(ANode *n) {
     AV g = n->grad, a = n->a, b = n->b, va = val_of(a), vb = val_of(b);
+    AV dva = deepval(va), dvb = deepval(vb);
     int sp = a_ntmp; A_PUSH(g);
     switch (n->op) {
     case N_ADD: acc_grad(a, unbroadcast(g, va)); acc_grad(b, unbroadcast(g, vb)); break;
@@ -1129,22 +1167,21 @@ static void backward_one(ANode *n) {
         break;
     case N_NEG: acc_grad(a, gv_neg(g)); break;
     case N_MATMUL: {
-        ATensor *A = TT(va), *B = TT(vb);
+        ATensor *A = TT(dva), *B = TT(dvb);
         if (is_n(a)) {
             AV ga;
             if (A->nd == 1 && B->nd == 1) ga = a_binop(OP_MUL, g, vb);
-            else if (A->nd == 1) ga = matmul(transpose2(vb), as_tensor(g)), ga = is_t(ga) ? ga : ga;
-            else if (B->nd == 1) { AV gg = as_tensor(g); A_PUSH(gg); int64_t sh[MAXD]; int nd = TT(gg)->nd; memcpy(sh, TT(gg)->sh, sizeof(int64_t) * (size_t)nd); sh[nd] = 1; AV g2 = reshape(gg, nd + 1, sh); A_PUSH(g2);
-                int64_t bs[2] = {1, B->sh[0]}; AV b2 = reshape(vb, 2, bs); A_PUSH(b2); ga = matmul(g2, b2); }
-            else { AV bt = transpose2(vb); A_PUSH(bt); ga = matmul(g, bt); }
+            else if (A->nd == 1) { AV bt = t_transpose_any(vb); A_PUSH(bt); ga = a_tensor_binop(OP_MATMUL, bt, g); }
+            else if (B->nd == 1) { AV gg = is_n(g) ? g : as_tensor(g); A_PUSH(gg); ATensor *GT = TT(deepval(gg)); int64_t sh[MAXD]; int nd = GT->nd; memcpy(sh, GT->sh, sizeof(int64_t) * (size_t)nd); sh[nd] = 1; AV g2 = t_reshape_any(gg, nd + 1, sh); A_PUSH(g2);
+                int64_t bs[2] = {1, B->sh[0]}; AV b2 = t_reshape_any(vb, 2, bs); A_PUSH(b2); ga = a_tensor_binop(OP_MATMUL, g2, b2); }
+            else { AV bt = t_transpose_any(vb); A_PUSH(bt); ga = a_tensor_binop(OP_MATMUL, g, bt); }
             A_PUSH(ga); acc_grad(a, unbroadcast(ga, va));
         }
         if (is_n(b)) {
             AV gb;
             if (A->nd == 1 && B->nd == 1) gb = a_binop(OP_MUL, g, va);
-            else if (A->nd == 1) { int64_t as[2] = {A->sh[0], 1}; AV a2 = reshape(va, 2, as); A_PUSH(a2); AV gg = as_tensor(g); A_PUSH(gg); int64_t gs[2] = {1, TT(gg)->n}; AV g2 = reshape(gg, 2, gs); A_PUSH(g2); gb = matmul(a2, g2); }
-            else if (B->nd == 1) { AV at = transpose2(va); A_PUSH(at); gb = matmul(at, g); }
-            else { AV at = transpose2(va); A_PUSH(at); gb = matmul(at, g); }
+            else if (A->nd == 1) { int64_t as[2] = {A->sh[0], 1}; AV a2 = t_reshape_any(va, 2, as); A_PUSH(a2); AV gg = is_n(g) ? g : as_tensor(g); A_PUSH(gg); int64_t gs[2] = {1, TT(deepval(gg))->n}; AV g2 = t_reshape_any(gg, 2, gs); A_PUSH(g2); gb = a_tensor_binop(OP_MATMUL, a2, g2); }
+            else { AV at = t_transpose_any(va); A_PUSH(at); gb = a_tensor_binop(OP_MATMUL, at, g); }
             A_PUSH(gb); acc_grad(b, unbroadcast(gb, vb));
         }
         break;
@@ -1153,7 +1190,7 @@ static void backward_one(ANode *n) {
     case N_SUM: acc_grad(a, expand_axis(g, va, ((AList *)n->x.o)->v[0], (int)((AList *)n->x.o)->v[1].i)); break;
     case N_MEAN: {
         AV axis = ((AList *)n->x.o)->v[0]; int keep = (int)((AList *)n->x.o)->v[1].i;
-        double cnt = is_t(va) ? (axis.t == T_NONE ? (double)TT(va)->n : (double)TT(va)->sh[norm_axis((int)axis.i, TT(va)->nd)]) : 1.0;
+        double cnt = is_t(dva) ? (axis.t == T_NONE ? (double)TT(dva)->n : (double)TT(dva)->sh[norm_axis((int)axis.i, TT(dva)->nd)]) : 1.0;
         AV e = expand_axis(g, va, axis, keep); A_PUSH(e);
         acc_grad(a, a_binop(OP_DIV, e, a_float(cnt))); break;
     }
@@ -1164,45 +1201,45 @@ static void backward_one(ANode *n) {
         AV e = expand_axis(g, va, axis, keep); A_PUSH(e);
         acc_grad(a, a_binop(OP_MUL, e, mask)); break;
     }
-    case N_RESHAPE: { AV gg = as_tensor(g); A_PUSH(gg); acc_grad(a, is_t(va) ? reshape(gg, TT(va)->nd, TT(va)->sh) : reduce(R_SUM, gg, A_NONE, 0, 0)); break; }
-    case N_TRANSPOSE: acc_grad(a, transpose2(g)); break;
+    case N_RESHAPE: { AV gg = is_n(g) ? g : as_tensor(g); A_PUSH(gg); acc_grad(a, is_t(dva) ? t_reshape_any(gg, TT(dva)->nd, TT(dva)->sh) : rsum(gg, A_NONE, 0)); break; }
+    case N_TRANSPOSE: acc_grad(a, t_transpose_any(g)); break;
     case N_PERMUTE: {
         AList *pl = (AList *)n->x.o; int perm[MAXD], inv[MAXD];
         for (int64_t i = 0; i < pl->len; i++) perm[i] = (int)pl->v[i].i;
         for (int64_t i = 0; i < pl->len; i++) inv[perm[i]] = (int)i;
-        acc_grad(a, permute(g, inv)); break;
+        acc_grad(a, t_permute_any(g, (int)pl->len, inv)); break;
     }
     case N_INDEX: {
-        AV z = a_obj(t_like(TT(va), TT(va)->dt == DT_F32 ? DT_F32 : DT_F64)); A_PUSH(z);
-        t_setitem(z, n->x, g, 1);
+        AV z = a_obj(t_like(TT(dva), TT(dva)->dt == DT_F32 ? DT_F32 : DT_F64)); A_PUSH(z);
+        t_setitem(z, n->x, deepval(g), 1);
         acc_grad(a, z); break;
     }
     case N_SOFTMAX: {        /* g_x = y * (g - sum(g * y, axis)) */
         int ax = (int)n->x.i; AV y = n->val;
         AV gy = gv_mul(g, y); A_PUSH(gy);
-        AV s = reduce(R_SUM, gy, a_int(ax), 1, 0); A_PUSH(s);
+        AV s = rsum(gy, a_int(ax), 1); A_PUSH(s);
         AV d = a_binop(OP_SUB, g, s); A_PUSH(d);
         acc_grad(a, gv_mul(y, d)); break;
     }
     case N_LOGSOFTMAX: {     /* g_x = g - softmax(x) * sum(g, axis) */
         int ax = (int)n->x.i;
         AV sm = a_tensor_unary(U_EXP, n->val); A_PUSH(sm);
-        AV s = reduce(R_SUM, g, a_int(ax), 1, 0); A_PUSH(s);
+        AV s = rsum(g, a_int(ax), 1); A_PUSH(s);
         AV t = gv_mul(sm, s); A_PUSH(t);
         acc_grad(a, a_binop(OP_SUB, g, t)); break;
     }
     case N_CONCAT: case N_STACK: {
         AList *parts = (AList *)a.o; int ax = (int)n->x.i; int64_t off = 0;
-        ATensor *G = TT(g);
+        ATensor *G = TT(deepval(g));
         int gax = norm_axis(ax, G->nd);
         for (int64_t i = 0; i < parts->len; i++) {
-            AV p = parts->v[i]; AV pv = as_tensor(val_of(p)); A_PUSH(pv);
+            AV p = parts->v[i]; AV pv = as_tensor(deepval(p)); A_PUSH(pv);
             int64_t len = n->op == N_STACK ? 1 : TT(pv)->sh[gax];
             if (is_n(p)) {
                 AV sl = a_slice(a_int(off), a_int(off + len), A_NONE); A_PUSH(sl);
                 AV items[MAXD]; for (int d = 0; d < G->nd; d++) items[d] = d == gax ? (n->op == N_STACK ? a_int(off) : sl) : a_slice(A_NONE, A_NONE, A_NONE);
                 AV idx = a_tuple(G->nd, items); A_PUSH(idx);
-                acc_grad(p, t_getitem(g, idx));
+                acc_grad(p, a_tensor_getitem(g, idx));
             }
             off += len;
         }
@@ -1230,7 +1267,7 @@ static void backward(AV out) {
     AList *order = (AList *)a_list(0, NULL).o; A_PUSH(a_obj(order));
     collect_nodes(out, order);
     for (int64_t i = 0; i < order->len; i++) ND(order->v[i])->seen = 0;
-    AV ov = ND(out)->val;
+    AV ov = deepval(ND(out)->val);
     ND(out)->grad = is_t(ov) ? a_binop(OP_ADD, a_obj(t_like(TT(ov), TT(ov)->dt == DT_F32 ? DT_F32 : DT_F64)), a_float(1.0)) : a_float(1.0);
     for (int64_t i = order->len - 1; i >= 0; i--) {
         ANode *n = ND(order->v[i]);
@@ -1323,7 +1360,7 @@ char *a_tensor_text(AV v, int top) {
 }
 int64_t a_tensor_len(AV v) { v = val_of(v); if (!is_t(v)) a_error("TypeError", "no len() of a number"); if (TT(v)->nd == 0) a_error("TypeError", "len() of a 0-d tensor"); return TT(v)->sh[0]; }
 AV a_tensor_getitem(AV v, AV i) {
-    if (is_n(v)) { AV r = t_getitem(ND(v)->val, i); int sp = a_ntmp; A_PUSH(r); AV n = node_new(r, N_INDEX, v, A_NONE, i); a_ntmp = sp; return n; }
+    if (is_n(v)) { AV r = a_tensor_getitem(ND(v)->val, i); int sp = a_ntmp; A_PUSH(r); AV n = node_new(r, N_INDEX, v, A_NONE, i); a_ntmp = sp; return n; }
     return t_getitem(v, i);
 }
 void a_tensor_setitem(AV v, AV i, AV x) { if (is_n(v)) a_error("TypeError", "cannot assign into a value being differentiated"); t_setitem(v, i, val_of(x), 0); }
@@ -1370,12 +1407,12 @@ static AV red(int op, int n, AV *a, ADict *kw) {
     return reduce(op, x, axis, keep, ddof);
 }
 static AV t_reshape_any(AV x, int nd, int64_t *sh) {
-    if (is_n(x)) { AV v = reshape(as_tensor(ND(x)->val), nd, sh); int sp = a_ntmp; A_PUSH(v); AV r = node_new(v, N_RESHAPE, x, A_NONE, A_NONE); a_ntmp = sp; return r; }
+    if (is_n(x)) { int64_t sh2[MAXD]; memcpy(sh2, sh, sizeof(int64_t) * (size_t)nd); AV v = t_reshape_any(ND(x)->val, nd, sh2); int sp = a_ntmp; A_PUSH(v); AV r = node_new(v, N_RESHAPE, x, A_NONE, A_NONE); a_ntmp = sp; return r; }
     return reshape(as_tensor(x), nd, sh);
 }
 static AV t_permute_any(AV x, int nd, const int *perm) {
     if (is_n(x)) {
-        AV v = permute(ND(x)->val, perm); int sp = a_ntmp; A_PUSH(v);
+        AV v = t_permute_any(ND(x)->val, nd, perm); int sp = a_ntmp; A_PUSH(v);
         AV pl = a_list(0, NULL); A_PUSH(pl); for (int i = 0; i < nd; i++) a_list_append((AList *)pl.o, a_int(perm[i]));
         AV r = node_new(v, N_PERMUTE, x, A_NONE, pl); a_ntmp = sp; return r;
     }
@@ -1402,7 +1439,7 @@ static AV t_softmax(AV v, int ax, int logsm) {
     return a_obj(o);
 }
 static AV softmax_any(AV x, int ax, int logsm) {
-    if (is_n(x)) { AV v = t_softmax(as_tensor(ND(x)->val), ax, logsm); int sp = a_ntmp; A_PUSH(v); AV r = node_new(v, logsm ? N_LOGSOFTMAX : N_SOFTMAX, x, A_NONE, a_int(ax)); a_ntmp = sp; return r; }
+    if (is_n(x)) { AV v = softmax_any(ND(x)->val, ax, logsm); int sp = a_ntmp; A_PUSH(v); AV r = node_new(v, logsm ? N_LOGSOFTMAX : N_SOFTMAX, x, A_NONE, a_int(ax)); a_ntmp = sp; return r; }
     return t_softmax(as_tensor(x), ax, logsm);
 }
 
@@ -1490,6 +1527,7 @@ BI(tb_squeeze) {
     for (int i = 0; i < nd; i++) if (!(TT(v)->sh[i] == 1 && (axi < 0 || axi == i))) sh[k++] = TT(v)->sh[i];
     return t_reshape_any(is_n(a[0]) ? a[0] : v, k, sh);
 }
+static AV join(int n, AV *a, ADict *kw, int stack);
 static AV join(int n, AV *a, ADict *kw, int stack) {
     AV items = a[0]; AV ax = axis_kw(n, a, kw, 1); int axi = ax.t == T_NONE ? 0 : (int)ax.i;
     AList *l = (AList *)items.o; int any_node = 0;
@@ -1498,7 +1536,7 @@ static AV join(int n, AV *a, ADict *kw, int stack) {
     int sp = a_ntmp;
     AV vals = a_list(l->len, l->v); A_PUSH(vals);
     for (int64_t i = 0; i < l->len; i++) ((AList *)vals.o)->v[i] = val_of(l->v[i]);
-    AV v = t_concat(vals, axi, stack); A_PUSH(v);
+    AV v = join(2, (AV[]){vals, a_int(axi)}, NULL, stack); A_PUSH(v);
     AV keep = a_list(l->len, l->v); A_PUSH(keep);
     AV r = node_new(v, stack ? N_STACK : N_CONCAT, keep, A_NONE, a_int(axi)); a_ntmp = sp; return r;
 }
@@ -1632,7 +1670,7 @@ BI(tb_t_isfinite) { UNUSED; AV x = val_of(a[0]); if (is_t(x)) return unary(U_ISF
 
 /* ---- differentiation */
 static AV wrap_tree(AV v, AList *leaves) {           /* every number and tensor in v becomes a recorded leaf */
-    if (is_t(v) || v.t == T_FLOAT || v.t == T_INT || a_is(v, O_QTY)) {
+    if (is_n(v) || is_t(v) || v.t == T_FLOAT || v.t == T_INT || a_is(v, O_QTY)) {
         AV x = v.t == T_INT ? a_float((double)v.i) : v;
         AV nd = node_new(x, N_LEAF, A_NONE, A_NONE, A_NONE); a_list_append(leaves, nd); return nd;
     }
@@ -1660,6 +1698,8 @@ static AV grads_tree(AV v) {                         /* the same structure, with
     if (is_n(v)) {
         ANode *n = ND(v);
         if (n->grad.t != T_NONE) return n->grad;
+        AV dv = deepval(n->val);
+        if (is_t(dv)) return a_obj(t_like(TT(dv), TT(dv)->dt == DT_F32 ? DT_F32 : DT_F64));
         if (is_t(n->val)) return a_obj(t_like(TT(n->val), TT(n->val)->dt == DT_F32 ? DT_F32 : DT_F64));
         return a_float(0.0);
     }
@@ -1693,7 +1733,7 @@ static AV run_grad(AV f, int n, AV *a, ADict *kw, int with_value) {
     AV out = a_call(f, n, ((AList *)args.o)->v, kw); A_PUSH(out);
     AV value = val_of(out);
     if (is_n(out)) {
-        if (is_t(value) && TT(value)->n != 1) a_error("ValueError", "grad needs a function with one number as its result");
+        if (is_t(deepval(value)) && TT(deepval(value))->n != 1) a_error("ValueError", "grad needs a function with one number as its result");
         backward(out);
     }
     AV g = grads_tree(x); A_PUSH(g);

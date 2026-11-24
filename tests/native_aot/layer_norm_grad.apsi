@@ -1,0 +1,7 @@
+use nn
+let x = randn(4, 8)
+let g = ones(8)
+fn f(g) = sum(layer_norm(x, g, zeros(8)))
+print(shape(grad(f)(g)))
+fn h(x) = sum(mean(x, axis=-1, keepdims=true))
+print(grad(h)(x)[0])
