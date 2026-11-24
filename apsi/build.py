@@ -266,7 +266,7 @@ def _copy_runtime(dest, sources, include, say):
 # =============================================================== apsi build
 def cmd_build_native(args):
     """--native: Apsi -> C -> machine code. The executable needs no Python and no Apsi installation."""
-    from .aot.build import build
+    from .aot.build import build, CheckError
     from .aot.cgen import NativeError
     entry = os.path.abspath(args.file)
     out_dir = os.path.abspath(args.output) if args.output else os.path.dirname(entry)
@@ -276,6 +276,10 @@ def cmd_build_native(args):
     exe = os.path.join(out_dir, name + (".exe" if os.name == "nt" or (target or "").endswith("windows-msvc") else ""))
     try:
         build(entry, exe, keep_c=getattr(args, "emit_c", False), target=target)
+    except CheckError as e:
+        from .cli import _report
+        _report(e.err, e.src, e.path)
+        return 1
     except NativeError as e:
         print(f"apsi build: {e}", file=sys.stderr)
         return 1
@@ -498,7 +502,14 @@ def cmd_compile(args):
     return status
 
 
+def cmd_toolchain(args):
+    from .aot.toolchain import main
+    return main([])
+
+
 def register(sub, perm_flags):
+    t = sub.add_parser("toolchain", help="where the C toolchain for native builds is (fetched once when missing)")
+    t.set_defaults(fn=cmd_toolchain)
     p = sub.add_parser("build", help="make an executable from a program (app.exe on Windows)")
     p.add_argument("file", help="the program's main .apsi file")
     p.add_argument("-o", "--output", help="output folder (default: next to the program)")

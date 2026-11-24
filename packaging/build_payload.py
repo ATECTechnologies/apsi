@@ -135,6 +135,18 @@ def main():
                            "--python-version", "3.12", "--implementation", "cp", "--only-binary=:all:",
                            "numpy>=1.26", "llvmlite>=0.44", "ml_dtypes>=0.5", whl] + (["pyreadline3>=3.4"] if a.platform == "windows" else []))
 
+    if a.platform == "windows":
+        # the C toolchain for `apsi build --native`: nobody has to install a compiler
+        sys.path.insert(0, ROOT)
+        from apsi.aot import toolchain
+        tc_zip = os.path.join(CACHE, toolchain.ZIP)
+        if not os.path.exists(tc_zip):
+            log(f"downloading {toolchain.ZIP}")
+            urllib.request.urlretrieve(toolchain.URL, tc_zip + ".part")
+            os.replace(tc_zip + ".part", tc_zip)
+        log("adding the C toolchain (llvm-mingw, trimmed to x86-64)")
+        toolchain.fetch(os.path.join(rt, "toolchain"), archive=tc_zip, quiet=True)   # copied with the runtime
+
     for d in ("examples", "docs"):
         shutil.copytree(os.path.join(ROOT, d), os.path.join(out, d),
                         ignore=shutil.ignore_patterns("*.so", "*.dll", "__pycache__", "*_store", "_tmp_*"))

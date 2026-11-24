@@ -10,29 +10,12 @@ from .cgen import compile_c, NativeError
 RT = os.path.join(os.path.dirname(__file__), "rt")
 
 
-def _windows_candidates():
-    roots = [os.environ.get("APSI_TOOLCHAIN"), os.path.join(os.environ.get("LOCALAPPDATA", ""), "apsi", "toolchain"),
-             r"C:\llvm-mingw", r"C:\Program Files\LLVM", r"C:\msys64\ucrt64", r"C:\msys64\mingw64", r"C:\w64devkit"]
-    for r in roots:
-        if not r or not os.path.isdir(r):
-            continue
-        for base in [r] + [os.path.join(r, d) for d in sorted(os.listdir(r)) if os.path.isdir(os.path.join(r, d))]:
-            for exe in ("clang.exe", "gcc.exe"):
-                p = os.path.join(base, "bin", exe)
-                if os.path.isfile(p):
-                    yield p
-
-
 def find_cc():
-    for cc in (os.environ.get("APSI_CC"), "clang", "gcc", "cc"):
-        if cc and shutil.which(cc):
-            return shutil.which(cc)
-    if os.name == "nt":
-        for p in _windows_candidates():
-            return p
-        raise NativeError("no C compiler found. Install llvm-mingw (https://github.com/mstorsjo/llvm-mingw/releases, "
-                          "the ucrt-x86_64 zip) and unpack it to C:\\llvm-mingw, or put clang/gcc on PATH, or set APSI_CC")
-    raise NativeError("no C compiler found (clang or gcc); install one or set APSI_CC")
+    from .toolchain import find, ToolchainError
+    try:
+        return find()
+    except ToolchainError as e:
+        raise NativeError(str(e))
 
 
 class CheckError(NativeError):
@@ -56,7 +39,7 @@ def check(src, path):
         raise CheckError(CheckFailed(errs), src, path)
 
 
-def build(path, out=None, opt="-O2", keep_c=False, target=None):
+def build(path, out=None, opt="-O3", keep_c=False, target=None):
     src = open(path, encoding="utf-8").read()
     check(src, path)
     c = compile_c(src, path)
@@ -71,12 +54,16 @@ def build(path, out=None, opt="-O2", keep_c=False, target=None):
         shutil.copy(cfile, os.path.splitext(out)[0] + ".c")
     cc = find_cc()
     cmd = [cc, opt, "-std=gnu11", "-w", "-D_CRT_SECURE_NO_WARNINGS", "-I", RT, cfile, os.path.join(RT, "apsi_rt.c"),
-           os.path.join(RT, "apsi_tensor.c"), os.path.join(RT, "apsi_gpu.c"), "-o", out]
+           os.path.join(RT, "apsi_tensor.c"), os.path.join(RT, "apsi_gpu.c"), os.path.join(RT, "apsi_gemm.c"),
+           "-o", out]
     if os.environ.get("APSI_GPU_EMU_BUILD"):        # tests: the card emulated on host threads
         cmd[-2:-2] = [os.path.join(RT, "kernels.c")]
         cmd[1:1] = ["-DAPSI_GPU_EMU_BUILD", "-DAPSI_EMU", "-DAPSI_CHECK_DEV"]
     if target:
         cmd[1:1] = ["-target", target]
+    elif not os.environ.get("APSI_PORTABLE"):
+        cmd[1:1] = ["-march=native", "-mprefer-vector-width=512"]   # built where it runs: every vector unit it has
+    cmd[1:1] = ["-fno-math-errno"]
     windows = os.name == "nt" or "windows" in (target or "") or "mingw" in (target or "")
     if not windows:
         cmd += ["-lm", "-lpthread", "-ldl"]
@@ -96,7 +83,7 @@ def main(argv=None):
     p.add_argument("-o", "--out")
     p.add_argument("--emit-c", action="store_true", help="also write the generated C next to the output")
     p.add_argument("--target", help="a clang target triple, e.g. x86_64-pc-windows-msvc")
-    p.add_argument("-O", dest="opt", default="2")
+    p.add_argument("-O", dest="opt", default="3")
     a = p.parse_args(argv)
     try:
         out = build(a.file, a.out, "-O" + a.opt, a.emit_c, a.target)

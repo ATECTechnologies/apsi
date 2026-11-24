@@ -42,21 +42,44 @@ static void d_fill(ATensor *o, float v); static ATensor *d_new(int dt, int nd, c
 
 /* ------------------------------------------------------------------ making tensors */
 void a_gpu_free(void *p);
-static void tfree(AObj *o) { if (((ATensor *)o)->dev) a_gpu_free(((ATensor *)o)->p); else free(((ATensor *)o)->p); }
+/* buffers of collected tensors are kept for the next tensors of the same size: no fresh pages, warm caches */
+#define POOL_N 64
+static struct { void *p; size_t bytes; } pool[POOL_N];
+static int pool_count = 0; static size_t pool_bytes = 0;
+static void *pool_get(size_t bytes) {
+    for (int i = pool_count - 1; i >= 0; i--) if (pool[i].bytes == bytes) {
+        void *p = pool[i].p; pool_bytes -= bytes; pool[i] = pool[--pool_count]; return p;
+    }
+    return NULL;
+}
+static void pool_put(void *p, size_t bytes) {
+    if (bytes < 4096 || bytes > ((size_t)1 << 31)) { free(p); return; }
+    while (pool_count == POOL_N || pool_bytes + bytes > ((size_t)1 << 31)) {
+        if (!pool_count) { free(p); return; }
+        free(pool[0].p); pool_bytes -= pool[0].bytes; pool[0] = pool[--pool_count];
+    }
+    pool[pool_count].p = p; pool[pool_count++].bytes = bytes; pool_bytes += bytes;
+}
+static void tfree(AObj *o) {
+    ATensor *t = (ATensor *)o;
+    if (t->dev) a_gpu_free(t->p); else pool_put(t->p, (size_t)t->n * (size_t)dt_size[t->dt]);
+}
 static void tmark(AObj *o) { (void)o; }
 static ATensor *t_new(int dt, int nd, const int64_t *sh) {
     ATensor *t = (ATensor *)a_alloc(sizeof(ATensor), O_TENSOR);
     t->dt = (uint8_t)dt; t->nd = (uint8_t)nd; t->n = 1;
     for (int i = 0; i < nd; i++) { if (sh[i] < 0) a_error("ValueError", "negative dimension"); t->sh[i] = sh[i]; t->n *= sh[i]; }
     size_t bytes = (size_t)t->n * (size_t)dt_size[dt];
-    t->p = calloc(bytes ? bytes : 1, 1);
+    t->p = pool_get(bytes);
+    if (!t->p) t->p = malloc(bytes ? bytes : 1);          /* not cleared: every maker writes every element (t_zeros clears) */
     if (!t->p) a_error("MemoryError", "cannot allocate a tensor of %lld elements", (long long)t->n);
     a_note_alloc(bytes);
     return t;
 }
+static ATensor *t_zeros(int dt, int nd, const int64_t *sh) { ATensor *t = t_new(dt, nd, sh); memset(t->p, 0, (size_t)t->n * (size_t)dt_size[dt]); return t; }
 static ATensor *t_like(ATensor *a, int dt) {
     if (a->dev) { ATensor *o = d_new(dt, a->nd, a->sh); d_fill(o, 0.0f); return o; }
-    return t_new(dt, a->nd, a->sh);
+    return t_zeros(dt, a->nd, a->sh);
 }
 static inline double t_get(ATensor *t, int64_t i) {
 #ifdef APSI_CHECK_DEV
@@ -294,6 +317,38 @@ static int res_dt(int op, ATensor *a, ATensor *b) {
     if (op == E_POW && b->dt == DT_I64) return DT_I64;
     return DT_I64;
 }
+
+/* broadcasting in rows: the last axis runs with stride 0 or 1 on each side, which the compiler vectorizes */
+#define ROW_LOOP(T)                                                                                              \
+    {                                                                                                          \
+        const T *x = (const T *)A->p, *y = (const T *)B->p; T *r = (T *)o->p;                                    \
+        int64_t L = osh[nd - 1], rows = o->n / (L ? L : 1), xs = sa[nd - 1], ys = sb[nd - 1];                    \
+        int64_t idx[MAXD] = {0}, ia = 0, ib = 0;                                                               \
+        for (int64_t q = 0; q < rows; q++) {                                                                   \
+            const T *xa = x + ia, *yb = y + ib; T *rr = r + q * L;                                             \
+            switch (op) {                                                                                      \
+            case E_ADD: if (xs && ys) for (int64_t i = 0; i < L; i++) rr[i] = xa[i] + yb[i]; else if (xs) { T v = yb[0]; for (int64_t i = 0; i < L; i++) rr[i] = xa[i] + v; } else if (ys) { T v = xa[0]; for (int64_t i = 0; i < L; i++) rr[i] = v + yb[i]; } else for (int64_t i = 0; i < L; i++) rr[i] = xa[0] + yb[0]; break; \
+            case E_SUB: if (xs && ys) for (int64_t i = 0; i < L; i++) rr[i] = xa[i] - yb[i]; else if (xs) { T v = yb[0]; for (int64_t i = 0; i < L; i++) rr[i] = xa[i] - v; } else if (ys) { T v = xa[0]; for (int64_t i = 0; i < L; i++) rr[i] = v - yb[i]; } else for (int64_t i = 0; i < L; i++) rr[i] = xa[0] - yb[0]; break; \
+            case E_MUL: if (xs && ys) for (int64_t i = 0; i < L; i++) rr[i] = xa[i] * yb[i]; else if (xs) { T v = yb[0]; for (int64_t i = 0; i < L; i++) rr[i] = xa[i] * v; } else if (ys) { T v = xa[0]; for (int64_t i = 0; i < L; i++) rr[i] = v * yb[i]; } else for (int64_t i = 0; i < L; i++) rr[i] = xa[0] * yb[0]; break; \
+            case E_DIV: if (xs && ys) for (int64_t i = 0; i < L; i++) rr[i] = xa[i] / yb[i]; else if (xs) { T v = yb[0]; for (int64_t i = 0; i < L; i++) rr[i] = xa[i] / v; } else if (ys) { T v = xa[0]; for (int64_t i = 0; i < L; i++) rr[i] = v / yb[i]; } else for (int64_t i = 0; i < L; i++) rr[i] = xa[0] / yb[0]; break; \
+            default: for (int64_t i = 0; i < L; i++) rr[i] = (T)eop(op, xa[i * xs], yb[i * ys]); break;      \
+            }                                                                                                  \
+            for (int d = nd - 2; d >= 0; d--) {                                                                \
+                idx[d]++; ia += sa[d]; ib += sb[d];                                                            \
+                if (idx[d] < osh[d]) break;                                                                    \
+                ia -= sa[d] * osh[d]; ib -= sb[d] * osh[d]; idx[d] = 0;                                        \
+            }                                                                                                  \
+        }                                                                                                      \
+    }
+static AV ewise_rows(int op, ATensor *A, ATensor *B, int dt, int nd, const int64_t *osh) {
+    int64_t sa[MAXD], sb[MAXD];
+    bstrides(A, nd, osh, sa); bstrides(B, nd, osh, sb);
+    if ((sa[nd - 1] != 0 && sa[nd - 1] != 1) || (sb[nd - 1] != 0 && sb[nd - 1] != 1)) return A_NONE;
+    ATensor *o = t_new(dt, nd, osh);
+    if (dt == DT_F64) ROW_LOOP(double) else ROW_LOOP(float)
+    return a_obj(o);
+}
+
 static AV ewise(int op, AV av, AV bv) {
     if (on_dev(av) || on_dev(bv)) return d_ewise(op, av, bv);
     ATensor *a = TT(av), *b = TT(bv);
@@ -307,6 +362,33 @@ static AV ewise(int op, AV av, AV bv) {
     if (dt == DT_F64 && a->dt == DT_F64 && b->dt == DT_F64 && (a->n == b->n || a->n == 1 || b->n == 1) && (a->nd == b->nd || a->n == 1 || b->n == 1)) {
         double *x = (double *)a->p, *y = (double *)b->p, *r = (double *)o->p;
         int64_t n = o->n, sa = a->n == 1 ? 0 : 1, sb = b->n == 1 ? 0 : 1;
+        if (sb == 0 && sa == 1) {            /* tensor op number: a loop the compiler vectorizes */
+            double v = y[0];
+            switch (op) {
+            case E_ADD: for (int64_t i = 0; i < n; i++) r[i] = x[i] + v; return a_obj(o);
+            case E_SUB: for (int64_t i = 0; i < n; i++) r[i] = x[i] - v; return a_obj(o);
+            case E_MUL: for (int64_t i = 0; i < n; i++) r[i] = x[i] * v; return a_obj(o);
+            case E_DIV: for (int64_t i = 0; i < n; i++) r[i] = x[i] / v; return a_obj(o);
+            default: break;
+            }
+        } else if (sa == 0 && sb == 1) {
+            double v = x[0];
+            switch (op) {
+            case E_ADD: for (int64_t i = 0; i < n; i++) r[i] = v + y[i]; return a_obj(o);
+            case E_SUB: for (int64_t i = 0; i < n; i++) r[i] = v - y[i]; return a_obj(o);
+            case E_MUL: for (int64_t i = 0; i < n; i++) r[i] = v * y[i]; return a_obj(o);
+            case E_DIV: for (int64_t i = 0; i < n; i++) r[i] = v / y[i]; return a_obj(o);
+            default: break;
+            }
+        } else if (sa == 1 && sb == 1) {
+            switch (op) {
+            case E_ADD: for (int64_t i = 0; i < n; i++) r[i] = x[i] + y[i]; return a_obj(o);
+            case E_SUB: for (int64_t i = 0; i < n; i++) r[i] = x[i] - y[i]; return a_obj(o);
+            case E_MUL: for (int64_t i = 0; i < n; i++) r[i] = x[i] * y[i]; return a_obj(o);
+            case E_DIV: for (int64_t i = 0; i < n; i++) r[i] = x[i] / y[i]; return a_obj(o);
+            default: break;
+            }
+        }
         switch (op) {
         case E_ADD: for (int64_t i = 0; i < n; i++) r[i] = x[i * sa] + y[i * sb]; return a_obj(o);
         case E_SUB: for (int64_t i = 0; i < n; i++) r[i] = x[i * sa] - y[i * sb]; return a_obj(o);
@@ -323,6 +405,14 @@ static AV ewise(int op, AV av, AV bv) {
         } else if (a->dt == DT_F32) { float *x = (float *)a->p; double y = t_get(b, 0); for (int64_t i = 0; i < n; i++) r[i] = (float)eop(op, x[i], y); }
         else { double x = t_get(a, 0); float *y = (float *)b->p; for (int64_t i = 0; i < n; i++) r[i] = (float)eop(op, x, y[i]); }
         return a_obj(o);
+    }
+    if ((dt == DT_F64 || dt == DT_F32) && nd >= 1 && o->n > 0 && op <= E_MIN) {
+        int sp = a_ntmp;
+        AV ca = a->dt == dt ? av : tcopy(a, dt); A_PUSH(ca);
+        AV cb = b->dt == dt ? bv : tcopy(b, dt); A_PUSH(cb);
+        AV r = ewise_rows(op, TT(ca), TT(cb), dt, nd, osh);
+        a_ntmp = sp;
+        if (r.t != T_NONE) return r;
     }
     int64_t sa[MAXD], sb[MAXD], idx[MAXD] = {0};
     bstrides(a, nd, osh, sa); bstrides(b, nd, osh, sb);
@@ -368,6 +458,60 @@ static inline double uop(int op, double x) {
     default: return NAN;
     }
 }
+
+/* ------------------------------------------------------------------ vector-friendly exp / expm1 / tanh (float64)
+ * branch-free so that loops over arrays become SIMD code; about 1 ulp (exp) and 2 ulp (expm1, tanh) */
+static inline double vexpm1_r(double r) {         /* expm1 on |r| <= ln2/2, Taylor to r^14 */
+    double p = 1.0 / 87178291200.0;
+    p = p * r + 1.0 / 6227020800.0; p = p * r + 1.0 / 479001600.0; p = p * r + 1.0 / 39916800.0;
+    p = p * r + 1.0 / 3628800.0; p = p * r + 1.0 / 362880.0; p = p * r + 1.0 / 40320.0; p = p * r + 1.0 / 5040.0;
+    p = p * r + 1.0 / 720.0; p = p * r + 1.0 / 120.0; p = p * r + 1.0 / 24.0; p = p * r + 1.0 / 6.0; p = p * r + 0.5;
+    return r + r * r * p;
+}
+static inline double vldexp(double x, double k) {      /* x * 2^k for whole k in [-1022, 1023], no int conversion */
+    double m = k + 6755399441055744.0;                   /* 2^52 + 2^51: k now sits in the low bits */
+    uint64_t b; memcpy(&b, &m, 8); b = (b + 1023) << 52;
+    double s; memcpy(&s, &b, 8); return x * s;
+}
+static inline double vexp(double x) {
+    double xc = x > 709.0 ? 709.0 : (x < -708.0 ? -708.0 : x);
+    double k = __builtin_rint(xc * 1.4426950408889634);
+    double r = (xc - k * 0.6931471803691238) - k * 1.9082149292705877e-10;
+    double y = vldexp(vexpm1_r(r) + 1.0, k);
+    y = x > 709.78 ? __builtin_inf() : y;
+    y = x < -745.2 ? 0.0 : y;
+    return x != x ? x : y;
+}
+static inline double vexpm1(double x) {
+    double xc = x > 709.0 ? 709.0 : (x < -60.0 ? -60.0 : x);
+    double k = __builtin_rint(xc * 1.4426950408889634);
+    double r = (xc - k * 0.6931471803691238) - k * 1.9082149292705877e-10;
+    double e = vexpm1_r(r);
+    double y = k == 0.0 ? e : vldexp(e + 1.0, k) - 1.0;
+    return x != x ? x : (x > 709.78 ? __builtin_inf() : y);
+}
+static inline double vtanh(double x) {
+    double ax = x < 0 ? -x : x;
+    double e = vexpm1(-2.0 * (ax > 20.0 ? 20.0 : ax));   /* e^{-2|x|} - 1, exact for small x */
+    double t = -e / (e + 2.0);
+    return x < 0 ? -t : t;
+}
+static void vec_unary(int op, const double *x, double *r, int64_t n) {
+    switch (op) {
+    case U_EXP: for (int64_t i = 0; i < n; i++) r[i] = vexp(x[i]); break;
+    case U_TANH: for (int64_t i = 0; i < n; i++) r[i] = vtanh(x[i]); break;
+    case U_SIGMOID: for (int64_t i = 0; i < n; i++) r[i] = 1.0 / (1.0 + vexp(-x[i])); break;
+    case U_GELU: for (int64_t i = 0; i < n; i++) { double v = x[i]; r[i] = 0.5 * v * (1.0 + vtanh(0.7978845608028654 * (v + 0.044715 * v * v * v))); } break;
+    case U_SILU: for (int64_t i = 0; i < n; i++) r[i] = x[i] / (1.0 + vexp(-x[i])); break;
+    case U_RELU: for (int64_t i = 0; i < n; i++) r[i] = x[i] > 0 ? x[i] : 0.0; break;
+    case U_NEG: for (int64_t i = 0; i < n; i++) r[i] = -x[i]; break;
+    case U_SQRT: for (int64_t i = 0; i < n; i++) r[i] = __builtin_sqrt(x[i]); break;
+    case U_SQUARE: for (int64_t i = 0; i < n; i++) r[i] = x[i] * x[i]; break;
+    case U_ABS: for (int64_t i = 0; i < n; i++) r[i] = x[i] < 0 ? -x[i] : x[i]; break;
+    default: for (int64_t i = 0; i < n; i++) r[i] = uop(op, x[i]); break;
+    }
+}
+
 static AV unary(int op, AV v) {
     if (on_dev(v)) return d_unary(op, v);
     ATensor *a = TT(v);
@@ -375,88 +519,30 @@ static AV unary(int op, AV v) {
     if (op == U_NOT || op == U_ISNAN || op == U_ISFINITE) dt = DT_BOOL;
     else if (dt == DT_BOOL || (dt == DT_I64 && !(op == U_NEG || op == U_ABS || op == U_RELU || op == U_SIGN || op == U_SQUARE || op == U_FLOOR || op == U_CEIL || op == U_ROUND))) dt = DT_F64;
     ATensor *o = t_like(a, dt);
-    if (a->dt == DT_F64 && dt == DT_F64) { double *x = (double *)a->p, *r = (double *)o->p; for (int64_t i = 0; i < a->n; i++) r[i] = uop(op, x[i]); }
+    if (a->dt == DT_F64 && dt == DT_F64) vec_unary(op, (const double *)a->p, (double *)o->p, a->n);
     else if (a->dt == DT_F32 && dt == DT_F32) { float *x = (float *)a->p, *r = (float *)o->p; for (int64_t i = 0; i < a->n; i++) r[i] = (float)uop(op, x[i]); }
     else for (int64_t i = 0; i < a->n; i++) t_set(o, i, uop(op, t_get(a, i)));
     return a_obj(o);
 }
 
-/* ------------------------------------------------------------------ matrix products (blocked, on every core) */
-typedef struct { const double *A, *B; double *C; int64_t M, N, K, r0, r1; } GJob;
-typedef struct { const float *A, *B; float *C; int64_t M, N, K, r0, r1; } GJobF;
-static void gemm_rows(GJob *j) {
-    const int64_t N = j->N, K = j->K; const double *A = j->A, *B = j->B; double *C = j->C;
-    for (int64_t kk = 0; kk < K; kk += 256) {
-        int64_t ke = kk + 256 < K ? kk + 256 : K;
-        for (int64_t i = j->r0; i < j->r1; i++) {
-            double *c = C + i * N; const double *a = A + i * K;
-            for (int64_t k = kk; k < ke; k++) { double x = a[k]; if (x == 0) continue; const double *b = B + k * N; for (int64_t q = 0; q < N; q++) c[q] += x * b[q]; }
-        }
+/* ------------------------------------------------------------------ matrix products (apsi_gemm.c) */
+void a_gemm_d(const double *A, const double *B, double *C, int64_t M, int64_t N, int64_t K, int parallel, int add);
+void a_gemm_f(const float *A, const float *B, float *C, int64_t M, int64_t N, int64_t K, int parallel, int add);
+int a_threads(void);
+void a_parallel(void (*fn)(void *, int64_t), void *ctx, int64_t ntasks);
+typedef struct { ATensor *a, *b, *o; int64_t M, N, K; int nb, ba, bb; const int64_t *bsh; int dt; int par; } MMJob;
+static void mm_one(void *p, int64_t q) {
+    MMJob *j = (MMJob *)p; ATensor *a = j->a, *b = j->b;
+    int64_t ia = 0, ib = 0, rem = q, mul_a = 1, mul_b = 1;
+    for (int i = j->nb - 1; i >= 0; i--) {
+        int64_t d = rem % j->bsh[i]; rem /= j->bsh[i];
+        int ai = i - (j->nb - j->ba), bi = i - (j->nb - j->bb);
+        if (ai >= 0) { if (a->sh[ai] != 1) ia += d * mul_a; mul_a *= a->sh[ai]; }
+        if (bi >= 0) { if (b->sh[bi] != 1) ib += d * mul_b; mul_b *= b->sh[bi]; }
     }
-}
-static void gemm_rows_f(GJobF *j) {
-    const int64_t N = j->N, K = j->K; const float *A = j->A, *B = j->B; float *C = j->C;
-    for (int64_t kk = 0; kk < K; kk += 512) {
-        int64_t ke = kk + 512 < K ? kk + 512 : K;
-        for (int64_t i = j->r0; i < j->r1; i++) {
-            float *c = C + i * N; const float *a = A + i * K;
-            for (int64_t k = kk; k < ke; k++) { float x = a[k]; if (x == 0) continue; const float *b = B + k * N; for (int64_t q = 0; q < N; q++) c[q] += x * b[q]; }
-        }
-    }
-}
-static int n_threads(void) {
-    static int n = 0;
-    if (!n) {
-        const char *e = getenv("APSI_THREADS");
-#ifdef _WIN32
-        SYSTEM_INFO si; GetSystemInfo(&si); n = e ? atoi(e) : (int)si.dwNumberOfProcessors;
-#else
-        long c = sysconf(_SC_NPROCESSORS_ONLN); n = e ? atoi(e) : (int)(c > 0 ? c : 1);
-#endif
-        if (n < 1) n = 1; if (n > 64) n = 64;
-    }
-    return n;
-}
-#ifdef _WIN32
-static DWORD WINAPI gemm_thread(LPVOID p) { gemm_rows((GJob *)p); return 0; }
-static DWORD WINAPI gemm_thread_f(LPVOID p) { gemm_rows_f((GJobF *)p); return 0; }
-#else
-static void *gemm_thread(void *p) { gemm_rows((GJob *)p); return NULL; }
-static void *gemm_thread_f(void *p) { gemm_rows_f((GJobF *)p); return NULL; }
-#endif
-static void gemm(const double *A, const double *B, double *C, int64_t M, int64_t N, int64_t K) {
-    int T = n_threads(); if ((double)M * N * K < 2e5 || M < 2) T = 1; if (T > M) T = (int)M;
-    GJob jobs[64];
-    for (int t = 0; t < T; t++) { jobs[t] = (GJob){A, B, C, M, N, K, M * t / T, M * (t + 1) / T}; }
-#ifndef _WIN32
-    pthread_t th[64];
-    for (int t = 1; t < T; t++) pthread_create(&th[t], NULL, gemm_thread, &jobs[t]);
-    gemm_rows(&jobs[0]);
-    for (int t = 1; t < T; t++) pthread_join(th[t], NULL);
-#else
-    HANDLE th[64];
-    for (int t = 1; t < T; t++) th[t] = CreateThread(NULL, 0, gemm_thread, &jobs[t], 0, NULL);
-    gemm_rows(&jobs[0]);
-    if (T > 1) WaitForMultipleObjects((DWORD)(T - 1), th + 1, TRUE, INFINITE);
-    for (int t = 1; t < T; t++) CloseHandle(th[t]);
-#endif
-}
-static void gemm_f(const float *A, const float *B, float *C, int64_t M, int64_t N, int64_t K) {
-    int T = n_threads(); if ((double)M * N * K < 2e5 || M < 2) T = 1; if (T > M) T = (int)M;
-    GJobF jobs[64];
-    for (int t = 0; t < T; t++) { jobs[t] = (GJobF){A, B, C, M, N, K, M * t / T, M * (t + 1) / T}; }
-#ifndef _WIN32
-    pthread_t th[64];
-    for (int t = 1; t < T; t++) pthread_create(&th[t], NULL, gemm_thread_f, &jobs[t]);
-    gemm_rows_f(&jobs[0]);
-    for (int t = 1; t < T; t++) pthread_join(th[t], NULL);
-#else
-    HANDLE th[64];
-    for (int t = 1; t < T; t++) th[t] = CreateThread(NULL, 0, gemm_thread_f, &jobs[t], 0, NULL);
-    gemm_rows_f(&jobs[0]);
-    if (T > 1) WaitForMultipleObjects((DWORD)(T - 1), th + 1, TRUE, INFINITE);
-    for (int t = 1; t < T; t++) CloseHandle(th[t]);
-#endif
+    int64_t M = j->M, N = j->N, K = j->K;
+    if (j->dt == DT_F64) a_gemm_d((double *)a->p + ia * M * K, (double *)b->p + ib * K * N, (double *)j->o->p + q * M * N, M, N, K, j->par, 0);
+    else a_gemm_f((float *)a->p + ia * M * K, (float *)b->p + ib * K * N, (float *)j->o->p + q * M * N, M, N, K, j->par, 0);
 }
 static AV matmul(AV av, AV bv) {
     if (on_dev(av) || on_dev(bv)) return d_matmul(av, bv);
@@ -483,18 +569,15 @@ static AV matmul(AV av, AV bv) {
     AV bc = b->dt == dt ? bv : tcopy(b, dt); A_PUSH(bc);
     A_PUSH(a_obj(o));
     int64_t nbatch = prod(bsh, nb);
-    int64_t abatch = prod(a->sh, ba), bbatch = prod(b->sh, bb);
-    for (int64_t q = 0; q < nbatch; q++) {
-        int64_t ia = 0, ib = 0, rem = q, mul_a = 1, mul_b = 1;
-        for (int i = nb - 1; i >= 0; i--) {
-            int64_t d = rem % bsh[i]; rem /= bsh[i];
-            int ai = i - (nb - ba), bi = i - (nb - bb);
-            if (ai >= 0) { if (a->sh[ai] != 1) ia += d * mul_a; mul_a *= a->sh[ai]; }
-            if (bi >= 0) { if (b->sh[bi] != 1) ib += d * mul_b; mul_b *= b->sh[bi]; }
-        }
-        (void)abatch; (void)bbatch;
-        if (dt == DT_F64) gemm((double *)TT(ac)->p + ia * M * K, (double *)TT(bc)->p + ib * K * N, (double *)o->p + q * M * N, M, N, K);
-        else gemm_f((float *)TT(ac)->p + ia * M * K, (float *)TT(bc)->p + ib * K * N, (float *)o->p + q * M * N, M, N, K);
+    /* a stack of products with no broadcasting of b and a 2-d b: one tall product */
+    if (b->nd == 2 && !a1 && nb > 0) {
+        MMJob j1 = {TT(ac), TT(bc), o, M * nbatch, N, K, 0, 0, 0, bsh, dt, 1};
+        mm_one(&j1, 0);
+    } else {
+        MMJob jb = {TT(ac), TT(bc), o, M, N, K, nb, ba, bb, bsh, dt, 0};
+        int small = (double)M * N * K < 2e6;
+        if (nbatch > 1 && small) a_parallel(mm_one, &jb, nbatch);            /* many small products: one per core */
+        else { jb.par = 1; for (int64_t q = 0; q < nbatch; q++) mm_one(&jb, q); }
     }
     a_ntmp = sp;
     if (ond == 0) return t_scalar(o, 0);
@@ -503,10 +586,43 @@ static AV matmul(AV av, AV bv) {
 
 /* ------------------------------------------------------------------ reductions */
 enum { R_SUM, R_MEAN, R_MAX, R_MIN, R_PROD, R_ARGMAX, R_ARGMIN, R_ANY, R_ALL, R_VAR, R_STD, R_LOGSUMEXP };
+
+/* sum / mean / max / min of float64 or float32 in typed loops (pairwise blocks for the sums, like NumPy) */
+#define RED_T(T)                                                                                               \
+    static double sum_##T(const T *x, int64_t n, int64_t st) {                                                 \
+        if (n <= 128) { double s0 = 0, s1 = 0, s2 = 0, s3 = 0; int64_t i = 0;                                  \
+            if (st == 1) for (; i + 4 <= n; i += 4) { s0 += x[i]; s1 += x[i + 1]; s2 += x[i + 2]; s3 += x[i + 3]; } \
+            for (; i < n; i++) s0 += x[i * st]; return (s0 + s1) + (s2 + s3); }                                \
+        int64_t h = n / 2; h -= h % 8; return sum_##T(x, h, st) + sum_##T(x + h * st, n - h, st);              \
+    }
+RED_T(double) RED_T(float)
+static int fast_reduce(int op, ATensor *a, int64_t outer, int64_t len, int64_t inner, ATensor *o) {
+    if (!(a->dt == DT_F64 || a->dt == DT_F32) || !(op == R_SUM || op == R_MEAN || op == R_MAX || op == R_MIN)) return 0;
+    for (int64_t p = 0; p < outer; p++) for (int64_t q = 0; q < inner; q++) {
+        int64_t base = p * len * inner + q; double acc;
+        if (op == R_SUM || op == R_MEAN) {
+            acc = a->dt == DT_F64 ? sum_double((const double *)a->p + base, len, inner) : sum_float((const float *)a->p + base, len, inner);
+            if (op == R_MEAN) acc /= (double)len;
+        } else {
+            acc = t_get(a, base);
+            if (a->dt == DT_F64) { const double *x = (const double *)a->p + base; for (int64_t k = 1; k < len; k++) { double v = x[k * inner]; if (op == R_MAX ? (v > acc || v != v) : (v < acc || v != v)) acc = v; } }
+            else { const float *x = (const float *)a->p + base; for (int64_t k = 1; k < len; k++) { double v = x[k * inner]; if (op == R_MAX ? (v > acc || v != v) : (v < acc || v != v)) acc = v; } }
+        }
+        t_set(o, p * inner + q, acc);
+    }
+    return 1;
+}
+
 static int norm_axis(int ax, int nd) { if (ax < 0) ax += nd; if (ax < 0 || ax >= nd) a_error("ValueError", "axis %d is out of range for %d dimensions", ax, nd); return ax; }
 static AV reduce(int op, AV v, AV axis, int keep, int ddof) {
     if (on_dev(v)) return d_reduce(op, v, axis, keep, ddof);
     ATensor *a = TT(v);
+    if (axis.t == T_NONE && (a->dt == DT_F64 || a->dt == DT_F32) && (op == R_SUM || op == R_MEAN || op == R_MAX || op == R_MIN) && a->n > 0) {
+        ATensor tmp1; tmp1.dt = DT_F64; double res; tmp1.p = &res; tmp1.dev = 0;
+        fast_reduce(op, a, 1, a->n, 1, &tmp1);
+        if (keep) { int64_t sh[MAXD]; for (int i = 0; i < a->nd; i++) sh[i] = 1; ATensor *o = t_new(a->dt, a->nd, sh); t_set(o, 0, res); return a_obj(o); }
+        return a_float(res);
+    }
     if (axis.t == T_NONE) {
         double acc; int64_t best = 0;
         if (a->n == 0 && (op == R_MAX || op == R_MIN || op == R_ARGMAX || op == R_ARGMIN)) a_error("ValueError", "max/min of an empty tensor");
@@ -535,6 +651,7 @@ static AV reduce(int op, AV v, AV axis, int keep, int ddof) {
              ((op == R_SUM || op == R_MAX || op == R_MIN || op == R_PROD) && (a->dt == DT_I64 || a->dt == DT_BOOL)) ? DT_I64 :
              a->dt == DT_F32 ? DT_F32 : DT_F64;
     ATensor *o = t_new(dt, ond, osh);
+    if (fast_reduce(op, a, outer, len, inner, o)) { if (ond == 0) return t_scalar(o, 0); return a_obj(o); }
     for (int64_t p = 0; p < outer; p++) for (int64_t q = 0; q < inner; q++) {
         int64_t base = p * len * inner + q;
         double acc = 0; int64_t best = 0;
@@ -576,6 +693,23 @@ static AV permute(AV v, const int *perm) {
     for (int i = 0; i < nd; i++) { osh[i] = a->sh[perm[i]]; ost[i] = ist[perm[i]]; }
     ATensor *o = t_new(a->dt, nd, osh);
     int es = dt_size[a->dt]; int64_t src = 0;
+    if (perm[nd - 1] == nd - 1) {                 /* the last axis stays: copy whole rows */
+        int64_t L = osh[nd - 1], rows = o->n / (L ? L : 1);
+        for (int64_t r = 0; r < rows; r++) {
+            memcpy((char *)o->p + r * L * es, (char *)a->p + src * es, (size_t)(L * es));
+            for (int d = nd - 2; d >= 0; d--) { idx[d]++; src += ost[d]; if (idx[d] < osh[d]) break; src -= ost[d] * osh[d]; idx[d] = 0; }
+        }
+        return a_obj(o);
+    }
+    if (es == 8 || es == 4) {
+        int64_t L = osh[nd - 1], ls = ost[nd - 1], rows = o->n / (L ? L : 1);
+        for (int64_t r = 0; r < rows; r++) {
+            if (es == 8) { double *dst = (double *)o->p + r * L; const double *s = (const double *)a->p + src; for (int64_t i = 0; i < L; i++) dst[i] = s[i * ls]; }
+            else { float *dst = (float *)o->p + r * L; const float *s = (const float *)a->p + src; for (int64_t i = 0; i < L; i++) dst[i] = s[i * ls]; }
+            for (int d = nd - 2; d >= 0; d--) { idx[d]++; src += ost[d]; if (idx[d] < osh[d]) break; src -= ost[d] * osh[d]; idx[d] = 0; }
+        }
+        return a_obj(o);
+    }
     for (int64_t i = 0; i < o->n; i++) {
         memcpy((char *)o->p + i * es, (char *)a->p + src * es, (size_t)es);
         for (int d = nd - 1; d >= 0; d--) { idx[d]++; src += ost[d]; if (idx[d] < osh[d]) break; src -= ost[d] * osh[d]; idx[d] = 0; }
@@ -797,6 +931,19 @@ static AV t_getitem_host(AV v, AV index) {
     int64_t st[MAXD], s = 1; for (int d = a->nd - 1; d >= 0; d--) { st[d] = s; s *= a->sh[d]; }
     int64_t cnt[MAXD] = {0};
     int es = dt_size[a->dt];
+    int last = a->nd - 1;
+    if (a->nd > 0 && sels[last].kind == 1 && sels[last].step == 1 && o->n > 0) {     /* whole runs of the last axis */
+        int64_t run = sels[last].len, nruns = o->n / (run ? run : 1);
+        for (int64_t r = 0; r < nruns; r++) {
+            int64_t src = sels[last].start;
+            for (int d = 0; d < last; d++) src += sel_pos(&sels[d], cnt[d], a->sh[d]) * st[d];
+            memcpy((char *)o->p + r * run * es, (char *)a->p + src * es, (size_t)(run * es));
+            for (int d = last - 1; d >= 0; d--) { if (sels[d].kind == 0) continue; if (++cnt[d] < sels[d].len) break; cnt[d] = 0; }
+        }
+        a_ntmp = sp;
+        if (ond == 0) return t_scalar(o, 0);
+        return a_obj(o);
+    }
     for (int64_t i = 0; i < o->n; i++) {
         int64_t src = 0;
         for (int d = 0; d < a->nd; d++) src += sel_pos(&sels[d], cnt[d], a->sh[d]) * st[d];
@@ -858,6 +1005,18 @@ static void t_setitem_host(AV v, AV index, AV val, int add) {
     bstrides(s, ond, osh, sst);
     int64_t st[MAXD], q = 1; for (int d = a->nd - 1; d >= 0; d--) { st[d] = q; q *= a->sh[d]; }
     int64_t cnt[MAXD] = {0}, ocnt[MAXD] = {0};
+    int last = a->nd - 1;
+    if (a->nd > 0 && sels[last].kind == 1 && sels[last].step == 1 && s->n == total && total > 0 && s->dt == a->dt && (a->dt == DT_F64 || a->dt == DT_F32)) {
+        int64_t run = sels[last].len, nruns = total / (run ? run : 1);       /* whole runs of the last axis */
+        for (int64_t r = 0; r < nruns; r++) {
+            int64_t dst = sels[last].start;
+            for (int d = 0; d < last; d++) dst += sel_pos(&sels[d], cnt[d], a->sh[d]) * st[d];
+            if (a->dt == DT_F64) { double *x = (double *)a->p + dst; const double *y = (const double *)s->p + r * run; if (add) for (int64_t i = 0; i < run; i++) x[i] += y[i]; else memcpy(x, y, (size_t)run * 8); }
+            else { float *x = (float *)a->p + dst; const float *y = (const float *)s->p + r * run; if (add) for (int64_t i = 0; i < run; i++) x[i] += y[i]; else memcpy(x, y, (size_t)run * 4); }
+            for (int d = last - 1; d >= 0; d--) { if (sels[d].kind == 0) continue; if (++cnt[d] < sels[d].len) break; cnt[d] = 0; }
+        }
+        a_ntmp = sp; return;
+    }
     for (int64_t i = 0; i < total; i++) {
         int64_t dst = 0, si = 0;
         for (int d = 0; d < a->nd; d++) dst += sel_pos(&sels[d], cnt[d], a->sh[d]) * st[d];
@@ -1114,8 +1273,11 @@ static AV unary_grad(int u, AV x, AV y, AV g) {     /* d op(x) / dx times g, fro
         /* d/dx 0.5 x (1 + tanh(k (x + c x^3))) */
         if (!is_t(x)) { double v = x.t == T_FLOAT ? x.f : (double)x.i, k = 0.7978845608028654, u = k * (v + 0.044715 * v * v * v), t = tanh(u);
             d = a_float(0.5 * (1 + t) + 0.5 * v * (1 - t * t) * k * (1 + 3 * 0.044715 * v * v)); break; }
-        ATensor *X = TT(x), *o = t_like(X, X->dt == DT_F32 ? DT_F32 : DT_F64);
-        for (int64_t i = 0; i < X->n; i++) { double v = t_get(X, i), k = 0.7978845608028654, u = k * (v + 0.044715 * v * v * v), t = tanh(u);
+        ATensor *X = TT(x), *o = t_new(X->dt == DT_F32 ? DT_F32 : DT_F64, X->nd, X->sh);
+        if (X->dt == DT_F64) { const double *xs = (const double *)X->p; double *r = (double *)o->p;
+            for (int64_t i = 0; i < X->n; i++) { double v = xs[i], k = 0.7978845608028654, u = k * (v + 0.044715 * v * v * v), t = vtanh(u);
+                r[i] = 0.5 * (1 + t) + 0.5 * v * (1 - t * t) * k * (1 + 3 * 0.044715 * v * v); } }
+        else for (int64_t i = 0; i < X->n; i++) { double v = t_get(X, i), k = 0.7978845608028654, u = k * (v + 0.044715 * v * v * v), t = tanh(u);
             t_set(o, i, 0.5 * (1 + t) + 0.5 * v * (1 - t * t) * k * (1 + 3 * 0.044715 * v * v)); }
         d = a_obj(o); break;
     }
@@ -1142,6 +1304,16 @@ static AV expand_axis(AV g, AV like, AV axis, int keep) {   /* the gradient of a
         for (int i = 0; i < L->nd; i++) sh[nd++] = i == ax ? 1 : L->sh[i];
         g = is_t(deepval(g)) ? t_reshape_any(g, nd, sh) : t_reshape_any(is_n(g) ? g : as_tensor(g), nd, sh);
         A_PUSH(g);
+    }
+    AV gv = deepval(g);
+    if (!is_n(g) && !L->dev && (is_t(gv) ? !TT(gv)->dev : 1)) {      /* a plain copy along the broadcast axes */
+        AV gt = as_tensor(gv); A_PUSH(gt);
+        int dt = L->dt == DT_F32 ? DT_F32 : DT_F64;
+        if (TT(gt)->dt != dt) { gt = tcopy(TT(gt), dt); A_PUSH(gt); }
+        ATensor zero; memset(&zero, 0, sizeof zero); zero.dt = (uint8_t)dt; zero.nd = 0; zero.n = 1; double zv = 0; float zf = 0; zero.p = dt == DT_F64 ? (void *)&zv : (void *)&zf;
+        int64_t osh[MAXD]; int nd = bshape(L, TT(gt), osh);
+        AV r = ewise_rows(E_ADD, TT(gt), &zero, dt, nd, osh);
+        if (r.t != T_NONE) { a_ntmp = sp; return r; }
     }
     AV z = a_obj(t_like(L, L->dt == DT_F32 ? DT_F32 : DT_F64)); A_PUSH(z);
     AV r = a_binop(OP_ADD, z, g);
@@ -1344,6 +1516,32 @@ AV a_tensor_binop(int op, AV a, AV b) {
     a_ntmp = sp;
     return r;
 }
+/* a op= b into a's own buffer: a is a temporary the compiled program will not read again (NumPy's elision) */
+AV a_tensor_binop_into(int op, AV a, AV b) {
+    if (!is_t(a) || is_n(b) || TT(a)->dev || (TT(a)->dt != DT_F64 && TT(a)->dt != DT_F32) || !(op == OP_ADD || op == OP_SUB || op == OP_MUL || op == OP_DIV))
+        return a_binop(op, a, b);
+    ATensor *A = TT(a);
+    if (is_num(b)) {
+        double v = b.t == T_FLOAT ? b.f : (double)b.i;
+        if (A->dt == DT_F64) { double *x = (double *)A->p; int64_t n = A->n;
+            switch (op) { case OP_ADD: for (int64_t i = 0; i < n; i++) x[i] += v; break; case OP_SUB: for (int64_t i = 0; i < n; i++) x[i] -= v; break;
+                          case OP_MUL: for (int64_t i = 0; i < n; i++) x[i] *= v; break; default: for (int64_t i = 0; i < n; i++) x[i] /= v; break; } }
+        else { float *x = (float *)A->p; float f = (float)v; int64_t n = A->n;
+            switch (op) { case OP_ADD: for (int64_t i = 0; i < n; i++) x[i] += f; break; case OP_SUB: for (int64_t i = 0; i < n; i++) x[i] -= f; break;
+                          case OP_MUL: for (int64_t i = 0; i < n; i++) x[i] *= f; break; default: for (int64_t i = 0; i < n; i++) x[i] /= f; break; } }
+        return a;
+    }
+    if (!is_t(b) || TT(b)->dev || TT(b)->dt != A->dt || TT(b)->n != A->n || TT(b)->nd != A->nd) return a_binop(op, a, b);
+    for (int i = 0; i < A->nd; i++) if (TT(b)->sh[i] != A->sh[i]) return a_binop(op, a, b);
+    int64_t n = A->n;
+    if (A->dt == DT_F64) { double *x = (double *)A->p; const double *y = (const double *)TT(b)->p;
+        switch (op) { case OP_ADD: for (int64_t i = 0; i < n; i++) x[i] += y[i]; break; case OP_SUB: for (int64_t i = 0; i < n; i++) x[i] -= y[i]; break;
+                      case OP_MUL: for (int64_t i = 0; i < n; i++) x[i] *= y[i]; break; default: for (int64_t i = 0; i < n; i++) x[i] /= y[i]; break; } }
+    else { float *x = (float *)A->p; const float *y = (const float *)TT(b)->p;
+        switch (op) { case OP_ADD: for (int64_t i = 0; i < n; i++) x[i] += y[i]; break; case OP_SUB: for (int64_t i = 0; i < n; i++) x[i] -= y[i]; break;
+                      case OP_MUL: for (int64_t i = 0; i < n; i++) x[i] *= y[i]; break; default: for (int64_t i = 0; i < n; i++) x[i] /= y[i]; break; } }
+    return a;
+}
 AV a_tensor_neg(AV a) {
     if (is_n(a)) { AV v = a_unop(OP_NEG, ND(a)->val); int sp = a_ntmp; A_PUSH(v); AV r = node_new(v, N_NEG, a, A_NONE, A_NONE); a_ntmp = sp; return r; }
     return unary(U_NEG, a);
@@ -1432,6 +1630,13 @@ static AV t_softmax(AV v, int ax, int logsm) {
     for (int64_t p = 0; p < outer; p++) for (int64_t q = 0; q < inner; q++) {
         int64_t base = p * len * inner + q; double m = -INFINITY, s = 0;
         for (int64_t k = 0; k < len; k++) { double x = t_get(a, base + k * inner); if (x > m) m = x; }
+        if (a->dt == DT_F64 && inner == 1) {
+            const double *x = (const double *)a->p + base; double *y = (double *)o->p + base;
+            for (int64_t k = 0; k < len; k++) { y[k] = vexp(x[k] - m); s += y[k]; }
+            if (logsm) { double ls = log(s); for (int64_t k = 0; k < len; k++) y[k] = x[k] - m - ls; }
+            else { double inv = 1.0 / s; for (int64_t k = 0; k < len; k++) y[k] *= inv; }
+            continue;
+        }
         for (int64_t k = 0; k < len; k++) s += exp(t_get(a, base + k * inner) - m);
         double ls = log(s);
         for (int64_t k = 0; k < len; k++) { double x = t_get(a, base + k * inner) - m; t_set(o, base + k * inner, logsm ? x - ls : exp(x - ls)); }
@@ -1447,13 +1652,13 @@ static AV softmax_any(AV x, int ax, int logsm) {
 #define BI(name) static AV name(int n, AV *a, ADict *kw, AV self)
 #define UNUSED (void)n; (void)a; (void)kw; (void)self
 BI(tb_tensor) { (void)self; if (!n) a_error("TypeError", "tensor() needs a value"); AV x = val_of(a[0]); if (is_t(x)) return tcopy(TT(x), dt_from_name(n > 1 ? a[1] : kwget(kw, "dtype"))); return t_from(x, dt_from_name(n > 1 ? a[1] : kwget(kw, "dtype"))); }
-static AV filled(int n, AV *a, ADict *kw, double v) { int64_t sh[MAXD]; int nd = shape_args(n, a, sh); int dt = dt_from_name(kwget(kw, "dtype")); ATensor *t = t_new(dt < 0 ? DT_F64 : dt, nd, sh); if (v != 0) for (int64_t i = 0; i < t->n; i++) t_set(t, i, v); return a_obj(t); }
+static AV filled(int n, AV *a, ADict *kw, double v) { int64_t sh[MAXD]; int nd = shape_args(n, a, sh); int dt = dt_from_name(kwget(kw, "dtype")); ATensor *t = t_zeros(dt < 0 ? DT_F64 : dt, nd, sh); if (v != 0) for (int64_t i = 0; i < t->n; i++) t_set(t, i, v); return a_obj(t); }
 BI(tb_zeros) { (void)self; return filled(n, a, kw, 0.0); }
 BI(tb_ones) { (void)self; return filled(n, a, kw, 1.0); }
 BI(tb_full) { UNUSED; int64_t sh[MAXD]; int nd = shape_args(1, a, sh); if (!(a_is(a[0], O_LIST) || a_is(a[0], O_TUPLE))) { nd = 1; sh[0] = a[0].i; } ATensor *t = t_new(a[1].t == T_INT ? DT_I64 : a[1].t == T_BOOL ? DT_BOOL : DT_F64, nd, sh); double v = a[1].t == T_FLOAT ? a[1].f : (double)a[1].i; for (int64_t i = 0; i < t->n; i++) t_set(t, i, v); return a_obj(t); }
 BI(tb_zeros_like) { UNUSED; AV x = as_tensor(val_of(a[0])); return a_obj(t_like(TT(x), TT(x)->dt)); }
 BI(tb_ones_like) { UNUSED; AV x = as_tensor(val_of(a[0])); ATensor *t = t_like(TT(x), TT(x)->dt); for (int64_t i = 0; i < t->n; i++) t_set(t, i, 1); return a_obj(t); }
-BI(tb_eye) { UNUSED; int64_t sh[2] = {a[0].i, n > 1 ? a[1].i : a[0].i}; ATensor *t = t_new(DT_F64, 2, sh); for (int64_t i = 0; i < sh[0] && i < sh[1]; i++) t_set(t, i * sh[1] + i, 1); return a_obj(t); }
+BI(tb_eye) { UNUSED; int64_t sh[2] = {a[0].i, n > 1 ? a[1].i : a[0].i}; ATensor *t = t_zeros(DT_F64, 2, sh); for (int64_t i = 0; i < sh[0] && i < sh[1]; i++) t_set(t, i * sh[1] + i, 1); return a_obj(t); }
 BI(tb_arange) {
     UNUSED;
     AV start = n > 1 ? a[0] : a_int(0), stop = n > 1 ? a[1] : a[0], step = n > 2 ? a[2] : a_int(1);

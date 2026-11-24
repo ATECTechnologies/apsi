@@ -2057,7 +2057,8 @@ static int ncpu(void) { long n = sysconf(_SC_NPROCESSORS_ONLN); return n > 0 ? (
 static AV b_cpu_threads(int n, AV *a, ADict *kw, AV self) { (void)n; (void)a; (void)kw; (void)self; return a_int(ncpu()); }
 static AV b_clock(int n, AV *a, ADict *kw, AV self) {
     (void)n; (void)a; (void)kw; (void)self;
-    struct timespec ts; timespec_get(&ts, TIME_UTC); return a_float((double)ts.tv_sec + ts.tv_nsec * 1e-9);
+    struct timespec ts; timespec_get(&ts, TIME_UTC); static const int16_t sec[7] = {0, 0, 60, 0, 0, 0, 0};
+    return a_qty((double)ts.tv_sec + ts.tv_nsec * 1e-9, sec, NULL, 1.0);       /* seconds, as in apsi run */
 }
 static AV b_getenv(int n, AV *a, ADict *kw, AV self) { (void)kw; (void)self; const char *v = getenv(STR(a_to_str(a[0]))->s); return v ? a_str(v) : (n > 1 ? a[1] : A_NONE); }
 static AV b_write_out(int n, AV *a, ADict *kw, AV self) { (void)kw; (void)self; for (int i = 0; i < n; i++) { AV s = a_to_str(a[i]); fwrite(STR(s)->s, 1, (size_t)STR(s)->len, stdout); } return A_NONE; }

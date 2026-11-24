@@ -140,6 +140,7 @@ void a_note_alloc(size_t bytes);
 void a_mark_value(AV v);
 AV a_tensor_binop(int op, AV a, AV b);
 AV a_tensor_neg(AV a);
+AV a_tensor_binop_into(int op, AV a, AV b);
 AV a_tensor_cmp(int op, AV a, AV b);
 AV a_tensor_unary(int u, AV v);
 AV a_tensor_where(AV c, AV a, AV b);
@@ -171,6 +172,11 @@ enum { OP_ADD = 1, OP_SUB, OP_MUL, OP_DIV, OP_FLOORDIV, OP_MOD, OP_POW, OP_MATMU
 static inline AV a_add(AV a, AV b) { int64_t r; if (a.t == T_INT && b.t == T_INT && !__builtin_add_overflow(a.i, b.i, &r)) return a_int(r); if (a.t == T_FLOAT && b.t == T_FLOAT) return a_float(a.f + b.f); return a_binop(OP_ADD, a, b); }
 static inline AV a_sub(AV a, AV b) { int64_t r; if (a.t == T_INT && b.t == T_INT && !__builtin_sub_overflow(a.i, b.i, &r)) return a_int(r); if (a.t == T_FLOAT && b.t == T_FLOAT) return a_float(a.f - b.f); return a_binop(OP_SUB, a, b); }
 static inline AV a_mul(AV a, AV b) { int64_t r; if (a.t == T_INT && b.t == T_INT && !__builtin_mul_overflow(a.i, b.i, &r)) return a_int(r); if (a.t == T_FLOAT && b.t == T_FLOAT) return a_float(a.f * b.f); return a_binop(OP_MUL, a, b); }
+/* a op b where a is a temporary nobody else holds: a tensor's buffer is reused */
+static inline AV a_binop_tmp(int op, AV a, AV b) {
+    if (a.t == T_OBJ && a.o->kind == O_TENSOR) return a_tensor_binop_into(op, a, b);
+    switch (op) { case OP_ADD: return a_add(a, b); case OP_SUB: return a_sub(a, b); case OP_MUL: return a_mul(a, b); default: return a_binop(op, a, b); }
+}
 static inline int a_lt(AV a, AV b) { if (a.t == T_INT && b.t == T_INT) return a.i < b.i; if (a.t == T_FLOAT && b.t == T_FLOAT) return a.f < b.f; return a_compare(OP_LT, a, b); }
 static inline int a_le(AV a, AV b) { if (a.t == T_INT && b.t == T_INT) return a.i <= b.i; if (a.t == T_FLOAT && b.t == T_FLOAT) return a.f <= b.f; return a_compare(OP_LE, a, b); }
 static inline int a_gt(AV a, AV b) { if (a.t == T_INT && b.t == T_INT) return a.i > b.i; if (a.t == T_FLOAT && b.t == T_FLOAT) return a.f > b.f; return a_compare(OP_GT, a, b); }

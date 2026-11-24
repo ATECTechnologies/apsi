@@ -1419,6 +1419,11 @@ class CGen:
     def e_Binary(self, e):
         a = self.hold(self.expr(e.left))
         b = self.expr(e.right)
+        fresh = (isinstance(e.left, A.Binary) and e.left.op in ("+", "-", "*", "/")) or \
+            (isinstance(e.left, A.Unary) and e.left.op == "-" and not isinstance(e.left.operand, A.Num))
+        if fresh and e.op in ("+", "-", "*", "/"):
+            # the left side was just made by an operator and nothing else holds it: reuse its buffer
+            return self.hold(f"a_binop_tmp({BINOPS[e.op]}, {a}, {b})")
         if e.op in FAST_BIN:
             return self.hold(f"{FAST_BIN[e.op]}({a}, {b})")
         if e.op in ("<", "<=", ">", ">=", "==", "!="):
