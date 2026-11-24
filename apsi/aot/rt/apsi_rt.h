@@ -159,7 +159,11 @@ void a_tensor_free(AObj *o);
 void a_tensor_init(void);
 static inline int a_is_tn(AV v) { return v.t == T_OBJ && (v.o->kind == O_TENSOR || v.o->kind == O_NODE); }
 AV a_cmp_slow(int op, AV a, AV b);
-AV a_gen_new(AFunc *fn, AFnCode body, int n, AV *args, ADict *kw);   /* a generator function's call */
+AV a_gen_new(AFunc *fn, AFnCode body, int n, AV *args, ADict *kw);
+AV a_coro_new(AFunc *fn, AFnCode body, int n, AV *args, ADict *kw);   /* an async fn's call */
+AV a_await(AV x);
+AV a_gen_step(AV g, AV send);
+int a_is_coro(AV v);   /* a generator function's call */
 AV a_yield(AV v);                                                   /* yield v: the value sent back in */
 int a_match_type(AV v, const char *t);
 AV a_match_field(AV v, int i);

@@ -1,0 +1,236 @@
+# asyncio for native programs: `import asyncio` / pyimport("asyncio") give this event loop over Apsi's coroutines
+# (async fn / await), with the parts of Python's asyncio that programs use most: run, sleep, gather, create_task,
+# wait_for, Event, Lock, Queue. One thread: the coroutines take turns at each await.
+
+class CancelledError(Exception):
+    pass
+
+class TimeoutError(Exception):
+    pass
+
+class QueueEmpty(Exception):
+    pass
+
+class InvalidStateError(Exception):
+    pass
+
+var _loop = none
+
+class Task:
+    fn __init__(self, coro, name=none):
+        self.coro = coro
+        self.done_ = false
+        self.result_ = none
+        self.exc = none
+        self.waiters = []
+        self.send = none
+        self.cancelled_ = false
+        self.name = name if name != none else "task"
+    fn done(self) = self.done_
+    fn cancelled(self) = self.cancelled_
+    fn result(self):
+        if not self.done_:
+            raise InvalidStateError("the task is not done")
+        if self.exc != none:
+            raise self.exc
+        return self.result_
+    fn exception(self) = self.exc
+    fn cancel(self):
+        if self.done_:
+            return false
+        self.cancelled_ = true
+        return true
+    fn __await__(self) = _wait_task(self)
+    fn __repr__(self) = f"<Task {self.name} {'done' if self.done_ else 'pending'}>"
+
+fn _wait_task(t):
+    while not t.done_:
+        yield ("wait", t)
+    if t.exc != none:
+        raise t.exc
+    return t.result_
+
+class Loop:
+    fn __init__(self):
+        self.ready = []
+        self.timers = []
+        self.count = 0
+
+    fn spawn(self, coro, name=none):
+        let t = coro if isinstance(coro, Task) else Task(coro, name)
+        self.ready.append(t)
+        return t
+
+    fn _finish(self, t, result, exc):
+        t.done_ = true
+        t.result_ = result
+        t.exc = exc
+        for w in t.waiters:
+            self.ready.append(w)
+        t.waiters = []
+
+    fn _step(self, t):
+        if t.done_:
+            return
+        if t.cancelled_:
+            self._finish(t, none, CancelledError(f"{t.name} was cancelled"))
+            return
+        var r = none
+        try:
+            r = __gen_step(t.coro, t.send)
+        except Exception as e:
+            self._finish(t, none, e)
+            return
+        t.send = none
+        if not r[0]:
+            self._finish(t, r[1], none)
+            return
+        let req = r[1]
+        if req == none:
+            self.ready.append(t)
+        elif req[0] == "sleep":
+            self.count = self.count + 1
+            self.timers.append([__time() + float(req[1]), self.count, t])
+        elif req[0] == "wait":
+            let other = req[1]
+            if other.done_:
+                self.ready.append(t)
+            else:
+                other.waiters.append(t)
+        else:
+            self.ready.append(t)
+
+    fn run_until(self, main):
+        while not main.done_:
+            if len(self.ready) > 0:
+                let batch = self.ready
+                self.ready = []
+                for t in batch:
+                    self._step(t)
+                continue
+            if len(self.timers) > 0:
+                var k = 0
+                for i in range(1, len(self.timers)):
+                    let a = self.timers[i]
+                    let b = self.timers[k]
+                    if a[0] < b[0] or (a[0] == b[0] and a[1] < b[1]):
+                        k = i
+                let due = self.timers[k]
+                let wait = due[0] - __time()
+                if wait > 0:
+                    __sleep(wait)
+                self.timers = self.timers[0:k] + self.timers[k + 1:]
+                self.ready.append(due[2])
+                continue
+            raise RuntimeError("asyncio: every task waits for another one (a deadlock)")
+        return main.result()
+
+fn _get_loop():
+    if _loop == none:
+        raise RuntimeError("no running event loop: start one with asyncio.run(main())")
+    return _loop
+
+fn run(main, debug=false):
+    if _loop != none:
+        raise RuntimeError("asyncio.run() cannot be called from a running event loop")
+    _loop = Loop()
+    try:
+        let t = _loop.spawn(main, "main")
+        return _loop.run_until(t)
+    finally:
+        _loop = none
+
+fn _sleep_gen(delay, result):
+    yield ("sleep", max(0.0, float(delay)))
+    return result
+
+fn sleep(delay, result=none) = _sleep_gen(delay, result)
+
+fn create_task(coro, name=none) = _get_loop().spawn(coro, name)
+
+fn ensure_future(aw) = aw if isinstance(aw, Task) else create_task(aw)
+
+async fn _gather(aws, return_exceptions):
+    let tasks = [ensure_future(a) for a in aws]
+    var out = []
+    for t in tasks:
+        if return_exceptions:
+            try:
+                out.append(await t)
+            except Exception as e:
+                out.append(e)
+        else:
+            out.append(await t)
+    return out
+
+fn gather(*aws, return_exceptions=false) = _gather(list(aws), return_exceptions)
+
+async fn _wait_for(aw, timeout):
+    let t = ensure_future(aw)
+    if timeout == none:
+        return await t
+    let deadline = __time() + float(timeout)
+    while not t.done_:
+        if __time() >= deadline:
+            t.cancel()
+            raise TimeoutError(f"timed out after {timeout} s")
+        await sleep(min(0.01, max(0.0, deadline - __time())))
+    return t.result()
+
+fn wait_for(aw, timeout) = _wait_for(aw, timeout)
+
+async fn _yield_now():
+    await sleep(0)
+
+fn current_task() = none
+
+class Event:
+    fn __init__(self):
+        self.flag = false
+    fn is_set(self) = self.flag
+    fn set(self):
+        self.flag = true
+    fn clear(self):
+        self.flag = false
+    async fn wait(self):
+        while not self.flag:
+            await sleep(0)
+        return true
+
+class Lock:
+    fn __init__(self):
+        self.held = false
+    fn locked(self) = self.held
+    async fn acquire(self):
+        while self.held:
+            await sleep(0)
+        self.held = true
+        return true
+    fn release(self):
+        self.held = false
+
+class Queue:
+    fn __init__(self, maxsize=0):
+        self.items = []
+        self.maxsize = maxsize
+    fn qsize(self) = len(self.items)
+    fn empty(self) = len(self.items) == 0
+    fn full(self) = self.maxsize > 0 and len(self.items) >= self.maxsize
+    async fn put(self, item):
+        while self.full():
+            await sleep(0)
+        self.items.append(item)
+    fn put_nowait(self, item):
+        self.items.append(item)
+    async fn get(self):
+        while len(self.items) == 0:
+            await sleep(0)
+        let v = self.items[0]
+        self.items = self.items[1:]
+        return v
+    fn get_nowait(self):
+        if len(self.items) == 0:
+            raise QueueEmpty("the queue is empty")
+        let v = self.items[0]
+        self.items = self.items[1:]
+        return v

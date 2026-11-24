@@ -445,6 +445,32 @@ let model = sequential([linear(32, 64), gpu_layer(scale_fwd, scale_bwd, init=sca
 - Layers you write as plain Apsi functions (`custom_layer`) still train with the GPU trainer: they run on the
   processor between the card's layers. `gpu_layer` is how to move such a part onto the card.
 
+## CUDA libraries
+
+Apsi needs only the NVIDIA driver: its kernels are built into Apsi and the driver compiles them for the card. CUDA
+libraries you install are used on top, for the operations they do best. Any CUDA line works (11, 12 or 13; a
+CUDA 12.6 toolkit is CUDA 12), and the newest one the driver runs is chosen.
+
+```bash
+apsi cuda                         # the driver, and the cuBLAS each program will use
+apsi cuda install                 # cuBLAS for your driver into ./.venv (made when missing)
+apsi cuda install --cuda 12       # a given line (the nvidia-cublas-cu12 wheel)
+apsi cuda install --user          # into ~/.apsi/cuda, for every program of this user
+```
+
+Programs look for cuBLAS in this order: `APSI_CUBLAS_PATH`, `CUDA_PATH` / `CUDA_HOME` (a CUDA Toolkit install), the
+active virtual environment, a `.venv` in the current folder, `~/.apsi/cuda`, the toolkit's default folders, then
+the system path. With cuBLAS, matrix products on the card go to it:
+
+| `APSI_GPU_MATH` | Matrix products |
+|---|---|
+| unset | exact float32 (the default) |
+| `tf32` | Tensor Cores with TF32 inputs (Ampere and newer) |
+| `bf16` | Tensor Cores with bfloat16 inputs, float32 sums |
+| `f16` | Tensor Cores with float16 inputs, float32 sums |
+
+`APSI_CUBLAS=0` turns cuBLAS off. Without it, Apsi's own kernels run and the results are the same.
+
 ## 7. Troubleshooting
 
 **"no NVIDIA GPU" / `lm.device` is `cpu`.** `lm.device_note` says why. Install or update the NVIDIA display driver

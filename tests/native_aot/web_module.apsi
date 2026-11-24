@@ -1,0 +1,24 @@
+use web
+let app = server(log=false)
+@app.get("/hello/{name}")
+fn hello(req) = {"hello": req.params["name"]}
+@app.get("/add/{a:int}/{b:int}")
+fn add(req) = {"sum": req.params["a"] + req.params["b"]}
+@app.post("/echo")
+fn echo(req) = req.json()
+@app.get("/boom")
+fn boom(req):
+    abort(418, "teapot")
+app.health()
+let r = app.handle("GET", "/hello/world")
+print(r.status, r.body)
+print(app.handle("GET", "/add/2/40").body, app.handle("GET", "/add/x/1").status)
+print(app.handle("POST", "/echo", {"a": 1}).body, app.handle("GET", "/echo").status, app.handle("GET", "/boom").body)
+print(app.handle("GET", "/health").body, app.handle("GET", "/nope").status)
+print(r.headers["X-Content-Type-Options"])
+let tok = jwt_sign({"sub": "u1"}, "secret")
+print(jwt_verify(tok, "secret")["sub"], jwt_verify(tok, "wrong"), jwt_verify("a.b.c", "secret"))
+let app2 = server(log=false)
+app2.before(require_api_key(["k1"]))
+app2.get("/x", fn(req) => "ok")
+print(app2.handle("GET", "/x").status, app2.handle("GET", "/x", headers={"X-API-Key": "k1"}).body)

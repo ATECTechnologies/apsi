@@ -1,0 +1,15 @@
+use data
+let p = from_range(10) |> map(fn(x) => x * 2) |> filter(fn(x) => x % 3 != 0)
+print(p.to_list())
+print([b for b in batch(from_list([1, 2, 3, 4, 5]), 2)])
+print(len(batch(from_range(10), 3)), take(from_range(100), 3).to_list(), skip(from_range(5), 3).to_list())
+let X = tensor([[1.0, 2.0], [3.0, 4.0], [5.0, 6.0]])
+let y = tensor([0.0, 1.0, 0.0])
+for xb, yb in from_tensors(X, y, batch=2):
+    print(xb, yb)
+print(repeat(from_list([1, 2]), 2).to_list(), shard(from_range(10), 3, 1).to_list())
+print([w for w in window(from_range(5), 3)])
+print(interleave([from_list([1, 2, 3]), from_list([10, 20])]).to_list(), len(from_list([5, 6]).map(fn(x) => x)))
+let sh = shuffle(from_range(10), seed=1).to_list()
+print(sorted(sh) == list(range(10)))
+print(unbatch(batch(from_list([1, 2, 3, 4]), 2)).to_list())

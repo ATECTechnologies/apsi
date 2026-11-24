@@ -1523,6 +1523,7 @@ def modules(core):
           "softmax": ops.softmax, "log_softmax": ops.log_softmax}
     linalg = {"inv": ops.inv, "det": ops.det, "solve": ops.solve, "eigh": ops.eigh,
               "eig": ops.eig, "svd": ops.svd, "trace": ops.trace, "norm": ops.norm}
+    linalg.update(_linalg_extra())
     rnd = {"seed": ops.seed, "randn": ops.randn, "rand": ops.rand, "randint": ops.randint,
            "permutation": ops.permutation}
     physics = dict(CONSTANTS)
@@ -1537,3 +1538,62 @@ def modules(core):
         "linalg": linalg,
         "random": rnd,
     }
+
+
+def _linalg_extra():
+    """The linalg functions added in 2.6.6 (the same in native programs): NumPy underneath."""
+    import numpy as np
+    from . import ops
+    from .errors import RuntimeErr
+
+    def a(x, what):
+        return ops._linalg_raw(what, x)
+
+    def norm(x, axis=None, ord=None):
+        if ord is None:
+            return ops.norm(x, axis=axis)
+        o = float("inf") if ord == float("inf") else ord
+        return ops.py(np.linalg.norm(a(x, "norm"), ord=o, axis=axis))
+
+    def slogdet(x):
+        s, l = np.linalg.slogdet(a(x, "slogdet"))
+        return (float(s), float(l))
+
+    def matrix_power(x, k):
+        return np.linalg.matrix_power(a(x, "matrix_power"), int(k))
+
+    def lstsq(x, b):
+        sol, res, rank, sv = np.linalg.lstsq(a(x, "lstsq"), a(b, "lstsq"), rcond=None)
+        return (sol, res, int(rank), sv)
+
+    def eig_values(x):
+        return ops.eig(x)[0]
+
+    def qr(x):
+        q, r = np.linalg.qr(a(x, "qr"))
+        return (q, r)
+
+    def matrix_rank(x, tol=None):
+        return int(np.linalg.matrix_rank(a(x, "matrix_rank"), tol=tol))
+
+    def pinv(x, rcond=None):
+        return np.linalg.pinv(a(x, "pinv"), rcond=1e-15 if rcond is None else rcond)
+
+    def cross(x, y):
+        return np.cross(a(x, "cross"), a(y, "cross"))
+
+    def check(f):
+        def g(*args):
+            try:
+                return f(*args)
+            except np.linalg.LinAlgError as e:
+                raise RuntimeErr(f"linalg: {e}")
+        g.__name__ = f.__name__
+        return g
+
+    return {"cholesky": check(lambda x: np.linalg.cholesky(a(x, "cholesky"))), "qr": check(qr),
+            "lstsq": check(lstsq), "pinv": check(pinv), "matrix_rank": matrix_rank,
+            "cond": check(lambda x: float(np.linalg.cond(a(x, "cond")))), "matrix_power": check(matrix_power),
+            "slogdet": slogdet, "eigvals": eig_values, "eigvalsh": lambda x: ops.eigh(x)[0],
+            "svdvals": lambda x: np.linalg.svd(a(x, "svdvals"), compute_uv=False),
+            "kron": lambda x, y: np.kron(a(x, "kron"), a(y, "kron")), "cross": cross, "norm": norm}

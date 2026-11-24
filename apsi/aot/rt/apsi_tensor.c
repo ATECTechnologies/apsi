@@ -1160,6 +1160,7 @@ static AV d_reduce(int op, AV v, AV axis, int keep, int ddof) {
     if (ond == 0) { float x; a_gpu_download(&x, o->p, 4); return a_float(x); }
     return a_obj(o);
 }
+int a_gpu_gemm_blas(const float *A, const float *B, float *C, int64_t M, int64_t N, int64_t K, int64_t batch, int64_t sa, int64_t sb);
 static AV d_matmul(AV av, AV bv) {
     int sp = a_ntmp;
     AV da = to_dev(av); A_PUSH(da); AV db = to_dev(bv); A_PUSH(db);
@@ -1181,6 +1182,7 @@ static AV d_matmul(AV av, AV bv) {
     }
     if (!ok) { AV ha = to_host(da); A_PUSH(ha); AV hb = to_host(db); A_PUSH(hb); AV r = matmul(ha, hb); if (is_t(r)) { A_PUSH(r); r = to_dev(r); } a_ntmp = sp; return r; }
     ATensor *o = d_new(DT_F32, ond, osh);
+    if (a_gpu_gemm_blas((const float *)a->p, (const float *)b->p, (float *)o->p, M, N, K, batch, sa0, sb0)) { a_ntmp = sp; return a_obj(o); }
     KArgs k = kargs(); k.M = M; k.N = N; k.K = K; k.a = (float *)a->p; k.b = (float *)b->p; k.c = (float *)o->p; k.sa[0] = sa0; k.sb[0] = sb0;
     int64_t tiles = ((M + 63) / 64) * ((N + 63) / 64);
     a_gpu_launch("k_gemm", &k, (unsigned)(tiles * batch), 256);
@@ -1222,7 +1224,8 @@ static AV d_where(AV c, AV a, AV b) {
 
 /* ================================================================== automatic differentiation */
 enum { N_LEAF, N_ADD, N_SUB, N_MUL, N_DIV, N_POW, N_NEG, N_MATMUL, N_UNARY, N_SUM, N_MEAN, N_RESHAPE, N_TRANSPOSE,
-       N_INDEX, N_SOFTMAX, N_LOGSOFTMAX, N_MAXRED, N_CONCAT, N_STACK, N_WHERE, N_MAXIMUM, N_PERMUTE, N_ABS, N_SQRT_Q };
+       N_INDEX, N_SOFTMAX, N_LOGSOFTMAX, N_MAXRED, N_CONCAT, N_STACK, N_WHERE, N_MAXIMUM, N_PERMUTE, N_ABS, N_SQRT_Q, N_CONV2D, N_MAXPOOL };
+static void conv_backward(AV g, AV a, AV b, AV opts); static void pool_backward(AV g, AV a, AV idx);
 static int64_t node_ids = 0;
 static AV node_new(AV val, int op, AV a, AV b, AV x) {
     ANode *n = (ANode *)a_alloc(sizeof(ANode), O_NODE);
@@ -1383,6 +1386,8 @@ static void backward_one(ANode *n) {
         if (is_n(b)) { AV t = gv_mul(n->val, a_tensor_unary(U_LOG, va)); A_PUSH(t); acc_grad(b, unbroadcast(gv_mul(g, t), vb)); }
         break;
     case N_NEG: acc_grad(a, gv_neg(g)); break;
+    case N_CONV2D: conv_backward(g, a, b, n->x); break;
+    case N_MAXPOOL: pool_backward(g, a, n->x); break;
     case N_MATMUL: {
         ATensor *A = TT(dva), *B = TT(dvb);
         if (is_n(a)) {
@@ -2008,7 +2013,13 @@ static AV tree_map_rec(AV f, int k, AV *trees) {
     if (a_is(t0, O_LIST) || a_is(t0, O_TUPLE)) {
         AList *l = (AList *)t0.o; AV out = t0.o->kind == O_LIST ? a_list(l->len, l->v) : a_tuple(l->len, l->v); A_PUSH(out);
         for (int64_t i = 0; i < l->len; i++) {
-            AV sub[8]; for (int j = 0; j < k; j++) sub[j] = ((AList *)trees[j].o)->v[i];
+            AV sub[8];
+            for (int j = 0; j < k; j++) {
+                if (!(a_is(trees[j], O_LIST) || a_is(trees[j], O_TUPLE)) || ((AList *)trees[j].o)->len != l->len)
+                    a_error("ValueError", "tree_map: the trees differ in structure (a list of %lld against %s)", (long long)l->len,
+                            a_is(trees[j], O_LIST) || a_is(trees[j], O_TUPLE) ? "a list of another length" : "something that is not a list");
+                sub[j] = ((AList *)trees[j].o)->v[i];
+            }
             ((AList *)out.o)->v[i] = tree_map_rec(f, k, sub);
         }
         a_ntmp = sp; return out;
@@ -2020,7 +2031,7 @@ static AV tree_map_rec(AV f, int k, AV *trees) {
         ADict *od = inst ? ((AInst *)out.o)->attrs : (ADict *)out.o;
         for (int64_t i = 0; i < d->nent; i++) if (d->e[i].used) {
             AV sub[8];
-            for (int j = 0; j < k; j++) { ADict *dj = a_is(trees[j], O_INST) ? ((AInst *)trees[j].o)->attrs : (ADict *)trees[j].o; if (!a_dict_get(dj, d->e[i].k, &sub[j])) a_error("ValueError", "tree_map: the trees differ in structure"); }
+            for (int j = 0; j < k; j++) { if (!(a_is(trees[j], O_DICT) || a_is(trees[j], O_INST))) a_error("ValueError", "tree_map: the trees differ in structure"); ADict *dj = a_is(trees[j], O_INST) ? ((AInst *)trees[j].o)->attrs : (ADict *)trees[j].o; if (!a_dict_get(dj, d->e[i].k, &sub[j])) a_error("ValueError", "tree_map: the trees differ in structure"); }
             a_dict_set(od, d->e[i].k, tree_map_rec(f, k, sub));
         }
         a_ntmp = sp; return out;
@@ -2161,9 +2172,14 @@ static const TEnt tensor_overrides[] = {
     {"sinh", tb_t_sinh}, {"cosh", tb_t_cosh}, {"log2", tb_t_log2}, {"log10", tb_t_log10}, {"erf", tb_t_erf},
     {"isnan", tb_t_isnan}, {"isfinite", tb_t_isfinite}, {"sum", tb_sum_bi}, {"max", tb_max_bi}, {"min", tb_min_bi},
     {NULL, NULL}};
+#include "apsi_crypto.c"
+#include "apsi_linalg.c"
+#include "apsi_lib.c"
 ABuiltinFn a_tensor_builtin(const char *name, int override_only) {
     for (const TEnt *e = tensor_overrides; e->name; e++) if (!strcmp(e->name, name)) return e->fn;
     if (override_only) return NULL;
+    if (name[0] == '_' && name[1] == '_') for (const TEnt *e = lib_builtins; e->name; e++) if (!strcmp(e->name, name)) return e->fn;
+    for (const TEnt *e = lib_globals; e->name; e++) if (!strcmp(e->name, name)) return e->fn;
     for (const TEnt *e = tensor_builtins; e->name; e++) if (!strcmp(e->name, name)) return e->fn;
     return NULL;
 }

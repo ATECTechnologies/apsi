@@ -1,0 +1,179 @@
+# use models: model files for native programs: safetensors (read and write, BF16/F16 decoded on load) and Apsi
+# checkpoints (.apsim: safetensors with a SHA-256 of the table and the data, as apsi run writes and checks them).
+
+fn _flatten(tree, prefix, out):
+    if isinstance(tree, dict):
+        for k in tree:
+            _flatten(tree[k], prefix + str(k) + ".", out)
+        return out
+    if isinstance(tree, list) or isinstance(tree, tuple):
+        for i in range(len(tree)):
+            _flatten(tree[i], prefix + str(i) + ".", out)
+        return out
+    if type(tree) == "Record":
+        let d = to_plain(tree)
+        for k in d:
+            _flatten(d[k], prefix + str(k) + ".", out)
+        return out
+    out[prefix.rstrip(".")] = tensor(tree) if not (ndim(tree) > 0) else tree
+    return out
+
+fn _nest(flat):
+    var root = {}
+    for name in flat:
+        let parts = name.split(".")
+        var node = root
+        for p in parts[0:len(parts) - 1]:
+            if p not in node:
+                node[p] = {}
+            node = node[p]
+        node[parts[len(parts) - 1]] = flat[name]
+    return _build(root)
+
+fn _build(d):
+    if not isinstance(d, dict):
+        return float(d[()]) if ndim(d) == 0 and str(d.dtype).startswith("f") else d
+    var all_digits = len(d) > 0
+    for k in d:
+        if not k.isdigit():
+            all_digits = false
+    if all_digits:
+        let ks = sorted([int(k) for k in d])
+        return [_build(d[str(k)]) for k in ks]
+    var out = {}
+    for k in d:
+        out[k] = _build(d[k])
+    return record(**out)
+
+fn save_safetensors(path, params, metadata=none):
+    var meta = none
+    if metadata != none:
+        meta = {}
+        let m = to_plain(metadata) if type(metadata) == "Record" else metadata
+        for k in m:
+            meta[str(k)] = str(m[k])
+    __st_save(path, _flatten(params, "", {}), meta, false)
+    return path
+
+fn load_safetensors(path, dtype=none, names=none, nested=true):
+    let r = __st_load(path, names, false)
+    var out = r[0]
+    if dtype != none:
+        var conv = {}
+        for k in out:
+            conv[k] = tensor(out[k], dtype)
+        out = conv
+    if nested == none:
+        return out
+    if nested:
+        return _nest(out)
+    var flat = {}
+    for k in out:
+        flat[k.replace(".", "_")] = out[k]
+    return record(**flat)
+
+fn _header(path):
+    let r = __st_load(path, [], false)
+    return r
+
+fn safetensors_metadata(path) = __st_load(path, [], false)[1]
+
+fn safetensors_info(path):
+    let full = __st_load(path, none, false)[0]
+    var out = {}
+    for k in full:
+        out[k] = (str(full[k].dtype) if hasattr(full[k], "dtype") else "?", shape(full[k]))
+    return out
+
+fn model_size(params):
+    var total = 0
+    for leaf in tree_leaves(params):
+        if ndim(leaf) > 0:
+            total = total + nbytes(leaf)
+    return total
+
+fn _apsim(path) = path if path.endswith(".apsim") or path.endswith(".index.json") else path + ".apsim"
+
+fn save_model(path, params, metadata=none, shard="4GB", sign=false):
+    if sign:
+        raise NotImplementedError("signed checkpoints are not in native programs yet; run with apsi run")
+    let p = _apsim(path)
+    var user = {}
+    if metadata != none:
+        let m = to_plain(metadata) if type(metadata) == "Record" else metadata
+        for k in m:
+            user[str(k)] = m[k]
+    let base = {"format": "apsi-model", "version": "1", "apsi": "2.6.6", "units": "{}", "qtensors": "{}", "metadata": json_str(user)}
+    let dir = p.rsplit("/", 1)[0] if "/" in p else ""
+    if dir != "":
+        __fs("mkdir", dir, none)
+    __st_save(p, _flatten(params, "", {}), base, true)
+    return p
+
+fn load_model(path, verify=true, key=none):
+    let p = _apsim(path)
+    if p.endswith(".index.json"):
+        let idx = json_parse(read_text(p))
+        let base = p.rsplit("/", 1)[0] + "/" if "/" in p else ""
+        var flat = {}
+        for fn_ in sorted(set([idx["weight_map"][k] for k in idx["weight_map"]])):
+            let part = __st_load(base + fn_, none, verify)
+            _check_plain(part[1], base + fn_)
+            for k in part[0]:
+                flat[k] = part[0][k]
+        return _nest(flat)
+    let r = __st_load(p, none, verify)
+    _check_plain(r[1], p)
+    return _nest(r[0])
+
+fn _check_plain(meta, p):
+    let q = meta.get("qtensors", "{}")
+    if q != "{}" and q != "":
+        raise NotImplementedError(f"{p} holds compressed tensors; load it with apsi run (or save it uncompressed)")
+
+fn model_info(path):
+    let p = _apsim(path)
+    let r = __st_load(p, none, false)
+    var tensors = {}
+    var total = 0
+    for k in r[0]:
+        tensors[k] = shape(r[0][k])
+        total = total + nbytes(r[0][k])
+    let meta = r[1]
+    return record(tensors=tensors, bytes=total, shards=1, format=meta.get("format", "safetensors"),
+                  metadata=_rec(json_parse(meta["metadata"])) if "metadata" in meta else meta)
+
+fn _rec(d) = record(**d) if isinstance(d, dict) else d
+
+fn save_checkpoint(path, params, opt=none, step=none, config=none, files=none, metadata=none, shard="4GB", sign=false):
+    var tree = {"params": params}
+    var extra = {}
+    if step != none:
+        extra["step"] = step
+    if config != none:
+        extra["config"] = to_plain(config) if type(config) == "Record" else config
+    if opt != none:
+        raise NotImplementedError("optimizer state in checkpoints is not in native programs yet; save the parameters with save_model")
+    var m = {} if metadata == none else (to_plain(metadata) if type(metadata) == "Record" else dict(metadata))
+    m["checkpoint"] = extra
+    return save_model(path, tree, m)
+
+fn load_checkpoint(path, verify=true, key=none):
+    let tree = load_model(path, verify, key)
+    let info = model_info(path).metadata
+    let ck = to_plain(info).get("checkpoint", {}) if type(info) == "Record" else {}
+    let params = tree.params if hasattr(tree, "params") else tree
+    return record(params=params, optimizer=none, step=ck.get("step", none), config=ck.get("config", none), files={}, metadata=info)
+
+fn _not_native(what):
+    raise NotImplementedError(f"models.{what} is not in native programs yet; run this program with apsi run")
+
+fn load_gguf(path, nested=true) = _not_native("load_gguf")
+fn save_gguf(path, params, metadata=none, dtype="f16", name=none, architecture="apsi") = _not_native("save_gguf")
+fn gguf_info(path) = _not_native("gguf_info")
+fn torch_load(path, map_location="cpu") = _not_native("torch_load")
+fn onnx_model(path, providers=none) = _not_native("onnx_model")
+fn hf_pipeline(task, model=none, device=none) = _not_native("hf_pipeline")
+fn quantize_model(params, dtype=none, min_size=1024) = _not_native("quantize_model")
+fn dequantize_model(params) = params
+fn qlinear(x, W, b=none) = x @ W + b if b != none else x @ W

@@ -27,6 +27,9 @@ def _builtin_names():
     names = set(re.findall(r'\{"([A-Za-z_0-9]+)", b_[A-Za-z_0-9]+\}', src))
     tsrc = open(os.path.join(_RT, "apsi_tensor.c"), encoding="utf-8").read()
     names |= set(re.findall(r'\{"([A-Za-z_0-9]+)", tb_[A-Za-z_0-9]+\}', tsrc))
+    lsrc = open(os.path.join(_RT, "apsi_lib.c"), encoding="utf-8").read()
+    names |= set(re.findall(r'\{"(__[A-Za-z_0-9]+)", lb_[A-Za-z_0-9]+\}', lsrc))
+    names |= set(re.findall(r'\{"([A-Za-z_0-9]+)", lg_[A-Za-z_0-9]+\}', lsrc))
     exc = re.search(r"a_exc_names\[A_NEXC\] = \{(.*?)\};", src, re.S).group(1)
     names |= set(re.findall(r'"([A-Za-z]+)"', exc))
     return names | {"cload", "ptr_f64", "ptr_f32", "ptr_i64", "ptr_i32", "ptr_u8", "ptr_void", "void", "cstr", "u8",
@@ -69,6 +72,9 @@ NATIVE_MODULES = {
                          "max_by", "min_by", "sum_by", "frequencies", "distinct_by", "interleave", "zip_longest",
                          "compose", "partial"),
 }
+
+# Python modules a native program gets as Apsi library modules (`import asyncio`, pyimport("asyncio"))
+PY_NATIVE = {"asyncio"}
 
 # C types in cload(...).fn(name, [types], result): C spelling, AV -> C, C -> AV
 FFI = {
@@ -125,7 +131,9 @@ class Scope:
         self.free = []           # names this function reads from an enclosing function (its cells, in order)
         self.loop_names = []     # while walking: the immutable names declared by the loops around (a stack of sets)
         self.snap = set()        # a lambda's names captured by value (per-iteration closures)
+        self.is_coro = False     # an async fn
         self.is_gen = False      # a generator function (it yields)
+        self.plain = []          # names given a value by `x = ...` (no let / var): local, or an outer variable's
 
     def bind(self, name):
         if name not in self.bound:
@@ -225,8 +233,36 @@ class Analyzer:
         mod = Scope(prog, None, "module")
         self.scopes[id(prog)] = mod
         self.block(prog.body, mod)
+        self.resolve_plain(mod)
         self.resolve(mod)
         return mod
+
+    def resolve_plain(self, sc):
+        """`x = v` in a function, with no let / var of x there, sets the variable x of the nearest enclosing
+        function that declares it, else the module's x when the module has one, else makes a local (as apsi run)."""
+        if sc.kind == "fn":
+            for name in sc.plain:
+                if name in sc.bound or name in sc.globals_ or name in sc.nonlocals:
+                    continue
+                p = sc.parent.fn_scope() if sc.parent else None
+                where = None
+                while p is not None:
+                    if p.kind == "module":
+                        if name in p.bound:
+                            where = "global"
+                        break
+                    if name in p.bound or name in p.nonlocals:
+                        where = "nonlocal"
+                        break
+                    p = p.parent.fn_scope() if p.parent else None
+                if where == "nonlocal":
+                    sc.nonlocals.add(name)
+                elif where == "global":
+                    sc.globals_.add(name)
+                else:
+                    sc.bind(name)
+        for c in sc.children:
+            self.resolve_plain(c)
 
     # ---- binding
     def bind_pattern(self, p, sc):
@@ -238,14 +274,18 @@ class Analyzer:
             for x in p:
                 self.bind_pattern(x, sc)
 
-    def bind_target(self, t, sc):
+    def bind_target(self, t, sc, plain=False):
         if isinstance(t, A.Name):
-            sc.bind(t.id)
+            if plain and sc.kind == "fn":
+                if t.id not in sc.plain:
+                    sc.plain.append(t.id)
+            else:
+                sc.bind(t.id)
         elif isinstance(t, (A.TupleLit, A.ListLit)):
             for x in t.items:
-                self.bind_target(x, sc)
+                self.bind_target(x, sc, plain)
         elif isinstance(t, A.Spread):
-            self.bind_target(t.value, sc)
+            self.bind_target(t.value, sc, plain)
         else:
             self.expr(t, sc)
 
@@ -268,12 +308,12 @@ class Analyzer:
         elif k == "Assign":
             self.expr(s.value, sc)
             for t in [s.target] + list(s.more or []):
-                self.bind_target(t, sc)
+                self.bind_target(t, sc, plain=True)
         elif k == "AugAssign":
             self.expr(s.value, sc)
             if isinstance(s.target, A.Name):
                 sc.used.add(s.target.id)
-                sc.bind(s.target.id)
+                self.bind_target(s.target, sc, plain=True)
             else:
                 self.expr(s.target, sc)
         elif k == "ExprStmt":
@@ -432,6 +472,9 @@ class Analyzer:
 
     def function(self, node, params, body, expr_body, sc):
         fs = Scope(node, sc, "fn")
+        if getattr(node, "is_async", False):
+            fs.is_gen = True               # a coroutine: a generator the event loop drives
+            fs.is_coro = True
         self.scopes[id(node)] = fs
         sc.fn_scope().children.append(fs) if sc.kind != "class" else sc.parent.fn_scope().children.append(fs)
         for p in params:
@@ -534,7 +577,10 @@ class Analyzer:
             if e.value is not None:
                 self.expr(e.value, sc)
         elif k == "Await":
-            raise NativeError("async is not supported by the native backend yet", e)
+            fs = sc.fn_scope()
+            if fs.kind != "fn" or not getattr(fs, "is_coro", False):
+                raise NativeError("'await' outside an async fn", e)
+            self.expr(e.value, sc)
         elif k == "FStr":
             for p in e.parts:
                 if isinstance(p, tuple):
@@ -677,7 +723,7 @@ class CGen:
         """('native', module, {name: builtin}) | ('local', path)"""
         from ..apsil import local_module
         lib = os.path.join(os.path.dirname(__file__), "lib", s.path.replace(".", os.sep) + ".apsi")
-        if os.path.isfile(lib) and not s.py and local_module(s.path, self.base_dir) is None:
+        if os.path.isfile(lib) and (not s.py or s.path in PY_NATIVE) and local_module(s.path, self.base_dir) is None:
             return ("local", os.path.abspath(lib))
         if s.path in NATIVE_MODULES and not s.py:
             return ("native", s.path, NATIVE_MODULES[s.path])
@@ -686,8 +732,14 @@ class CGen:
             return ("local", local)
         if s.path in NATIVE_MODULES:
             return ("native", s.path, NATIVE_MODULES[s.path])
-        raise NativeError(f"module '{s.path}' is not available to the native backend yet "
-                          f"(native modules: {', '.join(sorted(NATIVE_MODULES))}, and the program's own files)", s)
+        libs = sorted(f[:-5] for f in os.listdir(os.path.join(os.path.dirname(__file__), "lib"))
+                      if f.endswith(".apsi") and not f.startswith("_"))
+        have = sorted(set(NATIVE_MODULES) | set(libs))
+        import difflib
+        near = difflib.get_close_matches(s.path, have, n=1)
+        hint = f" Did you mean '{near[0]}'?" if near else ""
+        raise NativeError(f"module '{s.path}' is not in native programs yet.{hint} Native modules: {', '.join(have)}, "
+                          f"and the program's own files. `apsi run` has every module.", s)
 
     def use_names(self, s):
         r = self.resolve_use(s)
@@ -950,7 +1002,7 @@ class CGen:
             self.function_body(cname + "_body", scope, name, params, body, expr_body)
             wrap = Fn(cname, scope, name)
             wrap.text = [f"static AV {cname}(AFunc *self, int n, AV *args, ADict *kw) {{",
-                         f"    return a_gen_new(self, {cname}_body, n, args, kw);", "}"]
+                         f"    return a_{'coro' if getattr(scope, 'is_coro', False) else 'gen'}_new(self, {cname}_body, n, args, kw);", "}"]
             self.fns.append(wrap)
         else:
             self.function_body(cname, scope, name, params, body, expr_body)
@@ -1327,6 +1379,9 @@ class CGen:
             return
         v = self.expr(s.value) if s.value is not None else "A_NONE"
         self.emit(f"a_yield({v});")
+
+    def e_Await(self, e):
+        return self.hold(f"a_await({self.expr(e.value)})")
 
     def e_YieldExpr(self, e):
         if e.from_:
@@ -1905,6 +1960,13 @@ class CGen:
 
     def e_Call(self, e):
         f = e.func
+        # pyimport("asyncio"): the native asyncio (Apsi's event loop over coroutines)
+        if isinstance(f, A.Name) and f.id == "pyimport" and "pyimport" not in self.mod_scope.bound and len(e.args) == 1 \
+                and isinstance(e.args[0], A.Str) and e.args[0].value in PY_NATIVE:
+            r = self.resolve_use(A.Use(e.args[0].value, None, None, True))
+            mid, cname, pub = self.local_module(r[1])
+            self.emit(f"if (!M[{mid}]) {{ M[{mid}] = 1; {cname}(NULL, 0, NULL, NULL); }}")
+            return self.module_obj(e.args[0].value, [(n, f"a_gload(G[{self.gslot(n, mid)}], {cstr(n)})") for n in pub])
         # cload("file.c"): a C / C++ source next to the program is compiled into it
         if isinstance(f, A.Name) and f.id == "cload" and "cload" not in self.mod_scope.bound and len(e.args) == 1 \
                 and isinstance(e.args[0], A.Str):

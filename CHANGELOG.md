@@ -17,6 +17,22 @@
   `physics.constants`.
 - **`match` and `evolve`** in native programs; `u.<unit>` values; tensors with units.
 - Worker threads leave one core to the operating system and run below normal priority.
+- **The standard library in native programs:** `linalg` (LU, Cholesky, QR, symmetric and general eigenproblems,
+  SVD, least squares), `stats` (every distribution, test and model of `apsi run`, the same results), `sci` (FFT,
+  quadrature, interpolation, roots, L-BFGS, curve fitting, stiff and non-stiff ODE solvers, einsum), `data`
+  (pipelines), `layers` (MLPs, CNNs, recurrent layers, attention with grouped-query heads / RoPE / QK norm,
+  transformer language models, `fit`), `models` (safetensors and `.apsim` checkpoints, interchangeable with
+  `apsi run`), `web` (an HTTP/1.1 server on Apsi's own event loop), `crypto` (SHA-2, SHA-3, BLAKE2, HMAC, scrypt).
+- **`async fn` / `await`** in native programs, with `asyncio.run`, `gather`, `create_task`, `wait_for`, `sleep`,
+  `Event`, `Lock`, `Queue`.
+- **Convolution and pooling in C** with their gradients: a small CNN trains about 1.7× faster than under `apsi run`.
+- **cuBLAS when it is installed** (CUDA 11, 12 or 13): matrix products on the card go to it, Tensor Cores with
+  `APSI_GPU_MATH=tf32 / bf16 / f16`. **`apsi cuda`** shows the driver and libraries, `apsi cuda install` puts cuBLAS
+  into a `.venv` or `~/.apsi/cuda`. Freed card memory is reused instead of returned and asked for again.
+- The runtime is compiled once and cached: later native builds compile only the program.
+- More of Python's `str`, `set` and `dict` methods; `open()` with `with`, `load_csv` / `save_csv`, `roll`, `meshgrid`,
+  `nan_to_num`, `jacobian`, `hessian`, `laplace`, bit operations, `format` and `platform` in native programs.
+- "Did you mean …?" for misspelt attributes and methods at run time and for module names at build time.
 
 ### C and C++
 - **`cload("file.c")` / `cload("file.cpp")`:** the source file itself. `apsi run` builds it once into a cached shared
@@ -27,6 +43,9 @@
   in the native runtime.
 - Gradients through `concat` / `stack` reached only the first part in the native runtime.
 - `logsumexp` dropped gradients in `apsi run`.
+- In native programs, `x = …` inside a nested function now sets the enclosing function's variable, as in `apsi run`.
+- In native programs, a class whose `__iter__` returns a generator can be looped over.
+- `tree_map` on trees of different shapes reports the mismatch instead of reading past a list.
 
 ### Python habits that just work
 - **Single-quoted strings** `'text'`, `'''…'''`, `f'…'` and `b'…'`, as in Python (after a name or a closing

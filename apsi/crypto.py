@@ -143,4 +143,9 @@ def module():
             "secure_equal": secure_equal, "random_token": random_token,
             "random_hex": random_bytes_hex, "secure_randint": secure_randint,
             "password_hash": password_hash, "password_verify": password_verify,
-            "b64encode": b64encode, "b64decode": b64decode, "crc32": crc32, "hash_int": hash_int}
+            "b64encode": b64encode, "b64decode": b64decode, "crc32": crc32, "hash_int": hash_int,
+            "b64url_encode": lambda t: b64url_encode(t)}
+
+
+def b64url_encode(text):
+    return base64.urlsafe_b64encode(_bytes(text)).decode().rstrip("=")

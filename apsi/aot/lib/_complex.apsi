@@ -1,0 +1,99 @@
+# Complex tensors for native programs: the real and the imaginary parts as two float64 tensors (or numbers).
+
+fn _num(x):
+    let s = f"{x:.8g}"
+    if "." in s or "e" in s or "n" in s:
+        return s
+    return s + "."
+
+fn _fmt1(re, im):
+    let r = float(re)
+    let i = float(im)
+    let sign = "-" if i < 0 else "+"
+    return _num(r) + sign + _num(abs(i)) + "j"
+
+class Complex:
+    fn __init__(self, re, im):
+        self.re = re
+        self.im = im
+
+    fn __add__(self, o):
+        if isinstance(o, Complex):
+            return Complex(self.re + o.re, self.im + o.im)
+        return Complex(self.re + o, self.im)
+
+    fn __radd__(self, o) = Complex(self.re + o, self.im)
+
+    fn __sub__(self, o):
+        if isinstance(o, Complex):
+            return Complex(self.re - o.re, self.im - o.im)
+        return Complex(self.re - o, self.im)
+
+    fn __rsub__(self, o) = Complex(o - self.re, -self.im)
+
+    fn __mul__(self, o):
+        if isinstance(o, Complex):
+            return Complex(self.re * o.re - self.im * o.im, self.re * o.im + self.im * o.re)
+        return Complex(self.re * o, self.im * o)
+
+    fn __rmul__(self, o) = Complex(self.re * o, self.im * o)
+
+    fn __truediv__(self, o):
+        if isinstance(o, Complex):
+            let d = o.re * o.re + o.im * o.im
+            return Complex((self.re * o.re + self.im * o.im) / d, (self.im * o.re - self.re * o.im) / d)
+        return Complex(self.re / o, self.im / o)
+
+    fn __neg__(self) = Complex(-self.re, -self.im)
+
+    fn __getitem__(self, i) = Complex(self.re[i], self.im[i])
+
+    fn __len__(self) = len(self.re)
+
+    fn __eq__(self, o):
+        if isinstance(o, Complex):
+            return self.re == o.re and self.im == o.im
+        return false
+
+    fn abs(self) = sqrt(self.re * self.re + self.im * self.im)
+
+    fn angle(self) = atan2(self.im, self.re)
+
+    fn conj(self) = Complex(self.re, -self.im)
+
+    fn real(self) = self.re
+
+    fn imag(self) = self.im
+
+    fn shape(self) = shape(self.re)
+
+    fn tolist(self):
+        let r = tolist(self.re)
+        let i = tolist(self.im)
+        if isinstance(r, list):
+            return [Complex(r[k], i[k]) for k in range(len(r))]
+        return self
+
+    fn __str__(self):
+        if isinstance(self.re, float) or isinstance(self.re, int):
+            return "(" + _fmt1(self.re, self.im) + ")"
+        let r = tolist(self.re)
+        let i = tolist(self.im)
+        return _fmt_nested(r, i)
+
+    fn __repr__(self) = self.__str__()
+
+fn _fmt_nested(r, i):
+    if isinstance(r, list):
+        return "[" + ", ".join([_fmt_nested(r[k], i[k]) for k in range(len(r))]) + "]"
+    return _fmt1(r, i)
+
+fn complex(re, im=0.0) = Complex(re, im)
+
+fn c_real(x) = x.re if isinstance(x, Complex) else x
+
+fn c_imag(x) = x.im if isinstance(x, Complex) else zeros_like(x) if ndim(x) > 0 else 0.0
+
+fn c_conj(x) = x.conj() if isinstance(x, Complex) else x
+
+fn cabs(x) = x.abs() if isinstance(x, Complex) else abs(x)

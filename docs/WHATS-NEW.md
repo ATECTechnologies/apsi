@@ -42,15 +42,32 @@ apsi build --native app.apsi        # app.exe on Windows, app on Linux and macOS
 | Apsi's runtime (C) | values, memory management (a collector that runs at safe points), strings, lists, dicts, sets, closures, classes and structs, exceptions, generators, quantities with units |
 | Tensors (C) | float64 / float32 / int64 / bool arrays with NumPy's broadcasting and indexing, reductions, matrix products on every core, vectorised `exp` / `tanh` |
 | Automatic differentiation (C) | `grad`, `value_and_grad`, gradients of gradients, on numbers, quantities, tensors and trees of parameters |
-| GPU (C + PTX) | tensors on NVIDIA cards through the driver alone: element-wise maths, reductions, softmax, matrix products, `where` |
-| Standard library (Apsi) | `nn` (dense layers, CNNs, LSTMs, GRUs, losses, SGD / Adam / AdamW / RMSprop, schedules, `train`), the functional helpers, the `evolve` integrators, physical constants |
+| GPU (C + PTX) | tensors on NVIDIA cards through the driver alone: element-wise maths, reductions, softmax, matrix products, `where`; cuBLAS and Tensor Cores when CUDA 11–13 is installed |
+| Numerics (C) | LU, Cholesky, QR, eigenproblems and SVD; the FFT; incomplete gamma and beta functions; convolution and pooling with gradients |
+| Systems (C) | an HTTP/1.1 server on an event loop, SHA-2 / SHA-3 / BLAKE2 / HMAC / scrypt, safetensors and `.npy` files, files and folders |
+| Standard library (Apsi) | `linalg`, `stats`, `sci`, `data`, `layers`, `models`, `web`, `crypto`, `asyncio`, `nn`, the functional helpers, the `evolve` integrators, physical constants |
 
 **What runs natively.** The whole language: functions with default, keyword, `*args` and `**kwargs` parameters,
 closures, classes with inheritance and `super()`, structs, exceptions with `try` / `except` / `else` / `finally`,
-generators with `yield`, `yield from` and `send`, comprehensions, f-strings with format specs, `match`, `evolve`,
-units and shape parameters (`fn f[B](x: Tensor[B, _])`). Modules: the program's own files and packages, `math`,
-`random`, `io`, `sys`, `collections`, `nn`, `physics.constants`. Native programs print the same text and report
-errors the same way as `apsi run`.
+generators with `yield`, `yield from` and `send`, `async fn` and `await`, comprehensions, f-strings with format
+specs, `match`, `evolve`, units and shape parameters (`fn f[B](x: Tensor[B, _])`). Modules: the program's own files
+and packages, `math`, `random`, `io`, `sys`, `collections`, `nn`, `linalg`, `stats`, `sci`, `data`, `layers`,
+`models`, `web`, `crypto`, `asyncio`, `physics.constants`. Native programs print the same text and report errors the
+same way as `apsi run`.
+
+```apsi
+use layers
+use web
+
+let X = load_csv("features.csv")    # [n, 4] measurements
+let y = tensor([int(v) for v in read_text("labels.txt").split()])
+let model = mlp([4, 32, 3])
+let trained = fit(model, model.init(seed=0), X, y, loss="cross_entropy", epochs=200, verbose=false)
+
+let app = server()
+app.post("/predict", fn(req) => {"class": int(argmax(predict(model, trained.params, tensor([req.json()["x"]])), axis=1)[0])})
+app.run(port=8080)                  # apsi build --native: one executable, no Python
+```
 
 **Fast on the machine it runs on.** A native build is compiled for the processor of the computer that builds it
 (`-march=native`; set `APSI_PORTABLE=1` for a program that runs on any x86-64). Matrix products use packed,

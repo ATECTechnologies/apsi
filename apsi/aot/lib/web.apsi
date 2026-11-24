@@ -1,0 +1,570 @@
+# use web: HTTP servers in native programs. The sockets, the HTTP/1.1 parsing, the limits and the timeouts are the
+# native runtime's (one event loop: thousands of idle keep-alive connections are cheap); routing, hooks, JSON,
+# CORS, rate limits, static files and JWT are here. The same app runs under apsi run. No TLS in native programs:
+# put it behind a reverse proxy (Caddy, nginx) or a tunnel for HTTPS.
+use crypto
+
+let SECURITY_HEADERS = {"X-Content-Type-Options": "nosniff", "X-Frame-Options": "DENY", "Referrer-Policy": "no-referrer",
+                        "Cross-Origin-Opener-Policy": "same-origin",
+                        "Content-Security-Policy": "default-src 'none'; frame-ancestors 'none'",
+                        "Permissions-Policy": "camera=(), microphone=(), geolocation=()"}
+
+var _ids = 0
+
+class HTTPError(Exception):
+    fn __init__(self, status, message, headers=none):
+        self.status = status
+        self.message = message
+        self.headers = headers if headers != none else {}
+
+    fn __str__(self) = f"{self.status} {self.message}"
+
+class Response:
+    fn __init__(self, body="", status=200, headers=none, content_type=none):
+        self.status = int(status)
+        self.headers = dict(headers) if headers != none else {}
+        self.body = str(body)
+        if content_type != none:
+            if "Content-Type" not in self.headers:
+                self.headers["Content-Type"] = content_type
+        elif "Content-Type" not in self.headers and self.body != "":
+            self.headers["Content-Type"] = "text/plain; charset=utf-8"
+
+fn _unquote(s):
+    if "%" not in s and "+" not in s:
+        return s
+    var out = []
+    var i = 0
+    let n = len(s)
+    var bytes_ = []
+    while i < n:
+        let c = s[i]
+        if c == "%" and i + 2 < n + 0 and i + 2 <= n - 1:
+            let h = s[i + 1:i + 3]
+            if all([ch in "0123456789abcdefABCDEF" for ch in h]):
+                out.append(chr(int(h, 16)))
+                i = i + 3
+                continue
+        out.append(" " if c == "+" else c)
+        i = i + 1
+    return __utf8_fix("".join(out))
+
+fn __utf8_fix(s):
+    # percent-decoded bytes arrive one per character (latin-1); re-read them as UTF-8
+    var ok = true
+    for c in s:
+        if ord(c) > 255:
+            ok = false
+            break
+    if not ok:
+        return s
+    return __latin1_to_utf8(s)
+
+fn __latin1_to_utf8(s):
+    var out = []
+    var i = 0
+    let n = len(s)
+    while i < n:
+        let b = ord(s[i])
+        if b < 128:
+            out.append(s[i])
+            i = i + 1
+            continue
+        var need = 0
+        var cp = 0
+        if b >= 0xF0 and b < 0xF8:
+            need = 3
+            cp = b - 0xF0
+        elif b >= 0xE0:
+            need = 2
+            cp = b - 0xE0
+        elif b >= 0xC0:
+            need = 1
+            cp = b - 0xC0
+        else:
+            out.append("�")
+            i = i + 1
+            continue
+        if i + need >= n + 0 and i + need > n - 1:
+            out.append("�")
+            i = i + 1
+            continue
+        var good = true
+        for k in 1..need + 1:
+            let c2 = ord(s[i + k])
+            if c2 < 0x80 or c2 >= 0xC0:
+                good = false
+                break
+            cp = cp * 64 + (c2 - 0x80)
+        if good:
+            out.append(chr(cp))
+            i = i + need + 1
+        else:
+            out.append("�")
+            i = i + 1
+    return "".join(out)
+
+fn _query(qs):
+    var q = {}
+    if qs == "":
+        return q
+    for part in qs.split("&"):
+        if part == "":
+            continue
+        let kv = part.partition("=")
+        q[_unquote(kv[0])] = _unquote(kv[2])
+    return q
+
+class Request:
+    fn __init__(self, method, path, query, headers, body, client):
+        _ids = _ids + 1
+        self.method = method
+        self.path = path
+        self.query = query
+        self.headers = headers
+        self.body = body
+        self.client = client
+        self.peer = client
+        self.scheme = "http"
+        self.params = {}
+        self.id = f"{_ids:08x}"
+        self.started = __time()
+        self.user = none
+        self.text = body
+
+    fn host(self):
+        let h = self.headers.get("host", "")
+        if h.count(":") == 1:
+            return h.rsplit(":", 1)[0].lower()
+        return h.lower()
+
+    fn json(self):
+        if self.body == "":
+            return none
+        try:
+            return json_parse(self.body)
+        except Exception:
+            raise HTTPError(400, "request body is not valid JSON")
+
+    fn header(self, name, default=none) = self.headers.get(name.lower(), default)
+
+    fn __repr__(self) = f"<request {self.method} {self.path}>"
+
+fn response(body="", status=200, headers=none, type=none):
+    if isinstance(body, str):
+        return Response(body, status, headers, type)
+    return _json_response(body, status, headers)
+
+fn redirect(location, status=302) = Response("", status, {"Location": str(location)})
+
+fn abort(status, message="error"):
+    raise HTTPError(int(status), str(message))
+
+fn _json_response(obj, status=200, headers=none):
+    var h = {"Content-Type": "application/json; charset=utf-8"}
+    if headers != none:
+        for k in headers:
+            h[k] = headers[k]
+    return Response(json_str(obj), status, h)
+
+fn _to_response(r):
+    if isinstance(r, Response):
+        return r
+    if r == none:
+        return Response("", 204)
+    if isinstance(r, str):
+        return Response(r)
+    return _json_response(r)
+
+class Route:
+    fn __init__(self, method, pattern, handler):
+        self.method = method
+        self.pattern = pattern
+        self.handler = handler
+        self.parts = [p for p in pattern.split("/")]
+        self.dynamic = "{" in pattern
+
+    fn match(self, path):
+        let segs = path.split("/")
+        var params = {}
+        var i = 0
+        for k in range(len(self.parts)):
+            let p = self.parts[k]
+            if p.startswith("{") and p.endswith("}"):
+                let spec = p[1:len(p) - 1].partition(":")
+                let name = spec[0]
+                let kind = spec[2] if spec[2] != "" else "str"
+                if kind == "path":
+                    if i >= len(segs):
+                        return none
+                    params[name] = _unquote("/".join(segs[i:]))
+                    i = len(segs)
+                    continue
+                if i >= len(segs) or segs[i] == "":
+                    return none
+                let raw = _unquote(segs[i])
+                if kind == "int":
+                    let body = raw[1:] if raw.startswith("-") else raw
+                    if body == "" or not body.isdigit():
+                        return none
+                    params[name] = int(raw)
+                elif kind == "float":
+                    try:
+                        params[name] = float(raw)
+                    except ValueError:
+                        return none
+                else:
+                    params[name] = raw
+                i = i + 1
+            else:
+                if i >= len(segs) or segs[i] != p:
+                    return none
+                i = i + 1
+        if i != len(segs):
+            return none
+        return params
+
+class RateLimiter:
+    fn __init__(self, rate, per=1.0, burst=none):
+        self.rate = float(rate) / float(per)
+        self.burst = float(burst if burst != none else rate)
+        self.buckets = {}
+
+    fn allow(self, key):
+        let now = __time()
+        let b = self.buckets.get(key, [self.burst, now])
+        var tokens = min(self.burst, b[0] + (now - b[1]) * self.rate)
+        if len(self.buckets) > 100000:
+            self.buckets = {}
+        if tokens >= 1.0:
+            self.buckets[key] = [tokens - 1.0, now]
+            return (true, 0.0)
+        self.buckets[key] = [tokens, now]
+        return (false, (1.0 - tokens) / self.rate)
+
+class RouteGroup:
+    fn __init__(self, app, prefix):
+        self.app = app
+        self.prefix = prefix.rstrip("/")
+
+    fn route(self, method, path, handler=none) = self.app.route(method, self.prefix + path, handler)
+    fn get(self, path, handler=none) = self.route("GET", path, handler)
+    fn post(self, path, handler=none) = self.route("POST", path, handler)
+    fn put(self, path, handler=none) = self.route("PUT", path, handler)
+    fn patch(self, path, handler=none) = self.route("PATCH", path, handler)
+    fn delete(self, path, handler=none) = self.route("DELETE", path, handler)
+    fn group(self, prefix) = RouteGroup(self.app, self.prefix + prefix)
+
+let _MIME = {"html": "text/html; charset=utf-8", "htm": "text/html; charset=utf-8", "css": "text/css; charset=utf-8",
+             "js": "text/javascript; charset=utf-8", "json": "application/json", "txt": "text/plain; charset=utf-8",
+             "svg": "image/svg+xml", "png": "image/png", "jpg": "image/jpeg", "jpeg": "image/jpeg", "gif": "image/gif",
+             "webp": "image/webp", "ico": "image/x-icon", "wasm": "application/wasm", "md": "text/markdown; charset=utf-8",
+             "xml": "application/xml", "pdf": "application/pdf", "csv": "text/csv; charset=utf-8"}
+
+class App:
+    fn __init__(self, name="apsi", max_body=1048576, max_connections=10000, log=true, header_timeout=10.0,
+                 body_timeout=30.0, keepalive_timeout=15.0, security_headers=true):
+        self.name = name
+        self.max_body = max_body
+        self.max_connections = max_connections
+        self.log = log
+        self.header_timeout = header_timeout
+        self.body_timeout = body_timeout
+        self.keepalive_timeout = keepalive_timeout
+        self.security_headers = security_headers
+        self.routes = []
+        self.literal = {}
+        self.before_hooks = []
+        self.after_hooks = []
+        self.cors_origins = none
+        self.static_dirs = []
+        self.limiter = none
+        self.hosts = none
+        self.trusted = none
+        self.t0 = __time()
+        self.metrics = {"requests": 0, "errors": 0, "seconds": 0.0, "by_status": {}}
+
+    fn route(self, method, path, handler=none):
+        if handler == none:
+            fn deco(f):
+                self.route(method, path, f)
+                return f
+            return deco
+        let r = Route(method.upper(), path, handler)
+        self.routes.append(r)
+        if not r.dynamic:
+            self.literal[path] = self.literal.get(path, []) + [r]
+        return handler
+
+    fn get(self, path, handler=none) = self.route("GET", path, handler)
+    fn post(self, path, handler=none) = self.route("POST", path, handler)
+    fn put(self, path, handler=none) = self.route("PUT", path, handler)
+    fn patch(self, path, handler=none) = self.route("PATCH", path, handler)
+    fn delete(self, path, handler=none) = self.route("DELETE", path, handler)
+    fn group(self, prefix) = RouteGroup(self, prefix)
+
+    fn before(self, hook):
+        self.before_hooks.append(hook)
+        return hook
+
+    fn after(self, hook):
+        self.after_hooks.append(hook)
+        return hook
+
+    fn rate_limit(self, rate, per=1.0, burst=none):
+        self.limiter = RateLimiter(rate, per, burst)
+        return self
+
+    fn allowed_hosts(self, *hosts):
+        self.hosts = [h.lower() for h in hosts]
+        return self
+
+    fn trust_proxy(self, *proxies):
+        self.trusted = list(proxies) if len(proxies) > 0 else ["127.0.0.1", "::1"]
+        return self
+
+    fn cors(self, origins="*"):
+        self.cors_origins = origins if origins == "*" else list(origins)
+        return self
+
+    fn static(self, prefix, directory):
+        self.static_dirs.append([prefix.rstrip("/"), directory.rstrip("/")])
+        return self
+
+    fn health(self, path="/health"):
+        self.get(path, fn(req) => {"status": "ok", "name": self.name, "uptime_s": round(__time() - self.t0, 1)})
+        return self
+
+    fn ready(self, path="/ready"):
+        self.get(path, fn(req) => {"status": "ready"})
+        return self
+
+    fn expose_metrics(self, path="/metrics"):
+        self.get(path, fn(req) => self.stats())
+        return self
+
+    fn stats(self):
+        let m = self.metrics
+        return {"requests": m["requests"], "errors": m["errors"], "by_status": m["by_status"],
+                "mean_ms": m["seconds"] / max(1, m["requests"]) * 1000}
+
+    fn _static(self, req):
+        if req.method != "GET" and req.method != "HEAD":
+            return none
+        for pd in self.static_dirs:
+            let prefix = pd[0]
+            let root = pd[1]
+            if req.path == prefix or req.path.startswith(prefix + "/"):
+                var rel = _unquote(req.path[len(prefix):].lstrip("/"))
+                if rel == "":
+                    rel = "index.html"
+                for seg in rel.replace("\\", "/").split("/"):
+                    if seg == ".." or ":" in seg:
+                        raise HTTPError(403, "forbidden")
+                var full = root + "/" + rel
+                if __fs("isdir", full, none):
+                    full = full + "/index.html"
+                if not __fs("isfile", full, none):
+                    return none
+                let data = read_text(full)
+                let ext = full.rsplit(".", 1)[1].lower() if "." in full else ""
+                let etag = "\"" + hash(data)[0:16] + "\""
+                if req.headers.get("if-none-match") == etag:
+                    return Response("", 304, {"ETag": etag})
+                return Response(data, 200, {"Content-Type": _MIME.get(ext, "application/octet-stream"), "ETag": etag,
+                                            "Cache-Control": "public, max-age=300",
+                                            "Content-Security-Policy": "default-src 'self'; frame-ancestors 'none'"})
+        return none
+
+    fn dispatch(self, req):
+        try:
+            if self.trusted != none and req.peer in self.trusted:
+                let fwd = req.headers.get("x-forwarded-for", "")
+                if fwd != "":
+                    req.client = fwd.split(",")[0].strip()
+                if req.headers.get("x-forwarded-proto", "") == "https":
+                    req.scheme = "https"
+            if self.hosts != none:
+                let host = req.host()
+                var ok = false
+                for h in self.hosts:
+                    if host == h or (h.startswith("*.") and host.endswith(h[1:])):
+                        ok = true
+                if not ok:
+                    raise HTTPError(421, "this server does not answer for that host name")
+            if self.limiter != none:
+                let r = self.limiter.allow(req.client)
+                if not r[0]:
+                    raise HTTPError(429, "rate limit exceeded", {"Retry-After": str(max(1, int(r[1] + 0.999)))})
+            if req.method == "OPTIONS" and self.cors_origins != none:
+                return self._finish(req, Response("", 204))
+            for hook in self.before_hooks:
+                let r = hook(req)
+                if r != none:
+                    return self._finish(req, _to_response(r))
+            for route in self.literal.get(req.path, []):
+                if route.method == req.method or (route.method == "GET" and req.method == "HEAD"):
+                    return self._finish(req, _to_response(route.handler(req)))
+            var allowed = []
+            for route in self.routes:
+                let params = route.match(req.path)
+                if params == none:
+                    continue
+                if route.method != req.method and not (route.method == "GET" and req.method == "HEAD"):
+                    allowed.append(route.method)
+                    continue
+                req.params = params
+                return self._finish(req, _to_response(route.handler(req)))
+            let st = self._static(req)
+            if st != none:
+                return self._finish(req, st)
+            if len(allowed) > 0:
+                raise HTTPError(405, "method not allowed", {"Allow": ", ".join(sorted(set(allowed)))})
+            raise HTTPError(404, "not found")
+        except HTTPError as e:
+            return self._finish(req, _json_response({"error": e.message, "status": e.status}, e.status, e.headers))
+        except Exception as e:
+            let kind = type(e)
+            if kind == "UnitError" or kind == "ShapeError" or kind == "TypeError":
+                return self._finish(req, _json_response({"error": str(e), "kind": kind, "status": 400}, 400))
+            write_err(f"[{self.name}] internal error in {req.method} {req.path} (request id {req.id}): {e}\n")
+            self.metrics["errors"] = self.metrics["errors"] + 1
+            return self._finish(req, _json_response({"error": "internal server error", "id": req.id}, 500))
+
+    fn _finish(self, req, resp):
+        if self.cors_origins != none:
+            let origin = req.headers.get("origin")
+            if self.cors_origins == "*":
+                resp.headers.setdefault("Access-Control-Allow-Origin", "*")
+            elif origin in self.cors_origins:
+                resp.headers.setdefault("Access-Control-Allow-Origin", origin)
+                resp.headers.setdefault("Vary", "Origin")
+            resp.headers.setdefault("Access-Control-Allow-Methods", "GET, POST, PUT, PATCH, DELETE, OPTIONS")
+            resp.headers.setdefault("Access-Control-Allow-Headers", "Content-Type, Authorization")
+        if self.security_headers:
+            var merged = dict(SECURITY_HEADERS)
+            for k in resp.headers:
+                merged[k] = resp.headers[k]
+            resp.headers = merged
+        if "X-Request-Id" not in resp.headers:
+            resp.headers["X-Request-Id"] = req.id
+        for hook in self.after_hooks:
+            try:
+                hook(req, resp)
+            except Exception as e:
+                write_err(f"[{self.name}] after hook: {e}\n")
+        let dt = __time() - req.started
+        let m = self.metrics
+        m["requests"] = m["requests"] + 1
+        m["seconds"] = m["seconds"] + dt
+        let key = str(resp.status)
+        m["by_status"][key] = m["by_status"].get(key, 0) + 1
+        if self.log:
+            print(f"{req.client} {req.method} {req.path} {resp.status} {dt * 1000:.1f}ms")
+        return resp
+
+    fn handle(self, method, path, body=none, headers=none, client="127.0.0.1"):
+        var b = ""
+        if body != none:
+            b = body if isinstance(body, str) else json_str(body)
+        let pq = str(path).partition("?")
+        var hd = {}
+        if headers != none:
+            for k in headers:
+                hd[k.lower()] = str(headers[k])
+        let resp = self.dispatch(Request(method.upper(), pq[0], _query(pq[2]), hd, b, client))
+        let ctype = resp.headers.get("Content-Type", "")
+        var data = resp.body
+        if ctype.startswith("application/json") and data != "":
+            data = json_parse(data)
+        return record(status=resp.status, body=data, headers=resp.headers)
+
+    fn _serve_one(self, raw):
+        let pq = raw["target"].partition("?")
+        let req = Request(raw["method"], raw["path"], _query(pq[2]), raw["headers"], raw["body"], raw["peer"])
+        let resp = self.dispatch(req)
+        var hs = []
+        for k in resp.headers:
+            hs.append([k, resp.headers[k]])
+        return (resp.status, hs, resp.body)
+
+    fn run(self, host="127.0.0.1", port=8080, tls_cert=none, tls_key=none, processes=1, workers=none):
+        if tls_cert != none:
+            raise NotImplementedError("TLS is not in native programs: serve HTTP behind Caddy / nginx / a tunnel, or use apsi run")
+        let opts = {"max_body": self.max_body, "header_timeout": float(self.header_timeout), "body_timeout": float(self.body_timeout),
+                    "keepalive_timeout": float(self.keepalive_timeout), "max_connections": self.max_connections, "log": false}
+        return __http_serve(host, int(port), fn(raw) => self._serve_one(raw), opts)
+
+fn server(name="apsi", max_body=1048576, workers=none, max_connections=10000, log=true, handler_timeout=60.0,
+          header_timeout=10.0, body_timeout=30.0, keepalive_timeout=15.0, security_headers=true) = App(name, max_body, max_connections, log, header_timeout, body_timeout, keepalive_timeout, security_headers)
+
+# ---- tokens and keys
+fn jwt_sign(claims, secret, expires_in=3600):
+    var payload = dict(claims)
+    let now = int(__time())
+    if "iat" not in payload:
+        payload["iat"] = now
+    if expires_in != 0 and "exp" not in payload:
+        payload["exp"] = now + int(expires_in)
+    let h = __b64enc(json_str({"alg": "HS256", "typ": "JWT"}), true)
+    let p = __b64enc(json_str(payload), true)
+    return h + "." + p + "." + __hmac(str(secret), h + "." + p, "sha256", "b64u")
+
+fn jwt_verify(token, secret, leeway=30):
+    let parts = str(token).split(".")
+    if len(parts) != 3:
+        return none
+    try:
+        let header = json_parse(__b64dec(parts[0]))
+        if not isinstance(header, dict) or header.get("alg") != "HS256":
+            return none
+        let expect = __hmac(str(secret), parts[0] + "." + parts[1], "sha256", "b64u")
+        if not __secure_eq(expect, parts[2].rstrip("=")):
+            return none
+        let claims = json_parse(__b64dec(parts[1]))
+        let now = __time()
+        if "exp" in claims and now > float(claims["exp"]) + float(leeway):
+            return none
+        if "nbf" in claims and now + float(leeway) < float(claims["nbf"]):
+            return none
+        return claims
+    except Exception:
+        return none
+
+fn bearer_token(req):
+    let auth = req.headers.get("authorization", "")
+    if auth[0:7].lower() == "bearer ":
+        return auth[7:].strip()
+    return none
+
+fn require_jwt(secret, exempt=[]):
+    let ex = list(exempt)
+    fn hook(req):
+        if req.path in ex or req.method == "OPTIONS":
+            return none
+        let tok = bearer_token(req)
+        let claims = jwt_verify(tok if tok != none else "", secret)
+        if claims == none:
+            return Response("{\"error\":\"unauthorized\",\"status\":401}", 401, {"Content-Type": "application/json", "WWW-Authenticate": "Bearer"})
+        req.user = claims
+        return none
+    return hook
+
+fn require_api_key(keys, header="x-api-key", exempt=[]):
+    let ks = [str(k) for k in keys]
+    let ex = list(exempt)
+    fn hook(req):
+        if req.path in ex or req.method == "OPTIONS":
+            return none
+        let got = req.headers.get(header.lower(), "")
+        var ok = false
+        for k in ks:
+            if __secure_eq(got if got != none else "", k):
+                ok = true
+        if not ok:
+            return Response("{\"error\":\"unauthorized\",\"status\":401}", 401, {"Content-Type": "application/json"})
+        return none
+    return hook
+
+fn websocket_connect(url, headers=none, timeout=10.0, subprotocols=none):
+    raise NotImplementedError("websocket_connect is not in native programs yet; run this program with apsi run")

@@ -1284,6 +1284,7 @@ typedef struct AGen {
     AFrame *top, *base;                       /* the generator's frames while it is suspended */
     AFrame *caller_frame; AHandler *caller_handler, *handler; int caller_ntmp;
     struct AGen *outer;
+    AV ret; int coro;                         /* the body's return value; an async fn's coroutine */
 #ifdef _WIN32
     void *fiber, *caller_fiber;
 #else
@@ -1295,7 +1296,7 @@ static const char *gen_name(AObj *o) { return ((AGen *)o)->fn->name; }
 #define GEN_STACK (512 * 1024)
 
 static void gen_mark(AGen *g) {
-    mark_obj((AObj *)g->fn); mark(g->args); mark(g->kw); mark(g->value); mark(g->exc);
+    mark_obj((AObj *)g->fn); mark(g->args); mark(g->kw); mark(g->value); mark(g->exc); mark(g->ret);
     if (g->state == 1) for (AFrame *f = g->top; f; f = f->prev) { for (int i = 0; i < f->n; i++) mark(f->slots[i]); if (f == g->base) break; }
 }
 static void gen_free(AGen *g) {
@@ -1317,7 +1318,7 @@ static void gen_run(AGen *g) {
     g->base = NULL;
     if (!A_TRY(h)) {
         AV r = g->body(g->fn, (int)LIST(g->args)->len, LIST(g->args)->v, g->kw.t == T_NONE ? NULL : DICT(g->kw));
-        (void)r;
+        g->ret = r;
         a_handler = h.prev;
     } else { g->failed = 1; g->exc = a_exc; }
     g->state = 3;
@@ -1331,7 +1332,7 @@ static void gen_entry(void) { gen_run(gen_starting); }
 #endif
 AV a_gen_new(AFunc *fn, AFnCode body, int n, AV *args, ADict *kw) {
     AGen *g = (AGen *)a_alloc(sizeof(AGen), O_GEN);
-    g->fn = fn; g->body = body; g->args = A_NONE; g->kw = A_NONE; g->value = A_NONE; g->exc = A_NONE;
+    g->fn = fn; g->body = body; g->args = A_NONE; g->kw = A_NONE; g->value = A_NONE; g->exc = A_NONE; g->ret = A_NONE; g->coro = 0;
     int sp = a_ntmp; A_PUSH(a_obj(g));
     g->args = a_tuple(n, args);
     if (kw) g->kw = a_obj(kw);
@@ -1396,6 +1397,26 @@ AV a_yield(AV v) {
     gen_switch_out(g);
     return g->value;                              /* what the caller sent (none for next()) */
 }
+AV a_coro_new(AFunc *fn, AFnCode body, int n, AV *args, ADict *kw) { AV g = a_gen_new(fn, body, n, args, kw); ((AGen *)g.o)->coro = 1; return g; }
+/* await x: drive the coroutine x; whatever it yields (a request for the event loop) goes up to ours */
+AV a_await(AV x) {
+    if (a_is(x, O_GEN)) {
+        AGen *g = (AGen *)x.o; AV send = A_NONE, out; int sp = a_ntmp; A_PUSH(x);
+        if (g->state == 3) { a_ntmp = sp; return g->ret; }
+        while (gen_resume(g, send, &out)) send = a_yield(out);
+        a_ntmp = sp; return g->ret;
+    }
+    if (a_is(x, O_INST)) { AV f = a_getattr(x, "__await__"); if (f.t != 255) return a_await(a_call(f, 0, NULL, NULL)); }
+    a_error("TypeError", "object %s can't be used in 'await' (await a coroutine: the call of an async fn, or a task)", tname(x));
+}
+/* __gen_step(g, send) -> (true, the value it yielded) | (false, its return value) */
+AV a_gen_step(AV gv, AV send) {
+    if (!a_is(gv, O_GEN)) a_error("TypeError", "not a coroutine");
+    AGen *g = (AGen *)gv.o; AV out, p[2];
+    if (gen_resume(g, send, &out)) { p[0] = a_bool(1); p[1] = out; } else { p[0] = a_bool(0); p[1] = g->ret; }
+    return a_tuple(2, p);
+}
+int a_is_coro(AV v) { return a_is(v, O_GEN) && ((AGen *)v.o)->coro; }
 static AV m_gen_send(int n, AV *a, ADict *kw, AV s) { (void)kw; AV v; if (!gen_resume((AGen *)s.o, n ? a[0] : A_NONE, &v)) a_error("StopIteration", ""); return v; }
 
 /* =================================================================== iteration */
@@ -1431,7 +1452,12 @@ AV a_iter(AV o) {
     case O_ITER: case O_GEN: return o;
     case O_INST: {
         AV f = a_getattr(o, "__iter__");
-        if (f.t != 255) { AV r = a_call(f, 0, NULL, NULL); if (a_is(r, O_ITER)) return r; AV it = new_iter(IT_INST, r); return it; }
+        if (f.t != 255) {
+            AV r = a_call(f, 0, NULL, NULL);
+            if (a_is(r, O_ITER) || a_is(r, O_GEN)) return r;
+            if (r.t == T_OBJ && r.o->kind != O_INST) return a_iter(r);       /* __iter__ gave a list, a range, ... */
+            AV it = new_iter(IT_INST, r); return it;
+        }
         break;
     }
     default: break;
@@ -1520,9 +1546,63 @@ AV a_getattr(AV o, const char *name) {
     if (qt(o)) { AV r = a_tensor_attr(QTY(o)->tv, name); if (a_is(r, O_TENSOR) && !strcmp(name, "T")) return a_qty_make(r, QTY(o)->dim); return r; }
     return method_of(o, name);
 }
+/* the closest of the names an object has, for "did you mean ...?" (edit distance up to a third of the name) */
+static int edit_distance(const char *a, const char *b) {
+    size_t la = strlen(a), lb = strlen(b); if (la > 63 || lb > 63) return 99;
+    int d[64][64];
+    for (size_t i = 0; i <= la; i++) d[i][0] = (int)i;
+    for (size_t j = 0; j <= lb; j++) d[0][j] = (int)j;
+    for (size_t i = 1; i <= la; i++) for (size_t j = 1; j <= lb; j++) {
+        int c = d[i - 1][j - 1] + (a[i - 1] != b[j - 1]), x = d[i - 1][j] + 1, y = d[i][j - 1] + 1;
+        d[i][j] = c < x ? (c < y ? c : y) : (x < y ? x : y);
+        if (i > 1 && j > 1 && a[i - 1] == b[j - 2] && a[i - 2] == b[j - 1] && d[i - 2][j - 2] + 1 < d[i][j]) d[i][j] = d[i - 2][j - 2] + 1;
+    }
+    return d[la][lb];
+}
+static const char *str_methods[] = {"upper", "lower", "strip", "lstrip", "rstrip", "split", "rsplit", "join", "replace", "startswith",
+    "endswith", "find", "rfind", "index", "rindex", "count", "isdigit", "isalpha", "isspace", "isalnum", "isupper", "islower",
+    "title", "capitalize", "swapcase", "ljust", "rjust", "center", "zfill", "partition", "rpartition", "splitlines",
+    "removeprefix", "removesuffix", "casefold", "expandtabs", NULL};
+static const char *list_methods[] = {"append", "extend", "pop", "insert", "index", "count", "remove", "reverse", "sort", "clear", "copy", NULL};
+static const char *dict_methods[] = {"get", "keys", "values", "items", "pop", "popitem", "setdefault", "update", "clear", "copy", NULL};
+static const char *set_methods[] = {"add", "discard", "remove", "clear", "copy", "union", "intersection", "difference",
+    "symmetric_difference", "update", "issubset", "issuperset", "isdisjoint", "pop", NULL};
+static void consider(const char *want, const char *have, const char **best, int *bd) {
+    if (!have || have[0] == '_') return;
+    int d = edit_distance(want, have);
+    if (d < *bd) { *bd = d; *best = have; }
+}
+static const char *attr_hint(AV o, const char *name) {
+    const char *best = NULL; int bd = (int)strlen(name) / 3 + 1; if (bd > 3) bd = 3;
+    const char **tab = NULL;
+    if (o.t == T_OBJ) switch (o.o->kind) {
+    case O_STR: tab = str_methods; break;
+    case O_LIST: case O_TUPLE: tab = list_methods; break;
+    case O_DICT: tab = dict_methods; break;
+    case O_SET: tab = set_methods; break;
+    case O_INST: {
+        ADict *d = ((AInst *)o.o)->attrs;
+        for (int64_t i = 0; i < d->nent; i++) if (d->e[i].used && a_is(d->e[i].k, O_STR)) consider(name, STR(d->e[i].k)->s, &best, &bd);
+        for (AClass *c = ((AInst *)o.o)->cls; c; c = c->base)
+            for (int64_t i = 0; i < c->attrs->nent; i++) if (c->attrs->e[i].used && a_is(c->attrs->e[i].k, O_STR)) consider(name, STR(c->attrs->e[i].k)->s, &best, &bd);
+        break;
+    }
+    case O_CLASS:
+        for (AClass *c = (AClass *)o.o; c; c = c->base)
+            for (int64_t i = 0; i < c->attrs->nent; i++) if (c->attrs->e[i].used && a_is(c->attrs->e[i].k, O_STR)) consider(name, STR(c->attrs->e[i].k)->s, &best, &bd);
+        break;
+    default: break;
+    }
+    if (tab) for (int i = 0; tab[i]; i++) consider(name, tab[i], &best, &bd);
+    return best;
+}
 AV a_attr(AV o, const char *name) {
     AV v = a_getattr(o, name);
-    if (v.t == 255) a_error("AttributeError", "'%s' object has no attribute '%s'", tname(o), name);
+    if (v.t == 255) {
+        const char *h = attr_hint(o, name);
+        if (h) a_error("AttributeError", "'%s' object has no attribute '%s'; did you mean '%s'?", tname(o), name, h);
+        a_error("AttributeError", "'%s' object has no attribute '%s'", tname(o), name);
+    }
     return v;
 }
 void a_setattr(AV o, const char *name, AV v) {
@@ -1768,6 +1848,134 @@ static AV m_dict_update(int n, AV *a, ADict *kw, AV s) {
 static AV m_set_add(int n, AV *a, ADict *kw, AV s) { (void)n; (void)kw; a_dict_set(DICT(s), a[0], A_NONE); return A_NONE; }
 static AV m_set_discard(int n, AV *a, ADict *kw, AV s) { (void)n; (void)kw; a_dict_del(DICT(s), a[0]); return A_NONE; }
 
+/* ---- more str methods (as Python's) */
+static int a_dict_has(ADict *d, AV k) { AV v; return a_dict_get(d, k, &v); }
+static int64_t char_index(AV s, int64_t byte) { int64_t c = 0; for (int64_t b = 0; b < byte; b++) if ((((unsigned char)STR(s)->s[b]) & 0xC0) != 0x80) c++; return c; }
+static int64_t byte_rfind(AV s, AStr *x) { for (int64_t i = STR(s)->len - x->len; i >= 0; i--) if (!memcmp(STR(s)->s + i, x->s, (size_t)x->len)) return i; return -1; }
+static int64_t byte_find(AV s, AStr *x) { for (int64_t i = 0; i + x->len <= STR(s)->len; i++) if (!memcmp(STR(s)->s + i, x->s, (size_t)x->len)) return i; return -1; }
+static AStr *sarg(int n, AV *a, int i, const char *what) { if (n <= i || !a_is(a[i], O_STR)) a_error("TypeError", "%s takes text (Str)", what); return STR(a[i]); }
+static AV m_str_index(int n, AV *a, ADict *kw, AV s) { (void)kw; int64_t b = byte_find(s, sarg(n, a, 0, "index")); if (b < 0) a_error("ValueError", "substring not found"); return a_int(char_index(s, b)); }
+static AV m_str_rfind(int n, AV *a, ADict *kw, AV s) { (void)kw; int64_t b = byte_rfind(s, sarg(n, a, 0, "rfind")); return a_int(b < 0 ? -1 : char_index(s, b)); }
+static AV m_str_rindex(int n, AV *a, ADict *kw, AV s) { (void)kw; int64_t b = byte_rfind(s, sarg(n, a, 0, "rindex")); if (b < 0) a_error("ValueError", "substring not found"); return a_int(char_index(s, b)); }
+static AV str_map(AV s, int mode) {          /* 0 swapcase, 1 capitalize, 2 title */
+    AV r = a_strn(STR(s)->s, STR(s)->len); char *p = STR(r)->s; int start = 1;
+    for (int64_t i = 0; i < STR(r)->len; i++) {
+        char c = p[i]; int up = c >= 'A' && c <= 'Z', lo = c >= 'a' && c <= 'z';
+        if (mode == 0) { if (up) p[i] = (char)(c + 32); else if (lo) p[i] = (char)(c - 32); }
+        else if (mode == 1) { if (i == 0 && lo) p[i] = (char)(c - 32); else if (i > 0 && up) p[i] = (char)(c + 32); }
+        else { if (up || lo) { if (start && lo) p[i] = (char)(c - 32); else if (!start && up) p[i] = (char)(c + 32); start = 0; } else if (!((unsigned char)c & 0x80)) start = 1; }
+    }
+    return r;
+}
+static AV m_str_swapcase(int n, AV *a, ADict *kw, AV s) { (void)n; (void)a; (void)kw; return str_map(s, 0); }
+static AV m_str_capitalize(int n, AV *a, ADict *kw, AV s) { (void)n; (void)a; (void)kw; return str_map(s, 1); }
+static AV m_str_title(int n, AV *a, ADict *kw, AV s) { (void)n; (void)a; (void)kw; return str_map(s, 2); }
+static AV str_test(AV s, int mode) {
+    AStr *x = STR(s); int any = 0, cased = 0;
+    if (!x->len) return a_bool(0);
+    for (int64_t i = 0; i < x->len; i++) {
+        unsigned char c = (unsigned char)x->s[i]; int up = c >= 'A' && c <= 'Z', lo = c >= 'a' && c <= 'z', dg = c >= '0' && c <= '9';
+        if (mode == 0 && !(up || lo || dg || c >= 0x80)) return a_bool(0);
+        if (mode == 1 && lo) return a_bool(0);
+        if (mode == 2 && up) return a_bool(0);
+        if (mode == 3 && !(up || lo || dg || c == '_' || c >= 0x80)) return a_bool(0);
+        if (mode == 3 && i == 0 && dg) return a_bool(0);
+        if (up || lo) cased = 1; any = 1;
+    }
+    return a_bool(mode == 1 || mode == 2 ? cased : any);
+}
+static AV m_str_isalnum(int n, AV *a, ADict *kw, AV s) { (void)n; (void)a; (void)kw; return str_test(s, 0); }
+static AV m_str_isupper(int n, AV *a, ADict *kw, AV s) { (void)n; (void)a; (void)kw; return str_test(s, 1); }
+static AV m_str_islower(int n, AV *a, ADict *kw, AV s) { (void)n; (void)a; (void)kw; return str_test(s, 2); }
+static AV m_str_isidentifier(int n, AV *a, ADict *kw, AV s) { (void)n; (void)a; (void)kw; return str_test(s, 3); }
+static AV str_pad(AV s, int64_t width, const char *fill, int where) {   /* where: 0 left-justify, 1 right, 2 center */
+    int64_t have = STR(s)->nchars; if (width <= have) return s;
+    int64_t padn = width - have, l = where == 1 ? padn : where == 2 ? padn / 2 + (padn % 2 && width % 2 ? 1 : 0) : 0, r = padn - l;
+    if (where == 2) { l = padn / 2; r = padn - l; if (padn % 2 && have % 2 == 0) { } }
+    size_t fl = strlen(fill); char *o = (char *)malloc((size_t)STR(s)->len + (size_t)padn * fl + 1); size_t k = 0;
+    for (int64_t i = 0; i < l; i++) { memcpy(o + k, fill, fl); k += fl; }
+    memcpy(o + k, STR(s)->s, (size_t)STR(s)->len); k += (size_t)STR(s)->len;
+    for (int64_t i = 0; i < r; i++) { memcpy(o + k, fill, fl); k += fl; }
+    AV res = a_strn(o, (int64_t)k); free(o); return res;
+}
+static const char *fillc(int n, AV *a) { return n > 1 && a_is(a[1], O_STR) && STR(a[1])->len ? STR(a[1])->s : " "; }
+static AV m_str_ljust(int n, AV *a, ADict *kw, AV s) { (void)kw; return str_pad(s, a[0].i, fillc(n, a), 0); }
+static AV m_str_rjust(int n, AV *a, ADict *kw, AV s) { (void)kw; return str_pad(s, a[0].i, fillc(n, a), 1); }
+static AV m_str_center(int n, AV *a, ADict *kw, AV s) { (void)kw; return str_pad(s, a[0].i, fillc(n, a), 2); }
+static AV m_str_zfill(int n, AV *a, ADict *kw, AV s) {
+    (void)n; (void)kw; AStr *x = STR(s);
+    if (x->len && (x->s[0] == '-' || x->s[0] == '+')) { AV rest = str_pad(a_strn(x->s + 1, x->len - 1), a[0].i - 1, "0", 1); AV parts[2] = {a_strn(x->s, 1), rest}; return a_concat_strs(2, parts); }
+    return str_pad(s, a[0].i, "0", 1);
+}
+static AV str_part(AV s, AStr *sep, int right) {
+    int64_t b = right ? byte_rfind(s, sep) : byte_find(s, sep); AV p[3];
+    if (!sep->len) a_error("ValueError", "empty separator");
+    if (b < 0) { if (right) { p[0] = a_str(""); p[1] = a_str(""); p[2] = s; } else { p[0] = s; p[1] = a_str(""); p[2] = a_str(""); } }
+    else { p[0] = a_strn(STR(s)->s, b); p[1] = a_strn(sep->s, sep->len); p[2] = a_strn(STR(s)->s + b + sep->len, STR(s)->len - b - sep->len); }
+    return a_tuple(3, p);
+}
+static AV m_str_partition(int n, AV *a, ADict *kw, AV s) { (void)kw; return str_part(s, sarg(n, a, 0, "partition"), 0); }
+static AV m_str_rpartition(int n, AV *a, ADict *kw, AV s) { (void)kw; return str_part(s, sarg(n, a, 0, "rpartition"), 1); }
+static AV m_str_splitlines(int n, AV *a, ADict *kw, AV s) {
+    (void)n; (void)a; (void)kw; AV l = a_list(0, NULL); int sp = a_ntmp; A_PUSH(l); const char *p = STR(s)->s; int64_t L = STR(s)->len, st = 0;
+    for (int64_t i = 0; i < L; i++) if (p[i] == '\n' || p[i] == '\r') {
+        a_list_append(LIST(l), a_strn(p + st, i - st));
+        if (p[i] == '\r' && i + 1 < L && p[i + 1] == '\n') i++;
+        st = i + 1;
+    }
+    if (st < L) a_list_append(LIST(l), a_strn(p + st, L - st));
+    a_ntmp = sp; return l;
+}
+static AV m_str_rsplit(int n, AV *a, ADict *kw, AV s) {
+    AV mx = n > 1 ? a[1] : kwarg(kw, "maxsplit", a_int(-1));
+    if (mx.t != T_INT || mx.i < 0 || n == 0 || !a_is(a[0], O_STR)) return m_str_split(n, a, kw, s);
+    AStr *sep = STR(a[0]); if (!sep->len) a_error("ValueError", "empty separator");
+    AV l = a_list(0, NULL); int sp = a_ntmp; A_PUSH(l); int64_t end = STR(s)->len, cnt = 0;
+    for (int64_t i = end - sep->len; i >= 0 && cnt < mx.i; i--) if (!memcmp(STR(s)->s + i, sep->s, (size_t)sep->len)) {
+        a_list_append(LIST(l), a_strn(STR(s)->s + i + sep->len, end - i - sep->len)); end = i; cnt++; i -= sep->len - 1;
+    }
+    a_list_append(LIST(l), a_strn(STR(s)->s, end));
+    for (int64_t i = 0, j = LIST(l)->len - 1; i < j; i++, j--) { AV t = LIST(l)->v[i]; LIST(l)->v[i] = LIST(l)->v[j]; LIST(l)->v[j] = t; }
+    a_ntmp = sp; return l;
+}
+static AV m_str_removeprefix(int n, AV *a, ADict *kw, AV s) { (void)kw; AStr *x = sarg(n, a, 0, "removeprefix"); if (x->len <= STR(s)->len && !memcmp(STR(s)->s, x->s, (size_t)x->len)) return a_strn(STR(s)->s + x->len, STR(s)->len - x->len); return s; }
+static AV m_str_removesuffix(int n, AV *a, ADict *kw, AV s) { (void)kw; AStr *x = sarg(n, a, 0, "removesuffix"); if (x->len && x->len <= STR(s)->len && !memcmp(STR(s)->s + STR(s)->len - x->len, x->s, (size_t)x->len)) return a_strn(STR(s)->s, STR(s)->len - x->len); return s; }
+static AV m_str_expandtabs(int n, AV *a, ADict *kw, AV s) {
+    (void)kw; int64_t t = n ? a[0].i : 8, col = 0; AStr *x = STR(s); char *o = (char *)malloc((size_t)x->len * (size_t)(t > 0 ? t : 1) + 1); size_t k = 0;
+    for (int64_t i = 0; i < x->len; i++) { char c = x->s[i];
+        if (c == '\t') { int64_t sp = t > 0 ? t - col % t : 0; for (int64_t j = 0; j < sp; j++) o[k++] = ' '; col += sp; }
+        else { o[k++] = c; if (c == '\n' || c == '\r') col = 0; else if ((((unsigned char)c) & 0xC0) != 0x80) col++; } }
+    AV r = a_strn(o, (int64_t)k); free(o); return r;
+}
+/* ---- more set methods */
+static AV set_of(AV v) { if (a_is(v, O_SET)) return v; AV r = a_set(); int sp = a_ntmp; A_PUSH(r); AV it = a_iter(v); A_PUSH(it); AV x; while (a_next(it, &x)) a_dict_set(DICT(r), x, A_NONE); a_ntmp = sp; return r; }
+static AV set_op(AV s, int n, AV *a, int op) {    /* 0 union, 1 intersection, 2 difference, 3 symmetric difference */
+    AV r = a_set(); int sp = a_ntmp; A_PUSH(r); ADict *S = DICT(s);
+    if (op == 0 || op == 2 || op == 3) for (int64_t i = 0; i < S->nent; i++) if (S->e[i].used) a_dict_set(DICT(r), S->e[i].k, A_NONE);
+    if (op == 1) for (int64_t i = 0; i < S->nent; i++) if (S->e[i].used) {
+        int all = 1; for (int j = 0; j < n; j++) { AV o = set_of(a[j]); if (!a_dict_has(DICT(o), S->e[i].k)) { all = 0; break; } }
+        if (all) a_dict_set(DICT(r), S->e[i].k, A_NONE);
+    }
+    for (int j = 0; j < n && op != 1; j++) { AV o = set_of(a[j]); A_PUSH(o); ADict *O = DICT(o);
+        for (int64_t i = 0; i < O->nent; i++) if (O->e[i].used) {
+            AV k = O->e[i].k;
+            if (op == 0) a_dict_set(DICT(r), k, A_NONE);
+            else if (op == 2) a_dict_del(DICT(r), k);
+            else { if (a_dict_has(DICT(r), k)) a_dict_del(DICT(r), k); else a_dict_set(DICT(r), k, A_NONE); }
+        } }
+    a_ntmp = sp; return r;
+}
+static AV m_set_union(int n, AV *a, ADict *kw, AV s) { (void)kw; return set_op(s, n, a, 0); }
+static AV m_set_intersection(int n, AV *a, ADict *kw, AV s) { (void)kw; return set_op(s, n, a, 1); }
+static AV m_set_difference(int n, AV *a, ADict *kw, AV s) { (void)kw; return set_op(s, n, a, 2); }
+static AV m_set_symdiff(int n, AV *a, ADict *kw, AV s) { (void)kw; return set_op(s, n, a, 3); }
+static AV m_set_update(int n, AV *a, ADict *kw, AV s) { (void)kw; for (int j = 0; j < n; j++) { AV o = set_of(a[j]); ADict *O = DICT(o); for (int64_t i = 0; i < O->nent; i++) if (O->e[i].used) a_dict_set(DICT(s), O->e[i].k, A_NONE); } return A_NONE; }
+static AV m_set_issubset(int n, AV *a, ADict *kw, AV s) { (void)n; (void)kw; AV o = set_of(a[0]); ADict *S = DICT(s); for (int64_t i = 0; i < S->nent; i++) if (S->e[i].used && !a_dict_has(DICT(o), S->e[i].k)) return a_bool(0); return a_bool(1); }
+static AV m_set_issuperset(int n, AV *a, ADict *kw, AV s) { (void)n; (void)kw; AV o = set_of(a[0]); ADict *O = DICT(o); for (int64_t i = 0; i < O->nent; i++) if (O->e[i].used && !a_dict_has(DICT(s), O->e[i].k)) return a_bool(0); return a_bool(1); }
+static AV m_set_isdisjoint(int n, AV *a, ADict *kw, AV s) { (void)n; (void)kw; AV o = set_of(a[0]); ADict *S = DICT(s); for (int64_t i = 0; i < S->nent; i++) if (S->e[i].used && a_dict_has(DICT(o), S->e[i].k)) return a_bool(0); return a_bool(1); }
+static AV m_set_pop(int n, AV *a, ADict *kw, AV s) { (void)n; (void)a; (void)kw; ADict *S = DICT(s); for (int64_t i = 0; i < S->nent; i++) if (S->e[i].used) { AV k = S->e[i].k; a_dict_del(S, k); return k; } a_error("KeyError", "pop from an empty set"); }
+static AV m_dict_popitem(int n, AV *a, ADict *kw, AV s) { (void)n; (void)a; (void)kw; ADict *D = DICT(s); for (int64_t i = D->nent - 1; i >= 0; i--) if (D->e[i].used) { AV p[2] = {D->e[i].k, D->e[i].v}; AV t = a_tuple(2, p); a_dict_del(D, p[0]); return t; } a_error("KeyError", "popitem(): the dictionary is empty"); }
+
 static AV method_of(AV o, const char *name) {
     AV none; none.t = 255; none.i = 0;
     if (o.t != T_OBJ) return none;
@@ -1778,6 +1986,13 @@ static AV method_of(AV o, const char *name) {
         M("rstrip", m_str_rstrip); M("split", m_str_split); M("join", m_str_join); M("replace", m_str_replace);
         M("startswith", m_str_startswith); M("endswith", m_str_endswith); M("find", m_str_find); M("count", m_str_count);
         M("isdigit", m_str_isdigit); M("isalpha", m_str_isalpha); M("isspace", m_str_isspace);
+        M("index", m_str_index); M("rfind", m_str_rfind); M("rindex", m_str_rindex); M("title", m_str_title);
+        M("capitalize", m_str_capitalize); M("swapcase", m_str_swapcase); M("isalnum", m_str_isalnum);
+        M("isupper", m_str_isupper); M("islower", m_str_islower); M("isidentifier", m_str_isidentifier);
+        M("isnumeric", m_str_isdigit); M("isdecimal", m_str_isdigit); M("ljust", m_str_ljust); M("rjust", m_str_rjust);
+        M("center", m_str_center); M("zfill", m_str_zfill); M("partition", m_str_partition); M("rpartition", m_str_rpartition);
+        M("splitlines", m_str_splitlines); M("rsplit", m_str_rsplit); M("removeprefix", m_str_removeprefix);
+        M("removesuffix", m_str_removesuffix); M("casefold", m_str_lower); M("expandtabs", m_str_expandtabs);
         break;
     case O_LIST:
         M("append", m_list_append); M("extend", m_list_extend); M("pop", m_list_pop); M("insert", m_list_insert);
@@ -1788,10 +2003,13 @@ static AV method_of(AV o, const char *name) {
     case O_DICT:
         M("get", m_dict_get); M("keys", m_dict_keys); M("values", m_dict_values); M("items", m_dict_items);
         M("pop", m_dict_pop); M("setdefault", m_dict_setdefault); M("update", m_dict_update); M("clear", m_list_clear);
-        M("copy", m_list_copy);
+        M("copy", m_list_copy); M("popitem", m_dict_popitem);
         break;
     case O_GEN: M("send", m_gen_send); break;
-    case O_SET: M("add", m_set_add); M("discard", m_set_discard); M("remove", m_dict_pop); M("clear", m_list_clear); M("copy", m_list_copy); break;
+    case O_SET: M("add", m_set_add); M("discard", m_set_discard); M("remove", m_dict_pop); M("clear", m_list_clear); M("copy", m_list_copy);
+        M("union", m_set_union); M("intersection", m_set_intersection); M("difference", m_set_difference);
+        M("symmetric_difference", m_set_symdiff); M("update", m_set_update); M("issubset", m_set_issubset);
+        M("issuperset", m_set_issuperset); M("isdisjoint", m_set_isdisjoint); M("pop", m_set_pop); break;
     default: break;
     }
     #undef M

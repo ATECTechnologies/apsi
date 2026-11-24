@@ -427,3 +427,185 @@ fn rk45_run(deriv, t0, t1, h0, state, tol, every, want_record, keep):
     if want_record and accepted % every != 0:
         keep(t, st)
     return st
+
+# ---- added in 2.6.6: the rest of apsi run's everyday built-ins
+let tau = 2.0 * pi
+
+fn frozenset(xs=[]) = set(xs)
+
+fn join(xs, sep="") = sep.join([str(x) for x in xs])
+
+fn ascii(x):
+    let r = repr(x)
+    var out = []
+    for c in r:
+        let o = ord(c)
+        if o < 128:
+            out.append(c)
+        elif o < 256:
+            out.append("\\x" + hex(o)[2:].zfill(2))
+        elif o < 65536:
+            out.append("\\u" + hex(o)[2:].zfill(4))
+        else:
+            out.append("\\U" + hex(o)[2:].zfill(8))
+    return "".join(out)
+
+fn roll(x, shift, axis=none):
+    if axis == none:
+        let flat = reshape(x, -1)
+        let n = shape(flat)[0]
+        let k = shift % n if n > 0 else 0
+        if k == 0:
+            return x
+        return reshape(concat([flat[n - k:], flat[0:n - k]]), *shape(x))
+    let s = shape(x)
+    let ax = axis if axis >= 0 else len(s) + axis
+    let n = s[ax]
+    let k = shift % n if n > 0 else 0
+    if k == 0:
+        return x
+    var perm = [ax] + [i for i in range(len(s)) if i != ax]
+    var back = [0] * len(s)
+    for i in range(len(s)):
+        back[perm[i]] = i
+    let y = permute(x, *perm)
+    return permute(concat([y[n - k:], y[0:n - k]]), *back)
+
+fn meshgrid(x, y):
+    let nx = len(x)
+    let ny = len(y)
+    let X = reshape(x, nx, 1) + zeros(1, ny)
+    let Y = reshape(y, 1, ny) + zeros(nx, 1)
+    return (X, Y)
+
+fn nan_to_num(x, nan=0.0, posinf=none, neginf=none):
+    let big = 1.7976931348623157e308
+    let z = zeros_like(x)
+    var y = where(isnan(x), z + nan, x)
+    y = where(y == inf, z + (big if posinf == none else posinf), y)
+    return where(y == -inf, z + (-big if neginf == none else neginf), y)
+
+fn cross(a, b) = tensor([a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2], a[0] * b[1] - a[1] * b[0]])
+
+fn pmap(f, xs, workers=none) = [f(x) for x in xs]
+
+fn timed(f):
+    fn wrapper(*args, **kwargs):
+        let t0 = __time()
+        let r = f(*args, **kwargs)
+        print(f"[timed] {(__time() - t0) * 1000:.3f} ms")
+        return r
+    return wrapper
+
+fn derivative(f, x) = grad(f)(x)
+
+fn jacobian(f):
+    fn jac(x):
+        let y = f(x)
+        let m = shape(y)[0] if ndim(y) > 0 else 1
+        var rows = []
+        for i in range(m):
+            rows.append(grad(fn(v) => f(v)[i])(x))
+        return stack(rows)
+    return jac
+
+fn hessian(f) = jacobian(grad(f))
+
+fn laplace(f):
+    fn lap(x):
+        let H = hessian(f)(x)
+        var s = 0.0
+        for i in range(shape(H)[0]):
+            s = s + H[i, i]
+        return s
+    return lap
+
+fn native_info() = record(**_native_info())
+
+fn load_csv(path, skip_header=0):
+    var rows = []
+    var k = 0
+    for line in read_text(path).splitlines():
+        k = k + 1
+        if k <= skip_header or line.strip() == "":
+            continue
+        rows.append([float(v) for v in line.split(",")])
+    return tensor(rows)
+
+fn save_csv(path, data, header=""):
+    var out = []
+    if header != "":
+        out.append(header)
+    let rows = tolist(data)
+    for r in rows:
+        if isinstance(r, list):
+            out.append(",".join([repr(float(v)) for v in r]))
+        else:
+            out.append(repr(float(r)))
+    write_text(path, "\n".join(out) + "\n")
+
+class File:
+    fn __init__(self, path, mode):
+        self.path = path
+        self.mode = mode
+        self.closed = false
+        self.buf = []
+        self.pos = 0
+        self.text = ""
+        if "r" in mode:
+            self.text = read_text(path)
+        elif "w" in mode:
+            write_text(path, "")
+
+    fn read(self, n=-1):
+        if n < 0:
+            let r = self.text[self.pos:]
+            self.pos = len(self.text)
+            return r
+        let r = self.text[self.pos:self.pos + n]
+        self.pos = self.pos + len(r)
+        return r
+
+    fn readline(self):
+        if self.pos >= len(self.text):
+            return ""
+        let rest = self.text[self.pos:]
+        let i = rest.find("\n")
+        let line = rest if i < 0 else rest[0:i + 1]
+        self.pos = self.pos + len(line)
+        return line
+
+    fn readlines(self):
+        var out = []
+        while true:
+            let l = self.readline()
+            if l == "":
+                break
+            out.append(l)
+        return out
+
+    fn write(self, s):
+        self.buf.append(str(s))
+        if len(self.buf) > 256:
+            self.flush()
+        return len(str(s))
+
+    fn flush(self):
+        if len(self.buf) > 0:
+            __fs("append", self.path, "".join(self.buf))
+            self.buf = []
+
+    fn close(self):
+        if not self.closed:
+            self.flush()
+            self.closed = true
+
+    fn __iter__(self) = iter(self.readlines())
+
+    fn __enter__(self) = self
+
+    fn __exit__(self, *exc):
+        self.close()
+        return false
+
+fn open(path, mode="r", encoding="utf-8") = File(path, mode)

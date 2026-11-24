@@ -24,8 +24,12 @@ app.apsi ─► parser ─► checker ─► C ─► clang / gcc ─► app.exe
                                        ▲
               Apsi runtime (C): values, memory, exceptions, generators, units,
               tensors, automatic differentiation, GPU
-              standard library (Apsi): nn, helpers, evolve integrators, constants
+              standard library: linalg, stats, sci, data, layers, models, web, crypto,
+              asyncio, nn, and the everyday built-ins
 ```
+
+The runtime is compiled once per compiler and machine and kept (in `~/.apsi/cache/rt`), so after the first build a
+program's build compiles only the program.
 
 ### What you get
 
@@ -60,10 +64,16 @@ if gpu_available():
     print(sum(a @ b), gpu_info())
 ```
 
-On the card, element-wise maths, reductions, softmax, permutes, `where` and matrix products run as Apsi's own
-kernels, built into the program as PTX. Only the NVIDIA driver is needed, and the driver compiles the kernels for
-whatever card it finds. Operations the card does not have yet run on the processor and the result returns to the
-card. `to_host` brings tensors and whole parameter trees back.
+On the card, element-wise maths, reductions, softmax, permutes, `where`, gathers, scatters, optimizer steps and
+matrix products run as Apsi's own kernels, built into the program as PTX. Only the NVIDIA driver is needed, and the
+driver compiles the kernels for whatever card it finds. Operations the card does not have yet run on the processor
+and the result returns to the card. `to_host` brings tensors and whole parameter trees back.
+
+When cuBLAS is installed (any CUDA 11, 12 or 13: a CUDA Toolkit, or the `nvidia-cublas-cu12` / `-cu13` wheels in a
+`.venv`), matrix products go to it. `APSI_GPU_MATH=tf32`, `bf16` or `f16` lets it use Tensor Cores; the default
+stays exact float32. `apsi cuda` shows what is found and `apsi cuda install` adds cuBLAS (see
+[GPU.md](GPU.md#cuda-libraries)). Freed card memory is kept for reuse (up to a quarter of the card, or
+`APSI_GPU_CACHE_MB`) and given back when an allocation would fail.
 
 ### Gradients
 
@@ -76,19 +86,39 @@ backward pass walks its graph iteratively, so very deep graphs cannot overflow t
 `cload("file.c")` or `cload("file.cpp")` compiles the source file into the program, and each
 `lib.fn("name", [types], result)` becomes a typed C call. See [INTEROP.md](INTEROP.md#c-and-c-source-files).
 
+### The standard library in native programs
+
+| Module | In native programs |
+|---|---|
+| `linalg` | solve, inv, det, slogdet, cholesky, qr, eig, eigh, eigvals, svd, svdvals, pinv, lstsq, matrix_rank, cond, norm, trace, matrix_power, kron, cross |
+| `stats` | every distribution, test, model and correction of `apsi run`, with the same results (the test suite compares them to 6 digits) |
+| `sci` | fft, ifft, rfft, irfft, fftfreq, power_spectrum, trapz, cumtrapz, integrate, interp, find_root, bisect, minimize (L-BFGS, Adam), curve_fit, solve_ivp (TR-BDF2, Dormand–Prince), einsum |
+| `data` | the pipelines (sources, map, filter, batch, shuffle, window, shard, interleave, cache…), `.npy` files, glob patterns |
+| `layers` | dense, mlp, cnn, lstm / gru layers, attention (grouped-query, RoPE, QK norm), transformer blocks, encoders and language models, normalisations, residual and parallel blocks, `fit`, `predict`, `summary` |
+| `models` | safetensors (BF16 / F16 decoded on load) and `.apsim` checkpoints with their SHA-256, readable by `apsi run` and back |
+| `web` | `server()` with routes, hooks, CORS, rate limits, static files, JWT and API keys, on Apsi's own HTTP/1.1 event loop |
+| `crypto` | SHA-2, SHA-3, BLAKE2, SHA-1, MD5, HMAC, scrypt and PBKDF2 password hashes, Base64, secure random numbers |
+| `asyncio` | `import asyncio` / `pyimport("asyncio")`: `async fn`, `await`, run, sleep, gather, create_task, wait_for, Event, Lock, Queue |
+
+Convolutions and max pooling run as C kernels (image columns and the packed matrix product) with their gradients,
+about 1.7× faster than `apsi run` on a small CNN.
+
 ### What is not native yet
 
-These programs keep running with `apsi run`. A native build that reaches one of them stops with a clear message.
+These programs keep running with `apsi run`. A native build that reaches one of them stops with a message that says so.
 
-- the modules `layers`, `models`, `data`, `linalg`, `stats`, `sci`, `web`, `db`, `crypto`, `rl`, `tokens`, and the
-  GPU trainer `fit_batches`
-- Python modules (`pyimport`, `import numpy`) and `async`
+- graph networks, mixtures of experts and `fit_batches` in `layers`; GGUF, ONNX and PyTorch files in `models`;
+  `text_dataset`, `train_tokenizer` and Parquet in `data`; websockets and TLS in `web` (serve HTTPS through a
+  reverse proxy); the modules `db`, `rl`, `tokens`, `torch`, `dataframe`, `quantum`, `medical`
+- Python modules (`pyimport`, `import numpy`), except `asyncio`
 - random numbers: native programs use their own generator, so a seed gives different numbers than in `apsi run`
   (the same seed always gives the same numbers in native programs)
 
 ### Errors
 
-A native program that stops on an error prints the same report as `apsi run`, and exits with code 1:
+A native program that stops on an error prints the same report as `apsi run`, and exits with code 1. A misspelt
+attribute or method gets a suggestion (`'str' object has no attribute 'uper'; did you mean 'upper'?`), and so does a
+misspelt module name at build time:
 
 ```
 app.apsi:12:5: RuntimeError: IndexError: index 5 is out of range for an axis of size 3

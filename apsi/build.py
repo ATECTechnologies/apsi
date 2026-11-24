@@ -507,7 +507,15 @@ def cmd_toolchain(args):
     return main([])
 
 
+def cmd_cuda(args):
+    from .aot.cudasetup import main
+    return main(args.rest)
+
+
 def register(sub, perm_flags):
+    c = sub.add_parser("cuda", help="the NVIDIA driver and CUDA libraries Apsi uses; `apsi cuda install` adds cuBLAS")
+    c.add_argument("rest", nargs=__import__("argparse").REMAINDER, help="status | install [--cuda 12] [--venv DIR] [--user]")
+    c.set_defaults(fn=cmd_cuda)
     t = sub.add_parser("toolchain", help="where the C toolchain for native builds is (fetched once when missing)")
     t.set_defaults(fn=cmd_toolchain)
     p = sub.add_parser("build", help="make an executable from a program (app.exe on Windows)")

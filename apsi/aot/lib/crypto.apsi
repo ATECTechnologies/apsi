@@ -1,0 +1,32 @@
+# use crypto: hashes, HMAC, password hashes, Base64, secure random numbers. The algorithms are the standard ones
+# (SHA-2, SHA-3, BLAKE2, HMAC, scrypt, PBKDF2), in the native runtime; their results equal Python's hashlib.
+
+fn hash(data, algo="sha256") = __hash(str(data), algo)
+
+fn hash_int(data, algo="sha256", mod=none):
+    let v = int(__hash(str(data), algo), 16)
+    return v % int(mod) if mod else v
+
+fn crc32(data) = __crc32(str(data))
+
+fn hmac_sign(key, message, algo="sha256") = __hmac(str(key), str(message), algo, "hex")
+
+fn hmac_verify(key, message, signature, algo="sha256") = __secure_eq(__hmac(str(key), str(message), algo, "hex"), str(signature))
+
+fn secure_equal(a, b) = __secure_eq(str(a), str(b))
+
+fn random_token(nbytes=32) = __random_bytes(int(nbytes), "b64u")
+
+fn random_hex(nbytes=32) = __random_bytes(int(nbytes), "hex")
+
+fn secure_randint(lo, hi) = __secure_randint(int(lo), int(hi))
+
+fn password_hash(password, n=16384, r=8, p=1) = __password_hash(str(password), int(n), int(r), int(p))
+
+fn password_verify(password, stored) = __password_verify(str(password), stored)
+
+fn b64encode(text) = __b64enc(str(text), false)
+
+fn b64decode(text) = __b64dec(str(text))
+
+fn b64url_encode(text) = __b64enc(str(text), true)

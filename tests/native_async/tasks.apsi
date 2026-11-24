@@ -1,0 +1,34 @@
+let asyncio = pyimport("asyncio")
+async fn work(name, d):
+    await asyncio.sleep(d)
+    print("done", name)
+    return name + "!"
+async fn fails():
+    await asyncio.sleep(0.01)
+    raise ValueError("bad")
+async fn main():
+    let r = await asyncio.gather(work("a", 0.05), work("b", 0.01), work("c", 0.03))
+    print(r)
+    let t = asyncio.create_task(work("d", 0.0))
+    print(await t)
+    try:
+        await fails()
+    except ValueError as e:
+        print("caught", e)
+    try:
+        await asyncio.wait_for(work("slow", 1.0), 0.05)
+    except Exception as e:
+        print("timeout")
+    let q = asyncio.Queue()
+    async fn producer():
+        for i in range(3):
+            await q.put(i)
+    async fn consumer():
+        var s = 0
+        for i in range(3):
+            s = s + await q.get()
+        return s
+    let res = await asyncio.gather(producer(), consumer())
+    print(res[1])
+    return 42
+print(asyncio.run(main()))

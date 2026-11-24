@@ -354,6 +354,12 @@ fn pad2d(x, p):
     return concat([zc, tall, zc], axis=3)
 
 fn conv2d(x, w, b=none, stride=1, padding=0):
+    if not __is_dev(x) and not __is_dev(w):
+        # the native kernel: image columns and the packed matrix product, its gradient in C as well
+        var out = __conv2d(x, w, stride, padding)
+        if b != none:
+            out = out + reshape(b, 1, -1, 1, 1)
+        return out
     let xp = pad2d(x, padding)
     let s = shape(xp)
     let ws = shape(w)
@@ -372,6 +378,8 @@ fn conv2d(x, w, b=none, stride=1, padding=0):
     return out
 
 fn max_pool2d(x, k=2):
+    if not __is_dev(x):
+        return __maxpool2d(x, k, k)
     let s = shape(x)
     let h = s[2] // k
     let w = s[3] // k

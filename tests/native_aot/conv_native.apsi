@@ -1,0 +1,12 @@
+use nn
+let x = reshape(sin(arange(2 * 3 * 9 * 9) * 0.37), 2, 3, 9, 9)
+let w = reshape(cos(arange(4 * 3 * 3 * 3) * 0.11), 4, 3, 3, 3)
+let b = tensor([0.1, -0.2, 0.3, 0.0])
+fn loss(p) = sum(max_pool2d(relu(conv2d(p[0], p[1], p[2], stride=1, padding=1)), 2) ** 2)
+let g = grad(loss)([x, w, b])
+print(round(loss([x, w, b]), 6), shape(g[0]), round(sum(g[0] * g[0]), 6), round(sum(g[1] * g[1]), 6), round(sum(g[2]), 6))
+let y = conv2d(x, w, none, stride=2, padding=0)
+print(shape(y), round(sum(y), 6))
+let xf = tensor(x, f32)
+let wf = tensor(w, f32)
+print(round(sum(conv2d(xf, wf, none, padding=1)), 3))

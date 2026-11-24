@@ -1,0 +1,609 @@
+# use layers: models made of layers, for native programs. A layer has init(seed) -> parameters and is called as
+# layer(params, x, train=false); the parameter trees have the same names as under apsi run, so a model saved by one
+# engine loads in the other. Graph networks, mixtures of experts and PyTorch interop stay with apsi run.
+use nn
+
+fn _sub(seed, i) = none if seed == none else int(seed) * 1009 + i
+
+fn _randn(seed, *dims) = randn(*dims, seed=seed)
+
+fn _glorot(seed, n_in, n_out) = _randn(seed, n_in, n_out) * sqrt(2.0 / (n_in + n_out))
+
+class Layer:
+    fn init(self, seed=0) = record()
+    fn __call__(self, params, x, train=false) = self.apply(params, x, train)
+    fn apply(self, params, x, train=false) = x
+    fn describe(self) = "layer"
+    fn children(self) = []
+    fn __str__(self) = self.describe()
+    fn __repr__(self) = self.describe()
+
+class Linear(Layer):
+    fn __init__(self, n_in, n_out, bias=true, how="he"):
+        self.n_in = int(n_in)
+        self.n_out = int(n_out)
+        self.bias = bias
+        self.how = how
+    fn init(self, seed=0):
+        let W = _glorot(seed, self.n_in, self.n_out) if self.how == "glorot" else _randn(seed, self.n_in, self.n_out) * sqrt(2.0 / self.n_in)
+        return record(W=W, b=zeros(self.n_out)) if self.bias else record(W=W)
+    fn apply(self, p, x, train=false):
+        let y = x @ p.W
+        return y + p.b if self.bias else y
+    fn describe(self) = f"linear({self.n_in} -> {self.n_out})"
+
+fn _leaky(x) = where(x > 0, x, 0.01 * x)
+fn _elu(x) = where(x > 0, x, exp(where(x > 0, 0 * x, x)) - 1)
+let ACTIVATIONS = {"relu": relu, "gelu": gelu, "tanh": tanh, "sigmoid": sigmoid, "softplus": fn(x) => log(1 + exp(x)),
+                   "silu": fn(x) => x * sigmoid(x), "swish": fn(x) => x * sigmoid(x), "leaky_relu": _leaky, "elu": _elu,
+                   "mish": fn(x) => x * tanh(log(1 + exp(x))), "linear": fn(x) => x, "identity": fn(x) => x,
+                   "softmax": fn(x) => softmax(x, axis=-1), "sin": sin, "cos": cos}
+
+class Activation(Layer):
+    fn __init__(self, f, name=none):
+        if isinstance(f, str):
+            if f.lower() not in ACTIVATIONS:
+                raise ValueError(f"unknown activation '{f}' (choose from {', '.join(sorted(list(ACTIVATIONS.keys())))})")
+            self.f = ACTIVATIONS[f.lower()]
+            self.name = f
+        else:
+            self.f = f
+            self.name = name if name != none else "fn"
+    fn apply(self, p, x, train=false) = self.f(x)
+    fn describe(self) = f"activation({self.name})"
+
+class Dropout(Layer):
+    fn __init__(self, p=0.1):
+        self.p = float(p)
+    fn apply(self, params, x, train=false):
+        if not train or self.p <= 0:
+            return x
+        let mask = where(rand(*shape(x)) >= self.p, ones(*shape(x)), zeros(*shape(x))) / (1.0 - self.p)
+        return x * mask
+    fn describe(self) = f"dropout({self.p})"
+
+class LayerNorm(Layer):
+    fn __init__(self, d, eps=1e-5):
+        self.d = int(d)
+        self.eps = float(eps)
+    fn init(self, seed=0) = record(gamma=ones(self.d), beta=zeros(self.d))
+    fn apply(self, p, x, train=false) = layer_norm(x, p.gamma, p.beta, self.eps)
+    fn describe(self) = f"layer_norm({self.d})"
+
+class RMSNorm(Layer):
+    fn __init__(self, d, eps=1e-6):
+        self.d = int(d)
+        self.eps = float(eps)
+    fn init(self, seed=0) = record(gamma=ones(self.d))
+    fn apply(self, p, x, train=false) = x / sqrt(mean(x * x, axis=-1, keepdims=true) + self.eps) * p.gamma
+    fn describe(self) = f"rms_norm({self.d})"
+
+class BatchNorm(Layer):
+    fn __init__(self, d, eps=1e-5):
+        self.d = int(d)
+        self.eps = float(eps)
+    fn init(self, seed=0) = record(gamma=ones(self.d), beta=zeros(self.d))
+    fn apply(self, p, x, train=false):
+        let nd = ndim(x)
+        if nd == 2:
+            let m = mean(x, axis=0, keepdims=true)
+            let v = mean((x - m) * (x - m), axis=0, keepdims=true)
+            return (x - m) / sqrt(v + self.eps) * p.gamma + p.beta
+        var m = x
+        for ax in range(nd - 1, 1, -1):
+            m = mean(m, axis=ax, keepdims=true)
+        m = mean(m, axis=0, keepdims=true)
+        let dx = x - m
+        var v = dx * dx
+        for ax in range(nd - 1, 1, -1):
+            v = mean(v, axis=ax, keepdims=true)
+        v = mean(v, axis=0, keepdims=true)
+        var shp = [1, self.d]
+        for i in range(nd - 2):
+            shp.append(1)
+        return dx / sqrt(v + self.eps) * reshape(p.gamma, *shp) + reshape(p.beta, *shp)
+    fn describe(self) = f"batch_norm({self.d})"
+
+class Embedding(Layer):
+    fn __init__(self, vocab, d):
+        self.vocab = int(vocab)
+        self.d = int(d)
+    fn init(self, seed=0) = record(E=_randn(seed, self.vocab, self.d) * 0.02)
+    fn apply(self, p, x, train=false) = p.E[tensor(x, i64)]
+    fn describe(self) = f"embedding({self.vocab} x {self.d})"
+
+class PositionalEncoding(Layer):
+    fn __init__(self, max_len, d, learned=false):
+        self.max_len = int(max_len)
+        self.d = int(d)
+        self.learned = learned
+    fn init(self, seed=0) = record(P=_randn(seed, self.max_len, self.d) * 0.02) if self.learned else record()
+    fn apply(self, p, x, train=false):
+        let s = shape(x)
+        let T = s[len(s) - 2]
+        if self.learned:
+            return x + p.P[0:T]
+        let pos = reshape(arange(T) * 1.0, T, 1)
+        let i = reshape(arange(self.d), 1, self.d)
+        let ang = pos / (10000.0 ** ((2 * (i // 2)) * 1.0 / self.d))
+        return x + where(i % 2 == 0, sin(ang), cos(ang))
+    fn describe(self) = f"positional_encoding({'learned' if self.learned else 'sinusoidal'}, {self.d})"
+
+class Conv2D(Layer):
+    fn __init__(self, c_in, c_out, k=3, stride=1, padding="same"):
+        self.c_in = int(c_in)
+        self.c_out = int(c_out)
+        self.k = int(k)
+        self.stride = int(stride)
+        self.padding = self.k // 2 if padding == "same" else int(padding)
+    fn init(self, seed=0):
+        let fan = self.c_in * self.k * self.k
+        return record(W=_randn(seed, self.c_out, self.c_in, self.k, self.k) * sqrt(2.0 / fan), b=zeros(self.c_out))
+    fn apply(self, p, x, train=false) = conv2d(x, p.W, p.b, stride=self.stride, padding=self.padding)
+    fn describe(self) = f"conv2d({self.c_in} -> {self.c_out}, {self.k}x{self.k}, stride {self.stride})"
+
+class MaxPool(Layer):
+    fn __init__(self, k=2):
+        self.k = int(k)
+    fn apply(self, p, x, train=false) = max_pool2d(x, self.k)
+    fn describe(self) = f"max_pool({self.k})"
+
+class AvgPool(Layer):
+    fn __init__(self, k=2):
+        self.k = int(k)
+    fn apply(self, p, x, train=false) = avg_pool2d(x, self.k)
+    fn describe(self) = f"avg_pool({self.k})"
+
+class GlobalAvgPool(Layer):
+    fn apply(self, p, x, train=false) = mean(mean(x, axis=3), axis=2)
+    fn describe(self) = "global_avg_pool"
+
+class Flatten(Layer):
+    fn apply(self, p, x, train=false) = reshape(x, shape(x)[0], -1)
+    fn describe(self) = "flatten"
+
+class Reshape(Layer):
+    fn __init__(self, dims):
+        self.dims = list(dims)
+    fn apply(self, p, x, train=false) = reshape(x, shape(x)[0], *self.dims)
+    fn describe(self) = f"reshape({self.dims})"
+
+class MeanPool(Layer):
+    fn __init__(self, axis=1):
+        self.axis = axis
+    fn apply(self, p, x, train=false) = mean(x, axis=self.axis)
+    fn describe(self) = f"mean_pool(axis={self.axis})"
+
+class LastStep(Layer):
+    fn apply(self, p, x, train=false) = x[:, -1, :]
+    fn describe(self) = "last_step"
+
+class Select(Layer):
+    fn __init__(self, i):
+        self.i = i
+    fn apply(self, p, x, train=false) = x[self.i]
+    fn describe(self) = f"select({self.i})"
+
+class SliceLayer(Layer):
+    fn __init__(self, start, stop):
+        self.start = start
+        self.stop = stop
+    fn apply(self, p, x, train=false) = x[:, self.start:self.stop]
+    fn describe(self) = f"slice({self.start}:{self.stop})"
+
+class Identity(Layer):
+    fn describe(self) = "identity"
+
+class LSTMLayer(Layer):
+    fn __init__(self, n_in, n_hidden, return_sequences=true):
+        self.n_in = int(n_in)
+        self.n_hidden = int(n_hidden)
+        self.seq = return_sequences
+    fn init(self, seed=0) = lstm_init(self.n_in, self.n_hidden, seed=seed)
+    fn apply(self, p, x, train=false):
+        let out = lstm(p, x)
+        return out if self.seq else out[:, -1, :]
+    fn describe(self) = f"lstm({self.n_in} -> {self.n_hidden}{'' if self.seq else ', last step'})"
+
+class GRULayer(Layer):
+    fn __init__(self, n_in, n_hidden, return_sequences=true):
+        self.n_in = int(n_in)
+        self.n_hidden = int(n_hidden)
+        self.seq = return_sequences
+    fn init(self, seed=0) = gru_init(self.n_in, self.n_hidden, seed=seed)
+    fn apply(self, p, x, train=false):
+        let out = gru(p, x)
+        return out if self.seq else out[:, -1, :]
+    fn describe(self) = f"gru({self.n_in} -> {self.n_hidden}{'' if self.seq else ', last step'})"
+
+fn _rope_tables(T, hd, base, offset):
+    let half = hd // 2
+    let inv = 1.0 / (base ** (arange(half) * 2.0 / hd))
+    let ang = reshape(arange(T) * 1.0 + offset, T, 1) * reshape(inv, 1, half)
+    return (concat([cos(ang), cos(ang)], axis=1), concat([sin(ang), sin(ang)], axis=1))
+
+fn apply_rope(x, base=10000.0, offset=0):
+    let s = shape(x)
+    let T = s[len(s) - 2]
+    let hd = s[len(s) - 1]
+    if hd % 2 != 0:
+        raise ShapeError(f"rope: the head size {hd} must be even")
+    let cs = _rope_tables(T, hd, float(base), offset)
+    let half = hd // 2
+    let x1 = _last_slice(x, 0, half)
+    let x2 = _last_slice(x, half, hd)
+    let rot = concat([-x2, x1], axis=-1)
+    return x * cs[0] + rot * cs[1]
+
+fn _last_slice(x, a, b):
+    let s = list(shape(x))
+    let n = s[len(s) - 1]
+    let flat = reshape(x, -1, n)[:, a:b]
+    s[len(s) - 1] = b - a
+    return reshape(flat, *s)
+
+class MultiHeadAttention(Layer):
+    fn __init__(self, d, heads=4, causal=false, kv_heads=none, rope=false, rope_base=10000.0, qk_norm=false, eps=1e-6, bias=true):
+        self.d = int(d)
+        self.h = int(heads)
+        self.causal = causal
+        self.bias = bias
+        if self.d % self.h != 0:
+            raise ShapeError(f"multi_head_attention: d={self.d} must be divisible by heads={self.h}")
+        self.kvh = int(kv_heads) if kv_heads else self.h
+        if self.h % self.kvh != 0:
+            raise ShapeError(f"multi_head_attention: heads={self.h} must be a multiple of kv_heads={self.kvh}")
+        self.hd = self.d // self.h
+        self.rope = rope
+        self.rope_base = float(rope_base)
+        self.qk_norm = qk_norm
+        self.eps = float(eps)
+    fn init(self, seed=0):
+        let dkv = self.kvh * self.hd
+        var f = {"Wq": _glorot(_sub(seed, 0), self.d, self.d), "Wk": _glorot(_sub(seed, 1), self.d, dkv),
+                 "Wv": _glorot(_sub(seed, 2), self.d, dkv), "Wo": _glorot(_sub(seed, 3), self.d, self.d)}
+        if self.bias:
+            f["bo"] = zeros(self.d)
+        if self.qk_norm:
+            f["q_norm"] = ones(self.hd)
+            f["k_norm"] = ones(self.hd)
+        return record(**f)
+    fn apply(self, p, x, train=false):
+        let cross = isinstance(x, list) or isinstance(x, tuple)
+        let src = x[0] if cross else x
+        let mem = x[1] if cross else x
+        let s = shape(src)
+        let B = s[0]
+        let T = s[1]
+        let D = s[2]
+        let S = shape(mem)[1]
+        let hd = self.hd
+        let h = self.h
+        let kvh = self.kvh
+        var q = permute(reshape(src @ p.Wq, B, T, h, hd), 0, 2, 1, 3)
+        var k = permute(reshape(mem @ p.Wk, B, S, kvh, hd), 0, 2, 1, 3)
+        var v = permute(reshape(mem @ p.Wv, B, S, kvh, hd), 0, 2, 1, 3)
+        if self.qk_norm:
+            q = q / sqrt(mean(q * q, axis=-1, keepdims=true) + self.eps) * p.q_norm
+            k = k / sqrt(mean(k * k, axis=-1, keepdims=true) + self.eps) * p.k_norm
+        if self.rope:
+            q = apply_rope(q, self.rope_base)
+            k = apply_rope(k, self.rope_base)
+        if kvh != h:
+            let g = h // kvh
+            let one = ones(1, 1, g, 1, 1)
+            k = reshape(reshape(k, B, kvh, 1, S, hd) * one, B, h, S, hd)
+            v = reshape(reshape(v, B, kvh, 1, S, hd) * one, B, h, S, hd)
+        var sc = (q @ permute(k, 0, 1, 3, 2)) / sqrt(hd * 1.0)
+        if self.causal:
+            let r = reshape(arange(T), T, 1)
+            let c = reshape(arange(S), 1, S)
+            sc = sc + where(c > r, zeros(T, S) - 1e9, zeros(T, S))
+        let o = reshape(permute(softmax(sc, axis=-1) @ v, 0, 2, 1, 3), B, T, D)
+        let y = o @ p.Wo
+        return y + p.bo if self.bias else y
+    fn describe(self) = f"multi_head_attention(d={self.d}, heads={self.h}{', causal' if self.causal else ''})"
+
+class SwiGLU(Layer):
+    fn __init__(self, d, ff=none, act="silu", d_out=none):
+        self.d = int(d)
+        self.ff = int(ff if ff else (8 * int(d)) // 3)
+        self.d_out = int(d_out if d_out else d)
+        self.act = str(act).lower()
+    fn init(self, seed=0) = record(Wg=_glorot(_sub(seed, 0), self.d, self.ff), Wu=_glorot(_sub(seed, 1), self.d, self.ff), Wd=_glorot(_sub(seed, 2), self.ff, self.d_out))
+    fn apply(self, p, x, train=false):
+        let g = x @ p.Wg
+        var a = g
+        if self.act == "gelu":
+            a = gelu(g)
+        elif self.act == "relu":
+            a = relu(g)
+        else:
+            a = g * sigmoid(g)
+        return (a * (x @ p.Wu)) @ p.Wd
+    fn describe(self) = f"swiglu({self.d} -> {self.ff} -> {self.d_out}, {self.act})"
+
+class Sequential(Layer):
+    fn __init__(self, layers):
+        self.layers = list(layers)
+    fn init(self, seed=0) = [self.layers[i].init(_sub(seed, i)) for i in range(len(self.layers))]
+    fn apply(self, params, x, train=false):
+        if len(params) != len(self.layers):
+            raise ShapeError(f"sequential: {len(self.layers)} layers but {len(params)} parameter entries (create them with model.init())")
+        var h = x
+        for i in range(len(self.layers)):
+            h = self.layers[i](params[i], h, train)
+        return h
+    fn children(self) = self.layers
+    fn describe(self) = f"sequential({len(self.layers)} layers)"
+
+class Residual(Layer):
+    fn __init__(self, inner, pre_norm=none):
+        self.inner = inner
+        self.norm = pre_norm
+    fn init(self, seed=0) = record(inner=self.inner.init(_sub(seed, 0)), norm=self.norm.init(_sub(seed, 1)) if self.norm != none else record())
+    fn apply(self, p, x, train=false):
+        let h = self.norm(p.norm, x, train) if self.norm != none else x
+        return x + self.inner(p.inner, h, train)
+    fn children(self) = [self.inner] + ([self.norm] if self.norm != none else [])
+    fn describe(self) = "residual"
+
+class Parallel(Layer):
+    fn __init__(self, branches, combine="concat"):
+        self.branches = list(branches)
+        self.combine = combine
+    fn init(self, seed=0) = [self.branches[i].init(_sub(seed, i)) for i in range(len(self.branches))]
+    fn apply(self, params, x, train=false):
+        let outs = [self.branches[i](params[i], x, train) for i in range(len(self.branches))]
+        if self.combine == "add":
+            var s = outs[0]
+            for o in outs[1:]:
+                s = s + o
+            return s
+        if self.combine == "mul":
+            var s = outs[0]
+            for o in outs[1:]:
+                s = s * o
+            return s
+        return concat(outs, axis=-1)
+    fn children(self) = self.branches
+    fn describe(self) = f"parallel({len(self.branches)}, {self.combine})"
+
+class TransformerBlock(Layer):
+    fn __init__(self, d, heads=4, ff=none, causal=false, dropout=0.0, activation="gelu", kv_heads=none, rope=false, rope_base=10000.0, qk_norm=false, norm="layer", ffn="mlp"):
+        self.d = int(d)
+        self.norm_kind = str(norm).lower()
+        self.ffn_kind = str(ffn).lower()
+        fn mk() = LayerNorm(d) if self.norm_kind == "layer" else RMSNorm(d)
+        self.attn = Residual(MultiHeadAttention(d, heads, causal, kv_heads, rope, rope_base, qk_norm), pre_norm=mk())
+        var body = none
+        var f = ff
+        if self.ffn_kind == "swiglu":
+            f = int(ff if ff else (8 * int(d)) // 3)
+            body = SwiGLU(d, f, "silu" if str(activation).lower() == "gelu" else activation)
+            if dropout:
+                body = Sequential([body, Dropout(dropout)])
+        elif self.ffn_kind == "mlp":
+            f = int(ff if ff else 4 * d)
+            body = Sequential([Linear(d, f), Activation(activation), Dropout(dropout), Linear(f, d)])
+        else:
+            raise NotImplementedError(f"transformer_block: ffn '{ffn}' is not in native programs (mlp, swiglu)")
+        self.mlp = Residual(body, pre_norm=mk())
+        self.heads = int(heads)
+        self.ff = f
+        self.causal = causal
+    fn init(self, seed=0) = record(attn=self.attn.init(_sub(seed, 0)), mlp=self.mlp.init(_sub(seed, 1)))
+    fn apply(self, p, x, train=false) = self.mlp(p.mlp, self.attn(p.attn, x, train), train)
+    fn children(self) = [self.attn, self.mlp]
+    fn describe(self) = f"transformer_block(d={self.d}, heads={self.heads}, ff={self.ff}{', causal' if self.causal else ''})"
+
+class CustomLayer(Layer):
+    fn __init__(self, init_fn, forward_fn, name="model", parts=none):
+        self.init_fn = init_fn
+        self.forward_fn = forward_fn
+        self.name = str(name)
+        self.parts = parts
+    fn init(self, seed=0) = self.init_fn(seed=0 if seed == none else int(seed))
+    fn apply(self, p, x, train=false) = self.forward_fn(p, x, train)
+    fn describe(self) = self.name
+
+class LambdaLayer(Layer):
+    fn __init__(self, f, name="lambda"):
+        self.f = f
+        self.name = name
+    fn apply(self, p, x, train=false) = self.f(x)
+    fn describe(self) = self.name
+
+# ---- the functions
+fn linear(n_in, n_out, bias=true, init="he") = Linear(n_in, n_out, bias, init)
+fn dense(n_in, n_out, act=none) = Linear(n_in, n_out) if act == none else Sequential([Linear(n_in, n_out), Activation(act)])
+fn activation(f) = Activation(f)
+fn dropout_layer(p=0.1) = Dropout(p)
+fn layer_norm_layer(d, eps=1e-5) = LayerNorm(d, eps)
+fn rms_norm_layer(d, eps=1e-6) = RMSNorm(d, eps)
+fn batch_norm_layer(d, eps=1e-5) = BatchNorm(d, eps)
+fn embedding(vocab, d) = Embedding(vocab, d)
+fn positional_encoding(max_len, d, learned=false) = PositionalEncoding(max_len, d, learned)
+fn conv2d_layer(c_in, c_out, k=3, stride=1, padding="same") = Conv2D(c_in, c_out, k, stride, padding)
+fn max_pool(k=2) = MaxPool(k)
+fn avg_pool(k=2) = AvgPool(k)
+fn global_avg_pool() = GlobalAvgPool()
+fn flatten_layer() = Flatten()
+fn reshape_layer(*dims) = Reshape(dims)
+fn mean_pool(axis=1) = MeanPool(axis)
+fn last_step() = LastStep()
+fn select(i) = Select(i)
+fn slice_layer(start, stop) = SliceLayer(start, stop)
+fn identity() = Identity()
+fn lstm_layer(n_in, n_hidden, return_sequences=true) = LSTMLayer(n_in, n_hidden, return_sequences)
+fn gru_layer(n_in, n_hidden, return_sequences=true) = GRULayer(n_in, n_hidden, return_sequences)
+fn multi_head_attention(d, heads=4, causal=false, kv_heads=none, rope=false, rope_base=10000.0, qk_norm=false, eps=1e-6, bias=true, gate=none, memory_mask=false) = MultiHeadAttention(d, heads, causal, kv_heads, rope, rope_base, qk_norm, eps, bias)
+fn swiglu(d, ff=none, act="silu", d_out=none) = SwiGLU(d, ff, act, d_out)
+fn sequential(layers) = Sequential(layers)
+fn residual(inner, pre_norm=none) = Residual(inner, pre_norm)
+fn parallel(branches, combine="concat") = Parallel(branches, combine)
+fn custom_layer(init, forward, name="model", parts=none) = CustomLayer(init, forward, name, parts)
+fn lambda_layer(f, name="lambda", torch_fn=none) = LambdaLayer(f, name)
+fn transformer_block(d, heads=4, ff=none, causal=false, dropout=0.0, activation="gelu", kv_heads=none, rope=false, rope_base=10000.0, qk_norm=false, norm="layer", ffn="mlp", experts=8, top_k=2) = TransformerBlock(d, heads, ff, causal, dropout, activation, kv_heads, rope, rope_base, qk_norm, norm, ffn)
+
+fn transformer_encoder(d, heads=4, layers=2, ff=none, causal=false, dropout=0.0, norm="layer", ffn="mlp", kv_heads=none, rope=false, qk_norm=false, activation="gelu"):
+    var blocks = [TransformerBlock(d, heads, ff, causal, dropout, activation, kv_heads, rope, 10000.0, qk_norm, norm, ffn) for i in range(layers)]
+    blocks.append(RMSNorm(d) if str(norm).lower() == "rms" else LayerNorm(d))
+    return Sequential(blocks)
+
+fn transformer_lm(vocab, d=64, heads=4, layers=2, context=128, dropout=0.0, ff=none, norm="layer", ffn="mlp", kv_heads=none, rope=false, qk_norm=false, activation="gelu"):
+    var parts = [Embedding(vocab, d)]
+    if not rope:
+        parts.append(PositionalEncoding(context, d, true))
+    parts.append(transformer_encoder(d, heads, layers, ff, true, dropout, norm, ffn, kv_heads, rope, qk_norm, activation))
+    parts.append(Linear(d, vocab))
+    return Sequential(parts)
+
+fn transformer_classifier(vocab, classes, d=64, heads=4, layers=2, context=128) = Sequential([Embedding(vocab, d), PositionalEncoding(context, d), transformer_encoder(d, heads, layers), MeanPool(1), Linear(d, classes)])
+
+fn mlp(sizes, act="relu", dropout=0.0, norm=false, out_act=none):
+    var L = []
+    for i in range(len(sizes) - 1):
+        L.append(Linear(sizes[i], sizes[i + 1]))
+        if i < len(sizes) - 2:
+            if norm:
+                L.append(LayerNorm(sizes[i + 1]))
+            L.append(Activation(act))
+            if dropout:
+                L.append(Dropout(dropout))
+    if out_act:
+        L.append(Activation(out_act))
+    return Sequential(L)
+
+fn resnet_mlp(d_in, d_out, width=64, blocks=3, act="gelu"):
+    var body = [Linear(d_in, width)]
+    for i in range(blocks):
+        body.append(Residual(Sequential([Linear(width, width), Activation(act), Linear(width, width)]), pre_norm=LayerNorm(width)))
+    body.append(LayerNorm(width))
+    body.append(Linear(width, d_out))
+    return Sequential(body)
+
+fn cnn(in_channels, classes, image=28, channels=[16, 32], dense_width=64):
+    var L = []
+    var c = int(in_channels)
+    var size = int(image)
+    for ch in channels:
+        L.append(Conv2D(c, ch, 3))
+        L.append(Activation("relu"))
+        L.append(MaxPool(2))
+        c = int(ch)
+        size = size // 2
+    L.append(Flatten())
+    L.append(Linear(c * size * size, dense_width))
+    L.append(Activation("relu"))
+    L.append(Linear(dense_width, classes))
+    return Sequential(L)
+
+fn lstm_classifier(n_in, hidden, classes, layers=1):
+    var L = []
+    var d = n_in
+    for i in range(layers):
+        L.append(LSTMLayer(d, hidden, i < layers - 1))
+        d = hidden
+    L.append(Linear(hidden, classes))
+    return Sequential(L)
+
+fn count_params(params):
+    var n = 0
+    for leaf in tree_leaves(params):
+        if ndim(leaf) > 0:
+            n = n + len(tolist(flatten(leaf)))
+        elif isinstance(leaf, float):
+            n = n + 1
+    return n
+
+fn _walk(layer, depth, out):
+    out.append("  " * depth + layer.describe())
+    for c in layer.children():
+        _walk(c, depth + 1, out)
+
+fn summary(model, params=none):
+    var lines = []
+    _walk(model, 0, lines)
+    if params != none:
+        lines.append(f"parameters: {count_params(params)}")
+    let s = "\n".join(lines)
+    print(s)
+    return s
+
+fn _mae(p, y) = mean(abs(p - y))
+fn _bce(p, y) = -mean(y * log(sigmoid(p) + 1e-12) + (1 - y) * log(1 - sigmoid(p) + 1e-12))
+
+fn _loss_fn(loss):
+    if callable(loss):
+        return loss
+    if loss == "mse":
+        return mse
+    if loss == "cross_entropy":
+        return cross_entropy
+    if loss == "mae":
+        return _mae
+    if loss == "bce":
+        return _bce
+    raise ValueError(f"fit(): unknown loss '{loss}' (choose from mse, cross_entropy, mae, bce or pass a function)")
+
+fn fit(model, params, X, y=none, loss="mse", opt=none, epochs=10, batch_size=none, seed=0, verbose=true, clip=none, schedule=none, val=none, backend="numpy"):
+    let lf = _loss_fn(loss)
+    let o = opt if opt != none else adam(1e-3)
+    let target = X if y == none else y
+    fn objective(p, xb, yb) = lf(model(p, xb, true), yb)
+    let vg = value_and_grad(objective)
+    let n = shape(X)[0]
+    var history = []
+    var val_hist = []
+    var p = params
+    var step = 0
+    seed_push(int(seed))
+    for ep in range(epochs):
+        var total = 0.0
+        if not batch_size:
+            if schedule != none:
+                set_lr(o, schedule(step))
+            let r = vg(p, X, target)
+            var g = r[1]
+            if clip:
+                g = clip_grad_norm(g, clip)
+            p = o.step(p, g)
+            total = float(r[0])
+            step = step + 1
+        else:
+            let idx = permutation(n)
+            var i = 0
+            while i < n:
+                let b = idx[i:min(i + batch_size, n)]
+                if schedule != none:
+                    set_lr(o, schedule(step))
+                let r = vg(p, X[b], target[b])
+                var g = r[1]
+                if clip:
+                    g = clip_grad_norm(g, clip)
+                p = o.step(p, g)
+                total = total + float(r[0]) * len(b)
+                step = step + 1
+                i = i + batch_size
+            total = total / n
+        history.append(total)
+        if val != none:
+            val_hist.append(float(lf(model(p, val[0], false), val[1])))
+        if verbose and (ep % max(1, epochs // 10) == 0 or ep == epochs - 1):
+            print(f"epoch {ep + 1}/{epochs}  loss {total:.6g}" + (f"  val {val_hist[len(val_hist) - 1]:.6g}" if val != none else ""))
+    seed_pop()
+    return record(params=p, history=history, val_history=val_hist, device="native")
+
+fn predict(model, params, X, backend="numpy") = model(params, X, false)
+
+fn _not_native(what):
+    raise NotImplementedError(f"layers.{what} is not in native programs yet; run this program with apsi run")
+
+fn graph(edges=none, n=none, src=none, dst=none, self_loops=true, undirected=false, batch=none, types=none, reverse=false, node_types=none, edge_features=none, leading=none) = _not_native("graph")
+fn gcn(n_in, n_out, bias=true) = _not_native("gcn")
+fn gat(n_in, n_out, heads=4, concat=true, slope=0.2) = _not_native("gat")
+fn sage(n_in, n_out, aggregate="mean") = _not_native("sage")
+fn gin(n_in, n_out, hidden=none) = _not_native("gin")
+fn moe(d, experts=8, top_k=2, ff=none, act="silu") = _not_native("moe")
+fn fit_batches(model, params, batches, loss="cross_entropy", opt=none, epochs=1) = _not_native("fit_batches")

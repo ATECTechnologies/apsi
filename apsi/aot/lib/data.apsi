@@ -1,0 +1,410 @@
+# use data: streaming input pipelines for native programs (lazy, re-iterable: each `for` starts again).
+# Sources: from_list, from_range, from_tensors, from_generator, from_csv, from_jsonl, from_npy, from_files;
+# stages: map, filter, batch, unbatch, shuffle, take, skip, repeat, window, shard, interleave, prefetch, cache.
+
+class LengthUnknown(TypeError):
+    pass
+
+class Pipeline:
+    fn __init__(self, factory, length=none, desc="source"):
+        self._factory = factory
+        self._len = length
+        self.desc = desc
+
+    fn __iter__(self) = iter(self._factory())
+
+    fn __len__(self):
+        if self._len == none:
+            raise LengthUnknown("length of this pipeline is unknown (it has a filter or a streaming source)")
+        return self._len
+
+    fn __repr__(self) = f"<pipeline {self.desc}>"
+
+    fn __str__(self) = f"<pipeline {self.desc}>"
+
+    fn map(self, f, workers=none, ordered=true) = map(self, f, workers, ordered)
+
+    fn filter(self, f) = filter(self, f)
+
+    fn batch(self, size, drop_last=false) = batch(self, size, drop_last)
+
+    fn unbatch(self) = unbatch(self)
+
+    fn shuffle(self, buffer=1024, seed=none) = shuffle(self, buffer, seed)
+
+    fn prefetch(self, n=2) = self
+
+    fn take(self, n) = take(self, n)
+
+    fn skip(self, n) = skip(self, n)
+
+    fn repeat(self, times=none) = repeat(self, times)
+
+    fn to_list(self) = [x for x in self]
+
+let _seed_rng = seed
+
+fn _as_pipeline(p):
+    if isinstance(p, Pipeline):
+        return p
+    if isinstance(p, list) or isinstance(p, tuple):
+        return from_list(p)
+    if ndim(p) > 0:
+        return from_tensors(p)
+    raise TypeError(f"expected a pipeline, got {type(p)}")
+
+# ---- sources
+fn from_list(xs):
+    let items = list(xs)
+    fn run():
+        for x in items:
+            yield x
+    return Pipeline(run, len(items), "list")
+
+fn from_range(n):
+    fn run():
+        for i in range(n):
+            yield i
+    return Pipeline(run, n, "range")
+
+fn from_generator(f):
+    fn run():
+        for x in f():
+            yield x
+    return Pipeline(run, none, "generator")
+
+fn from_tensors(*arrays, batch=none, shuffle=false, seed=none, drop_last=false):
+    if len(arrays) == 0:
+        raise ValueError("from_tensors needs at least one tensor")
+    let n = len(arrays[0])
+    for a in arrays:
+        if len(a) != n:
+            raise ValueError("from_tensors: all tensors must have the same number of rows")
+    if batch:
+        let size = int(batch)
+        var epoch = 0
+        fn run_batches():
+            var order = none
+            if shuffle:
+                if seed != none:
+                    _seed_rng(int(seed) + epoch)
+                order = permutation(n)
+            epoch = epoch + 1
+            let stop = n - (n % size) if drop_last else n
+            var i = 0
+            while i < stop:
+                let j = min(i + size, n)
+                var parts = []
+                for a in arrays:
+                    if order == none:
+                        parts.append(a[i:j])
+                    else:
+                        parts.append(a[sort(order[i:j])])
+                yield parts[0] if len(parts) == 1 else tuple(parts)
+                i = i + size
+        return Pipeline(run_batches, n // size if drop_last else (n + size - 1) // size, f"tensors(batch={size})")
+    if len(arrays) == 1:
+        let a = arrays[0]
+        fn run1():
+            for i in range(n):
+                yield a[i]
+        return Pipeline(run1, n, "tensor")
+    fn runk():
+        for i in range(n):
+            yield tuple([a[i] for a in arrays])
+    return Pipeline(runk, n, "tensors")
+
+fn from_csv(path, skip_header=0, chunk=10000, delimiter=","):
+    fn run():
+        var k = 0
+        for line in read_text(path).splitlines():
+            k = k + 1
+            let s = line.strip()
+            if k <= skip_header or s == "":
+                continue
+            yield tensor([float(v) for v in s.split(delimiter)])
+    return Pipeline(run, none, "csv")
+
+fn from_jsonl(path):
+    fn run():
+        for line in read_text(path).splitlines():
+            if line.strip() != "":
+                yield json_parse(line)
+    return Pipeline(run, none, "jsonl")
+
+fn load_tensor(path, mmap=false):
+    let p = path if path.endswith(".npy") or __fs("isfile", path, none) else path + ".npy"
+    return __npy_load(p)
+
+fn save_tensor(path, x):
+    let p = path if path.endswith(".npy") else path + ".npy"
+    __npy_save(p, x)
+    return p
+
+fn from_npy(path):
+    let arr = load_tensor(path)
+    return from_tensors(arr)
+
+fn _glob_match(pat, s):
+    if pat == "":
+        return s == ""
+    if pat[0] == "*":
+        for i in range(len(s) + 1):
+            if _glob_match(pat[1:], s[i:]):
+                return true
+        return false
+    if s == "":
+        return false
+    if pat[0] == "?" or pat[0] == s[0]:
+        return _glob_match(pat[1:], s[1:])
+    return false
+
+fn _glob(pattern):
+    let norm = pattern.replace("\\", "/")
+    let parts = norm.split("/")
+    var bases = ["/" if norm.startswith("/") else ""]
+    for i in range(len(parts)):
+        let part = parts[i]
+        if part == "" and i == 0:
+            continue
+        var nxt = []
+        for b in bases:
+            let d = b if b != "" else "."
+            if "*" in part or "?" in part:
+                if part == "**":
+                    nxt.append(b)
+                    var stack = [b]
+                    while len(stack) > 0:
+                        let cur = stack.pop()
+                        let cd = cur if cur != "" else "."
+                        if __fs("isdir", cd, none):
+                            for nm in __fs("list", cd, none):
+                                let full = (cur + nm) if cur.endswith("/") or cur == "" else cur + "/" + nm
+                                if __fs("isdir", full, none):
+                                    nxt.append(full + "/")
+                                    stack.append(full + "/")
+                    continue
+                if __fs("isdir", d, none):
+                    for nm in __fs("list", d, none):
+                        if _glob_match(part, nm):
+                            nxt.append(b + nm + ("/" if i < len(parts) - 1 else ""))
+            else:
+                let full = b + part + ("/" if i < len(parts) - 1 else "")
+                if __fs("isdir", full, none) or __fs("isfile", full.rstrip("/"), none):
+                    nxt.append(full)
+        bases = nxt
+    return sorted(distinct_by([b.rstrip("/") for b in bases if __fs("isfile", b.rstrip("/"), none)], fn(x) => x))
+
+fn from_files(pattern):
+    let files = _glob(pattern)
+    return from_list(files)
+
+# ---- stages
+fn _collate(items):
+    let first = items[0]
+    if isinstance(first, tuple):
+        return tuple([_collate([it[k] for it in items]) for k in range(len(first))])
+    if isinstance(first, dict):
+        var d = {}
+        for k in first:
+            d[k] = _collate([it[k] for it in items])
+        return d
+    if isinstance(first, int) or isinstance(first, float) or ndim(first) > 0 or type(first) == "Tensor":
+        return stack([tensor(v) for v in items])
+    return list(items)
+
+fn batch(p, size, drop_last=false):
+    let src = _as_pipeline(p)
+    let k = int(size)
+    fn run():
+        var buf = []
+        for x in src:
+            buf.append(x)
+            if len(buf) == k:
+                yield _collate(buf)
+                buf = []
+        if len(buf) > 0 and not drop_last:
+            yield _collate(buf)
+    var n = none
+    if src._len != none:
+        n = src._len // k if drop_last else (src._len + k - 1) // k
+    return Pipeline(run, n, f"{src.desc} -> batch({k})")
+
+fn unbatch(p):
+    let src = _as_pipeline(p)
+    fn run():
+        for b in src:
+            if isinstance(b, tuple):
+                for i in range(len(b[0])):
+                    yield tuple([part[i] for part in b])
+            else:
+                for i in range(len(b)):
+                    yield b[i]
+    return Pipeline(run, none, f"{src.desc} -> unbatch")
+
+fn map(p, f, workers=none, ordered=true):
+    let src = _as_pipeline(p)
+    fn run():
+        for x in src:
+            yield f(x)
+    return Pipeline(run, src._len, f"{src.desc} -> map")
+
+fn filter(p, f):
+    let src = _as_pipeline(p)
+    fn run():
+        for x in src:
+            if f(x):
+                yield x
+    return Pipeline(run, none, f"{src.desc} -> filter")
+
+fn shuffle(p, buffer=1024, seed=none):
+    let src = _as_pipeline(p)
+    var epoch = 0
+    fn run():
+        if seed != none:
+            _seed_rng(int(seed) + epoch)
+        epoch = epoch + 1
+        var buf = []
+        for x in src:
+            if len(buf) < buffer:
+                buf.append(x)
+                continue
+            let k = int(randint(0, len(buf)))
+            yield buf[k]
+            buf[k] = x
+        let order = tolist(permutation(len(buf))) if len(buf) > 0 else []
+        for k in order:
+            yield buf[k]
+    return Pipeline(run, src._len, f"{src.desc} -> shuffle")
+
+fn prefetch(p, n=2) = _as_pipeline(p)
+
+fn take(p, n):
+    let src = _as_pipeline(p)
+    fn run():
+        var k = 0
+        if n <= 0:
+            return
+        for x in src:
+            yield x
+            k = k + 1
+            if k >= n:
+                return
+    return Pipeline(run, none if src._len == none else min(src._len, int(n)), f"{src.desc} -> take")
+
+fn skip(p, n):
+    let src = _as_pipeline(p)
+    fn run():
+        var k = 0
+        for x in src:
+            if k >= n:
+                yield x
+            k = k + 1
+    return Pipeline(run, none if src._len == none else max(0, src._len - int(n)), f"{src.desc} -> skip")
+
+fn repeat(p, times=none):
+    let src = _as_pipeline(p)
+    fn run():
+        var k = 0
+        while times == none or k < times:
+            for x in src:
+                yield x
+            k = k + 1
+    return Pipeline(run, none if times == none or src._len == none else src._len * int(times), f"{src.desc} -> repeat")
+
+fn window(p, size, shift=1, drop_last=true):
+    let src = _as_pipeline(p)
+    fn run():
+        var buf = []
+        var k = 0
+        for x in src:
+            buf.append(x)
+            if len(buf) > size:
+                buf = buf[1:]
+            if len(buf) == size:
+                if k % shift == 0:
+                    yield stack([tensor(v) for v in buf])
+                k = k + 1
+    return Pipeline(run, none, f"{src.desc} -> window({size}, {shift})")
+
+fn shard(p, count, index):
+    let src = _as_pipeline(p)
+    if index < 0 or index >= count:
+        raise ValueError("shard(): index must be in 0..count-1")
+    fn run():
+        var i = 0
+        for x in src:
+            if i % count == index:
+                yield x
+            i = i + 1
+    return Pipeline(run, none, f"{src.desc} -> shard({index}/{count})")
+
+fn interleave(pipelines, cycle=true):
+    let srcs = [_as_pipeline(p) for p in pipelines]
+    fn run():
+        var its = [iter(s) for s in srcs]
+        while len(its) > 0:
+            var alive = []
+            for it in its:
+                let v = next(it, StopIteration)
+                if v != StopIteration:
+                    yield v
+                    alive.append(it)
+            its = alive
+    var total = 0
+    for s in srcs:
+        if s._len == none:
+            total = none
+            break
+        total = total + s._len
+    return Pipeline(run, total, f"interleave({len(srcs)})")
+
+fn cache(p, directory=none, shard=4096):
+    let src = _as_pipeline(p)
+    var saved = none
+    fn run():
+        if saved == none:
+            var items = []
+            for x in src:
+                items.append(x)
+                yield x
+            saved = items
+        else:
+            for x in saved:
+                yield x
+    return Pipeline(run, src._len, f"{src.desc} -> cache")
+
+fn disk_cache(directory="cache") = fn(p) => cache(p, directory)
+
+fn flush(x) = x
+
+fn detect_format(rec):
+    if isinstance(rec, str):
+        return "text"
+    if isinstance(rec, dict):
+        if "messages" in rec:
+            return "chat"
+        if "instruction" in rec or "prompt" in rec:
+            return "instruct"
+        if "text" in rec:
+            return "text"
+    return "unknown"
+
+fn throughput(p, limit=none):
+    let t0 = __time()
+    var n = 0
+    for x in (take(p, limit) if limit else _as_pipeline(p)):
+        n = n + 1
+    let dt = __time() - t0
+    return record(items=n, seconds=dt, per_second=n / dt if dt > 0 else inf)
+
+fn _not_native(what):
+    raise NotImplementedError(f"data.{what} is not in native programs yet; run this program with apsi run")
+
+fn from_parquet(path, columns=none, rows=65536) = _not_native("from_parquet")
+
+fn open_tensor(path, shape, dtype="f32", mode="w+") = _not_native("open_tensor")
+
+fn text_dataset(source, tokenizer="bytes", seq_len=512, format="auto", field=none, template=none, chat="auto", eos=none, train_on_prompt=false, pack=true, stride=none, text_split="file") = _not_native("text_dataset")
+
+fn train_tokenizer(source, vocab_size=8000, min_frequency=2, special_tokens=["<|endoftext|>"], lower=false, format="auto", field=none, template=none, text_split="file", verbose=false, engine="auto") = _not_native("train_tokenizer")

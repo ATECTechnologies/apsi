@@ -1,0 +1,96 @@
+# use linalg: linear algebra on float64 matrices (the native runtime's LU, Cholesky, QR, eigen and SVD routines).
+use _complex
+
+fn _sq(a, what):
+    let s = shape(a)
+    if len(s) != 2 or s[0] != s[1]:
+        raise ShapeError(f"{what}() needs a square matrix, got shape {s}")
+
+fn solve(a, b) = __la("solve", a, b)
+
+fn inv(a) = __la("inv", a)
+
+fn det(a) = __la("det", a)
+
+fn slogdet(a):
+    let d = __la("det", a)
+    if d == 0:
+        return (0.0, -inf)
+    return (1.0 if d > 0 else -1.0, log(abs(d)))
+
+fn trace(a):
+    let s = shape(a)
+    let n = min(s[0], s[1])
+    var t = 0.0
+    for i in range(n):
+        t = t + a[i, i]
+    return t
+
+fn norm(x, axis=none, ord=none):
+    if ord == none or ord == "fro":
+        return sqrt(sum(x * x, axis=axis)) if axis != none else sqrt(sum(x * x))
+    if ord == 1 and ndim(x) == 1:
+        return sum(abs(x))
+    if ord == inf and ndim(x) == 1:
+        return max(abs(x))
+    if ord == 2 and ndim(x) == 2:
+        return __la("svd", x)[1][0]
+    if ord == "nuc":
+        return sum(__la("svd", x)[1])
+    if ord == 1:
+        return max(sum(abs(x), axis=0))
+    if ord == inf:
+        return max(sum(abs(x), axis=1))
+    return sum(abs(x) ** ord) ** (1.0 / ord)
+
+fn cholesky(a) = __la("cholesky", a)
+
+fn qr(a) = __la("qr", a)
+
+fn eigh(a) = __la("eigh", a)
+
+fn eigvalsh(a) = __la("eigh", a)[0]
+
+fn eig(a):
+    let r = __la("eig", a)
+    if r[4]:
+        return (Complex(r[0], r[2]), Complex(r[1], r[3]))
+    return (r[0], r[1])
+
+fn eigvals(a) = eig(a)[0]
+
+fn svd(a) = __la("svd", a)
+
+fn svdvals(a) = __la("svd", a)[1]
+
+fn pinv(a, rcond=none) = __la("pinv", a, rcond)
+
+fn matrix_rank(a, tol=none) = __la("rank", a, tol)
+
+fn lstsq(a, b) = __la("lstsq", a, b)
+
+fn cond(a):
+    let s = __la("svd", a)[1]
+    return s[0] / s[len(s) - 1]
+
+fn matrix_power(a, k):
+    _sq(a, "matrix_power")
+    if k < 0:
+        return matrix_power(inv(a), -k)
+    var result = eye(shape(a)[0])
+    var base = a
+    var e = k
+    while e > 0:
+        if e % 2 == 1:
+            result = result @ base
+        base = base @ base
+        e = e // 2
+    return result
+
+fn kron(a, b):
+    let sa = shape(a)
+    let sb = shape(b)
+    let r = reshape(a, sa[0], 1, sa[1], 1) * reshape(b, 1, sb[0], 1, sb[1])
+    return reshape(r, sa[0] * sb[0], sa[1] * sb[1])
+
+fn cross(a, b) = tensor([a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2], a[0] * b[1] - a[1] * b[0]])

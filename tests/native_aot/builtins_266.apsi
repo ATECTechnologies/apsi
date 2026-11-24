@@ -1,0 +1,8 @@
+print(band(12, 10), bor(12, 10), bxor(12, 10), shl(1, 10), shr(1024, 3), platform() != "")
+print(roll(tensor([1.0, 2.0, 3.0, 4.0]), 1), roll(tensor([[1.0, 2.0], [3.0, 4.0]]), 1, axis=1))
+let g = meshgrid(tensor([1.0, 2.0, 3.0]), tensor([10.0, 20.0]))
+print(g[0], g[1])
+print(nan_to_num(tensor([1.0, nan, inf, -inf])))
+print(derivative(fn(x) => x ** 3, 2.0), jacobian(fn(v) => v * v)(tensor([1.0, 2.0])), hessian(fn(v) => sum(v ** 3))(tensor([1.0, 2.0])))
+print(laplace(fn(v) => sum(v ** 2))(tensor([1.0, 2.0, 3.0])))
+print("abc".title(), "a,b,c".rsplit(",", 1), "x".center(5, "*"), "42".zfill(5), {1, 2}.union({3}), "Hello".swapcase())
