@@ -26,7 +26,7 @@
 - `use sci` (einsum, FFT, integrate, find_root, minimize, curve_fit)
 - nn: LSTM, GRU, batch/RMS norm, RMSprop, Adagrad, `train()`, sample datasets
 
-## ✅ 1.10.0 — first production release with installers (8 November 2026, about 04:00–09:00 Bangkok time)
+## ✅ 1.10.0 — first production release with installers
 - Windows setup wizard (.exe with its own Python), portable zip, .deb for Debian/Ubuntu, wheel
 - FP64 → FP4/INT4 number formats, bit-exact with the standards; quantization-aware training
 - streaming data pipelines, memory-mapped tensors on SSD, signed on-disk cache
@@ -53,6 +53,15 @@
   multi-GPU row splitting
 - `apsi native info/explain/ir/asm`, `apsi run --native`
 
+## ✅ 2.6.6 — a new architecture: native programs
+- `apsi build --native`: the checked program → C → machine code with Apsi's own runtime (values, collector,
+  exceptions, generators, units, tensors, automatic differentiation, GPU); no Python inside the executable
+- the standard library written in Apsi (`nn`, helpers, `evolve` integrators, constants), compiled with the program
+- the C toolchain shipped with Apsi on Windows; `cload("file.c")` / `cload("file.cpp")` for C and C++ sources
+- next for native programs: the remaining standard modules (`layers`, `models`, `data`, `linalg`, `stats`, `sci`,
+  `web`, `db`, `crypto`, `rl`, `tokens`), Tensor Core kernels (bf16 / fp16) for large models, device-resident
+  indexing and optimizer steps, `async`
+
 ## Phase 2 (continued) — IR compiler and speed
 - **Apsi IR**: lower the checked AST to an SSA IR carrying types, shapes and units (2.0 specialises straight to LLVM IR)
 - erase units across the whole program (not just in `evolve`): check once, run on plain numbers
@@ -68,8 +77,7 @@
   f16/bf16, and native FP8/FP4 on sm_89/sm_90/sm_100 (the formats are already bit-exact but computed through FP32)
 - `@shard(devices=...)` to spread work over several GPUs and `@pipeline` for pipeline parallelism
 - automatic GPU memory management: memory pool, async copies overlapping computation
-- `apsi build --native`: machine code instead of bytecode inside the executable, and `apsi build --lib`: a shared
-  library callable from C/C++/Python/JS (the executable itself exists since 1.10.0)
+- `apsi build --lib`: a shared library callable from C/C++/Python/JS (`apsi build --native` exists since 2.6.6)
 
 ## Phase 4 — advanced physics and AI
 - `field` and PDEs in the syntax (`∂t u = α ∇²u`) with several kinds of boundary conditions

@@ -35,7 +35,50 @@ let back = from_torch(t @ t)                   # torch.Tensor -> Apsi tensor
 # whole models: `use layers` then torch_module(model, params) -> torch.nn.Module (see BACKENDS.md)
 ```
 
-## C / C++ / Rust (FFI)
+## C and C++ source files
+
+The simplest way to use C or C++ with Apsi is to put the source file next to the program:
+
+```c
+// vecmath.c
+#include <stdint.h>
+double dot(const double *a, const double *b, int64_t n) {
+    double s = 0;
+    for (int64_t i = 0; i < n; i++) s += a[i] * b[i];
+    return s;
+}
+```
+
+```cpp
+// geometry.cpp — C++ is fine; export the functions with extern "C"
+#include <cmath>
+extern "C" double hyp(double x, double y) { return std::hypot(x, y); }
+```
+
+```apsi
+let vec = cload("vecmath.c")
+let dot = vec.fn("dot", [ptr_f64, ptr_f64, i64], f64)
+let a = tensor([1.0, 2.0, 3.0])
+print(dot(a, a, len(a)))                               # 14.0
+
+let geo = cload("geometry.cpp")
+print(geo.fn("hyp", [f64, f64], f64)(3.0, 4.0))        # 5.0
+```
+
+| | `apsi run app.apsi --allow-ffi` | `apsi build --native app.apsi` |
+|---|---|---|
+| The source file | compiled once into a shared library, cached in `~/.apsi/cache/c` by its contents | compiled into the program |
+| `lib.fn(...)` | a call through ctypes | a typed C call generated at compile time |
+| The compiler | Apsi's toolchain on Windows, the system's `clang` / `gcc` elsewhere | the same |
+
+- C files are compiled as C11 (`gnu11`), C++ files (`.cc`, `.cpp`, `.cxx`) as C++17, with `-O3`. Header files next to
+  the source are found.
+- In native builds the types must be written in the call (`[ptr_f64, i64]`, not a variable holding the list), so
+  the call can be generated.
+- Native programs export their C functions, so a native program can also call C functions it was linked with
+  through `cload` of a shared library.
+
+## C / C++ / Rust shared libraries (FFI)
 
 ```c
 // vecmath.c   ->   gcc -O3 -shared -fPIC vecmath.c -o libvecmath.so

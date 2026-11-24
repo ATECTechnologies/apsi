@@ -2,6 +2,32 @@
 
 ## 2.6.6 — in development
 
+### A new architecture: native programs
+- **`apsi build --native`:** a program compiled to C and machine code with Apsi's own runtime (values, collector,
+  exceptions, generators, units, tensors, automatic differentiation, GPU) and the standard library written in Apsi.
+  The executable contains no Python. The checker runs first. Output and error reports match `apsi run`.
+- **The C toolchain comes with Apsi** on Windows (trimmed llvm-mingw in the installer, fetched once in a source
+  checkout); `apsi toolchain` shows the compiler.
+- **Native tensors:** float64 / float32 / int64 / bool, NumPy broadcasting and indexing, views for `reshape`,
+  packed matrix products on every core, vectorised `exp` / `tanh`, buffers reused in place and recycled.
+- **Gradients:** `grad` / `value_and_grad`, gradients of gradients, trees of parameters.
+- **GPU in native programs:** `to_gpu` / `to_host`, Apsi's kernels as PTX built in, only the driver needed.
+- **Standard library in Apsi:** `nn` (dense, `conv2d`, pooling, LSTM, GRU, batch norm, losses, optimizers,
+  schedules, `train`), collections helpers, `evolve` integrators (euler, midpoint, rk4, symplectic, verlet, rk45),
+  `physics.constants`.
+- **`match` and `evolve`** in native programs; `u.<unit>` values; tensors with units.
+- Worker threads leave one core to the operating system and run below normal priority.
+
+### C and C++
+- **`cload("file.c")` / `cload("file.cpp")`:** the source file itself. `apsi run` builds it once into a cached shared
+  library, and native builds compile it into the program with a typed call per `lib.fn(...)`.
+
+### Fixed
+- Element-wise maths on two tensors with the same number of elements but different shapes took the same-shape path
+  in the native runtime.
+- Gradients through `concat` / `stack` reached only the first part in the native runtime.
+- `logsumexp` dropped gradients in `apsi run`.
+
 ### Python habits that just work
 - **Single-quoted strings** `'text'`, `'''…'''`, `f'…'` and `b'…'`, as in Python (after a name or a closing
   bracket `'` stays the derivative mark of `evolve`: `y' = -y / tau`).

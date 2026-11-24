@@ -1,4 +1,103 @@
-# Native code: `@native`, `parallel for` and `@gpu`
+# Native code
+
+Apsi has two ways to turn a program into machine code:
+
+- **Native programs** (`apsi build --native`, new in 2.6.6): the whole program is compiled into an executable with
+  Apsi's own runtime. It contains no Python.
+- **`@native` functions** inside `apsi run`: single numeric functions compiled with LLVM while the rest of the
+  program runs on the Python host.
+
+## Native programs: `apsi build --native`
+
+```bash
+apsi build --native app.apsi             # -> app.exe (Windows) / app (Linux, macOS)
+apsi build --native app.apsi -o dist     # into another folder
+apsi build --native app.apsi --emit-c    # also keep the generated C next to the program
+apsi toolchain                           # which C compiler is used
+```
+
+The program is checked first, exactly as `apsi run` checks it, and nothing is built if the checker finds an error.
+It is then translated to C and compiled together with Apsi's runtime:
+
+```
+app.apsi ─► parser ─► checker ─► C ─► clang / gcc ─► app.exe
+                                       ▲
+              Apsi runtime (C): values, memory, exceptions, generators, units,
+              tensors, automatic differentiation, GPU
+              standard library (Apsi): nn, helpers, evolve integrators, constants
+```
+
+### What you get
+
+- **One file.** On Windows the program is linked statically and needs nothing beside it. On Linux and macOS it
+  uses the system's C library.
+- **The same behaviour as `apsi run`.** Output, number formatting, error messages with their line and column, and
+  the functions named in the traceback all match.
+- **Compiled for this machine.** Programs are built for the processor of the computer that builds them. To build one
+  that runs on any x86-64 computer, set `APSI_PORTABLE=1`.
+- **Cross-building.** `--target x86_64-pc-windows-msvc` (or another clang target triple) builds for another system.
+
+### How values live
+
+Every value a function holds is kept in a slot of its frame, and frames are linked, so the collector can run at any
+safe point: on entry to a function and at the end of each loop iteration. It frees what nothing reaches any more,
+including tensor buffers and GPU memory. A variable captured by an inner function lives in a cell. A loop variable
+captured by a `fn(...) => ...` gets a fresh cell on each iteration, as in `apsi run`. Exceptions unwind frames and
+handlers together. Generators run on stacks of their own (fibers on Windows), and the collector sees their
+suspended frames.
+
+### Tensors and the GPU
+
+Native tensors are float64, float32, int64 or bool arrays with NumPy's broadcasting, indexing (slices, masks,
+position lists, blocks of positions) and printing. `reshape` returns a view. Matrix products use packed kernels on
+every core. The worker threads leave one core to the operating system and run slightly below normal priority.
+
+```apsi
+use sys
+if gpu_available():
+    let a = to_gpu(randn(1024, 1024))
+    let b = to_gpu(randn(1024, 1024))
+    print(sum(a @ b), gpu_info())
+```
+
+On the card, element-wise maths, reductions, softmax, permutes, `where` and matrix products run as Apsi's own
+kernels, built into the program as PTX. Only the NVIDIA driver is needed, and the driver compiles the kernels for
+whatever card it finds. Operations the card does not have yet run on the processor and the result returns to the
+card. `to_host` brings tensors and whole parameter trees back.
+
+### Gradients
+
+`grad`, `value_and_grad` and `stop_gradient` work on numbers, quantities with units, tensors and trees of parameters
+(lists, dicts, records, structs). A gradient can itself be differentiated, which physics-informed networks need. The
+backward pass walks its graph iteratively, so very deep graphs cannot overflow the stack.
+
+### C and C++
+
+`cload("file.c")` or `cload("file.cpp")` compiles the source file into the program, and each
+`lib.fn("name", [types], result)` becomes a typed C call. See [INTEROP.md](INTEROP.md#c-and-c-source-files).
+
+### What is not native yet
+
+These programs keep running with `apsi run`. A native build that reaches one of them stops with a clear message.
+
+- the modules `layers`, `models`, `data`, `linalg`, `stats`, `sci`, `web`, `db`, `crypto`, `rl`, `tokens`, and the
+  GPU trainer `fit_batches`
+- Python modules (`pyimport`, `import numpy`) and `async`
+- random numbers: native programs use their own generator, so a seed gives different numbers than in `apsi run`
+  (the same seed always gives the same numbers in native programs)
+
+### Errors
+
+A native program that stops on an error prints the same report as `apsi run`, and exits with code 1:
+
+```
+app.apsi:12:5: RuntimeError: IndexError: index 5 is out of range for an axis of size 3
+    let y = x[5]
+    ^
+  in step()
+```
+
+## `@native` functions
 
 Apsi compiles functions to machine code. A function marked `@native` is specialised on the types and units of
 its arguments, translated to LLVM IR, optimised at `-O3` for the exact CPU it runs on (AVX2, AVX-512, FMA, NEON), and

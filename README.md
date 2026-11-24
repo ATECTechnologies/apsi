@@ -12,9 +12,9 @@
   <a href="https://github.com/ATECTechnologies/apsi/actions/workflows/darwin-arm64.yml"><img src="https://github.com/ATECTechnologies/apsi/actions/workflows/darwin-arm64.yml/badge.svg" alt="darwin-arm64"></a>
 </p>
 <p align="center">
-  <a href="https://apsi.dev/download"><img src="https://img.shields.io/badge/download-2.6.2-2ea44f" alt="Download Apsi 2.6.2"></a>
+  <a href="https://apsi.dev/download"><img src="https://img.shields.io/badge/download-2.6.6-2ea44f" alt="Download Apsi 2.6.6"></a>
   <img src="https://img.shields.io/badge/python-3.12%20%7C%203.13%20%7C%203.14-3776ab" alt="Python 3.12 | 3.13 | 3.14">
-  <img src="https://img.shields.io/badge/native-LLVM%20%7C%20AVX2%20%7C%20AVX--512%20%7C%20NEON-555" alt="native code">
+  <img src="https://img.shields.io/badge/native-executables%20%7C%20AVX2%20%7C%20AVX--512%20%7C%20NEON-555" alt="native code">
   <img src="https://img.shields.io/badge/GPU-CUDA%20%7C%20Tensor%20Cores-76b900" alt="GPU">
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-Apsi%202.0-blue" alt="license"></a>
 </p>
@@ -22,8 +22,7 @@
 <p align="center">
   <a href="https://apsi.dev">Website</a> ·
   <a href="https://apsi.dev/docs">Documentation</a> ·
-  <a href="docs/WHATS-NEW.md">What's new in 2.6.2</a> ·
-  <a href="https://apsi.dev/benchmarks">Benchmarks</a> ·
+  <a href="docs/WHATS-NEW.md">What's new in 2.6.6</a> ·
   <a href="https://apsi.dev/download">Download</a>
 </p>
 
@@ -32,9 +31,9 @@
 ## What is Apsi?
 
 Apsi is a programming language with the syntax of Python and the safety net of a compiler. Physical units, tensor
-shapes and types are checked before the program starts, so `5m + 2s` or a matrix of the wrong size is an error on the
-line where you wrote it, not a wrong number an hour later. Numeric code compiles to machine code, and every Python
-library is one `pyimport` away.
+shapes and types are checked before the program starts, so `5m + 2s` or a matrix of the wrong size is an error on
+the line where you wrote it, not a wrong number an hour later. Since 2.6.6, an Apsi program can also be compiled
+into a standalone executable that runs without Python, and it works with C and C++ code directly.
 
 ```apsi
 use physics.constants
@@ -44,14 +43,46 @@ fn kinetic(m: Mass, v: Velocity) -> Energy = 0.5 * m * v ** 2
 print(kinetic(2kg, 3[m/s]))            # 9.0 J
 print(m_e * c ** 2 as [MeV])           # 0.510998949996 MeV
 let wrong = 5m + 2s                    # ✗ UnitError before running: cannot add Length and Time
-
-@native                                # machine code for this CPU, units checked then erased
-fn energy(x, v, k: Float) -> Float:
-    var e = 0.0
-    parallel for i in 0..len(x):       # all CPU cores; @gpu runs the same loop on NVIDIA GPUs
-        e += 0.5 * v[i] * v[i] + 0.5 * k * x[i] * x[i]
-    return e
 ```
+
+```bash
+apsi run physics.apsi                  # run it straight away
+apsi build --native physics.apsi       # or make physics.exe: machine code, no Python inside
+```
+
+## Apsi 2.6.6: a new architecture
+
+Until 2.6.2, every Apsi program ran on top of a Python host. 2.6.6 adds a second way to run Apsi, built from the
+ground up for it:
+
+```
+            ┌──────────── apsi run ──────────────┐
+ app.apsi → │ checker → Python host (NumPy, …)   │   quick to start, every library, the REPL and debugger
+            └────────────────────────────────────┘
+            ┌──────── apsi build --native ───────┐
+ app.apsi → │ checker → C → machine code         │   app.exe: one file, no Python, Apsi's own runtime
+            └────────────────────────────────────┘
+```
+
+- **Apsi's own runtime.** Values, memory management, strings, collections, closures, classes, exceptions,
+  generators, units, tensors, automatic differentiation and the GPU are implemented in Apsi's runtime, written in C.
+  A native program contains no Python interpreter.
+- **The standard library in Apsi.** The functional helpers, `nn` (layers, losses, optimizers, CNNs, LSTMs, GRUs),
+  the `evolve` integrators and the physical constants are written in Apsi and compiled with your program.
+- **Built for the machine it runs on.** Matrix products use packed, register-blocked kernels on every core;
+  element-wise maths, `exp` and `tanh` use the CPU's widest vector unit.
+- **The GPU without a toolkit.** Kernels are built into the program, and the NVIDIA driver is the only thing the
+  card needs.
+- **C and C++ next to Apsi.** `cload("vecmath.c")` or `cload("model.cpp")` takes the source file itself. A native
+  build compiles it into the program, and `apsi run` builds it once and caches it. Tensors are passed to C without a
+  copy.
+- **Nothing to install.** On Windows, Apsi carries its own C toolchain (clang and lld), so no compiler setup is needed.
+- **The same answers.** Native programs are tested against `apsi run`: same output, same error messages, same
+  numbers, and they run clean under AddressSanitizer.
+
+`apsi run` stays as it was, so existing programs, Python libraries and tools keep working. Both ways share one
+checker, so a program that passes it behaves the same either way. The full list is in
+[What's new in 2.6.6](docs/WHATS-NEW.md), and the native compiler is covered in [docs/NATIVE.md](docs/NATIVE.md).
 
 ## How Apsi is different
 
@@ -59,23 +90,27 @@ fn energy(x, v, k: Float) -> Float:
 |---|---|---|
 | Units (`9.81[m/s^2]`, `5km`) | a library, checked at run time | part of the language, checked before running |
 | Tensor shapes | found when the program crashes | `fn f[B, T](x: Tensor[B, T])` names the wrong dimension before running |
-| Speed of numeric loops | interpreter | `@native`: LLVM machine code, next to C and Rust on the [benchmarks](https://apsi.dev/benchmarks) |
-| Existing Python code | — | `apsi convert` turns it, and the libraries written in Python it uses, into Apsi that behaves byte for byte the same |
+| Speed | an interpreter | `apsi build --native`: a compiled executable; `@native` functions inside `apsi run` |
+| Shipping a program | Python and its packages on every machine | one executable |
+| C and C++ | ctypes, cffi or an extension module | `cload("file.c")`, the source file itself |
+| Existing Python code | — | `apsi convert` turns it into Apsi that behaves the same |
 | Permissions | a script can read any file and open any socket | files, network and Python modules are off until you allow them |
-| Built in | — | autodiff, layers, RL, real-time loops, tables, PostgreSQL / MySQL / MongoDB / Redis, an HTTP and WebSocket server |
+| Built in | — | autodiff, layers, RL, real-time loops, tables, databases, an HTTP and WebSocket server |
 
 ## Install
 
-**Download: [apsi.dev/download](https://apsi.dev/download)** — every version, with the SHA-256 of each file.
+Download: [apsi.dev/download](https://apsi.dev/download) — every version, with the SHA-256 of each file.
 
 | System | File | Install |
 |---|---|---|
-| Windows 10/11 (x64) | `ApsiSetup-2.6.2-x64.exe` | double-click (brings its own Python; no administrator rights) |
-| Any Linux, also WSL | `ApsiSetup-2.6.2-linux.sh` | `sh ApsiSetup-2.6.2-linux.sh` (no root) |
-| Ubuntu / Debian | `apsi_2.6.2_all.deb` | `sudo apt install ./apsi_2.6.2_all.deb` |
+| Windows 10/11 (x64) | `ApsiSetup-2.6.6-x64.exe` | double-click (brings its own Python and C toolchain; no administrator rights) |
+| Any Linux, also WSL | `ApsiSetup-2.6.6-linux.sh` | `sh ApsiSetup-2.6.6-linux.sh` (no root) |
+| Ubuntu / Debian | `apsi_2.6.6_all.deb` | `sudo apt install ./apsi_2.6.6_all.deb` |
 
 From this repository: `pip install numpy`, then `./apsi.sh run examples/01_hello.apsi` (Linux, macOS) or
-`apsi.bat run examples\01_hello.apsi` (Windows). Building the installers: [`docs/BUILD.md`](docs/BUILD.md).
+`apsi.bat run examples\01_hello.apsi` (Windows). Native builds on Linux and macOS use the system's `clang` or
+`gcc`; on Windows the toolchain is fetched once on first use when Apsi was not installed with the installer.
+Building the installers: [docs/BUILD.md](docs/BUILD.md).
 
 ## Quick start
 
@@ -83,16 +118,83 @@ From this repository: `pip install numpy`, then `./apsi.sh run examples/01_hello
 apsi new hello && cd hello
 apsi run                        # runs src/main.apsi
 apsi test                       # runs the tests next to it
-apsi convert script.py          # an existing Python program → script.apsi, same behaviour
+apsi build --native             # src/main.apsi -> an executable
+apsi convert script.py          # an existing Python program -> script.apsi, same behaviour
 apsi debug app.apsi             # breakpoints and stepping (or F5 in VS Code)
 ```
 
 Then read [Getting started](docs/GETTING-STARTED.md) (15 minutes) or [Write Apsi your way](docs/WRITE-APSI.md).
 
+## A tour in code
+
+**Train a network** — layers, losses and optimizers from `nn`, gradients from the language:
+
+```apsi
+use nn
+
+let X, y = spiral_data(n_per_class=100, classes=3, seed=0)
+var params = mlp_init([2, 64, 64, 3], seed=0)
+fn loss_fn(p, xb, yb):
+    var h = xb
+    for i, layer in enumerate(p):
+        h = h @ layer.W + layer.b
+        if i < len(p) - 1:
+            h = relu(h)
+    return cross_entropy(h, yb)
+
+let result = train(loss_fn, params, (X, y), adam(lr=0.01), epochs=200, batch_size=64)
+print("final loss:", result.history[-1])
+```
+
+**Solve physics** — an ODE with units, integrated by the language:
+
+```apsi
+use physics.constants
+
+var pos = tensor([0.0, 1.0]) * u.m
+var vel = tensor([30.0, 30.0]) * u.m / u.s
+evolve pos, vel over t in 0[s]..4[s] step 1[ms] using rk4 record every 100 into path:
+    pos' = vel
+    vel' = tensor([0.0, -1.0]) * g0
+print("highest point:", max(path.pos[:, 1]))
+```
+
+**Call C** — the source file next to your program, compiled for you:
+
+```c
+// vecmath.c
+#include <stdint.h>
+double dot(const double *a, const double *b, int64_t n) {
+    double s = 0; for (int64_t i = 0; i < n; i++) s += a[i] * b[i]; return s;
+}
+```
+
+```apsi
+let lib = cload("vecmath.c")
+let dot = lib.fn("dot", [ptr_f64, ptr_f64, i64], f64)
+let a = tensor([1.0, 2.0, 3.0])
+print(dot(a, a, len(a)))            # 14.0
+```
+
+**Match on structure** — patterns on lists, maps, types and classes:
+
+```apsi
+fn describe(v):
+    match v:
+        case [first, *rest] if len(rest) > 0:
+            return f"{first} and {len(rest)} more"
+        case {"name": n, **others}:
+            return f"named {n}"
+        case int() | float() as x:
+            return f"the number {x}"
+        case _:
+            return "something else"
+```
+
 ## Train your own language model
 
 A tokenizer, a LLaMA / Qwen3-style decoder, training and text written by the model — the whole program
-([`examples/47_train_your_llm.apsi`](examples/47_train_your_llm.apsi)), seconds on a laptop:
+(`examples/47_train_your_llm.apsi`), seconds on a laptop:
 
 ```apsi
 use layers
@@ -107,55 +209,26 @@ let lm = transformer_lm(tok.vocab_size, d=64, heads=4, layers=2, context=24,
                         kv_heads=2, rope=true, qk_norm=true, norm="rms", ffn="swiglu")
 let r = fit_batches(lm, lm.init(seed=0), batches, loss="cross_entropy",
                     opt=adamw(lr=3e-3, state="bf16"), epochs=40, clip=1.0)
-print(f"loss {r.history[0]:.2f} -> {r.history[-1]:.2f}")                 # loss 6.74 -> 0.02
+print(f"loss {r.history[0]:.2f} -> {r.history[-1]:.2f}")
 ```
 
-The same lines train a 127 M model on an NVIDIA card (`backend="gpu"`, `steps=`, `checkpoint=` to resume exactly
-after any stop): 16,000–18,000 tokens/s on an RTX 3060, the [measured numbers](https://apsi.dev/benchmarks).
+The same lines train larger models on an NVIDIA card (`backend="gpu"`), with checkpoints that resume exactly after
+any stop. See [Training](docs/TRAINING.md) and [GPU](docs/GPU.md).
 
-## What's new in 2.6.2
+## Stable by design
 
-* **Large models on one card.** Activation recompute measured per block (planned again when a batch grows), global
-  attention in pieces, nothing per edge kept, optimizer moments in bfloat16.
-* **Your own GPU kernels as layers** (`gpu_layer`), **parameter groups** (each part its own AdamW settings and
-  clipping), **weighted cross-entropy on the card** (`card_loss(weights=)`).
-* **Other programs' model files:** a parameter tree under another program's tensor names (`models.named_tensors` /
-  `from_named_tensors`), text metadata in `.safetensors`, running statistics of layers in checkpoints.
-* **Training that resumes exactly and learns from its own output:** batches made when training reaches them
-  (`record(later=fn)`, `training_params()`), your program's state and the random generators in the checkpoint
-  (`state=`), steps of their own length, parts with their own optimizer step every batch.
-* **Half the optimizer's memory:** `adamw(state="bf16")` (bfloat16 moments, stochastic rounding).
-* **The language:** raw strings `r#"..."#`, Python kept inside a program (`pymodule`).
+Breaking changes in libraries are a common reason projects in new languages stop working. Apsi avoids them in
+these ways:
 
-## What's new in 2.6.0
-
-* **Faster than PyTorch on the same card.** A 127 M GPT, 2 epochs on an RTX 3060: 20,708 tokens/s against PyTorch 2.14
-  bf16's 18,809 at the same temperature (1.10×), on Apsi's own 16-bit kernels (no cuBLAS), the card never above 79 °C.
-* **The same weights on one card or eight.** Gradients of accumulated batches, of copies of the model and across the
-  cuts of a model split over cards are summed exactly (double-float, rounded once): adding cards makes training
-  faster, never different.
-* **The same weights every run.** No atomic additions anywhere in training — bias and norm gradients, embeddings,
-  losses, split products, attention's backward all add in a fixed order. Checked on a real RTX 3060: heterogeneous graph models and a
-  transformer trained twice give identical weights.
-* **Training that finishes.** `fit_batches(…, steps=20000, checkpoint="run.npz", save_every=500)`: saved on any stop
-  (a crash, Ctrl+C), resumed bit for bit by running the same line again; a step with an inf or NaN gradient is skipped
-  inside the optimizer kernel. [Training guide](docs/TRAINING.md).
-* **Heterogeneous graphs.** `hgt`, `typed_linear`, `typed_norm`: graphs with many node types and relations, on
-  NumPy, one card or many. [Graphs](docs/GRAPHS.md).
-* **Fewer tokens.** `tokens.focus(context, question, budget)` keeps what a question needs, chosen on
-  code and text graphs, and numbers what it leaves out so anything can be put back exactly (`unfold`);
-  `fit_chat` for conversations. A 15,137-token module to 1,333 tokens for one question. [Tokens](docs/TOKENS.md).
-* **Your own tokenizer.** `data.train_tokenizer(corpus, vocab_size=32000)`: byte-level BPE in Apsi (or Rust when
-  installed), saved as tokenizer.json.
-* **Any optimizer, loss and layer on the GPU trainer**, frozen parts for fine-tuning, `gpu_tensor` for your own code
-  on the card, physics-informed networks (`pinn_fit`), one model across many cards.
-* **The card never waits:** queued copies through pinned memory, losses and gates kept on the card, one launch per
-  reduction — a small transformer's step from 5.3–6.0 ms to 4.0–4.7 ms on an RTX 3060 (best runs).
-* **Every setting in one file:** [`config/apsi-training.env`](config/apsi-training.env), each with its default and
-  what it does.
-
-Details, examples and measurements: [`docs/WHATS-NEW.md`](docs/WHATS-NEW.md) · every change: [`CHANGELOG.md`](CHANGELOG.md) ·
-2.4.4: [`docs/WHATS-NEW-2.4.4.md`](docs/WHATS-NEW-2.4.4.md).
+- **No binary ABI between Apsi libraries.** Apsi modules are compiled from source together with your program, so a
+  new Apsi version never meets an old compiled library.
+- **A pinned toolchain.** The C compiler that builds native programs is a fixed version shipped with Apsi, not
+  whatever happens to be installed.
+- **One file to ship.** Native Windows programs are linked statically, so nothing else needs installing next to them.
+- **One checker, two engines.** `apsi run` and native builds share the parser and the checker, and native programs
+  are tested for the same output as `apsi run`.
+- **Published libraries cannot change under you.** A version on the hub is never replaced, so builds stay
+  reproducible.
 
 ## Supported platforms
 
@@ -163,7 +236,8 @@ Details, examples and measurements: [`docs/WHATS-NEW.md`](docs/WHATS-NEW.md) · 
 |---|---|
 | Operating systems | Windows 10 / 11 (x64), Linux x86-64 and ARM64 (Ubuntu 22.04+, Debian 12+, Fedora, Arch, WSL), macOS on Apple silicon and Intel — each tested on every push |
 | Python (host runtime) | 3.12, 3.13, 3.14 |
-| Native compiler | x86-64 with AVX2 / AVX-512, ARM64 with NEON (needs `llvmlite`; on Intel Macs, where llvmlite has no wheels, Apsi runs without it) |
+| Native programs | `apsi build --native`: Windows x64 (the C toolchain comes with Apsi), Linux and macOS (the system's clang or gcc); x86-64 with AVX2 / AVX-512, ARM64 with NEON |
+| `@native` functions | inside `apsi run`, through LLVM (`llvmlite`) |
 | GPUs | NVIDIA GTX 1660 and newer (training on Apsi's own tensor-core kernels; only the NVIDIA driver needed); AMD ROCm, Apple MPS, Intel XPU through the PyTorch backend |
 | Editors | VS Code, Cursor, Windsurf, VSCodium, Sublime Text, Vim/Neovim, Notepad++, JetBrains, Helix, Zed, Emacs |
 
@@ -172,7 +246,7 @@ Details, examples and measurements: [`docs/WHATS-NEW.md`](docs/WHATS-NEW.md) · 
 | Start | Language | Topics |
 |---|---|---|
 | [Getting started](docs/GETTING-STARTED.md) | [Language reference](docs/LANGUAGE.md) | [AI](docs/AI.md) · [Layers](docs/LAYERS.md) · [Training](docs/TRAINING.md) · [GPU](docs/GPU.md) · [RL](docs/RL.md) |
-| [What's new](docs/WHATS-NEW.md) | [Everything on one page](docs/REFERENCE.md) | [From Python](docs/PYTHON.md) · [Native code](docs/NATIVE.md) · [Embedded](docs/EMBEDDED.md) |
+| [What's new](docs/WHATS-NEW.md) | [Everything on one page](docs/REFERENCE.md) | [From Python](docs/PYTHON.md) · [Native programs](docs/NATIVE.md) · [C and C++](docs/INTEROP.md) · [Embedded](docs/EMBEDDED.md) |
 | [Install](docs/INSTALL.md) · [Linux](docs/INSTALL-LINUX.md) | [Project overview](docs/OVERVIEW.md) | [Real time](docs/REALTIME.md) · [Memory](docs/MEMORY.md) · [Tokens](docs/TOKENS.md) · [Hub](docs/HUB.md) · [Graphs](docs/GRAPHS.md) · [Number formats](docs/NUMBERS.md) |
 | [Troubleshooting](docs/TROUBLESHOOTING.md) | [Security](docs/SECURITY.md) | [Tables](docs/DATAFRAME.md) · [Databases](docs/DATABASES.md) · [Servers](docs/SERVER.md) |
 | [Versions compared](docs/VERSIONS.md) | [Editors](docs/EDITORS.md) | [Science](docs/SCIENCE.md) · [Debugging](docs/DEBUGGING.md) · [Configuration](docs/ENV.md) |
@@ -183,7 +257,9 @@ The same documentation, searchable, is at [apsi.dev/docs](https://apsi.dev/docs)
 
 ```
 apsi/          the language: lexer, parser, checker, compiler, runtime, standard library, tools
-apsi/native/   the native compiler (LLVM) and GPU code generation
+apsi/aot/      the native compiler: Apsi → C → machine code, its C runtime (values, memory, tensors, GPU) and the
+               standard library written in Apsi
+apsi/native/   @native functions inside apsi run (LLVM) and GPU code generation for the trainer
 docs/          documentation (also published on apsi.dev)
 examples/      runnable examples, also used as tests
 tests/         the test suite (python -m unittest discover tests; apsi test tests/apsi examples)
@@ -206,14 +282,10 @@ apsi fmt --check examples tests/apsi
 Security problems: please report them privately as described in [`docs/SECURITY.md`](docs/SECURITY.md) or at
 [apsi.dev/security](https://apsi.dev/security), not in public issues.
 
-## How Apsi was built
+## Credits
 
-Apsi is the work of one developer at ATEC, working together with Claude, the AI model made by Anthropic. Development
-started on 8 November 2026; everything from the first version to 2.4.4 — the language, checker and compilers, native
-and GPU code generation, the Python converter, the standard library, the tools, the documentation and the website —
-took about **25 hours of active work** in total (time actually spent working, in sessions over several days).
-This figure is final: it covers the first build of the project, from nothing to a finished 2.4.4. Apsi 2.4.4 is
-complete as that first stage; later versions are new work and are not added to it.
+Apsi is designed and developed by **ATEC**. Its development is assisted by Claude, the AI model made by Anthropic.
+Thank you to everyone who reports problems, writes libraries and shares their work with the community.
 
 ## License
 

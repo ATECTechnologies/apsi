@@ -192,15 +192,13 @@ python -m unittest discover tests           # toolchain, REPL, CLI, LSP, formatt
 
 ## Development
 
-Development started on **Sunday, 8 November 2026 at about 04:00** (Bangkok time, UTC+7). Everything from the first
-line to this release, Apsi 2.4.4, took about **25 hours of active work** in sessions over several days. That number
-is final: it is the first build of the project, completed with 2.4.4; later versions are new work.
+Apsi is designed and developed by ATEC, with the assistance of Claude, the AI model made by Anthropic.
 
 ## Documentation
 
-- [`WHATS-NEW.md`](WHATS-NEW.md) — **everything new in 2.6.2**, with examples, measurements and limits ([2.4.4](WHATS-NEW-2.4.4.md))
+- [`WHATS-NEW.md`](WHATS-NEW.md) — **everything new in 2.6.6**: native programs, C and C++, the language ([2.6.2](WHATS-NEW-2.6.2.md), [2.4.4](WHATS-NEW-2.4.4.md))
 - [`GETTING-STARTED.md`](GETTING-STARTED.md) — install, first program, first model, first library
-- [`NATIVE.md`](NATIVE.md) — **native code**: `@native`, `parallel for`, `@gpu`, benchmarks against C, C++, Rust, Go, Java, JavaScript, C#, Julia and Mojo
+- [`NATIVE.md`](NATIVE.md) — **native code**: native programs (`apsi build --native`), `@native`, `parallel for`, `@gpu`, benchmarks against C, C++, Rust, Go, Java, JavaScript, C#, Julia and Mojo
 - [`LIBRARIES.md`](LIBRARIES.md) — `.apsil` libraries: install, create, pack, publish, the registry API
 - [`RL.md`](RL.md) — reinforcement learning and learning from preferences
 - [`SCALE.md`](SCALE.md) — planning 21B–2T-parameter training runs (`apsi plan`, `use scale`)

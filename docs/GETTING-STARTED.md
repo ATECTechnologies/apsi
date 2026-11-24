@@ -66,6 +66,16 @@ print(mandel(1000, 50))
 
 See the [native compiler guide](NATIVE.md) for what can be compiled and how to use all cores with `parallel for`.
 
+To make the whole program an executable that runs without Python, build it natively:
+
+```bash
+apsi build --native mandel.apsi     # -> mandel.exe on Windows, mandel on Linux and macOS
+./mandel
+```
+
+On Windows the C toolchain comes with Apsi, so there is nothing to install. See
+[Native programs](NATIVE.md#native-programs-apsi-build---native).
+
 ## 4. Train a model
 
 ```apsi
