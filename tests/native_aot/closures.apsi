@@ -1,0 +1,16 @@
+var fs = []
+for k in 0..3:
+    fs.append(fn(x) => x + k)
+print([f(10) for f in fs])
+fn g():
+    var hs = []
+    for k in 0..3:
+        hs.append(fn(x) => x + k)
+    return [h(1) for h in hs]
+print(g())
+fn h2():
+    var v = 1
+    let f = fn() => v
+    v = 5
+    return f()
+print(h2())

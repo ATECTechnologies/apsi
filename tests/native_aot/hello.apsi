@@ -1,0 +1,33 @@
+print("Hello, Apsi!")
+let name = "Apsi"
+var count = 0
+for i in 1..=10:
+    count += i
+print(f"{name}: sum of 1 to 10 = {count}")
+fn square(x: Float) -> Float = x * x
+fn fib(n: Int) -> Int:
+    var a, b = 0, 1
+    for _ in 0..n:
+        a, b = b, a + b
+    return a
+print("square(7) =", square(7.0))
+print("fib(30) =", fib(30))
+let evens = [x * x for x in 0..10 if x % 2 == 0]
+print("evens² =", evens)
+let double = fn(x) => 2 * x
+print("pipe:", 21 |> double)
+print("sum via pipe:", evens |> sum)
+struct Vec2D:
+    x: Float
+    y: Float
+    fn length(self) -> Float = sqrt(self.x ** 2 + self.y ** 2)
+let v = Vec2D(3.0, 4.0)
+print(v, "length =", v.length())
+let grade = 87
+if grade >= 90:
+    print("A")
+elif grade >= 80:
+    print("B")
+else:
+    print("C")
+print("pass" if grade >= 50 else "fail")

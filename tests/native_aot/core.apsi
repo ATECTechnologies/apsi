@@ -1,0 +1,103 @@
+fn make_counter():
+    var n = 0
+    fn inc():
+        nonlocal n
+        n += 1
+        return n
+    return inc
+let c = make_counter()
+c()
+c()
+print("counter", c())
+fn adders():
+    return [fn(x) => x + k for k in 0..3]
+print([f(10) for f in adders()])
+class Animal:
+    fn __init__(self, name):
+        self.name = name
+    fn speak(self):
+        return f"{self.name} makes a sound"
+    fn __repr__(self):
+        return f"Animal({self.name!r})"
+class Dog(Animal):
+    fn __init__(self, name, breed):
+        super().__init__(name)
+        self.breed = breed
+    fn speak(self):
+        return super().speak() + " (woof)"
+let d = Dog("Rex", "lab")
+print(d.speak(), d.breed, isinstance(d, Animal), isinstance(d, Dog))
+print([Animal("a"), Animal("b")])
+class MyErr(Exception):
+    pass
+fn risky(x):
+    if x < 0:
+        raise MyErr("negative: " + str(x))
+    return x * 2
+for v in [1, -2]:
+    try:
+        print("ok", risky(v))
+    except MyErr as e:
+        print("caught", e)
+    finally:
+        print("finally", v)
+try:
+    print(1 / 0)
+except ZeroDivisionError as e:
+    print("zde:", e)
+try:
+    let xs = [1, 2]
+    print(xs[5])
+except IndexError:
+    print("index error")
+try:
+    let d2 = {"a": 1}
+    print(d2["b"])
+except KeyError as e:
+    print("key error", e)
+fn f_ret():
+    try:
+        return "from try"
+    finally:
+        print("cleanup")
+print(f_ret())
+var total = 0
+for i in 0..10:
+    try:
+        if i == 3:
+            continue
+        if i == 6:
+            break
+        total += i
+    finally:
+        total += 100
+print("total", total)
+let dd = {"x": 1, "y": 2}
+dd["z"] = 3
+for k, v in dd.items():
+    print(k, v)
+print(dd, len(dd), "x" in dd, dd.get("q", 9))
+let s = {3, 1, 2, 3}
+print(len(s), 2 in s, sorted(s))
+let words = "the quick brown fox".split()
+print(words, "-".join(words), "Fox".lower(), "  pad ".strip(), "abc".upper())
+print(sorted(words, key=fn(w) => len(w)), sorted([3,1,2], reverse=true))
+print(f"{3.14159:.2f} {42:5d}|{'hi':<5}|{'hi':>5}|{1234567:,}")
+print(10 // 3, -7 // 2, -7 % 3, 7.5 % 2, 2 ** 10, 2 ** -1, 1e20, 1.5e-7, 0.1 + 0.2, 100.0, 1/3)
+print(list(zip([1,2,3], "abc")), list(enumerate(["a","b"])), list(map(fn(x) => x * x, [1,2,3])))
+print(max([3, 7, 2]), min(4, 1, 9), sum([0.5, 0.25]), abs(-3), round(2.675, 2), round(3.5), int("42"), float("1.5"))
+var a, b, *rest = [1, 2, 3, 4, 5]
+print(a, b, rest)
+let t = (1, "two", 3.0)
+print(t, t[1], t[-1], t[0:2], "hello"[1:4], "hello"[::-1], [1,2,3,4][::2])
+fn kw(a, b=2, *args, c=5, **more):
+    return [a, b, args, c, more]
+print(kw(1), kw(1, 3, 4, 5, c=9, z=1))
+var big = []
+for i in 0..200000:
+    big.append([i, str(i)])
+print(len(big), big[-1])
+let nested = {k: [j for j in 0..k] for k in 0..4}
+print(nested)
+print(1 < 2 < 3, 1 < 3 < 2, not true, true and false, 0 or "x", none is none)
+print(str(none), repr("a'b"), [none, true, 1.0])

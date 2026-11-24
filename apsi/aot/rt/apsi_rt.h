@@ -1,0 +1,147 @@
+/* Apsi native runtime: the values of a compiled Apsi program, their memory (a mark-and-sweep collector that runs
+ * only at safe points: function entry and loop back edges), exceptions (setjmp / longjmp), and the built-in
+ * functions and methods. No Python anywhere: the program is machine code linked with this file. */
+#ifndef APSI_RT_H
+#define APSI_RT_H
+#include <stdint.h>
+#include <stddef.h>
+#include <setjmp.h>
+
+typedef enum { T_NONE = 0, T_BOOL, T_INT, T_FLOAT, T_OBJ } ATag;
+
+struct AObj;
+typedef struct AV {
+    uint8_t t;
+    union { int64_t i; double f; struct AObj *o; };
+} AV;
+
+typedef enum {
+    O_STR = 1, O_LIST, O_TUPLE, O_DICT, O_SET, O_FUNC, O_CLASS, O_INST, O_BOUND, O_RANGE, O_ITER, O_CELL, O_BUILTIN,
+    O_SLICE
+} AKind;
+
+typedef struct AObj { struct AObj *gcnext; uint8_t kind, mark; } AObj;
+
+typedef struct AStr { AObj h; int64_t len; int64_t nchars; uint64_t hash; int ascii; char s[]; } AStr;
+typedef struct AList { AObj h; int64_t len, cap; AV *v; } AList;           /* list and tuple */
+typedef struct ADEnt { AV k, v; uint64_t hash; int used; } ADEnt;
+typedef struct ADict { AObj h; int64_t len, nent, cap; ADEnt *e; int64_t *idx; int64_t icap; } ADict;  /* dict, set */
+typedef struct ACell { AObj h; AV v; } ACell;
+struct AFunc;
+typedef AV (*AFnCode)(struct AFunc *self, int n, AV *args, ADict *kw);
+typedef struct AFunc {
+    AObj h; const char *name; AFnCode code;
+    int ncells; ACell **cells;            /* the closure's captured variables */
+    int ndef; AV *defaults;               /* defaults of the last ndef parameters */
+} AFunc;
+typedef struct AClass { AObj h; AStr *name; struct AClass *base; ADict *attrs; int nfields; AStr **fields; int is_struct; } AClass;
+typedef struct AInst { AObj h; AClass *cls; ADict *attrs; } AInst;
+typedef struct ABound { AObj h; AV self, fn; } ABound;
+typedef struct ARange { AObj h; int64_t start, stop, step; } ARange;
+typedef struct ASlice { AObj h; AV lo, hi, step; } ASlice;
+typedef AV (*ABuiltinFn)(int n, AV *args, ADict *kw, AV self);
+typedef struct ABuiltin { AObj h; const char *name; ABuiltinFn fn; AV self; } ABuiltin;
+typedef struct AIter { AObj h; int kind; AV src; int64_t pos, end, step; AV aux; } AIter;
+
+/* ------------------------------------------------------------------ values */
+#define A_NONE ((AV){.t = T_NONE, .i = 0})
+static inline AV a_int(int64_t i) { AV v; v.t = T_INT; v.i = i; return v; }
+static inline AV a_float(double f) { AV v; v.t = T_FLOAT; v.f = f; return v; }
+static inline AV a_bool(int b) { AV v; v.t = T_BOOL; v.i = b ? 1 : 0; return v; }
+static inline AV a_obj(void *o) { AV v; v.t = T_OBJ; v.o = (AObj *)o; return v; }
+static inline int a_is(AV v, AKind k) { return v.t == T_OBJ && v.o->kind == k; }
+
+/* ------------------------------------------------------------------ memory */
+typedef struct AFrame { struct AFrame *prev; int n; AV *slots; const char *name; int pos; } AFrame;   /* pos: line << 12 | column */
+extern AFrame *a_frame;
+void a_gc_safe(void);                      /* a safe point: collects when enough was allocated */
+void a_root(AV *slots, int n);             /* module globals */
+void *a_alloc(size_t size, AKind kind);
+
+/* ------------------------------------------------------------------ exceptions */
+typedef struct AHandler { jmp_buf jb; struct AHandler *prev; AFrame *frame; int ntmp; } AHandler;
+/* the runtime's own temporaries that must live across a call back into compiled code */
+extern AV a_tmp[]; extern int a_ntmp;
+#define A_PUSH(v) (a_tmp[a_ntmp] = (v), a_ntmp++ < 65535 ? (void)0 : a_overflow())
+void a_overflow(void);
+#define A_TRY(h) ((h).prev = a_handler, (h).frame = a_frame, (h).ntmp = a_ntmp, a_handler = &(h), setjmp((h).jb))
+extern AHandler *a_handler;
+extern AV a_exc;                           /* the exception being raised / handled (an instance) */
+_Noreturn void a_raise(AV exc);
+_Noreturn void a_error(const char *type, const char *fmt, ...);
+int a_exc_matches(AV exc, AV cls);
+extern const char *a_file, *a_source;
+
+/* ------------------------------------------------------------------ objects */
+AV a_str(const char *s);
+AV a_strn(const char *s, int64_t n);
+AV a_list(int64_t n, AV *items);
+AV a_tuple(int64_t n, AV *items);
+AV a_dict(void);
+AV a_set(void);
+AV a_range(int64_t a, int64_t b, int64_t step);
+AV a_slice(AV lo, AV hi, AV step);
+AV a_func(const char *name, AFnCode code, int ncells, int ndef);
+ACell *a_cell(AV v);
+AV a_class(const char *name, AV base, int is_struct, int nfields, const char **fields);
+AV a_builtin(const char *name, ABuiltinFn fn, AV self);
+void a_dict_set(ADict *d, AV k, AV v);
+int a_dict_get(ADict *d, AV k, AV *out);
+int a_dict_del(ADict *d, AV k);
+void a_list_append(AList *l, AV v);
+
+/* ------------------------------------------------------------------ operations */
+int a_truthy(AV v);
+AV a_binop(int op, AV a, AV b);
+AV a_unop(int op, AV a);
+int a_compare(int op, AV a, AV b);
+int a_eq(AV a, AV b);
+uint64_t a_hash(AV v);
+int a_contains(AV container, AV item);
+AV a_getitem(AV o, AV i);
+void a_setitem(AV o, AV i, AV v);
+void a_delitem(AV o, AV i);
+AV a_getattr(AV o, const char *name);
+void a_setattr(AV o, const char *name, AV v);
+AV a_call(AV f, int n, AV *args, ADict *kw);
+AV a_iter(AV o);
+int a_next(AV it, AV *out);
+int64_t a_len(AV o);
+AV a_to_str(AV v);                         /* str(v) */
+AV a_repr(AV v);
+AV a_format(AV v, const char *spec);       /* f"{v:spec}" */
+AV a_concat_strs(int n, AV *parts);
+void a_unpack(AV v, int n, AV *out);
+AV a_global_builtin(const char *name);     /* print, len, range, ... (NONE if unknown) */
+int a_param(AFunc *f, int n, AV *args, ADict *kw, int i, const char *name, int ndefault_from, AV *out);
+AV a_rest_args(int n, AV *args, int from);
+ADict *a_rest_kw(ADict *kw, int nnames, const char **names);
+int a_isinstance(AV v, AV cls);
+AV a_super_attr(AV self, AV cls, const char *name);
+void a_init(int argc, char **argv);
+AV a_attr(AV o, const char *name);           /* o.name, AttributeError if missing */
+AV a_attrk(AV o, AV key);                    /* o.key with a prebuilt name string */
+void a_setattrk(AV o, AV key, AV v);
+AV a_call_spread(AV f, AV args, AV kw);      /* f(*args, **kw): a tuple/list and a dict (or None) */
+AV a_inplace(int op, AV a, AV b);            /* a op= b: lists and dicts change in place */
+AV a_range_val(AV start, AV end, int inclusive);
+void a_unpack_star(AV v, int before, int after, AV *out);   /* a, *b, c = v */
+AV a_gundef(const char *name);
+AV a_fmt_spec(AV v, AV spec);           /* o.name, AttributeError if missing */
+
+enum { OP_ADD = 1, OP_SUB, OP_MUL, OP_DIV, OP_FLOORDIV, OP_MOD, OP_POW, OP_MATMUL, OP_AND, OP_OR, OP_XOR, OP_SHL, OP_SHR,
+       OP_NEG, OP_POS, OP_NOT, OP_INV,
+       OP_EQ, OP_NE, OP_LT, OP_LE, OP_GT, OP_GE, OP_IN, OP_NOTIN, OP_IS, OP_ISNOT };
+
+/* ------------------------------------------------------------------ fast paths the compiler inlines */
+static inline AV a_add(AV a, AV b) { int64_t r; if (a.t == T_INT && b.t == T_INT && !__builtin_add_overflow(a.i, b.i, &r)) return a_int(r); if (a.t == T_FLOAT && b.t == T_FLOAT) return a_float(a.f + b.f); return a_binop(OP_ADD, a, b); }
+static inline AV a_sub(AV a, AV b) { int64_t r; if (a.t == T_INT && b.t == T_INT && !__builtin_sub_overflow(a.i, b.i, &r)) return a_int(r); if (a.t == T_FLOAT && b.t == T_FLOAT) return a_float(a.f - b.f); return a_binop(OP_SUB, a, b); }
+static inline AV a_mul(AV a, AV b) { int64_t r; if (a.t == T_INT && b.t == T_INT && !__builtin_mul_overflow(a.i, b.i, &r)) return a_int(r); if (a.t == T_FLOAT && b.t == T_FLOAT) return a_float(a.f * b.f); return a_binop(OP_MUL, a, b); }
+static inline int a_lt(AV a, AV b) { if (a.t == T_INT && b.t == T_INT) return a.i < b.i; if (a.t == T_FLOAT && b.t == T_FLOAT) return a.f < b.f; return a_compare(OP_LT, a, b); }
+static inline int a_le(AV a, AV b) { if (a.t == T_INT && b.t == T_INT) return a.i <= b.i; if (a.t == T_FLOAT && b.t == T_FLOAT) return a.f <= b.f; return a_compare(OP_LE, a, b); }
+static inline int a_gt(AV a, AV b) { if (a.t == T_INT && b.t == T_INT) return a.i > b.i; if (a.t == T_FLOAT && b.t == T_FLOAT) return a.f > b.f; return a_compare(OP_GT, a, b); }
+static inline int a_ge(AV a, AV b) { if (a.t == T_INT && b.t == T_INT) return a.i >= b.i; if (a.t == T_FLOAT && b.t == T_FLOAT) return a.f >= b.f; return a_compare(OP_GE, a, b); }
+static inline int a_eqf(AV a, AV b) { if (a.t == T_INT && b.t == T_INT) return a.i == b.i; return a_eq(a, b); }
+static inline int a_test(AV v) { if (v.t == T_BOOL || v.t == T_INT) return v.i != 0; return a_truthy(v); }
+static inline AV a_gload(AV v, const char *name) { return v.t == 255 ? a_gundef(name) : v; }
+#endif

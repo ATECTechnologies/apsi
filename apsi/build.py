@@ -264,7 +264,29 @@ def _copy_runtime(dest, sources, include, say):
 
 
 # =============================================================== apsi build
+def cmd_build_native(args):
+    """--native: Apsi -> C -> machine code. The executable needs no Python and no Apsi installation."""
+    from .aot.build import build
+    from .aot.cgen import NativeError
+    entry = os.path.abspath(args.file)
+    out_dir = os.path.abspath(args.output) if args.output else os.path.dirname(entry)
+    os.makedirs(out_dir, exist_ok=True)
+    name = args.name or os.path.splitext(os.path.basename(entry))[0]
+    target = getattr(args, "target", None)
+    exe = os.path.join(out_dir, name + (".exe" if os.name == "nt" or (target or "").endswith("windows-msvc") else ""))
+    try:
+        build(entry, exe, keep_c=getattr(args, "emit_c", False), target=target)
+    except NativeError as e:
+        print(f"apsi build: {e}", file=sys.stderr)
+        return 1
+    if not args.quiet:
+        print(f"built {exe} (native)")
+    return 0
+
+
 def cmd_build(args):
+    if getattr(args, "native", False):
+        return cmd_build_native(args)
     from .checker import Checker
     from .errors import ApsiError
     from .interpreter import Interpreter
@@ -489,6 +511,10 @@ def register(sub, perm_flags):
     p.add_argument("--list", action="store_true", help="list the program files that went in")
     p.add_argument("--windowed", action="store_true", help="Windows: no console window (GUI / server programs)")
     p.add_argument("-q", "--quiet", action="store_true")
+    p.add_argument("--native", action="store_true",
+                   help="compile to machine code (no Python inside): Apsi -> C -> clang/gcc")
+    p.add_argument("--target", help="with --native: a clang target triple (e.g. x86_64-pc-windows-msvc)")
+    p.add_argument("--emit-c", action="store_true", help="with --native: keep the generated C next to the program")
     perm_flags(p)
     p.set_defaults(fn=cmd_build)
 
