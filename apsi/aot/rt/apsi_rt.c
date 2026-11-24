@@ -41,6 +41,7 @@ void *a_alloc(size_t size, AKind kind) {
     return o;
 }
 
+void a_note_alloc(size_t bytes) { a_allocated += bytes; }
 void a_root(AV *slots, int n) {
     ARoots *r = (ARoots *)xmalloc(sizeof(ARoots));
     r->slots = slots; r->n = n; r->next = a_roots; a_roots = r;
@@ -97,11 +98,13 @@ static void mark_obj(AObj *o) {
         case O_SLICE: { ASlice *s = (ASlice *)o; mark(s->lo); mark(s->hi); mark(s->step); return; }
         case O_QTY: o = (AObj *)((AQty *)o)->dtext; continue;
         case O_GEN: gen_mark((struct AGen *)o); return;
+        case O_NODE: a_tensor_mark(o); return;
         default: return;
         }
     }
 }
 static void mark(AV v) { if (v.t == T_OBJ && v.o) mark_obj(v.o); }
+void a_mark_value(AV v) { mark(v); }
 
 static void free_obj(AObj *o) {
     switch (o->kind) {
@@ -110,6 +113,7 @@ static void free_obj(AObj *o) {
     case O_FUNC: free(((AFunc *)o)->cells); free(((AFunc *)o)->defaults); break;
     case O_CLASS: free(((AClass *)o)->fields); break;
     case O_GEN: gen_free((struct AGen *)o); break;
+    case O_TENSOR: a_tensor_free(o); break;
     default: break;
     }
     free(o);
@@ -417,6 +421,7 @@ uint64_t a_hash(AV v) {
 static int num(AV v) { return v.t == T_INT || v.t == T_BOOL || v.t == T_FLOAT; }
 static double fval(AV v) { return v.t == T_FLOAT ? v.f : (double)v.i; }
 int a_eq(AV a, AV b) {
+    if (a_is_tn(a) || a_is_tn(b)) return a_tensor_eq(a, b);
     if (a_is(a, O_QTY) != a_is(b, O_QTY)) {
         AV q = a_is(a, O_QTY) ? a : b, o = a_is(a, O_QTY) ? b : a;
         return is_zero_num(o) && ((AQty *)q.o)->v == 0.0;
@@ -459,6 +464,7 @@ int a_eq(AV a, AV b) {
     }
 }
 int a_truthy(AV v) {
+    if (a_is_tn(v)) return a_tensor_truthy(v);
     switch (v.t) {
     case T_NONE: return 0;
     case T_BOOL: case T_INT: return v.i != 0;
@@ -597,6 +603,14 @@ static void repr_into(SB *b, AV v, int repr) {
             else if (m.t != 255) repr_into(b, m, 0);
             return;
         }
+        if (ec->is_struct == 2) {          /* record(name=value, ...) */
+            sb_puts(b, "record("); int first = 1;
+            for (int64_t i = 0; i < s->attrs->nent; i++) if (s->attrs->e[i].used) {
+                if (!first) sb_puts(b, ", "); first = 0;
+                repr_into(b, s->attrs->e[i].k, 0); sb_puts(b, "="); repr_into(b, s->attrs->e[i].v, 1);
+            }
+            sb_puts(b, ")"); return;
+        }
         if (ec->is_struct) {               /* Name(field=value, ...), or its to_str() */
             AV ts = a_getattr(v, "to_str");
             if (ts.t != 255) { AV r = a_to_str(a_call(ts, 0, NULL, NULL)); sb_put(b, STR(r)->s, STR(r)->len); return; }
@@ -614,6 +628,7 @@ static void repr_into(SB *b, AV v, int repr) {
         sb_puts(b, "<__main__."); sb_puts(b, ec->name->s); sb_puts(b, t); return;
     }
     case O_BOUND: sb_puts(b, "<bound method>"); return;
+    case O_TENSOR: case O_NODE: { char *s = a_tensor_text(v, !repr); sb_puts(b, s); free(s); return; }
     case O_GEN: sb_puts(b, "<generator "); sb_puts(b, gen_name(v.o)); sb_puts(b, ">"); return;
     case O_QTY: qty_text(b, (AQty *)v.o, NULL); return;
     default: sb_puts(b, "<object>"); return;
@@ -847,6 +862,7 @@ static const char *tname(AV v) {
     }
 }
 AV a_binop(int op, AV a, AV b) {
+    if (a_is_tn(a) || a_is_tn(b)) return a_tensor_binop(op, a, b);
     if (a_is(a, O_QTY) || a_is(b, O_QTY)) return qty_binop(op, a, b);
     if ((a.t == T_INT || a.t == T_BOOL) && (b.t == T_INT || b.t == T_BOOL)) {
         int64_t x = a.i, y = b.i, r;
@@ -926,6 +942,11 @@ AV a_binop(int op, AV a, AV b) {
     a_error("TypeError", "unsupported operand types for %s: '%s' and '%s'", opname(op), tname(a), tname(b));
 }
 AV a_unop(int op, AV a) {
+    if (a_is_tn(a)) {
+        if (op == OP_NEG) return a_tensor_neg(a);
+        if (op == OP_POS) return a;
+        if (op == OP_NOT) return a_bool(!a_tensor_truthy(a));
+    }
     switch (op) {
     case OP_NOT: return a_bool(!a_truthy(a));
     case OP_NEG:
@@ -971,7 +992,12 @@ static int cmp_order(AV a, AV b) {   /* <0, 0, >0 */
     }
     a_error("TypeError", "'<' not supported between '%s' and '%s'", tname(a), tname(b));
 }
+AV a_cmp_slow(int op, AV a, AV b) {
+    if ((a_is_tn(a) || a_is_tn(b)) && op != OP_IN && op != OP_NOTIN && op != OP_IS && op != OP_ISNOT) return a_tensor_cmp(op, a, b);
+    return a_bool(a_compare(op, a, b));
+}
 int a_compare(int op, AV a, AV b) {
+    if ((a_is_tn(a) || a_is_tn(b)) && op != OP_IN && op != OP_NOTIN && op != OP_IS && op != OP_ISNOT) return a_tensor_truthy(a_tensor_cmp(op, a, b));
     switch (op) {
     case OP_EQ: return a_eq(a, b);
     case OP_NE: return !a_eq(a, b);
@@ -1021,6 +1047,7 @@ static _Noreturn void a_key_error(AV k) {
     a_error("KeyError", "%s", STR(m)->s);
 }
 int64_t a_len(AV o) {
+    if (a_is_tn(o)) return a_tensor_len(o);
     if (o.t == T_OBJ) switch (o.o->kind) {
     case O_STR: return STR(o)->nchars;
     case O_LIST: case O_TUPLE: return LIST(o)->len;
@@ -1057,6 +1084,7 @@ static void slice_bounds(ASlice *s, int64_t n, int64_t *lo, int64_t *hi, int64_t
     *lo = a; *hi = b; *st = step;
 }
 AV a_getitem(AV o, AV i) {
+    if (a_is_tn(o)) return a_tensor_getitem(o, i);
     if (o.t != T_OBJ) a_error("TypeError", "'%s' object is not subscriptable", tname(o));
     switch (o.o->kind) {
     case O_LIST: case O_TUPLE: {
@@ -1097,6 +1125,7 @@ AV a_getitem(AV o, AV i) {
     a_error("TypeError", "'%s' object is not subscriptable", tname(o));
 }
 void a_setitem(AV o, AV i, AV v) {
+    if (a_is_tn(o)) { a_tensor_setitem(o, i, v); return; }
     if (a_is(o, O_LIST)) {
         AList *l = LIST(o);
         if (a_is(i, O_SLICE)) {
@@ -1264,6 +1293,12 @@ static AV new_iter(int kind, AV src) {
     return a_obj(it);
 }
 AV a_iter(AV o) {
+    if (a_is_tn(o)) {                 /* a tensor iterates over its first axis */
+        int64_t n = a_tensor_len(o); int sp = a_ntmp; A_PUSH(o);
+        AList *l = new_list(0, O_LIST); A_PUSH(a_obj(l));
+        for (int64_t i = 0; i < n; i++) a_list_append(l, a_tensor_getitem(o, a_int(i)));
+        a_ntmp = sp; return new_iter(IT_SEQ, a_obj(l));
+    }
     if (o.t != T_OBJ) a_error("TypeError", "'%s' object is not iterable", tname(o));
     switch (o.o->kind) {
     case O_LIST: case O_TUPLE: return new_iter(IT_SEQ, o);
@@ -1362,6 +1397,7 @@ AV a_getattr(AV o, const char *name) {
         if (!strcmp(name, "__name__")) return a_obj(((AClass *)o.o)->name);
         return v;
     }
+    if (a_is_tn(o)) return a_tensor_attr(o, name);
     return method_of(o, name);
 }
 AV a_attr(AV o, const char *name) {
@@ -1702,7 +1738,7 @@ static AV b_dict(int n, AV *a, ADict *kw, AV self) {
     return d;
 }
 static AV b_set(int n, AV *a, ADict *kw, AV self) { (void)kw; (void)self; AV s = a_set(); if (n) { int sp = a_ntmp; A_PUSH(s); AV it = a_iter(a[0]), x; A_PUSH(it); while (a_next(it, &x)) a_dict_set(DICT(s), x, A_NONE); a_ntmp = sp; } return s; }
-static AV b_abs(int n, AV *a, ADict *kw, AV self) { (void)n; (void)kw; (void)self; if (a_is(a[0], O_QTY)) return a_qty(fabs(QTY(a[0])->v), QTY(a[0])->dim, NULL, 1); if (a[0].t == T_FLOAT) return a_float(fabs(a[0].f)); if (a[0].t == T_INT || a[0].t == T_BOOL) return a_int(a[0].i < 0 ? -a[0].i : a[0].i); a_error("TypeError", "abs() of %s", tname(a[0])); }
+static AV b_abs(int n, AV *a, ADict *kw, AV self) { if (n && a_is_tn(a[0])) return a_tensor_builtin("abs", 1)(n, a, kw, self); (void)n; (void)kw; (void)self; if (a_is(a[0], O_QTY)) return a_qty(fabs(QTY(a[0])->v), QTY(a[0])->dim, NULL, 1); if (a[0].t == T_FLOAT) return a_float(fabs(a[0].f)); if (a[0].t == T_INT || a[0].t == T_BOOL) return a_int(a[0].i < 0 ? -a[0].i : a[0].i); a_error("TypeError", "abs() of %s", tname(a[0])); }
 static AV minmax(int n, AV *a, ADict *kw, int mx) {
     AV key = kwarg(kw, "key", A_NONE), best = A_NONE, bestk = A_NONE; int have = 0;
     int sp = a_ntmp; AV src = n == 1 ? a_iter(a[0]) : A_NONE; int i = 0; AV x;
@@ -1717,9 +1753,9 @@ static AV minmax(int n, AV *a, ADict *kw, int mx) {
     if (!have) { AV d; if (kw && a_dict_get(kw, a_str("default"), &d)) return d; a_error("ValueError", "%s() of an empty sequence", mx ? "max" : "min"); }
     return best;
 }
-static AV b_min(int n, AV *a, ADict *kw, AV self) { (void)self; return minmax(n, a, kw, 0); }
-static AV b_max(int n, AV *a, ADict *kw, AV self) { (void)self; return minmax(n, a, kw, 1); }
-static AV b_sum(int n, AV *a, ADict *kw, AV self) {
+static AV b_min(int n, AV *a, ADict *kw, AV self) { if ((n == 1 || kw) && a_is_tn(a[0])) return a_tensor_builtin("min", 1)(n, a, kw, self); (void)self; return minmax(n, a, kw, 0); }
+static AV b_max(int n, AV *a, ADict *kw, AV self) { if ((n == 1 || kw) && a_is_tn(a[0])) return a_tensor_builtin("max", 1)(n, a, kw, self); (void)self; return minmax(n, a, kw, 1); }
+static AV b_sum(int n, AV *a, ADict *kw, AV self) { if (n && a_is_tn(a[0])) return a_tensor_builtin("sum", 1)(n, a, kw, self);
     (void)kw; (void)self;
     int sp = a_ntmp; AV acc = n > 1 ? a[1] : a_int(0), it = a_iter(a[0]), x; A_PUSH(it); A_PUSH(acc);
     while (a_next(it, &x)) { acc = a_add(acc, x); a_tmp[sp + 1] = acc; }
@@ -1772,8 +1808,8 @@ static AV b_input(int n, AV *a, ADict *kw, AV self) {
 static AV b_hash(int n, AV *a, ADict *kw, AV self) { (void)n; (void)kw; (void)self; return a_int((int64_t)(a_hash(a[0]) >> 1)); }
 static AV b_divmod(int n, AV *a, ADict *kw, AV self) { (void)n; (void)kw; (void)self; AV p[2] = {a_binop(OP_FLOORDIV, a[0], a[1]), a_binop(OP_MOD, a[0], a[1])}; return a_tuple(2, p); }
 static AV b_pow(int n, AV *a, ADict *kw, AV self) { (void)n; (void)kw; (void)self; return a_binop(OP_POW, a[0], a[1]); }
-#define MATH1(nm, fn) static AV b_##nm(int n, AV *a, ADict *kw, AV self) { (void)n; (void)kw; (void)self; if (a_is(a[0], O_QTY)) a_error("UnitError", #nm "() needs a dimensionless number"); if (!num(a[0])) a_error("TypeError", #nm "() needs a number"); return a_float(fn(fval(a[0]))); }
-static AV b_sqrt(int n, AV *a, ADict *kw, AV self) {
+#define MATH1(nm, fn) static AV b_##nm(int n, AV *a, ADict *kw, AV self) { (void)n; (void)kw; (void)self; if (a_is_tn(a[0])) return a_tensor_builtin(#nm, 1)(n, a, kw, self); if (a_is(a[0], O_QTY)) a_error("UnitError", #nm "() needs a dimensionless number"); if (!num(a[0])) a_error("TypeError", #nm "() needs a number"); return a_float(fn(fval(a[0]))); }
+static AV b_sqrt(int n, AV *a, ADict *kw, AV self) { if (n && a_is_tn(a[0])) return a_tensor_builtin("sqrt", 1)(n, a, kw, self);
     (void)n; (void)kw; (void)self;
     if (a_is(a[0], O_QTY)) return qty_binop(OP_POW, a[0], a_float(0.5));
     if (!num(a[0])) a_error("TypeError", "sqrt() needs a number");
@@ -1823,21 +1859,30 @@ double a_rand_n(void) {
 void a_seed(uint64_t x) {
     for (int i = 0; i < 4; i++) { x += 0x9E3779B97F4A7C15ull; uint64_t z = x; z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9ull; z = (z ^ (z >> 27)) * 0x94D049BB133111EBull; rng_s[i] = z ^ (z >> 31); }
 }
+static uint64_t rng_saved[16][4]; static int rng_depth = 0;
+static void seed_push(AV s) { if (rng_depth >= 16) a_error("RuntimeError", "seeds nested too deeply"); memcpy(rng_saved[rng_depth++], rng_s, sizeof rng_s); a_seed((uint64_t)(s.t == T_INT ? s.i : 0)); }
+static void seed_pop(void) { if (rng_depth > 0) memcpy(rng_s, rng_saved[--rng_depth], sizeof rng_s); }
+static AV b_seed_push(int n, AV *a, ADict *kw, AV self) { (void)kw; (void)self; seed_push(n ? a[0] : a_int(0)); return A_NONE; }
+static AV b_seed_pop(int n, AV *a, ADict *kw, AV self) { (void)n; (void)a; (void)kw; (void)self; seed_pop(); return A_NONE; }
+static AV with_seed(AV (*f)(int, AV *, ADict *, AV), int n, AV *a, ADict *kw, AV self) {
+    AV s; if (!(kw && a_dict_get(kw, a_str("seed"), &s)) || s.t == T_NONE) return f(n, a, NULL, self);
+    seed_push(s); AV r = f(n, a, NULL, self); seed_pop(); return r;
+}
 static AV b_seed(int n, AV *a, ADict *kw, AV self) { (void)n; (void)kw; (void)self; a_seed((uint64_t)a[0].i); return A_NONE; }
 AV (*a_tensor_random)(int kind, int n, AV *shape, AV lo, AV hi) = NULL;   /* set by the tensor runtime */
 static AV rand_shaped(int kind, int n, AV *a, AV lo, AV hi) {
     if (!a_tensor_random) a_error("NotImplementedError", "tensors are not linked into this program");
     return a_tensor_random(kind, n, a, lo, hi);
 }
-static AV b_rand(int n, AV *a, ADict *kw, AV self) { (void)kw; (void)self; if (n) return rand_shaped(0, n, a, A_NONE, A_NONE); return a_float(a_rand_f()); }
-static AV b_randn(int n, AV *a, ADict *kw, AV self) { (void)kw; (void)self; if (n) return rand_shaped(1, n, a, A_NONE, A_NONE); return a_float(a_rand_n()); }
-static AV b_randint(int n, AV *a, ADict *kw, AV self) {
+static AV b_rand0(int n, AV *a, ADict *kw, AV self) { (void)kw; (void)self; if (n) return rand_shaped(0, n, a, A_NONE, A_NONE); return a_float(a_rand_f()); }
+static AV b_randn0(int n, AV *a, ADict *kw, AV self) { (void)kw; (void)self; if (n) return rand_shaped(1, n, a, A_NONE, A_NONE); return a_float(a_rand_n()); }
+static AV b_randint0(int n, AV *a, ADict *kw, AV self) {
     (void)kw; (void)self;
     if (n > 2) return rand_shaped(2, n - 2, a + 2, a[0], a[1]);
     int64_t lo = a[0].i, hi = a[1].i; if (hi <= lo) a_error("ValueError", "randint(): high must be above low");
     return a_int(lo + (int64_t)(a_rand_u64() % (uint64_t)(hi - lo)));
 }
-static AV b_permutation(int n, AV *a, ADict *kw, AV self) {
+static AV b_permutation0(int n, AV *a, ADict *kw, AV self) {
     (void)n; (void)kw; (void)self;
     int64_t m = a[0].i; AList *l = new_list(m, O_LIST);
     for (int64_t i = 0; i < m; i++) l->v[i] = a_int(i);
@@ -1845,6 +1890,10 @@ static AV b_permutation(int n, AV *a, ADict *kw, AV self) {
     return a_obj(l);
 }
 
+static AV b_rand(int n, AV *a, ADict *kw, AV self) { return with_seed(b_rand0, n, a, kw, self); }
+static AV b_randn(int n, AV *a, ADict *kw, AV self) { return with_seed(b_randn0, n, a, kw, self); }
+static AV b_randint(int n, AV *a, ADict *kw, AV self) { return with_seed(b_randint0, n, a, kw, self); }
+static AV b_permutation(int n, AV *a, ADict *kw, AV self) { return with_seed(b_permutation0, n, a, kw, self); }
 /* ---- files */
 static AV b_exists(int n, AV *a, ADict *kw, AV self) { (void)n; (void)kw; (void)self; FILE *f = fopen(STR(a_to_str(a[0]))->s, "rb"); if (f) fclose(f); return a_bool(f != NULL); }
 static AV b_read_text(int n, AV *a, ADict *kw, AV self) {
@@ -1995,8 +2044,8 @@ static AV b_getenv(int n, AV *a, ADict *kw, AV self) { (void)kw; (void)self; con
 static AV b_write_out(int n, AV *a, ADict *kw, AV self) { (void)kw; (void)self; for (int i = 0; i < n; i++) { AV s = a_to_str(a[i]); fwrite(STR(s)->s, 1, (size_t)STR(s)->len, stdout); } return A_NONE; }
 static AV b_write_err(int n, AV *a, ADict *kw, AV self) { (void)kw; (void)self; fflush(stdout); for (int i = 0; i < n; i++) { AV s = a_to_str(a[i]); fwrite(STR(s)->s, 1, (size_t)STR(s)->len, stderr); } return A_NONE; }
 static AV b_flush_out(int n, AV *a, ADict *kw, AV self) { (void)n; (void)a; (void)kw; (void)self; fflush(stdout); return A_NONE; }
-static AV b_isnan(int n, AV *a, ADict *kw, AV self) { (void)n; (void)kw; (void)self; return a_bool(a[0].t == T_FLOAT && isnan(a[0].f)); }
-static AV b_isfinite(int n, AV *a, ADict *kw, AV self) { (void)n; (void)kw; (void)self; return a_bool(a[0].t != T_FLOAT || isfinite(a[0].f)); }
+static AV b_isnan(int n, AV *a, ADict *kw, AV self) { if (n && a_is_tn(a[0])) return a_tensor_builtin("isnan", 1)(n, a, kw, self); (void)n; (void)kw; (void)self; return a_bool(a[0].t == T_FLOAT && isnan(a[0].f)); }
+static AV b_isfinite(int n, AV *a, ADict *kw, AV self) { if (n && a_is_tn(a[0])) return a_tensor_builtin("isfinite", 1)(n, a, kw, self); (void)n; (void)kw; (void)self; return a_bool(a[0].t != T_FLOAT || isfinite(a[0].f)); }
 static AV b_hex(int n, AV *a, ADict *kw, AV self) { (void)n; (void)kw; (void)self; char t[40]; long long v = a[0].i; snprintf(t, sizeof t, "%s0x%llx", v < 0 ? "-" : "", v < 0 ? -v : v); return a_str(t); }
 static AV b_oct(int n, AV *a, ADict *kw, AV self) { (void)n; (void)kw; (void)self; char t[40]; long long v = a[0].i; snprintf(t, sizeof t, "%s0o%llo", v < 0 ? "-" : "", v < 0 ? -v : v); return a_str(t); }
 static AV b_bin(int n, AV *a, ADict *kw, AV self) { (void)n; (void)kw; (void)self; AV s = a_format(a_int(a[0].i < 0 ? -a[0].i : a[0].i), "b"); SB b = {0}; sb_puts(&b, a[0].i < 0 ? "-0b" : "0b"); sb_put(&b, STR(s)->s, STR(s)->len); return sb_done(&b); }
@@ -2009,8 +2058,8 @@ static AV b_next(int n, AV *a, ADict *kw, AV self) { (void)kw; (void)self; AV v;
 static AV b_set_recursion_limit(int n, AV *a, ADict *kw, AV self) { (void)n; (void)a; (void)kw; (void)self; return A_NONE; }
 static AV b_error(int n, AV *a, ADict *kw, AV self) { (void)kw; (void)self; a_raise(n ? a_to_str(a[0]) : a_str("error")); }
 
-static AV b_floor(int n, AV *a, ADict *kw, AV self) { (void)n; (void)kw; (void)self; if (a[0].t == T_INT) return a[0]; return a_int((int64_t)floor(fval(a[0]))); }
-static AV b_ceil(int n, AV *a, ADict *kw, AV self) { (void)n; (void)kw; (void)self; if (a[0].t == T_INT) return a[0]; return a_int((int64_t)ceil(fval(a[0]))); }
+static AV b_floor(int n, AV *a, ADict *kw, AV self) { if (n && a_is_tn(a[0])) return a_tensor_builtin("floor", 1)(n, a, kw, self); (void)n; (void)kw; (void)self; if (a[0].t == T_INT) return a[0]; return a_int((int64_t)floor(fval(a[0]))); }
+static AV b_ceil(int n, AV *a, ADict *kw, AV self) { if (n && a_is_tn(a[0])) return a_tensor_builtin("ceil", 1)(n, a, kw, self); (void)n; (void)kw; (void)self; if (a[0].t == T_INT) return a[0]; return a_int((int64_t)ceil(fval(a[0]))); }
 static AV b_atan2(int n, AV *a, ADict *kw, AV self) { (void)n; (void)kw; (void)self; return a_float(atan2(fval(a[0]), fval(a[1]))); }
 static AV b_hypot(int n, AV *a, ADict *kw, AV self) { (void)n; (void)kw; (void)self; return a_float(hypot(fval(a[0]), fval(a[1]))); }
 static AV b_exit(int n, AV *a, ADict *kw, AV self) { (void)kw; (void)self; fflush(stdout); exit(n ? (int)a[0].i : 0); }
@@ -2028,7 +2077,7 @@ static const BEnt a_builtins[] = {
     {"floor", b_floor}, {"ceil", b_ceil}, {"atan2", b_atan2}, {"hypot", b_hypot}, {"exit", b_exit},
     {"cbrt", b_cbrt}, {"erf", b_erf}, {"erfc", b_erfc}, {"expm1", b_expm1}, {"log1p", b_log1p}, {"lgamma", b_lgamma},
     {"gamma", b_gamma}, {"beta", b_beta}, {"factorial", b_factorial}, {"comb", b_comb}, {"seed", b_seed},
-    {"rand", b_rand}, {"randn", b_randn}, {"randint", b_randint}, {"permutation", b_permutation},
+    {"rand", b_rand}, {"randn", b_randn}, {"randint", b_randint}, {"permutation", b_permutation}, {"seed_push", b_seed_push}, {"seed_pop", b_seed_pop},
     {"exists", b_exists}, {"read_text", b_read_text}, {"write_text", b_write_text}, {"json_str", b_json_str},
     {"json_parse", b_json_parse}, {"load_json", b_load_json}, {"save_json", b_save_json},
     {"cpu_threads", b_cpu_threads}, {"clock", b_clock}, {"getenv", b_getenv}, {"write_out", b_write_out},
@@ -2048,6 +2097,8 @@ AV a_global_builtin(const char *name) {
     if (!strcmp(name, "inf")) return a_float(INFINITY);
     if (!strcmp(name, "nan")) return a_float(NAN);
     for (const BEnt *b = a_builtins; b->name; b++) if (!strcmp(b->name, name)) return a_builtin(b->name, b->fn, A_NONE);
+    ABuiltinFn tf = a_tensor_builtin(name, 0);
+    if (tf) return a_builtin(name, tf, A_NONE);
     AV v; v.t = 255; v.i = 0; return v;
 }
 
@@ -2069,6 +2120,7 @@ void a_init(int argc, char **argv) {
         AV base = a_exc_base[i] >= 0 ? a_exc_classes[a_exc_base[i]] : A_NONE;
         a_exc_classes[i] = a_class(a_exc_names[i], base, 0, 0, NULL);
     }
+    a_tensor_init();
     a_dict_set(((AClass *)a_exc_classes[0].o)->attrs, a_str("__init__"), a_func("BaseException.__init__", exc_init_code, 0, 0));
 }
 

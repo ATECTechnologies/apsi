@@ -25,6 +25,8 @@ _RT = os.path.join(os.path.dirname(__file__), "rt")
 def _builtin_names():
     src = open(os.path.join(_RT, "apsi_rt.c"), encoding="utf-8").read()
     names = set(re.findall(r'\{"([A-Za-z_0-9]+)", b_[A-Za-z_0-9]+\}', src))
+    tsrc = open(os.path.join(_RT, "apsi_tensor.c"), encoding="utf-8").read()
+    names |= set(re.findall(r'\{"([A-Za-z_0-9]+)", tb_[A-Za-z_0-9]+\}', tsrc))
     exc = re.search(r"a_exc_names\[A_NEXC\] = \{(.*?)\};", src, re.S).group(1)
     names |= set(re.findall(r'"([A-Za-z]+)"', exc))
     return names | {"pi", "e", "inf", "nan", "Error", "IOError", "EnvironmentError"}
@@ -539,6 +541,9 @@ class CGen:
     def resolve_use(self, s):
         """('native', module, {name: builtin}) | ('local', path)"""
         from ..apsil import local_module
+        lib = os.path.join(os.path.dirname(__file__), "lib", s.path.replace(".", os.sep) + ".apsi")
+        if os.path.isfile(lib) and not s.py and local_module(s.path, self.base_dir) is None:
+            return ("local", os.path.abspath(lib))
         if s.path in NATIVE_MODULES and not s.py:
             return ("native", s.path, NATIVE_MODULES[s.path])
         local = local_module(s.path, self.base_dir)
@@ -1403,6 +1408,8 @@ class CGen:
         b = self.expr(e.right)
         if e.op in FAST_BIN:
             return self.hold(f"{FAST_BIN[e.op]}({a}, {b})")
+        if e.op in ("<", "<=", ">", ">=", "==", "!="):
+            return self.hold(f"a_cmpv({CMPOPS[e.op]}, {a}, {b})")
         if e.op in CMPOPS:
             return self.hold(f"a_bool({self.cmp_code(e.op, a, b)})")
         if e.op not in BINOPS:

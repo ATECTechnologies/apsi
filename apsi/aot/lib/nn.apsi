@@ -1,0 +1,338 @@
+# The nn module, written in Apsi: layers' parameters, losses, optimizers, schedules and toy data. It runs on the
+# native tensors and their automatic differentiation.
+
+fn dense(n_in, n_out, seed=none, scale=none):
+    let s = scale if scale != none else sqrt(2.0 / n_in)
+    return record(W=randn(n_in, n_out, seed=seed) * s, b=zeros(n_out))
+
+fn mlp_init(sizes, seed=0):
+    return [dense(sizes[i], sizes[i + 1], seed=seed + i) for i in 0..len(sizes) - 1]
+
+fn mse(pred, target):
+    let d = pred - target
+    return mean(d * d)
+
+fn cross_entropy(logits, labels):
+    var lg = logits
+    var lb = tensor(labels, "int64")
+    if ndim(lb) > 1:
+        let c = shape(logits)[-1]
+        lg = reshape(logits, -1, c)
+        lb = reshape(lb, -1)
+    let lp = log_softmax(lg, axis=-1)
+    let keep = [i for i in 0..len(lb) if lb[i] >= 0]
+    if len(keep) == len(lb):
+        return -mean(lp[(arange(len(lb)), lb)])
+    if len(keep) == 0:
+        return mean(lp[(arange(1), zeros(1, dtype="int64"))]) * 0.0
+    return -mean(lp[(tensor(keep, "int64"), lb[keep])])
+
+fn nll_loss(log_probs, labels):
+    let lb = tensor(labels, "int64")
+    return -mean(log_probs[(arange(len(lb)), lb)])
+
+fn l1_loss(pred, target):
+    return mean(abs(pred - target))
+
+fn bce_with_logits(logits, target):
+    return mean(softplus(logits) - target * logits)
+
+fn bce(prob, target):
+    let lp = clip(log(prob), -100.0, none)
+    let lq = clip(log(1.0 - prob), -100.0, none)
+    return -mean(target * lp + (1.0 - target) * lq)
+
+fn huber_loss(pred, target, delta=1.0):
+    let d = pred - target
+    let quad = 0.5 * d * d
+    let lin = delta * (abs(d) - 0.5 * delta)
+    return mean(where(abs(stop_gradient(d)) <= delta, quad, lin))
+
+fn accuracy(logits, labels):
+    let pred = argmax(stop_gradient(logits), axis=-1)
+    return mean(to_float(pred == tensor(labels, "int64")))
+
+fn one_hot(labels, k):
+    let lb = tensor(labels, "int64")
+    var out = zeros(len(lb), k)
+    out[(arange(len(lb)), lb)] = 1.0
+    return out
+
+class Loader:
+    fn __init__(self, X, y, batch_size, shuffle, seed):
+        self.X = X
+        self.y = y
+        self.size = batch_size
+        self.shuffle = shuffle
+        self.n = shape(X)[0]
+        self.seed = seed
+    fn __iter__(self):
+        let idx = permutation(self.n) if self.shuffle else list(range(self.n))
+        var out = []
+        for i in range(0, self.n, self.size):
+            let j = tensor(idx[i:i + self.size], "int64")
+            out.append((self.X[j], self.y[j]))
+        return iter(out)
+    fn __len__(self):
+        return (self.n + self.size - 1) // self.size
+
+fn loader(X, y, batch_size=32, shuffle=false, seed=none):
+    return Loader(X, y, batch_size, shuffle, seed)
+
+fn batches(X, y, size, seed=none):
+    let n = shape(X)[0]
+    if seed != none:
+        seed_push(seed)
+    let idx = permutation(n)
+    if seed != none:
+        seed_pop()
+    return [(X[tensor(idx[i:i + size], "int64")], y[tensor(idx[i:i + size], "int64")]) for i in range(0, n, size)]
+
+class SGD:
+    fn __init__(self, lr, momentum):
+        self.lr = lr
+        self.momentum = momentum
+        self.vel = none
+    fn step(self, params, grads):
+        var g = grads
+        if self.momentum:
+            if self.vel == none:
+                self.vel = tree_map(zeros_like, grads)
+            self.vel = tree_map(fn(v, x) => self.momentum * v + x, self.vel, grads)
+            g = self.vel
+        return tree_map(fn(p, x) => p - self.lr * x, params, g)
+
+class Adam:
+    fn __init__(self, lr, b1, b2, eps, wd):
+        self.lr = lr
+        self.b1 = b1
+        self.b2 = b2
+        self.eps = eps
+        self.wd = wd
+        self.m = none
+        self.v = none
+        self.t = 0
+    fn step(self, params, grads):
+        var ps = params
+        if self.wd:
+            ps = tree_map(fn(p) => p * (1 - self.lr * self.wd) if ndim(p) >= 2 else p, params)
+        if self.m == none:
+            self.m = tree_map(zeros_like, grads)
+            self.v = tree_map(zeros_like, grads)
+        self.t += 1
+        let b1 = self.b1
+        let b2 = self.b2
+        self.m = tree_map(fn(m, g) => b1 * m + (1 - b1) * g, self.m, grads)
+        self.v = tree_map(fn(v, g) => b2 * v + (1 - b2) * g * g, self.v, grads)
+        let c1 = 1 - b1 ** self.t
+        let c2 = 1 - b2 ** self.t
+        let lr = self.lr
+        let eps = self.eps
+        return tree_map(fn(p, m, v) => p - lr * (m / c1) / (sqrt(v / c2) + eps), ps, self.m, self.v)
+
+class RMSprop:
+    fn __init__(self, lr, decay, eps):
+        self.lr = lr
+        self.decay = decay
+        self.eps = eps
+        self.s = none
+    fn step(self, params, grads):
+        if self.s == none:
+            self.s = tree_map(zeros_like, grads)
+        let d = self.decay
+        self.s = tree_map(fn(s, g) => d * s + (1 - d) * g * g, self.s, grads)
+        return tree_map(fn(p, g, s) => p - self.lr * g / (sqrt(s) + self.eps), params, grads, self.s)
+
+class Adagrad:
+    fn __init__(self, lr, eps):
+        self.lr = lr
+        self.eps = eps
+        self.s = none
+    fn step(self, params, grads):
+        if self.s == none:
+            self.s = tree_map(zeros_like, grads)
+        self.s = tree_map(fn(s, g) => s + g * g, self.s, grads)
+        return tree_map(fn(p, g, s) => p - self.lr * g / (sqrt(s) + self.eps), params, grads, self.s)
+
+fn sgd(lr=0.01, momentum=0.0):
+    return SGD(lr, momentum)
+
+fn adam(lr=1e-3, b1=0.9, b2=0.999, eps=1e-8, state="fp32"):
+    return Adam(lr, b1, b2, eps, 0.0)
+
+fn adamw(lr=1e-3, b1=0.9, b2=0.999, eps=1e-8, weight_decay=0.01, state="fp32"):
+    return Adam(lr, b1, b2, eps, weight_decay)
+
+fn rmsprop(lr=1e-3, decay=0.9, eps=1e-8):
+    return RMSprop(lr, decay, eps)
+
+fn adagrad(lr=1e-2, eps=1e-10):
+    return Adagrad(lr, eps)
+
+fn set_lr(opt, lr):
+    opt.lr = lr
+    return opt
+
+fn cosine_lr(step, total, base=1e-3, warmup=0, minimum=0.0):
+    if warmup and step < warmup:
+        return base * (step + 1) / warmup
+    let t = min(1.0, (step - warmup) / max(1.0, total - warmup))
+    return minimum + 0.5 * (base - minimum) * (1 + cos(pi * t))
+
+fn step_lr(step, base=1e-3, every=100, factor=0.5):
+    return base * factor ** (step // every)
+
+fn linear_warmup(step, base=1e-3, warmup=100):
+    return base * min(1.0, (step + 1) / warmup)
+
+fn global_norm(grads):
+    var s = 0.0
+    for g in tree_leaves(grads):
+        s += sum(g * g)
+    return sqrt(s)
+
+fn clip_grad_norm(grads, max_norm=1.0):
+    let n = global_norm(grads)
+    if n <= max_norm or n == 0:
+        return grads
+    let s = max_norm / n
+    return tree_map(fn(g) => g * s, grads)
+
+fn layer_norm(x, gamma=none, beta=none, eps=1e-5):
+    let m = mean(x, axis=-1, keepdims=true)
+    let d = x - m
+    let v = mean(d * d, axis=-1, keepdims=true)
+    var y = d / sqrt(v + eps)
+    if gamma != none:
+        y = y * gamma
+    if beta != none:
+        y = y + beta
+    return y
+
+fn rms_norm(x, gamma=none, eps=1e-6):
+    let y = x / sqrt(mean(x * x, axis=-1, keepdims=true) + eps)
+    return y * gamma if gamma != none else y
+
+fn norm_init(d):
+    return record(gamma=ones(d), beta=zeros(d))
+
+fn dropout(x, p=0.1, train=true, seed=none):
+    if not train or p <= 0:
+        return x
+    let mask = to_float(rand(*shape(x), seed=seed) >= p) / (1.0 - p)
+    return x * mask
+
+fn embedding_init(vocab, d, seed=none):
+    return randn(vocab, d, seed=seed) * 0.02
+
+fn causal_mask(T):
+    var m = zeros(T, T)
+    for i in 0..T:
+        for j in i + 1..T:
+            m[i, j] = -1e9
+    return m
+
+fn attention(q, k, v, mask=none):
+    let d = shape(q)[-1]
+    var s = (q @ swapaxes(k, -1, -2)) / sqrt(d)
+    if mask != none:
+        s = s + mask
+    return softmax(s, axis=-1) @ v
+
+fn spiral_data(n_per_class=100, classes=3, noise=0.2, seed=0):
+    let n = n_per_class
+    var X = zeros(n * classes, 2)
+    var y = zeros(n * classes, dtype="int64")
+    let noise_all = randn(classes, n, seed=seed)
+    for c in 0..classes:
+        let r = linspace(0.0, 1.0, n)
+        let t = linspace(c * 4.0, (c + 1) * 4.0, n) + noise_all[c] * noise
+        X[c * n:(c + 1) * n, 0] = r * sin(t)
+        X[c * n:(c + 1) * n, 1] = r * cos(t)
+        y[c * n:(c + 1) * n] = c
+    return (X, y)
+
+fn make_moons(n=200, noise=0.1, seed=0):
+    let n1 = n // 2
+    let n2 = n - n1
+    let t1 = linspace(0, pi, n1)
+    let t2 = linspace(0, pi, n2)
+    var X = concat([stack([cos(t1), sin(t1)], axis=1), stack([1 - cos(t2), 0.5 - sin(t2)], axis=1)])
+    X = X + randn(n, 2, seed=seed) * noise
+    let y = concat([zeros(n1, dtype="int64"), ones(n2, dtype="int64")])
+    return (X, y)
+
+fn make_blobs(n=300, centers=3, dim=2, spread=0.5, seed=0):
+    seed_push(seed)
+    let cs = rand(centers, dim) * 10 - 5
+    let y = randint(0, centers, n)
+    let X = cs[y] + randn(n, dim) * spread
+    seed_pop()
+    return (X, y)
+
+fn make_regression(n=100, features=3, noise=0.1, seed=0):
+    seed_push(seed)
+    let X = randn(n, features)
+    let w = randn(features)
+    let y = X @ w + randn(n) * noise
+    seed_pop()
+    return (X, y, w)
+
+fn train_test_split(X, y, test=0.2, seed=0):
+    let n = shape(X)[0]
+    seed_push(seed)
+    let idx = permutation(n)
+    seed_pop()
+    let k = round(n * (1 - test))
+    let a = tensor(idx[:k], "int64")
+    let b = tensor(idx[k:], "int64")
+    return (X[a], X[b], y[a], y[b])
+
+fn standardize(X, axis=0):
+    let m = mean(X, axis=axis, keepdims=true)
+    let s = std(X, axis=axis, keepdims=true)
+    return ((X - m) / s, m, s)
+
+fn numeric_grad(f, x, eps=1e-6):
+    var xv = to_float(x)
+    var g = zeros_like(xv)
+    let flat = reshape(xv, -1)
+    var gf = reshape(g, -1)
+    for i in 0..len(flat):
+        var xp = to_float(flat)
+        var xm = to_float(flat)
+        xp[i] = xp[i] + eps
+        xm[i] = xm[i] - eps
+        gf[i] = (f(reshape(xp, *shape(xv))) - f(reshape(xm, *shape(xv)))) / (2 * eps)
+    return reshape(gf, *shape(xv))
+
+fn train(loss_fn, params, data, opt, epochs=10, batch_size=none, seed=0, verbose=true, clip=none, schedule=none, eval_fn=none):
+    let vg = value_and_grad(loss_fn)
+    var p = params
+    var history = []
+    var step = 0
+    let n = shape(data[0])[0]
+    let bs = batch_size if batch_size != none else n
+    seed_push(seed)
+    for epoch in 0..epochs:
+        let idx = permutation(n)
+        var total = 0.0
+        var count = 0
+        for i in range(0, n, bs):
+            let j = tensor(idx[i:i + bs], "int64")
+            let batch = [d[j] for d in data]
+            let loss, g = vg(p, *batch)
+            var gg = g
+            if clip != none:
+                gg = clip_grad_norm(g, clip)
+            if schedule != none:
+                set_lr(opt, schedule(step))
+            p = opt.step(p, gg)
+            total += loss
+            count += 1
+            step += 1
+        history.append(total / count)
+        if verbose:
+            print(f"epoch {epoch + 1}/{epochs}  loss {total / count:.4f}")
+    seed_pop()
+    return record(params=p, history=history)

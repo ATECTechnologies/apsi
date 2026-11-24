@@ -17,7 +17,7 @@ typedef struct AV {
 
 typedef enum {
     O_STR = 1, O_LIST, O_TUPLE, O_DICT, O_SET, O_FUNC, O_CLASS, O_INST, O_BOUND, O_RANGE, O_ITER, O_CELL, O_BUILTIN,
-    O_SLICE, O_QTY, O_GEN
+    O_SLICE, O_QTY, O_GEN, O_TENSOR, O_NODE
 } AKind;
 
 typedef struct AObj { struct AObj *gcnext; uint8_t kind, mark; } AObj;
@@ -134,6 +134,28 @@ AV a_range_val(AV start, AV end, int inclusive);
 void a_unpack_star(AV v, int before, int after, AV *out);   /* a, *b, c = v */
 AV a_gundef(const char *name);
 AV a_fmt_spec(AV v, AV spec);
+/* tensors and differentiation (apsi_tensor.c) */
+void a_note_alloc(size_t bytes);
+void a_mark_value(AV v);
+AV a_tensor_binop(int op, AV a, AV b);
+AV a_tensor_neg(AV a);
+AV a_tensor_cmp(int op, AV a, AV b);
+AV a_tensor_unary(int u, AV v);
+AV a_tensor_where(AV c, AV a, AV b);
+int a_tensor_truthy(AV v);
+char *a_tensor_text(AV v, int top);
+int64_t a_tensor_len(AV v);
+AV a_tensor_getitem(AV v, AV i);
+void a_tensor_setitem(AV v, AV i, AV x);
+int a_tensor_eq(AV a, AV b);
+double a_tensor_float(AV v);
+AV a_tensor_attr(AV v, const char *name);
+ABuiltinFn a_tensor_builtin(const char *name, int override_only);
+void a_tensor_mark(AObj *o);
+void a_tensor_free(AObj *o);
+void a_tensor_init(void);
+static inline int a_is_tn(AV v) { return v.t == T_OBJ && (v.o->kind == O_TENSOR || v.o->kind == O_NODE); }
+AV a_cmp_slow(int op, AV a, AV b);
 AV a_gen_new(AFunc *fn, AFnCode body, int n, AV *args, ADict *kw);   /* a generator function's call */
 AV a_yield(AV v);                                                   /* yield v: the value sent back in */
 AV a_module(const char *name, int n, const char **names, AV *vals);
@@ -153,6 +175,11 @@ static inline int a_le(AV a, AV b) { if (a.t == T_INT && b.t == T_INT) return a.
 static inline int a_gt(AV a, AV b) { if (a.t == T_INT && b.t == T_INT) return a.i > b.i; if (a.t == T_FLOAT && b.t == T_FLOAT) return a.f > b.f; return a_compare(OP_GT, a, b); }
 static inline int a_ge(AV a, AV b) { if (a.t == T_INT && b.t == T_INT) return a.i >= b.i; if (a.t == T_FLOAT && b.t == T_FLOAT) return a.f >= b.f; return a_compare(OP_GE, a, b); }
 static inline int a_eqf(AV a, AV b) { if (a.t == T_INT && b.t == T_INT) return a.i == b.i; return a_eq(a, b); }
+static inline AV a_cmpv(int op, AV a, AV b) {
+    if (a.t == T_INT && b.t == T_INT) switch (op) { case OP_LT: return a_bool(a.i < b.i); case OP_LE: return a_bool(a.i <= b.i); case OP_GT: return a_bool(a.i > b.i); case OP_GE: return a_bool(a.i >= b.i); case OP_EQ: return a_bool(a.i == b.i); case OP_NE: return a_bool(a.i != b.i); default: break; }
+    if (a.t == T_FLOAT && b.t == T_FLOAT) switch (op) { case OP_LT: return a_bool(a.f < b.f); case OP_LE: return a_bool(a.f <= b.f); case OP_GT: return a_bool(a.f > b.f); case OP_GE: return a_bool(a.f >= b.f); case OP_EQ: return a_bool(a.f == b.f); case OP_NE: return a_bool(a.f != b.f); default: break; }
+    return a_cmp_slow(op, a, b);
+}
 static inline int a_test(AV v) { if (v.t == T_BOOL || v.t == T_INT) return v.i != 0; return a_truthy(v); }
 static inline AV a_gload(AV v, const char *name) { return v.t == 255 ? a_gundef(name) : v; }
 #endif

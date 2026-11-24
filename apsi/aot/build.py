@@ -52,11 +52,12 @@ def build(path, out=None, opt="-O2", keep_c=False, target=None):
     if keep_c:
         shutil.copy(cfile, os.path.splitext(out)[0] + ".c")
     cc = find_cc()
-    cmd = [cc, opt, "-std=gnu11", "-w", "-I", RT, cfile, os.path.join(RT, "apsi_rt.c"), "-o", out]
+    cmd = [cc, opt, "-std=gnu11", "-w", "-I", RT, cfile, os.path.join(RT, "apsi_rt.c"),
+           os.path.join(RT, "apsi_tensor.c"), "-o", out]
     if target:
         cmd[1:1] = ["-target", target]
     if not (target or "").endswith("windows-msvc") and os.name != "nt":
-        cmd.append("-lm")
+        cmd += ["-lm", "-lpthread"]
     r = subprocess.run(cmd, capture_output=True, text=True)
     shutil.rmtree(work, ignore_errors=True)
     if r.returncode != 0:
