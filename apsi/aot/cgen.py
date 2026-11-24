@@ -62,7 +62,7 @@ NATIVE_MODULES = {
                   "round", "sin", "sinh", "sqrt", "tan", "tanh", "tau", "beta", "hypot", "expm1", "log1p"),
     "random": _same("seed", "rand", "randint", "randn", "permutation"),
     "io": _same("exists", "read_text", "write_text", "json_parse", "json_str", "load_json", "save_json"),
-    "sys": _same("cpu_threads"),
+    "sys": _same("cpu_threads", "gpu_available", "gpu_info", "to_gpu", "to_cpu"),
     "collections": _same("first", "last", "fold", "scan", "partition", "flat_map", "take_while", "drop_while",
                          "max_by", "min_by", "sum_by", "frequencies", "distinct_by", "interleave", "zip_longest",
                          "compose", "partial"),

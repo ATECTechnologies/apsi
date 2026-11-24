@@ -135,7 +135,9 @@ static void a_collect(void) {
     a_allocated = 0;
     if (a_threshold < live * 2) a_threshold = live * 2;
 }
-void a_gc_safe(void) { if (a_allocated > a_threshold) a_collect(); }
+void a_gc_full(void) { a_collect(); }
+extern size_t a_dev_since, a_dev_limit;
+void a_gc_safe(void) { if (a_allocated > a_threshold || a_dev_since > a_dev_limit) { a_collect(); a_dev_since = 0; } }
 
 static _Noreturn void a_key_error(AV k);
 #define QTY(v) ((AQty *)(v).o)

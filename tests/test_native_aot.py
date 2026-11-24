@@ -22,3 +22,17 @@ def test_native_matches_run(prog, tmp_path):
     got = subprocess.run([exe], capture_output=True, text=True)
     assert got.stdout == want.stdout
     assert got.returncode == want.returncode
+
+
+@pytest.mark.skipif(CC is None, reason="no C compiler")
+def test_gpu_kernels_emulated(tmp_path, monkeypatch):
+    """The card's kernels and the runtime's GPU path, run on host threads (APSI_GPU_EMU)."""
+    from apsi.aot.build import build
+    monkeypatch.setenv("APSI_GPU_EMU_BUILD", "1")
+    exe = build(os.path.join(HERE, "native_aot_gpu.apsi"), str(tmp_path / "gpu"))
+    got = subprocess.run([exe], capture_output=True, text=True, env=dict(os.environ, APSI_GPU_EMU="1"))
+    assert got.returncode == 0, got.stderr
+    lines = got.stdout.splitlines()
+    assert lines[0] == "true" and lines[1].startswith("gpu [[6., 6.],")
+    assert lines[-1] == "true"
+    assert lines[-2].startswith("0.0002282") and lines[-2].endswith("gpu")

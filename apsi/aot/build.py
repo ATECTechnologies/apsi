@@ -53,11 +53,14 @@ def build(path, out=None, opt="-O2", keep_c=False, target=None):
         shutil.copy(cfile, os.path.splitext(out)[0] + ".c")
     cc = find_cc()
     cmd = [cc, opt, "-std=gnu11", "-w", "-I", RT, cfile, os.path.join(RT, "apsi_rt.c"),
-           os.path.join(RT, "apsi_tensor.c"), "-o", out]
+           os.path.join(RT, "apsi_tensor.c"), os.path.join(RT, "apsi_gpu.c"), "-o", out]
+    if os.environ.get("APSI_GPU_EMU_BUILD"):        # tests: the card emulated on host threads
+        cmd[-2:-2] = [os.path.join(RT, "kernels.c")]
+        cmd[1:1] = ["-DAPSI_GPU_EMU_BUILD", "-DAPSI_EMU", "-DAPSI_CHECK_DEV"]
     if target:
         cmd[1:1] = ["-target", target]
     if not (target or "").endswith("windows-msvc") and os.name != "nt":
-        cmd += ["-lm", "-lpthread"]
+        cmd += ["-lm", "-lpthread", "-ldl"]
     r = subprocess.run(cmd, capture_output=True, text=True)
     shutil.rmtree(work, ignore_errors=True)
     if r.returncode != 0:

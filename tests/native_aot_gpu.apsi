@@ -1,0 +1,15 @@
+use sys
+print(gpu_available())
+let a = to_gpu(tensor([[1.0, 2.0, 3.0], [4.0, -5.0, 6.0]]))
+let b = to_gpu(ones(3, 2))
+print(a.device, a @ b, sum(a), mean(a, axis=0), a * 2.0 + 1.0, relu(a), softmax(a), a.T, exp(a) > 2.0)
+print(log_softmax(a, axis=-1), max(a, axis=1), a[1], a[:, 1:])
+fn loss(w) = mean((a @ w - 1.0) ** 2)
+var w = to_gpu(zeros(3, 2))
+for i in 0..200:
+    w = w - 0.05 * grad(loss)(w)
+print(loss(w), w.device)
+let big = to_gpu(randn(130, 70, seed=3))
+let big2 = to_gpu(randn(70, 90, seed=4))
+let d = to_host(big @ big2) - to_host(big) @ to_host(big2)
+print(max(abs(d)) < 1e-3)

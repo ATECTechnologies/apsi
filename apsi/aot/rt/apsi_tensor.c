@@ -24,9 +24,17 @@ typedef struct ANode { AObj h; AV val; int op; AV a, b, x; AV grad; int64_t id; 
 static int is_t(AV v) { return v.t == T_OBJ && v.o->kind == O_TENSOR; }
 static int is_n(AV v) { return v.t == T_OBJ && v.o->kind == O_NODE; }
 static int is_num(AV v) { return v.t == T_INT || v.t == T_FLOAT || v.t == T_BOOL; }
+static AV tcopy(struct ATensor *a, int dt);
+void a_gpu_upload(void *dst, const void *src, size_t n); void a_gpu_copy(void *dst, const void *src, size_t n);
+static AV t_softmax(AV v, int ax, int logsm);
+static int on_dev(AV v); static AV to_host(AV v); static AV to_dev(AV v);
+static AV d_ewise(int op, AV av, AV bv); static AV d_unary(int u, AV v); static AV d_reduce(int op, AV v, AV axis, int keep, int ddof);
+static AV d_matmul(AV av, AV bv); static AV d_permute(AV v, const int *perm); static AV d_softmax(AV v, int ax, int logsm);
+static void d_fill(ATensor *o, float v); static ATensor *d_new(int dt, int nd, const int64_t *sh);
 
 /* ------------------------------------------------------------------ making tensors */
-static void tfree(AObj *o) { free(((ATensor *)o)->p); }
+void a_gpu_free(void *p);
+static void tfree(AObj *o) { if (((ATensor *)o)->dev) a_gpu_free(((ATensor *)o)->p); else free(((ATensor *)o)->p); }
 static void tmark(AObj *o) { (void)o; }
 static ATensor *t_new(int dt, int nd, const int64_t *sh) {
     ATensor *t = (ATensor *)a_alloc(sizeof(ATensor), O_TENSOR);
@@ -38,8 +46,14 @@ static ATensor *t_new(int dt, int nd, const int64_t *sh) {
     a_note_alloc(bytes);
     return t;
 }
-static ATensor *t_like(ATensor *a, int dt) { return t_new(dt, a->nd, a->sh); }
+static ATensor *t_like(ATensor *a, int dt) {
+    if (a->dev) { ATensor *o = d_new(dt, a->nd, a->sh); d_fill(o, 0.0f); return o; }
+    return t_new(dt, a->nd, a->sh);
+}
 static inline double t_get(ATensor *t, int64_t i) {
+#ifdef APSI_CHECK_DEV
+    if (t->dev) a_error("RuntimeError", "internal: a host read of a tensor on the card");
+#endif
     switch (t->dt) {
     case DT_F64: return ((double *)t->p)[i];
     case DT_F32: return ((float *)t->p)[i];
@@ -116,6 +130,10 @@ AV t_from(AV v, int dt) {
     return a_obj(t);
 }
 static AV tcopy(ATensor *a, int dt) {
+    if (a->dev) {
+        if (dt < 0 || dt == DT_F32 || dt == DT_F64 || dt == a->dt) { ATensor *o = d_new(dt < 0 ? a->dt : dt, a->nd, a->sh); a_gpu_copy(o->p, a->p, (size_t)a->n * 4); return a_obj(o); }
+        int sp = a_ntmp; AV h = to_host(a_obj(a)); A_PUSH(h); AV r = tcopy(TT(h), dt); A_PUSH(r); r = to_dev(r); a_ntmp = sp; return r;
+    }
     ATensor *t = t_like(a, dt < 0 ? a->dt : dt);
     if (t->dt == a->dt) memcpy(t->p, a->p, (size_t)a->n * (size_t)dt_size[a->dt]);
     else for (int64_t i = 0; i < a->n; i++) t_set(t, i, t_get(a, i));
@@ -194,6 +212,7 @@ static void print_rec(TB *b, ATensor *t, int ax, int64_t off, int64_t stride_tot
     tb_put(b, "]");
 }
 char *t_text(AV v, int top) {
+    if (on_dev(v)) { int sp = a_ntmp; AV h = to_host(v); A_PUSH(h); char *s = t_text(h, top); a_ntmp = sp; return s; }
     ATensor *t = TT(v);
     TB b = {0};
     if (!top && t->n > 8) {
@@ -268,6 +287,7 @@ static int res_dt(int op, ATensor *a, ATensor *b) {
     return DT_I64;
 }
 static AV ewise(int op, AV av, AV bv) {
+    if (on_dev(av) || on_dev(bv)) return d_ewise(op, av, bv);
     ATensor *a = TT(av), *b = TT(bv);
     int64_t osh[MAXD]; int nd = bshape(a, b, osh);
     int dt = res_dt(op, a, b);
@@ -341,6 +361,7 @@ static inline double uop(int op, double x) {
     }
 }
 static AV unary(int op, AV v) {
+    if (on_dev(v)) return d_unary(op, v);
     ATensor *a = TT(v);
     int dt = a->dt;
     if (op == U_NOT || op == U_ISNAN || op == U_ISFINITE) dt = DT_BOOL;
@@ -419,6 +440,7 @@ static void gemm_f(const float *A, const float *B, float *C, int64_t M, int64_t 
 #endif
 }
 static AV matmul(AV av, AV bv) {
+    if (on_dev(av) || on_dev(bv)) return d_matmul(av, bv);
     ATensor *a = TT(av), *b = TT(bv);
     if (a->nd == 0 || b->nd == 0) a_error("ValueError", "matmul needs tensors with at least 1 dimension; use * for scalars");
     int dt = (a->dt == DT_F32 && b->dt == DT_F32) ? DT_F32 : DT_F64;
@@ -464,6 +486,7 @@ static AV matmul(AV av, AV bv) {
 enum { R_SUM, R_MEAN, R_MAX, R_MIN, R_PROD, R_ARGMAX, R_ARGMIN, R_ANY, R_ALL, R_VAR, R_STD, R_LOGSUMEXP };
 static int norm_axis(int ax, int nd) { if (ax < 0) ax += nd; if (ax < 0 || ax >= nd) a_error("ValueError", "axis %d is out of range for %d dimensions", ax, nd); return ax; }
 static AV reduce(int op, AV v, AV axis, int keep, int ddof) {
+    if (on_dev(v)) return d_reduce(op, v, axis, keep, ddof);
     ATensor *a = TT(v);
     if (axis.t == T_NONE) {
         double acc; int64_t best = 0;
@@ -522,11 +545,13 @@ static AV reshape(AV v, int nd, int64_t *sh) {
     for (int i = 0; i < nd; i++) { if (sh[i] == -1) { if (neg >= 0) a_error("ValueError", "only one -1 in a shape"); neg = i; } else known *= sh[i]; }
     if (neg >= 0) { if (known == 0 || a->n % known) a_error("ValueError", "cannot reshape %lld elements", (long long)a->n); sh[neg] = a->n / known; known *= sh[neg]; }
     if (known != a->n) a_error("ValueError", "cannot reshape %lld elements into a shape of %lld", (long long)a->n, (long long)known);
+    if (a->dev) { ATensor *o = d_new(a->dt, nd, sh); a_gpu_copy(o->p, a->p, (size_t)a->n * 4); return a_obj(o); }
     ATensor *o = t_new(a->dt, nd, sh);
     memcpy(o->p, a->p, (size_t)a->n * (size_t)dt_size[a->dt]);
     return a_obj(o);
 }
 static AV permute(AV v, const int *perm) {
+    if (on_dev(v)) return d_permute(v, perm);
     ATensor *a = TT(v); int nd = a->nd; int64_t osh[MAXD], ist[MAXD], ost[MAXD], idx[MAXD] = {0};
     int64_t s = 1; for (int i = nd - 1; i >= 0; i--) { ist[i] = s; s *= a->sh[i]; }
     for (int i = 0; i < nd; i++) { osh[i] = a->sh[perm[i]]; ost[i] = ist[perm[i]]; }
@@ -546,7 +571,16 @@ static AV transpose2(AV v) {
     if (a->nd > 2) return permute(v, perm);
     int full[MAXD] = {1, 0}; return permute(v, full);
 }
+static AV t_concat_host(AV items, int ax, int stack);
 static AV t_concat(AV items, int ax, int stack) {
+    AList *l = (AList *)items.o; int any = 0;
+    for (int64_t i = 0; i < l->len; i++) if (on_dev(l->v[i])) any = 1;
+    if (!any) return t_concat_host(items, ax, stack);
+    int sp = a_ntmp; AV hs = a_list(l->len, l->v); A_PUSH(hs);
+    for (int64_t i = 0; i < l->len; i++) ((AList *)hs.o)->v[i] = to_host(l->v[i]);
+    AV r = t_concat_host(hs, ax, stack); A_PUSH(r); r = to_dev(r); a_ntmp = sp; return r;
+}
+static AV t_concat_host(AV items, int ax, int stack) {
     AList *l = (AList *)items.o;
     if (!l->len) a_error("ValueError", "nothing to concatenate");
     int sp = a_ntmp;
@@ -679,7 +713,29 @@ static void zip_walk(ATensor *a, Sel *sels, ATensor *o, ATensor *src, int mode) 
     }
 }
 
+static AV t_getitem_host(AV v, AV index);
+static AV host_index(AV index) {
+    if (on_dev(index)) return to_host(index);
+    if (a_is(index, O_TUPLE)) {
+        AList *l = (AList *)index.o; int any = 0;
+        for (int64_t i = 0; i < l->len; i++) if (on_dev(l->v[i])) any = 1;
+        if (!any) return index;
+        AV out = a_tuple(l->len, l->v); int sp = a_ntmp; A_PUSH(out);
+        for (int64_t i = 0; i < l->len; i++) ((AList *)out.o)->v[i] = to_host(l->v[i]);
+        a_ntmp = sp; return out;
+    }
+    return index;
+}
 static AV t_getitem(AV v, AV index) {
+    int sp = a_ntmp;
+    AV hi = host_index(index); A_PUSH(hi);
+    if (!on_dev(v)) { AV r = t_getitem_host(v, hi); a_ntmp = sp; return r; }
+    AV h = to_host(v); A_PUSH(h);
+    AV r = t_getitem_host(h, hi);
+    if (is_t(r)) { A_PUSH(r); r = to_dev(r); }
+    a_ntmp = sp; return r;
+}
+static AV t_getitem_host(AV v, AV index) {
     ATensor *a = TT(v);
     if ((index.t == T_INT || index.t == T_BOOL) && a->nd == 1) return t_scalar(a, idx_norm(index.i, a->sh[0]));
     if (is_t(index) && TT(index)->dt == DT_BOOL && TT(index)->nd == a->nd && a->nd > 1) {
@@ -717,7 +773,19 @@ static AV t_getitem(AV v, AV index) {
     if (ond == 0) return t_scalar(o, 0);
     return a_obj(o);
 }
+static void t_setitem_host(AV v, AV index, AV val, int add);
 static void t_setitem(AV v, AV index, AV val, int add) {
+    int sp = a_ntmp;
+    AV hi = host_index(index); A_PUSH(hi);
+    AV hv = on_dev(val) ? to_host(val) : val; A_PUSH(hv);
+    if (!on_dev(v)) { t_setitem_host(v, hi, hv, add); a_ntmp = sp; return; }
+    AV h = to_host(v); A_PUSH(h);
+    t_setitem_host(h, hi, hv, add);
+    AV f = TT(h)->dt == DT_F32 ? h : tcopy(TT(h), DT_F32); A_PUSH(f);
+    a_gpu_upload(TT(v)->p, TT(f)->p, (size_t)TT(v)->n * 4);        /* written back in place */
+    a_ntmp = sp;
+}
+static void t_setitem_host(AV v, AV index, AV val, int add) {
     ATensor *a = TT(v);
     if (is_t(index) && TT(index)->dt == DT_BOOL && TT(index)->nd == a->nd && a->nd > 1) {
         ATensor *m = TT(index); AV src = as_tensor(val); int64_t k = 0;
@@ -753,6 +821,169 @@ static void t_setitem(AV v, AV index, AV val, int add) {
         for (int d = a->nd - 1, od = ond - 1; d >= 0; d--) { if (sels[d].kind == 0) continue; ocnt[od]++; if (++cnt[d] < sels[d].len) break; cnt[d] = 0; ocnt[od] = 0; od--; }
     }
     a_ntmp = sp;
+}
+
+
+/* ================================================================== tensors on the card (float32 storage) */
+#include "kernels.h"
+int a_gpu_available(void); const char *a_gpu_name(void); void *a_gpu_alloc(size_t bytes);
+void a_gpu_download(void *dst, const void *src, size_t n);
+void a_gpu_launch(const char *name, KArgs *k, unsigned grid, unsigned block);
+void a_gpu_info(size_t *free_b, size_t *total_b); void a_gpu_sync(void);
+static int on_dev(AV v) { return is_t(v) && TT(v)->dev; }
+static ATensor *d_new(int dt, int nd, const int64_t *sh) {      /* contents undefined */
+    ATensor *t = (ATensor *)a_alloc(sizeof(ATensor), O_TENSOR);
+    t->dt = (uint8_t)(dt == DT_F64 ? DT_F32 : dt); t->nd = (uint8_t)nd; t->n = 1; t->dev = 1;
+    for (int i = 0; i < nd; i++) { t->sh[i] = sh[i]; t->n *= sh[i]; }
+    t->p = a_gpu_alloc((size_t)t->n * 4);
+    a_note_alloc((size_t)t->n * 4);
+    return t;
+}
+static unsigned grid_for(int64_t n) { int64_t g = (n + 255) / 256; if (g > 262144) g = 262144; return (unsigned)(g ? g : 1); }
+static KArgs kargs(void) { KArgs k; memset(&k, 0, sizeof k); return k; }
+static void d_fill(ATensor *o, float v) { KArgs k = kargs(); k.n = o->n; k.c = (float *)o->p; k.s = v; a_gpu_launch("k_fill", &k, grid_for(o->n), 256); }
+static AV to_host(AV v) {
+    if (!on_dev(v)) return v;
+    ATensor *d = TT(v);
+    ATensor *h = t_new(DT_F32, d->nd, d->sh);
+    a_gpu_download(h->p, d->p, (size_t)d->n * 4);
+    if (d->dt == DT_F32) return a_obj(h);
+    int sp = a_ntmp; A_PUSH(a_obj(h));
+    AV r = tcopy(h, d->dt); a_ntmp = sp; return r;
+}
+static AV to_dev(AV v) {
+    if (on_dev(v)) return v;
+    int sp = a_ntmp;
+    v = as_tensor(v); A_PUSH(v);
+    ATensor *h = TT(v);
+    AV f = h->dt == DT_F32 ? v : tcopy(h, DT_F32); A_PUSH(f);
+    ATensor *d = d_new(h->dt == DT_F64 ? DT_F32 : h->dt, h->nd, h->sh);
+    a_gpu_upload(d->p, TT(f)->p, (size_t)h->n * 4);
+    a_ntmp = sp;
+    return a_obj(d);
+}
+static const int e2k[] = {K_ADD, K_SUB, K_MUL, K_DIV, K_POW, K_MOD, K_FLOORDIV, K_MAX, K_MIN, K_LT, K_LE, K_GT, K_GE, K_EQ, K_NE, K_AND, K_OR, -1, -1};
+static AV d_ewise(int op, AV av, AV bv) {
+    int kop = e2k[op];
+    int sp = a_ntmp;
+    int dt = (op >= E_LT && op <= E_XOR) ? DT_BOOL : DT_F32;
+    if (kop < 0) { AV ha = to_host(av); A_PUSH(ha); AV hb = to_host(bv); A_PUSH(hb); AV r = ewise(op, ha, hb); A_PUSH(r); r = to_dev(r); a_ntmp = sp; return r; }
+    ATensor *a = TT(av), *b = TT(bv);
+    if (!a->dev && a->n == 1) {           /* a number on the host side: a scalar argument */
+        ATensor *o = d_new(dt, b->nd, b->sh);
+        KArgs k = kargs(); k.n = o->n; k.op = kop; k.a = (float *)b->p; k.c = (float *)o->p; k.s = (float)t_get(a, 0); k.flag = 1;
+        if (a->nd > b->nd) { a_ntmp = sp; AV hb = to_host(bv); A_PUSH(hb); AV r = ewise(op, av, hb); A_PUSH(r); r = to_dev(r); a_ntmp = sp; return r; }
+        a_gpu_launch("k_scalar", &k, grid_for(o->n), 256); return a_obj(o);
+    }
+    if (!b->dev && b->n == 1 && b->nd <= a->nd) {
+        ATensor *o = d_new(dt, a->nd, a->sh);
+        KArgs k = kargs(); k.n = o->n; k.op = kop; k.a = (float *)a->p; k.c = (float *)o->p; k.s = (float)t_get(b, 0);
+        a_gpu_launch("k_scalar", &k, grid_for(o->n), 256); return a_obj(o);
+    }
+    AV da = to_dev(av); A_PUSH(da); AV db = to_dev(bv); A_PUSH(db);
+    a = TT(da); b = TT(db);
+    int64_t osh[MAXD]; int nd = bshape(a, b, osh);
+    ATensor *o = d_new(dt, nd, osh);
+    KArgs k = kargs(); k.n = o->n; k.op = kop; k.nd = nd; k.a = (float *)a->p; k.b = (float *)b->p; k.c = (float *)o->p;
+    int64_t sa[MAXD], sb[MAXD]; bstrides(a, nd, osh, sa); bstrides(b, nd, osh, sb);
+    for (int i = 0; i < nd; i++) { k.sh[i] = osh[i]; k.sa[i] = sa[i]; k.sb[i] = sb[i]; }
+    if (a->n == o->n && b->n == o->n) { k.nd = 1; k.sh[0] = o->n; k.sa[0] = 1; k.sb[0] = 1; }
+    a_gpu_launch("k_binary", &k, grid_for(o->n), 256);
+    a_ntmp = sp;
+    return a_obj(o);
+}
+static int u2k(int u) {
+    switch (u) {
+    case U_NEG: return KU_NEG; case U_ABS: return KU_ABS; case U_EXP: return KU_EXP; case U_LOG: return KU_LOG;
+    case U_SQRT: return KU_SQRT; case U_TANH: return KU_TANH; case U_RELU: return KU_RELU; case U_SIGMOID: return KU_SIGMOID;
+    case U_GELU: return KU_GELU; case U_GELU_ERF: return KU_GELU_ERF; case U_SOFTPLUS: return KU_SOFTPLUS; case U_SILU: return KU_SILU;
+    case U_SQUARE: return KU_SQUARE; case U_RSQRT: return KU_RSQRT; case U_SIGN: return KU_SIGN; case U_NOT: return KU_NOT;
+    default: return -1;
+    }
+}
+static AV d_unary(int u, AV v) {
+    int ku = u2k(u);
+    if (ku < 0) { int sp = a_ntmp; AV h = to_host(v); A_PUSH(h); AV r = unary(u, h); A_PUSH(r); r = to_dev(r); a_ntmp = sp; return r; }
+    ATensor *a = TT(v), *o = d_new(u == U_NOT ? DT_BOOL : DT_F32, a->nd, a->sh);
+    KArgs k = kargs(); k.n = a->n; k.op = ku; k.a = (float *)a->p; k.c = (float *)o->p;
+    a_gpu_launch("k_unary", &k, grid_for(a->n), 256);
+    return a_obj(o);
+}
+static AV d_reduce(int op, AV v, AV axis, int keep, int ddof) {
+    ATensor *a = TT(v);
+    int kop = op == R_SUM ? K_SUM : op == R_MEAN ? K_MEAN : op == R_MAX ? K_MAX : op == R_MIN ? K_MIN : -1;
+    if (kop < 0 || a->n == 0) { int sp = a_ntmp; AV h = to_host(v); A_PUSH(h); AV r = reduce(op, h, axis, keep, ddof); if (is_t(r)) { A_PUSH(r); r = to_dev(r); } a_ntmp = sp; return r; }
+    int64_t outer, len, inner, osh[MAXD]; int ond = 0;
+    if (axis.t == T_NONE) { outer = 1; len = a->n; inner = 1; if (keep) for (int i = 0; i < a->nd; i++) osh[ond++] = 1; }
+    else {
+        int ax = norm_axis((int)axis.i, a->nd);
+        outer = prod(a->sh, ax); len = a->sh[ax]; inner = prod(a->sh + ax + 1, a->nd - ax - 1);
+        for (int i = 0; i < a->nd; i++) { if (i == ax) { if (keep) osh[ond++] = 1; } else osh[ond++] = a->sh[i]; }
+    }
+    ATensor *o = d_new(DT_F32, ond, osh);
+    KArgs k = kargs(); k.op = kop; k.len = len; k.inner = inner; k.a = (float *)a->p; k.c = (float *)o->p;
+    a_gpu_launch("k_reduce", &k, (unsigned)(outer * inner), 256);
+    if (ond == 0) { float x; a_gpu_download(&x, o->p, 4); return a_float(x); }
+    return a_obj(o);
+}
+static AV d_matmul(AV av, AV bv) {
+    int sp = a_ntmp;
+    AV da = to_dev(av); A_PUSH(da); AV db = to_dev(bv); A_PUSH(db);
+    ATensor *a = TT(da), *b = TT(db);
+    int ok = a->nd >= 2 && b->nd >= 2;
+    int64_t M = 0, K = 0, N = 0, batch = 1, sa0 = 0, sb0 = 0; int64_t osh[MAXD]; int ond = 0;
+    if (ok) {
+        K = a->sh[a->nd - 1]; N = b->sh[b->nd - 1];
+        if (b->sh[b->nd - 2] != K) a_error("ValueError", "matmul: inner sizes differ (%lld and %lld)", (long long)K, (long long)b->sh[b->nd - 2]);
+        if (b->nd == 2) { M = a->n / K; for (int i = 0; i < a->nd - 1; i++) osh[ond++] = a->sh[i]; osh[ond++] = N; }
+        else if (a->nd == b->nd) {
+            for (int i = 0; i < a->nd - 2; i++) if (a->sh[i] != b->sh[i]) ok = 0;
+            M = a->sh[a->nd - 2]; batch = prod(a->sh, a->nd - 2); sa0 = M * K; sb0 = K * N;
+            for (int i = 0; i < a->nd - 1; i++) osh[ond++] = a->sh[i]; osh[ond++] = N;
+        } else if (a->nd == 2) {
+            M = a->sh[0]; batch = prod(b->sh, b->nd - 2); sa0 = 0; sb0 = K * N;
+            for (int i = 0; i < b->nd - 2; i++) osh[ond++] = b->sh[i]; osh[ond++] = M; osh[ond++] = N;
+        } else ok = 0;
+    }
+    if (!ok) { AV ha = to_host(da); A_PUSH(ha); AV hb = to_host(db); A_PUSH(hb); AV r = matmul(ha, hb); if (is_t(r)) { A_PUSH(r); r = to_dev(r); } a_ntmp = sp; return r; }
+    ATensor *o = d_new(DT_F32, ond, osh);
+    KArgs k = kargs(); k.M = M; k.N = N; k.K = K; k.a = (float *)a->p; k.b = (float *)b->p; k.c = (float *)o->p; k.sa[0] = sa0; k.sb[0] = sb0;
+    int64_t tiles = ((M + 63) / 64) * ((N + 63) / 64);
+    a_gpu_launch("k_gemm", &k, (unsigned)(tiles * batch), 256);
+    a_ntmp = sp;
+    return a_obj(o);
+}
+static AV d_permute(AV v, const int *perm) {
+    ATensor *a = TT(v); int nd = a->nd; int64_t ist[MAXD], s = 1;
+    for (int i = nd - 1; i >= 0; i--) { ist[i] = s; s *= a->sh[i]; }
+    int64_t osh[MAXD]; for (int i = 0; i < nd; i++) osh[i] = a->sh[perm[i]];
+    ATensor *o = d_new(a->dt, nd, osh);
+    KArgs k = kargs(); k.n = a->n; k.nd = nd; k.a = (float *)a->p; k.c = (float *)o->p;
+    for (int i = 0; i < nd; i++) { k.sh[i] = osh[i]; k.sa[i] = ist[perm[i]]; }
+    a_gpu_launch("k_permute", &k, grid_for(a->n), 256);
+    return a_obj(o);
+}
+static AV d_softmax(AV v, int ax, int logsm) {
+    ATensor *a = TT(v); ax = norm_axis(ax, a->nd);
+    if (ax != a->nd - 1) { int sp = a_ntmp; AV h = to_host(v); A_PUSH(h); AV r = t_softmax(h, ax, logsm); A_PUSH(r); r = to_dev(r); a_ntmp = sp; return r; }
+    ATensor *o = d_new(DT_F32, a->nd, a->sh);
+    KArgs k = kargs(); k.len = a->sh[a->nd - 1]; k.a = (float *)a->p; k.c = (float *)o->p; k.flag = logsm;
+    a_gpu_launch("k_softmax", &k, (unsigned)(a->n / (k.len ? k.len : 1)), 256);
+    return a_obj(o);
+}
+static AV d_where(AV c, AV a, AV b) {
+    int sp = a_ntmp;
+    AV dc = to_dev(c); A_PUSH(dc); AV da = to_dev(a); A_PUSH(da); AV db = to_dev(b); A_PUSH(db);
+    ATensor *C = TT(dc), *A = TT(da), *B = TT(db);
+    int64_t s1[MAXD], s2[MAXD]; int nd1 = bshape(C, A, s1); ATensor tmp; tmp.nd = (uint8_t)nd1; memcpy(tmp.sh, s1, sizeof s1);
+    int nd = bshape(&tmp, B, s2);
+    ATensor *o = d_new(DT_F32, nd, s2);
+    KArgs k = kargs(); k.n = o->n; k.nd = nd; k.a = (float *)A->p; k.b = (float *)B->p; k.d = (float *)C->p; k.c = (float *)o->p;
+    int64_t sc[MAXD], sa[MAXD], sb[MAXD]; bstrides(C, nd, s2, sc); bstrides(A, nd, s2, sa); bstrides(B, nd, s2, sb);
+    for (int i = 0; i < nd; i++) { k.sh[i] = s2[i]; k.sa[i] = sa[i]; k.sb[i] = sb[i]; k.sc[i] = sc[i]; }
+    a_gpu_launch("k_where", &k, grid_for(o->n), 256);
+    a_ntmp = sp;
+    return a_obj(o);
 }
 
 /* ================================================================== automatic differentiation */
@@ -1009,12 +1240,14 @@ AV a_tensor_cmp(int op, AV a, AV b) {
     int sp = a_ntmp; AV ta = as_tensor(a); A_PUSH(ta); AV tb = as_tensor(b); A_PUSH(tb);
     AV r = ewise(e, ta, tb); a_ntmp = sp; return r;
 }
+static AV d_where(AV c, AV a, AV b);
 AV a_tensor_where(AV c, AV a, AV b) {
     int sp = a_ntmp;
     if (is_n(a) || is_n(b)) {
         AV v = a_tensor_where(c, val_of(a), val_of(b)); A_PUSH(v);
         AV n = node_new(v, N_WHERE, a, b, c); a_ntmp = sp; return n;
     }
+    if (on_dev(val_of(c)) || on_dev(a) || on_dev(b)) { AV r = d_where(val_of(c), a, b); a_ntmp = sp; return r; }
     AV tc = as_tensor(val_of(c)); A_PUSH(tc); AV ta = as_tensor(a); A_PUSH(ta); AV tb = as_tensor(b); A_PUSH(tb);
     ATensor *C = TT(tc), *A = TT(ta), *B = TT(tb);
     int64_t s1[MAXD], s2[MAXD]; int nd1 = bshape(C, A, s1); ATensor tmp; tmp.nd = (uint8_t)nd1; memcpy(tmp.sh, s1, sizeof s1);
@@ -1060,7 +1293,7 @@ AV a_tensor_neg(AV a) {
     return unary(U_NEG, a);
 }
 int a_tensor_truthy(AV v) {
-    v = val_of(v);
+    v = val_of(v); v = to_host(v);
     if (!is_t(v)) return a_truthy(v);
     if (TT(v)->n != 1) a_error("ValueError", "the truth of a tensor with more than one element is ambiguous; use any() or all()");
     return t_get(TT(v), 0) != 0;
@@ -1077,12 +1310,13 @@ AV a_tensor_getitem(AV v, AV i) {
 void a_tensor_setitem(AV v, AV i, AV x) { if (is_n(v)) a_error("TypeError", "cannot assign into a value being differentiated"); t_setitem(v, i, val_of(x), 0); }
 int a_tensor_eq(AV a, AV b) {
     a = val_of(a); b = val_of(b);
+    int sp = a_ntmp; a = to_host(a); A_PUSH(a); b = to_host(b); a_ntmp = sp;
     if (!is_t(a) || !is_t(b)) return 0;
     if (TT(a)->n != TT(b)->n || TT(a)->nd != TT(b)->nd) return 0;
     for (int64_t i = 0; i < TT(a)->n; i++) if (t_get(TT(a), i) != t_get(TT(b), i)) return 0;
     return 1;
 }
-double a_tensor_float(AV v) { v = val_of(v); if (is_t(v)) { if (TT(v)->n != 1) a_error("TypeError", "only a one-element tensor converts to a number"); return t_get(TT(v), 0); } return v.t == T_FLOAT ? v.f : (double)v.i; }
+double a_tensor_float(AV v) { v = to_host(val_of(v)); if (is_t(v)) { if (TT(v)->n != 1) a_error("TypeError", "only a one-element tensor converts to a number"); return t_get(TT(v), 0); } return v.t == T_FLOAT ? v.f : (double)v.i; }
 
 /* ---- reductions and shapes, recorded when differentiated */
 static AV axis_kw(int n, AV *a, ADict *kw, int pos) { AV ax = kwget(kw, "axis"); if (ax.t == T_NONE && n > pos) ax = a[pos]; if (ax.t == T_NONE) ax = kwget(kw, "dim"); return ax; }
@@ -1135,6 +1369,7 @@ static AV t_transpose_any(AV x) {
     return t_permute_any(is_n(x) ? x : v, nd, perm);
 }
 static AV t_softmax(AV v, int ax, int logsm) {
+    if (on_dev(v)) return d_softmax(v, ax, logsm);
     ATensor *a = TT(v); ax = norm_axis(ax, a->nd);
     int64_t outer = prod(a->sh, ax), len = a->sh[ax], inner = prod(a->sh + ax + 1, a->nd - ax - 1);
     ATensor *o = t_like(a, a->dt == DT_F32 ? DT_F32 : DT_F64);
@@ -1251,7 +1486,15 @@ static AV join(int n, AV *a, ADict *kw, int stack) {
 BI(tb_concat) { (void)self; return join(n, a, kw, 0); }
 BI(tb_stack) { (void)self; return join(n, a, kw, 1); }
 BI(tb_matmul) { UNUSED; return a_tensor_binop(OP_MATMUL, a[0], a[1]); }
+static AV tb_dot_h(int n, AV *a, ADict *kw, AV self);
 BI(tb_dot) {
+    int any = 0; for (int i = 0; i < n && i < 3; i++) if (on_dev(val_of(a[i]))) any = 1;
+    if (!any || is_n(a[0])) return tb_dot_h(n, a, kw, self);
+    int sp = a_ntmp; AV h[8]; for (int i = 0; i < n && i < 8; i++) { h[i] = on_dev(val_of(a[i])) ? to_host(val_of(a[i])) : a[i]; A_PUSH(h[i]); }
+    AV r = tb_dot_h(n, h, kw, self); if (is_t(r)) { A_PUSH(r); r = to_dev(r); }
+    a_ntmp = sp; return r;
+}
+static AV tb_dot_h(int n, AV *a, ADict *kw, AV self) {
     UNUSED;
     AV x = val_of(a[0]), y = val_of(a[1]);
     if (is_t(x) && is_t(y) && TT(x)->nd == 1 && TT(y)->nd == 1 && !is_n(a[0]) && !is_n(a[1])) {
@@ -1297,7 +1540,15 @@ BI(tb_logsumexp) {
     if (a_is(x, O_LIST)) x = t_from(x, -1);
     return reduce(R_LOGSUMEXP, x, axis_kw(n, a, kw, 1), 0, 0);
 }
+static AV tb_cumsum_h(int n, AV *a, ADict *kw, AV self);
 BI(tb_cumsum) {
+    int any = 0; for (int i = 0; i < n && i < 3; i++) if (on_dev(val_of(a[i]))) any = 1;
+    if (!any || is_n(a[0])) return tb_cumsum_h(n, a, kw, self);
+    int sp = a_ntmp; AV h[8]; for (int i = 0; i < n && i < 8; i++) { h[i] = on_dev(val_of(a[i])) ? to_host(val_of(a[i])) : a[i]; A_PUSH(h[i]); }
+    AV r = tb_cumsum_h(n, h, kw, self); if (is_t(r)) { A_PUSH(r); r = to_dev(r); }
+    a_ntmp = sp; return r;
+}
+static AV tb_cumsum_h(int n, AV *a, ADict *kw, AV self) {
     UNUSED; AV x = as_tensor(val_of(a[0])); ATensor *t = TT(x);
     AV axv = n > 1 ? a[1] : kwget(kw, "axis");
     if (axv.t == T_NONE) { int64_t cnt = t->n; ATensor *o = t_new(t->dt == DT_BOOL ? DT_I64 : t->dt, 1, &cnt); double s = 0; for (int64_t i = 0; i < t->n; i++) { s += t_get(t, i); t_set(o, i, s); } return a_obj(o); }
@@ -1307,7 +1558,15 @@ BI(tb_cumsum) {
     return a_obj(o);
 }
 BI(tb_where) { UNUSED; return a_tensor_where(a[0], a[1], a[2]); }
+static AV tb_clip_h(int n, AV *a, ADict *kw, AV self);
 BI(tb_clip) {
+    int any = 0; for (int i = 0; i < n && i < 3; i++) if (on_dev(val_of(a[i]))) any = 1;
+    if (!any || is_n(a[0])) return tb_clip_h(n, a, kw, self);
+    int sp = a_ntmp; AV h[8]; for (int i = 0; i < n && i < 8; i++) { h[i] = on_dev(val_of(a[i])) ? to_host(val_of(a[i])) : a[i]; A_PUSH(h[i]); }
+    AV r = tb_clip_h(n, h, kw, self); if (is_t(r)) { A_PUSH(r); r = to_dev(r); }
+    a_ntmp = sp; return r;
+}
+static AV tb_clip_h(int n, AV *a, ADict *kw, AV self) {
     UNUSED; AV x = a[0];
     int sp = a_ntmp;
     AV lo = a[1], hi = a[2];
@@ -1323,7 +1582,15 @@ BI(tb_clip) {
     return a_obj(o);
 }
 static int cmp_dbl(const void *x, const void *y) { double a = *(const double *)x, b = *(const double *)y; return a < b ? -1 : a > b; }
+static AV tb_sort_h(int n, AV *a, ADict *kw, AV self);
 BI(tb_sort) {
+    int any = 0; for (int i = 0; i < n && i < 3; i++) if (on_dev(val_of(a[i]))) any = 1;
+    if (!any || is_n(a[0])) return tb_sort_h(n, a, kw, self);
+    int sp = a_ntmp; AV h[8]; for (int i = 0; i < n && i < 8; i++) { h[i] = on_dev(val_of(a[i])) ? to_host(val_of(a[i])) : a[i]; A_PUSH(h[i]); }
+    AV r = tb_sort_h(n, h, kw, self); if (is_t(r)) { A_PUSH(r); r = to_dev(r); }
+    a_ntmp = sp; return r;
+}
+static AV tb_sort_h(int n, AV *a, ADict *kw, AV self) {
     UNUSED; AV x = val_of(a[0]);
     if (!is_t(x)) return a_call(a_global_builtin("sorted"), n, a, kw);
     ATensor *t = TT(x); AV r = tcopy(t, t->dt == DT_F32 ? DT_F32 : t->dt);
@@ -1425,6 +1692,7 @@ BI(tb_stop_gradient) { UNUSED; return val_of(a[0]); }
 
 /* ---- trees of values (lists, tuples, dicts, records) */
 static int leaf(AV v) { return is_t(v) || is_n(v) || is_num(v) || a_is(v, O_QTY); }
+static AV tb_to_gpu1(int n, AV *a, ADict *kw, AV self); static AV tb_to_host1(int n, AV *a, ADict *kw, AV self);
 static AV tree_map_rec(AV f, int k, AV *trees) {
     AV t0 = trees[0];
     if (leaf(t0) || t0.t == T_NONE) return t0.t == T_NONE ? A_NONE : a_call(f, k, trees, NULL);
@@ -1459,6 +1727,31 @@ static void leaves_rec(AV v, AList *out) {
 }
 BI(tb_tree_leaves) { UNUSED; AV out = a_list(0, NULL); int sp = a_ntmp; A_PUSH(out); leaves_rec(a[0], (AList *)out.o); a_ntmp = sp; return out; }
 
+
+/* ---- the card */
+static AV move_tree(AV v, int dev) {
+    if (is_t(v)) return dev ? to_dev(v) : to_host(v);
+    if (is_n(v)) return move_tree(ND(v)->val, dev);
+    if (a_is(v, O_LIST) || a_is(v, O_TUPLE) || a_is(v, O_DICT) || a_is(v, O_INST)) {
+        AV f = a_builtin(dev ? "to_gpu" : "to_host", dev ? tb_to_gpu1 : tb_to_host1, A_NONE);
+        int sp = a_ntmp; A_PUSH(f); AV r = tree_map_rec(f, 1, &v); a_ntmp = sp; return r;
+    }
+    return v;
+}
+static AV tb_to_gpu1(int n, AV *a, ADict *kw, AV self) { (void)n; (void)kw; (void)self; return is_t(a[0]) ? to_dev(a[0]) : a[0]; }
+static AV tb_to_host1(int n, AV *a, ADict *kw, AV self) { (void)n; (void)kw; (void)self; return is_t(a[0]) ? to_host(a[0]) : a[0]; }
+BI(tb_to_gpu) { UNUSED; if (!a_gpu_available()) a_error("RuntimeError", "no GPU: %s", a_gpu_name()); return move_tree(a[0], 1); }
+BI(tb_to_host) { UNUSED; return move_tree(a[0], 0); }
+BI(tb_gpu_available) { UNUSED; return a_bool(a_gpu_available()); }
+BI(tb_gpu_info) {
+    UNUSED;
+    if (!a_gpu_available()) return a_str(a_gpu_name());
+    size_t f, tot; a_gpu_info(&f, &tot);
+    char s[400]; snprintf(s, sizeof s, "%s, %.1f GB free of %.1f GB", a_gpu_name(), f / 1e9, tot / 1e9);
+    return a_str(s);
+}
+BI(tb_gpu_sync) { UNUSED; a_gpu_sync(); return A_NONE; }
+
 /* ---- records */
 BI(tb_record) {
     UNUSED;
@@ -1470,7 +1763,15 @@ BI(tb_record) {
 }
 BI(tb_item) { UNUSED; return a_float(a_tensor_float(a[0])); }
 BI(tb_to_float) { UNUSED; AV x = val_of(a[0]); if (is_t(x)) return tcopy(TT(x), DT_F64); return a_float(a_tensor_float(x)); }
+static AV tb_tolist_h(int n, AV *a, ADict *kw, AV self);
 BI(tb_tolist) {
+    int any = 0; for (int i = 0; i < n && i < 3; i++) if (on_dev(val_of(a[i]))) any = 1;
+    if (!any || is_n(a[0])) return tb_tolist_h(n, a, kw, self);
+    int sp = a_ntmp; AV h[8]; for (int i = 0; i < n && i < 8; i++) { h[i] = on_dev(val_of(a[i])) ? to_host(val_of(a[i])) : a[i]; A_PUSH(h[i]); }
+    AV r = tb_tolist_h(n, h, kw, self); if (0) { A_PUSH(r); r = to_dev(r); }
+    a_ntmp = sp; return r;
+}
+static AV tb_tolist_h(int n, AV *a, ADict *kw, AV self) {
     UNUSED; AV x = val_of(a[0]);
     if (!is_t(x)) return x;
     ATensor *t = TT(x);
@@ -1517,6 +1818,7 @@ AV a_tensor_attr(AV v, const char *name) {
     if (!strcmp(name, "dtype")) return a_str(dt_name[t->dt]);
     if (!strcmp(name, "T")) return t_transpose_any(is_n(v) ? v : x);
     if (!strcmp(name, "value")) return x;
+    if (!strcmp(name, "device")) return a_str(t->dev ? "gpu" : "cpu");
     #define M(nm) if (!strcmp(name, #nm)) return method_bound(#nm, tmm_##nm, v)
     M(sum); M(mean); M(max); M(min); M(std); M(var); M(argmax); M(argmin); M(prod); M(reshape); M(flatten);
     M(transpose); M(permute); M(tolist); M(item); M(astype); M(squeeze); M(unsqueeze); M(any); M(all); M(cumsum);
@@ -1540,6 +1842,8 @@ static const TEnt tensor_builtins[] = {
     {"grad", tb_grad}, {"value_and_grad", tb_value_and_grad}, {"stop_gradient", tb_stop_gradient},
     {"record", tb_record}, {"item", tb_item}, {"to_float", tb_to_float}, {"tolist", tb_tolist},
     {"param_count", tb_param_count}, {"tree_map", tb_tree_map}, {"tree_leaves", tb_tree_leaves},
+    {"to_gpu", tb_to_gpu}, {"gpu_tensor", tb_to_gpu}, {"to_host", tb_to_host}, {"to_cpu", tb_to_host},
+    {"gpu_available", tb_gpu_available}, {"gpu_info", tb_gpu_info}, {"gpu_sync", tb_gpu_sync},
     {NULL, NULL}};
 /* the maths built-ins of the core take tensors and nodes through these */
 static const TEnt tensor_overrides[] = {

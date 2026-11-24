@@ -60,7 +60,8 @@ static inline int a_is(AV v, AKind k) { return v.t == T_OBJ && v.o->kind == k; }
 /* ------------------------------------------------------------------ memory */
 typedef struct AFrame { struct AFrame *prev; int n; AV *slots; const char *name; int pos; } AFrame;   /* pos: line << 12 | column */
 extern AFrame *a_frame;
-void a_gc_safe(void);                      /* a safe point: collects when enough was allocated */
+void a_gc_safe(void);
+void a_gc_full(void);                       /* collect now (the card ran out of memory) */                      /* a safe point: collects when enough was allocated */
 void a_root(AV *slots, int n);             /* module globals */
 void *a_alloc(size_t size, AKind kind);
 
