@@ -16,6 +16,10 @@
 #else
 #include <pthread.h>
 #include <unistd.h>
+#include <sys/resource.h>
+#ifdef __linux__
+#include <sys/syscall.h>
+#endif
 #endif
 
 /* ================================================================== the worker threads */
@@ -53,6 +57,12 @@ static void *pool_thread(void *p)
 {
     (void)p;
     int64_t seen = 0;
+    /* the helpers run a little below normal priority: the desktop and other programs stay responsive */
+#ifdef _WIN32
+    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
+#elif defined(__linux__)
+    setpriority(PRIO_PROCESS, (id_t)syscall(SYS_gettid), 5);
+#endif
     for (;;) {
         LOCK();
         while (pool_gen == seen) WAIT(pool_cv);
@@ -73,6 +83,7 @@ int a_threads(void) {
 #else
         long c = sysconf(_SC_NPROCESSORS_ONLN); n = c > 0 ? (int)c : 1;
 #endif
+        if (n > 2) n -= 1;                 /* one core is left to the operating system and other programs */
         if (e && atoi(e) > 0) n = atoi(e);
         if (n > 64) n = 64;
         pool_n = n;

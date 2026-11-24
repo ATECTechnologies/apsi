@@ -312,27 +312,143 @@ fn train(loss_fn, params, data, opt, epochs=10, batch_size=none, seed=0, verbose
     var history = []
     var step = 0
     let n = shape(data[0])[0]
-    let bs = batch_size if batch_size != none else n
+    let bs = batch_size if batch_size else n
     seed_push(seed)
-    for epoch in 0..epochs:
-        let idx = permutation(n)
+    for ep in 0..epochs:
+        let idx = permutation(n) if batch_size else list(range(n))
         var total = 0.0
         var count = 0
         for i in range(0, n, bs):
-            let j = tensor(idx[i:i + bs], "int64")
+            let sel = idx[i:i + bs]
+            let j = tensor(sel, "int64")
             let batch = [d[j] for d in data]
-            let loss, g = vg(p, *batch)
-            var gg = g
-            if clip != none:
-                gg = clip_grad_norm(g, clip)
             if schedule != none:
-                set_lr(opt, schedule(step))
-            p = opt.step(p, gg)
-            total += loss
-            count += 1
+                opt.lr = schedule(step)
+            let lg = vg(p, *batch)
+            var g = lg[1]
+            if clip:
+                g = clip_grad_norm(g, clip)
+            p = opt.step(p, g)
+            total += to_plain(lg[0]) * len(sel)
+            count += len(sel)
             step += 1
         history.append(total / count)
-        if verbose:
-            print(f"epoch {epoch + 1}/{epochs}  loss {total / count:.4f}")
+        if verbose and (ep % max(1, epochs // 10) == 0 or ep == epochs - 1):
+            let extra = f"  {eval_fn(p):.4f}" if eval_fn != none else ""
+            print(f"epoch {ep:4}  loss {history[-1]:.5f}{extra}")
     seed_pop()
     return record(params=p, history=history)
+
+# ---- convolutions and pooling (built from slices and matrix products, so they differentiate on their own)
+fn conv_init(c_in, c_out, k=3, seed=none):
+    let fan_in = c_in * k * k
+    return record(W=randn(c_out, c_in, k, k, seed=seed) * sqrt(2.0 / fan_in), b=zeros(c_out))
+
+fn pad2d(x, p):
+    if p == 0:
+        return x
+    let s = shape(x)
+    let zr = zeros(s[0], s[1], p, s[3])
+    let tall = concat([zr, x, zr], axis=2)
+    let zc = zeros(s[0], s[1], s[2] + 2 * p, p)
+    return concat([zc, tall, zc], axis=3)
+
+fn conv2d(x, w, b=none, stride=1, padding=0):
+    let xp = pad2d(x, padding)
+    let s = shape(xp)
+    let ws = shape(w)
+    let k = ws[2]
+    let ho = (s[2] - k) // stride + 1
+    let wo = (s[3] - ws[3]) // stride + 1
+    var out = none
+    for i in 0..k:
+        for j in 0..ws[3]:
+            let patch = xp[:, :, i:i + stride * (ho - 1) + 1:stride, j:j + stride * (wo - 1) + 1:stride]
+            let term = permute(patch, 0, 2, 3, 1) @ transpose(w[:, :, i, j])
+            out = term if out == none else out + term
+    out = permute(out, 0, 3, 1, 2)
+    if b != none:
+        out = out + reshape(b, 1, -1, 1, 1)
+    return out
+
+fn max_pool2d(x, k=2):
+    let s = shape(x)
+    let h = s[2] // k
+    let w = s[3] // k
+    let xs = x[:, :, 0:h * k, 0:w * k]
+    return max(max(reshape(xs, s[0], s[1], h, k, w, k), axis=5), axis=3)
+
+fn avg_pool2d(x, k=2):
+    let s = shape(x)
+    let h = s[2] // k
+    let w = s[3] // k
+    let xs = x[:, :, 0:h * k, 0:w * k]
+    return mean(mean(reshape(xs, s[0], s[1], h, k, w, k), axis=5), axis=3)
+
+# ---- recurrent networks
+fn lstm_init(n_in, n_hidden, seed=none):
+    let k = 1.0 / sqrt(n_hidden)
+    var b = zeros(4 * n_hidden)
+    b[n_hidden:2 * n_hidden] = 1.0
+    return record(W=rand(n_in + n_hidden, 4 * n_hidden, seed=seed) * (2 * k) - k, b=b)
+
+fn lstm_cell(p, x, h, c):
+    let H = shape(h)[-1]
+    let z = concat([x, h], axis=-1) @ p.W + p.b
+    let i = sigmoid(z[:, 0:H])
+    let f = sigmoid(z[:, H:2 * H])
+    let g = tanh(z[:, 2 * H:3 * H])
+    let o = sigmoid(z[:, 3 * H:4 * H])
+    let c2 = f * c + i * g
+    return (o * tanh(c2), c2)
+
+fn lstm(p, xs):
+    let s = shape(xs)
+    let H = shape(p.b)[0] // 4
+    var h = zeros(s[0], H)
+    var c = zeros(s[0], H)
+    var outs = []
+    for t in 0..s[1]:
+        let hc = lstm_cell(p, xs[:, t, :], h, c)
+        h = hc[0]
+        c = hc[1]
+        outs.append(h)
+    return stack(outs, axis=1)
+
+fn gru_init(n_in, n_hidden, seed=none):
+    let k = 1.0 / sqrt(n_hidden)
+    let n = n_in + n_hidden
+    seed_push(seed if seed != none else 0)
+    let wzr = rand(n, 2 * n_hidden) * (2 * k) - k
+    let wh = rand(n, n_hidden) * (2 * k) - k
+    seed_pop()
+    return record(Wzr=wzr, bzr=zeros(2 * n_hidden), Wh=wh, bh=zeros(n_hidden))
+
+fn gru_cell(p, x, h):
+    let H = shape(h)[-1]
+    let zr = sigmoid(concat([x, h], axis=-1) @ p.Wzr + p.bzr)
+    let z = zr[:, 0:H]
+    let r = zr[:, H:2 * H]
+    let cand = tanh(concat([x, r * h], axis=-1) @ p.Wh + p.bh)
+    return (1 - z) * h + z * cand
+
+fn gru(p, xs):
+    let s = shape(xs)
+    let H = shape(p.bh)[0]
+    var h = zeros(s[0], H)
+    var outs = []
+    for t in 0..s[1]:
+        h = gru_cell(p, xs[:, t, :], h)
+        outs.append(h)
+    return stack(outs, axis=1)
+
+fn batch_norm(x, gamma=none, beta=none, eps=1e-5, axis=0):
+    let m = mean(x, axis=axis, keepdims=true)
+    let d = x - m
+    let v = mean(d * d, axis=axis, keepdims=true)
+    var y = d / sqrt(v + eps)
+    if gamma != none:
+        y = y * gamma
+    if beta != none:
+        y = y + beta
+    return y

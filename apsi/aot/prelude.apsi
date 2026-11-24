@@ -314,3 +314,116 @@ fn timeit(f, repeat=5, warmup=1):
         f()
         runs.append(clock() - t)
     return {"best": min(runs), "median": median(runs), "mean": sum(runs) / len(runs), "runs": runs}
+
+# ---- evolve: the integrators behind `evolve ... using rk4` (the compiler turns the block into deriv)
+fn evolve_run(names, state, t0, t1, h, method, every, want_record, deriv, tol=none):
+    let nsteps = round(to_plain((t1 - t0) / h))
+    if nsteps <= 0 and method != "rk45":
+        raise RuntimeError("evolve: the time range must be longer than one step")
+    if method == "verlet" and len(names) != 2:
+        raise RuntimeError("verlet needs exactly two states: position, velocity")
+    var st = list(state)
+    var rec_t = []
+    var rec = [[] for _ in names]
+    fn keep(t, s):
+        rec_t.append(t)
+        for k in 0..len(s):
+            rec[k].append(s[k])
+    if want_record:
+        keep(t0, st)
+    if method == "rk45":
+        st = rk45_run(deriv, t0, t1, h, st, 1e-8 if tol == none else tol, every, want_record, keep)
+    else:
+        for k in 0..nsteps:
+            let t = t0 + k * h
+            if method == "euler":
+                let d = deriv(t, *st)
+                st = [st[i] + h * d[i] for i in 0..len(st)]
+            elif method == "midpoint":
+                let k1 = deriv(t, *st)
+                let mid = [st[i] + (0.5 * h) * k1[i] for i in 0..len(st)]
+                let k2 = deriv(t + 0.5 * h, *mid)
+                st = [st[i] + h * k2[i] for i in 0..len(st)]
+            elif method == "rk4":
+                let k1 = deriv(t, *st)
+                let k2 = deriv(t + 0.5 * h, *[st[i] + (0.5 * h) * k1[i] for i in 0..len(st)])
+                let k3 = deriv(t + 0.5 * h, *[st[i] + (0.5 * h) * k2[i] for i in 0..len(st)])
+                let k4 = deriv(t + h, *[st[i] + h * k3[i] for i in 0..len(st)])
+                st = [st[i] + (h / 6.0) * (k1[i] + 2 * k2[i] + 2 * k3[i] + k4[i]) for i in 0..len(st)]
+            elif method == "symplectic":
+                var i = len(st) - 1
+                while i >= 0:
+                    st[i] = st[i] + h * deriv(t, *st)[i]
+                    i -= 1
+            elif method == "verlet":
+                let x = st[0]
+                let v = st[1]
+                let vh = v + (0.5 * h) * deriv(t, x, v)[1]
+                let x2 = x + h * deriv(t, x, vh)[0]
+                let v2 = vh + (0.5 * h) * deriv(t + h, x2, vh)[1]
+                st = [x2, v2]
+            else:
+                raise ValueError(f"evolve: unknown method '{method}'")
+            if want_record and ((k + 1) % every == 0 or k == nsteps - 1):
+                keep(t0 + (k + 1) * h, st)
+    if not want_record:
+        return (st, none)
+    var fields = {"t": stack(rec_t)}
+    for k in 0..len(names):
+        fields[names[k]] = stack(rec[k])
+    return (st, record(**fields))
+
+fn rk45_run(deriv, t0, t1, h0, state, tol, every, want_record, keep):
+    let C = [0, 1 / 5, 3 / 10, 4 / 5, 8 / 9, 1, 1]
+    let A = [[], [1 / 5], [3 / 40, 9 / 40], [44 / 45, -56 / 15, 32 / 9],
+             [19372 / 6561, -25360 / 2187, 64448 / 6561, -212 / 729],
+             [9017 / 3168, -355 / 33, 46732 / 5247, 49 / 176, -5103 / 18656],
+             [35 / 384, 0, 500 / 1113, 125 / 192, -2187 / 6784, 11 / 84]]
+    let B5 = [35 / 384, 0, 500 / 1113, 125 / 192, -2187 / 6784, 11 / 84, 0]
+    let B4 = [5179 / 57600, 0, 7571 / 16695, 393 / 640, -92097 / 339200, 187 / 2100, 1 / 40]
+    let E = [B5[i] - B4[i] for i in 0..7]
+    fn comb(coefs, ks, j):
+        var total = none
+        for i in 0..len(coefs):
+            if coefs[i] != 0:
+                let term = coefs[i] * ks[i][j]
+                total = term if total == none else total + term
+        return total
+    var t = t0
+    var h = h0
+    var st = list(state)
+    let sign = 1.0 if to_plain(t1 - t0) >= 0 else -1.0
+    let scale0 = [max_abs(si_magnitude(v)) + 1e-300 for v in st]
+    var k1 = deriv(t, *st)
+    var accepted = 0
+    var rejected = 0
+    while to_plain(t1 - t) * sign > 1e-15 * (abs(to_plain(t1)) + abs(to_plain(h))):
+        if to_plain(t + h - t1) * sign > 0:
+            h = t1 - t
+        var ks = [k1]
+        for i in 1..7:
+            ks.append(deriv(t + C[i] * h, *[st[j] + h * comb(A[i], ks, j) for j in 0..len(st)]))
+        let y5 = [st[j] + h * comb(B5, ks, j) for j in 0..len(st)]
+        var err = 0.0
+        for j in 0..len(st):
+            let e = si_magnitude(h * comb(E, ks, j))
+            let sc = tol * max(max(max_abs(si_magnitude(st[j])), max_abs(si_magnitude(y5[j]))), scale0[j] * 1e-3)
+            err = max(err, max_abs(e) / sc)
+        var factor = 1.0
+        if err <= 1.0:
+            t = t + h
+            st = y5
+            k1 = ks[6]
+            accepted += 1
+            if want_record and accepted % every == 0:
+                keep(t, st)
+            factor = 5.0 if err == 0 else min(5.0, max(0.2, 0.9 * err ** -0.2))
+        else:
+            rejected += 1
+            factor = 0.1 if not isfinite(err) else max(0.1, 0.9 * err ** -0.25)
+        h = h * factor
+        if accepted + rejected > 10000000:
+            raise RuntimeError("rk45: too many steps (is the system stiff, or the tolerance too strict?)")
+    if want_record and accepted % every != 0:
+        keep(t, st)
+    return st

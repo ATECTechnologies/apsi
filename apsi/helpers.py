@@ -66,6 +66,13 @@ def hypot(*xs):
 
 
 def logsumexp(xs, axis=None):
+    from .autodiff import Node
+    if isinstance(xs, Node):                      # differentiable: log(sum(exp(x - m))) + m with m held constant
+        m = np.max(np.asarray(ops.raw(xs), dtype=float), axis=axis, keepdims=True)
+        m = np.where(np.isfinite(m), m, 0.0)
+        s = ops.sum_(ops.exp(xs - m), axis=axis, keepdims=True)
+        r = ops.log(s) + m
+        return ops.reshape(r, *np.shape(np.squeeze(m, axis=axis) if axis is not None else m.reshape(())))
     v = np.asarray(ops.raw(xs) if not isinstance(xs, list) else xs, dtype=float)
     m = np.max(v, axis=axis, keepdims=True)
     m = np.where(np.isfinite(m), m, 0.0)

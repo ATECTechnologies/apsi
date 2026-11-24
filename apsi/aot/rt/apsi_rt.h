@@ -42,9 +42,10 @@ typedef struct ASlice { AObj h; AV lo, hi, step; } ASlice;
 typedef AV (*ABuiltinFn)(int n, AV *args, ADict *kw, AV self);
 typedef struct ABuiltin { AObj h; const char *name; ABuiltinFn fn; AV self; } ABuiltin;
 /* a quantity with a unit: the value in SI base units, the 7 SI exponents (in 60ths), the unit it shows in */
-typedef struct AQty { AObj h; double v; int16_t dim[7]; struct AStr *dtext; double dscale; } AQty;
+typedef struct AQty { AObj h; double v; int16_t dim[7]; struct AStr *dtext; double dscale; AV tv; } AQty;   /* tv: a tensor value (else none: v) */
 typedef struct AUnitName { int16_t dim[7]; const char *name; } AUnitName;
 void a_unit_names(const AUnitName *names, int n);
+void a_dim_names(const AUnitName *names, int n);
 AV a_qty(double v, const int16_t *dim, const char *text, double scale);   /* a dimensionless one is a plain float */
 AV a_as_unit(AV v, const int16_t *dim, const char *text, double scale);
 typedef struct AIter { AObj h; int kind; AV src; int64_t pos, end, step; AV aux; } AIter;
@@ -160,6 +161,9 @@ static inline int a_is_tn(AV v) { return v.t == T_OBJ && (v.o->kind == O_TENSOR 
 AV a_cmp_slow(int op, AV a, AV b);
 AV a_gen_new(AFunc *fn, AFnCode body, int n, AV *args, ADict *kw);   /* a generator function's call */
 AV a_yield(AV v);                                                   /* yield v: the value sent back in */
+int a_match_type(AV v, const char *t);
+AV a_match_field(AV v, int i);
+AV a_list_of(AV v);
 AV a_module(const char *name, int n, const char **names, AV *vals);
 uint64_t a_rand_u64(void); double a_rand_f(void); double a_rand_n(void); void a_seed(uint64_t x);
 extern AV (*a_tensor_random)(int kind, int n, AV *shape, AV lo, AV hi);           /* o.name, AttributeError if missing */

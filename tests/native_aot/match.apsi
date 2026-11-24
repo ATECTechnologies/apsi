@@ -1,0 +1,21 @@
+struct P:
+    x: Int
+    y: Int
+fn describe(v):
+    match v:
+        case 0:
+            return "zero"
+        case [1, x, *rest] if x > 0:
+            return f"list from 1, then {x}, rest {rest}"
+        case {"name": n, **others}:
+            return f"named {n} with {others}"
+        case int() | float() as num:
+            return f"number {num}"
+        case str() as s:
+            return "text " + s
+        case none:
+            return "nothing"
+        case _:
+            return "something else"
+for v in [0, [1, 5, 6, 7], [1, -1], {"name": "a", "k": 2}, 4.5, "hi", none, (1, 2)]:
+    print(describe(v))

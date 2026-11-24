@@ -96,9 +96,9 @@ static void mark_obj(AObj *o) {
         case O_BUILTIN: mark(((ABuiltin *)o)->self); return;
         case O_ITER: { AIter *it = (AIter *)o; mark(it->src); mark(it->aux); return; }
         case O_SLICE: { ASlice *s = (ASlice *)o; mark(s->lo); mark(s->hi); mark(s->step); return; }
-        case O_QTY: o = (AObj *)((AQty *)o)->dtext; continue;
+        case O_QTY: mark(((AQty *)o)->tv); o = (AObj *)((AQty *)o)->dtext; continue;
         case O_GEN: gen_mark((struct AGen *)o); return;
-        case O_NODE: a_tensor_mark(o); return;
+        case O_NODE: case O_TENSOR: a_tensor_mark(o); return;
         default: return;
         }
     }
@@ -145,7 +145,9 @@ static int same_dim(const int16_t *a, const int16_t *b);
 static int is_zero_num(AV v);
 struct SB;
 static void qty_text(struct SB *b, AQty *q, const char *spec);
-static AV qty_binop(int op, AV a, AV b);
+static AV qty_binop(int op, AV a, AV b); static int qt(AV v); static AV qval(AV v);
+AV a_qty_make(AV val, const int16_t *dim); AV a_qty_cmp(int op, AV a, AV b);
+static AV qty_builtin(ABuiltin *f, int n, AV *a, ADict *kw);
 static double qty_same(AV a, AV b, const char *verb, int *ok);
 static int num(AV v); static double fval(AV v); static const char *tname(AV v); static const char *opname(int op);
 /* =================================================================== strings */
@@ -461,7 +463,8 @@ int a_eq(AV a, AV b) {
         return 0;
     }
     case O_RANGE: { ARange *x = (ARange *)a.o, *y = (ARange *)b.o; return x->start == y->start && x->stop == y->stop && x->step == y->step; }
-    case O_QTY: return same_dim(QTY(a)->dim, QTY(b)->dim) && QTY(a)->v == QTY(b)->v;
+    case O_QTY: if (qt(a) || qt(b)) return same_dim(QTY(a)->dim, QTY(b)->dim) && a_eq(qval(a), qval(b));
+        return same_dim(QTY(a)->dim, QTY(b)->dim) && QTY(a)->v == QTY(b)->v;
     default: return 0;
     }
 }
@@ -478,7 +481,7 @@ int a_truthy(AV v) {
     case O_LIST: case O_TUPLE: return LIST(v)->len != 0;
     case O_DICT: case O_SET: return DICT(v)->len != 0;
     case O_RANGE: return a_len(v) != 0;
-    case O_QTY: return ((AQty *)v.o)->v != 0.0;
+    case O_QTY: if (qt(v)) return a_tensor_truthy(QTY(v)->tv); return ((AQty *)v.o)->v != 0.0;
     case O_INST: {
         AV f = a_getattr(v, "__bool__");
         if (f.t != 255) return a_truthy(a_call(f, 0, NULL, NULL));
@@ -644,7 +647,7 @@ AV a_repr(AV v) { SB b = {0}; repr_into(&b, v, 1); return sb_done(&b); }
 
 AV a_format(AV v, const char *spec) {
     if (!spec || !*spec) return a_to_str(v);
-    if (a_is(v, O_QTY)) { SB b = {0}; qty_text(&b, (AQty *)v.o, spec); return sb_done(&b); }
+    if (a_is(v, O_QTY)) { SB b = {0}; qty_text(&b, (AQty *)v.o, QTY(v)->tv.t == T_OBJ ? NULL : spec); return sb_done(&b); }
     /* [[fill]align][sign][0][width][,][.precision][type] */
     char fill = ' ', align = 0, sign = '-', type = 0; int width = -1, prec = -1, comma = 0, zero = 0;
     const char *p = spec;
@@ -722,7 +725,7 @@ static int same_dim(const int16_t *a, const int16_t *b) { return !memcmp(a, b, s
 AV a_qty(double v, const int16_t *dim, const char *text, double scale) {
     if (dimless(dim)) return a_float(text ? v / scale : v);
     AQty *q = (AQty *)a_alloc(sizeof(AQty), O_QTY);
-    q->v = v; memcpy(q->dim, dim, sizeof q->dim);
+    q->v = v; memcpy(q->dim, dim, sizeof q->dim); q->tv = A_NONE;
     q->dtext = text ? STR(a_str(text)) : NULL; q->dscale = text ? scale : 1.0;
     return a_obj(q);
 }
@@ -752,6 +755,12 @@ static const char *dim_desc(const int16_t *d, char *buf, size_t n) {
     SB b = {0}; unit_string(&b, d); snprintf(buf, n, "[%s]", b.p); free(b.p); return buf;
 }
 static void qty_text(SB *b, AQty *q, const char *spec) {
+    if (q->tv.t == T_OBJ) {
+        AV shown = q->dtext ? a_binop(OP_DIV, q->tv, a_float(q->dscale)) : q->tv;
+        char *s = a_tensor_text(shown, 1); sb_puts(b, s); free(s); sb_puts(b, " ");
+        if (q->dtext) sb_put(b, q->dtext->s, q->dtext->len); else unit_string(b, q->dim);
+        return;
+    }
     double val = q->dtext ? q->v / q->dscale : q->v;
     AV s = spec && *spec ? a_format(a_float(val), spec) : a_to_str(a_float(val));
     sb_put(b, STR(s)->s, STR(s)->len); sb_puts(b, " ");
@@ -768,7 +777,9 @@ static double qty_same(AV a, AV b, const char *verb, int *ok) {   /* b's value w
     if (is_zero_num(b)) return 0.0;
     a_error("UnitError", "cannot %s %s and a dimensionless number", verb, dim_desc(q->dim, x, sizeof x));
 }
+static AV qty_binop_gen(int op, AV a, AV b);
 static AV qty_binop(int op, AV a, AV b) {
+    if (qt(a) || qt(b) || a_is_tn(a) || a_is_tn(b)) return qty_binop_gen(op, a, b);
     int16_t d[7]; int ok;
     int qa = a_is(a, O_QTY), qb = a_is(b, O_QTY);
     double x = qa ? QTY(a)->v : (a.t == T_FLOAT ? a.f : (a.t == T_INT || a.t == T_BOOL) ? (double)a.i : NAN);
@@ -799,8 +810,90 @@ static AV qty_binop(int op, AV a, AV b) {
     default: a_error("TypeError", "unsupported operand types for %s with a quantity", opname(op));
     }
 }
+
+/* ---- quantities whose value is a tensor: the unit rides along, the maths runs on the tensor */
+static int qt(AV v) { return a_is(v, O_QTY) && QTY(v)->tv.t == T_OBJ; }
+static AV qval(AV v) { return a_is(v, O_QTY) ? (QTY(v)->tv.t == T_OBJ ? QTY(v)->tv : a_float(QTY(v)->v)) : v; }
+static const int16_t no_dim[7] = {0};
+static const int16_t *qdim(AV v) { return a_is(v, O_QTY) ? QTY(v)->dim : no_dim; }
+AV a_qty_make(AV val, const int16_t *dim) {
+    if (dimless(dim)) return val;
+    if (val.t == T_FLOAT || val.t == T_INT) return a_qty(val.t == T_FLOAT ? val.f : (double)val.i, dim, NULL, 1);
+    int sp = a_ntmp; A_PUSH(val);
+    AQty *q = (AQty *)a_alloc(sizeof(AQty), O_QTY);
+    q->v = 0; memcpy(q->dim, dim, sizeof q->dim); q->tv = val; q->dtext = NULL; q->dscale = 1;
+    a_ntmp = sp; return a_obj(q);
+}
+static void same_or_fail(AV a, AV b, const char *verb) {
+    char x[96], y[96];
+    if (same_dim(qdim(a), qdim(b))) return;
+    if (!a_is(a, O_QTY) && is_zero_num(a)) return;
+    if (!a_is(b, O_QTY) && is_zero_num(b)) return;
+    a_error("UnitError", "cannot %s %s and %s", verb, dim_desc(qdim(a), x, sizeof x), dim_desc(qdim(b), y, sizeof y));
+}
+static AV qty_binop_gen(int op, AV a, AV b) {
+    int16_t d[7];
+    const int16_t *da = qdim(a), *db = qdim(b);
+    AV va = qval(a), vb = qval(b);
+    int sp = a_ntmp; A_PUSH(va); A_PUSH(vb);
+    AV r;
+    switch (op) {
+    case OP_ADD: case OP_SUB: case OP_MOD:
+        same_or_fail(a, b, op == OP_ADD ? "add" : op == OP_SUB ? "subtract" : "take modulo of");
+        r = a_binop(op, va, vb); a_ntmp = sp; return a_qty_make(r, a_is(a, O_QTY) ? da : db);
+    case OP_MUL: case OP_DIV: case OP_MATMUL:
+        for (int i = 0; i < 7; i++) d[i] = (int16_t)(da[i] + (op == OP_DIV ? -1 : 1) * db[i]);
+        r = a_binop(op, va, vb); a_ntmp = sp; return a_qty_make(r, d);
+    case OP_POW: {
+        if (a_is(b, O_QTY)) a_error("UnitError", "exponent must be dimensionless");
+        double p = vb.t == T_FLOAT ? vb.f : (double)vb.i;
+        for (int i = 0; i < 7; i++) d[i] = (int16_t)nearbyint(da[i] * p);
+        r = a_binop(op, va, vb); a_ntmp = sp; return a_qty_make(r, d);
+    }
+    default: a_error("TypeError", "unsupported operand types for %s with a quantity", opname(op));
+    }
+}
+AV a_qty_cmp(int op, AV a, AV b) { same_or_fail(a, b, "compare"); return a_tensor_cmp(op, qval(a), qval(b)); }
+/* built-in functions applied to a tensor with a unit: what happens to the unit */
+static AV qty_builtin(ABuiltin *f, int n, AV *a, ADict *kw) {
+    static const char *same[] = {"sum", "mean", "max", "min", "norm", "abs", "cumsum", "reshape", "transpose", "flatten",
+        "squeeze", "unsqueeze", "std", "clip", "sort", "permute", "swapaxes", "to_gpu", "to_host", "to_cpu", "copy", NULL};
+    static const char *plain[] = {"argmax", "argmin", "shape", "ndim", "len", NULL};
+    const char *nm = f->name;
+    if ((!strcmp(nm, "stack") || !strcmp(nm, "concat") || !strcmp(nm, "tensor")) && n >= 1 && (a_is(a[0], O_LIST) || a_is(a[0], O_TUPLE))) {
+        AList *l = LIST(a[0]); if (!l->len || !a_is(l->v[0], O_QTY)) return A_NONE;
+        int sp = a_ntmp; AV vals = a_list(l->len, l->v); A_PUSH(vals);
+        for (int64_t i = 0; i < l->len; i++) { same_or_fail(l->v[0], l->v[i], "join"); LIST(vals)->v[i] = qval(l->v[i]); }
+        AV args[8]; args[0] = vals; for (int i = 1; i < n && i < 8; i++) args[i] = a[i];
+        AV r = f->fn(n, args, kw, f->self); A_PUSH(r);
+        r = a_qty_make(r, QTY(l->v[0])->dim); a_ntmp = sp; return r;
+    }
+    if (n >= 2 && (!strcmp(nm, "dot") || !strcmp(nm, "matmul") || !strcmp(nm, "outer") || !strcmp(nm, "cross")) &&
+        (a_is(a[0], O_QTY) || a_is(a[1], O_QTY))) {                 /* products: the units multiply */
+        int16_t d2[7]; const int16_t *x = qdim(a[0]), *y = qdim(a[1]);
+        for (int i = 0; i < 7; i++) d2[i] = (int16_t)(x[i] + y[i]);
+        AV args[8]; args[0] = qval(a[0]); args[1] = qval(a[1]); for (int i = 2; i < n && i < 8; i++) args[i] = a[i];
+        int sp = a_ntmp; A_PUSH(args[0]); A_PUSH(args[1]);
+        AV r = f->fn(n, args, kw, f->self); a_ntmp = sp; return a_qty_make(r, d2);
+    }
+    if (n < 1 || !qt(a[0])) return A_NONE;
+    int16_t d[7]; const int16_t *dim = QTY(a[0])->dim; int keep = 0;
+    for (int i = 0; same[i]; i++) if (!strcmp(nm, same[i])) { memcpy(d, dim, sizeof d); keep = 1; }
+    if (!strcmp(nm, "sqrt")) { for (int i = 0; i < 7; i++) d[i] = (int16_t)(dim[i] / 2); keep = 1; }
+    if (!strcmp(nm, "var")) { for (int i = 0; i < 7; i++) d[i] = (int16_t)(dim[i] * 2); keep = 1; }
+    int pl = 0; for (int i = 0; plain[i]; i++) if (!strcmp(nm, plain[i])) pl = 1;
+    if (!keep && !pl) return A_NONE;
+    AV args[8]; args[0] = QTY(a[0])->tv; for (int i = 1; i < n && i < 8; i++) args[i] = a[i];
+    AV r = f->fn(n, args, kw, f->self);
+    return pl ? r : a_qty_make(r, d);
+}
+
 AV a_as_unit(AV v, const int16_t *dim, const char *text, double scale) {
     char x[96], y[96];
+    if (qt(v)) {
+        if (!same_dim(QTY(v)->dim, dim)) a_error("UnitError", "cannot express %s in [%s] (%s)", dim_desc(QTY(v)->dim, x, sizeof x), text, dim_desc(dim, y, sizeof y));
+        AV r = a_qty_make(QTY(v)->tv, dim); QTY(r)->dtext = STR(a_str(text)); QTY(r)->dscale = scale; return r;
+    }
     if (a_is(v, O_QTY)) {
         if (!same_dim(QTY(v)->dim, dim)) a_error("UnitError", "cannot express %s in [%s] (%s)", dim_desc(QTY(v)->dim, x, sizeof x), text, dim_desc(dim, y, sizeof y));
         return a_qty(QTY(v)->v, dim, text, scale);
@@ -864,8 +957,9 @@ static const char *tname(AV v) {
     }
 }
 AV a_binop(int op, AV a, AV b) {
-    if (a_is_tn(a) || a_is_tn(b)) return a_tensor_binop(op, a, b);
+    if (a_is(a, O_NODE) || a_is(b, O_NODE)) return a_tensor_binop(op, a, b);
     if (a_is(a, O_QTY) || a_is(b, O_QTY)) return qty_binop(op, a, b);
+    if (a_is_tn(a) || a_is_tn(b)) return a_tensor_binop(op, a, b);
     if ((a.t == T_INT || a.t == T_BOOL) && (b.t == T_INT || b.t == T_BOOL)) {
         int64_t x = a.i, y = b.i, r;
         switch (op) {
@@ -952,6 +1046,7 @@ AV a_unop(int op, AV a) {
     switch (op) {
     case OP_NOT: return a_bool(!a_truthy(a));
     case OP_NEG:
+        if (qt(a)) return a_qty_make(a_unop(OP_NEG, QTY(a)->tv), QTY(a)->dim);
         if (a_is(a, O_QTY)) return a_qty(-QTY(a)->v, QTY(a)->dim, NULL, 1);
         if (a.t == T_INT || a.t == T_BOOL) { if (a.i == INT64_MIN) a_error("OverflowError", "integer overflow in -"); return a_int(-a.i); }
         if (a.t == T_FLOAT) return a_float(-a.f);
@@ -1001,10 +1096,12 @@ static int tensor_cmp_applies(int op, AV a, AV b) {
     return 1;
 }
 AV a_cmp_slow(int op, AV a, AV b) {
+    if ((qt(a) || qt(b)) && op != OP_IN && op != OP_NOTIN && op != OP_IS && op != OP_ISNOT) return a_qty_cmp(op, a, b);
     if (tensor_cmp_applies(op, a, b)) return a_tensor_cmp(op, a, b);
     return a_bool(a_compare(op, a, b));
 }
 int a_compare(int op, AV a, AV b) {
+    if ((qt(a) || qt(b)) && op != OP_IN && op != OP_NOTIN && op != OP_IS && op != OP_ISNOT) return a_tensor_truthy(a_qty_cmp(op, a, b));
     if (tensor_cmp_applies(op, a, b)) return a_tensor_truthy(a_tensor_cmp(op, a, b));
     switch (op) {
     case OP_EQ: return a_eq(a, b);
@@ -1056,6 +1153,7 @@ static _Noreturn void a_key_error(AV k) {
 }
 int64_t a_len(AV o) {
     if (a_is_tn(o)) return a_tensor_len(o);
+    if (qt(o)) return a_tensor_len(QTY(o)->tv);
     if (o.t == T_OBJ) switch (o.o->kind) {
     case O_STR: return STR(o)->nchars;
     case O_LIST: case O_TUPLE: return LIST(o)->len;
@@ -1093,6 +1191,7 @@ static void slice_bounds(ASlice *s, int64_t n, int64_t *lo, int64_t *hi, int64_t
 }
 AV a_getitem(AV o, AV i) {
     if (a_is_tn(o)) return a_tensor_getitem(o, i);
+    if (qt(o)) return a_qty_make(a_tensor_getitem(QTY(o)->tv, i), QTY(o)->dim);
     if (o.t != T_OBJ) a_error("TypeError", "'%s' object is not subscriptable", tname(o));
     switch (o.o->kind) {
     case O_LIST: case O_TUPLE: {
@@ -1134,6 +1233,7 @@ AV a_getitem(AV o, AV i) {
 }
 void a_setitem(AV o, AV i, AV v) {
     if (a_is_tn(o)) { a_tensor_setitem(o, i, v); return; }
+    if (qt(o)) { same_or_fail(o, v, "assign"); a_tensor_setitem(QTY(o)->tv, i, qval(v)); return; }
     if (a_is(o, O_LIST)) {
         AList *l = LIST(o);
         if (a_is(i, O_SLICE)) {
@@ -1306,6 +1406,12 @@ static AV new_iter(int kind, AV src) {
     return a_obj(it);
 }
 AV a_iter(AV o) {
+    if (qt(o)) {
+        int64_t n = a_tensor_len(QTY(o)->tv); int sp = a_ntmp; A_PUSH(o);
+        AList *l = new_list(0, O_LIST); A_PUSH(a_obj(l));
+        for (int64_t i = 0; i < n; i++) a_list_append(l, a_getitem(o, a_int(i)));
+        a_ntmp = sp; return new_iter(IT_SEQ, a_obj(l));
+    }
     if (a_is_tn(o)) {                 /* a tensor iterates over its first axis */
         int64_t n = a_tensor_len(o); int sp = a_ntmp; A_PUSH(o);
         AList *l = new_list(0, O_LIST); A_PUSH(a_obj(l));
@@ -1411,6 +1517,7 @@ AV a_getattr(AV o, const char *name) {
         return v;
     }
     if (a_is_tn(o)) return a_tensor_attr(o, name);
+    if (qt(o)) { AV r = a_tensor_attr(QTY(o)->tv, name); if (a_is(r, O_TENSOR) && !strcmp(name, "T")) return a_qty_make(r, QTY(o)->dim); return r; }
     return method_of(o, name);
 }
 AV a_attr(AV o, const char *name) {
@@ -1433,7 +1540,11 @@ AV a_call(AV f, int n, AV *args, ADict *kw) {
     if (f.t != T_OBJ) a_error("TypeError", "'%s' object is not callable", tname(f));
     switch (f.o->kind) {
     case O_FUNC: { AFunc *fn = (AFunc *)f.o; return fn->code(fn, n, args, kw); }
-    case O_BUILTIN: { ABuiltin *b = (ABuiltin *)f.o; return b->fn(n, args, kw, b->self); }
+    case O_BUILTIN: {
+        ABuiltin *b = (ABuiltin *)f.o;
+        if ((n >= 1 && (a_is(args[0], O_QTY) || a_is(args[0], O_LIST))) || (n >= 2 && a_is(args[1], O_QTY))) { AV r = qty_builtin(b, n, args, kw); if (r.t != T_NONE) return r; }
+        return b->fn(n, args, kw, b->self);
+    }
     case O_BOUND: {
         ABound *b = (ABound *)f.o;
         AV *a2 = (AV *)__builtin_alloca(sizeof(AV) * (size_t)(n + 1));
@@ -1810,7 +1921,39 @@ static AV b_chr(int n, AV *a, ADict *kw, AV self) {
     else { b[k++] = (char)(0xF0 | (c >> 18)); b[k++] = (char)(0x80 | ((c >> 12) & 63)); b[k++] = (char)(0x80 | ((c >> 6) & 63)); b[k++] = (char)(0x80 | (c & 63)); }
     return a_strn(b, k);
 }
-static AV b_type(int n, AV *a, ADict *kw, AV self) { (void)n; (void)kw; (void)self; if (a_is(a[0], O_INST)) return a_obj(((AInst *)a[0].o)->cls); return a_str(tname(a[0])); }
+static const AUnitName *dim_names; static int n_dim_names;
+void a_dim_names(const AUnitName *names, int n) { dim_names = names; n_dim_names = n; }
+static AV b_type(int n, AV *a, ADict *kw, AV self) {      /* the type's name, as apsi run shows it */
+    (void)n; (void)kw; (void)self;
+    AV v = a[0];
+    switch (v.t) { case T_NONE: return a_str("None"); case T_BOOL: return a_str("Bool"); case T_INT: return a_str("Int"); case T_FLOAT: return a_str("Float"); default: break; }
+    switch (v.o->kind) {
+    case O_STR: return a_str("Str"); case O_LIST: return a_str("List"); case O_TUPLE: return a_str("Tuple"); case O_DICT: return a_str("Dict");
+    case O_SET: return a_str("set"); case O_RANGE: return a_str("range"); case O_FUNC: case O_BUILTIN: case O_BOUND: case O_CLASS: return a_str("Fn");
+    case O_INST: return a_obj(((AInst *)v.o)->cls->name);
+    case O_QTY: {
+        const int16_t *d = QTY(v)->dim; const char *dn = NULL;
+        for (int i = 0; i < n_dim_names; i++) if (same_dim(dim_names[i].dim, d)) dn = dim_names[i].name;
+        SB b = {0};
+        if (qt(v)) {
+            AV sh = a_call(a_global_builtin("shape"), 1, &QTY(v)->tv, NULL);
+            sb_puts(&b, "Tensor[");
+            for (int64_t i = 0; i < LIST(sh)->len; i++) { char t[32]; snprintf(t, sizeof t, i ? "x%lld" : "%lld", (long long)LIST(sh)->v[i].i); sb_puts(&b, t); }
+            sb_puts(&b, ", ");
+            if (dn) sb_puts(&b, dn); else { sb_puts(&b, "["); unit_string(&b, d); sb_puts(&b, "]"); }
+            sb_puts(&b, "]"); return sb_done(&b);
+        }
+        if (dn) { free(b.p); return a_str(dn); }
+        sb_puts(&b, "Quantity["); unit_string(&b, d); sb_puts(&b, "]"); return sb_done(&b); }
+    case O_TENSOR: case O_NODE: {
+        AV sh = a_call(a_global_builtin("shape"), 1, &v, NULL); AV dt = a_attr(v, "dtype");
+        SB b = {0}; sb_puts(&b, "Tensor[");
+        for (int64_t i = 0; i < LIST(sh)->len; i++) { char t[32]; snprintf(t, sizeof t, i ? "x%lld" : "%lld", (long long)LIST(sh)->v[i].i); sb_puts(&b, t); }
+        sb_puts(&b, LIST(sh)->len ? ", " : ""); sb_puts(&b, STR(dt)->s); sb_puts(&b, "]"); return sb_done(&b);
+    }
+    default: return a_str(tname(v));
+    }
+}
 static AV b_input(int n, AV *a, ADict *kw, AV self) {
     (void)kw; (void)self;
     if (n) { AV s = a_to_str(a[0]); fwrite(STR(s)->s, 1, (size_t)STR(s)->len, stdout); fflush(stdout); }
@@ -2077,6 +2220,17 @@ static AV b_iter(int n, AV *a, ADict *kw, AV self) { (void)n; (void)kw; (void)se
 static AV b_next(int n, AV *a, ADict *kw, AV self) { (void)kw; (void)self; AV v; if (a_next(a[0], &v)) return v; if (n > 1) return a[1]; a_error("StopIteration", ""); }
 static AV b_set_recursion_limit(int n, AV *a, ADict *kw, AV self) { (void)n; (void)a; (void)kw; (void)self; return A_NONE; }
 static AV b_identity(int n, AV *a, ADict *kw, AV self) { (void)kw; (void)self; if (n == 1 && !kw) return a[0]; return a_builtin("decorator", b_identity, A_NONE); }
+static AV b_si_magnitude(int n, AV *a, ADict *kw, AV self) { (void)n; (void)kw; (void)self; return qval(a[0]); }
+static AV b_to_plain(int n, AV *a, ADict *kw, AV self) {     /* a dimensionless value (or a quantity's SI magnitude) as a number */
+    (void)n; (void)kw; (void)self; AV v = qval(a[0]);
+    if (a_is_tn(v)) return a_float(a_tensor_float(v));
+    return v;
+}
+static AV b_max_abs(int n, AV *a, ADict *kw, AV self) {
+    (void)n; (void)kw; (void)self; AV v = qval(a[0]);
+    if (a_is_tn(v)) { AV ab = a_tensor_unary(1 /* U_ABS */, v); int sp = a_ntmp; A_PUSH(ab); AV r = a_call(a_global_builtin("max"), 1, &ab, NULL); a_ntmp = sp; return r; }
+    double x = v.t == T_FLOAT ? v.f : (double)v.i; return a_float(fabs(x));
+}
 static AV b_error(int n, AV *a, ADict *kw, AV self) { (void)kw; (void)self; a_raise(n ? a_to_str(a[0]) : a_str("error")); }
 
 static AV b_floor(int n, AV *a, ADict *kw, AV self) { if (n && a_is_tn(a[0])) return a_tensor_builtin("floor", 1)(n, a, kw, self); (void)n; (void)kw; (void)self; if (a[0].t == T_INT) return a[0]; return a_int((int64_t)floor(fval(a[0]))); }
@@ -2106,6 +2260,7 @@ static const BEnt a_builtins[] = {
     {"hex", b_hex}, {"oct", b_oct}, {"bin", b_bin}, {"callable", b_callable}, {"getattr", b_getattr},
     {"hasattr", b_hasattr}, {"setattr", b_setattr}, {"iter", b_iter}, {"next", b_next},
     {"set_recursion_limit", b_set_recursion_limit}, {"error", b_error},
+    {"si_magnitude", b_si_magnitude}, {"to_plain", b_to_plain}, {"max_abs", b_max_abs},
     {"native", b_identity}, {"gpu", b_identity}, {"memo", b_identity},
     {NULL, NULL}};
 
@@ -2203,3 +2358,27 @@ AV a_module(const char *name, int n, const char **names, AV *vals) {
     for (int i = 0; i < n; i++) a_dict_set(((AInst *)m.o)->attrs, a_str(names[i]), vals[i]);
     a_ntmp = sp; return m;
 }
+
+/* ---- match statements */
+int a_match_type(AV v, const char *t) {
+    if (!strcmp(t, "int")) return v.t == T_INT || v.t == T_BOOL;
+    if (!strcmp(t, "float")) return v.t == T_FLOAT;
+    if (!strcmp(t, "bool")) return v.t == T_BOOL;
+    if (!strcmp(t, "str")) return a_is(v, O_STR);
+    if (!strcmp(t, "list")) return a_is(v, O_LIST);
+    if (!strcmp(t, "tuple")) return a_is(v, O_TUPLE);
+    if (!strcmp(t, "dict")) return a_is(v, O_DICT);
+    if (!strcmp(t, "set")) return a_is(v, O_SET);
+    return 0;
+}
+AV a_match_field(AV v, int i) {        /* the i-th positional field: a struct's fields, or __match_args__ */
+    if (!a_is(v, O_INST)) a_error("TypeError", "a positional sub-pattern needs a struct or a class");
+    AClass *c = ((AInst *)v.o)->cls;
+    AV ma = a_getattr(v, "__match_args__");
+    if (ma.t != 255) { AV name = a_getitem(ma, a_int(i)); return a_attr(v, STR(name)->s); }
+    int nf = 0; AClass *chain[16]; for (AClass *x = c; x && nf < 16; x = x->base) chain[nf++] = x;
+    int pos = 0;
+    for (int ci = nf - 1; ci >= 0; ci--) for (int k = 0; k < chain[ci]->nfields; k++) { if (pos == i) return a_attrk(v, a_obj(chain[ci]->fields[k])); pos++; }
+    a_error("TypeError", "%s has no positional field %d", c->name->s, i);
+}
+AV a_list_of(AV v) { if (a_is(v, O_LIST)) return v; AV l = a_list(0, NULL); int sp = a_ntmp; A_PUSH(l); AV it = a_iter(v), x; A_PUSH(it); while (a_next(it, &x)) a_list_append(LIST(l), x); a_ntmp = sp; return l; }

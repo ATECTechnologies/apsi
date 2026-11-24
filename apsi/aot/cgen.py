@@ -120,6 +120,72 @@ class Scope:
         return s
 
 
+_EV = [0]
+
+
+def lower_evolve(body):
+    """`evolve a, b over t in r step h using m ...:` becomes a derivative function and a call of evolve_run."""
+    out = []
+    for st in body:
+        for f in ("body", "else_body", "final_body"):
+            if isinstance(getattr(st, f, None), list):
+                setattr(st, f, lower_evolve(getattr(st, f)))
+        if isinstance(st, A.If):
+            st.branches = [(c, lower_evolve(b)) for c, b in st.branches]
+        if isinstance(st, A.Try):
+            st.handlers = [(k, n, lower_evolve(b)) for k, n, b in st.handlers]
+        if isinstance(st, A.Match):
+            st.cases = [(p, g, lower_evolve(b)) for p, g, b in st.cases]
+        if isinstance(st, A.ClassDef):
+            st.body = lower_evolve(st.body)
+        if not isinstance(st, A.Evolve):
+            out.append(st)
+            continue
+        _EV[0] += 1
+        n = _EV[0]
+        line = getattr(st, "line", 0)
+        dname = f"evolve_deriv_{n}"
+        names = list(st.states)
+        dvars = {s_: f"d_{s_}_{n}" for s_ in names}
+        fbody = []
+        for x in lower_evolve(st.body):
+            if isinstance(x, A.Deriv):
+                a = A.Let([dvars[x.name]], None, x.expr, True)
+                a.line = getattr(x, "line", line)
+                fbody.append(a)
+            else:
+                fbody.append(x)
+        for s_ in names:
+            if not any(isinstance(x, A.Deriv) and x.name == s_ for x in st.body):
+                raise NativeError(f"evolve: no derivative for {s_} (add a line {s_}' = ...)", st)
+        fbody.append(A.Return(A.ListLit([A.Name(dvars[s_]) for s_ in names])))
+        fn = A.FnDef(dname, None, [A.Param(st.tvar, None, None, None)] + [A.Param(s_, None, None, None) for s_ in names],
+                     None, fbody, False, [], False)
+        fn.line = line
+        out.append(fn)
+        if isinstance(st.range, A.Range):
+            t0, t1 = st.range.start, st.range.end
+        else:
+            t0, t1 = A.Attr(st.range, "start"), A.Attr(st.range, "end")
+        call = A.Call(A.Name("evolve_run"), [
+            A.ListLit([A.Str(s_) for s_ in names]), A.ListLit([A.Name(s_) for s_ in names]), t0, t1, st.step,
+            A.Str(st.method), st.every if st.every is not None else A.Num(1, "1", None), A.Bool(bool(st.into)),
+            A.Name(dname)], [("tol", st.tol)] if st.tol is not None else [])
+        res = f"evolve_result_{n}"
+        let = A.Let([res], None, call, False)
+        let.line = line
+        out.append(let)
+        for k, s_ in enumerate(names):
+            a = A.Assign(A.Name(s_), A.Index(A.Index(A.Name(res), A.Num(0, "0", None)), A.Num(k, str(k), None)), [])
+            a.line = line
+            out.append(a)
+        if st.into:
+            a = A.Let([st.into], None, A.Index(A.Name(res), A.Num(1, "1", None)), False)
+            a.line = line
+            out.append(a)
+    return out
+
+
 class Analyzer:
     """Walks the tree once: finds each function's bound and used names, renames comprehension variables apart,
     then works out cells and free variables."""
@@ -130,6 +196,14 @@ class Analyzer:
         self.use_names = use_names or (lambda s: [])
 
     def run(self, prog):
+        prog.body = lower_evolve(prog.body)
+
+        def lower_fns(body):
+            for st in body:
+                if isinstance(st, A.FnDef) and not st.is_expr:
+                    st.body = lower_evolve(st.body)
+                    lower_fns(st.body)
+        lower_fns(prog.body)
         mod = Scope(prog, None, "module")
         self.scopes[id(prog)] = mod
         self.block(prog.body, mod)
@@ -288,8 +362,46 @@ class Analyzer:
         elif k == "Use":
             for n in self.use_names(s):
                 sc.bind(n)
+        elif k == "Match":
+            self.expr(s.subject, sc)
+            for pat, guard, body in s.cases:
+                self.pattern(pat, sc)
+                if guard is not None:
+                    self.expr(guard, sc)
+                self.block(body, sc)
         else:
             raise NativeError(f"'{k}' is not supported by the native backend yet", s)
+
+    def pattern(self, p, sc):
+        k = p[0]
+        if k == "capture":
+            sc.bind(p[1])
+        elif k == "star" and p[1]:
+            sc.bind(p[1])
+        elif k == "as":
+            self.pattern(p[1], sc)
+            sc.bind(p[2])
+        elif k in ("or", "seq"):
+            for x in p[1]:
+                self.pattern(x, sc)
+        elif k == "map":
+            for key, v in p[1]:
+                if isinstance(key, A.AST):
+                    self.expr(key, sc)
+                self.pattern(v, sc)
+            if p[2]:
+                sc.bind(p[2])
+        elif k == "class":
+            sc.used.add(p[1].split(".")[0])
+            for x in p[2]:
+                self.pattern(x, sc)
+            for _, x in p[3]:
+                self.pattern(x, sc)
+        elif k == "value":
+            sc.used.add(p[1].split(".")[0])
+        elif k == "lit":
+            if isinstance(p[1], A.AST):
+                self.expr(p[1], sc)
 
     def loop_declare(self, p, sc):
         if isinstance(p, str):
@@ -705,6 +817,10 @@ class CGen:
         names = [f"{{{self.dim_c(d)}, {cstr(n)}}}" for d, n in _DISPLAY_MAP.items()]
         out.append(f"    static const AUnitName un[] = {{{', '.join(names)}}};")
         out.append(f"    a_unit_names(un, {len(names)});")
+        from ..units import _DIM_TO_NAME
+        dn = [f"{{{self.dim_c(d)}, {cstr(n)}}}" for d, n in _DIM_TO_NAME.items()]
+        out.append(f"    static const AUnitName dn[] = {{{', '.join(dn)}}};")
+        out.append(f"    a_dim_names(dn, {len(dn)});")
         out.append(f"    for (int i = 0; i < {max(1, len(self.globals))}; i++) {{ G[i].t = 255; G[i].i = 0; }}")
         out.append(f"    a_root(G, {max(1, len(self.globals))});")
         out.append(f"    a_root(K, {max(1, len(self.consts))});")
@@ -1197,6 +1313,119 @@ class CGen:
         v = self.expr(e.value) if e.value is not None else "A_NONE"
         return self.hold(f"a_yield({v})")
 
+    _PTYPES = {"int": "a_is_int", "float": "a_is_float", "str": "a_is_str", "bool": "a_is_bool", "list": "a_is_list",
+               "tuple": "a_is_tuple", "dict": "a_is_dict", "set": "a_is_set"}
+
+    def s_Match(self, s):
+        subj = self.hold(self.expr(s.subject))
+        end = self.label("mend")
+        for pat, guard, body in s.cases:
+            fail = self.label("mfail")
+            t0 = self.fn.t
+            self.emit("{")
+            self.fn.ind += 1
+            self.pmatch(pat, subj, fail)
+            if guard is not None:
+                c = self.cond(guard)
+                self.emit(f"if (!({c})) goto {fail};")
+            self.block(body)
+            self.emit(f"goto {end};")
+            self.fn.ind -= 1
+            self.emit("}")
+            self.emit(f"{fail}:;")
+            self.fn.t = t0
+        self.emit(f"{end}:;")
+
+    def dotted(self, name):
+        parts = name.split(".")
+        v = self.load(parts[0])
+        for a in parts[1:]:
+            v = self.hold(f"a_attrk({v}, {self.k_str(a)})")
+        return v
+
+    def pmatch(self, p, v, fail):
+        k = p[0]
+        if k == "wild":
+            return
+        if k == "capture":
+            self.store(p[1], v)
+            return
+        if k == "as":
+            self.pmatch(p[1], v, fail)
+            self.store(p[2], v)
+            return
+        if k == "lit":
+            lit = self.hold(self.expr(p[1]))
+            op = "a_compare(OP_IS, " if isinstance(p[1], (A.NoneLit, A.Bool)) else "a_eq("
+            self.emit(f"if (!{op}{v}, {lit})) goto {fail};")
+            return
+        if k == "value":
+            val = self.dotted(p[1])
+            self.emit(f"if (!a_eq({v}, {val})) goto {fail};")
+            return
+        if k == "or":
+            ok = self.label("mor")
+            for alt in p[1]:
+                nxt = self.label("malt")
+                self.pmatch(alt, v, nxt)
+                self.emit(f"goto {ok};")
+                self.emit(f"{nxt}:;")
+            self.emit(f"goto {fail};")
+            self.emit(f"{ok}:;")
+            return
+        if k == "seq":
+            items = p[1]
+            star = [i for i, x in enumerate(items) if x[0] == "star"]
+            n = len(items) - len(star)
+            self.emit(f"if (!(a_is({v}, O_LIST) || a_is({v}, O_TUPLE))) goto {fail};")
+            ln = f"((AList *){v}.o)->len"
+            self.emit(f"if ({ln} {'<' if star else '!='} {n}) goto {fail};")
+            for i, x in enumerate(items):
+                if x[0] == "star":
+                    if x[1]:
+                        after = len(items) - i - 1
+                        sl = self.hold(f"a_slice(a_int({i}), a_int({ln} - {after}), A_NONE)")
+                        self.store(x[1], f"a_list_of(a_getitem({v}, {sl}))")
+                    continue
+                idx = f"a_int({i})" if not star or i < star[0] else f"a_int({ln} - {len(items) - i})"
+                el = self.hold(f"a_getitem({v}, {idx})")
+                self.pmatch(x, el, fail)
+            return
+        if k == "map":
+            self.emit(f"if (!a_is({v}, O_DICT)) goto {fail};")
+            keys = []
+            for key, sub in p[1]:
+                kv = self.hold(self.dotted(key[1]) if isinstance(key, tuple) else self.expr(key))
+                keys.append(kv)
+                el = self.tmp()
+                self.emit(f"if (!a_dict_get((ADict *){v}.o, {kv}, &{el})) goto {fail};")
+                self.pmatch(sub, el, fail)
+            if p[2]:
+                rest = self.tmp()
+                self.emit(f"{rest} = a_call(a_attrk({v}, {self.k_str('copy')}), 0, NULL, NULL);")
+                for kv in keys:
+                    self.emit(f"a_dict_del((ADict *){rest}.o, {kv});")
+                self.store(p[2], rest)
+            return
+        if k == "class":
+            name = p[1]
+            if name in self._PTYPES and self.where(name)[0] == "builtin":
+                self.emit(f"if (!a_match_type({v}, {cstr(name)})) goto {fail};")
+                if p[2]:
+                    self.pmatch(p[2][0], v, fail)
+                return
+            cls = self.dotted(name)
+            self.emit(f"if (!a_isinstance({v}, {cls})) goto {fail};")
+            for i, sub in enumerate(p[2]):
+                el = self.hold(f"a_match_field({v}, {i})")
+                self.pmatch(sub, el, fail)
+            for an, sub in p[3]:
+                el = self.tmp()
+                self.emit(f"{el} = a_getattr({v}, {cstr(an)}); if ({el}.t == 255) goto {fail};")
+                self.pmatch(sub, el, fail)
+            return
+        raise NativeError(f"unknown pattern {k}")
+
     def s_Raise(self, s):
         if s.value is None:
             self.emit("a_raise(a_exc);")
@@ -1619,6 +1848,14 @@ class CGen:
         return self.hold(f"a_range_val({a}, {b}, {int(bool(e.inclusive))})")
 
     def e_Attr(self, e):
+        if isinstance(e.obj, A.Name) and e.obj.id == "u" and "u" not in self.mod_scope.bound and \
+                (self.fn.scope.kind != "fn" or ("u" not in self.fn.scope.bound and "u" not in self.fn.scope.free)):
+            from ..units import lookup_unit                    # u.km: the unit itself, as a constant
+            found = lookup_unit(e.name)
+            if found is None:
+                raise NativeError(f"unknown unit u.{e.name}", e)
+            scale, dim = found
+            return self.e_Num(A.Num(1, "1", (e.name, scale, dim)))
         o = self.expr(e.obj)
         return self.hold(f"a_attrk({o}, {self.k_str(e.name)})")
 

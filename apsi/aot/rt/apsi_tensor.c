@@ -24,7 +24,7 @@ enum { DT_F64 = 0, DT_F32, DT_I64, DT_BOOL };
 static const char *dt_name[] = {"float64", "float32", "int64", "bool"};
 static const int dt_size[] = {8, 4, 8, 1};
 #define MAXD 8
-typedef struct ATensor { AObj h; uint8_t dt, nd, dev, pad; int64_t sh[MAXD]; int64_t n; void *p; } ATensor;
+typedef struct ATensor { AObj h; uint8_t dt, nd, dev, pad; int64_t sh[MAXD]; int64_t n; void *p; AObj *base; } ATensor;   /* base: the tensor whose buffer this one shares (a reshape) */
 typedef struct ANode { AObj h; AV val; int op; AV a, b, x; AV grad; int64_t id; int seen; } ANode;
 #define TT(v) ((ATensor *)(v).o)
 #define ND(v) ((ANode *)(v).o)
@@ -62,6 +62,7 @@ static void pool_put(void *p, size_t bytes) {
 }
 static void tfree(AObj *o) {
     ATensor *t = (ATensor *)o;
+    if (t->base) return;                       /* a view: the buffer is its base's */
     if (t->dev) a_gpu_free(t->p); else pool_put(t->p, (size_t)t->n * (size_t)dt_size[t->dt]);
 }
 static void tmark(AObj *o) { (void)o; }
@@ -319,36 +320,62 @@ static int res_dt(int op, ATensor *a, ATensor *b) {
 }
 
 /* broadcasting in rows: the last axis runs with stride 0 or 1 on each side, which the compiler vectorizes */
-#define ROW_LOOP(T)                                                                                              \
-    {                                                                                                          \
-        const T *x = (const T *)A->p, *y = (const T *)B->p; T *r = (T *)o->p;                                    \
-        int64_t L = osh[nd - 1], rows = o->n / (L ? L : 1), xs = sa[nd - 1], ys = sb[nd - 1];                    \
-        int64_t idx[MAXD] = {0}, ia = 0, ib = 0;                                                               \
-        for (int64_t q = 0; q < rows; q++) {                                                                   \
-            const T *xa = x + ia, *yb = y + ib; T *rr = r + q * L;                                             \
-            switch (op) {                                                                                      \
-            case E_ADD: if (xs && ys) for (int64_t i = 0; i < L; i++) rr[i] = xa[i] + yb[i]; else if (xs) { T v = yb[0]; for (int64_t i = 0; i < L; i++) rr[i] = xa[i] + v; } else if (ys) { T v = xa[0]; for (int64_t i = 0; i < L; i++) rr[i] = v + yb[i]; } else for (int64_t i = 0; i < L; i++) rr[i] = xa[0] + yb[0]; break; \
-            case E_SUB: if (xs && ys) for (int64_t i = 0; i < L; i++) rr[i] = xa[i] - yb[i]; else if (xs) { T v = yb[0]; for (int64_t i = 0; i < L; i++) rr[i] = xa[i] - v; } else if (ys) { T v = xa[0]; for (int64_t i = 0; i < L; i++) rr[i] = v - yb[i]; } else for (int64_t i = 0; i < L; i++) rr[i] = xa[0] - yb[0]; break; \
-            case E_MUL: if (xs && ys) for (int64_t i = 0; i < L; i++) rr[i] = xa[i] * yb[i]; else if (xs) { T v = yb[0]; for (int64_t i = 0; i < L; i++) rr[i] = xa[i] * v; } else if (ys) { T v = xa[0]; for (int64_t i = 0; i < L; i++) rr[i] = v * yb[i]; } else for (int64_t i = 0; i < L; i++) rr[i] = xa[0] * yb[0]; break; \
-            case E_DIV: if (xs && ys) for (int64_t i = 0; i < L; i++) rr[i] = xa[i] / yb[i]; else if (xs) { T v = yb[0]; for (int64_t i = 0; i < L; i++) rr[i] = xa[i] / v; } else if (ys) { T v = xa[0]; for (int64_t i = 0; i < L; i++) rr[i] = v / yb[i]; } else for (int64_t i = 0; i < L; i++) rr[i] = xa[0] / yb[0]; break; \
-            default: for (int64_t i = 0; i < L; i++) rr[i] = (T)eop(op, xa[i * xs], yb[i * ys]); break;      \
-            }                                                                                                  \
-            for (int d = nd - 2; d >= 0; d--) {                                                                \
-                idx[d]++; ia += sa[d]; ib += sb[d];                                                            \
-                if (idx[d] < osh[d]) break;                                                                    \
-                ia -= sa[d] * osh[d]; ib -= sb[d] * osh[d]; idx[d] = 0;                                        \
-            }                                                                                                  \
+/* rows of the output: the switch on the operation and on which side broadcasts is taken once, outside */
+#define ROW_WALK(BODY)                                                                                         \
+    for (int64_t q = 0; q < rows; q++) {                                                                       \
+        const T *xa = x + ia, *yb = y + ib; T *rr = r + q * L;                                                 \
+        BODY                                                                                                   \
+        for (int d = nd - 2; d >= 0; d--) {                                                                    \
+            idx[d]++; ia += sa[d]; ib += sb[d];                                                                \
+            if (idx[d] < osh[d]) break;                                                                        \
+            ia -= sa[d] * osh[d]; ib -= sb[d] * osh[d]; idx[d] = 0;                                            \
         }                                                                                                      \
     }
-static AV ewise_rows(int op, ATensor *A, ATensor *B, int dt, int nd, const int64_t *osh) {
-    int64_t sa[MAXD], sb[MAXD];
-    bstrides(A, nd, osh, sa); bstrides(B, nd, osh, sb);
-    if ((sa[nd - 1] != 0 && sa[nd - 1] != 1) || (sb[nd - 1] != 0 && sb[nd - 1] != 1)) return A_NONE;
-    ATensor *o = t_new(dt, nd, osh);
-    if (dt == DT_F64) ROW_LOOP(double) else ROW_LOOP(float)
+#define ROW_OP(OPX)                                                                                            \
+    if (xs && ys) { ROW_WALK(for (int64_t i = 0; i < L; i++) rr[i] = OPX(xa[i], yb[i]);) }                    \
+    else if (xs) { ROW_WALK(T v = yb[0]; for (int64_t i = 0; i < L; i++) rr[i] = OPX(xa[i], v);) }            \
+    else if (ys) { ROW_WALK(T v = xa[0]; for (int64_t i = 0; i < L; i++) rr[i] = OPX(v, yb[i]);) }            \
+    else { ROW_WALK(T v = OPX(xa[0], yb[0]); for (int64_t i = 0; i < L; i++) rr[i] = v;) }
+#define OADD(p, q) ((p) + (q))
+#define OSUB(p, q) ((p) - (q))
+#define OMUL(p, q) ((p) * (q))
+#define ODIV(p, q) ((p) / (q))
+#define OGEN(p, q) ((T)eop(op, (p), (q)))
+#define ROW_LOOP(T)                                                                                            \
+    {                                                                                                          \
+        const T *x = (const T *)A->p, *y = (const T *)B->p; T *r = (T *)o->p;                                 \
+        int64_t L = osh[nd - 1], rows = o->n / (L ? L : 1), xs = sa[nd - 1], ys = sb[nd - 1];                   \
+        int64_t idx[MAXD] = {0}, ia = 0, ib = 0;                                                              \
+        switch (op) {                                                                                         \
+        case E_ADD: ROW_OP(OADD) break; case E_SUB: ROW_OP(OSUB) break;                                       \
+        case E_MUL: ROW_OP(OMUL) break; case E_DIV: ROW_OP(ODIV) break;                                       \
+        default: ROW_OP(OGEN) break;                                                                          \
+        }                                                                                                      \
+    }
+static AV ewise_rows(int op, ATensor *A, ATensor *B, int dt, int nd0, const int64_t *osh0) {
+    int64_t sa0[MAXD], sb0[MAXD];
+    bstrides(A, nd0, osh0, sa0); bstrides(B, nd0, osh0, sb0);
+    if ((sa0[nd0 - 1] != 0 && sa0[nd0 - 1] != 1) || (sb0[nd0 - 1] != 0 && sb0[nd0 - 1] != 1)) return A_NONE;
+    ATensor *o = t_new(dt, nd0, osh0);
+    /* merge neighbouring axes that walk the same way on both sides: longer inner rows */
+    int64_t osh[MAXD], sa[MAXD], sb[MAXD]; int nd = 0;
+    for (int d = 0; d < nd0; d++) {
+        if (osh0[d] == 1) continue;
+        if (nd > 0 && sa[nd - 1] == sa0[d] * osh0[d] && sb[nd - 1] == sb0[d] * osh0[d]) {
+            osh[nd - 1] *= osh0[d]; sa[nd - 1] = sa0[d]; sb[nd - 1] = sb0[d];
+        } else { osh[nd] = osh0[d]; sa[nd] = sa0[d]; sb[nd] = sb0[d]; nd++; }
+    }
+    if (nd == 0) { osh[0] = 1; sa[0] = 0; sb[0] = 0; nd = 1; }
+    if ((sa[nd - 1] != 0 && sa[nd - 1] != 1) || (sb[nd - 1] != 0 && sb[nd - 1] != 1)) { osh[nd] = 1; sa[nd] = 0; sb[nd] = 0; nd++; }
+    if (dt == DT_F64) { typedef double T; ROW_LOOP(T) } else { typedef float T; ROW_LOOP(T) }
     return a_obj(o);
 }
 
+static int same_shape(ATensor *a, ATensor *b) {
+    if (a->nd != b->nd) return 0;
+    for (int i = 0; i < a->nd; i++) if (a->sh[i] != b->sh[i]) return 0;
+    return 1;
+}
 static AV ewise(int op, AV av, AV bv) {
     if (on_dev(av) || on_dev(bv)) return d_ewise(op, av, bv);
     ATensor *a = TT(av), *b = TT(bv);
@@ -359,7 +386,7 @@ static AV ewise(int op, AV av, AV bv) {
         for (int64_t i = 0; i < b->n; i++) if (t_get(b, i) == 0) a_error("ZeroDivisionError", "integer division by zero in a tensor");
     }
     /* the fast paths: same shapes, or a scalar on one side, in float64 / float32 */
-    if (dt == DT_F64 && a->dt == DT_F64 && b->dt == DT_F64 && (a->n == b->n || a->n == 1 || b->n == 1) && (a->nd == b->nd || a->n == 1 || b->n == 1)) {
+    if (dt == DT_F64 && a->dt == DT_F64 && b->dt == DT_F64 && (same_shape(a, b) || (a->n == 1 && a->nd <= b->nd) || (b->n == 1 && b->nd <= a->nd))) {
         double *x = (double *)a->p, *y = (double *)b->p, *r = (double *)o->p;
         int64_t n = o->n, sa = a->n == 1 ? 0 : 1, sb = b->n == 1 ? 0 : 1;
         if (sb == 0 && sa == 1) {            /* tensor op number: a loop the compiler vectorizes */
@@ -397,7 +424,7 @@ static AV ewise(int op, AV av, AV bv) {
         default: for (int64_t i = 0; i < n; i++) r[i] = eop(op, x[i * sa], y[i * sb]); return a_obj(o);
         }
     }
-    if (dt == DT_F32 && (a->dt == DT_F32 || a->n == 1) && (b->dt == DT_F32 || b->n == 1) && (a->n == b->n || a->n == 1 || b->n == 1) && (a->nd == b->nd || a->n == 1 || b->n == 1)) {
+    if (dt == DT_F32 && (a->dt == DT_F32 || a->n == 1) && (b->dt == DT_F32 || b->n == 1) && (same_shape(a, b) || (a->n == 1 && a->nd <= b->nd) || (b->n == 1 && b->nd <= a->nd))) {
         float *r = (float *)o->p; int64_t n = o->n;
         if (a->dt == DT_F32 && b->dt == DT_F32) {
             float *x = (float *)a->p, *y = (float *)b->p; int64_t sa = a->n == 1 ? 0 : 1, sb = b->n == 1 ? 0 : 1;
@@ -681,9 +708,11 @@ static AV reshape(AV v, int nd, int64_t *sh) {
     for (int i = 0; i < nd; i++) { if (sh[i] == -1) { if (neg >= 0) a_error("ValueError", "only one -1 in a shape"); neg = i; } else known *= sh[i]; }
     if (neg >= 0) { if (known == 0 || a->n % known) a_error("ValueError", "cannot reshape %lld elements", (long long)a->n); sh[neg] = a->n / known; known *= sh[neg]; }
     if (known != a->n) a_error("ValueError", "cannot reshape %lld elements into a shape of %lld", (long long)a->n, (long long)known);
-    if (a->dev) { ATensor *o = d_new(a->dt, nd, sh); a_gpu_copy(o->p, a->p, (size_t)a->n * 4); return a_obj(o); }
-    ATensor *o = t_new(a->dt, nd, sh);
-    memcpy(o->p, a->p, (size_t)a->n * (size_t)dt_size[a->dt]);
+    /* a view on the same buffer, as NumPy's reshape */
+    ATensor *o = (ATensor *)a_alloc(sizeof(ATensor), O_TENSOR);
+    o->dt = a->dt; o->nd = (uint8_t)nd; o->dev = a->dev; o->n = a->n; o->p = a->p;
+    o->base = a->base ? a->base : (AObj *)a;
+    for (int i = 0; i < nd; i++) o->sh[i] = sh[i];
     return a_obj(o);
 }
 static AV permute(AV v, const int *perm) {
@@ -1238,14 +1267,30 @@ static void acc_grad(AV node, AV g) {
     ANode *n = ND(node);
     if (n->grad.t == T_NONE) n->grad = g; else n->grad = gv_add(n->grad, g);
 }
+/* every node out depends on, inputs before the nodes made from them (iterative: deep graphs do not overflow the stack) */
 static void collect_nodes(AV v, AList *out) {
     if (!is_n(v)) return;
-    ANode *n = ND(v);
-    if (n->seen) return;
-    n->seen = 1;
-    collect_nodes(n->a, out); collect_nodes(n->b, out);
-    if (n->op == N_CONCAT || n->op == N_STACK) { AList *l = (AList *)n->a.o; (void)l; }
-    a_list_append(out, v);
+    int64_t cap = 256, top = 0;
+    AV *stack = (AV *)malloc(sizeof(AV) * (size_t)cap);
+    uint8_t *expanded = (uint8_t *)malloc((size_t)cap);
+    stack[top] = v; expanded[top++] = 0;
+    while (top) {
+        AV x = stack[top - 1];
+        if (expanded[top - 1]) { top--; a_list_append(out, x); continue; }
+        ANode *n = ND(x);
+        if (n->seen) { top--; continue; }             /* already placed through another path */
+        n->seen = 1; expanded[top - 1] = 1;
+        AV kids[2] = {n->a, n->b}; AList *l = NULL;
+        if (n->op == N_CONCAT || n->op == N_STACK) l = (AList *)n->a.o;
+        int64_t count = l ? l->len : 2;
+        for (int64_t i = 0; i < count; i++) {
+            AV c = l ? l->v[i] : kids[i];
+            if (!is_n(c) || ND(c)->seen) continue;
+            if (top == cap) { cap *= 2; stack = (AV *)realloc(stack, sizeof(AV) * (size_t)cap); expanded = (uint8_t *)realloc(expanded, (size_t)cap); }
+            stack[top] = c; expanded[top++] = 0;
+        }
+    }
+    free(stack); free(expanded);
 }
 static AV unary_grad(int u, AV x, AV y, AV g) {     /* d op(x) / dx times g, from x and y = op(x) */
     AV d;
@@ -1500,7 +1545,6 @@ AV a_tensor_binop(int op, AV a, AV b) {
         if (nop < 0) return v;                           /* //, % ...: no derivative, the plain value */
         int sp = a_ntmp; A_PUSH(v); AV r = node_new(v, nop, a, b, A_NONE); a_ntmp = sp; return r;
     }
-    if (a_is(a, O_QTY) || a_is(b, O_QTY)) a_error("TypeError", "a tensor with units is not supported natively yet");
     int sp = a_ntmp;
     AV ta = as_tensor(a); A_PUSH(ta); AV tb = as_tensor(b); A_PUSH(tb);
     AV r;
@@ -1518,7 +1562,7 @@ AV a_tensor_binop(int op, AV a, AV b) {
 }
 /* a op= b into a's own buffer: a is a temporary the compiled program will not read again (NumPy's elision) */
 AV a_tensor_binop_into(int op, AV a, AV b) {
-    if (!is_t(a) || is_n(b) || TT(a)->dev || (TT(a)->dt != DT_F64 && TT(a)->dt != DT_F32) || !(op == OP_ADD || op == OP_SUB || op == OP_MUL || op == OP_DIV))
+    if (!is_t(a) || is_n(b) || TT(a)->dev || TT(a)->base || (TT(a)->dt != DT_F64 && TT(a)->dt != DT_F32) || !(op == OP_ADD || op == OP_SUB || op == OP_MUL || op == OP_DIV))
         return a_binop(op, a, b);
     ATensor *A = TT(a);
     if (is_num(b)) {
@@ -2124,6 +2168,7 @@ ABuiltinFn a_tensor_builtin(const char *name, int override_only) {
     return NULL;
 }
 void a_tensor_mark(AObj *o) {
+    if (o->kind == O_TENSOR) { if (((ATensor *)o)->base) a_mark_value(a_obj(((ATensor *)o)->base)); return; }
     if (o->kind == O_NODE) { ANode *n = (ANode *)o; a_mark_value(n->val); a_mark_value(n->a); a_mark_value(n->b); a_mark_value(n->x); a_mark_value(n->grad); }
 }
 void a_tensor_free(AObj *o) { if (o->kind == O_TENSOR) tfree(o); }
