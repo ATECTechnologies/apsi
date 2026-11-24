@@ -7,7 +7,15 @@
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
-#ifndef _WIN32
+#ifdef _WIN32
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#else
 #include <pthread.h>
 #include <unistd.h>
 #endif
@@ -401,7 +409,7 @@ static int n_threads(void) {
     if (!n) {
         const char *e = getenv("APSI_THREADS");
 #ifdef _WIN32
-        n = e ? atoi(e) : 4;
+        SYSTEM_INFO si; GetSystemInfo(&si); n = e ? atoi(e) : (int)si.dwNumberOfProcessors;
 #else
         long c = sysconf(_SC_NPROCESSORS_ONLN); n = e ? atoi(e) : (int)(c > 0 ? c : 1);
 #endif
@@ -409,7 +417,10 @@ static int n_threads(void) {
     }
     return n;
 }
-#ifndef _WIN32
+#ifdef _WIN32
+static DWORD WINAPI gemm_thread(LPVOID p) { gemm_rows((GJob *)p); return 0; }
+static DWORD WINAPI gemm_thread_f(LPVOID p) { gemm_rows_f((GJobF *)p); return 0; }
+#else
 static void *gemm_thread(void *p) { gemm_rows((GJob *)p); return NULL; }
 static void *gemm_thread_f(void *p) { gemm_rows_f((GJobF *)p); return NULL; }
 #endif
@@ -423,7 +434,11 @@ static void gemm(const double *A, const double *B, double *C, int64_t M, int64_t
     gemm_rows(&jobs[0]);
     for (int t = 1; t < T; t++) pthread_join(th[t], NULL);
 #else
-    for (int t = 0; t < T; t++) gemm_rows(&jobs[t]);
+    HANDLE th[64];
+    for (int t = 1; t < T; t++) th[t] = CreateThread(NULL, 0, gemm_thread, &jobs[t], 0, NULL);
+    gemm_rows(&jobs[0]);
+    if (T > 1) WaitForMultipleObjects((DWORD)(T - 1), th + 1, TRUE, INFINITE);
+    for (int t = 1; t < T; t++) CloseHandle(th[t]);
 #endif
 }
 static void gemm_f(const float *A, const float *B, float *C, int64_t M, int64_t N, int64_t K) {
@@ -436,7 +451,11 @@ static void gemm_f(const float *A, const float *B, float *C, int64_t M, int64_t 
     gemm_rows_f(&jobs[0]);
     for (int t = 1; t < T; t++) pthread_join(th[t], NULL);
 #else
-    for (int t = 0; t < T; t++) gemm_rows_f(&jobs[t]);
+    HANDLE th[64];
+    for (int t = 1; t < T; t++) th[t] = CreateThread(NULL, 0, gemm_thread_f, &jobs[t], 0, NULL);
+    gemm_rows_f(&jobs[0]);
+    if (T > 1) WaitForMultipleObjects((DWORD)(T - 1), th + 1, TRUE, INFINITE);
+    for (int t = 1; t < T; t++) CloseHandle(th[t]);
 #endif
 }
 static AV matmul(AV av, AV bv) {

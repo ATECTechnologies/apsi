@@ -1159,6 +1159,12 @@ void a_delitem(AV o, AV i) {
 
 /* =================================================================== generators: each runs on a stack of its own */
 #ifdef _WIN32
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
 #include <windows.h>
 #else
 #include <ucontext.h>
@@ -1236,8 +1242,7 @@ static int gen_resume(AGen *g, AV send, AV *out) {
         g->state = 2;
         a_handler = NULL;
 #ifdef _WIN32
-        g->caller_fiber = GetCurrentFiber();
-        if (!g->caller_fiber || g->caller_fiber == (void *)0x1E00) g->caller_fiber = ConvertThreadToFiber(NULL);
+        g->caller_fiber = IsThreadAFiber() ? GetCurrentFiber() : ConvertThreadToFiber(NULL);
         g->fiber = CreateFiber(GEN_STACK, gen_entry, g);
         SwitchToFiber(g->fiber);
 #else
@@ -2030,6 +2035,12 @@ static AV b_save_json(int n, AV *a, ADict *kw, AV self) { (void)n; (void)kw; SB 
 
 /* ---- the system */
 #ifdef _WIN32
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
 #include <windows.h>
 static int ncpu(void) { SYSTEM_INFO si; GetSystemInfo(&si); return (int)si.dwNumberOfProcessors; }
 #else
