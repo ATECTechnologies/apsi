@@ -75,6 +75,12 @@ stays exact float32. `apsi cuda` shows what is found and `apsi cuda install` add
 [GPU.md](GPU.md#cuda-libraries)). Freed card memory is kept for reuse (up to a quarter of the card, or
 `APSI_GPU_CACHE_MB`) and given back when an allocation would fail.
 
+### Numbers
+
+Ints have no size limit, as in `apsi run`: a result beyond 64 bits becomes an Int of any size (`2 ** 200`,
+`math.factorial(100)`, `int("…")` of a long text), and goes back to the fast 64-bit form when it fits again. `use hp`
+gives decimals of any precision with Python's decimal arithmetic.
+
 ### Gradients
 
 `grad`, `value_and_grad` and `stop_gradient` work on numbers, quantities with units, tensors and trees of parameters

@@ -202,7 +202,7 @@ static AV dv_av(const DV *x) {
     return a_obj(o);
 }
 static void dv_load(DV *x, AV v) {                          /* an hp number or an integer, exactly */
-    if (a_is(v, O_DEC)) { ADec *o = DEC(v); x->sign = o->sign; x->exp = o->exp; bn_reserve(&x->c, o->n); if (o->n) memcpy(x->c.d, o->d, sizeof(uint32_t) * (size_t)o->n); x->c.n = o->n; return; }
+    if (a_is(v, O_DEC) || a_is(v, O_BIG)) { ADec *o = DEC(v); x->sign = o->sign; x->exp = o->exp; bn_reserve(&x->c, o->n); if (o->n) memcpy(x->c.d, o->d, sizeof(uint32_t) * (size_t)o->n); x->c.n = o->n; return; }
     if (v.t == T_INT || v.t == T_BOOL) { dv_set_int(x, v.i); return; }
     a_error("TypeError", "unsupported operand type for Decimal: '%s'", a_tname(v));
 }
@@ -439,7 +439,7 @@ static double dv_double(const DV *x) { char *s = dv_text(x); double d = strtod(s
 
 /* ------------------------------------------------------------------------------------------- hooks */
 static void dv_operand(DV *x, AV v, int op, AV a, AV b) {
-    if (a_is(v, O_DEC) || v.t == T_INT || v.t == T_BOOL) { dv_load(x, v); return; }
+    if (a_is(v, O_DEC) || a_is(v, O_BIG) || v.t == T_INT || v.t == T_BOOL) { dv_load(x, v); return; }
     static const char *sym[] = {"", "+", "-", "*", "/", "//", "%", "**"};
     a_error("TypeError", "unsupported operand type(s) for %s: '%s' and '%s'", op >= 1 && op <= 7 ? sym[op] : "?",
             a_is(a, O_DEC) ? "decimal.Decimal" : a_tname(a), a_is(b, O_DEC) ? "decimal.Decimal" : a_tname(b));
@@ -447,9 +447,9 @@ static void dv_operand(DV *x, AV v, int op, AV a, AV b) {
 int a_dec_cmp(AV a, AV b, int *ok) {
     DV x, y; dv_init(&x); dv_init(&y); *ok = 1;
     if (a.t == T_FLOAT) { if (isnan(a.f)) { *ok = 0; return 0; } if (isinf(a.f)) return a.f < 0 ? -1 : 1; dv_from_double(&x, a.f); }
-    else if (a_is(a, O_DEC) || a.t == T_INT || a.t == T_BOOL) dv_load(&x, a); else { *ok = 0; return 0; }
+    else if (a_is(a, O_DEC) || a_is(a, O_BIG) || a.t == T_INT || a.t == T_BOOL) dv_load(&x, a); else { *ok = 0; return 0; }
     if (b.t == T_FLOAT) { if (isnan(b.f)) { *ok = 0; dv_free(&x); return 0; } if (isinf(b.f)) { dv_free(&x); return b.f < 0 ? 1 : -1; } dv_from_double(&y, b.f); }
-    else if (a_is(b, O_DEC) || b.t == T_INT || b.t == T_BOOL) dv_load(&y, b); else { *ok = 0; dv_free(&x); return 0; }
+    else if (a_is(b, O_DEC) || a_is(b, O_BIG) || b.t == T_INT || b.t == T_BOOL) dv_load(&y, b); else { *ok = 0; dv_free(&x); return 0; }
     int c = dv_cmp(&x, &y); dv_free(&x); dv_free(&y); return c;
 }
 AV a_dec_binop(int op, AV a, AV b) {
@@ -626,6 +626,7 @@ BI(lb_dec) {
         if (a_is(v, O_STR)) dv_parse(&x, ((AStr *)v.o)->s);
         else if (v.t == T_FLOAT) dv_from_double(&x, v.f);
         else if (v.t == T_INT || v.t == T_BOOL) dv_set_int(&x, v.t == T_BOOL ? (v.i != 0) : v.i);
+        else if (a_is(v, O_BIG)) dv_load(&x, v);
         else a_error("TypeError", "hp works with plain numbers (got '%s')", a_tname(v));
         AV r = dv_av(&x); dv_free(&x); return r;
     }
@@ -637,4 +638,139 @@ BI(lb_dec) {
         AV out = dv_av(&r); dv_free(&x); dv_free(&y); dv_free(&r); return out;
     }
     a_error("ValueError", "__dec: unknown operation '%s'", op); return A_NONE;
+}
+
+/* ------------------------------------------------------------------------------------------- integers of any size
+   An Int that does not fit in 64 bits becomes an O_BIG (the ADec layout with exponent 0); every result that fits
+   again is a plain Int, so the fast paths keep working and a value has one form. */
+static AV big_make(const DV *x) {                           /* the integer x (exp 0), as an Int when it fits */
+    if (x->c.n <= 3) {
+        unsigned __int128 v = 0; for (int64_t i = x->c.n - 1; i >= 0; i--) v = v * DB + x->c.d[i];
+        if (!x->sign && v <= (unsigned __int128)INT64_MAX) return a_int((int64_t)v);
+        if (x->sign && v <= (unsigned __int128)INT64_MAX + 1) return a_int(v == (unsigned __int128)INT64_MAX + 1 ? INT64_MIN : -(int64_t)v);
+    }
+    ADec *o = (ADec *)a_alloc(sizeof(ADec) + sizeof(uint32_t) * (size_t)x->c.n, O_BIG);
+    o->sign = x->sign; o->exp = 0; o->n = x->c.n; memcpy(o->d, x->c.d, sizeof(uint32_t) * (size_t)x->c.n);
+    return a_obj(o);
+}
+static void big_load(DV *x, AV v) {
+    if (a_is(v, O_BIG)) { ADec *o = DEC(v); x->sign = o->sign; x->exp = 0; bn_reserve(&x->c, o->n); memcpy(x->c.d, o->d, sizeof(uint32_t) * (size_t)o->n); x->c.n = o->n; return; }
+    if (v.t == T_INT || v.t == T_BOOL) { dv_set_int(x, v.t == T_BOOL ? (v.i != 0) : v.i); return; }
+    a_error("TypeError", "an integer is required, not '%s'", a_tname(v));
+}
+static int big_isint(AV v) { return v.t == T_INT || v.t == T_BOOL || a_is(v, O_BIG); }
+double a_big_float(AV v) {
+    DV x; dv_init(&x); big_load(&x, v); double d = dv_double(&x); dv_free(&x);
+    if (isinf(d)) a_error("OverflowError", "int too large to convert to float");
+    return d;
+}
+char *a_big_text(AV v) { DV x; dv_init(&x); big_load(&x, v); int64_t len; char *s = bn_text(&x.c, &len); char *r = (char *)malloc((size_t)len + 2); r[0] = '-'; memcpy(r + (x.sign ? 1 : 0), s, (size_t)len + 1); free(s); dv_free(&x); return r; }
+uint64_t a_big_hash(AV v) { char *s = a_big_text(v); uint64_t h = 1469598103934665603ULL; for (char *p = s; *p; p++) h = (h ^ (unsigned char)*p) * 1099511628211ULL; free(s); return h; }
+AV a_big_parse(const char *s) {                              /* decimal digits with a sign (int("…") too long for 64 bits) */
+    DV x; dv_init(&x); const char *p = s; while (*p == ' ') p++;
+    x.sign = 0; if (*p == '+' || *p == '-') { x.sign = *p == '-'; p++; }
+    const char *st = p; while ((*p >= '0' && *p <= '9') || *p == '_') p++;
+    const char *e = p; while (*e == ' ') e++;
+    if (p == st || *e) { dv_free(&x); return A_NONE; }
+    char *dig = (char *)malloc((size_t)(p - st) + 1); int64_t n = 0; for (const char *q = st; q < p; q++) if (*q != '_') dig[n++] = *q;
+    bn_from_digits(&x.c, dig, n); free(dig);
+    AV r = big_make(&x); dv_free(&x); return r;
+}
+AV a_big_from_double(double d) {                             /* int(x) of a float beyond 64 bits */
+    if (isnan(d) || isinf(d)) a_error("ValueError", "cannot convert float %f to integer", d);
+    DV x; dv_init(&x); dv_from_double(&x, d); if (x.exp < 0) { BN q; bn_init(&q); bn_split10(&x.c, -x.exp, &q); bn_free(&x.c); x.c = q; x.exp = 0; } else { bn_mul_pow10(&x.c, x.exp); x.exp = 0; }
+    AV r = big_make(&x); dv_free(&x); return r;
+}
+static void big_divmod(const DV *a, const DV *b, DV *q, DV *r) {   /* floor division, as Python */
+    if (dv_zero(b)) a_error("ZeroDivisionError", "integer division or modulo by zero");
+    BN qq, rr; bn_init(&qq); bn_init(&rr); bn_divmod(&a->c, &b->c, &qq, &rr);
+    int neg = a->sign != b->sign;
+    if (neg && rr.n) { bn_add_small(&qq, 1); BN t; bn_init(&t); bn_sub(&t, &b->c, &rr); bn_free(&rr); rr = t; }
+    if (q) { bn_free(&q->c); q->c = qq; q->sign = neg && qq.n; q->exp = 0; } else bn_free(&qq);
+    if (r) { bn_free(&r->c); r->c = rr; r->sign = b->sign && rr.n; r->exp = 0; } else bn_free(&rr);
+}
+static void big_bits(const DV *x, uint32_t **w, int64_t *nw) {      /* |x| in base 2^32 words, little-endian */
+    BN t; bn_init(&t); bn_copy(&t, &x->c); int64_t cap = t.n + 2, k = 0; uint32_t *o = (uint32_t *)calloc((size_t)cap, 4);
+    while (t.n) { uint32_t lo = bn_div_small(&t, 65536); uint32_t hi = bn_div_small(&t, 65536); o[k++] = lo | (hi << 16); }
+    bn_free(&t); *w = o; *nw = k;
+}
+static void big_from_bits(DV *x, const uint32_t *w, int64_t nw) {
+    bn_set_u64(&x->c, 0); x->c.n = 0; x->exp = 0;
+    for (int64_t i = nw - 1; i >= 0; i--) { bn_mul_small(&x->c, 65536); bn_add_small(&x->c, w[i] >> 16); bn_mul_small(&x->c, 65536); bn_add_small(&x->c, w[i] & 0xFFFF); }
+}
+AV a_big_binop(int op, AV a, AV b) {
+    if (a.t == T_FLOAT || b.t == T_FLOAT) {                 /* an Int that big meets a Float: as Python, via float */
+        if (op >= OP_EQ && op <= OP_GE) { int ok; int c = a_dec_cmp(a_is(a, O_BIG) ? a_dec_from_big(a) : a, a_is(b, O_BIG) ? a_dec_from_big(b) : b, &ok); if (!ok) return a_bool(op == OP_NE); return a_bool(op == OP_EQ ? c == 0 : op == OP_NE ? c != 0 : op == OP_LT ? c < 0 : op == OP_LE ? c <= 0 : op == OP_GT ? c > 0 : c >= 0); }
+        return a_binop(op, a_is(a, O_BIG) ? a_float(a_big_float(a)) : a, a_is(b, O_BIG) ? a_float(a_big_float(b)) : b);
+    }
+    if (!big_isint(a) || !big_isint(b)) {
+        if (op == OP_EQ) return a_bool(0);
+        if (op == OP_NE) return a_bool(1);
+        if (op == OP_MUL && (a_is(b, O_STR) || a_is(b, O_LIST) || a_is(a, O_STR) || a_is(a, O_LIST))) a_error("OverflowError", "cannot fit 'int' into an index-sized integer");
+        a_error("TypeError", "unsupported operand type(s) for an Int: '%s' and '%s'", a_tname(a), a_tname(b));
+    }
+    DV x, y, r; dv_init(&x); dv_init(&y); dv_init(&r); big_load(&x, a); big_load(&y, b);
+    AV out;
+    switch (op) {
+    case OP_ADD: dv_add(&r, &x, &y, 0, 0); out = big_make(&r); break;
+    case OP_SUB: dv_add(&r, &x, &y, 1, 0); out = big_make(&r); break;
+    case OP_MUL: dv_mul(&r, &x, &y, 0); out = big_make(&r); break;
+    case OP_FLOORDIV: big_divmod(&x, &y, &r, NULL); out = big_make(&r); break;
+    case OP_MOD: big_divmod(&x, &y, NULL, &r); out = big_make(&r); break;
+    case OP_DIV: {
+        if (dv_zero(&y)) a_error("ZeroDivisionError", "division by zero");
+        dv_div(&r, &x, &y, 40); double d = dv_double(&r); if (isinf(d)) a_error("OverflowError", "integer division result too large for a float");
+        out = a_float(d); break;
+    }
+    case OP_POW: {
+        if (y.sign) { out = a_float(pow(a_big_float(a), a_big_float(b))); break; }
+        if (y.c.n > 1 || (y.c.n == 1 && y.c.d[0] > 100000000)) a_error("OverflowError", "exponent too large");
+        int64_t k = y.c.n ? y.c.d[0] : 0;
+        if (bn_ndigits(&x.c) * (double)k > 5e7) a_error("MemoryError", "the result would have more than 50 million digits");
+        dv_powi(&r, &x, k, 0); r.exp = 0; out = big_make(&r); break;
+    }
+    case OP_SHL: case OP_SHR: {
+        if (y.sign) a_error("ValueError", "negative shift count");
+        if (y.c.n > 1 || y.c.d[0] > 100000000) a_error("OverflowError", "shift count too large");
+        DV p; dv_init(&p); DV two; dv_init(&two); dv_set_int(&two, 2); dv_powi(&p, &two, y.c.n ? y.c.d[0] : 0, 0); p.exp = 0;
+        if (op == OP_SHL) dv_mul(&r, &x, &p, 0); else big_divmod(&x, &p, &r, NULL);
+        dv_free(&p); dv_free(&two); out = big_make(&r); break;
+    }
+    case OP_AND: case OP_OR: case OP_XOR: {
+        if (x.sign || y.sign) a_error("ValueError", "& | ^ of negative integers beyond 64 bits are not supported natively");
+        uint32_t *wa, *wb; int64_t na, nb; big_bits(&x, &wa, &na); big_bits(&y, &wb, &nb);
+        int64_t n = na > nb ? na : nb; uint32_t *wr = (uint32_t *)calloc((size_t)n + 1, 4);
+        for (int64_t i = 0; i < n; i++) { uint32_t p = i < na ? wa[i] : 0, q = i < nb ? wb[i] : 0; wr[i] = op == OP_AND ? (p & q) : op == OP_OR ? (p | q) : (p ^ q); }
+        big_from_bits(&r, wr, n); r.sign = 0; free(wa); free(wb); free(wr); out = big_make(&r); break;
+    }
+    case OP_EQ: case OP_NE: case OP_LT: case OP_LE: case OP_GT: case OP_GE: {
+        int c = dv_cmp(&x, &y);
+        out = a_bool(op == OP_EQ ? c == 0 : op == OP_NE ? c != 0 : op == OP_LT ? c < 0 : op == OP_LE ? c <= 0 : op == OP_GT ? c > 0 : c >= 0); break;
+    }
+    default: a_error("TypeError", "unsupported operation on an Int"); out = A_NONE;
+    }
+    dv_free(&x); dv_free(&y); dv_free(&r); return out;
+}
+AV a_big_neg(AV a) { DV x; dv_init(&x); big_load(&x, a); x.sign = !x.sign && x.c.n; AV r = big_make(&x); dv_free(&x); return r; }
+AV a_dec_from_big(AV a) { DV x; dv_init(&x); big_load(&x, a); AV r = dv_av(&x); dv_free(&x); return r; }
+char *a_big_format(AV v, const char *spec) {                 /* "", "d", ",", "_" grouping, width / alignment / sign */
+    char *t = a_big_text(v); const char *p = spec; char fill = ' ', align = 0, sgn = '-', grp = 0; int64_t width = 0;
+    if (p[0] && (p[1] == '<' || p[1] == '>' || p[1] == '^' || p[1] == '=')) { fill = p[0]; align = p[1]; p += 2; }
+    else if (*p == '<' || *p == '>' || *p == '^' || *p == '=') align = *p++;
+    if (*p == '+' || *p == '-' || *p == ' ') sgn = *p++;
+    int zero = 0; if (*p == '0') { zero = 1; p++; }
+    while (*p >= '0' && *p <= '9') width = width * 10 + (*p++ - '0');
+    if (*p == ',' || *p == '_') grp = *p++;
+    if (*p && *p != 'd' && *p != 'n') { double d = a_big_float(v); free(t); AV r = a_format(a_float(d), spec); return strdup(((AStr *)r.o)->s); }
+    int neg = t[0] == '-'; const char *dg = t + neg; int64_t L = (int64_t)strlen(dg);
+    DSB b = {0};
+    for (int64_t i = 0; i < L; i++) { if (grp && i && (L - i) % 3 == 0) ds_put(&b, &grp, 1); ds_put(&b, dg + i, 1); }
+    const char *sign = neg ? "-" : sgn == '+' ? "+" : sgn == ' ' ? " " : "";
+    int64_t blen = b.n + (int64_t)strlen(sign), pad = width > blen ? width - blen : 0;
+    if (zero && !align) { align = '='; fill = '0'; }
+    if (!align) align = '>';
+    DSB o = {0};
+    if (align == '=') { ds_puts(&o, sign); for (int64_t i = 0; i < pad; i++) ds_put(&o, &fill, 1); ds_put(&o, b.p, b.n); }
+    else { int64_t lp = align == '<' ? 0 : align == '^' ? pad / 2 : pad; for (int64_t i = 0; i < lp; i++) ds_put(&o, &fill, 1); ds_puts(&o, sign); ds_put(&o, b.p, b.n); for (int64_t i = 0; i < pad - lp; i++) ds_put(&o, &fill, 1); }
+    free(t); free(b.p); return o.p ? o.p : strdup("");
 }

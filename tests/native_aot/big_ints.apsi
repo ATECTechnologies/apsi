@@ -1,0 +1,24 @@
+use math
+fn fib(n):
+    var a = 0
+    var b = 1
+    for i in range(n):
+        let t = a + b
+        a = b
+        b = t
+    return a
+print(fib(90), fib(100), fib(300))
+let f = 2 ** 100
+print(f, -f, f * f, f // 3, f % 7, -f // 7, -f % 7, f - f, f + 1 - f, type(f), isinstance(f, int))
+print(2 ** 64, 2 ** 63, -(2 ** 63), 9223372036854775807 + 1, -9223372036854775807 - 2, 1 << 70, f >> 90, f / 3, f == 2 ** 100, f > 10 ** 30, f < 1e31, f == 1.2676506002282294e30)
+print(float(f), int(f), abs(-f), str(f), len(str(10 ** 50)), int("123456789012345678901234567890"), int(1e25), hash(f) == hash(2 ** 100))
+print(f"{f:,}", f"{10 ** 20:>30}", f"{-(10 ** 19):_}", round(f), max(f, 3), sorted([f, 1, 10 ** 19]), sum([2 ** 62, 2 ** 62, 2 ** 62]))
+var acc = 1
+for i in range(1, 30):
+    acc = acc * i
+print(acc, acc // (10 ** 20))
+print(f & (2 ** 101 - 1), f | 1, f & 12345)
+let dd = {f: "big"}
+print(dd[2 ** 100])
+print(math.factorial(25), math.comb(100, 50), math.factorial(30))
+print(sum(range(10 ** 6)) * 10 ** 10, max([2 ** 70, 3]), min(-2 ** 70, 0), divmod(2 ** 70, 7), pow(2, 70), pow(2, 70, 1000), str(-(2 ** 64)).zfill(3))

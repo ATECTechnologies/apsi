@@ -1,6 +1,7 @@
 /* Apsi native runtime (see apsi_rt.h). */
 #include "apsi_rt.h"
 #include <stdio.h>
+#include <errno.h>
 #include <stdlib.h>
 #include <string.h>
 #include <stdarg.h>
@@ -437,7 +438,7 @@ int a_isinstance(AV v, AV cls) {
     }
     if (a_is(cls, O_BUILTIN)) {               /* int, float, str, list, dict, ... */
         const char *n = ((ABuiltin *)cls.o)->name;
-        if (!strcmp(n, "int")) return v.t == T_INT || v.t == T_BOOL;
+        if (!strcmp(n, "int")) return v.t == T_INT || v.t == T_BOOL || a_is(v, O_BIG);
         if (!strcmp(n, "float")) return v.t == T_FLOAT;
         if (!strcmp(n, "bool")) return v.t == T_BOOL;
         if (!strcmp(n, "str")) return a_is(v, O_STR);
@@ -470,6 +471,7 @@ uint64_t a_hash(AV v) {
     switch (v.o->kind) {
     case O_STR: case O_BYTES: { AStr *s = STR(v); if (!s->hash) s->hash = fnv(s->s, s->len); return s->hash; }
     case O_DEC: return a_dec_hash(v);
+    case O_BIG: return a_big_hash(v);
     case O_COMPLEX: { double re = a_cplx_builtin("real", 1, &v, NULL).f, im = a_cplx_builtin("imag", 1, &v, NULL).f; if (im == 0) return a_hash(a_float(re)); uint64_t x, y; memcpy(&x, &re, 8); memcpy(&y, &im, 8); return x * 1000003ull ^ y; }
     case O_TUPLE: {
         uint64_t h = 0x345678;
@@ -484,6 +486,7 @@ static int num(AV v) { return v.t == T_INT || v.t == T_BOOL || v.t == T_FLOAT; }
 static double fval(AV v) { return v.t == T_FLOAT ? v.f : (double)v.i; }
 int a_eq(AV a, AV b) {
     if (a_is(a, O_DEC) || a_is(b, O_DEC)) { int ok; int c = a_dec_cmp(a, b, &ok); return ok && c == 0; }
+    if (a_is(a, O_BIG) || a_is(b, O_BIG)) { AV o = a_is(a, O_BIG) ? b : a; if (o.t == T_INT || o.t == T_BOOL || o.t == T_FLOAT || a_is(o, O_BIG)) return a_truthy(a_big_binop(OP_EQ, a, b)); return 0; }
     if ((a.t == T_OBJ && (a.o->kind == O_COMPLEX || a.o->kind == O_CTENSOR)) || (b.t == T_OBJ && (b.o->kind == O_COMPLEX || b.o->kind == O_CTENSOR))) return a_cplx_eq(a, b);
     if (a_is_tn(a) || a_is_tn(b)) return a_tensor_eq(a, b);
     if ((a_is(a, O_STR) && a_is(b, O_CLASS)) || (a_is(a, O_CLASS) && a_is(b, O_STR))) {   /* type(x) == SomeClass */
@@ -555,6 +558,7 @@ int a_truthy(AV v) {
     case O_STR: case O_BYTES: return STR(v)->len != 0;
     case O_BYTEARRAY: return STR(BA(v)->data)->len != 0;
     case O_DEC: return a_dec_truthy(v);
+    case O_BIG: return 1;
     case O_LIST: case O_TUPLE: return LIST(v)->len != 0;
     case O_DICT: case O_SET: return DICT(v)->len != 0;
     case O_RANGE: return a_len(v) != 0;
@@ -652,6 +656,7 @@ static void repr_into(SB *b, AV v, int repr) {
         sb_put(b, &q, 1); return;
     }
     case O_DEC: { char *t = a_dec_text(v); sb_puts(b, t); free(t); return; }
+    case O_BIG: { char *t = a_big_text(v); sb_puts(b, t); free(t); return; }
     case O_BYTEARRAY: sb_puts(b, "bytearray("); repr_into(b, BA(v)->data, 1); sb_puts(b, ")"); return;
     case O_LIST: case O_TUPLE: {
         int tup = v.o->kind == O_TUPLE;
@@ -746,6 +751,7 @@ AV a_format(AV v, const char *spec) {
     if (!spec || !*spec) return a_to_str(v);
     if (a_is(v, O_QTY)) { SB b = {0}; qty_text(&b, (AQty *)v.o, QTY(v)->tv.t == T_OBJ ? NULL : spec); return sb_done(&b); }
     if (a_is(v, O_DEC)) { char *t = a_dec_format(v, spec); AV r = a_str(t); free(t); return r; }
+    if (a_is(v, O_BIG)) { char *t = a_big_format(v, spec); AV r = a_str(t); free(t); return r; }
     /* [[fill]align][sign][0][width][,][.precision][type] */
     char fill = ' ', align = 0, sign = '-', type = 0; int width = -1, prec = -1, comma = 0, zero = 0;
     const char *p = spec;
@@ -1060,7 +1066,7 @@ static const char *tname(AV v) {
     default: break;
     }
     switch (v.o->kind) {
-    case O_STR: return "str"; case O_BYTES: return "bytes"; case O_BYTEARRAY: return "bytearray"; case O_DEC: return "decimal.Decimal"; case O_COMPLEX: return "complex"; case O_CTENSOR: return "tensor"; case O_LIST: return "list"; case O_TUPLE: return "tuple"; case O_DICT: return "dict";
+    case O_STR: return "str"; case O_BYTES: return "bytes"; case O_BYTEARRAY: return "bytearray"; case O_DEC: return "decimal.Decimal"; case O_BIG: return "int"; case O_COMPLEX: return "complex"; case O_CTENSOR: return "tensor"; case O_LIST: return "list"; case O_TUPLE: return "tuple"; case O_DICT: return "dict";
     case O_SET: return "set"; case O_FUNC: case O_BUILTIN: case O_BOUND: return "function"; case O_CLASS: return "type";
     case O_INST: return ((AInst *)v.o)->cls->name->s; case O_RANGE: return "range";
     default: return "object";
@@ -1070,6 +1076,9 @@ static const char *const a_dn[] = {"", "__add__", "__sub__", "__mul__", "__trued
 static const char *const a_rn[] = {"", "__radd__", "__rsub__", "__rmul__", "__rtruediv__", "__rfloordiv__", "__rmod__", "__rpow__", "__rmatmul__", "__rand__", "__ror__", "__rxor__", "__rlshift__", "__rrshift__"};
 AV a_binop(int op, AV a, AV b) {
     if ((a.t == T_OBJ && a.o->kind == O_DEC) || (b.t == T_OBJ && b.o->kind == O_DEC)) return a_dec_binop(op, a, b);
+    if ((a.t == T_OBJ && a.o->kind == O_BIG) || (b.t == T_OBJ && b.o->kind == O_BIG)) {
+        if (!((a_is(a, O_INST) || a_is(b, O_INST)) && op >= OP_ADD && op <= OP_SHR) && !a_is_tn(a) && !a_is_tn(b)) return a_big_binop(op, a, b);
+    }
     if ((a_is(a, O_INST) || a_is(b, O_INST)) && op >= OP_ADD && op <= OP_SHR) {   /* a class's operators win over tensors */
         int ok; AV r = inst_op(a, b, a_dn[op], a_rn[op], &ok); if (ok) return r;
     }
@@ -1080,9 +1089,9 @@ AV a_binop(int op, AV a, AV b) {
     if ((a.t == T_INT || a.t == T_BOOL) && (b.t == T_INT || b.t == T_BOOL)) {
         int64_t x = a.i, y = b.i, r;
         switch (op) {
-        case OP_ADD: if (__builtin_add_overflow(x, y, &r)) a_error("OverflowError", "integer overflow in +"); return a_int(r);
-        case OP_SUB: if (__builtin_sub_overflow(x, y, &r)) a_error("OverflowError", "integer overflow in -"); return a_int(r);
-        case OP_MUL: if (__builtin_mul_overflow(x, y, &r)) a_error("OverflowError", "integer overflow in *"); return a_int(r);
+        case OP_ADD: if (__builtin_add_overflow(x, y, &r)) return a_big_binop(op, a, b); return a_int(r);
+        case OP_SUB: if (__builtin_sub_overflow(x, y, &r)) return a_big_binop(op, a, b); return a_int(r);
+        case OP_MUL: if (__builtin_mul_overflow(x, y, &r)) return a_big_binop(op, a, b); return a_int(r);
         case OP_DIV: if (y == 0) a_error("ZeroDivisionError", "division by zero"); return a_float((double)x / (double)y);
         case OP_FLOORDIV: return a_int(floordiv_i(x, y));
         case OP_MOD: return a_int(mod_i(x, y));
@@ -1090,16 +1099,16 @@ AV a_binop(int op, AV a, AV b) {
             if (y < 0) return a_float(pow((double)x, (double)y));
             int64_t acc = 1, base = x; int64_t e = y;
             while (e) {
-                if (e & 1) { if (__builtin_mul_overflow(acc, base, &acc)) a_error("OverflowError", "integer overflow in **"); }
+                if (e & 1) { if (__builtin_mul_overflow(acc, base, &acc)) return a_big_binop(op, a, b); }
                 e >>= 1;
-                if (e && __builtin_mul_overflow(base, base, &base)) a_error("OverflowError", "integer overflow in **");
+                if (e && __builtin_mul_overflow(base, base, &base)) return a_big_binop(op, a, b);
             }
             return a_int(acc);
         }
         case OP_AND: return a.t == T_BOOL && b.t == T_BOOL ? a_bool(x & y) : a_int(x & y);
         case OP_OR: return a.t == T_BOOL && b.t == T_BOOL ? a_bool(x | y) : a_int(x | y);
         case OP_XOR: return a.t == T_BOOL && b.t == T_BOOL ? a_bool(x ^ y) : a_int(x ^ y);
-        case OP_SHL: if (y < 0) a_error("ValueError", "negative shift count"); return a_int(y >= 63 ? 0 : x << y);
+        case OP_SHL: if (y < 0) a_error("ValueError", "negative shift count"); if (x == 0) return a_int(0); if (y < 63 && ((x << y) >> y) == x) return a_int(x << y); return a_big_binop(op, a, b);
         case OP_SHR: if (y < 0) a_error("ValueError", "negative shift count"); return a_int(y >= 63 ? (x < 0 ? -1 : 0) : x >> y);
         default: break;
         }
@@ -1189,7 +1198,8 @@ AV a_unop(int op, AV a) {
     case OP_NEG:
         if (qt(a)) return a_qty_make(a_unop(OP_NEG, QTY(a)->tv), QTY(a)->dim);
         if (a_is(a, O_QTY)) return a_qty(-QTY(a)->v, QTY(a)->dim, NULL, 1);
-        if (a.t == T_INT || a.t == T_BOOL) { if (a.i == INT64_MIN) a_error("OverflowError", "integer overflow in -"); return a_int(-a.i); }
+        if (a.t == T_INT || a.t == T_BOOL) { if (a.i == INT64_MIN) return a_big_neg(a); return a_int(-a.i); }
+        if (a_is(a, O_BIG)) return a_big_neg(a);
         if (a.t == T_FLOAT) return a_float(-a.f);
         if (a_is(a, O_INST)) { AV f = a_getattr(a, "__neg__"); if (f.t != 255) return a_call(f, 0, NULL, NULL); }
         break;
@@ -1274,6 +1284,7 @@ AV a_cmp_slow(int op, AV a, AV b) {
 }
 int a_compare(int op, AV a, AV b) {
     if ((op == OP_LT || op == OP_LE || op == OP_GT || op == OP_GE) && (a_is(a, O_DEC) || a_is(b, O_DEC))) return a_truthy(a_dec_binop(op, a, b));
+    if ((op == OP_LT || op == OP_LE || op == OP_GT || op == OP_GE) && (a_is(a, O_BIG) || a_is(b, O_BIG))) return a_truthy(a_big_binop(op, a, b));
     { AV r; if (op != OP_EQ && op != OP_NE && inst_cmp(op, a, b, &r)) return a_truthy(r); }
     if ((qt(a) || qt(b)) && op != OP_IN && op != OP_NOTIN && op != OP_IS && op != OP_ISNOT) return a_tensor_truthy(a_qty_cmp(op, a, b));
     if (tensor_cmp_applies(op, a, b)) return a_tensor_truthy(a_tensor_cmp(op, a, b));
@@ -1878,6 +1889,12 @@ AV a_call(AV f, int n, AV *args, ADict *kw) {
         ABuiltin *b = (ABuiltin *)f.o;
         if ((n >= 1 && (a_is(args[0], O_QTY) || a_is(args[0], O_LIST))) || (n >= 2 && a_is(args[1], O_QTY))) { AV r = qty_builtin(b, n, args, kw); if (r.t != T_NONE) return r; }
         if (n >= 1 && a_is(args[0], O_DEC) && a_dec_wants(b->name, n, args)) return a_dec_builtin(b->name, n, args);
+        if (n >= 1 && a_is(args[0], O_BIG)) {
+            const char *bn = b->name;
+            if (!strcmp(bn, "abs")) return a_truthy(a_big_binop(OP_LT, args[0], a_int(0))) ? a_big_neg(args[0]) : args[0];
+            if (!strcmp(bn, "float")) return a_float(a_big_float(args[0]));
+            if (!strcmp(bn, "int") || (!strcmp(bn, "round") && (n < 2 || args[1].t == T_NONE || (args[1].t == T_INT && args[1].i >= 0)))) return args[0];
+        }
         if ((n >= 1 || kw) && a_cplx_wants(b->name, n, args, kw)) { AV r = a_cplx_builtin(b->name, n, args, kw); if (r.t != 255) return r; }
         return b->fn(n, args, kw, b->self);
     }
@@ -2472,11 +2489,13 @@ static AV b_int(int n, AV *a, ADict *kw, AV self) {
     AV v = a[0];
     if (v.t == T_INT) return v;
     if (v.t == T_BOOL) return a_int(v.i);
-    if (v.t == T_FLOAT) { if (isnan(v.f) || isinf(v.f)) a_error("ValueError", "cannot convert float %f to integer", v.f); return a_int((int64_t)v.f); }
+    if (v.t == T_FLOAT) { if (isnan(v.f) || isinf(v.f)) a_error("ValueError", "cannot convert float %f to integer", v.f); if (fabs(v.f) >= 9.2e18) return a_big_from_double(v.f); return a_int((int64_t)v.f); }
+    if (a_is(v, O_BIG)) return v;
     if (a_is(v, O_STR)) {
         int base = n > 1 ? (int)a[1].i : 10; char *end; AV st = strip_any(v, 0, NULL, 1, 1);
 
-        long long r = strtoll(STR(st)->s, &end, base);
+        errno = 0; long long r = strtoll(STR(st)->s, &end, base);
+        if (errno == ERANGE && base == 10) { AV big = a_big_parse(STR(st)->s); if (big.t != T_NONE) return big; }
         if (end == STR(st)->s || *end) a_error("ValueError", "invalid literal for int(): '%s'", STR(v)->s);
         return a_int(r);
     }
@@ -2587,7 +2606,7 @@ static AV b_type(int n, AV *a, ADict *kw, AV self) {      /* the type's name, as
     AV v = a[0];
     switch (v.t) { case T_NONE: return a_str("None"); case T_BOOL: return a_str("Bool"); case T_INT: return a_str("Int"); case T_FLOAT: return a_str("Float"); default: break; }
     switch (v.o->kind) {
-    case O_STR: return a_str("Str"); case O_BYTES: return a_str("bytes"); case O_BYTEARRAY: return a_str("bytearray"); case O_DEC: return a_str("Decimal"); case O_COMPLEX: case O_CTENSOR: return a_str(a_cplx_type(v)); case O_LIST: return a_str("List"); case O_TUPLE: return a_str("Tuple"); case O_DICT: return a_str("Dict");
+    case O_STR: return a_str("Str"); case O_BYTES: return a_str("bytes"); case O_BYTEARRAY: return a_str("bytearray"); case O_DEC: return a_str("Decimal"); case O_BIG: return a_str("Int"); case O_COMPLEX: case O_CTENSOR: return a_str(a_cplx_type(v)); case O_LIST: return a_str("List"); case O_TUPLE: return a_str("Tuple"); case O_DICT: return a_str("Dict");
     case O_SET: return a_str("set"); case O_RANGE: return a_str("range"); case O_FUNC: case O_BUILTIN: case O_BOUND: case O_CLASS: return a_str("Fn");
     case O_INST: return a_obj(((AInst *)v.o)->cls->name);
     case O_QTY: {
@@ -2622,7 +2641,18 @@ static AV b_input(int n, AV *a, ADict *kw, AV self) {
 }
 static AV b_hash(int n, AV *a, ADict *kw, AV self) { (void)n; (void)kw; (void)self; return a_int((int64_t)(a_hash(a[0]) >> 1)); }
 static AV b_divmod(int n, AV *a, ADict *kw, AV self) { (void)n; (void)kw; (void)self; AV p[2] = {a_binop(OP_FLOORDIV, a[0], a[1]), a_binop(OP_MOD, a[0], a[1])}; return a_tuple(2, p); }
-static AV b_pow(int n, AV *a, ADict *kw, AV self) { (void)n; (void)kw; (void)self; return a_binop(OP_POW, a[0], a[1]); }
+static AV b_pow(int n, AV *a, ADict *kw, AV self) {
+    (void)kw; (void)self;
+    if (n == 3 && a[2].t != T_NONE) {                            /* pow(b, e, m): modular, as Python */
+        if (a[0].t != T_INT || a[1].t != T_INT || a[2].t != T_INT) { AV p = a_binop(OP_POW, a[0], a[1]); return a_binop(OP_MOD, p, a[2]); }
+        int64_t m = a[2].i, e = a[1].i; if (m == 0) a_error("ValueError", "pow() 3rd argument cannot be 0");
+        if (e < 0) a_error("ValueError", "pow() with a negative exponent and a modulus is not supported natively");
+        __int128 r = 1 % (m < 0 ? -(__int128)m : m), b = ((__int128)a[0].i % m + m) % m, M = m < 0 ? -(__int128)m : m;
+        while (e) { if (e & 1) r = r * b % M; b = b * b % M; e >>= 1; }
+        int64_t out = (int64_t)r; if (m < 0 && out) out += m; return a_int(out);
+    }
+    return a_binop(OP_POW, a[0], a[1]);
+}
 #define MATH1(nm, fn) static AV b_##nm(int n, AV *a, ADict *kw, AV self) { (void)n; (void)kw; (void)self; if (a_is_tn(a[0])) return a_tensor_builtin(#nm, 1)(n, a, kw, self); if (a_is(a[0], O_QTY)) a_error("UnitError", #nm "() needs a dimensionless number"); if (!num(a[0])) a_error("TypeError", #nm "() needs a number"); return a_float(fn(fval(a[0]))); }
 static AV b_sqrt(int n, AV *a, ADict *kw, AV self) { if (n && a_is_tn(a[0])) return a_tensor_builtin("sqrt", 1)(n, a, kw, self);
     (void)n; (void)kw; (void)self;
@@ -2642,15 +2672,22 @@ static AV b_gamma(int n, AV *a, ADict *kw, AV self) { (void)n; (void)kw; (void)s
 static AV b_beta(int n, AV *a, ADict *kw, AV self) { (void)n; (void)kw; (void)self; double x = fval(a[0]), y = fval(a[1]); return a_float(exp(lgamma(x) + lgamma(y) - lgamma(x + y))); }
 static AV b_factorial(int n, AV *a, ADict *kw, AV self) {
     (void)n; (void)kw; (void)self;
-    if (a[0].t == T_INT) { if (a[0].i < 0) a_error("ValueError", "factorial() not defined for negative values"); int64_t r = 1; for (int64_t i = 2; i <= a[0].i; i++) if (__builtin_mul_overflow(r, i, &r)) a_error("OverflowError", "factorial(%lld) does not fit in 64 bits", (long long)a[0].i); return a_int(r); }
+    if (a[0].t == T_INT) { if (a[0].i < 0) a_error("ValueError", "factorial() not defined for negative values"); int64_t r = 1; int64_t i = 2; for (; i <= a[0].i; i++) if (__builtin_mul_overflow(r, i, &r)) break;
+        if (i > a[0].i) return a_int(r);
+        AV acc = a_int(1); int sp = a_ntmp; A_PUSH(acc);                        /* beyond 64 bits: an Int of any size */
+        for (int64_t j = 2; j <= a[0].i; j++) { acc = a_binop(OP_MUL, acc, a_int(j)); a_tmp[sp] = acc; }
+        a_ntmp = sp; return acc; }
     return a_float(tgamma(fval(a[0]) + 1));
 }
 static AV b_comb(int n, AV *a, ADict *kw, AV self) {
     (void)n; (void)kw; (void)self;
     if (a[0].t == T_INT && a[1].t == T_INT) {
         int64_t N = a[0].i, k = a[1].i; if (k < 0 || k > N) return a_int(0); if (k > N - k) k = N - k;
-        __int128 r = 1; for (int64_t i = 1; i <= k; i++) { r = r * (N - k + i) / i; if (r > INT64_MAX) a_error("OverflowError", "comb() does not fit in 64 bits"); }
-        return a_int((int64_t)r);
+        __int128 r = 1; int64_t i = 1; for (; i <= k; i++) { if (r > ((__int128)1 << 100) / (N - k + i + 1)) break; r = r * (N - k + i) / i; }
+        if (i > k && r <= INT64_MAX) return a_int((int64_t)r);
+        AV acc = a_int(1); int sp = a_ntmp; A_PUSH(acc);
+        for (int64_t j = 1; j <= k; j++) { acc = a_binop(OP_FLOORDIV, a_binop(OP_MUL, acc, a_int(N - k + j)), a_int(j)); a_tmp[sp] = acc; }
+        a_ntmp = sp; return acc;
     }
     double N = fval(a[0]), k = fval(a[1]); return a_float(exp(lgamma(N + 1) - lgamma(k + 1) - lgamma(N - k + 1)));
 }
