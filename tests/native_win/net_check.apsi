@@ -1,0 +1,26 @@
+# Windows checks that need the system's own libraries: HTTPS through WinHTTP, SQLite through winsqlite3.dll.
+use db
+use net
+
+try:
+    let page = http_get("https://example.com/")
+    print("https GET example.com:", "ok" if "Example Domain" in page else "unexpected page", len(page), "chars")
+except Exception as e:
+    print("https GET failed:", e)
+try:
+    let r = net.get("https://api.github.com/zen", {"Accept": "text/plain"})
+    print("https api.github.com:", r.status, r.headers.get("Content-Type", r.headers.get("content-type", "?")))
+except Exception as e:
+    print("https api.github.com failed:", e)
+try:
+    http_get("https://example.com/definitely-missing-page")
+except net.HTTPError as e:
+    print("HTTPError as expected:", e.code)
+except Exception as e:
+    print("missing page:", e)
+
+let lite = db.sqlite(":memory:")
+print("sqlite library:", db.sqlite_library())
+lite.execute("create table t (k text, v real)")
+lite.insert_many("t", [["a", 1.5], ["b", 2.5]])
+print("sqlite:", lite.query("select sqlite_version() as version, sum(v) as total from t").one())

@@ -890,3 +890,5 @@ fn mongo(url=none, **kw):
     raise _net_only("mongo")
 fn pool(url, size=8, **kw):
     raise _net_only("pool")
+
+fn sqlite_library() = __sqlite("library")      # the SQLite library file in use (native programs)
