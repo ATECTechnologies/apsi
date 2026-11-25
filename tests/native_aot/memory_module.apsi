@@ -1,0 +1,38 @@
+# use memory natively: the machine measured as apsi run measures it, budgets, arrays, pools, a two-tier store
+use memory
+let s = memory.status()
+print(s.ram_total_gb > 0, s.cpus >= 1, s.pressure in ["ok", "moderate", "high", "critical"], str(s).startswith("RAM "))
+let l = memory.limits()
+print(l.ram_total_gb > 0, l.source)
+print(memory.pressure().level in ["ok", "moderate", "high", "critical"])
+print(memory.budget(2), memory.best_device(), memory.devices()[0]["name"])
+let a = memory.array([1000, 10], "float64", fill=2.0)
+print(shape(a), float(sum(a)), memory.on_disk(a), len(memory.report()) >= 1)
+memory.free(a)
+var tot = 0.0
+for c in memory.chunks(a, rows=300):
+    tot = tot + float(sum(c))
+print(tot, shape(memory.map(fn(b) => b * 2.0, a, rows=256)))
+let r = memory.fit_batch(fn(b) => b * 10, 64)
+print(r)
+let st = memory.store("apsi-test-native", ram_mb=1)
+st.clear()
+st.set("x", {"a": [1, 2, 3], "b": "hi"})
+st["t"] = tensor([1.0, 2.0, 3.0])
+print(st.get("x"), st["t"], "x" in st, st.get("nope", -1))
+let st2 = memory.store("apsi-test-native", ram_mb=1)
+print(st2.get("x"), st2.get("t"), st2.stats()["disk_items"])
+var calls = [0]
+fn slow(n):
+    calls[0] = calls[0] + 1
+    return n * n
+let fast = memory.cached(slow, name="apsi-test-sq")
+print(fast(12), fast(12), calls[0] <= 1)
+let p = memory.pool()
+let b1 = p.take([100, 100])
+p.give(b1)
+let b2 = p.take([100, 100], zero=true)
+print(p.stats()["reused"], float(sum(b2)), memory.relieve() >= 0)
+let w = memory.on_pressure(fn(pr) => print("pressure", pr.level), level="critical")
+w.stop()
+st.clear()

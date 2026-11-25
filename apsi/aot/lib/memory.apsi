@@ -1,0 +1,646 @@
+# use memory in native programs: RAM, SSD and devices, measured from the operating system (and the container's
+# cgroup limit on Linux) the way apsi run measures them.
+#   status() limits() pressure() relieve() budget(gb) devices() best_device(need_gb) spill_dir()
+#   array(shape, dtype, fill, ram) free(a) on_disk(a) report() pool(max_gb)
+#   chunks(a, rows) map(fn, a, rows, out) fit_batch(fn, batch, minimum)
+#   store(name, ram_mb, disk_gb) cached(fn, name)
+# Native arrays always live in RAM (on_disk is false); a store keeps tensors as .npy files (the same files apsi run
+# writes) and other values as signed JSON.
+
+let LEVELS = {"ok": 0, "moderate": 1, "high": 2, "critical": 3}
+let _GB = 1073741824.0
+var _state = {"budget": none, "used": 0, "level": "ok", "level_t": -1.0, "reacted": -1.0, "next_id": 0}
+var _tracked = {}
+var _shrinkable = []
+var _watchers = []
+
+fn _env(name):
+    let v = getenv(name)
+    return none if v is none or v == "" else v
+
+fn _join(a, b) = a + "/" + b if not (a.endswith("/") or a.endswith("\\")) else a + b
+
+fn _home():
+    let h = _env("APSI_HOME")
+    if h is not none:
+        return h
+    let u = _env("HOME")
+    if u is not none:
+        return _join(u, ".apsi")
+    let w = _env("USERPROFILE")
+    return _join(w if w is not none else ".", ".apsi")
+
+fn spill_dir():
+    let d = _env("APSI_SPILL_DIR")
+    let p = d if d is not none else _join(_home(), "spill")
+    __fs("mkdir", p)
+    return p
+
+# ------------------------------------------------------------------ what the machine has
+fn _read_int(path):
+    if not __fs("isfile", path):
+        return none
+    let v = read_text(path).strip()
+    if v == "" or v == "max":
+        return none
+    try:
+        let n = int(v)
+        return n if n < (1 << 60) else none
+    except ValueError:
+        return none
+
+fn _stat_value(path, key):
+    if not __fs("isfile", path):
+        return 0
+    for line in read_text(path).split("\n"):
+        let parts = line.split(" ")
+        if len(parts) == 2 and parts[0] == key:
+            return int(parts[1])
+    return 0
+
+fn _cgroup():
+    # [limit, usage, reclaimable, pressure file or none, version] when a cgroup limits this process's memory
+    if not __fs("isfile", "/proc/self/cgroup"):
+        return none
+    for line in read_text("/proc/self/cgroup").split("\n"):
+        let parts = line.split(":", 2)
+        if len(parts) != 3:
+            continue
+        if parts[0] == "0" and parts[1] == "":
+            var d = "/sys/fs/cgroup" + parts[2]
+            if d.endswith("/"):
+                d = d[0:len(d) - 1]
+            var best = none
+            while d.startswith("/sys/fs/cgroup"):
+                let lim = _read_int(d + "/memory.max")
+                if lim is not none and (best is none or lim < best[0]):
+                    best = [lim, d]
+                if d == "/sys/fs/cgroup":
+                    break
+                d = d[0:d.rfind("/")]
+            if best is not none:
+                let bd = best[1]
+                let usage = _read_int(bd + "/memory.current")
+                let pf = bd + "/memory.pressure"
+                return [best[0], usage if usage is not none else 0, _stat_value(bd + "/memory.stat", "inactive_file"),
+                        pf if __fs("isfile", pf) else none, 2]
+        elif "memory" in parts[1].split(","):
+            var d = "/sys/fs/cgroup/memory/" + parts[2].lstrip("/")
+            var lim = _read_int(d + "/memory.limit_in_bytes")
+            if lim is none:
+                d = "/sys/fs/cgroup/memory"
+                lim = _read_int(d + "/memory.limit_in_bytes")
+            if lim is not none:
+                let usage = _read_int(d + "/memory.usage_in_bytes")
+                return [lim, usage if usage is not none else 0, _stat_value(d + "/memory.stat", "total_inactive_file"), none, 1]
+    return none
+
+fn _meminfo():
+    # [total, available, swap total, swap free]: the machine's, or the container's limit when smaller
+    let h = __meminfo()
+    var total = h[0]
+    var avail = h[1]
+    let cg = _cgroup()
+    if cg is not none:
+        if cg[0] < total or not total:
+            total = float(cg[0])
+        let room = float(cg[0] - cg[1] + cg[2])
+        avail = max(0.0, min(avail, room)) if avail else max(0.0, room)
+    return [total, avail, h[2], h[3]]
+
+fn _psi(path):
+    var some = 0.0
+    var full = 0.0
+    let p = path if path is not none else "/proc/pressure/memory"
+    if not __fs("isfile", p):
+        return [0.0, 0.0]
+    for line in read_text(p).split("\n"):
+        let parts = line.split(" ")
+        for item in parts[1:]:
+            if item.startswith("avg10="):
+                let v = float(item[6:])
+                if parts[0] == "some":
+                    some = v
+                elif parts[0] == "full":
+                    full = v
+    return [some, full]
+
+class Status:
+    var d = {}
+    var text = none
+    fn __getattr__(self, k):
+        if k in self.d:
+            return self.d[k]
+        raise AttributeError(k)
+    fn __getitem__(self, k) = self.d[k]
+    fn as_dict(self) = dict(self.d)
+    fn __str__(self):
+        if self.text is not none:
+            return self.text
+        let gs = "; ".join([f"GPU {g['index']} {g['free_gb']:.1f}/{g['total_gb']:.1f} GB free" for g in self.d["gpus"]])
+        let g = gs if gs != "" else "no GPU"
+        let cont = " (container limit)" if self.d["limit_source"] == "container" else ""
+        return f"RAM {self.d['ram_free_gb']:.1f}/{self.d['ram_total_gb']:.1f} GB free (this program {self.d['process_gb']:.2f} GB, budget {self.d['budget_gb']:.1f} GB) | swap {self.d['swap_free_gb']:.1f} GB | pressure {self.d['pressure']}{cont} | SSD {self.d['disk_free_gb']:.0f} GB free at {self.d['spill_dir']} | {self.d['cpus']} cores, load {self.d['load']:.2f} | {g}"
+    fn __repr__(self) = self.__str__()
+
+fn _status(d, text=none):
+    var s = Status()
+    s.d = d
+    s.text = text
+    return s
+
+fn _gpus():
+    var out = []
+    if __builtin("gpu_available")():
+        let i = __builtin("gpu_info")()
+        if isinstance(i, dict):
+            let free = float(i["free_bytes"]) / _GB if "free_bytes" in i else 0.0
+            let total = float(i["total_bytes"]) / _GB if "total_bytes" in i else 0.0
+            out.append({"index": 0, "name": str(i["name"]) if "name" in i else "cuda:0", "free_gb": free, "total_gb": total, "via": "native"})
+        else:
+            out.append({"index": 0, "name": str(i), "free_gb": 0.0, "total_gb": 0.0, "via": "native"})
+    return out
+
+fn _source():
+    let cg = _cgroup()
+    return "container" if cg is not none and cg[0] <= __meminfo()[0] else "machine"
+
+fn limits():
+    let h = __meminfo()
+    let cg = _cgroup()
+    let m = _meminfo()
+    let src = f"container (cgroup v{cg[4]})" if cg is not none and cg[0] <= h[0] else "machine"
+    let txt = f"{m[0] / _GB:.1f} GB usable ({src}), {m[1] / _GB:.1f} GB free, budget {_budget() / _GB:.1f} GB"
+    return _status({"ram_total_gb": m[0] / _GB, "ram_free_gb": m[1] / _GB, "machine_ram_gb": h[0] / _GB,
+                    "cgroup_limit_gb": cg[0] / _GB if cg is not none else none,
+                    "cgroup_used_gb": cg[1] / _GB if cg is not none else none, "source": src,
+                    "budget_gb": _budget() / _GB}, txt)
+
+fn pressure():
+    let m = _meminfo()
+    let frac = m[1] / m[0] if m[0] else 1.0
+    let cg = _cgroup()
+    let ps = _psi(cg[3] if cg is not none and cg[3] is not none else none)
+    let some = ps[0]
+    let full = ps[1]
+    var level = "ok"
+    if frac < 0.05 or full >= 10:
+        level = "critical"
+    elif frac < 0.10 or some >= 20 or full >= 2:
+        level = "high"
+    elif frac < 0.20 or some >= 5:
+        level = "moderate"
+    _state["level"] = level
+    _state["level_t"] = __time()
+    let txt = f"{level}: {m[1] / _GB:.1f} GB free ({frac * 100:.0f} %), stalls {some:.1f} % (some) / {full:.1f} % (full)"
+    return _status({"level": level, "ram_free_fraction": frac, "ram_free_gb": m[1] / _GB, "psi_some": some,
+                    "psi_full": full}, txt)
+
+fn _level():
+    if __time() - _state["level_t"] >= 0.5:
+        pressure()
+    for w in _watchers:
+        w.check()
+    return _state["level"]
+
+fn relieve(level="high"):
+    # give RAM back now: stores drop (part of) their RAM tier, pools their spare buffers
+    let hard = LEVELS[str(level)] >= LEVELS["critical"] if str(level) in LEVELS else false
+    var freed = 0
+    for o in _shrinkable:
+        freed = freed + o._shrink(hard)
+    return freed
+
+fn _react():
+    let lv = _level()
+    if LEVELS[lv] >= LEVELS["high"] and __time() - _state["reacted"] >= 0.5:
+        _state["reacted"] = __time()
+        relieve(lv)
+    return lv
+
+class Watcher:
+    var fn_ = none
+    var level = "high"
+    var every = 1.0
+    var repeat = 10.0
+    var last = -1.0
+    var fired = -1e18
+    var active = true
+    fn check(self):
+        # called by the allocation paths (native programs have no watcher thread)
+        if not self.active or __time() - self.last < self.every:
+            return
+        self.last = __time()
+        if LEVELS[_state["level"]] >= LEVELS[self.level] and __time() - self.fired >= self.repeat:
+            self.fired = __time()
+            self.fn_(pressure())
+    fn stop(self):
+        self.active = false
+    fn __repr__(self) = f"<memory watcher: level {self.level}, every {self.every} s>"
+
+fn on_pressure(f=none, level="high", every=1.0, repeat=10.0):
+    var w = Watcher()
+    w.fn_ = f if f is not none else fn(p) => relieve(p.level)
+    w.level = str(level)
+    w.every = float(every)
+    w.repeat = float(repeat)
+    _watchers.append(w)
+    return w
+
+fn status():
+    let m = _meminfo()
+    let h = __meminfo()
+    let d = spill_dir()
+    return _status({"ram_total_gb": m[0] / _GB, "ram_free_gb": m[1] / _GB, "swap_total_gb": m[2] / _GB,
+                    "swap_free_gb": m[3] / _GB, "process_gb": h[4] / _GB, "budget_gb": _budget() / _GB,
+                    "in_ram_gb": _state["used"] / _GB, "disk_free_gb": __disk_free(d) / _GB, "spill_dir": d,
+                    "cpus": __cpu_count(), "load": h[5], "gpus": _gpus(), "pressure": pressure().level,
+                    "limit_source": _source()})
+
+fn devices():
+    var out = [{"name": "cpu", "cores": __cpu_count(), "free_gb": _meminfo()[1] / _GB}]
+    for g in _gpus():
+        var e = dict(g)
+        e["name"] = f"cuda:{g['index']}"
+        out.append(e)
+    return out
+
+fn best_device(need_gb=0.0):
+    let gs = sorted(_gpus(), key=fn(g) => -g["free_gb"])
+    if len(gs) > 0 and gs[0]["free_gb"] >= float(need_gb):
+        return f"cuda:{gs[0]['index']}"
+    return "cpu"
+
+# ------------------------------------------------------------------ RAM budget and arrays
+fn _parse_size(s):
+    let t = str(s).strip().upper()
+    let units = [["TB", 1099511627776.0], ["GB", _GB], ["MB", 1048576.0], ["KB", 1024.0], ["T", 1099511627776.0],
+                 ["G", _GB], ["M", 1048576.0], ["K", 1024.0], ["B", 1.0]]
+    for u in units:
+        if t.endswith(u[0]):
+            return int(float(t[0:len(t) - len(u[0])].strip()) * u[1])
+    return int(float(t))
+
+fn _budget():
+    if _state["budget"] is none:
+        let env = _env("APSI_RAM_BUDGET")
+        _state["budget"] = _parse_size(env) if env is not none else (int(_meminfo()[1] * 0.7) or (1 << 31))
+    return _state["budget"]
+
+fn budget(gb=none):
+    if gb is not none:
+        _state["budget"] = int(float(gb) * _GB)
+    return _budget() / _GB
+
+fn _itemsize(dt) = 4 if dt == "float32" or dt == "int32" else (1 if dt == "bool" or dt == "uint8" or dt == "int8" else 8)
+
+fn _dtype_native(dt):
+    let s = str(dt)
+    return "float32" if s == "float32" else ("int64" if s.startswith("int") or s.startswith("uint") else ("bool" if s == "bool" else "float64"))
+
+fn array(shape, dtype="float32", fill=none, ram=none):
+    # an array within the RAM budget (native arrays stay in RAM; apsi run moves larger ones to the SSD)
+    let sh = [int(shape)] if isinstance(shape, int) else [int(s) for s in shape]
+    var nel = 1
+    for v in sh:
+        nel = nel * v
+    let dt = _dtype_native(dtype)
+    let nbytes = nel * _itemsize(dt)
+    if ram is none and nbytes >= (1 << 20):
+        _react()
+    _state["used"] = _state["used"] + nbytes
+    let a = zeros(*sh, dtype=dt) if fill is none else tensor(full(sh, fill), dt)
+    _state["next_id"] = _state["next_id"] + 1
+    _tracked[_state["next_id"]] = [a, sh, dt, nbytes, __time()]
+    return a
+
+fn on_disk(a) = false
+
+fn free(a):
+    for k in list(keys(_tracked)):
+        if _tracked[k][0] is a:
+            _state["used"] = max(0, _state["used"] - _tracked[k][3])
+            _tracked.pop(k)
+            return none
+    return none
+
+fn report():
+    var rows = []
+    for k in keys(_tracked):
+        let t = _tracked[k]
+        rows.append(_status({"shape": list(t[1]), "dtype": t[2], "gb": t[3] / _GB, "where": "RAM", "file": none,
+                             "age_s": __time() - t[4]}, f"{list(t[1])} {t[2]} {t[3] / _GB:.3f} GB RAM"))
+    return rows
+
+fn _rows(a):
+    if isinstance(a, str):
+        return __npy_load(a)
+    return a
+
+fn chunks(a, rows=65536):
+    let x = _rows(a)
+    let n = len(x)
+    let r = max(1, int(rows))
+    return [x[s:min(n, s + r)] for s in range(0, n, r)]
+
+fn map(f, a, rows=65536, out=none, workers=none):
+    # out[i:j] = f(a[i:j]) for row blocks
+    let x = _rows(a)
+    let n = len(x)
+    let r = max(1, int(rows))
+    if n == 0:
+        return out
+    var parts = [f(x[s:min(n, s + r)]) for s in range(0, n, r)]
+    let res = concat(parts, axis=0) if len(parts) > 1 else parts[0]
+    if out is none:
+        return res
+    out[0:n] = res
+    return out
+
+fn _is_oom(e):
+    let m = str(e).lower()
+    return isinstance(e, MemoryError) or "out of memory" in m
+
+fn fit_batch(f, batch, minimum=1):
+    # f(batch); on out-of-memory the batch is halved and tried again. Returns [result, batch].
+    var b = int(batch)
+    while true:
+        try:
+            return (f(b), b)
+        except Exception as e:
+            if not _is_oom(e) or b <= int(minimum):
+                raise
+            b = max(int(minimum), b // 2)
+
+class Pool:
+    var limit = none
+    var spare = {}
+    var spare_bytes = 0
+    var taken = 0
+    var reused = 0
+    fn _limit(self) = self.limit if self.limit is not none else max(64 * 1048576, _budget() // 10)
+    fn take(self, shape, dtype="float64", zero=false):
+        let sh = [int(shape)] if isinstance(shape, int) else [int(s) for s in shape]
+        let dt = _dtype_native(dtype)
+        if LEVELS[_level()] >= LEVELS["high"]:
+            self._shrink(true)
+        self.taken = self.taken + 1
+        let key = f"{dt}{sh}"
+        if key in self.spare and len(self.spare[key]) > 0:
+            let a = self.spare[key].pop()
+            self.spare_bytes = self.spare_bytes - _nbytes(a)
+            self.reused = self.reused + 1
+            if zero:
+                a[:] = 0
+            return a
+        return zeros(*sh, dtype=dt)
+    fn give(self, a):
+        let n = _nbytes(a)
+        if n > self._limit():
+            return none
+        let key = f"{a.dtype}{list(shape(a))}"
+        if key not in self.spare:
+            self.spare[key] = []
+        self.spare[key].append(a)
+        self.spare_bytes = self.spare_bytes + n
+        while self.spare_bytes > self._limit() and len(self.spare) > 0:
+            let k0 = list(keys(self.spare))[0]
+            let lst = self.spare[k0]
+            if len(lst) > 0:
+                self.spare_bytes = self.spare_bytes - _nbytes(lst.pop())
+            if len(lst) == 0:
+                self.spare.pop(k0)
+        return none
+    fn _shrink(self, hard=true):
+        let freed = self.spare_bytes
+        self.spare = {}
+        self.spare_bytes = 0
+        return freed
+    fn clear(self):
+        self._shrink(true)
+    fn stats(self) = {"taken": self.taken, "reused": self.reused, "spare_mb": self.spare_bytes / 1048576.0, "limit_mb": self._limit() / 1048576.0}
+    fn __repr__(self):
+        let s = self.stats()
+        return f"<pool: {s['taken']} taken, {s['reused']} reused, {s['spare_mb']:.1f} MB spare>"
+
+fn _is_t(v) = str(type(v)).startswith("Tensor")
+
+fn _nbytes(a):
+    var n = 1
+    for v in shape(a):
+        n = n * v
+    return n * _itemsize(str(a.dtype))
+
+fn pool(max_gb=none):
+    var p = Pool()
+    p.limit = int(float(max_gb) * _GB) if max_gb is not none else none
+    p.spare = {}
+    _shrinkable.append(p)
+    return p
+
+# ------------------------------------------------------------------ two-tier store
+fn _key_of(k):
+    if isinstance(k, str) and len(k) <= 120:
+        var ok = true
+        for c in k:
+            if not (c.isalnum() or c in "-_."):
+                ok = false
+        if ok:
+            return k
+    return __hash(repr(k), "sha256")
+
+fn _secret():
+    let p = _join(_home(), "store.key")
+    if __fs("isfile", p):
+        return read_text(p).strip()
+    __fs("mkdir", _home())
+    let s = __random_bytes(32, "hex")
+    write_text(p, s)
+    return s
+
+class Store:
+    var path = ""
+    var ram_limit = 0
+    var disk_limit = 0
+    var ram = {}
+    var ram_bytes = 0
+    var hits = 0
+    var misses = 0
+    var disk_hits = 0
+    var scale = 1.0
+    fn _shrink(self, hard=false):
+        let before = self.ram_bytes
+        let target = 0 if hard else self.ram_bytes // 2
+        while self.ram_bytes > target and len(self.ram) > 0:
+            let k0 = list(keys(self.ram))[0]
+            self.ram_bytes = self.ram_bytes - self.ram[k0][1]
+            self.ram.pop(k0)
+        self.scale = 0.25 if hard else 0.5
+        return before - self.ram_bytes
+    fn _file(self, key, ext) = _join(_join(self.path, key[0:2]), key + ext)
+    fn _size(self, v):
+        if _is_t(v):
+            return _nbytes(v)
+        return len(json_str(v)) if _jsonable(v) else 64
+    fn _ram_put(self, key, v, size):
+        let lv = _level()
+        if LEVELS[lv] >= LEVELS["high"]:
+            _react()
+        elif self.scale < 1.0 and lv == "ok":
+            self.scale = 1.0
+        let limit = int(self.ram_limit * self.scale)
+        if size > limit:
+            return none
+        if key in self.ram:
+            self.ram_bytes = self.ram_bytes - self.ram[key][1]
+            self.ram.pop(key)
+        self.ram[key] = [v, size]
+        self.ram_bytes = self.ram_bytes + size
+        while self.ram_bytes > limit and len(self.ram) > 0:
+            let k0 = list(keys(self.ram))[0]
+            self.ram_bytes = self.ram_bytes - self.ram[k0][1]
+            self.ram.pop(k0)
+        return none
+    fn set(self, k, v):
+        let key = _key_of(k)
+        self._ram_put(key, v, self._size(v))
+        __fs("mkdir", _join(self.path, key[0:2]))
+        if _is_t(v):
+            __npy_save(self._file(key, ".npy"), v)
+            if __fs("isfile", self._file(key, ".json")):
+                __fs("remove", self._file(key, ".json"))
+        elif _jsonable(v):
+            let body = json_str(v)
+            write_text(self._file(key, ".json"), __hmac(_secret(), body, "sha256", "hex") + "\n" + body)
+            if __fs("isfile", self._file(key, ".npy")):
+                __fs("remove", self._file(key, ".npy"))
+        self._trim()
+        return v
+    fn get(self, k, default=none):
+        let key = _key_of(k)
+        if key in self.ram:
+            let hit = self.ram.pop(key)
+            self.ram[key] = hit
+            self.hits = self.hits + 1
+            return hit[0]
+        let npy = self._file(key, ".npy")
+        if __fs("isfile", npy):
+            self.disk_hits = self.disk_hits + 1
+            let v = __npy_load(npy)
+            self._ram_put(key, v, _nbytes(v))
+            return v
+        let js = self._file(key, ".json")
+        if __fs("isfile", js):
+            let blob = read_text(js)
+            let nl = blob.find("\n")
+            let body = blob[nl + 1:]
+            if nl > 0 and __secure_eq(blob[0:nl], __hmac(_secret(), body, "sha256", "hex")):
+                let v = json_parse(body)
+                self._ram_put(key, v, len(body))
+                self.disk_hits = self.disk_hits + 1
+                return v
+            __fs("remove", js)
+        self.misses = self.misses + 1
+        return default
+    fn __contains__(self, k):
+        let key = _key_of(k)
+        return key in self.ram or __fs("isfile", self._file(key, ".npy")) or __fs("isfile", self._file(key, ".json"))
+    fn __getitem__(self, k):
+        if not self.__contains__(k):
+            raise KeyError(k)
+        return self.get(k)
+    fn __setitem__(self, k, v):
+        self.set(k, v)
+    fn delete(self, k):
+        let key = _key_of(k)
+        if key in self.ram:
+            self.ram_bytes = self.ram_bytes - self.ram[key][1]
+            self.ram.pop(key)
+        for ext in [".npy", ".json"]:
+            if __fs("isfile", self._file(key, ext)):
+                __fs("remove", self._file(key, ext))
+    fn _files(self):
+        var out = []
+        if not __fs("isdir", self.path):
+            return out
+        for d in __fs("list", self.path):
+            let sub = _join(self.path, d)
+            if __fs("isdir", sub):
+                for f in __fs("list", sub):
+                    if f.endswith(".npy") or f.endswith(".json"):
+                        let p = _join(sub, f)
+                        out.append([__fs("mtime", p), __fs("size", p), p])
+        return out
+    fn _trim(self):
+        let files = self._files()
+        var total = 0
+        for f in files:
+            total = total + f[1]
+        if total > self.disk_limit:
+            let goal = int(self.disk_limit * 0.9)
+            for f in sorted(files, key=fn(x) => x[0]):
+                __fs("remove", f[2])
+                total = total - f[1]
+                if total <= goal:
+                    break
+    fn clear(self):
+        self.ram = {}
+        self.ram_bytes = 0
+        for f in self._files():
+            __fs("remove", f[2])
+    fn stats(self):
+        let files = self._files()
+        var mb = 0
+        for f in files:
+            mb = mb + f[1]
+        return {"ram_items": len(self.ram), "ram_mb": self.ram_bytes / 1048576.0, "disk_items": len(files),
+                "disk_mb": mb / 1048576.0, "hits": self.hits, "disk_hits": self.disk_hits, "misses": self.misses}
+    fn __repr__(self):
+        let s = self.stats()
+        return f"<store {self.path}: {s['ram_items']} in RAM ({s['ram_mb']:.1f} MB), {s['disk_items']} on SSD ({s['disk_mb']:.1f} MB)>"
+
+fn _jsonable(v):
+    if v is none or isinstance(v, bool) or isinstance(v, int) or isinstance(v, float) or isinstance(v, str):
+        return true
+    if isinstance(v, list) or isinstance(v, tuple):
+        for x in v:
+            if not _jsonable(x):
+                return false
+        return true
+    if isinstance(v, dict):
+        for k in keys(v):
+            if not isinstance(k, str) or not _jsonable(v[k]):
+                return false
+        return true
+    return false
+
+fn _store_path(name):
+    if "/" in name or "\\" in name:
+        return name
+    var safe = ""
+    for c in name:
+        safe = safe + (c if c.isalnum() or c in "-_." else "_")
+    let base = _env("APSI_SPILL_DIR")
+    return _join(_join(base if base is not none else _home(), "store"), safe if safe != "" else "default")
+
+fn store(name="default", ram_mb=256, disk_gb=10):
+    var s = Store()
+    s.path = _store_path(str(name))
+    __fs("mkdir", s.path)
+    s.ram_limit = int(float(ram_mb) * 1048576)
+    s.disk_limit = int(float(disk_gb) * _GB)
+    s.ram = {}
+    _shrinkable.append(s)
+    return s
+
+fn cached(f=none, name=none, ram_mb=128, disk_gb=5):
+    # memoise f in a two-tier store (RAM, then SSD); results survive restarts
+    fn wrap(g):
+        let st = store(name if name is not none else "fn-" + str(g.__name__), ram_mb, disk_gb)
+        fn inner(*args, **kwargs):
+            let k = repr([list(args), sorted([[kk, kwargs[kk]] for kk in keys(kwargs)])])
+            if st.__contains__(k):
+                return st.get(k)
+            return st.set(k, g(*args, **kwargs))
+        return inner
+    return wrap(f) if f is not none else wrap

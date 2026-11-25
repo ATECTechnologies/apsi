@@ -886,11 +886,70 @@ BI(lb_arity) {                                                /* required positi
     return a_int(d);
 }
 BI(lb_is_dev) { (void)self; (void)kw; (void)n; AV v = deepval(a[0]); return a_bool(is_t(v) && TT(v)->dev); }
+/* __meminfo(): [RAM total, RAM available, swap total, swap free, this process's resident bytes, 1-minute load]
+   from the operating system (the cgroup limit is read by lib/memory.apsi); __disk_free(path): free bytes there */
+#ifdef __APPLE__
+#include <sys/sysctl.h>
+#include <mach/mach.h>
+#endif
+#if !defined(_WIN32)
+#include <sys/statvfs.h>
+#endif
+BI(lb_meminfo) {
+    (void)self; (void)kw; (void)n; (void)a;
+    double total = 0, avail = 0, swt = 0, swf = 0, rss = 0, load = 0;
+#ifdef _WIN32
+    MEMORYSTATUSEX m; m.dwLength = sizeof m;
+    if (GlobalMemoryStatusEx(&m)) { total = (double)m.ullTotalPhys; avail = (double)m.ullAvailPhys;
+        swt = m.ullTotalPageFile > m.ullTotalPhys ? (double)(m.ullTotalPageFile - m.ullTotalPhys) : 0;
+        swf = m.ullAvailPageFile > m.ullAvailPhys ? (double)(m.ullAvailPageFile - m.ullAvailPhys) : 0; }
+    {   typedef struct { DWORD cb, PageFaultCount; SIZE_T PeakWorkingSetSize, WorkingSetSize, a, b, c, d, e, f; } PMC;
+        typedef BOOL (WINAPI *GPMI)(HANDLE, PMC *, DWORD);
+        HMODULE k = GetModuleHandleA("kernel32.dll"); GPMI f = k ? (GPMI)(void *)GetProcAddress(k, "K32GetProcessMemoryInfo") : NULL;
+        PMC pm; memset(&pm, 0, sizeof pm); pm.cb = sizeof pm;
+        if (f && f(GetCurrentProcess(), &pm, sizeof pm)) rss = (double)pm.WorkingSetSize; }
+#elif defined(__APPLE__)
+    { int64_t mem = 0; size_t len = sizeof mem; if (sysctlbyname("hw.memsize", &mem, &len, NULL, 0) == 0) total = (double)mem; }
+    { vm_statistics64_data_t vs; mach_msg_type_number_t c = HOST_VM_INFO64_COUNT; vm_size_t page = 4096; host_page_size(mach_host_self(), &page);
+      if (host_statistics64(mach_host_self(), HOST_VM_INFO64, (host_info64_t)&vs, &c) == KERN_SUCCESS)
+          avail = (double)page * (double)(vs.free_count + vs.inactive_count + vs.purgeable_count + vs.speculative_count); }
+    { struct xsw_usage sw; size_t len = sizeof sw; if (sysctlbyname("vm.swapusage", &sw, &len, NULL, 0) == 0) { swt = (double)sw.xsu_total; swf = (double)sw.xsu_avail; } }
+    { mach_task_basic_info_data_t ti; mach_msg_type_number_t c = MACH_TASK_BASIC_INFO_COUNT;
+      if (task_info(mach_task_self(), MACH_TASK_BASIC_INFO, (task_info_t)&ti, &c) == KERN_SUCCESS) rss = (double)ti.resident_size; }
+    { double l[1]; if (getloadavg(l, 1) == 1) load = l[0]; }
+#else
+    FILE *f = fopen("/proc/meminfo", "r");
+    if (f) { char line[256]; double fr = -1;
+        while (fgets(line, sizeof line, f)) { char k[64]; double v;
+            if (sscanf(line, "%63[^:]: %lf", k, &v) == 2) { v *= 1024;
+                if (!strcmp(k, "MemTotal")) total = v; else if (!strcmp(k, "MemAvailable")) avail = v; else if (!strcmp(k, "MemFree")) fr = v;
+                else if (!strcmp(k, "SwapTotal")) swt = v; else if (!strcmp(k, "SwapFree")) swf = v; } }
+        fclose(f); if (avail == 0 && fr >= 0) avail = fr; }
+    if (total == 0) { long pg = sysconf(_SC_PAGESIZE); total = (double)pg * (double)sysconf(_SC_PHYS_PAGES); avail = (double)pg * (double)sysconf(_SC_AVPHYS_PAGES); }
+    f = fopen("/proc/self/statm", "r");
+    if (f) { long sz, res; if (fscanf(f, "%ld %ld", &sz, &res) == 2) rss = (double)res * (double)sysconf(_SC_PAGESIZE); fclose(f); }
+    { double l[1]; if (getloadavg(l, 1) == 1) load = l[0]; }
+#endif
+    AV v[6] = {a_float(total), a_float(avail), a_float(swt), a_float(swf), a_float(rss), a_float(load)};
+    return a_list(6, v);
+}
+BI(lb_disk_free) {
+    (void)self; (void)kw; (void)n;
+    const char *p = STR(a_to_str(a[0]))->s;
+#ifdef _WIN32
+    ULARGE_INTEGER fr; if (GetDiskFreeSpaceExA(p, &fr, NULL, NULL)) return a_float((double)fr.QuadPart);
+    return a_float(0.0);
+#else
+    struct statvfs st; if (statvfs(p, &st) == 0) return a_float((double)st.f_bavail * (double)st.f_frsize);
+    return a_float(0.0);
+#endif
+}
+
 static const TEnt lib_builtins[] = {
     {"__hash", lb_hash}, {"__pbkdf2", lb_pbkdf2}, {"__hmac", lb_hmac}, {"__b64enc", lb_b64enc}, {"__b64dec", lb_b64dec}, {"__crc32", lb_crc32},
     {"__secure_eq", lb_secure_eq}, {"__random_bytes", lb_random_bytes}, {"__secure_randint", lb_secure_randint},
     {"__password_hash", lb_password_hash}, {"__password_verify", lb_password_verify},
     {"__la", lb_la}, {"__fft", lb_fft}, {"__special", lb_special}, {"__conv2d", lb_conv2d}, {"__maxpool2d", lb_maxpool2d},
     {"__time", lb_time}, {"__sleep", lb_sleep}, {"__fs", lb_fs}, {"__st_load", lb_st_load}, {"__st_save", lb_st_save},
-    {"__npy_load", lb_npy_load}, {"__npy_save", lb_npy_save}, {"__http_serve", lb_http_serve}, {"__is_dev", lb_is_dev}, {"__frombuffer", lb_frombuffer}, {"__pk", lb_pk}, {"__dec", lb_dec}, {"__re", lb_re}, {"__mt", lb_mt}, {"__pymode", lb_pymode}, {"__subclass", lb_subclass}, {"__task", lb_task}, {"__in_task", lb_in_task}, {"__suspend", lb_suspend}, {"__cpu_count", lb_cpu_count}, {"__set_threads", lb_set_threads}, {"__setraw", lb_setraw}, {"__upk", lb_upk}, {"__frame", lb_frame}, {"__sqlite", lb_sqlite}, {"__net", lb_net}, {"__ct", lb_ct}, {"__is_cplx", lb_is_cplx}, {"__ckron", lb_ckron}, {"__is_traced", lb_is_traced}, {"__qfmt", lb_qfmt}, {"__apsi_version", lb_apsi_version}, {"__arity", lb_arity}, {"__localtime", lb_localtime}, {"__isatty", lb_isatty}, {"__rec_dict", lb_rec_dict}, {"__is_rec", lb_is_rec}, {"__argv", lb_argv}, {"__environ_names", lb_environ_names}, {"__builtin", lb_builtin}, {"__setenv", lb_setenv}, {"__gen_step", lb_gen_step}, {"__is_coro", lb_is_coro},
+    {"__npy_load", lb_npy_load}, {"__npy_save", lb_npy_save}, {"__http_serve", lb_http_serve}, {"__is_dev", lb_is_dev}, {"__frombuffer", lb_frombuffer}, {"__pk", lb_pk}, {"__dec", lb_dec}, {"__re", lb_re}, {"__mt", lb_mt}, {"__pymode", lb_pymode}, {"__subclass", lb_subclass}, {"__task", lb_task}, {"__in_task", lb_in_task}, {"__suspend", lb_suspend}, {"__cpu_count", lb_cpu_count}, {"__set_threads", lb_set_threads}, {"__setraw", lb_setraw}, {"__upk", lb_upk}, {"__frame", lb_frame}, {"__sqlite", lb_sqlite}, {"__net", lb_net}, {"__ct", lb_ct}, {"__is_cplx", lb_is_cplx}, {"__ckron", lb_ckron}, {"__is_traced", lb_is_traced}, {"__qfmt", lb_qfmt}, {"__apsi_version", lb_apsi_version}, {"__arity", lb_arity}, {"__localtime", lb_localtime}, {"__isatty", lb_isatty}, {"__rec_dict", lb_rec_dict}, {"__is_rec", lb_is_rec}, {"__argv", lb_argv}, {"__environ_names", lb_environ_names}, {"__builtin", lb_builtin}, {"__setenv", lb_setenv}, {"__gen_step", lb_gen_step}, {"__is_coro", lb_is_coro}, {"__meminfo", lb_meminfo}, {"__disk_free", lb_disk_free},
     {NULL, NULL}};
