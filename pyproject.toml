@@ -22,7 +22,8 @@ web = ["uvloop; sys_platform != \"win32\""]
 apsi = "apsi.cli:main"
 
 [tool.setuptools]
-packages = ["apsi", "apsi.native"]
+packages = ["apsi", "apsi.native", "apsi.aot"]
 
 [tool.setuptools.package-data]
-apsi = ["MANIFEST.json", "ptx/*.ptx.gz"]
+apsi = ["MANIFEST.json", "ptx/*.ptx.gz", "csrc/*"]
+"apsi.aot" = ["prelude.apsi", "rt/*.c", "rt/*.h", "lib/*.apsi", "lib/*/*.apsi"]

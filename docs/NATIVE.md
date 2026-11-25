@@ -109,6 +109,7 @@ backward pass walks its graph iteratively, so very deep graphs cannot overflow t
 | `lab` | seeds, provenance, experiment logs, `format_measurement`, Markdown / LaTeX / CSV tables |
 | `sys`, `gpu` | `device`, `to_device`, `hardware`, `cpu_threads`, GPU info |
 | `tokens` | `pack` / `unpack`, `dedupe` / `expand`, `diff` / `patch`, `best`, `count` (the estimate), `savings` |
+| `dataframe` | typed columns, expressions, filter / select / group by / join / sort / window, CSV (parsed in C), JSON, the same table printout |
 | `env`, `log` | `.env` files and secrets; leveled logging to the console and rotating text / JSON files, timers, reading logs back |
 
 Convolutions and max pooling run as C kernels (image columns and the packed matrix product) with their gradients,
@@ -120,7 +121,7 @@ These programs keep running with `apsi run`. A native build that reaches one of 
 
 - graph networks, mixtures of experts and `fit_batches` in `layers`; GGUF, ONNX and PyTorch files in `models`;
   `text_dataset`, `train_tokenizer` and Parquet in `data`; websockets and TLS in `web` (serve HTTPS through a
-  reverse proxy); `tokens.focus` / `fit_chat` / `outline` (they read Python syntax trees); the modules `db`, `rl`, `torch`, `dataframe`, `quantum`, `medical`
+  reverse proxy); `tokens.focus` / `fit_chat` / `outline` (they read Python syntax trees); the modules `db`, `rl`, `torch`, `quantum`, `medical`
 - Python modules (`pyimport`, `import numpy`), except `asyncio`
 - random numbers: native programs use their own generator, so a seed gives different numbers than in `apsi run`
   (the same seed always gives the same numbers in native programs)

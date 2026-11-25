@@ -1,0 +1,46 @@
+use dataframe as df
+
+let csv = "customer,region,amount,qty,paid,note\nann,EU,120.5,3,true,\"first, order\"\nbob,US,80,1,false,\ncy,EU,300.25,7,true,\"says \"\"hi\"\"\"\nann,EU,99.5,2,false,repeat\ndee,ASIA,150,4,true,\nbob,US,210,5,true,x\neve,EU,,2,false,late\n"
+let sales = df.from_csv_text(csv)
+print(sales)
+print(sales.shape, sales.columns, sales.dtypes, len(sales), sales.height, sales.width)
+let big = sales.filter((df.col("amount") > 100) & (df.col("region") == "EU"))
+print(big)
+let by = sales.group_by("customer").agg(total=df.col("amount").sum(), n=df.count(), avg=df.col("amount").mean(),
+                                         q=df.col("qty").sum(), qmax=df.col("qty").max(), first_note=df.col("note").first(),
+                                         sd=df.col("amount").std(), med=df.col("qty").median(), nu=df.col("region").n_unique())
+print(by)
+let top = by.sort("total", descending=true).head(3)
+print(top)
+let customers = df.DataFrame([{"customer": "ann", "city": "Oslo"}, {"customer": "bob", "city": "NYC"}, {"customer": "zed", "city": "Rome"}])
+print(top.join(customers, on="customer", how="left"))
+print(by.join(customers, on="customer", how="inner").select("customer", "city", "total"))
+print(customers.join(by.select("customer", "n"), on="customer", how="outer"))
+print(sales.select("customer", (df.col("amount") * 2).alias("double"), df.col("qty") + 1, big_q=df.col("qty") >= 4))
+print(sales.with_columns(df.col("customer").str_upper().alias("cu"), rate=df.col("amount") / df.col("qty")).drop("note", "paid"))
+print(sales.select(df.col("amount").sum(), df.col("qty").mean(), df.col("customer").n_unique()))
+print(sales.value_counts("region"))
+print(sales.unique(["customer"]).height, sales.sort(["region", "amount"], descending=[false, true])["customer"])
+print(sales.describe())
+print(sales["amount"], sales["customer"], sales[2], sales[1:3].height, sales.tail(2)["qty"])
+print(sales.filter(df.col("note").is_null()).height, sales.filter(df.col("customer").is_in(["ann", "eve"])).height,
+      sales.filter(~df.col("paid")).height, sales.filter(df.col("amount").is_null()).height)
+print(sales.select(df.col("amount").fill_null(0.0).cumsum().alias("cum"), df.col("qty").shift(1), df.col("qty").rolling_mean(2)))
+print(sales.select(df.col("customer") + "-" + df.col("region"), df.col("customer").str_len(), df.col("note").str_contains("o")))
+print(sales.to_dicts()[0], sales.rows()[1], sales.to_dict()["qty"])
+print(sales.rename({"qty": "units"}).columns, df.concat([sales.head(2), sales.tail(1)]).height, sales.memory_bytes())
+print(sales.select(df.col("qty").cast("float"), df.col("qty").cast("str"), df.col("amount").round(0)))
+let recs = df.from_records([[1, "a", 2.5], [2, "b", none]], ["id", "name", "score"])
+print(recs, recs.to_json())
+recs.write_csv("df_out.csv")
+print(read_text("df_out.csv"))
+for r in recs:
+    print(r)
+let g = sales.group_by("region", "paid").agg(df.col("amount").sum(), df.col("qty").max())
+print(g.sort(["region", "paid"]))
+print(sales.group_by("region").sum("amount", "qty").sort("region"), sales.group_by("region").count().sort("region"))
+print(sales.customer, sales.filter(df.col("customer") > "bob").height, sales.filter(df.col("qty") % 2 == 0).height)
+
+let s2 = df.read_csv("df_out.csv")
+print(s2, s2.dtypes)
+print(df.from_csv_text("a,b\n").shape, df.from_csv_text("x;y\n1;2\n3;4\n", sep=";")["y"], df.from_csv_text("a,b\n1,2\n", columns=["b"]).columns)

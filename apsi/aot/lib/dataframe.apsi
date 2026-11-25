@@ -1,0 +1,1055 @@
+# use dataframe: a columnar table engine for native programs (filter, select, group by, join, sort, window),
+# the same API and results as apsi run. Number columns are tensors (int64, float64, bool); text columns are
+# dictionary-encoded (codes into a list of distinct values, -1 = null). Group-by, joins, sorts and CSV parsing run
+# in C (__frame kernels).
+
+let _tconcat = __builtin("concat")
+let _seed = __builtin("seed")
+let _perm = __builtin("permutation")
+
+class _Strs:
+    var codes = none           # int64 tensor, -1 = null
+    var values = []
+    var index = none
+
+fn _strs(codes, values):
+    var s = _Strs()
+    s.codes = codes
+    s.values = values
+    return s
+
+fn _sindex(s):
+    if s.index == none:
+        var d = {}
+        for i in range(len(s.values)):
+            d[s.values[i]] = i
+        s.index = d
+    return s.index
+
+fn _is_s(c) = isinstance(c, _Strs)
+
+fn _pyrepr(v):
+    if v == none:
+        return "None"
+    if not isinstance(v, str):
+        return _pystr(v)
+    let q = "\"" if "'" in v and "\"" not in v else "'"
+    var out = q
+    for ch in v:
+        if ch == "\\":
+            out = out + "\\\\"
+        elif ch == q:
+            out = out + "\\" + q
+        elif ch == "\n":
+            out = out + "\\n"
+        elif ch == "\t":
+            out = out + "\\t"
+        elif ch == "\r":
+            out = out + "\\r"
+        else:
+            out = out + ch
+    return out + q
+
+class _StrCol:                         # a text column taken out of a frame: prints as apsi run prints it
+    var items = []
+    fn __len__(self) = len(self.items)
+    fn __getitem__(self, i) = self.items[i]
+    fn __iter__(self) = iter(self.items)
+    fn tolist(self) = list(self.items)
+    fn __str__(self) = "[" + ", ".join([_pyrepr(v) for v in self.items]) + "]"
+
+fn _strcol(items):
+    var c = _StrCol()
+    c.items = items
+    return c
+fn _dt(c) = "str" if _is_s(c) else str(c.dtype)
+fn _clen(c) = len(c.codes) if _is_s(c) else len(c)
+fn _ilist(t) = [int(v) for v in t.tolist()]
+
+fn _s_tolist(s):
+    let v = s.values
+    return [v[c] if c >= 0 else none for c in _ilist(s.codes)]
+
+fn _s_from_list(items):
+    var index = {}
+    var values = []
+    var codes = []
+    for x in items:
+        if x == none:
+            codes.append(-1)
+            continue
+        if x not in index:
+            index[x] = len(values)
+            values.append(x)
+        codes.append(index[x])
+    var s = _strs(tensor(codes, "int64") if len(codes) > 0 else zeros(0, dtype="int64"), values)
+    s.index = index
+    return s
+
+fn _s_compact(s):
+    let codes = _ilist(s.codes)
+    var used = {}
+    for c in codes:
+        if c >= 0:
+            used[c] = true
+    if len(used) == len(s.values):
+        return s
+    let keep = sorted(list(used.keys()))
+    var remap = {}
+    for i in range(len(keep)):
+        remap[keep[i]] = i
+    return _strs(tensor([remap[c] if c >= 0 else -1 for c in codes], "int64") if len(codes) > 0 else s.codes,
+                 [s.values[i] for i in keep])
+
+fn _take(c, idx):
+    if _is_s(c):
+        return _strs(__frame("take", c.codes, idx, false), c.values)
+    return __frame("take", c, idx, false)
+
+fn _take_null(c, idx):
+    if _is_s(c):
+        return _strs(__frame("take", c.codes, idx, false), c.values)   # -1 rows stay -1: null
+    return __frame("take", c, idx, true)
+
+fn _tolist(a):
+    if _is_s(a):
+        return _s_tolist(a)
+    if isinstance(a, list):
+        return a
+    return a.tolist()
+
+fn _is_float(x) = isinstance(x, float)
+
+fn _infer(items):
+    var kinds = set()
+    for v in items:
+        if v == none or (isinstance(v, float) and v != v):
+            kinds.add("null")
+        elif isinstance(v, bool):
+            kinds.add("bool")
+        elif isinstance(v, int):
+            kinds.add("int")
+        elif isinstance(v, float):
+            kinds.add("float")
+        else:
+            kinds.add("str")
+    var k = set(kinds)
+    k.discard("null")
+    let n = len(items)
+    if k == {"bool"} and "null" not in kinds:
+        return tensor(items, "bool")
+    if k == {"int"} and "null" not in kinds:
+        return tensor(items, "int64")
+    if len(k) > 0 and k.issubset({"int", "float", "bool"}):
+        return tensor([nan if v == none else float(v) for v in items], f64)
+    if len(k) == 0:
+        return full(n, nan) if n > 0 else zeros(0)
+    return _s_compact(_s_from_list([none if v == none else (v if isinstance(v, str) else _pystr(v)) for v in items]))
+
+fn _pystr(v):
+    if isinstance(v, bool):
+        return "True" if v else "False"
+    if v == none:
+        return "None"
+    return str(v)
+
+fn _col(x, n=none):
+    if _is_s(x):
+        return x
+    if isinstance(x, _StrCol):
+        return _infer(x.items)
+    if isinstance(x, list) or isinstance(x, tuple):
+        return _infer(list(x))
+    if str(type(x)).startswith("Tensor"):
+        return x
+    if n != none:
+        return _infer([x] * n)
+    return _infer(list(x))
+
+# ------------------------------------------------------------------ expressions
+class Expr:
+    var f = none
+    var name = ""
+    var agg = none
+    fn eval(self, df) = self.f(df)
+    fn alias(self, name) = _expr(self.f, name, self.agg)
+    fn _bin(self, other, sym):
+        let o = other if isinstance(other, Expr) else lit(other)
+        let me = self
+        return _expr(fn(df) => _binop(me.eval(df), o.eval(df), sym), self.name)
+    fn __add__(self, o) = self._bin(o, "+")
+    fn __radd__(self, o) = lit(o)._bin(self, "+")
+    fn __sub__(self, o) = self._bin(o, "-")
+    fn __rsub__(self, o) = lit(o)._bin(self, "-")
+    fn __mul__(self, o) = self._bin(o, "*")
+    fn __rmul__(self, o) = lit(o)._bin(self, "*")
+    fn __truediv__(self, o) = self._bin(o, "/")
+    fn __rtruediv__(self, o) = lit(o)._bin(self, "/")
+    fn __floordiv__(self, o) = self._bin(o, "//")
+    fn __mod__(self, o) = self._bin(o, "%")
+    fn __pow__(self, o) = self._bin(o, "**")
+    fn __eq__(self, o) = self._bin(o, "==")
+    fn __ne__(self, o) = self._bin(o, "!=")
+    fn __lt__(self, o) = self._bin(o, "<")
+    fn __le__(self, o) = self._bin(o, "<=")
+    fn __gt__(self, o) = self._bin(o, ">")
+    fn __ge__(self, o) = self._bin(o, ">=")
+    fn __and__(self, o) = self._bin(o, "&")
+    fn __or__(self, o) = self._bin(o, "|")
+    fn __invert__(self):
+        let me = self
+        return _expr(fn(df) => _bool(me.eval(df)) == false, self.name)
+    fn __neg__(self):
+        let me = self
+        return _expr(fn(df) => -me.eval(df), self.name)
+    fn is_in(self, values):
+        let vals = list(values)
+        let me = self
+        fn f(df):
+            let a = me.eval(df)
+            if _is_s(a):
+                let idx = _sindex(a)
+                let cs = [idx[v] for v in vals if v in idx]
+                return __frame("isin", a.codes, tensor(cs, f64) if len(cs) > 0 else zeros(0))
+            return __frame("isin", a, tensor([float(v) for v in vals], f64) if len(vals) > 0 else zeros(0))
+        return _expr(f, self.name)
+    fn is_null(self):
+        let me = self
+        fn f(df):
+            let a = me.eval(df)
+            if _is_s(a):
+                return a.codes < 0
+            return isnan(a) if _dt(a) == "float64" else zeros(len(a), dtype="bool")
+        return _expr(f, self.name)
+    fn fill_null(self, v):
+        let me = self
+        fn f(df):
+            let a = me.eval(df)
+            if _is_s(a):
+                return _infer([v if x == none else x for x in _s_tolist(a)])
+            if _dt(a) == "float64":
+                return where(isnan(a), full(len(a), float(v)), a)
+            return a
+        return _expr(f, self.name)
+    fn map(self, func):
+        let me = self
+        return _expr(fn(df) => _infer([func(x) for x in _tolist(me.eval(df))]), self.name)
+    fn _num(self, op):
+        let me = self
+        return _expr(fn(df) => op(me.eval(df)), self.name)
+    fn abs(self) = self._num(fn(a) => abs(a))
+    fn sqrt(self) = self._num(fn(a) => sqrt(tensor(a, f64)))
+    fn log(self) = self._num(fn(a) => log(tensor(a, f64)))
+    fn exp(self) = self._num(fn(a) => exp(tensor(a, f64)))
+    fn round(self, d=0) = self._num(fn(a) => _round_col(a, d))
+    fn cast(self, t):
+        let me = self
+        fn f(df):
+            let a = me.eval(df)
+            if t == "str":
+                return _infer([none if x == none else _pystr(x) for x in _tolist(a)])
+            if _is_s(a):
+                let xs = _s_tolist(a)
+                if t == "int":
+                    return tensor([int(x) for x in xs], "int64")
+                if t == "float":
+                    return tensor([float(x) for x in xs], f64)
+                return tensor([len(x) > 0 for x in xs], "bool")
+            if t == "int":
+                return tensor(a, "int64")
+            if t == "float":
+                return tensor(a, f64)
+            return tensor(a, "bool")
+        return _expr(f, self.name)
+    fn _str(self, func, result="str"):
+        let me = self
+        fn f(df):
+            let a = me.eval(df)
+            if not _is_s(a):
+                raise RuntimeError("string operation on a non-string column")
+            let mapped = [func(v) for v in a.values]
+            if result == "bool":
+                let lut = tensor(mapped + [false], "bool")
+                return __frame("take", lut, where(a.codes < 0, full(len(a.codes), len(mapped), dtype="int64"), a.codes), false)
+            if result == "num":
+                let lut = tensor([float(x) for x in mapped] + [nan], f64)
+                return __frame("take", lut, where(a.codes < 0, full(len(a.codes), len(mapped), dtype="int64"), a.codes), false)
+            let s = _strs(a.codes, mapped)
+            return _s_compact(s) if len(set(mapped)) < len(mapped) else s
+        return _expr(f, self.name)
+    fn str_lower(self) = self._str(fn(v) => v.lower())
+    fn str_upper(self) = self._str(fn(v) => v.upper())
+    fn str_strip(self) = self._str(fn(v) => v.strip())
+    fn str_len(self) = self._str(fn(v) => len(v), "num")
+    fn str_contains(self, sub) = self._str(fn(v) => sub in v, "bool")
+    fn str_startswith(self, p) = self._str(fn(v) => v.startswith(p), "bool")
+    fn str_endswith(self, p) = self._str(fn(v) => v.endswith(p), "bool")
+    fn str_replace(self, a, b) = self._str(fn(v) => v.replace(a, b))
+    fn _agg(self, kind):
+        let me = self
+        return _expr(fn(df) => _reduce_all(kind, me.eval(df)), self.name, [kind, self])
+    fn sum(self) = self._agg("sum")
+    fn mean(self) = self._agg("mean")
+    fn min(self) = self._agg("min")
+    fn max(self) = self._agg("max")
+    fn std(self) = self._agg("std")
+    fn __getattr__(self, k):                     # x.var(): `var` is a keyword, so the method comes from here
+        if k == "var":
+            let me = self
+            return fn() => me._agg("var")
+        raise AttributeError(f"'Expr' object has no attribute '{k}'")
+    fn count(self) = self._agg("count")
+    fn first(self) = self._agg("first")
+    fn last(self) = self._agg("last")
+    fn n_unique(self) = self._agg("n_unique")
+    fn median(self) = self._agg("median")
+    fn cumsum(self):
+        let me = self
+        return _expr(fn(df) => cumsum(me.eval(df)), self.name)
+    fn shift(self, k=1):
+        let me = self
+        fn f(df):
+            let a = tensor(me.eval(df), f64).tolist()
+            let n = len(a)
+            var out = [nan] * n
+            for i in range(n):
+                let j = i - k
+                if 0 <= j and j < n:
+                    out[i] = a[j]
+            return tensor(out, f64) if n > 0 else zeros(0)
+        return _expr(f, self.name)
+    fn rolling_mean(self, w):
+        let me = self
+        fn f(df):
+            let a = tensor(me.eval(df), f64).tolist()
+            let n = len(a)
+            var c = [0.0]
+            for x in a:
+                c.append(c[len(c) - 1] + x)
+            var out = [nan] * n
+            for i in range(w - 1, n):
+                out[i] = (c[i + 1] - c[i + 1 - w]) / w
+            return tensor(out, f64) if n > 0 else zeros(0)
+        return _expr(f, self.name)
+    fn __str__(self) = f"<expr {self.name}>"
+
+fn _expr(f, name, agg=none):
+    var e = Expr()
+    e.f = f
+    e.name = name
+    e.agg = agg
+    return e
+
+fn _round_col(a, d):
+    if _dt(a) == "int64" and d >= 0:
+        return a
+    return round(tensor(a, f64), d)
+
+fn _bool(a):
+    if str(type(a)).startswith("Tensor"):
+        return a if _dt(a) == "bool" else a != 0
+    return a
+
+fn _scalar(x) = not (_is_s(x) or isinstance(x, list) or str(type(x)).startswith("Tensor"))
+
+fn _binop(a, b, sym):
+    let sa = _is_s(a)
+    let sb = _is_s(b)
+    if sa or sb:
+        if sym == "==" or sym == "!=":
+            if sa and not sb and _scalar(b):
+                let code = _sindex(a).get(b, -2)
+                let r = a.codes == code
+                return r if sym == "==" else r == false
+            if sa and sb:
+                let la = _s_tolist(a)
+                let lb = _s_tolist(b)
+                let r = tensor([la[i] == lb[i] for i in range(len(la))], "bool")
+                return r if sym == "==" else r == false
+        if (sym == "<" or sym == "<=" or sym == ">" or sym == ">=") and sa and _scalar(b):
+            var lut = []
+            for v in a.values:
+                lut.append(v < b if sym == "<" else (v <= b if sym == "<=" else (v > b if sym == ">" else v >= b)))
+            lut.append(false)
+            let codes = where(a.codes < 0, full(len(a.codes), len(a.values), dtype="int64"), a.codes)
+            return __frame("take", tensor(lut, "bool"), codes, false)
+        if sym == "+":
+            let la = _s_tolist(a) if sa else ([a] * _clen(b) if _scalar(a) else _tolist(a))
+            let lb = _s_tolist(b) if sb else ([b] * len(la) if _scalar(b) else _tolist(b))
+            return _infer([none if la[i] == none or lb[i] == none else _pystr(la[i]) + _pystr(lb[i]) for i in range(len(la))])
+        raise RuntimeError(f"operator {sym} is not defined for string columns")
+    if sym == "+":
+        return a + b
+    if sym == "-":
+        return a - b
+    if sym == "*":
+        return a * b
+    if sym == "/":
+        return a / b
+    if sym == "//":
+        return a // b
+    if sym == "%":
+        return a % b
+    if sym == "**":
+        return a ** b
+    if sym == "==":
+        return a == b
+    if sym == "!=":
+        return a != b
+    if sym == "<":
+        return a < b
+    if sym == "<=":
+        return a <= b
+    if sym == ">":
+        return a > b
+    if sym == ">=":
+        return a >= b
+    if sym == "&":
+        return _bool(a) & _bool(b)
+    return _bool(a) | _bool(b)
+
+fn _num_out(kind, dt, r):
+    if r != r:
+        return nan
+    if (kind == "sum" or kind == "min" or kind == "max" or kind == "first" or kind == "last") and dt == "int64":
+        return int(r)
+    if (kind == "min" or kind == "max" or kind == "first" or kind == "last") and dt == "bool":
+        return r != 0
+    if kind == "sum" and dt == "bool":
+        return int(r)
+    return float(r)
+
+fn _reduce_all(kind, a):
+    if _is_s(a):
+        let codes = _ilist(a.codes)
+        if kind == "count":
+            return len([c for c in codes if c >= 0])
+        if kind == "n_unique":
+            return len(set([c for c in codes if c >= 0]))
+        if kind == "first" or kind == "last":
+            if len(codes) == 0:
+                return none
+            let c = codes[0] if kind == "first" else codes[len(codes) - 1]
+            return a.values[c] if c >= 0 else none
+        let vals = sorted([v for v in _s_tolist(a) if v != none])
+        if len(vals) == 0:
+            return none
+        return vals[0] if kind == "min" else vals[len(vals) - 1]
+    let dt = _dt(a)
+    let n = len(a)
+    if kind == "count":
+        return int(float(__frame("reduce", zeros(n, dtype="int64"), 1, a, "count")[0])) if dt == "float64" else n
+    if n == 0:
+        return none
+    if kind == "first":
+        return _item(a, 0)
+    if kind == "last":
+        return _item(a, n - 1)
+    let r = float(__frame("reduce", zeros(n, dtype="int64"), 1, a, kind)[0])
+    if (kind == "min" or kind == "max") and (r == inf or r == -inf) and dt == "float64":
+        return nan
+    return _num_out(kind, dt, r)
+
+fn _item(c, i):
+    if _is_s(c):
+        let k = int(c.codes[i])
+        return c.values[k] if k >= 0 else none
+    let dt = _dt(c)
+    let v = c[i]
+    if dt == "int64":
+        return int(v)
+    if dt == "bool":
+        return bool(v)
+    return float(v)
+
+fn col(name):
+    return _expr(fn(df) => df._column(name), name)
+
+fn lit(v) = _expr(fn(df) => v, "literal")
+
+fn count() = _expr(fn(df) => df.height, "count", ["len", none])
+
+# ------------------------------------------------------------------ the frame
+class _Frame:
+    var _cols = {}
+    var height = 0
+    var width = 0
+    var shape = (0, 0)
+    var columns = []
+    var dtypes = {}
+    fn _column(self, name):
+        if name not in self._cols:
+            raise RuntimeError(f"no column '{name}' (columns: {', '.join(list(self._cols.keys()))})")
+        return self._cols[name]
+    fn __len__(self) = self.height
+    fn __getitem__(self, k):
+        if isinstance(k, str):
+            let c = self._column(k)
+            return _strcol(_s_tolist(c)) if _is_s(c) else c
+        if isinstance(k, list):
+            return self.select(*k)
+        if isinstance(k, int):
+            let i = k if k >= 0 else self.height + k
+            if i < 0 or i >= self.height:
+                raise IndexError(f"row {k} is out of range for {self.height} rows")
+            return self.row(i)
+        if isinstance(k, Expr):
+            return self.filter(k)
+        if str(type(k)).startswith("Tensor"):
+            return self.filter(k)
+        let idx = list(range(self.height))[k]
+        return self._rows_at(tensor(idx, "int64") if len(idx) > 0 else zeros(0, dtype="int64"))
+    fn __setitem__(self, k, v):
+        var cols = dict(self._cols)
+        cols[str(k)] = _col(v, self.height)
+        _fill(self, cols)
+    fn __getattr__(self, k):
+        if k in self._cols:
+            return self[k]
+        raise AttributeError(f"'DataFrame' object has no attribute '{k}'")
+    fn __iter__(self) = iter(self.to_dicts())
+    fn _rows_at(self, idx):
+        var out = {}
+        for k in self._cols:
+            out[k] = _take(self._cols[k], idx)
+        return _frame_of(out)
+    fn row(self, i):
+        var r = {}
+        for k in self._cols:
+            r[k] = _item(self._cols[k], i)
+        return r
+    fn rows(self):
+        let names = list(self._cols.keys())
+        let lists = [_col_list(self._cols[k]) for k in names]
+        var out = []
+        for i in range(self.height):
+            out.append(tuple([l[i] for l in lists]))
+        return out
+    fn to_dicts(self):
+        let names = list(self._cols.keys())
+        let lists = [_col_list(self._cols[k]) for k in names]
+        var out = []
+        for i in range(self.height):
+            var d = {}
+            for j in range(len(names)):
+                d[names[j]] = lists[j][i]
+            out.append(d)
+        return out
+    fn to_dict(self):
+        var d = {}
+        for k in self._cols:
+            d[k] = _col_list(self._cols[k])
+        return d
+    fn to_numpy(self, *cols):
+        var names = list(cols)
+        if len(names) == 0:
+            names = [k for k in self._cols if not _is_s(self._cols[k])]
+        return stack([tensor(self._cols[n], f64) for n in names], axis=1)
+    fn _eval(self, e, n=none):
+        var v = none
+        if isinstance(e, Expr):
+            v = e.eval(self)
+        elif isinstance(e, str):
+            v = self._column(e)
+        else:
+            v = e
+        if _is_s(v):
+            return v
+        if _scalar(v):
+            return _infer([v] * (n if n != none else self.height))
+        return _col(v)
+    fn select(self, *exprs, **named):
+        var out = {}
+        for e in exprs:
+            if isinstance(e, list) or isinstance(e, tuple):
+                for x in e:
+                    out[x if isinstance(x, str) else x.name] = self._eval(x)
+                continue
+            out[e if isinstance(e, str) else e.name] = self._eval(e)
+        for k in named:
+            out[k] = self._eval(named[k])
+        return _frame_of(out)
+    fn with_columns(self, *exprs, **named):
+        var cols = dict(self._cols)
+        for e in exprs:
+            cols[e.name] = self._eval(e)
+        for k in named:
+            cols[k] = self._eval(named[k])
+        return _frame_of(cols)
+    fn with_column(self, *exprs, **named) = self.with_columns(*exprs, **named)
+    fn drop(self, *names):
+        var out = {}
+        for k in self._cols:
+            if k not in names:
+                out[k] = self._cols[k]
+        return _frame_of(out)
+    fn rename(self, mapping=none, **kw):
+        var m = dict(mapping) if mapping != none else {}
+        for k in kw:
+            m[k] = kw[k]
+        var out = {}
+        for k in self._cols:
+            out[m.get(k, k)] = self._cols[k]
+        return _frame_of(out)
+    fn filter(self, cond):
+        let mask = _bool(cond.eval(self) if isinstance(cond, Expr) else cond)
+        if not str(type(mask)).startswith("Tensor") or ndim(mask) != 1 or len(mask) != self.height:
+            raise RuntimeError("filter needs one true/false per row")
+        return self._rows_at(__frame("nonzero", mask))
+    fn where(self, cond) = self.filter(cond)
+    fn head(self, n=5) = self._rows_at(arange(min(n, self.height), dtype="int64") if min(n, self.height) > 0 else zeros(0, dtype="int64"))
+    fn tail(self, n=5):
+        let s = max(0, self.height - n)
+        return self._rows_at(arange(s, self.height, dtype="int64") if self.height > s else zeros(0, dtype="int64"))
+    fn sample(self, n, seed=none):
+        if seed != none:
+            _seed(int(seed))
+        let k = min(n, self.height)
+        let p = _perm(self.height).tolist()
+        return self._rows_at(tensor([int(p[i]) for i in range(k)], "int64") if k > 0 else zeros(0, dtype="int64"))
+    fn sort(self, by, descending=false):
+        let keys = [by] if isinstance(by, str) or isinstance(by, Expr) else list(by)
+        let desc = list(descending) if isinstance(descending, list) or isinstance(descending, tuple) else [descending] * len(keys)
+        var arrays = []
+        for q in range(len(keys)):
+            let c = self._eval(keys[q])
+            var key = none
+            if _is_s(c):
+                let vals = c.values + [""]
+                let order = sorted(list(range(len(vals))), key=fn(i) => vals[i])
+                var rank = [0] * len(vals)
+                for i in range(len(order)):
+                    rank[order[i]] = i
+                let codes = where(c.codes < 0, full(len(c.codes), len(c.values), dtype="int64"), c.codes)
+                key = tensor(__frame("take", tensor(rank, f64), codes, false), f64)
+            else:
+                key = tensor(c, f64)
+            if desc[q]:
+                key = -key if _dt(c) != "bool" else 1.0 - key
+            arrays.append(key)
+        return self._rows_at(__frame("argsort", arrays))
+    fn unique(self, subset=none):
+        let names = subset if subset != none else self.columns
+        let g = __frame("group", [_key(self._column(k)) for k in names])
+        let idx = sorted(_ilist(g[1]))
+        return self._rows_at(tensor(idx, "int64") if len(idx) > 0 else zeros(0, dtype="int64"))
+    fn group_by(self, *keys):
+        var ks = []
+        for k in keys:
+            if isinstance(k, list) or isinstance(k, tuple):
+                for x in k:
+                    ks.append(x)
+            else:
+                ks.append(k)
+        return _group(self, ks)
+    fn groupby(self, *keys) = self.group_by(*keys)
+    fn join(self, other, on=none, left_on=none, right_on=none, how="inner", suffix="_right"):
+        let lo = left_on if left_on != none else on
+        let ro = right_on if right_on != none else on
+        let lnames = [lo] if isinstance(lo, str) else list(lo)
+        let rnames = [ro] if isinstance(ro, str) else list(ro)
+        var lk = []
+        var rk = []
+        var as_float = false
+        for q in range(len(lnames)):
+            let a = self._column(lnames[q])
+            let b = other._column(rnames[q])
+            if _is_s(a) and _is_s(b):
+                let idx = _sindex(a)
+                var extra = {}
+                var lut = []
+                for v in b.values:
+                    var c = idx.get(v, none)
+                    if c == none:
+                        if v not in extra:
+                            extra[v] = len(a.values) + len(extra)
+                        c = extra[v]
+                    lut.append(c)
+                lut.append(-2)                         # a right null never meets anything
+                let rc = where(b.codes < 0, full(len(b.codes), len(b.values), dtype="int64"), b.codes)
+                lk.append(a.codes)
+                rk.append(__frame("take", tensor(lut, "int64"), rc, false))
+            elif _is_s(a) or _is_s(b):
+                let both = _s_from_list([_pystr(x) for x in _tolist(a) + _tolist(b)])
+                let codes = _ilist(both.codes)
+                let na = _clen(a)
+                lk.append(tensor(codes[0:na], "int64") if na > 0 else zeros(0, dtype="int64"))
+                rk.append(tensor(codes[na:], "int64") if len(codes) > na else zeros(0, dtype="int64"))
+            else:
+                if _dt(a) == "float64" or _dt(b) == "float64":
+                    as_float = true
+                lk.append(a)
+                rk.append(b)
+        let pair = __frame("join", lk, rk, how, as_float)
+        let li = pair[0]
+        let ri = pair[1]
+        var out = {}
+        for k in self._cols:
+            out[k] = _take_null(self._cols[k], li)
+        if how == "right" or how == "outer" or how == "full":
+            let fill = _ilist(li)
+            if -1 in fill:
+                for q in range(len(lnames)):
+                    let lc = self._column(lnames[q])
+                    let rc = other._column(rnames[q])
+                    let lv = _tolist(out[lnames[q]])
+                    let rv = _tolist(_take_null(rc, ri))
+                    let merged = [rv[i] if fill[i] < 0 else lv[i] for i in range(len(fill))]
+                    if not _is_s(lc) and not _is_s(rc) and _dt(lc) == "int64" and _dt(rc) == "int64":
+                        out[lnames[q]] = tensor([int(x) for x in merged], "int64") if len(merged) > 0 else zeros(0, dtype="int64")
+                    elif _is_s(lc) or _is_s(rc):
+                        out[lnames[q]] = _infer(merged)
+                    else:
+                        out[lnames[q]] = tensor([float(x) for x in merged], f64) if len(merged) > 0 else zeros(0)
+        for k in other._cols:
+            if k in rnames and rnames == lnames:
+                continue
+            let name = k if k not in out else k + suffix
+            out[name] = _take_null(other._cols[k], ri)
+        return _frame_of(out)
+    fn concat(self, *others):
+        let frames = [self] + list(others)
+        var out = {}
+        for k in self.columns:
+            let parts = [f._column(k) for f in frames]
+            var anys = false
+            for p in parts:
+                if _is_s(p):
+                    anys = true
+            if anys:
+                var items = []
+                for p in parts:
+                    items = items + _tolist(p)
+                out[k] = _infer(items)
+            else:
+                var flt = false
+                for p in parts:
+                    if _dt(p) == "float64":
+                        flt = true
+                out[k] = _tconcat([tensor(p, f64) if flt else p for p in parts])
+        return _frame_of(out)
+    fn value_counts(self, column, sort=true):
+        let r = self.group_by(column).agg(count=count())
+        return r.sort("count", descending=true) if sort else r
+    fn describe(self):
+        var rows = []
+        for k in self._cols:
+            let c = self._cols[k]
+            if _is_s(c):
+                rows.append({"column": k, "type": "str", "count": _reduce_all("count", c), "unique": len(c.values),
+                             "mean": none, "std": none, "min": none, "max": none})
+            else:
+                let a = tensor(c, f64)
+                let n = len(a)
+                rows.append({"column": k, "type": _dtype_name(c), "count": _reduce_all("count", a), "unique": none,
+                             "mean": _reduce_all("mean", a) if n > 0 else none,
+                             "std": _reduce_all("std", a) if n > 1 else none,
+                             "min": _nanmm("min", a) if n > 0 else none, "max": _nanmm("max", a) if n > 0 else none})
+        return frame(rows)
+    fn _csv_text(self):
+        var lines = [",".join([_csv_cell(x) for x in self.columns])]
+        for r in self.rows():
+            lines.append(",".join([_csv_cell(_csv_value(x)) for x in r]))
+        return "\r\n".join(lines) + "\r\n"
+    fn write_csv(self, path):
+        write_text(path, self._csv_text())
+    fn write_jsonl(self, path):
+        var parts = []
+        for r in self.to_dicts():
+            parts.append(json_str(r) + "\n")
+        write_text(path, "".join(parts))
+    fn write_json(self, path):
+        write_text(path, json_str(self.to_dicts()))
+    fn to_json(self) = json_str(self.to_dicts())
+    fn memory_bytes(self):
+        var tot = 0
+        for k in self._cols:
+            let c = self._cols[k]
+            if _is_s(c):
+                var chars = 0
+                for v in c.values:
+                    chars = chars + len(v)
+                tot = tot + 4 * len(c.codes) + chars + 8 * len(c.values)
+            else:
+                tot = tot + (len(c) if _dt(c) == "bool" else 8 * len(c))
+        return tot
+    fn __str__(self):
+        let n = self.height
+        var show = []
+        if n <= 20:
+            show = list(range(min(n, 10)))
+        else:
+            show = list(range(5)) + [-1] + list(range(n - 5, n))
+        let names = self.columns
+        var cells = [names, [self.dtypes[k] for k in names]]
+        for i in show:
+            if i < 0:
+                cells.append(["…"] * len(names))
+                continue
+            let r = self.row(i)
+            cells.append([_fmt(r[k]) for k in names])
+        var widths = []
+        for j in range(len(names)):
+            var w = 0
+            for row in cells:
+                w = max(w, len(str(row[j])))
+            widths.append(w)
+        fn line(row):
+            var parts = []
+            for j in range(len(names)):
+                let v = str(row[j])
+                parts.append(v.rjust(widths[j]) if j else v.ljust(widths[j]))
+            return "│ " + " │ ".join(parts) + " │"
+        let sep = "├" + "┼".join(["─" * (w + 2) for w in widths]) + "┤"
+        var out = [f"shape: ({n}, {len(names)})", "┌" + "┬".join(["─" * (w + 2) for w in widths]) + "┐", line(cells[0]),
+                   line(cells[1]), sep]
+        for r in cells[2:]:
+            out.append(line(r))
+        out.append("└" + "┴".join(["─" * (w + 2) for w in widths]) + "┘")
+        return "\n".join(out)
+
+fn _nanmm(kind, a):
+    let r = _reduce_all(kind, a)
+    return r
+
+fn _dtype_name(c):
+    if _is_s(c):
+        return "str"
+    let d = _dt(c)
+    if d == "int64":
+        return "int"
+    if d == "bool":
+        return "bool"
+    return "float"
+
+fn _col_list(c):
+    if _is_s(c):
+        return _s_tolist(c)
+    let d = _dt(c)
+    if d == "int64":
+        return [int(v) for v in c.tolist()]
+    if d == "bool":
+        return [bool(v) for v in c.tolist()]
+    return [float(v) for v in c.tolist()]
+
+fn _key(c) = c.codes if _is_s(c) else c
+
+fn _fill(df, cols):
+    var n = -1
+    for k in cols:
+        let m = _clen(cols[k])
+        if n >= 0 and m != n:
+            raise RuntimeError(f"column '{k}' has {m} values, the others {n}")
+        n = m
+    df._cols = cols
+    df.height = max(n, 0)
+    df.width = len(cols)
+    df.shape = (df.height, df.width)
+    df.columns = list(cols.keys())
+    var dts = {}
+    for k in cols:
+        dts[k] = _dtype_name(cols[k])
+    df.dtypes = dts
+    return df
+
+fn _frame_of(cols) = _fill(_Frame(), cols)
+
+fn frame(data=none, columns=none):
+    if data == none:
+        return _frame_of({})
+    if isinstance(data, _Frame):
+        return _frame_of(dict(data._cols))
+    var d = data
+    if isinstance(data, list) and len(data) > 0 and isinstance(data[0], dict):
+        var keys = []
+        var seen = {}
+        for r in data:
+            for k in r:
+                if k not in seen:
+                    seen[k] = true
+                    keys.append(k)
+        d = {}
+        for k in keys:
+            d[k] = [r.get(k, none) for r in data]
+    elif isinstance(data, list) and columns != none:
+        d = {}
+        for i in range(len(columns)):
+            d[columns[i]] = [r[i] for r in data]
+    elif isinstance(data, list):
+        d = {}
+    var cols = {}
+    for k in d:
+        cols[str(k)] = _col(d[k])
+    return _frame_of(cols)
+
+fn DataFrame(data=none, columns=none) = frame(data, columns)
+
+fn _fmt(v):
+    if isinstance(v, float):
+        return "null" if v != v else f"{v:.6g}"
+    if v == none:
+        return "null"
+    return _pystr(v)
+
+fn _csv_value(x):
+    if x == none:
+        return ""
+    if isinstance(x, bool):
+        return "True" if x else "False"
+    if isinstance(x, float):
+        if x != x:
+            return "nan"
+        if x == inf:
+            return "inf"
+        if x == -inf:
+            return "-inf"
+    return str(x)
+
+fn _csv_cell(s):
+    if "," in s or "\"" in s or "\n" in s or "\r" in s:
+        return "\"" + s.replace("\"", "\"\"") + "\""
+    return s
+
+class _GroupBy:
+    var df = none
+    var keys = []
+    var gid = none
+    var first = none
+    var k = 0
+    fn agg(self, *exprs, **named):
+        let df = self.df
+        let gid = self.gid
+        let k = self.k
+        var out = {}
+        for key in self.keys:
+            out[key] = _take(df._column(key), self.first)
+        var items = []
+        for e in exprs:
+            items.append([e.name, e])
+        for nm in named:
+            items.append([nm, named[nm]])
+        for it in items:
+            let name = it[0]
+            var e = it[1]
+            if isinstance(e, str):
+                e = col(e).sum()
+            let kind = e.agg[0] if e.agg != none else "first"
+            let inner = e.agg[1] if e.agg != none else e
+            if kind == "len":
+                out[name] = tensor(__frame("reduce", gid, k, ones(len(gid)), "count"), "int64")
+                continue
+            let a = inner.eval(df)
+            if _is_s(a):
+                if kind == "count":
+                    out[name] = tensor(__frame("reduce", gid, k, where(a.codes >= 0, ones(len(gid)), full(len(gid), nan)), "count"), "int64")
+                elif kind == "n_unique":
+                    out[name] = tensor(__frame("reduce", gid, k, a.codes, "n_unique"), "int64")
+                else:
+                    let pick = tensor(__frame("reduce", gid, k, arange(len(gid)), "first" if kind == "first" else "last"), "int64")
+                    out[name] = _take(a, pick)
+                continue
+            let dt = _dt(a)
+            if kind == "count":
+                out[name] = tensor(__frame("reduce", gid, k, a if dt == "float64" else ones(len(gid)), "count"), "int64")
+                continue
+            if kind == "first":
+                out[name] = _take(a, self.first)
+                continue
+            if kind == "last":
+                out[name] = _take(a, tensor(__frame("reduce", gid, k, arange(len(gid)), "last"), "int64"))
+                continue
+            let r = __frame("reduce", gid, k, a, kind)
+            if kind == "sum" and (dt == "int64" or dt == "bool") and float(max(abs(r))) < 2.0 ** 52:
+                out[name] = tensor(r, "int64")
+            elif (kind == "min" or kind == "max") and dt == "int64":
+                out[name] = tensor(r, "int64")
+            elif kind == "n_unique":
+                out[name] = tensor(r, "int64")
+            else:
+                out[name] = r
+        return _frame_of(out)
+    fn count(self) = self.agg(count=count())
+    fn sum(self, *cols):
+        var d = {}
+        for c in (list(cols) if len(cols) > 0 else self._value_cols()):
+            d[c] = col(c).sum()
+        return self.agg(**d)
+    fn mean(self, *cols):
+        var d = {}
+        for c in (list(cols) if len(cols) > 0 else self._value_cols()):
+            d[c] = col(c).mean()
+        return self.agg(**d)
+    fn _value_cols(self) = [k for k in self.df._cols if k not in self.keys and not _is_s(self.df._cols[k])]
+
+fn _group(df, keys):
+    var g = _GroupBy()
+    g.df = df
+    g.keys = keys
+    let r = __frame("group", [_key(df._column(k)) for k in keys])
+    g.gid = r[0]
+    g.first = r[1]
+    g.k = len(r[1])
+    return g
+
+# ------------------------------------------------------------------ IO
+fn _from_rows(rows, columns=none):
+    if len(rows) == 0:
+        return _frame_of({})
+    let header = rows[0]
+    let body = rows[1:]
+    if len(body) == 0:
+        var cols = {}
+        for h in header:
+            cols[h] = zeros(0)
+        return _frame_of(cols)
+    var width = len(header)
+    for r in body:
+        width = min(width, len(r))
+    var cols = {}
+    for j in range(width):
+        let name = header[j]
+        if columns != none and name not in columns:
+            continue
+        let c = __frame("convert", [r[j] for r in body])
+        cols[name] = _strs(c[1], c[2]) if isinstance(c, tuple) else c
+    return _frame_of(cols)
+
+fn from_csv_text(text, sep=",", columns=none):
+    let r = __frame("read", text, sep, columns)
+    if len(r[0]) == 0:
+        return _frame_of({})
+    var cols = {}
+    for name in r[0]:
+        if name not in r[1]:
+            continue
+        let c = r[1][name]
+        cols[name] = _strs(c[1], c[2]) if isinstance(c, tuple) else c
+    if len(cols) > 0 and _clen(cols[list(cols.keys())[0]]) == 0:
+        var empty = {}
+        for name in cols:
+            empty[name] = zeros(0)
+        return _frame_of(empty)
+    return _frame_of(cols)
+
+fn read_csv(path, sep=",", columns=none) = from_csv_text(read_text(path), sep, columns)
+
+fn read_jsonl(path):
+    var rows = []
+    var k = 0
+    for line in read_text(path).split("\n"):
+        if line.strip() == "":
+            continue
+        k = k + 1
+        try:
+            rows.append(json_parse(line))
+        except ValueError as e:
+            raise RuntimeError(f"read_jsonl(): record {k} (not counting empty lines) is not valid JSON ({e})")
+    return frame(rows) if len(rows) > 0 else frame()
+
+fn read_json(path) = frame(load_json(path))
+
+fn from_records(rows, columns=none) = frame(rows, columns)
+
+fn concat(frames):
+    let fs = list(frames)
+    return fs[0].concat(*fs[1:])

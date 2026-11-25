@@ -1060,9 +1060,15 @@ AV a_binop(int op, AV a, AV b) {
     if (op >= OP_ADD && op <= OP_SHR) { int ok; AV r = inst_op(a, b, dn[op], rn[op], &ok); if (ok) return r; }
     a_error("TypeError", "unsupported operand types for %s: '%s' and '%s'", opname(op), tname(a), tname(b));
 }
+static AV inst_method(AV o, const char *name);
 AV a_unop(int op, AV a) {
     if (a_is_tn(a)) {
         if (op == OP_NEG) return a_tensor_neg(a);
+        if (op == OP_INV) {                                    /* ~ : logical not of a bool tensor, else -x - 1 */
+            AV dt = a_getattr(a, "dtype");
+            if (a_is(dt, O_STR) && !strcmp(STR(dt)->s, "bool")) return a_tensor_cmp(OP_EQ, a, a_bool(0));
+            AV m = a_tensor_neg(a); int sp = a_ntmp; A_PUSH(m); AV r = a_binop(OP_SUB, m, a_int(1)); a_ntmp = sp; return r;
+        }
         if (op == OP_POS) return a;
         if (op == OP_NOT) return a_bool(!a_tensor_truthy(a));
     }
@@ -1076,7 +1082,10 @@ AV a_unop(int op, AV a) {
         if (a_is(a, O_INST)) { AV f = a_getattr(a, "__neg__"); if (f.t != 255) return a_call(f, 0, NULL, NULL); }
         break;
     case OP_POS: if (a_is(a, O_QTY)) return a; if (num(a)) return a.t == T_BOOL ? a_int(a.i) : a; break;
-    case OP_INV: if (a.t == T_INT || a.t == T_BOOL) return a_int(~a.i); break;
+    case OP_INV:
+        if (a.t == T_INT || a.t == T_BOOL) return a_int(~a.i);
+        if (a_is(a, O_INST)) { AV f = inst_method(a, "__invert__"); if (f.t != 255) return a_call(f, 0, NULL, NULL); }
+        break;
     default: break;
     }
     a_error("TypeError", "bad operand type for unary operator: '%s'", tname(a));
@@ -1118,12 +1127,39 @@ static int tensor_cmp_applies(int op, AV a, AV b) {
     if ((op == OP_EQ || op == OP_NE) && (a.t == T_NONE || b.t == T_NONE || a_is(a, O_STR) || a_is(b, O_STR))) return 0;
     return 1;
 }
+/* a class's rich comparisons (__lt__ ... __eq__) give their own result, with Python's reflected fallback */
+static AV class_lookup(AClass *c, const char *name);
+static AV inst_method(AV o, const char *name) {               /* a method the class defines (not __getattr__) */
+    if (!a_is(o, O_INST)) return (AV){.t = 255};
+    AV v = class_lookup(((AInst *)o.o)->cls, name);
+    return a_is(v, O_FUNC) ? a_bound(o, v) : (AV){.t = 255};
+}
+static int inst_cmp(int op, AV a, AV b, AV *out) {
+    if (!(a_is(a, O_INST) || a_is(b, O_INST))) return 0;
+    const char *nm, *rn;
+    switch (op) {
+    case OP_LT: nm = "__lt__"; rn = "__gt__"; break; case OP_LE: nm = "__le__"; rn = "__ge__"; break;
+    case OP_GT: nm = "__gt__"; rn = "__lt__"; break; case OP_GE: nm = "__ge__"; rn = "__le__"; break;
+    case OP_EQ: nm = rn = "__eq__"; break; case OP_NE: nm = rn = "__ne__"; break;
+    default: return 0;
+    }
+    if (a_is(a, O_INST)) { AV f = inst_method(a, nm); if (f.t != 255) { *out = a_call(f, 1, &b, NULL); return 1; } }
+    if (a_is(b, O_INST)) { AV f = inst_method(b, rn); if (f.t != 255) { *out = a_call(f, 1, &a, NULL); return 1; } }
+    if (op == OP_NE) { AV r; if (inst_cmp(OP_EQ, a, b, &r)) { *out = a_bool(!a_truthy(r)); return 1; } }
+    if (op == OP_GT || op == OP_GE) {                       /* only __lt__ / __le__ defined: the mirror */
+        AV f = inst_method(b, op == OP_GT ? "__lt__" : "__le__");
+        if (f.t != 255) { *out = a_call(f, 1, &a, NULL); return 1; }
+    }
+    return 0;
+}
 AV a_cmp_slow(int op, AV a, AV b) {
+    { AV r; if (inst_cmp(op, a, b, &r)) return r; }
     if ((qt(a) || qt(b)) && op != OP_IN && op != OP_NOTIN && op != OP_IS && op != OP_ISNOT) return a_qty_cmp(op, a, b);
     if (tensor_cmp_applies(op, a, b)) return a_tensor_cmp(op, a, b);
     return a_bool(a_compare(op, a, b));
 }
 int a_compare(int op, AV a, AV b) {
+    { AV r; if (op != OP_EQ && op != OP_NE && inst_cmp(op, a, b, &r)) return a_truthy(r); }
     if ((qt(a) || qt(b)) && op != OP_IN && op != OP_NOTIN && op != OP_IS && op != OP_ISNOT) return a_tensor_truthy(a_qty_cmp(op, a, b));
     if (tensor_cmp_applies(op, a, b)) return a_tensor_truthy(a_tensor_cmp(op, a, b));
     switch (op) {
@@ -1621,6 +1657,10 @@ static const char *attr_hint(AV o, const char *name) {
 }
 AV a_attr(AV o, const char *name) {
     AV v = a_getattr(o, name);
+    if (v.t == 255 && a_is(o, O_INST) && strcmp(name, "__getattr__")) {   /* the class's __getattr__, for names it lacks */
+        AV f = inst_method(o, "__getattr__");
+        if (f.t != 255) { AV k = a_str(name); return a_call(f, 1, &k, NULL); }
+    }
     if (v.t == 255) {
         const char *h = attr_hint(o, name);
         if (h) a_error("AttributeError", "'%s' object has no attribute '%s'; did you mean '%s'?", tname(o), name, h);
@@ -2319,6 +2359,11 @@ static AV b_read_text(int n, AV *a, ADict *kw, AV self) {
     while ((k = fread(buf, 1, sizeof buf, f)) > 0) sb_put(&b, buf, (int64_t)k);
     fclose(f);
     if (b.n >= 3 && (unsigned char)b.p[0] == 0xEF && (unsigned char)b.p[1] == 0xBB && (unsigned char)b.p[2] == 0xBF) { memmove(b.p, b.p + 3, (size_t)b.n - 2); b.n -= 3; }
+    {   /* text mode, as apsi run (Python) reads files: \r\n and \r become \n */
+        int64_t w = 0;
+        for (int64_t r = 0; r < b.n; r++) { if (b.p[r] == '\r') { b.p[w++] = '\n'; if (r + 1 < b.n && b.p[r + 1] == '\n') r++; } else b.p[w++] = b.p[r]; }
+        b.n = w;
+    }
     return sb_done(&b);
 }
 static AV b_write_text(int n, AV *a, ADict *kw, AV self) {
