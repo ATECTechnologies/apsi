@@ -48,7 +48,7 @@ void a_root(AV *slots, int n) {
 }
 
 /* the class objects of the built-in exceptions (kept alive as roots) */
-#define A_NEXC 43
+#define A_NEXC 45
 static AV a_exc_classes[A_NEXC];
 static const char *a_exc_names[A_NEXC] = {
     "BaseException", "Exception", "ArithmeticError", "ZeroDivisionError", "OverflowError", "ValueError", "TypeError",
@@ -57,9 +57,9 @@ static const char *a_exc_names[A_NEXC] = {
     "FloatingPointError", "FileNotFoundError", "FileExistsError", "PermissionError", "TimeoutError", "ConnectionError",
     "UnicodeError", "MemoryError", "EOFError", "ImportError", "ShapeError", "UserError", "IsADirectoryError",
     "ModuleNotFoundError", "UnicodeDecodeError", "UnicodeEncodeError", "ConnectionRefusedError", "ConnectionResetError",
-    "ConnectionAbortedError", "BrokenPipeError", "NotADirectoryError", "SystemExit", "GeneratorExit"};
+    "ConnectionAbortedError", "BrokenPipeError", "NotADirectoryError", "SystemExit", "GeneratorExit", "InvalidOperation", "DivisionByZero"};
 static const int a_exc_base[A_NEXC] = {-1, 0, 1, 2, 2, 1, 1, 1, 7, 7, 1, 1, 1, 12, 1, 1, 5, 1, 12, 0,
-    2, 17, 17, 17, 17, 17, 5, 1, 1, 1, 5, 12, 17, 29, 26, 26, 25, 25, 25, 25, 17, 0, 0};
+    2, 17, 17, 17, 17, 17, 5, 1, 1, 1, 5, 12, 17, 29, 26, 26, 25, 25, 25, 25, 17, 0, 0, 2, 3};
 
 static void mark(AV v);
 struct AGen; static void gen_mark(struct AGen *g); static void gen_free(struct AGen *g); static const char *gen_name(AObj *o);
@@ -469,6 +469,7 @@ uint64_t a_hash(AV v) {
     }
     switch (v.o->kind) {
     case O_STR: case O_BYTES: { AStr *s = STR(v); if (!s->hash) s->hash = fnv(s->s, s->len); return s->hash; }
+    case O_DEC: return a_dec_hash(v);
     case O_COMPLEX: { double re = a_cplx_builtin("real", 1, &v, NULL).f, im = a_cplx_builtin("imag", 1, &v, NULL).f; if (im == 0) return a_hash(a_float(re)); uint64_t x, y; memcpy(&x, &re, 8); memcpy(&y, &im, 8); return x * 1000003ull ^ y; }
     case O_TUPLE: {
         uint64_t h = 0x345678;
@@ -482,6 +483,7 @@ uint64_t a_hash(AV v) {
 static int num(AV v) { return v.t == T_INT || v.t == T_BOOL || v.t == T_FLOAT; }
 static double fval(AV v) { return v.t == T_FLOAT ? v.f : (double)v.i; }
 int a_eq(AV a, AV b) {
+    if (a_is(a, O_DEC) || a_is(b, O_DEC)) { int ok; int c = a_dec_cmp(a, b, &ok); return ok && c == 0; }
     if ((a.t == T_OBJ && (a.o->kind == O_COMPLEX || a.o->kind == O_CTENSOR)) || (b.t == T_OBJ && (b.o->kind == O_COMPLEX || b.o->kind == O_CTENSOR))) return a_cplx_eq(a, b);
     if (a_is_tn(a) || a_is_tn(b)) return a_tensor_eq(a, b);
     if ((a_is(a, O_STR) && a_is(b, O_CLASS)) || (a_is(a, O_CLASS) && a_is(b, O_STR))) {   /* type(x) == SomeClass */
@@ -552,6 +554,7 @@ int a_truthy(AV v) {
     switch (v.o->kind) {
     case O_STR: case O_BYTES: return STR(v)->len != 0;
     case O_BYTEARRAY: return STR(BA(v)->data)->len != 0;
+    case O_DEC: return a_dec_truthy(v);
     case O_LIST: case O_TUPLE: return LIST(v)->len != 0;
     case O_DICT: case O_SET: return DICT(v)->len != 0;
     case O_RANGE: return a_len(v) != 0;
@@ -648,6 +651,7 @@ static void repr_into(SB *b, AV v, int repr) {
         }
         sb_put(b, &q, 1); return;
     }
+    case O_DEC: { char *t = a_dec_text(v); sb_puts(b, t); free(t); return; }
     case O_BYTEARRAY: sb_puts(b, "bytearray("); repr_into(b, BA(v)->data, 1); sb_puts(b, ")"); return;
     case O_LIST: case O_TUPLE: {
         int tup = v.o->kind == O_TUPLE;
@@ -741,6 +745,7 @@ AV a_repr(AV v) { SB b = {0}; repr_into(&b, v, 1); return sb_done(&b); }
 AV a_format(AV v, const char *spec) {
     if (!spec || !*spec) return a_to_str(v);
     if (a_is(v, O_QTY)) { SB b = {0}; qty_text(&b, (AQty *)v.o, QTY(v)->tv.t == T_OBJ ? NULL : spec); return sb_done(&b); }
+    if (a_is(v, O_DEC)) { char *t = a_dec_format(v, spec); AV r = a_str(t); free(t); return r; }
     /* [[fill]align][sign][0][width][,][.precision][type] */
     char fill = ' ', align = 0, sign = '-', type = 0; int width = -1, prec = -1, comma = 0, zero = 0;
     const char *p = spec;
@@ -1055,7 +1060,7 @@ static const char *tname(AV v) {
     default: break;
     }
     switch (v.o->kind) {
-    case O_STR: return "str"; case O_BYTES: return "bytes"; case O_BYTEARRAY: return "bytearray"; case O_COMPLEX: return "complex"; case O_CTENSOR: return "tensor"; case O_LIST: return "list"; case O_TUPLE: return "tuple"; case O_DICT: return "dict";
+    case O_STR: return "str"; case O_BYTES: return "bytes"; case O_BYTEARRAY: return "bytearray"; case O_DEC: return "decimal.Decimal"; case O_COMPLEX: return "complex"; case O_CTENSOR: return "tensor"; case O_LIST: return "list"; case O_TUPLE: return "tuple"; case O_DICT: return "dict";
     case O_SET: return "set"; case O_FUNC: case O_BUILTIN: case O_BOUND: return "function"; case O_CLASS: return "type";
     case O_INST: return ((AInst *)v.o)->cls->name->s; case O_RANGE: return "range";
     default: return "object";
@@ -1064,6 +1069,7 @@ static const char *tname(AV v) {
 static const char *const a_dn[] = {"", "__add__", "__sub__", "__mul__", "__truediv__", "__floordiv__", "__mod__", "__pow__", "__matmul__", "__and__", "__or__", "__xor__", "__lshift__", "__rshift__"};
 static const char *const a_rn[] = {"", "__radd__", "__rsub__", "__rmul__", "__rtruediv__", "__rfloordiv__", "__rmod__", "__rpow__", "__rmatmul__", "__rand__", "__ror__", "__rxor__", "__rlshift__", "__rrshift__"};
 AV a_binop(int op, AV a, AV b) {
+    if ((a.t == T_OBJ && a.o->kind == O_DEC) || (b.t == T_OBJ && b.o->kind == O_DEC)) return a_dec_binop(op, a, b);
     if ((a_is(a, O_INST) || a_is(b, O_INST)) && op >= OP_ADD && op <= OP_SHR) {   /* a class's operators win over tensors */
         int ok; AV r = inst_op(a, b, a_dn[op], a_rn[op], &ok); if (ok) return r;
     }
@@ -1166,6 +1172,7 @@ AV a_binop(int op, AV a, AV b) {
 }
 static AV inst_method(AV o, const char *name);
 AV a_unop(int op, AV a) {
+    if (a_is(a, O_DEC) && (op == OP_NEG || op == OP_POS)) return a_dec_unop(op, a);
     if ((a_is(a, O_COMPLEX) || a_is(a, O_CTENSOR)) && (op == OP_NEG || op == OP_POS)) return op == OP_NEG ? a_cplx_neg(a) : a;
     if (a_is_tn(a)) {
         if (op == OP_NEG) return a_tensor_neg(a);
@@ -1266,6 +1273,7 @@ AV a_cmp_slow(int op, AV a, AV b) {
     return a_bool(a_compare(op, a, b));
 }
 int a_compare(int op, AV a, AV b) {
+    if ((op == OP_LT || op == OP_LE || op == OP_GT || op == OP_GE) && (a_is(a, O_DEC) || a_is(b, O_DEC))) return a_truthy(a_dec_binop(op, a, b));
     { AV r; if (op != OP_EQ && op != OP_NE && inst_cmp(op, a, b, &r)) return a_truthy(r); }
     if ((qt(a) || qt(b)) && op != OP_IN && op != OP_NOTIN && op != OP_IS && op != OP_ISNOT) return a_tensor_truthy(a_qty_cmp(op, a, b));
     if (tensor_cmp_applies(op, a, b)) return a_tensor_truthy(a_tensor_cmp(op, a, b));
@@ -1770,6 +1778,7 @@ AV a_getattr(AV o, const char *name) {
         return v;
     }
     if (a_is_tn(o)) return a_tensor_attr(o, name);
+    if (a_is(o, O_DEC)) return a_dec_attr(o, name);
     if (a_is(o, O_COMPLEX) || a_is(o, O_CTENSOR)) return a_cplx_attr(o, name);
     if (qt(o)) { AV r = a_tensor_attr(QTY(o)->tv, name); if (a_is(r, O_TENSOR) && !strcmp(name, "T")) return a_qty_make(r, QTY(o)->dim); return r; }
     return method_of(o, name);
@@ -1859,6 +1868,7 @@ AV a_call(AV f, int n, AV *args, ADict *kw) {
     case O_BUILTIN: {
         ABuiltin *b = (ABuiltin *)f.o;
         if ((n >= 1 && (a_is(args[0], O_QTY) || a_is(args[0], O_LIST))) || (n >= 2 && a_is(args[1], O_QTY))) { AV r = qty_builtin(b, n, args, kw); if (r.t != T_NONE) return r; }
+        if (n >= 1 && a_is(args[0], O_DEC) && a_dec_wants(b->name, n, args)) return a_dec_builtin(b->name, n, args);
         if ((n >= 1 || kw) && a_cplx_wants(b->name, n, args, kw)) { AV r = a_cplx_builtin(b->name, n, args, kw); if (r.t != 255) return r; }
         return b->fn(n, args, kw, b->self);
     }
@@ -2567,7 +2577,7 @@ static AV b_type(int n, AV *a, ADict *kw, AV self) {      /* the type's name, as
     AV v = a[0];
     switch (v.t) { case T_NONE: return a_str("None"); case T_BOOL: return a_str("Bool"); case T_INT: return a_str("Int"); case T_FLOAT: return a_str("Float"); default: break; }
     switch (v.o->kind) {
-    case O_STR: return a_str("Str"); case O_BYTES: return a_str("bytes"); case O_BYTEARRAY: return a_str("bytearray"); case O_COMPLEX: case O_CTENSOR: return a_str(a_cplx_type(v)); case O_LIST: return a_str("List"); case O_TUPLE: return a_str("Tuple"); case O_DICT: return a_str("Dict");
+    case O_STR: return a_str("Str"); case O_BYTES: return a_str("bytes"); case O_BYTEARRAY: return a_str("bytearray"); case O_DEC: return a_str("Decimal"); case O_COMPLEX: case O_CTENSOR: return a_str(a_cplx_type(v)); case O_LIST: return a_str("List"); case O_TUPLE: return a_str("Tuple"); case O_DICT: return a_str("Dict");
     case O_SET: return a_str("set"); case O_RANGE: return a_str("range"); case O_FUNC: case O_BUILTIN: case O_BOUND: case O_CLASS: return a_str("Fn");
     case O_INST: return a_obj(((AInst *)v.o)->cls->name);
     case O_QTY: {

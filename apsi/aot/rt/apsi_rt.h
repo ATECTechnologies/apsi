@@ -19,7 +19,8 @@ typedef enum {
     O_STR = 1, O_LIST, O_TUPLE, O_DICT, O_SET, O_FUNC, O_CLASS, O_INST, O_BOUND, O_RANGE, O_ITER, O_CELL, O_BUILTIN,
     O_SLICE, O_QTY, O_GEN, O_TENSOR, O_NODE, O_BYTES,    /* O_BYTES: an AStr whose characters are bytes */
     O_COMPLEX, O_CTENSOR,                                    /* a complex number, a complex128 tensor (apsi_cplx.c) */
-    O_BYTEARRAY                                              /* mutable bytes: an O_BYTES buffer with spare room */
+    O_BYTEARRAY,                                             /* mutable bytes: an O_BYTES buffer with spare room */
+    O_DEC                                                    /* a decimal of any precision (apsi_dec.c, use hp) */
 } AKind;
 
 typedef struct AObj { struct AObj *gcnext; uint8_t kind, mark; } AObj;
@@ -92,6 +93,9 @@ AV a_bytes(const char *s, int64_t n);
 AV a_cplx(double re, double im); AV a_cplx_binop(int op, AV a, AV b); AV a_cplx_neg(AV a); int a_cplx_eq(AV a, AV b);
 char *a_cplx_text(AV v, int top); AV a_cplx_getitem(AV v, AV i); void a_cplx_setitem(AV v, AV i, AV x); int64_t a_cplx_len(AV v);
 AV a_cplx_builtin(const char *name, int n, AV *a, struct ADict *kw); int a_cplx_wants(const char *name, int n, AV *a, struct ADict *kw);
+AV a_dec_binop(int op, AV a, AV b); AV a_dec_unop(int op, AV a); int a_dec_cmp(AV a, AV b, int *ok); int a_dec_truthy(AV v);
+char *a_dec_text(AV v); char *a_dec_format(AV v, const char *spec); uint64_t a_dec_hash(AV v); double a_dec_float(AV v);
+int a_dec_wants(const char *name, int n, AV *a); AV a_dec_builtin(const char *name, int n, AV *a); AV a_dec_attr(AV v, const char *name);
 AV a_cplx_attr(AV v, const char *name); AV a_cplx_iter_list(AV v); const char *a_cplx_type(AV v);
 void a_float_repr(double x, char *out, size_t cap); const char *a_tname(AV v); void a_slice_bounds(AV slice, int64_t n, int64_t *lo, int64_t *hi, int64_t *st);
 AV a_list(int64_t n, AV *items);

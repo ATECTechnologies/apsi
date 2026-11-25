@@ -1,0 +1,22 @@
+use hp
+for d in [30, 50, 100, 300]:
+    hp.digits(d)
+    print(d, hp.sin(1), hp.cos(hp.num("0.5")), hp.tan(2), hp.atan(3), hp.asin("0.3"), hp.acos("-0.7"), hp.atan2(-1, -2))
+    print(hp.sinh(2), hp.cosh("-1.5"), hp.tanh("0.25"), hp.exp(-3), hp.exp(100), hp.ln("0.001"), hp.log2(10), hp.log10(2))
+    print(hp.root(10, 5), hp.cbrt(-27), hp.cbrt(2), hp.pow("1.5", "2.5"), hp.pow(2, -3), hp.pow(-2, 3), hp.sqrt("1e-20"), hp.sqrt(10 ** 15))
+    print(hp.ln("1.0000000000000000000001"), hp.exp("1e-30"), hp.sin(1000), hp.cos("1e10"))
+    print(hp.mean([1, 2, "3.5"]), hp.prod([1.5, 2, 3]), hp.dot([1, 2], ["0.1", "0.2"]), hp.det([[2, 1], [1, 3]]), hp.inv([[2, 1], [1, 3]]))
+    print(hp.matmul([[1, 2], [3, 4]], [[5], [6]]), hp.equal(hp.pi(), "3.14159"), hp.equal(hp.pi(), hp.pi()), hp.str(hp.e(), 20), hp.gamma(5), hp.gamma("2.5"))
+hp.digits(50)
+let x = hp.num("123.456")
+print(x // 7, x % 7, -x // 7, x ** 3, x ** -1, abs(-x), float(x), int(-x), x > 123, x >= hp.num("123.4560"), x != 1.5, x == 123.456)
+print(f"{x:12.2f}|{x:<12.3e}|{x:+.1f}|{x:%}|{x:g}|{hp.num('1e10'):f}|{hp.num('0.000001234'):g}|{x:.10g}")
+print(hp.num("1.50E+3"), hp.num("-0"), hp.num("100") * hp.num("1e5"), hp.num("0.0000001"), hp.num(1.1), hp.num(true), hp.num("1_000.5"))
+print(sorted([hp.num(3), hp.num("1.5"), hp.num(2)]), max(hp.num(1), hp.num("1.01")), sum([hp.num("0.1")] * 3))
+let dd = {hp.num(2): "two"}
+print(dd[hp.num("2.0")], hp.num(2) in [2], hp.num(0) or "zero")
+for f in [fn() => hp.num("0.1") + 0.1, fn() => hp.num("abc"), fn() => hp.ln(-1), fn() => hp.sqrt(-4), fn() => hp.num(1) / 0, fn() => hp.num(0) / 0, fn() => hp.root(-8, 2)]:
+    try:
+        print(f())
+    except Exception as e:
+        print(type(e).__name__, e)

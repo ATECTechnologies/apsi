@@ -1,0 +1,444 @@
+# use hp: high-precision arithmetic (30, 50, 100 or thousands of significant digits) for native programs, with the
+# numbers, rounding (half even, once) and text of apsi run's hp (Python's decimal): the runtime's decimals carry the
+# digits, this file has the same algorithms as apsi/hp.py.
+
+let _str = __builtin("str")
+let _float = __builtin("float")
+let _int = __builtin("int")
+let _digits = [50]
+
+fn _enter(extra) = __dec("prec", _digits[0] + extra)
+fn _leave(old):
+    __dec("prec", old)
+fn _round(x) = __dec("round", x, _digits[0])
+fn _d(x) = __dec("new", x)
+
+fn digits(n=none):
+    if n != none:
+        let k = _int(n)
+        if k < 2 or k > 100000:
+            raise ValueError("hp.digits must be between 2 and 100000")
+        _digits[0] = k
+    __dec("prec", _digits[0])
+    return _digits[0]
+
+fn num(x):
+    if __dec("is", x):
+        return x
+    if isinstance(x, _str):
+        return _d(x.strip().replace("_", ""))
+    if isinstance(x, bool):
+        return _d(1 if x else 0)
+    if isinstance(x, int):
+        return _d(x)
+    if __is_rec(x) or _str(type(x)).startswith("Quantity"):
+        raise TypeError("hp works with plain numbers; take magnitude(x) of a quantity first")
+    return _d(_float(x))
+
+fn float(x) = _float(x)
+
+# ------------------------------------------------------------------------------------------------ constants
+fn _atan_inv(n):
+    let eps = _d(10) ** (-(__dec("prec") + 2))
+    let x = _d(1) / n
+    let x2 = x * x
+    var term = x
+    var total = x
+    var k = 1
+    while abs(term) > eps:
+        term = term * -x2
+        k = k + 2
+        total = total + term / k
+    return total
+
+fn pi_raw() = 16 * _atan_inv(5) - 4 * _atan_inv(239)
+
+fn pi():
+    let o = _enter(10)
+    try:
+        return _round(16 * _atan_inv(5) - 4 * _atan_inv(239))
+    finally:
+        _leave(o)
+
+fn e() = exp(1)
+
+# ------------------------------------------------------------------------------------------------ roots and logs
+fn sqrt(x):
+    let o = _enter(10)
+    try:
+        return _round(num(x).sqrt())
+    finally:
+        _leave(o)
+
+fn root(x, n):
+    let k = _int(n)
+    let o = _enter(10)
+    try:
+        let v = num(x)
+        if v < 0:
+            if k % 2 == 0:
+                raise ValueError("even root of a negative number")
+            return _round(-root(-v, k))
+        if v == 0:
+            return _d(0)
+        return _round((v.ln() / k).exp())
+    finally:
+        _leave(o)
+
+fn cbrt(x) = root(x, 3)
+
+fn exp(x):
+    let o = _enter(10)
+    try:
+        return _round(num(x).exp())
+    finally:
+        _leave(o)
+
+fn ln(x):
+    let o = _enter(10)
+    try:
+        return _round(num(x).ln())
+    finally:
+        _leave(o)
+
+fn log(x) = ln(x)
+
+fn log10(x):
+    let o = _enter(10)
+    try:
+        return _round(num(x).log10())
+    finally:
+        _leave(o)
+
+fn log2(x):
+    let o = _enter(10)
+    try:
+        return _round(num(x).ln() / _d(2).ln())
+    finally:
+        _leave(o)
+
+fn pow(x, y):
+    let o = _enter(10)
+    try:
+        let a = num(x)
+        let b = num(y)
+        if b == b.to_integral_value() and abs(b) < 1000000:
+            return _round(a ** _int(b))
+        if a <= 0:
+            if a == 0:
+                return _d(0)
+            raise ValueError("a negative number to a non-integer power")
+        return _round((b * a.ln()).exp())
+    finally:
+        _leave(o)
+
+# ------------------------------------------------------------------------------------------------ trigonometry
+fn _reduce(x):
+    let p = pi_raw()
+    let two = 2 * p
+    let k = (x / two).to_integral_value()
+    return [x - k * two, p]
+
+fn _sin_series(x):
+    let eps = _d(10) ** (-(__dec("prec") + 2))
+    var term = x
+    var total = x
+    var k = 1
+    let x2 = x * x
+    while abs(term) > eps:
+        term = term * (-x2 / ((k + 1) * (k + 2)))
+        k = k + 2
+        total = total + term
+    return total
+
+fn _cos_series(x):
+    let eps = _d(10) ** (-(__dec("prec") + 2))
+    var term = _d(1)
+    var total = _d(1)
+    var k = 0
+    let x2 = x * x
+    while abs(term) > eps:
+        term = term * (-x2 / ((k + 1) * (k + 2)))
+        k = k + 2
+        total = total + term
+    return total
+
+fn sin(x):
+    let o = _enter(20 + max(0, num(x).adjusted()))
+    try:
+        return _round(_sin_series(_reduce(num(x))[0]))
+    finally:
+        _leave(o)
+
+fn cos(x):
+    let o = _enter(20 + max(0, num(x).adjusted()))
+    try:
+        return _round(_cos_series(_reduce(num(x))[0]))
+    finally:
+        _leave(o)
+
+fn tan(x):
+    let o = _enter(20 + max(0, num(x).adjusted()))
+    try:
+        let r = _reduce(num(x))[0]
+        return _round(_sin_series(r) / _cos_series(r))
+    finally:
+        _leave(o)
+
+fn _atan(x0):
+    var x = x0
+    if x < 0:
+        return -_atan(-x)
+    if x > 1:
+        return pi_raw() / 2 - _atan(1 / x)
+    var halvings = 0
+    while x > _d("0.1"):
+        x = x / (1 + (1 + x * x).sqrt())
+        halvings = halvings + 1
+    let eps = _d(10) ** (-(__dec("prec") + 2))
+    var term = x
+    var total = x
+    var k = 1
+    let x2 = x * x
+    while abs(term) > eps:
+        term = term * -x2
+        k = k + 2
+        total = total + term / k
+    return total * (2 ** halvings)
+
+fn atan(x):
+    let o = _enter(20)
+    try:
+        return _round(_atan(num(x)))
+    finally:
+        _leave(o)
+
+fn atan2(y, x):
+    let o = _enter(20)
+    try:
+        let a = num(y)
+        let b = num(x)
+        if b > 0:
+            return _round(_atan(a / b))
+        let p = pi_raw()
+        if b < 0:
+            return _round(_atan(a / b) + (p if a >= 0 else -p))
+        if a > 0:
+            return _round(p / 2)
+        if a < 0:
+            return _round(-p / 2)
+        return _d(0)
+    finally:
+        _leave(o)
+
+fn asin(x):
+    let o = _enter(20)
+    try:
+        let v = num(x)
+        if abs(v) > 1:
+            raise ValueError("asin of a number outside [-1, 1]")
+        if abs(v) == 1:
+            return _round(pi_raw() / 2 * (1 if v > 0 else -1))
+        return _round(_atan(v / (1 - v * v).sqrt()))
+    finally:
+        _leave(o)
+
+fn acos(x):
+    let o = _enter(20)
+    try:
+        return _round(pi_raw() / 2 - asin(x))
+    finally:
+        _leave(o)
+
+fn sinh(x):
+    let o = _enter(10)
+    try:
+        let ex = num(x).exp()
+        return _round((ex - 1 / ex) / 2)
+    finally:
+        _leave(o)
+
+fn cosh(x):
+    let o = _enter(10)
+    try:
+        let ex = num(x).exp()
+        return _round((ex + 1 / ex) / 2)
+    finally:
+        _leave(o)
+
+fn tanh(x):
+    let o = _enter(10)
+    try:
+        let e2 = (2 * num(x)).exp()
+        return _round((e2 - 1) / (e2 + 1))
+    finally:
+        _leave(o)
+
+# ------------------------------------------------------------------------------------------------ collections
+fn _items(xs0):
+    var xs = xs0
+    if _str(type(xs)).startswith("Tensor"):
+        xs = xs.tolist()
+    var out = []
+    for v in xs:
+        if isinstance(v, list) or isinstance(v, tuple):
+            out.extend(_items(v))
+        else:
+            out.append(num(v))
+    return out
+
+fn sum(xs):
+    var total = _d(0)
+    for v in _items(xs):
+        total = __dec("add", total, v, 0)
+    return _round(total)
+
+fn prod(xs):
+    let o = _enter(len(xs) if (isinstance(xs, list) or isinstance(xs, tuple)) else 20)
+    try:
+        var p = _d(1)
+        for v in _items(xs):
+            p = p * v
+        return _round(p)
+    finally:
+        _leave(o)
+
+fn mean(xs):
+    let items = _items(xs)
+    let o = _enter(10)
+    try:
+        return _round(sum(items) / len(items))
+    finally:
+        _leave(o)
+
+fn dot(a, b):
+    let x = _items(a)
+    let y = _items(b)
+    if len(x) != len(y):
+        raise ValueError(f"dot: lengths differ ({len(x)} and {len(y)})")
+    var total = _d(0)
+    for i in range(len(x)):
+        total = __dec("add", total, __dec("mul", x[i], y[i], 0), 0)
+    return _round(total)
+
+fn _matrix(m0):
+    var m = m0
+    if not (isinstance(m, list) or isinstance(m, tuple)):
+        m = m.tolist()
+    return [[num(v) for v in row] for row in m]
+
+fn matmul(a, b):
+    let A = _matrix(a)
+    let B = _matrix(b)
+    if len(A[0]) != len(B):
+        raise ValueError("matmul: inner sizes differ")
+    let cols = [[B[i][j] for i in range(len(B))] for j in range(len(B[0]))]
+    return [[dot(row, col) for col in cols] for row in A]
+
+fn _lu(A0):
+    let n = len(A0)
+    var A = [list(row) for row in A0]
+    var perm = list(range(n))
+    var sign = 1
+    for k in range(n):
+        var p = k
+        for i in range(k + 1, n):
+            if abs(A[i][k]) > abs(A[p][k]):
+                p = i
+        if A[p][k] == 0:
+            raise ValueError("the matrix is singular")
+        if p != k:
+            let t = A[k]
+            A[k] = A[p]
+            A[p] = t
+            let tp = perm[k]
+            perm[k] = perm[p]
+            perm[p] = tp
+            sign = -sign
+        for i in range(k + 1, n):
+            let f = A[i][k] / A[k][k]
+            A[i][k] = f
+            for j in range(k + 1, n):
+                A[i][j] = A[i][j] - f * A[k][j]
+    return [A, perm, sign]
+
+fn solve(a, b):
+    let o = _enter(20)
+    try:
+        let A = _matrix(a)
+        let n = len(A)
+        let rhs = [num(v) for v in _items(b)]
+        let lu = _lu(A)
+        let LU = lu[0]
+        let perm = lu[1]
+        var y = [rhs[perm[i]] for i in range(n)]
+        for i in range(n):
+            for j in range(i):
+                y[i] = y[i] - LU[i][j] * y[j]
+        var x = [_d(0)] * n
+        for i in range(n - 1, -1, -1):
+            var s = y[i]
+            for j in range(i + 1, n):
+                s = s - LU[i][j] * x[j]
+            x[i] = s / LU[i][i]
+        return [_round(v) for v in x]
+    finally:
+        _leave(o)
+
+fn det(a):
+    let o = _enter(20)
+    try:
+        let lu = _lu(_matrix(a))
+        var d = _d(lu[2])
+        for i in range(len(lu[0])):
+            d = d * lu[0][i][i]
+        return _round(d)
+    finally:
+        _leave(o)
+
+fn inv(a):
+    let n = len(_matrix(a))
+    let cols = [solve(a, [1 if i == j else 0 for i in range(n)]) for j in range(n)]
+    return [[cols[j][i] for j in range(n)] for i in range(n)]
+
+fn _fact(n):
+    var p = _d(1)
+    for i in range(2, n + 1):
+        p = __dec("mul", p, i, 0)
+    return p
+
+fn factorial(n):
+    let k = _int(n)
+    if k < 0:
+        raise ValueError("factorial() not defined for negative values")
+    return _fact(k)
+
+fn gamma(x0):
+    let x = num(x0)
+    let o = _enter(10)
+    try:
+        if x == x.to_integral_value() and x > 0:
+            return _round(_fact(_int(x) - 1))
+        if (2 * x) == (2 * x).to_integral_value() and x > 0:
+            let k = _int(x - _d("0.5"))
+            return _round(_fact(2 * k) / (_d(4) ** k * _fact(k)) * pi_raw().sqrt())
+    finally:
+        _leave(o)
+    raise ValueError("hp.gamma supports positive integers and halves; use special.gamma for other values")
+
+fn equal(a, b, digits_=none):
+    let d = _digits[0] - 2 if digits_ == none else _int(digits_)
+    let x = num(a)
+    let y = num(b)
+    if x == y:
+        return true
+    let scale = max(abs(x), abs(y))
+    let o = _enter(10)
+    try:
+        return abs(x - y) <= scale * _d(10) ** (-d)
+    finally:
+        _leave(o)
+
+fn str(x, n=none):
+    let k = _digits[0] if n == none else _int(n)
+    return format(__dec("round", num(x), k), "g")

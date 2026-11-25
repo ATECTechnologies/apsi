@@ -807,6 +807,7 @@ BI(lb_upk) {
     default: return a_int((int64_t)u);
     }
 }
+BI(lb_dec);
 BI(lb_setraw) { (void)self; (void)kw; (void)n; if (!a_is(a[0], O_INST)) a_error("TypeError", "__setraw: an object"); a_dict_set(((AInst *)a[0].o)->attrs, a[1], a[2]); return A_NONE; }
 #define APSI_VERSION "2.6.6"                                  /* kept equal to apsi.__version__ by the tests */
 BI(lb_apsi_version) { (void)n; (void)a; (void)kw; (void)self; return a_str(APSI_VERSION); }
@@ -829,5 +830,5 @@ static const TEnt lib_builtins[] = {
     {"__password_hash", lb_password_hash}, {"__password_verify", lb_password_verify},
     {"__la", lb_la}, {"__fft", lb_fft}, {"__special", lb_special}, {"__conv2d", lb_conv2d}, {"__maxpool2d", lb_maxpool2d},
     {"__time", lb_time}, {"__sleep", lb_sleep}, {"__fs", lb_fs}, {"__st_load", lb_st_load}, {"__st_save", lb_st_save},
-    {"__npy_load", lb_npy_load}, {"__npy_save", lb_npy_save}, {"__http_serve", lb_http_serve}, {"__is_dev", lb_is_dev}, {"__frombuffer", lb_frombuffer}, {"__pk", lb_pk}, {"__setraw", lb_setraw}, {"__upk", lb_upk}, {"__frame", lb_frame}, {"__sqlite", lb_sqlite}, {"__net", lb_net}, {"__ct", lb_ct}, {"__is_cplx", lb_is_cplx}, {"__ckron", lb_ckron}, {"__is_traced", lb_is_traced}, {"__qfmt", lb_qfmt}, {"__apsi_version", lb_apsi_version}, {"__arity", lb_arity}, {"__localtime", lb_localtime}, {"__isatty", lb_isatty}, {"__rec_dict", lb_rec_dict}, {"__is_rec", lb_is_rec}, {"__argv", lb_argv}, {"__environ_names", lb_environ_names}, {"__builtin", lb_builtin}, {"__setenv", lb_setenv}, {"__gen_step", lb_gen_step}, {"__is_coro", lb_is_coro},
+    {"__npy_load", lb_npy_load}, {"__npy_save", lb_npy_save}, {"__http_serve", lb_http_serve}, {"__is_dev", lb_is_dev}, {"__frombuffer", lb_frombuffer}, {"__pk", lb_pk}, {"__dec", lb_dec}, {"__setraw", lb_setraw}, {"__upk", lb_upk}, {"__frame", lb_frame}, {"__sqlite", lb_sqlite}, {"__net", lb_net}, {"__ct", lb_ct}, {"__is_cplx", lb_is_cplx}, {"__ckron", lb_ckron}, {"__is_traced", lb_is_traced}, {"__qfmt", lb_qfmt}, {"__apsi_version", lb_apsi_version}, {"__arity", lb_arity}, {"__localtime", lb_localtime}, {"__isatty", lb_isatty}, {"__rec_dict", lb_rec_dict}, {"__is_rec", lb_is_rec}, {"__argv", lb_argv}, {"__environ_names", lb_environ_names}, {"__builtin", lb_builtin}, {"__setenv", lb_setenv}, {"__gen_step", lb_gen_step}, {"__is_coro", lb_is_coro},
     {NULL, NULL}};
