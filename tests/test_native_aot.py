@@ -33,7 +33,8 @@ def test_native_matches_run(prog, tmp_path):
     assert got.returncode == want.returncode
 
 
-@pytest.mark.skipif(CC is None, reason="no C compiler")
+@pytest.mark.skipif(CC is None or os.name == "nt", reason="the emulated card runs on POSIX threads (a real card is "
+                                                         "tested by tests/native_win/gpu_check.apsi)")
 def test_gpu_kernels_emulated(tmp_path, monkeypatch):
     """The card's kernels and the runtime's GPU path, run on host threads (APSI_GPU_EMU)."""
     from apsi.aot.build import build

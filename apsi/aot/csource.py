@@ -28,6 +28,31 @@ def cxx_of(cc):
     return cc
 
 
+_CXX_INC = {}
+
+
+def cxx_include_flags(cc):
+    """Where the C++ library's headers are in a Windows toolchain folder (libc++'s c++/v1), as -isystem flags: some
+    llvm-mingw layouts keep them where clang does not look by itself ('cmath' file not found)."""
+    if os.name != "nt" or "clang" not in os.path.basename(cc).lower():
+        return []
+    root = os.path.dirname(os.path.dirname(os.path.abspath(shutil.which(cc) or cc)))
+    if root not in _CXX_INC:
+        found = []
+        for sub in ("include", "generic-w64-mingw32/include", "x86_64-w64-mingw32/include"):
+            d = os.path.join(root, *sub.split("/"), "c++", "v1")
+            if os.path.isfile(os.path.join(d, "cmath")):
+                found = ["-isystem", d]
+                break
+        if not found:
+            for dp, dn, fn in os.walk(root):
+                if dp.replace("\\", "/").endswith("c++/v1") and "cmath" in fn:
+                    found = ["-isystem", dp]
+                    break
+        _CXX_INC[root] = found
+    return _CXX_INC[root]
+
+
 def lib_suffix():
     return ".dll" if os.name == "nt" else (".dylib" if sys.platform == "darwin" else ".so")
 
@@ -49,10 +74,13 @@ def compile_shared(src, cache_dir=None):
     if os.path.isfile(out):
         return out
     cmd = [tool, "-O3", "-shared", "-I", os.path.dirname(src), src, "-o", out + ".part"]
+    if cxx:
+        cmd[1:1] = cxx_include_flags(tool)
     if os.name != "nt":
         cmd[1:1] = ["-fPIC"]
     else:
-        cmd += ["-static-libgcc"] + (["-static-libstdc++"] if cxx else [])
+        from .toolchain import link_flags
+        cmd += link_flags(tool) + (["-static-libgcc"] + (["-static-libstdc++"] if cxx else []) if "clang" not in os.path.basename(tool).lower() else ["-static"])
     cmd[1:1] = ["-std=c++17"] if cxx else ["-std=gnu11"]
     r = subprocess.run(cmd, capture_output=True, text=True)
     if r.returncode != 0:

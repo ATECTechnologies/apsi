@@ -125,3 +125,11 @@ def main(argv=None):
 
 if __name__ == "__main__":
     sys.exit(main())
+
+
+def link_flags(cc, target=None):
+    """clang for Windows links with lld itself: the triple-named `ld` in some llvm-mingw folders is a shell script
+    that Windows cannot start (error 0xC1)."""
+    name = os.path.basename(cc).lower()
+    windows = os.name == "nt" or "windows" in (target or "") or "mingw" in (target or "")
+    return ["-fuse-ld=lld"] if windows and "clang" in name else []
