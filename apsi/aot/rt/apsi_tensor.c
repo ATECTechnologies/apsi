@@ -174,6 +174,7 @@ static AV tcopy(ATensor *a, int dt) {
     return a_obj(t);
 }
 static AV as_tensor(AV v) {
+    while (v.t == T_OBJ && v.o->kind == O_NODE) v = ((ANode *)v.o)->val;   /* a value nested grad() calls recorded */
     if (is_t(v)) return v;
     if (is_num(v)) { ATensor *t = t_new(v.t == T_FLOAT ? DT_F64 : v.t == T_INT ? DT_I64 : DT_BOOL, 0, NULL); t_set(t, 0, v.t == T_FLOAT ? v.f : (double)v.i); return a_obj(t); }
     return t_from(v, -1);
@@ -1275,8 +1276,8 @@ static AV unbroadcast(AV g, AV like) {
     ATensor *L = TT(lv);
     if (TT(gv)->nd == L->nd) { int same = 1; for (int i = 0; i < L->nd; i++) if (TT(gv)->sh[i] != L->sh[i]) same = 0; if (same) return g; }
     int sp = a_ntmp; A_PUSH(g);
-    while (TT(deepval(g))->nd > L->nd) { g = rsum(g, a_int(0), 0); a_tmp[sp] = g; }
-    for (int i = 0; i < L->nd; i++) if (L->sh[i] == 1 && TT(deepval(g))->sh[i] != 1) { g = rsum(g, a_int(i), 1); a_tmp[sp] = g; }
+    while (is_t(deepval(g)) && TT(deepval(g))->nd > L->nd) { g = rsum(g, a_int(0), 0); a_tmp[sp] = g; }
+    for (int i = 0; i < L->nd; i++) if (is_t(deepval(g)) && L->sh[i] == 1 && TT(deepval(g))->sh[i] != 1) { g = rsum(g, a_int(i), 1); a_tmp[sp] = g; }
     a_ntmp = sp;
     return g;
 }
@@ -1331,6 +1332,14 @@ static AV unary_grad(int u, AV x, AV y, AV g) {     /* d op(x) / dx times g, fro
     case U_COSH: d = a_tensor_unary(U_SINH, x); break;
     case U_SQUARE: d = a_binop(OP_MUL, x, a_float(2.0)); break;
     case U_ABS: d = a_tensor_unary(U_SIGN, x); break;
+    case U_SIGN: case U_FLOOR: case U_CEIL: case U_ROUND: {   /* flat almost everywhere */
+        AV dx = deepval(x); d = is_t(dx) ? a_obj(t_like(TT(dx), TT(dx)->dt == DT_F32 ? DT_F32 : DT_F64)) : a_float(0.0); break; }
+    case U_ASIN: { AV t = a_binop(OP_SUB, a_float(1.0), a_binop(OP_MUL, x, x)); A_PUSH(t); d = a_binop(OP_DIV, a_float(1.0), a_tensor_unary(U_SQRT, t)); break; }
+    case U_LOG2: d = a_binop(OP_DIV, a_float(1.4426950408889634), x); break;
+    case U_LOG10: d = a_binop(OP_DIV, a_float(0.4342944819032518), x); break;
+    case U_ERF: { AV xx = a_binop(OP_MUL, x, x); A_PUSH(xx); AV e = a_tensor_unary(U_EXP, a_unop(OP_NEG, xx)); A_PUSH(e); d = a_binop(OP_MUL, e, a_float(1.1283791670955126)); break; }
+    case U_RSQRT: { AV y3 = a_binop(OP_MUL, a_binop(OP_MUL, y, y), y); A_PUSH(y3); d = a_binop(OP_MUL, y3, a_float(-0.5)); break; }
+    case U_ACOS: { AV t = a_binop(OP_SUB, a_float(1.0), a_binop(OP_MUL, x, x)); A_PUSH(t); d = a_binop(OP_DIV, a_float(-1.0), a_tensor_unary(U_SQRT, t)); break; }
     case U_SILU: { AV s = a_tensor_unary(U_SIGMOID, x); A_PUSH(s); AV t = a_binop(OP_MUL, x, a_binop(OP_SUB, a_float(1.0), s)); A_PUSH(t); d = a_binop(OP_MUL, s, a_binop(OP_ADD, t, a_float(1.0))); break; }
     case U_GELU: {
         /* d/dx 0.5 x (1 + tanh(k (x + c x^3))) */
@@ -1514,9 +1523,18 @@ static void backward(AV out) {
 }
 
 /* ================================================================== the hooks the core runtime calls */
+/* a 0-d result is a plain number, as NumPy gives (apsi run): tensor(2.5) + 1 is the float 3.5 */
+static AV scalar0(AV r) {
+    if (!is_t(r) || TT(r)->nd != 0 || TT(r)->dev) return r;
+    ATensor *t = TT(r);
+    if (t->dt == DT_F64) return a_float(((double *)t->p)[0]);
+    if (t->dt == DT_I64) return a_int(((int64_t *)t->p)[0]);
+    if (t->dt == DT_BOOL) return a_bool(t_get(t, 0) != 0);
+    return r;
+}
 static AV wrap_unary(int u, AV v) {
     if (is_n(v)) { AV r = a_tensor_unary(u, ND(v)->val); int sp = a_ntmp; A_PUSH(r); AV n = node_new(r, N_UNARY, v, A_NONE, a_int(u)); a_ntmp = sp; return n; }
-    if (is_t(v)) return unary(u, v);
+    if (is_t(v)) return scalar0(unary(u, v));
     if (a_is(v, O_QTY) && u == U_ABS) return a_call(a_global_builtin("abs"), 1, &v, NULL);
     if (!is_num(v)) a_error("TypeError", "this function needs a number or a tensor");
     double x = v.t == T_FLOAT ? v.f : (double)v.i;
@@ -1527,7 +1545,7 @@ static AV wrap_unary(int u, AV v) {
 }
 AV a_tensor_unary(int u, AV v) { return wrap_unary(u, v); }
 AV a_tensor_cmp(int op, AV a, AV b) {
-    a = val_of(a); b = val_of(b);
+    a = deepval(a); b = deepval(b);
     int e = op == OP_LT ? E_LT : op == OP_LE ? E_LE : op == OP_GT ? E_GT : op == OP_GE ? E_GE : op == OP_EQ ? E_EQ : E_NE;
     if (!is_t(a) && !is_t(b)) return a_bool(a_compare(op, a, b));
     int sp = a_ntmp; AV ta = as_tensor(a); A_PUSH(ta); AV tb = as_tensor(b); A_PUSH(tb);
@@ -1586,7 +1604,7 @@ AV a_tensor_binop(int op, AV a, AV b) {
     default: a_error("TypeError", "this operator does not apply to tensors");
     }
     a_ntmp = sp;
-    return r;
+    return scalar0(r);
 }
 /* a op= b into a's own buffer: a is a temporary the compiled program will not read again (NumPy's elision) */
 AV a_tensor_binop_into(int op, AV a, AV b) {
@@ -1758,7 +1776,12 @@ static AV softmax_any(AV x, int ax, int logsm) {
 /* ================================================================== the built-in functions */
 #define BI(name) static AV name(int n, AV *a, ADict *kw, AV self)
 #define UNUSED (void)n; (void)a; (void)kw; (void)self
-BI(tb_tensor) { (void)self; if (!n) a_error("TypeError", "tensor() needs a value"); AV x = val_of(a[0]); if (is_t(x)) return tcopy(TT(x), dt_from_name(n > 1 ? a[1] : kwget(kw, "dtype"))); return t_from(x, dt_from_name(n > 1 ? a[1] : kwget(kw, "dtype"))); }
+static AV cast_any(AV x, int dt) {     /* a copy in another dtype; a recorded value stays differentiable (as apsi run) */
+    if (is_n(x)) { AV v = cast_any(ND(x)->val, dt); int sp = a_ntmp; A_PUSH(v); AV r = node_new(v, N_RESHAPE, x, A_NONE, A_NONE); a_ntmp = sp; return r; }
+    if (is_t(x)) return tcopy(TT(x), dt);
+    return t_from(x, dt);
+}
+BI(tb_tensor) { (void)self; if (!n) a_error("TypeError", "tensor() needs a value"); return cast_any(a[0], dt_from_name(n > 1 ? a[1] : kwget(kw, "dtype"))); }
 static AV filled(int n, AV *a, ADict *kw, double v) { int64_t sh[MAXD]; int nd = shape_args(n, a, sh); int dt = dt_from_name(kwget(kw, "dtype")); ATensor *t = t_zeros(dt < 0 ? DT_F64 : dt, nd, sh); if (v != 0) for (int64_t i = 0; i < t->n; i++) t_set(t, i, v); return a_obj(t); }
 BI(tb_zeros) { (void)self; return filled(n, a, kw, 0.0); }
 BI(tb_ones) { (void)self; return filled(n, a, kw, 1.0); }
@@ -1791,7 +1814,7 @@ static AV t_random(int kind, int n, AV *a, AV lo, AV hi) {
     for (int64_t i = 0; i < t->n; i++) {
         if (kind == 0) t_set(t, i, a_rand_f());
         else if (kind == 1) t_set(t, i, a_rand_n());
-        else ((int64_t *)t->p)[i] = lo.i + (int64_t)(a_rand_u64() % (uint64_t)(hi.i - lo.i));
+        else ((int64_t *)t->p)[i] = a_rand_int(lo.i, hi.i);
     }
     return a_obj(t);
 }
@@ -2170,7 +2193,7 @@ static AV tb_tolist_h(int n, AV *a, ADict *kw, AV self) {
     for (int64_t i = 0; i < t->sh[0]; i++) { AV row = t_getitem(x, a_int(i)); A_PUSH(row); AV r = tb_tolist(1, &row, NULL, A_NONE); a_ntmp--; a_list_append(l, r); }
     a_ntmp = sp; return a_obj(l);
 }
-BI(tb_astype) { UNUSED; AV x = as_tensor(val_of(a[0])); return tcopy(TT(x), dt_from_name(a[1])); }
+BI(tb_astype) { UNUSED; if (is_n(a[0])) return cast_any(a[0], dt_from_name(a[1])); AV x = as_tensor(a[0]); return tcopy(TT(x), dt_from_name(a[1])); }
 BI(tb_param_count) {
     UNUSED; AV v = a[0];
     if (is_t(val_of(v))) return a_int(TT(val_of(v))->n);

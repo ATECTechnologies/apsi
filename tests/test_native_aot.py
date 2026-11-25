@@ -32,6 +32,10 @@ def test_native_matches_run(prog, tmp_path):
     got = subprocess.run([exe], capture_output=True, text=True, cwd=str(tmp_path))
     assert got.stdout == want.stdout
     assert got.returncode == want.returncode
+    expected = os.path.splitext(prog)[0] + ".expected"      # what a program must print, on both backends
+    if os.path.exists(expected):
+        with open(expected, encoding="utf-8") as f:
+            assert got.stdout == f.read()
 
 
 @pytest.mark.skipif(CC is None or os.name == "nt", reason="the emulated card runs on POSIX threads (a real card is "

@@ -1,0 +1,1150 @@
+# shared: this module is plain Apsi, the same file for apsi run and for native programs
+#
+# use llm: build, train and talk to your own language model in a few lines, with every part open to change.
+#
+#     use llm
+#     let m = llm.create(data="notes/**/*.txt", layers=4, d=256, heads=8, experts=4)
+#     m.train(steps=2000)
+#     print(m.chat("What is Apsi?"))
+#     m.save("my_model")
+#
+# What is inside (all of it written here in Apsi; copy a function and change it to make your own variant):
+#   tokenizers      bytes, characters, or byte-level BPE trained on your text (special tokens for chat)
+#   model           decoder-only transformer: token embedding, RMSNorm, rotary positions (RoPE), grouped-query
+#                   attention (kv_heads), SwiGLU feed-forward, mixture of experts (experts / top_k, sparse dispatch,
+#                   load-balancing loss), tied output embedding
+#   training        AdamW with decoupled weight decay, warm-up then cosine learning rate, global gradient clipping,
+#                   gradient accumulation, loss only on answers for question / answer data, validation loss and
+#                   perplexity, checkpoints
+#   generation      key / value cache, temperature, top-k, top-p, repetition penalty, stop tokens; chat with history
+#   data            text files / folders / globs, .jsonl with text or question / answer or messages, lists of
+#                   strings or of (question, answer) pairs; weights per source
+
+use data
+use models
+
+let _set_seed = seed
+
+fn _now() = float(clock() / 1[s])
+
+fn leaves(tree):
+    # the tensors of a parameter tree (records, lists, dicts)
+    var out = []
+    tree_map(fn(l) => out.append(l), tree)
+    return out
+
+# =============================================================================== tokenizers
+let SPECIALS = ["<pad>", "<bos>", "<eos>", "<sys>", "<user>", "<assistant>"]
+
+class Tokenizer:
+    var kind = "bytes"
+    var merges = []
+    var vocab = []
+    var chars = []
+    var size = 0
+    var base = 0
+    var _ranks = {}
+    var _cache = {}
+    var _char_id = {}
+
+    fn special(self, name) = SPECIALS.index(name)
+    fn _bpe_word(self, word):
+        if word in self._cache:
+            return self._cache[word]
+        var parts = [self.base + b for b in list(word.encode())]
+        while len(parts) > 1:
+            var best = -1
+            var best_rank = 1000000000
+            for i in range(len(parts) - 1):
+                let key = f"{parts[i]} {parts[i + 1]}"
+                if key in self._ranks:
+                    let r = self._ranks[key]
+                    if r < best_rank:
+                        best_rank = r
+                        best = i
+            if best < 0:
+                break
+            parts = parts[0:best] + [self.base + 256 + best_rank] + parts[best + 2:]
+        if len(self._cache) < 100000:
+            self._cache[word] = parts
+        return parts
+    fn encode(self, text):
+        if self.kind == "chars":
+            return [self._char_id.get(c, self.special("<pad>")) for c in text]
+        if self.kind == "bytes":
+            return [self.base + b for b in list(text.encode())]
+        var out = []
+        for w in _pretokens(text):
+            out.extend(self._bpe_word(w))
+        return out
+    fn _bytes_of(self, t):
+        if t < self.base:
+            return []
+        if self.kind == "chars":
+            return list(self.chars[t - self.base].encode())
+        let k = t - self.base
+        if k < 256:
+            return [k]
+        let pair = self.merges[k - 256]
+        return self._bytes_of(pair[0]) + self._bytes_of(pair[1])
+    fn decode(self, ids):
+        var raw = []
+        for t in ids:
+            let v = int(t)
+            if v >= self.base and v < self.size:
+                raw.extend(self._bytes_of(v))
+        return bytes(raw).decode("utf-8", "replace")
+    fn token_text(self, t) = SPECIALS[t] if t < self.base else self.decode([t])
+    fn to_dict(self) = {"kind": self.kind, "merges": self.merges, "chars": self.chars}
+    fn __str__(self) = f"Tokenizer({self.kind}, {self.size} tokens)"
+    fn __repr__(self) = self.__str__()
+
+fn _pretokens(text):
+    # words with their leading space, runs of digits, single other characters (GPT-2 style, simplified)
+    var out = []
+    var cur = ""
+    var kind = 0
+    for c in text:
+        let k = 1 if c.isalpha() else (2 if c.isdigit() else (3 if c == " " else 4))
+        if cur != "" and (k == kind or (kind == 3 and k == 1)) and k != 4:
+            cur = cur + c
+            if kind == 3:
+                kind = k
+        else:
+            if cur != "":
+                out.append(cur)
+            cur = c
+            kind = k
+    if cur != "":
+        out.append(cur)
+    return out
+
+fn _new_tok(kind):
+    var t = Tokenizer()
+    t.kind = kind
+    t.base = len(SPECIALS)
+    t.merges = []
+    t.chars = []
+    t._ranks = {}
+    t._cache = {}
+    t._char_id = {}
+    return t
+
+fn byte_tokenizer():
+    var t = _new_tok("bytes")
+    t.size = t.base + 256
+    return t
+
+fn char_tokenizer(texts):
+    var t = _new_tok("chars")
+    var seen = {}
+    for s in texts:
+        for c in s:
+            seen[c] = true
+    t.chars = sorted(list(seen.keys()))
+    for i in range(len(t.chars)):
+        t._char_id[t.chars[i]] = t.base + i
+    t.size = t.base + len(t.chars)
+    return t
+
+fn bpe_tokenizer(texts, vocab=1024, min_count=2, verbose=false):
+    # byte-level BPE: merges learned on the distinct words of the text, weighted by how often they occur
+    var t = _new_tok("bpe")
+    var counts = {}
+    for s in texts:
+        for w in _pretokens(s):
+            counts[w] = counts.get(w, 0) + 1
+    var words = []
+    var freq = []
+    for w in counts:
+        words.append([t.base + b for b in list(w.encode())])
+        freq.append(counts[w])
+    let n_merges = max(0, int(vocab) - t.base - 256)
+    for m in range(n_merges):
+        var pairs = {}
+        for wi in range(len(words)):
+            let w = words[wi]
+            let f = freq[wi]
+            for i in range(len(w) - 1):
+                let key = f"{w[i]} {w[i + 1]}"
+                pairs[key] = pairs.get(key, 0) + f
+        var best = ""
+        var bc = 0
+        for k in pairs:
+            if pairs[k] > bc:
+                bc = pairs[k]
+                best = k
+        if bc < min_count or best == "":
+            break
+        let ab = best.split(" ")
+        let a = int(ab[0])
+        let b = int(ab[1])
+        let new_id = t.base + 256 + len(t.merges)
+        t.merges.append([a, b])
+        t._ranks[best] = len(t.merges) - 1
+        for wi in range(len(words)):
+            let w = words[wi]
+            if len(w) < 2:
+                continue
+            var out = []
+            var i = 0
+            while i < len(w):
+                if i + 1 < len(w) and w[i] == a and w[i + 1] == b:
+                    out.append(new_id)
+                    i = i + 2
+                else:
+                    out.append(w[i])
+                    i = i + 1
+            words[wi] = out
+        if verbose and m % 100 == 0:
+            print(f"bpe: {m} merges")
+    t.size = t.base + 256 + len(t.merges)
+    return t
+
+fn tokenizer_from(d):
+    var t = _new_tok(d["kind"])
+    if t.kind == "bpe":
+        t.merges = [list(p) for p in d["merges"]]
+        for i in range(len(t.merges)):
+            t._ranks[f"{t.merges[i][0]} {t.merges[i][1]}"] = i
+        t.size = t.base + 256 + len(t.merges)
+    elif t.kind == "chars":
+        t.chars = list(d["chars"])
+        for i in range(len(t.chars)):
+            t._char_id[t.chars[i]] = t.base + i
+        t.size = t.base + len(t.chars)
+    else:
+        t.size = t.base + 256
+    return t
+
+# =============================================================================== data
+fn _is_pair(x) = (isinstance(x, list) or isinstance(x, tuple)) and len(x) == 2 and isinstance(x[0], str) and isinstance(x[1], str)
+
+fn _records_of_json(o):
+    if isinstance(o, str):
+        return [o]
+    if isinstance(o, dict):
+        for qa in [["question", "answer"], ["prompt", "response"], ["instruction", "output"], ["input", "output"], ["q", "a"]]:
+            if qa[0] in o and qa[1] in o:
+                let q = o[qa[0]] if "input" not in o or qa[0] == "input" else o[qa[0]] + "\n" + str(o["input"])
+                return [[str(q), str(o[qa[1]])]]
+        if "messages" in o:
+            var turns = []
+            for msg in o["messages"]:
+                turns.append([str(msg.get("role", "user")), str(msg.get("content", ""))])
+            return [turns]
+        for k in ["text", "content", "body"]:
+            if k in o:
+                return [str(o[k])]
+    return []
+
+fn read_source(src):
+    # text, question / answer pairs and conversations from a file, a folder, a glob or a list
+    if isinstance(src, list) or isinstance(src, tuple):
+        var out = []
+        for x in src:
+            if isinstance(x, str) and (exists(x) or "*" in x):
+                out.extend(read_source(x))
+            elif isinstance(x, str) or _is_pair(x):
+                out.append(x)
+            elif isinstance(x, dict):
+                out.extend(_records_of_json(x))
+        return out
+    let s = str(src)
+    var files = []
+    if "*" in s:
+        files = list(data.from_files(s))
+    elif exists(s) and not s.endswith(".txt") and not s.endswith(".jsonl") and not s.endswith(".json") and not s.endswith(".md") and not s.endswith(".csv"):
+        for ext in ["txt", "md", "jsonl", "json"]:
+            files.extend(list(data.from_files(s + "/**/*." + ext)))
+    elif exists(s):
+        files = [s]
+    else:
+        return [s]
+    var out = []
+    for f in sorted(files):
+        if f.endswith(".jsonl"):
+            for line in read_text(f).split("\n"):
+                if line.strip() != "":
+                    out.extend(_records_of_json(json_parse(line)))
+        elif f.endswith(".json"):
+            let o = json_parse(read_text(f))
+            if isinstance(o, list):
+                for r in o:
+                    out.extend(_records_of_json(r))
+            else:
+                out.extend(_records_of_json(o))
+        else:
+            out.append(read_text(f))
+    return out
+
+fn _texts_of(records):
+    var out = []
+    for r in records:
+        if isinstance(r, str):
+            out.append(r)
+        elif _is_pair(r):
+            out.append(r[0])
+            out.append(r[1])
+        else:
+            for t in r:
+                out.append(t[1])
+    return out
+
+fn encode_chat(tok, turns, system=none):
+    # one conversation as tokens and a mask that is 1 on what the assistant says (what training learns)
+    let B = tok.special("<bos>")
+    let E = tok.special("<eos>")
+    var ids = [B]
+    var mask = [0]
+    if system is not none:
+        let s = [tok.special("<sys>")] + tok.encode(system) + [E]
+        ids.extend(s)
+        mask.extend([0] * len(s))
+    for t in turns:
+        let role = t[0]
+        let body = tok.encode(t[1])
+        if role == "assistant":
+            ids.append(tok.special("<assistant>"))
+            mask.append(0)
+            ids.extend(body + [E])
+            mask.extend([1] * (len(body) + 1))
+        else:
+            let head = [tok.special("<sys>" if role == "system" else "<user>")]
+            ids.extend(head + body + [E])
+            mask.extend([0] * (len(body) + 2))
+    return [ids, mask]
+
+fn encode_records(tok, records):
+    # every record as [ids, mask]: plain text learns every token, question / answer only the answers
+    var out = []
+    for r in records:
+        if isinstance(r, str):
+            let ids = [tok.special("<bos>")] + tok.encode(r) + [tok.special("<eos>")]
+            out.append([ids, [1] * len(ids)])
+        elif _is_pair(r):
+            out.append(encode_chat(tok, [["user", r[0]], ["assistant", r[1]]]))
+        else:
+            out.append(encode_chat(tok, r))
+    return out
+
+class Dataset:
+    var ids = []
+    var mask = []
+    var starts = []
+    var lens = []
+    var cum = []
+    var aligned = false
+    var context = 128
+    fn __len__(self) = len(self.ids)
+    fn _pick(self, r):
+        # a record, drawn in proportion to its weight (data importance)
+        let total = self.cum[len(self.cum) - 1]
+        let u = (r % 1000003) / 1000003.0 * total
+        var lo = 0
+        var hi = len(self.cum) - 1
+        while lo < hi:
+            let mid = (lo + hi) // 2
+            if self.cum[mid] > u:
+                hi = mid
+            else:
+                lo = mid + 1
+        return lo
+    fn batch(self, size, rand_ints):
+        # size windows of context + 1 tokens: from the start of a record (question / answer, chat) or anywhere in it
+        let T = self.context
+        let n = len(self.ids)
+        var xs = []
+        var ms = []
+        for k in range(size):
+            let r = rand_ints[k]
+            let i = self._pick(r)
+            var s = self.starts[i]
+            if not self.aligned or k % 4 == 3:
+                s = s + (r // 1000003) % max(1, self.lens[i])
+            s = min(s, max(0, n - T - 1))
+            xs.append(self.ids[s:s + T + 1])
+            ms.append(self.mask[s + 1:s + T + 1])
+        return [tensor(xs, "int64"), tensor(ms, "float32")]
+
+fn dataset(tok, records, context=128, weights=none):
+    # the records as one packed stream of tokens; weights (default 1) say how often each one is drawn
+    var d = Dataset()
+    d.context = int(context)
+    var ids = []
+    var mask = []
+    var starts = []
+    var lens = []
+    var cum = []
+    var acc = 0.0
+    var chat = false
+    for i in range(len(records)):
+        if not isinstance(records[i], str):
+            chat = true
+    let enc = encode_records(tok, records)
+    for i in range(len(enc)):
+        starts.append(len(ids))
+        lens.append(len(enc[i][0]))
+        ids.extend(enc[i][0])
+        mask.extend(enc[i][1])
+        acc = acc + max(0.0, float(weights[i]) if weights is not none and i < len(weights) else 1.0)
+        cum.append(acc)
+    let pad = tok.special("<pad>")
+    ids.extend([pad] * (d.context + 2))
+    mask.extend([0] * (d.context + 2))
+    d.ids = ids
+    d.mask = mask
+    d.starts = starts if len(starts) > 0 else [0]
+    d.lens = lens if len(lens) > 0 else [1]
+    d.cum = cum if len(cum) > 0 and acc > 0 else [1.0]
+    d.aligned = chat
+    return d
+
+# =============================================================================== model
+fn config(vocab=256, d=128, layers=4, heads=4, kv_heads=none, ff=none, context=256, experts=0, top_k=2, moe_every=1,
+          rope_base=10000.0, norm_eps=1e-6, tie=true, aux_weight=0.01, z_weight=0.0, dropout=0.0, init_std=0.02, dtype="float32",
+          rope_scale=1.0):
+    let h = int(heads)
+    let kvh = h if kv_heads is none else int(kv_heads)
+    if int(d) % h:
+        raise ValueError(f"d ({d}) must be a multiple of heads ({h})")
+    if h % kvh:
+        raise ValueError(f"heads ({h}) must be a multiple of kv_heads ({kvh})")
+    let ffn = int(ff) if ff is not none else ((int(8 * int(d) / 3) + 63) // 64) * 64
+    return record(vocab=int(vocab), d=int(d), layers=int(layers), heads=h, kv_heads=kvh, ff=ffn, context=int(context),
+                  experts=int(experts), top_k=min(int(top_k), max(1, int(experts))), moe_every=max(1, int(moe_every)),
+                  rope_base=float(rope_base), norm_eps=float(norm_eps), tie=bool(tie), aux_weight=float(aux_weight),
+                  z_weight=float(z_weight), dropout=float(dropout), init_std=float(init_std), dtype=str(dtype),
+                  rope_scale=float(rope_scale))
+
+fn _is_moe(cfg, i) = cfg.experts > 1 and i % cfg.moe_every == cfg.moe_every - 1
+
+fn init_params(cfg, seed=0):
+    let std = cfg.init_std
+    let d = cfg.d
+    let hd = d // cfg.heads
+    let kvd = hd * cfg.kv_heads
+    let out_std = std / sqrt(2.0 * cfg.layers)
+    var s = [int(seed) * 1000]
+    fn nrm(*dims):
+        s[0] = s[0] + 1
+        return tensor(randn(*dims, seed=s[0]) * std, cfg.dtype)
+    fn nrm_out(*dims):
+        s[0] = s[0] + 1
+        return tensor(randn(*dims, seed=s[0]) * out_std, cfg.dtype)
+    var blocks = []
+    for i in range(cfg.layers):
+        let attn = record(wq=nrm(d, d), wk=nrm(d, kvd), wv=nrm(d, kvd), wo=nrm_out(d, d))
+        var ffn = none
+        if _is_moe(cfg, i):
+            ffn = record(router=nrm(d, cfg.experts), w1=nrm(cfg.experts, d, cfg.ff), w3=nrm(cfg.experts, d, cfg.ff), w2=nrm_out(cfg.experts, cfg.ff, d))
+        else:
+            ffn = record(w1=nrm(d, cfg.ff), w3=nrm(d, cfg.ff), w2=nrm_out(cfg.ff, d))
+        blocks.append(record(norm1=tensor(ones(d), cfg.dtype), attn=attn, norm2=tensor(ones(d), cfg.dtype), ffn=ffn))
+    if cfg.tie:
+        return record(embed=nrm(cfg.vocab, d), blocks=blocks, norm=tensor(ones(d), cfg.dtype))
+    return record(embed=nrm(cfg.vocab, d), blocks=blocks, norm=tensor(ones(d), cfg.dtype), head=nrm(d, cfg.vocab))
+
+fn count_params(params):
+    var n = 0
+    for l in leaves(params):
+        var k = 1
+        for v in shape(l):
+            k = k * v
+        n = n + k
+    return n
+
+fn active_params(cfg, params):
+    # parameters used for one token: a mixture of experts runs top_k of its experts
+    var n = count_params(params)
+    if cfg.experts > 1:
+        for i in range(cfg.layers):
+            if _is_moe(cfg, i):
+                n = n - (cfg.experts - cfg.top_k) * 3 * cfg.d * cfg.ff
+    return n
+
+fn rms_norm(x, w, eps=1e-6) = x / sqrt(mean(x * x, axis=-1, keepdims=true) + eps) * w
+
+fn rope_tables(T, hd, base=10000.0, offset=0, scale=1.0):
+    # scale > 1 interpolates positions: a model trained on n tokens reads scale · n (extend_context)
+    let half = hd // 2
+    let inv = exp(arange(half) * (-log(base) / half))
+    let ang = reshape((arange(T) + offset) * (1.0 / scale), T, 1) * reshape(inv, 1, half)
+    return [tensor(cos(ang), "float32"), tensor(sin(ang), "float32")]
+
+fn apply_rope(x, cs):
+    # x [B, H, T, hd]: rotate the two halves of every head by the position's angle
+    let hd = shape(x)[3]
+    let half = hd // 2
+    let x1 = x[:, :, :, 0:half]
+    let x2 = x[:, :, :, half:hd]
+    let c = cs[0]
+    let s = cs[1]
+    return concat([x1 * c - x2 * s, x1 * s + x2 * c], axis=-1)
+
+fn _heads(x, B, T, H, hd) = permute(reshape(x, B, T, H, hd), 0, 2, 1, 3)
+
+fn _repeat_kv(x, rep):
+    if rep == 1:
+        return x
+    let sh = shape(x)
+    let B = sh[0]
+    let K = sh[1]
+    let T = sh[2]
+    let hd = sh[3]
+    return reshape(stack([x] * rep, axis=2), B, K * rep, T, hd)
+
+fn causal_mask(T, S=none, offset=0):
+    # 0 where a query may look, a large negative number in the future
+    let s = T if S is none else S
+    let allowed = reshape(arange(T) + offset, T, 1) >= reshape(arange(s), 1, s)
+    return (tensor(allowed, "float32") - 1.0) * 1e9
+
+fn attention(cfg, p, x, cs, cache=none, offset=0):
+    let sh = shape(x)
+    let B = sh[0]
+    let T = sh[1]
+    let H = cfg.heads
+    let K = cfg.kv_heads
+    let hd = cfg.d // H
+    let q = apply_rope(_heads(x @ p.wq, B, T, H, hd), cs)
+    var k = apply_rope(_heads(x @ p.wk, B, T, K, hd), cs)
+    var v = _heads(x @ p.wv, B, T, K, hd)
+    if cache is not none:
+        if cache["k"] is not none:
+            k = concat([cache["k"], k], axis=2)
+            v = concat([cache["v"], v], axis=2)
+        cache["k"] = k
+        cache["v"] = v
+    let S = shape(k)[2]
+    let kk = _repeat_kv(k, H // K)
+    let vv = _repeat_kv(v, H // K)
+    let scores = (q @ swapaxes(kk, -2, -1)) * (1.0 / sqrt(hd)) + causal_mask(T, S, S - T)
+    let o = softmax(scores, axis=-1) @ vv
+    return reshape(permute(o, 0, 2, 1, 3), B, T, cfg.d) @ p.wo
+
+fn swiglu(x, w1, w3, w2) = ((x @ w1) * sigmoid(x @ w1) * (x @ w3)) @ w2
+
+fn _onehot(idx, n):
+    let m = shape(idx)[0]
+    return tensor(reshape(tensor(idx, "float64"), m, 1) == reshape(arange(n) * 1.0, 1, n), "float32")
+
+fn moe(cfg, p, x):
+    # mixture of experts: a router picks top_k experts per token; only those run (sparse dispatch), their outputs
+    # are mixed by the renormalised router probabilities. Returns [output, load-balancing loss, router z-loss].
+    let sh = shape(x)
+    let N = sh[0] * sh[1]
+    let E = cfg.experts
+    let xf = reshape(x, N, cfg.d)
+    let logits = xf @ p.router
+    let probs = softmax(logits, axis=-1)
+    var chosen = tensor(zeros(N, E), "float32")
+    var left = stop_gradient(probs)
+    for k in range(cfg.top_k):
+        let pick = _onehot(argmax(left, axis=-1), E)
+        chosen = chosen + pick
+        left = where(pick > 0, -1.0, left)
+    let gates = probs * chosen
+    let gates_n = gates / (sum(gates, axis=-1, keepdims=true) + 1e-9)
+    # sparse dispatch: each expert runs on its own tokens; the outputs come back by gathering, top_k rows a token
+    let ch = chosen.tolist()
+    var parts = []
+    var slot = [[0] * N for j in range(cfg.top_k)]
+    var used = [0] * N
+    var row = 0
+    for e in range(E):
+        var rows = []
+        for i in range(N):
+            if ch[i][e] > 0:
+                rows.append(i)
+                slot[used[i]][i] = row
+                used[i] = used[i] + 1
+                row = row + 1
+        if len(rows) == 0:
+            continue
+        let idx = tensor(rows, "int64")
+        parts.append(swiglu(xf[idx], p.w1[e], p.w3[e], p.w2[e]) * reshape(gates_n[idx][:, e], len(rows), 1))
+    let Y = parts[0] if len(parts) == 1 else concat(parts, axis=0)
+    var out = Y[tensor(slot[0], "int64")]
+    for j in range(1, cfg.top_k):
+        out = out + Y[tensor(slot[j], "int64")]
+    let frac = mean(stop_gradient(chosen), axis=0) / cfg.top_k
+    let aux = E * sum(frac * mean(probs, axis=0))
+    let lse = log(sum(exp(logits - stop_gradient(max(logits, axis=-1, keepdims=true))), axis=-1)) + stop_gradient(max(logits, axis=-1))
+    let z = mean(lse * lse)
+    return [reshape(out, sh[0], sh[1], cfg.d), aux, z]
+
+fn _dropout(x, rate, train, seed):
+    if not train or rate <= 0:
+        return x
+    let keep = tensor(rand(*shape(x), seed=seed) >= rate, "float32") / (1.0 - rate)
+    return x * keep
+
+fn forward(cfg, params, ids, caches=none, offset=0, train=false, seed=0):
+    # logits [B, T, vocab] and the auxiliary losses (mixture of experts) for token ids [B, T]
+    let sh = shape(ids)
+    let B = sh[0]
+    let T = sh[1]
+    var x = reshape(params.embed[reshape(ids, -1)], B, T, cfg.d)
+    let cs = rope_tables(T, cfg.d // cfg.heads, cfg.rope_base, offset, cfg.rope_scale)
+    var aux = 0.0
+    var z = 0.0
+    for i in range(cfg.layers):
+        let b = params.blocks[i]
+        let a = attention(cfg, b.attn, rms_norm(x, b.norm1, cfg.norm_eps), cs, caches[i] if caches is not none else none, offset)
+        x = x + _dropout(a, cfg.dropout, train, seed + 2 * i)
+        let hn = rms_norm(x, b.norm2, cfg.norm_eps)
+        if _is_moe(cfg, i):
+            let r = moe(cfg, b.ffn, hn)
+            x = x + _dropout(r[0], cfg.dropout, train, seed + 2 * i + 1)
+            aux = aux + r[1]
+            z = z + r[2]
+        else:
+            x = x + _dropout(swiglu(hn, b.ffn.w1, b.ffn.w3, b.ffn.w2), cfg.dropout, train, seed + 2 * i + 1)
+    let xn = rms_norm(x, params.norm, cfg.norm_eps)
+    let logits = xn @ (swapaxes(params.embed, 0, 1) if cfg.tie else params.head)
+    return [logits, aux, z]
+
+fn token_loss(logits, targets, mask=none, label_smoothing=0.0):
+    # mean cross-entropy of the next tokens (where mask is 1)
+    let sh = shape(logits)
+    let V = sh[2]
+    let n = sh[0] * sh[1]
+    let lp = log_softmax(reshape(logits, n, V), axis=-1)
+    let picked = lp[(tensor(list(range(n)), "int64"), reshape(targets, -1))]
+    var nll = -picked
+    if label_smoothing > 0:
+        nll = (1.0 - label_smoothing) * nll - label_smoothing * mean(lp, axis=-1)
+    if mask is none:
+        return mean(nll)
+    let m = reshape(mask, -1)
+    return sum(nll * m) / max(float(sum(m)), 1.0)
+
+fn run_forward(fwd, cfg, params, ids, caches=none, offset=0, train=false, seed=0):
+    # the default forward or a model of the user's own: it returns logits or [logits, aux, z]
+    if fwd is none:
+        return forward(cfg, params, ids, caches, offset, train, seed)
+    let out = fwd(cfg, params, ids, caches, offset, train, seed)
+    if isinstance(out, list):
+        return out
+    return [out, 0.0, 0.0]
+
+fn loss_fn(cfg, params, batch, train=true, seed=0, label_smoothing=0.0, fwd=none):
+    let x = batch[0]
+    let ids = x[:, 0:shape(x)[1] - 1]
+    let tg = x[:, 1:shape(x)[1]]
+    let out = run_forward(fwd, cfg, params, ids, none, 0, train, seed)
+    let ce = token_loss(out[0], tg, batch[1], label_smoothing)
+    return ce + cfg.aux_weight * out[1] + cfg.z_weight * out[2]
+
+# =============================================================================== optimiser and schedule
+class AdamW:
+    var lr = 3e-4
+    var b1 = 0.9
+    var b2 = 0.95
+    var eps = 1e-8
+    var wd = 0.1
+    var t = 0
+    var m = none
+    var v = none
+    fn step(self, params, grads, lr=none):
+        let rate = self.lr if lr is none else lr
+        if self.m is none:
+            self.m = tree_map(fn(g) => zeros_like(g), grads)
+            self.v = tree_map(fn(g) => zeros_like(g), grads)
+        self.t = self.t + 1
+        let b1 = self.b1
+        let b2 = self.b2
+        self.m = tree_map(fn(m, g) => b1 * m + (1 - b1) * g, self.m, grads)
+        self.v = tree_map(fn(v, g) => b2 * v + (1 - b2) * g * g, self.v, grads)
+        let c1 = 1 - b1 ** self.t
+        let c2 = 1 - b2 ** self.t
+        let eps = self.eps
+        let wd = self.wd
+        # weight decay on matrices only (not on norms)
+        return tree_map(fn(p, m, v) => p - rate * ((m / c1) / (sqrt(v / c2) + eps) + (wd * p if ndim(p) >= 2 else 0.0)), params, self.m, self.v)
+
+fn adamw(lr=3e-4, betas=[0.9, 0.95], eps=1e-8, weight_decay=0.1):
+    var o = AdamW()
+    o.lr = float(lr)
+    o.b1 = float(betas[0])
+    o.b2 = float(betas[1])
+    o.eps = float(eps)
+    o.wd = float(weight_decay)
+    return o
+
+fn lr_at(step, total, lr, warmup=100, min_ratio=0.1):
+    # linear warm-up, then cosine down to min_ratio · lr
+    if step < warmup:
+        return lr * (step + 1) / max(1, warmup)
+    let p = (step - warmup) / max(1, total - warmup)
+    return lr * (min_ratio + (1 - min_ratio) * 0.5 * (1 + cos(pi * min(1.0, p))))
+
+fn clip_grads(grads, max_norm=1.0):
+    var total = 0.0
+    for g in leaves(grads):
+        total = total + float(sum(g * g))
+    let norm = sqrt(total)
+    if max_norm is none or norm <= max_norm:
+        return [grads, norm]
+    let c = max_norm / (norm + 1e-6)
+    return [tree_map(fn(g) => g * c, grads), norm]
+
+# =============================================================================== generation
+fn _sample(logits, temperature=0.8, top_k=40, top_p=0.95, seed=none, banned=none, recent=none, repetition_penalty=1.0):
+    var lg = [float(v) for v in logits.tolist()]
+    if recent is not none and repetition_penalty != 1.0:
+        for t in recent:
+            lg[t] = lg[t] / repetition_penalty if lg[t] > 0 else lg[t] * repetition_penalty
+    if banned is not none:
+        for t in banned:
+            lg[t] = -1e30
+    if temperature <= 0:
+        var best = 0
+        for i in range(len(lg)):
+            if lg[i] > lg[best]:
+                best = i
+        return best
+    let order = sorted(list(range(len(lg))), key=fn(i) => -lg[i])
+    var keep = order[0:top_k] if top_k and top_k > 0 else order
+    let mx = lg[keep[0]]
+    var ws = [exp((lg[i] - mx) / temperature) for i in keep]
+    let tot = sum(ws)
+    if top_p is not none and top_p < 1.0:
+        var cum = 0.0
+        var cut = len(keep)
+        for j in range(len(keep)):
+            cum = cum + ws[j] / tot
+            if cum >= top_p:
+                cut = j + 1
+                break
+        keep = keep[0:cut]
+        ws = ws[0:cut]
+    let u = float(rand(1, seed=seed)[0]) * sum(ws)
+    var acc = 0.0
+    for j in range(len(keep)):
+        acc = acc + ws[j]
+        if acc >= u:
+            return keep[j]
+    return keep[len(keep) - 1]
+
+fn generate_ids(cfg, params, prompt_ids, max_new=100, temperature=0.8, top_k=40, top_p=0.95, stop=none, seed=0,
+                repetition_penalty=1.1, banned=none, fwd=none):
+    # new token ids after prompt_ids, with a key / value cache (each step looks at one new token)
+    var ids = list(prompt_ids)
+    if len(ids) > cfg.context - 1:
+        ids = ids[len(ids) - cfg.context + 1:]
+    var caches = [{"k": none, "v": none} for i in range(cfg.layers)]
+    var out = run_forward(fwd, cfg, params, tensor([ids], "int64"), caches, 0, false)
+    return _decode_loop(cfg, params, out, caches, len(ids), ids, max_new, temperature, top_k, top_p, stop, seed,
+                        repetition_penalty, banned, fwd)[0]
+
+fn _decode_loop(cfg, params, out0, caches, pos0, ids, max_new, temperature, top_k, top_p, stop, seed,
+                repetition_penalty, banned, fwd):
+    # sample from the last logits, feed each new token through the cache; returns [new ids, last logits, position]
+    var out = out0
+    var pos = pos0
+    var new = []
+    for step in range(int(max_new)):
+        let last = out[0][0, shape(out[0])[1] - 1]
+        let t = _sample(last, temperature, top_k, top_p, seed + step if seed is not none else none, banned, (ids + new)[max(0, len(ids) + len(new) - 64):], repetition_penalty)
+        if stop is not none and t in stop:
+            break
+        new.append(t)
+        if pos >= cfg.context:
+            break
+        out = run_forward(fwd, cfg, params, tensor([[t]], "int64"), caches, pos, false)
+        pos = pos + 1
+    return [new, out, pos]
+
+# =============================================================================== parameter-efficient tuning
+fn lora_init(cfg, params, rank=8, targets=none, seed=0):
+    # adapters for the named matrices of every block (attention wq wk wv wo, feed-forward w1 w3 w2; mixture-of-
+    # experts layers adapt their attention): A [n_in, rank] random, B [rank, n_out] zero, so training starts from
+    # the model as it is
+    let tg = targets if targets is not none else ["wq", "wk", "wv", "wo"]
+    var s = int(seed) * 977 + 5
+    var out = []
+    for i in range(cfg.layers):
+        let b = params.blocks[i]
+        var blk = {}
+        for part in ["attn", "ffn"]:
+            if part == "ffn" and _is_moe(cfg, i):
+                continue
+            let sub = b[part]
+            var d = {}
+            for k in keys(sub):
+                if k in tg:
+                    let sh = shape(sub[k])
+                    s = s + 1
+                    d[k] = record(a=tensor(randn(sh[0], rank, seed=s) * (1.0 / sqrt(sh[0])), cfg.dtype),
+                                  b=tensor(zeros(rank, sh[1]), cfg.dtype))
+            if len(d) > 0:
+                blk[part] = record(**d)
+        out.append(record(**blk))
+    return out
+
+fn lora_merge(cfg, params, adapters, scale=2.0):
+    # the parameters with every adapter added: W + (A @ B) · scale
+    var blocks = []
+    for i in range(cfg.layers):
+        let b = params.blocks[i]
+        let ad = adapters[i]
+        var nb = _rec_to_dict(b)
+        for part in keys(ad):
+            var sub = _rec_to_dict(b[part])
+            let ap = ad[part]
+            for k in keys(ap):
+                sub[k] = sub[k] + (ap[k].a @ ap[k].b) * scale
+            nb[part] = record(**sub)
+        blocks.append(record(**nb))
+    var top = _rec_to_dict(params)
+    top["blocks"] = blocks
+    return record(**top)
+
+fn fit_turns(tok, turns, system, budget):
+    # the most recent turns that fit budget tokens with the system prompt (the last turn always stays)
+    var keep = list(turns)
+    while len(keep) > 1 and len(encode_chat(tok, keep, system)[0]) > budget:
+        keep = keep[1:]
+        while len(keep) > 1 and keep[0][0] == "assistant":
+            keep = keep[1:]
+    return keep
+
+# =============================================================================== the model object
+class LLM:
+    var cfg = none
+    var tok = none
+    var params = none
+    var records = []
+    var weights = []
+    var opt = none
+    var steps_done = 0
+    var history = []
+    var system = none
+    var fwd = none
+    var adapters = none
+    var adapter_scale = 1.0
+
+    fn __str__(self):
+        let c = self.cfg
+        let moe_txt = f", {c.experts} experts top-{c.top_k}" if c.experts > 1 else ""
+        return f"LLM({count_params(self.params):,} parameters ({active_params(c, self.params):,} active), {c.layers} layers, d={c.d}, heads={c.heads}/{c.kv_heads}{moe_txt}, context={c.context}, {self.tok})"
+    fn __repr__(self) = self.__str__()
+    fn summary(self) = record(parameters=count_params(self.params), active=active_params(self.cfg, self.params), config=self.cfg,
+                              tokenizer=str(self.tok), steps=self.steps_done, records=len(self.records))
+    fn add_data(self, source, weight=1.0):
+        # more records (a file, folder, glob, list or {source: weight}); the tokenizer stays as it is
+        let src = _sources(source, weight)
+        self.records.extend(src[0])
+        self.weights.extend(src[1])
+        return len(src[0])
+
+    fn _dataset(self, lo, hi) = dataset(self.tok, self.records[lo:hi], self.cfg.context, self.weights[lo:hi])
+
+    fn train(self, steps=500, batch=8, lr=3e-3, warmup=none, accumulate=1, clip=1.0, weight_decay=0.1,
+             eval_every=none, val_fraction=0.05, log_every=50, seed=0, label_smoothing=0.0, checkpoint=none,
+             verbose=true, data=none):
+        # every parameter learns; log_every=0 prints only the last step
+        if data is not none:
+            self.add_data(data)
+        if len(self.records) == 0:
+            raise ValueError("no training data: llm.create(data=…) or m.add_data(…) first")
+        let nval = int(len(self.records) * val_fraction) if len(self.records) >= 20 else 0
+        let n = len(self.records)
+        let train_ds = self._dataset(0, n - nval)
+        let val_ds = self._dataset(n - nval, n) if nval else none
+        if self.opt is none:
+            self.opt = adamw(lr, [0.9, 0.95], 1e-8, weight_decay)
+        let r = self._loop(train_ds, val_ds, self.params, fn(q) => q, self.opt, steps, batch, lr, warmup, accumulate,
+                           clip, eval_every, log_every, seed, label_smoothing, checkpoint, verbose)
+        self.params = r[0]
+        return r[1]
+
+    fn finetune(self, data=none, steps=200, rank=8, alpha=none, lr=1e-3, targets=none, batch=8, warmup=none,
+                accumulate=1, clip=1.0, log_every=50, seed=0, label_smoothing=0.0, verbose=true, weight=1.0, merge=true,
+                replay=0.3):
+        # low-rank adaptation: the weights stay frozen and learn W + (A @ B) · alpha / rank, a small fraction of the
+        # parameters (fast, little memory, hard to forget what the model knew). merge=true folds the adapters in,
+        # so the model runs as fast as before; merge=false keeps them in m.adapters (apply with lora_merge).
+        # replay: the share of batches drawn from what the model learned before, so new data does not overwrite it
+        var recs = self.records
+        var ws = self.weights
+        if data is not none:
+            let src = _sources(data, weight)
+            recs = src[0]
+            ws = src[1]
+            let old = sum(self.weights) if len(self.weights) > 0 else 0.0
+            if replay > 0 and old > 0 and len(recs) > 0:
+                let f = float(replay) / (1.0 - min(float(replay), 0.95)) * sum(ws) / old
+                recs = recs + self.records
+                ws = ws + [w * f for w in self.weights]
+            self.records.extend(src[0])
+            self.weights.extend(src[1])
+        if len(recs) == 0:
+            raise ValueError("no data to fine-tune on")
+        let cfg = self.cfg
+        let tg = targets if targets is not none else ["wq", "wk", "wv", "wo", "w1", "w3", "w2"]
+        let ad = lora_init(cfg, self.params, rank, tg, seed)
+        let scale = 1.0 if alpha is none else float(alpha) / rank
+        let base = self.params
+        let ds = dataset(self.tok, recs, cfg.context, ws)
+        let opt = adamw(lr, [0.9, 0.99], 1e-8, 0.0)
+        let r = self._loop(ds, none, ad, fn(q) => lora_merge(cfg, base, q, scale), opt, steps, batch, lr, warmup,
+                           accumulate, clip, none, log_every, seed, label_smoothing, none, verbose)
+        if merge:
+            self.params = lora_merge(cfg, base, r[0], scale)
+            self.adapters = none
+        else:
+            self.adapters = r[0]
+            self.adapter_scale = scale
+        var res = _rec_to_dict(r[1])
+        res["trained"] = count_params(r[0])
+        res["frozen"] = count_params(base)
+        return record(**res)
+
+    fn _loop(self, train_ds, val_ds, p0, build, opt, steps, batch, lr, warmup, accumulate, clip, eval_every, log_every,
+             seed, label_smoothing, checkpoint, verbose):
+        # the training loop shared by train and finetune: p are the trained values, build(p) the model's parameters
+        let cfg = self.cfg
+        let fwd = self.fwd
+        let wu = int(warmup) if warmup is not none else max(1, int(steps) // 20)
+        let every = int(log_every) if log_every else 0
+        _set_seed(int(seed))
+        var p = p0
+        let t0 = _now()
+        var tokens = 0
+        var last = 0.0
+        for st in range(int(steps)):
+            var gsum = none
+            var lsum = 0.0
+            for a in range(int(accumulate)):
+                let ri = [randint(0, 1 << 30) for k in range(batch)]
+                let b = train_ds.batch(batch, ri)
+                let sd = (self.steps_done + st) * 131 + a
+                let vg = value_and_grad(fn(q) => loss_fn(cfg, build(q), b, true, sd, label_smoothing, fwd))(p)
+                lsum = lsum + float(vg[0])
+                gsum = vg[1] if gsum is none else tree_map(fn(x, y) => x + y, gsum, vg[1])
+                tokens = tokens + batch * cfg.context
+            let g = tree_map(fn(x) => x / accumulate, gsum) if accumulate > 1 else gsum
+            let cg = clip_grads(g, clip)
+            let rate = lr_at(self.steps_done + st, self.steps_done + int(steps), lr, wu)
+            p = opt.step(p, cg[0], rate)
+            last = lsum / accumulate
+            self.history.append(last)
+            if verbose and ((every > 0 and st % every == 0) or st == int(steps) - 1):
+                let el = _now() - t0
+                print(f"step {self.steps_done + st + 1}: loss {last:.4f}  lr {rate:.2e}  grad-norm {cg[1]:.2f}  {tokens / max(el, 1e-9):,.0f} tokens/s")
+            if eval_every and val_ds is not none and (st + 1) % int(eval_every) == 0:
+                let vl = self._eval(build(p), val_ds)
+                if verbose:
+                    print(f"  validation loss {vl:.4f}  perplexity {exp(vl):.2f}")
+            if checkpoint is not none and (st + 1) % max(1, int(steps) // 4) == 0:
+                self.params = build(p)
+                self.save(checkpoint)
+        self.steps_done = self.steps_done + int(steps)
+        var res = {"loss": last, "steps": self.steps_done, "seconds": _now() - t0}
+        if val_ds is not none:
+            res["val_loss"] = self._eval(build(p), val_ds)
+            res["perplexity"] = exp(res["val_loss"])
+        return [p, record(**res)]
+
+    fn _eval(self, p, ds, batches=4, batch=8):
+        var tot = 0.0
+        for i in range(batches):
+            let b = ds.batch(batch, [(i * batch + k) * 7919 for k in range(batch)])
+            tot = tot + float(loss_fn(self.cfg, p, b, false, 0, 0.0, self.fwd))
+        return tot / batches
+
+    fn _live(self) = self.params if self.adapters is none else lora_merge(self.cfg, self.params, self.adapters, self.adapter_scale)
+
+    fn loss(self, text, answer=none):
+        # mean cross-entropy of a text, or of the answer to a question (text) when answer is given
+        var ids = []
+        var mask = none
+        if answer is none:
+            ids = [self.tok.special("<bos>")] + self.tok.encode(text) + [self.tok.special("<eos>")]
+        else:
+            let e = encode_chat(self.tok, [["user", str(text)], ["assistant", str(answer)]], self.system)
+            ids = e[0]
+            mask = e[1]
+        let n = min(len(ids), self.cfg.context + 1)
+        let x = tensor([ids[0:n]], "int64")
+        let mk = tensor([mask[1:n]], "float32") if mask is not none else none
+        return float(loss_fn(self.cfg, self._live(), [x, mk], false, 0, 0.0, self.fwd))
+    fn perplexity(self, text) = exp(self.loss(text))
+
+    fn generate(self, prompt="", max_new=100, temperature=0.8, top_k=40, top_p=0.95, seed=0, repetition_penalty=1.1):
+        let ids = [self.tok.special("<bos>")] + self.tok.encode(prompt)
+        let new = generate_ids(self.cfg, self._live(), ids, max_new, temperature, top_k, top_p, [self.tok.special("<eos>")], seed, repetition_penalty, list(range(self.tok.base)), self.fwd)
+        return self.tok.decode(new)
+
+    fn chat(self, message, history=none, system=none, max_new=200, temperature=0.0, top_k=20, top_p=0.9, seed=0, repetition_penalty=1.0):
+        # one answer (greedy by default: the most likely answer, what question / answer training taught; give a
+        # temperature for varied replies); history is [[role, text], …]. When it does not fit the context the oldest turns go first
+        # (the system prompt and the new message always stay), never a cut through the middle of a turn.
+        var turns = []
+        if history is not none:
+            for h in history:
+                turns.append([h[0], h[1]] if isinstance(h, list) or isinstance(h, tuple) else ["user", str(h)])
+        turns.append(["user", str(message)])
+        let sys = system if system is not none else self.system
+        let mn = min(int(max_new), self.cfg.context // 4)
+        let enc = encode_chat(self.tok, fit_turns(self.tok, turns, sys, self.cfg.context - mn - 1), sys)
+        let prompt = enc[0] + [self.tok.special("<assistant>")]
+        let new = generate_ids(self.cfg, self._live(), prompt, max_new, temperature, top_k, top_p, [self.tok.special("<eos>")], seed, repetition_penalty, self._banned(), self.fwd)
+        return self.tok.decode(new).strip()
+
+    fn _banned(self) = [i for i in range(self.tok.base) if i != self.tok.special("<eos>")]
+
+    fn conversation(self, system=none, keep_first=0):
+        # a chat that remembers: every turn's keys and values stay cached, so a new message costs only its own
+        # tokens (not the whole history again). When the context fills up, the oldest turns leave (the system
+        # prompt and the first keep_first exchanges are pinned) and the cache is rebuilt once.
+        var c = Conversation()
+        c.m = self
+        c.system = system if system is not none else self.system
+        c.keep_first = int(keep_first)
+        c.turns = []
+        c._reset()
+        return c
+
+    fn extend_context(self, factor=2):
+        # read factor times longer texts (position interpolation of the rotary angles); a short train() at the
+        # new length afterwards makes it fluent there
+        var d = _rec_to_dict(self.cfg)
+        d["context"] = int(self.cfg.context * factor)
+        d["rope_scale"] = self.cfg.rope_scale * factor
+        self.cfg = record(**d)
+        return self.cfg.context
+
+    fn save(self, path):
+        models.save_model(path, self._live(), metadata={"llm_config": json_str(_rec_to_dict(self.cfg)), "llm_tokenizer": json_str(self.tok.to_dict()), "llm_steps": str(self.steps_done)})
+        return path
+
+class Conversation:
+    var m = none
+    var system = none
+    var keep_first = 0
+    var turns = []
+    var caches = none
+    var pos = 0
+    var pending = []
+    var ids = []
+    var fed = 0
+    var rebuilt = 0
+    fn _reset(self):
+        # encode the remembered turns once and cache them
+        let m = self.m
+        let enc = encode_chat(m.tok, self.turns, self.system)
+        self.caches = [{"k": none, "v": none} for i in range(m.cfg.layers)]
+        self.pending = enc[0]
+        self.ids = []
+        self.pos = 0
+    fn _evict(self, need):
+        # drop the oldest unpinned exchange until need more tokens fit
+        let m = self.m
+        let pin = 2 * self.keep_first
+        while len(self.turns) > pin and len(encode_chat(m.tok, self.turns, self.system)[0]) + need > m.cfg.context:
+            var rest = self.turns[pin + 1:]
+            while len(rest) > 0 and rest[0][0] == "assistant":
+                rest = rest[1:]
+            self.turns = self.turns[0:pin] + rest
+        self.rebuilt = self.rebuilt + 1
+        self._reset()
+    fn say(self, message, max_new=128, temperature=0.0, top_k=20, top_p=0.9, seed=0, repetition_penalty=1.0):
+        let m = self.m
+        let tok = m.tok
+        let E = tok.special("<eos>")
+        let add = [tok.special("<user>")] + tok.encode(str(message)) + [E, tok.special("<assistant>")]
+        let mn = min(int(max_new), m.cfg.context // 4)
+        if self.pos + len(self.pending) + len(add) + mn > m.cfg.context:
+            self._evict(len(add) + mn)
+        let feed = self.pending + add
+        let p = m._live()
+        let out = run_forward(m.fwd, m.cfg, p, tensor([feed], "int64"), self.caches, self.pos, false)
+        self.fed = self.fed + len(feed)
+        let hist = self.ids + feed
+        let r = _decode_loop(m.cfg, p, out, self.caches, self.pos + len(feed), hist, mn, temperature, top_k, top_p,
+                             [E], seed, repetition_penalty, m._banned(), m.fwd)
+        let new = r[0]
+        let start = self.pos + len(feed)
+        self.fed = self.fed + (r[2] - start)
+        self.pos = r[2]
+        # what is not in the cache yet (<eos>, and the last token when the context ran out) goes in with the next message
+        self.pending = ([new[len(new) - 1]] if len(new) > r[2] - start else []) + [E]
+        self.ids = hist + new[0:r[2] - start]
+        let text = tok.decode(new).strip()
+        self.turns.append(["user", str(message)])
+        self.turns.append(["assistant", text])
+        return text
+    fn tokens_processed(self) = self.fed
+    fn __str__(self) = f"Conversation({len(self.turns) // 2} exchanges, {self.pos} cached tokens, {self.rebuilt} rebuilds)"
+    fn __repr__(self) = self.__str__()
+
+fn _rec_to_dict(r):
+    var d = {}
+    for k in keys(r):
+        d[k] = r[k]
+    return d
+
+fn _make(cfg, tok, params):
+    var m = LLM()
+    m.cfg = cfg
+    m.tok = tok
+    m.params = params
+    m.records = []
+    m.weights = []
+    m.history = []
+    return m
+
+fn _sources(data, default_weight):
+    # data: a source, a list of sources, or {source: weight} (how much each one counts)
+    var recs = []
+    var ws = []
+    if data is none:
+        return [recs, ws]
+    if isinstance(data, dict):
+        for k in keys(data):
+            let rs = read_source(k)
+            recs.extend(rs)
+            ws.extend([float(data[k])] * len(rs))
+        return [recs, ws]
+    let rs = read_source(data)
+    return [rs, [float(default_weight)] * len(rs)]
+
+fn create(data=none, tokenizer="bpe", vocab=1024, layers=4, d=128, heads=4, kv_heads=none, ff=none, context=128,
+          experts=0, top_k=2, moe_every=1, dropout=0.0, tie=true, seed=0, system=none, data_weight=1.0, forward=none,
+          init=none, **extra):
+    # a new model: the tokenizer is learned from data (bpe or chars), or bytes. forward(cfg, params, ids, caches,
+    # offset, train, seed) and init(cfg, seed) replace the built-in transformer with a model of your own.
+    let src = _sources(data, data_weight)
+    let records = src[0]
+    var tok = none
+    if isinstance(tokenizer, Tokenizer):
+        tok = tokenizer
+    elif tokenizer == "bytes" or len(records) == 0:
+        tok = byte_tokenizer()
+    elif tokenizer == "chars":
+        tok = char_tokenizer(_texts_of(records))
+    else:
+        tok = bpe_tokenizer(_texts_of(records), vocab)
+    let cfg = config(tok.size, d, layers, heads, kv_heads, ff, context, experts, top_k, moe_every, dropout=dropout, tie=tie, **extra)
+    var m = _make(cfg, tok, init_params(cfg, seed) if init is none else init(cfg, seed))
+    m.system = system
+    m.fwd = forward
+    m.records = records
+    m.weights = src[1]
+    return m
+
+fn load(path0, forward=none):
+    let path = path0 if exists(path0) else path0 + ".apsim"
+    let info = models.model_info(path)
+    let meta = info.metadata
+    let c = json_parse(meta["llm_config"])
+    let ks = keys(c)
+    let cfg = config(c["vocab"], c["d"], c["layers"], c["heads"], c["kv_heads"], c["ff"], c["context"], c["experts"], c["top_k"], c["moe_every"], c["rope_base"], c["norm_eps"], c["tie"], c["aux_weight"], c["z_weight"], c["dropout"], c["init_std"], c["dtype"] if "dtype" in ks else "float32", c["rope_scale"] if "rope_scale" in ks else 1.0)
+    var m = _make(cfg, tokenizer_from(json_parse(meta["llm_tokenizer"])), models.load_model(path))
+    m.steps_done = int(meta["llm_steps"]) if "llm_steps" in keys(meta) else 0
+    m.fwd = forward
+    return m

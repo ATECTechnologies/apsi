@@ -170,7 +170,7 @@ def type_name(v):
     if isinstance(v, Node):
         return "Traced[" + type_name(v.value) + "]"
     if isinstance(v, np.ndarray):
-        return f"Tensor[{shape_str(v.shape)}, {v.dtype}]"
+        return f"Tensor[{shape_str(v.shape)}, {v.dtype}]" if v.ndim else f"Tensor[{v.dtype}]"
     if isinstance(v, list):
         return "List"
     if isinstance(v, tuple):

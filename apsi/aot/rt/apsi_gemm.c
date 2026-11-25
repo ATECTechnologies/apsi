@@ -182,13 +182,15 @@ static void pack_a_d(const double *A, int64_t lda, int64_t mc, int64_t kc, doubl
         }
     }
 }
-typedef struct { const double *A, *B; double *C; int64_t M, N, K, lda, ldb, ldc; const double *Bp; int64_t kc, pc, jc, nc; int add; } GD;
+typedef struct { const double *A, *B; double *C; int64_t M, N, K, lda, ldb, ldc; const double *Bp; int64_t kc, pc, jc, nc; int add; int64_t nsplit, nchunk; } GD;
 static void gd_task(void *p, int64_t t) {          /* one MC block of rows against the packed B panel */
     GD *g = (GD *)p;
-    int64_t ic = t * MC, mc = g->M - ic < MC ? g->M - ic : MC;
+    int64_t ib = t / g->nsplit, js = t % g->nsplit;              /* a block of rows x a range of columns */
+    int64_t ic = ib * MC, mc = g->M - ic < MC ? g->M - ic : MC;
+    int64_t j0 = js * g->nchunk, j1 = j0 + g->nchunk < g->nc ? j0 + g->nchunk : g->nc;
     static _Thread_local double Ap[MC * KC] __attribute__((aligned(64)));
     pack_a_d(g->A + ic * g->lda + g->pc, g->lda, mc, g->kc, Ap);
-    for (int64_t jr = 0; jr < g->nc; jr += NR)
+    for (int64_t jr = j0; jr < j1; jr += NR)
         for (int64_t ir = 0; ir < mc; ir += MR)
             kernel_d(g->kc, Ap + ir * g->kc, g->Bp + jr * g->kc, g->C + (ic + ir) * g->ldc + g->jc + jr, g->ldc,
                      (int)(mc - ir < MR ? mc - ir : MR), (int)(g->nc - jr < NR ? g->nc - jr : NR), g->add);
@@ -210,8 +212,10 @@ void a_gemm_d(const double *A, const double *B, double *C, int64_t M, int64_t N,
         for (int64_t pc = 0; pc < K; pc += KC) {
             int64_t kc = K - pc < KC ? K - pc : KC;
             pack_b_d(B + pc * N + jc, N, kc, nc, Bp);
-            GD g = {A, B, C, M, N, K, K, N, N, Bp, kc, pc, jc, nc, add || pc > 0};
-            int64_t tasks = (M + MC - 1) / MC;
+            int64_t mt = (M + MC - 1) / MC, ns = 1, chunk = nc;
+            if (parallel) { int th = a_threads(); if (mt < th * 2) { int64_t want = (th * 2 + mt - 1) / mt, maxs = (nc + NR - 1) / NR; ns = want < maxs ? want : maxs; if (ns < 1) ns = 1; chunk = ((nc + ns - 1) / ns + NR - 1) / NR * NR; ns = (nc + chunk - 1) / chunk; } }
+            GD g = {A, B, C, M, N, K, K, N, N, Bp, kc, pc, jc, nc, add || pc > 0, ns, chunk};
+            int64_t tasks = mt * ns;
             if (parallel) a_parallel(gd_task, &g, tasks); else for (int64_t t = 0; t < tasks; t++) gd_task(&g, t);
         }
     }
@@ -257,13 +261,15 @@ static void pack_a_f(const float *A, int64_t lda, int64_t mc, int64_t kc, float 
         }
     }
 }
-typedef struct { const float *A, *B; float *C; int64_t M, N, K, lda, ldb, ldc; const float *Bp; int64_t kc, pc, jc, nc; int add; } GF;
+typedef struct { const float *A, *B; float *C; int64_t M, N, K, lda, ldb, ldc; const float *Bp; int64_t kc, pc, jc, nc; int add; int64_t nsplit, nchunk; } GF;
 static void gf_task(void *p, int64_t t) {
     GF *g = (GF *)p;
-    int64_t ic = t * MC, mc = g->M - ic < MC ? g->M - ic : MC;
+    int64_t ib = t / g->nsplit, js = t % g->nsplit;              /* a block of rows x a range of columns */
+    int64_t ic = ib * MC, mc = g->M - ic < MC ? g->M - ic : MC;
+    int64_t j0 = js * g->nchunk, j1 = j0 + g->nchunk < g->nc ? j0 + g->nchunk : g->nc;
     static _Thread_local float Ap[MC * KC] __attribute__((aligned(64)));
     pack_a_f(g->A + ic * g->lda + g->pc, g->lda, mc, g->kc, Ap);
-    for (int64_t jr = 0; jr < g->nc; jr += NRF)
+    for (int64_t jr = j0; jr < j1; jr += NRF)
         for (int64_t ir = 0; ir < mc; ir += MR)
             kernel_f(g->kc, Ap + ir * g->kc, g->Bp + jr * g->kc, g->C + (ic + ir) * g->ldc + g->jc + jr, g->ldc,
                      (int)(mc - ir < MR ? mc - ir : MR), (int)(g->nc - jr < NRF ? g->nc - jr : NRF), g->add);
@@ -284,8 +290,10 @@ void a_gemm_f(const float *A, const float *B, float *C, int64_t M, int64_t N, in
         for (int64_t pc = 0; pc < K; pc += KC) {
             int64_t kc = K - pc < KC ? K - pc : KC;
             pack_b_f(B + pc * N + jc, N, kc, nc, Bp);
-            GF g = {A, B, C, M, N, K, K, N, N, Bp, kc, pc, jc, nc, add || pc > 0};
-            int64_t tasks = (M + MC - 1) / MC;
+            int64_t mt = (M + MC - 1) / MC, ns = 1, chunk = nc;
+            if (parallel) { int th = a_threads(); if (mt < th * 2) { int64_t want = (th * 2 + mt - 1) / mt, maxs = (nc + NRF - 1) / NRF; ns = want < maxs ? want : maxs; if (ns < 1) ns = 1; chunk = ((nc + ns - 1) / ns + NRF - 1) / NRF * NRF; ns = (nc + chunk - 1) / chunk; } }
+            GF g = {A, B, C, M, N, K, K, N, N, Bp, kc, pc, jc, nc, add || pc > 0, ns, chunk};
+            int64_t tasks = mt * ns;
             if (parallel) a_parallel(gf_task, &g, tasks); else for (int64_t t = 0; t < tasks; t++) gf_task(&g, t);
         }
     }

@@ -2735,6 +2735,7 @@ static AV b_float(int n, AV *a, ADict *kw, AV self) {
         if (end == STR(st)->s || *end) a_error("ValueError", "could not convert string to float: '%s'", STR(v)->s);
         return a_float(d);
     }
+    if (a_is_tn(v)) return a_float(a_tensor_float(v));
     a_error("TypeError", "float() of %s", tname(v));
 }
 static AV b_bool(int n, AV *a, ADict *kw, AV self) { (void)kw; (void)self; return a_bool(n && a_truthy(a[0])); }
@@ -2753,6 +2754,7 @@ static AV b_dict(int n, AV *a, ADict *kw, AV self) {
 static AV b_set(int n, AV *a, ADict *kw, AV self) { (void)kw; (void)self; AV s = a_set(); if (n) { int sp = a_ntmp; A_PUSH(s); AV it = a_iter(a[0]), x; A_PUSH(it); while (a_next(it, &x)) a_dict_set(DICT(s), x, A_NONE); a_ntmp = sp; } return s; }
 static AV b_abs(int n, AV *a, ADict *kw, AV self) { if (n && a_is_tn(a[0])) return a_tensor_builtin("abs", 1)(n, a, kw, self); (void)n; (void)kw; (void)self; if (a_is(a[0], O_QTY)) return a_qty(fabs(QTY(a[0])->v), QTY(a[0])->dim, NULL, 1); if (a[0].t == T_FLOAT) return a_float(fabs(a[0].f)); if (a[0].t == T_INT || a[0].t == T_BOOL) return a_int(a[0].i < 0 ? -a[0].i : a[0].i); a_error("TypeError", "abs() of %s", tname(a[0])); }
 static AV minmax(int n, AV *a, ADict *kw, int mx) {
+    if (n == 1 && (a[0].t == T_INT || a[0].t == T_FLOAT)) return a[0];     /* max(x) of a number is x (as apsi run) */
     AV key = kwarg(kw, "key", A_NONE), best = A_NONE, bestk = A_NONE; int have = 0;
     int sp = a_ntmp; AV src = n == 1 ? a_iter(a[0]) : A_NONE; int i = 0; AV x;
     A_PUSH(src); A_PUSH(A_NONE); A_PUSH(A_NONE); A_PUSH(A_NONE);
@@ -2926,35 +2928,102 @@ static AV b_comb(int n, AV *a, ADict *kw, AV self) {
     double N = fval(a[0]), k = fval(a[1]); return a_float(exp(lgamma(N + 1) - lgamma(k + 1) - lgamma(N - k + 1)));
 }
 
-/* ---- random numbers: xoshiro256** */
-static uint64_t rng_s[4] = {0x9E3779B97F4A7C15ull, 0xBF58476D1CE4E5B9ull, 0x94D049BB133111EBull, 0x2545F4914F6CDD1Dull};
-static uint64_t rotl(uint64_t x, int k) { return (x << k) | (x >> (64 - k)); }
-uint64_t a_rand_u64(void) {
-    uint64_t r = rotl(rng_s[1] * 5, 7) * 9, t = rng_s[1] << 17;
-    rng_s[2] ^= rng_s[0]; rng_s[3] ^= rng_s[1]; rng_s[1] ^= rng_s[2]; rng_s[0] ^= rng_s[3]; rng_s[2] ^= t; rng_s[3] = rotl(rng_s[3], 45);
-    return r;
-}
-double a_rand_f(void) { return (double)(a_rand_u64() >> 11) * 0x1.0p-53; }
-double a_rand_n(void) {
-    static int have = 0; static double keep;
-    if (have) { have = 0; return keep; }
-    double u, v, s;
-    do { u = 2 * a_rand_f() - 1; v = 2 * a_rand_f() - 1; s = u * u + v * v; } while (s >= 1 || s == 0);
-    double m = sqrt(-2 * log(s) / s); keep = v * m; have = 1; return u * m;
+/* ---- random numbers: NumPy's Generator (PCG64 seeded by SeedSequence), bit for bit, so a program draws the same
+   numbers natively as with apsi run: random() for rand, the ziggurat for randn, Lemire's method for randint and
+   the masked interval draws of shuffle for permutation */
+#include "apsi_zig.h"
+typedef unsigned __int128 rng_u128;
+typedef struct { rng_u128 state, inc; int has32; uint32_t u32; } RngState;
+static RngState rng;
+static int rng_ready = 0;
+#define PCG_MULT (((rng_u128)0x2360ED051FC65DA4ull << 64) | 0x4385DF649FCCF645ull)
+static uint32_t ss_hashmix(uint32_t v, uint32_t *hc) { v ^= *hc; *hc *= 0x931e8875u; v *= *hc; v ^= v >> 16; return v; }
+static uint32_t ss_mix(uint32_t x, uint32_t y) { uint32_t r = 0xca01f9ddu * x - 0x4973f715u * y; r ^= r >> 16; return r; }
+static void rng_seed_words(const uint32_t *ent, int n) {
+    uint32_t pool[4], hc = 0x43b0d7e5u;
+    for (int i = 0; i < 4; i++) pool[i] = ss_hashmix(i < n ? ent[i] : 0, &hc);
+    for (int a = 0; a < 4; a++) for (int b = 0; b < 4; b++) if (a != b) pool[b] = ss_mix(pool[b], ss_hashmix(pool[a], &hc));
+    for (int a = 4; a < n; a++) for (int b = 0; b < 4; b++) pool[b] = ss_mix(pool[b], ss_hashmix(ent[a], &hc));
+    uint32_t w[8], hb = 0x8b51f9ddu;
+    for (int i = 0; i < 8; i++) { uint32_t d = pool[i % 4] ^ hb; hb *= 0x58f38dedu; d *= hb; d ^= d >> 16; w[i] = d; }
+    uint64_t u[4]; for (int i = 0; i < 4; i++) u[i] = (uint64_t)w[2 * i] | ((uint64_t)w[2 * i + 1] << 32);
+    rng_u128 st = ((rng_u128)u[0] << 64) | u[1], in = ((rng_u128)u[2] << 64) | u[3];
+    rng.inc = (in << 1) | 1; rng.state = 0;
+    rng.state = rng.state * PCG_MULT + rng.inc; rng.state += st; rng.state = rng.state * PCG_MULT + rng.inc;
+    rng.has32 = 0; rng.u32 = 0; rng_ready = 1;
 }
 void a_seed(uint64_t x) {
-    for (int i = 0; i < 4; i++) { x += 0x9E3779B97F4A7C15ull; uint64_t z = x; z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9ull; z = (z ^ (z >> 27)) * 0x94D049BB133111EBull; rng_s[i] = z ^ (z >> 31); }
+    uint32_t e[2] = {(uint32_t)x, (uint32_t)(x >> 32)};
+    rng_seed_words(e, (x >> 32) ? 2 : 1);
 }
-static uint64_t rng_saved[16][4]; static int rng_depth = 0;
-static void seed_push(AV s) { if (rng_depth >= 16) a_error("RuntimeError", "seeds nested too deeply"); memcpy(rng_saved[rng_depth++], rng_s, sizeof rng_s); a_seed((uint64_t)(s.t == T_INT ? s.i : 0)); }
-static void seed_pop(void) { if (rng_depth > 0) memcpy(rng_s, rng_saved[--rng_depth], sizeof rng_s); }
+uint64_t a_rand_u64(void) {
+    if (!rng_ready) a_seed(0);
+    rng.state = rng.state * PCG_MULT + rng.inc;
+    uint64_t x = (uint64_t)(rng.state >> 64) ^ (uint64_t)rng.state; unsigned rot = (unsigned)(rng.state >> 122);
+    return (x >> rot) | (x << ((64 - rot) & 63));
+}
+static uint32_t rand_u32(void) {
+    if (!rng_ready) a_seed(0);
+    if (rng.has32) { rng.has32 = 0; return rng.u32; }
+    uint64_t v = a_rand_u64(); rng.has32 = 1; rng.u32 = (uint32_t)(v >> 32); return (uint32_t)v;
+}
+double a_rand_f(void) { return (double)(a_rand_u64() >> 11) * (1.0 / 9007199254740992.0); }
+double a_rand_n(void) {
+    const double R = 3.6541528853610087963519472518, IR = 1.0 / 3.6541528853610087963519472518;
+    for (;;) {
+        uint64_t r = a_rand_u64(); int idx = (int)(r & 0xff); r >>= 8;
+        int sign = (int)(r & 1); uint64_t rabs = (r >> 1) & 0x000fffffffffffffull;
+        double x = (double)rabs * zig_wi[idx];
+        if (sign) x = -x;
+        if (rabs < zig_ki[idx]) return x;
+        if (idx == 0) {
+            for (;;) {
+                double xx = -IR * log1p(-a_rand_f()), yy = -log1p(-a_rand_f());
+                if (yy + yy > xx * xx) return ((rabs >> 8) & 1) ? -(R + xx) : R + xx;
+            }
+        } else if ((zig_fi[idx - 1] - zig_fi[idx]) * a_rand_f() + zig_fi[idx] < exp(-0.5 * x * x)) return x;
+    }
+}
+/* an integer in [lo, hi): NumPy's Generator.integers */
+int64_t a_rand_int(int64_t lo, int64_t hi) {
+    uint64_t rg = (uint64_t)hi - (uint64_t)lo - 1;
+    if (rg == 0) return lo;
+    if (rg <= 0xffffffffull) {
+        if (rg == 0xffffffffull) return (int64_t)((uint64_t)lo + rand_u32());
+        uint32_t ex = (uint32_t)rg + 1; uint64_t m = (uint64_t)rand_u32() * ex; uint32_t left = (uint32_t)m;
+        if (left < ex) { uint32_t th = (uint32_t)(0xffffffffu - (uint32_t)rg) % ex; while (left < th) { m = (uint64_t)rand_u32() * ex; left = (uint32_t)m; } }
+        return (int64_t)((uint64_t)lo + (m >> 32));
+    }
+    if (rg == UINT64_MAX) return (int64_t)((uint64_t)lo + a_rand_u64());
+    uint64_t ex = rg + 1; rng_u128 m = (rng_u128)a_rand_u64() * ex; uint64_t left = (uint64_t)m;
+    if (left < ex) { uint64_t th = (UINT64_MAX - rg) % ex; while (left < th) { m = (rng_u128)a_rand_u64() * ex; left = (uint64_t)m; } }
+    return (int64_t)((uint64_t)lo + (uint64_t)(m >> 64));
+}
+static uint64_t rand_interval(uint64_t mx) {            /* NumPy's random_interval, used by shuffle */
+    if (mx == 0) return 0;
+    uint64_t mask = mx; mask |= mask >> 1; mask |= mask >> 2; mask |= mask >> 4; mask |= mask >> 8; mask |= mask >> 16; mask |= mask >> 32;
+    uint64_t v;
+    if (mx <= 0xffffffffull) { while ((v = (rand_u32() & mask)) > mx) {} }
+    else { while ((v = (a_rand_u64() & mask)) > mx) {} }
+    return v;
+}
+static RngState rng_saved[16]; static int rng_saved_ready[16]; static int rng_depth = 0;
+static uint64_t seed_value(AV s) {
+    if (s.t == T_BOOL) return (uint64_t)s.i;
+    if (s.t == T_FLOAT) s = a_int((int64_t)s.f);
+    if (s.t != T_INT) return 0;
+    if (s.i < 0) a_error("ValueError", "expected non-negative integer");
+    return (uint64_t)s.i;
+}
+static void seed_push(AV s) { if (rng_depth >= 16) a_error("RuntimeError", "seeds nested too deeply"); rng_saved_ready[rng_depth] = rng_ready; rng_saved[rng_depth++] = rng; a_seed(seed_value(s)); }
+static void seed_pop(void) { if (rng_depth > 0) { rng_depth--; rng = rng_saved[rng_depth]; rng_ready = rng_saved_ready[rng_depth]; } }
 static AV b_seed_push(int n, AV *a, ADict *kw, AV self) { (void)kw; (void)self; seed_push(n ? a[0] : a_int(0)); return A_NONE; }
 static AV b_seed_pop(int n, AV *a, ADict *kw, AV self) { (void)n; (void)a; (void)kw; (void)self; seed_pop(); return A_NONE; }
 static AV with_seed(AV (*f)(int, AV *, ADict *, AV), int n, AV *a, ADict *kw, AV self) {
     AV s; if (!(kw && a_dict_get(kw, a_str("seed"), &s)) || s.t == T_NONE) return f(n, a, NULL, self);
     seed_push(s); AV r = f(n, a, NULL, self); seed_pop(); return r;
 }
-static AV b_seed(int n, AV *a, ADict *kw, AV self) { (void)n; (void)kw; (void)self; a_seed((uint64_t)a[0].i); return A_NONE; }
+static AV b_seed(int n, AV *a, ADict *kw, AV self) { (void)n; (void)kw; (void)self; a_seed(seed_value(a[0])); return A_NONE; }
 AV (*a_tensor_random)(int kind, int n, AV *shape, AV lo, AV hi) = NULL;   /* set by the tensor runtime */
 static AV rand_shaped(int kind, int n, AV *a, AV lo, AV hi) {
     if (!a_tensor_random) a_error("NotImplementedError", "tensors are not linked into this program");
@@ -2966,13 +3035,13 @@ static AV b_randint0(int n, AV *a, ADict *kw, AV self) {
     (void)kw; (void)self;
     if (n > 2) return rand_shaped(2, n - 2, a + 2, a[0], a[1]);
     int64_t lo = a[0].i, hi = a[1].i; if (hi <= lo) a_error("ValueError", "randint(): high must be above low");
-    return a_int(lo + (int64_t)(a_rand_u64() % (uint64_t)(hi - lo)));
+    return a_int(a_rand_int(lo, hi));
 }
 static AV b_permutation0(int n, AV *a, ADict *kw, AV self) {
     (void)n; (void)kw; (void)self;
     int64_t m = a[0].i; AList *l = new_list(m, O_LIST);
     for (int64_t i = 0; i < m; i++) l->v[i] = a_int(i);
-    for (int64_t i = m - 1; i > 0; i--) { int64_t j = (int64_t)(a_rand_u64() % (uint64_t)(i + 1)); AV t = l->v[i]; l->v[i] = l->v[j]; l->v[j] = t; }
+    for (int64_t i = m - 1; i > 0; i--) { int64_t j = (int64_t)rand_interval((uint64_t)i); AV t = l->v[i]; l->v[i] = l->v[j]; l->v[j] = t; }
     return a_obj(l);
 }
 

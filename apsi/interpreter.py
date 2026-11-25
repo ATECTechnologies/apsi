@@ -1214,7 +1214,7 @@ class Interpreter:
         self._libraries.add(name)
         return True
 
-    def import_target(self, path, base, names=None, py=False):
+    def import_target(self, path, base, names=None, py=False):  # noqa: C901
         """Where `use`/`from`/`import` finds a module: ("module", name) a standard module or an installed library,
         ("local", file) one of the program's own files, ("python", name) a Python module, or (None, None).
         `use M` / `from M import …`: standard modules, the program's files, libraries, then (for `from`) Python.
@@ -1242,6 +1242,9 @@ class Interpreter:
             return "module", path
         if local is not None:
             return "local", local
+        shared = shared_module(path)
+        if shared is not None:
+            return "local", shared
         if self.ensure_module(path, base):
             return "module", path
         if names is not None and _py_exists(path):
@@ -2175,3 +2178,16 @@ def run_source(source, filename="<main>", check=True):
 def run_file(path, check=True):
     with open(path, encoding="utf-8-sig") as fh:
         return Interpreter().run(fh.read(), path, check)
+
+
+def shared_module(path):
+    """A standard module written in Apsi and shared with native programs (apsi/aot/lib/<name>.apsi whose first line
+    says `# shared:`), or None."""
+    if not path.replace("_", "").isalnum():
+        return None
+    f = os.path.join(os.path.dirname(__file__), "aot", "lib", path + ".apsi")
+    try:
+        with open(f, encoding="utf-8") as fh:
+            return f if fh.readline().startswith("# shared:") else None
+    except OSError:
+        return None

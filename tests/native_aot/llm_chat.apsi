@@ -1,0 +1,62 @@
+# A small language model, built, trained, asked, tuned, saved and loaded; the same output from `apsi run` and native.
+use llm
+
+fn jsonl(rows) = "\n".join([json_str(r) for r in rows]) + "\n"
+write_text("llm_qa.jsonl", jsonl([
+    {"question": "What is Apsi?", "answer": "Apsi is a programming language for science and AI."},
+    {"question": "What is 2 plus 2?", "answer": "2 plus 2 is 4."},
+    {"question": "What color is the sky?", "answer": "The sky is blue."},
+    {"question": "Who are you?", "answer": "I am a small model trained in Apsi."}
+]))
+write_text("llm_more.jsonl", jsonl([
+    {"question": "What is the capital of France?", "answer": "Paris is the capital of France."},
+    {"question": "What is water made of?", "answer": "Water is hydrogen and oxygen."}
+]))
+write_text("llm_new.jsonl", jsonl([
+    {"question": "Who made Apsi?", "answer": "Apsi was made by its users."}
+]))
+
+let qs = ["What is Apsi?", "What color is the sky?", "Who are you?"]
+
+# data from two files, the first counting twice as much; a mixture of experts in every second layer
+let m = llm.create(data={"llm_qa.jsonl": 2, "llm_more.jsonl": 1}, tokenizer="chars", layers=2, d=48, heads=4, kv_heads=2,
+                   context=96, experts=4, top_k=2, moe_every=2, seed=1)
+print(m.summary().parameters > m.summary().active, m.cfg.ff, m.tok.size > 30)
+let r = m.train(steps=120, batch=8, lr=1e-2, log_every=0, verbose=false)
+print("trained:", r.loss < 0.5, r.steps)
+for q in qs:
+    print(m.chat(q))
+
+# a conversation keeps its keys and values: the second question costs only its own tokens
+let c = m.conversation()
+let a1 = c.say("What is 2 plus 2?")
+let a2 = c.say("What color is the sky?", max_new=30)
+print(a1, "|", len(a2) > 0, c.rebuilt, c.tokens_processed() == c.pos, c.pos > 50)
+
+# the cache gives the same next-token logits as running the whole sequence
+let ids = [1, 7, 9, 12, 3, 5]
+let full = llm.forward(m.cfg, m.params, tensor([ids], "int64"))[0]
+var caches = [{"k": none, "v": none} for i in range(m.cfg.layers)]
+llm.forward(m.cfg, m.params, tensor([ids[0:4]], "int64"), caches, 0)
+let o4 = llm.forward(m.cfg, m.params, tensor([[ids[4]]], "int64"), caches, 4)[0]
+print("cache:", float(max(abs(full[0, 4] - o4[0, 0]))) < 1e-4)
+
+# low-rank fine-tuning on new data: a small share of the parameters learns, the old answers stay
+let before = m.loss("Who made Apsi?", "Apsi was made by its users.")
+let f = m.finetune(data="llm_new.jsonl", steps=60, rank=8, log_every=0, verbose=false)
+print("lora:", f.trained < f.frozen / 10, m.loss("Who made Apsi?", "Apsi was made by its users.") < before * 0.9)
+print(m.chat("What is Apsi?"))
+print(m.chat("Who are you?"))
+
+m.save("llm_chat_model")
+let m2 = llm.load("llm_chat_model")
+print("loaded:", m2.chat("What color is the sky?"), m2.cfg.experts, m2.cfg.moe_every)
+print("longer context:", m2.extend_context(2), m2.cfg.rope_scale)
+
+# a model of your own (a bigram table) trained and sampled by the same machinery
+fn my_init(cfg, seed) = record(w=tensor(zeros(cfg.vocab, cfg.vocab), "float32"))
+fn my_forward(cfg, p, ids, caches, offset, train, seed) = p.w[ids]
+let b = llm.create(data="llm_qa.jsonl", tokenizer="chars", context=32, init=my_init, forward=my_forward)
+let b0 = b.loss("The sky is blue.")
+b.train(steps=40, batch=8, lr=0.1, log_every=0, verbose=false)
+print("custom:", b.loss("The sky is blue.") < b0 - 1.0, llm.count_params(b.params))

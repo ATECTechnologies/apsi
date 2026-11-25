@@ -1,0 +1,372 @@
+# shared: this module is plain Apsi, the same file for apsi run and for native programs
+#
+# use pinn: physics-informed networks. A network u(x) learns from the equations it must satisfy (and any data), with
+# its derivatives computed exactly in one pass.
+#
+#     use pinn
+#     let net = pinn.mlp([2, 32, 32, 1], act="tanh")                 # inputs (t, x) -> u
+#     let x = pinn.box([0.0, -1.0], [1.0, 1.0], 512)                  # collocation points
+#     fn loss(x, u, du, d2u):
+#         let pde = du[:, 0, 0] - 0.1 * d2u[:, 1, 0]                  # u_t = 0.1 u_xx
+#         return [mean(pde ** 2), ...boundary and initial terms...]
+#     net.fit(x, loss, epochs=2000)
+#     print(net.u(tensor([[0.5, 0.0]])))
+#
+# What is inside (all of it here in Apsi):
+#   derivatives   Taylor mode: every layer carries the values and their first and second derivatives along each
+#                 input in one stacked matrix product; hessian=true adds the mixed second derivatives
+#   networks      tanh, sin, sigmoid, softplus, silu or linear layers; Fourier features (fourier=, sigma=) so a
+#                 network can learn fine detail and high frequencies
+#   training      Adam with warm-up and a cosine schedule, gradient clipping; a loss may be a list of terms whose
+#                 weights adapt (adapt=true, balanced by their gradient sizes); collocation points can be drawn
+#                 again during training (points=fn(step) => ...)
+#   inverse       unknowns={"nu": 0.05}: physical constants learned together with the network (the loss gets k)
+#   sampling      box (inside a box), faces (on its boundary), grid
+
+use nn
+
+let _set_seed = seed
+
+fn _now() = float(clock() / 1[s])
+
+fn _leaves(tree):
+    var out = []
+    tree_map(fn(l) => out.append(l), tree)
+    return out
+
+# =============================================================================== sampling
+fn box(lo, hi, n, seed=0):
+    # n points spread uniformly inside the box lo..hi (one bound per input)
+    let d = len(lo)
+    let u = rand(int(n), d, seed=seed)
+    return u * (tensor(hi) - tensor(lo)) + tensor(lo)
+
+fn faces(lo, hi, n, seed=0, axes=none):
+    # about n points on the faces of the box (on the given axes; all by default), split evenly
+    let d = len(lo)
+    let ax = list(range(d)) if axes is none else list(axes)
+    let per = max(1, int(n) // (2 * len(ax)))
+    var parts = []
+    var s = int(seed) * 7919 + 1
+    for a in ax:
+        for side in [0, 1]:
+            s = s + 1
+            var p = box(lo, hi, per, s)
+            let mask = tensor([1.0 if i == a else 0.0 for i in range(d)])
+            let val = lo[a] if side == 0 else hi[a]
+            p = p * (1.0 - mask) + mask * val
+            parts.append(p)
+    return concat(parts, axis=0)
+
+fn grid(lo, hi, n):
+    # a regular grid with n points along each input (n ** d points)
+    let d = len(lo)
+    var pts = [[]]
+    for a in range(d):
+        let line = linspace(float(lo[a]), float(hi[a]), int(n)).tolist()
+        var nxt = []
+        for p in pts:
+            for v in line:
+                nxt.append(p + [v])
+        pts = nxt
+    return tensor(pts)
+
+fn _as_points(x, dtype) = tensor(x, dtype) if isinstance(x, list) else x
+
+# =============================================================================== activations with derivatives
+fn act3(name, z):
+    # an activation and its first and second derivatives at z
+    if name == "tanh":
+        let a = tanh(z)
+        let a1 = 1.0 - a * a
+        return [a, a1, -2.0 * a * a1]
+    if name == "sin":
+        let s = sin(z)
+        return [s, cos(z), -s]
+    if name == "cos":
+        let c = cos(z)
+        return [c, -sin(z), -c]
+    if name == "sigmoid":
+        let s = sigmoid(z)
+        let s1 = s * (1.0 - s)
+        return [s, s1, s1 * (1.0 - 2.0 * s)]
+    if name == "softplus":
+        let s = sigmoid(z)
+        let sp = where(z > 0, z, 0.0) + log(1.0 + exp(-abs(z)))
+        return [sp, s, s * (1.0 - s)]
+    if name == "silu" or name == "swish":
+        let s = sigmoid(z)
+        let s1 = s * (1.0 - s)
+        return [z * s, s + z * s1, s1 * (2.0 + z * (1.0 - 2.0 * s))]
+    if name == "linear" or name == "identity":
+        return [z, ones_like(z), zeros_like(z)]
+    raise ValueError(f"unknown activation {name} (tanh, sin, cos, sigmoid, softplus, silu, linear)")
+
+# =============================================================================== the network
+fn _directions(d, hessian):
+    # the input directions derivatives are taken along: every axis, then (hessian) every pair of axes
+    var dirs = []
+    for i in range(d):
+        dirs.append([1.0 if k == i else 0.0 for k in range(d)])
+    if hessian:
+        for i in range(d):
+            for j in range(i + 1, d):
+                dirs.append([1.0 if k == i or k == j else 0.0 for k in range(d)])
+    return dirs
+
+fn _act_stack(name, z, dz, d2z):
+    let r = act3(name, z)
+    let a1 = reshape(r[1], 1, shape(z)[0], shape(z)[1])
+    let a2 = reshape(r[2], 1, shape(z)[0], shape(z)[1])
+    return [r[0], a1 * dz, a2 * dz * dz + a1 * d2z]
+
+fn _lin_stack(h, dh, d2h, w, b):
+    # one matrix product for the values and every derivative
+    let D = shape(dh)[0]
+    let N = shape(h)[0]
+    let H = shape(h)[1]
+    let all = reshape(concat([reshape(h, 1, N, H), dh, d2h], axis=0), (1 + 2 * D) * N, H) @ w
+    let O = shape(w)[1]
+    let z3 = reshape(all, 1 + 2 * D, N, O)
+    return [z3[0] + b, z3[1:1 + D], z3[1 + D:1 + 2 * D]]
+
+fn taylor(net, params, x, hessian=false):
+    # u [N, m], du [N, d, m], d2u [N, d, m] (and hess [N, d, d, m] with hessian=true) of the network at x [N, d]
+    let N = shape(x)[0]
+    let d = shape(x)[1]
+    let dirs = _directions(d, hessian)
+    let D = len(dirs)
+    var h = _as_points(x, net.dtype)
+    var dh = reshape(tensor(dirs, net.dtype), D, 1, d) * tensor(ones(1, N, 1), net.dtype)
+    var d2h = tensor(zeros(D, N, d), net.dtype)
+    if net.fourier is not none:
+        # features sin(2π x B), cos(2π x B): their derivatives along each direction come along
+        let r = _lin_stack(h, dh, d2h, net.fourier, 0.0)
+        let s = _act_stack("sin", r[0], r[1], r[2])
+        let c = _act_stack("cos", r[0], r[1], r[2])
+        h = concat([s[0], c[0]], axis=-1)
+        dh = concat([s[1], c[1]], axis=-1)
+        d2h = concat([s[2], c[2]], axis=-1)
+    let L = len(params.layers)
+    for i in range(L):
+        let ly = params.layers[i]
+        let r = _lin_stack(h, dh, d2h, ly.w, ly.b)
+        if i < L - 1:
+            let a = _act_stack(net.act, r[0], r[1], r[2])
+            h = a[0]
+            dh = a[1]
+            d2h = a[2]
+        else:
+            h = r[0]
+            dh = r[1]
+            d2h = r[2]
+    let du = permute(dh[0:d], 1, 0, 2)
+    let d2u = permute(d2h[0:d], 1, 0, 2)
+    if not hessian:
+        return record(u=h, du=du, d2u=d2u)
+    # mixed derivatives from the pair directions: D²(e_i + e_j) = u_ii + 2 u_ij + u_jj
+    var rows = []
+    var k = d
+    var pair = {}
+    for i in range(d):
+        for j in range(i + 1, d):
+            pair[f"{i},{j}"] = k
+            k = k + 1
+    for i in range(d):
+        var cols = []
+        for j in range(d):
+            if i == j:
+                cols.append(d2h[i])
+            else:
+                let a = min(i, j)
+                let b = max(i, j)
+                cols.append((d2h[pair[f"{a},{b}"]] - d2h[a] - d2h[b]) * 0.5)
+        rows.append(stack(cols, axis=1))
+    return record(u=h, du=du, d2u=d2u, hess=stack(rows, axis=1))
+
+fn values(net, params, x):
+    # the network alone (no derivatives)
+    var h = _as_points(x, net.dtype)
+    if net.fourier is not none:
+        let z = h @ net.fourier
+        h = concat([sin(z), cos(z)], axis=-1)
+    let L = len(params.layers)
+    for i in range(L):
+        let ly = params.layers[i]
+        h = h @ ly.w + ly.b
+        if i < L - 1:
+            h = act3(net.act, h)[0]
+    return h
+
+fn init_layers(sizes, act="tanh", seed=0, dtype="float64"):
+    # Glorot-normal weights (He-scaled for sin), zero biases
+    var layers = []
+    for i in range(len(sizes) - 1):
+        let a = int(sizes[i])
+        let b = int(sizes[i + 1])
+        let std = sqrt(2.0 / (a + b))
+        layers.append(record(w=tensor(randn(a, b, seed=int(seed) * 101 + i) * std, dtype), b=tensor(zeros(b), dtype)))
+    return record(layers=layers)
+
+class Net:
+    var sizes = []
+    var act = "tanh"
+    var dtype = "float64"
+    var fourier = none
+    var params = none
+    var unknowns = none
+    var k_scale = 10.0
+    var history = []
+    var weights = none
+    var opt = none
+    var steps_done = 0
+
+    fn __str__(self):
+        let ff = f", Fourier features {shape(self.fourier)[1]}" if self.fourier is not none else ""
+        return f"pinn.Net({self.sizes}, {self.act}{ff}, {self.count()} parameters)"
+    fn __repr__(self) = self.__str__()
+    fn count(self):
+        var n = 0
+        for l in _leaves(self.params):
+            var k = 1
+            for v in shape(l):
+                k = k * v
+            n = n + k
+        return n
+    fn u(self, x) = values(self, self.params, x)
+    fn derivatives(self, x, hessian=false) = taylor(self, self.params, x, hessian)
+    fn k(self):
+        # the learned unknowns as numbers
+        var d = {}
+        if self.unknowns is not none:
+            for name in keys(self.unknowns):
+                d[name] = float(self.unknowns[name])
+        return d
+
+    fn _terms(self, q, x, loss, hessian):
+        let r = taylor(self, q.net, x, hessian)
+        var args = [x, r.u, r.du, r.d2u]
+        if hessian:
+            args.append(r.hess)
+        if self.unknowns is not none:
+            # the unknowns are trained as k / k_scale: Adam moves them k_scale times faster than the weights
+            var k = {}
+            for name in keys(q.k):
+                k[name] = q.k[name] * self.k_scale
+            args.append(k)
+        let out = loss(*args)
+        if isinstance(out, list) or isinstance(out, tuple):
+            return list(out)
+        return [out]
+
+    fn fit(self, points, loss, epochs=2000, lr=1e-3, warmup=none, every=0, clip=none, adapt=false, adapt_every=50,
+           resample_every=100, hessian=false, min_lr=none, verbose=true, seed=0, k_lr=10.0):
+        # train the network (and the unknowns) to make loss small. loss(x, u, du, d2u[, hess][, k]) returns a
+        # number or a list of terms; points is a tensor [N, d] or fn(step) => a new one (drawn every resample_every).
+        # The unknowns learn k_lr times faster than the network's weights.
+        _set_seed(int(seed))
+        self.k_scale = float(k_lr)
+        let pts_fn = points if callable(points) else none
+        var x = points(0) if pts_fn is not none else _as_points(points, self.dtype)
+        var kq = {}
+        if self.unknowns is not none:
+            for name in keys(self.unknowns):
+                kq[name] = self.unknowns[name] / self.k_scale
+        var q = record(net=self.params, k=kq)
+        if self.opt is none:
+            self.opt = adam(lr=lr)
+        let wu = int(warmup) if warmup is not none else max(1, int(epochs) // 50)
+        let floor = float(min_lr) if min_lr is not none else lr * 0.01
+        var w = self.weights
+        let t0 = _now()
+        var last = 0.0
+        var terms_last = []
+        for st in range(int(epochs)):
+            if pts_fn is not none and st > 0 and st % int(resample_every) == 0:
+                x = pts_fn(st)
+            let xs = x
+            if w is none:
+                w = [1.0] * len(self._terms(q, xs, loss, hessian))
+            let ws = w
+            if adapt and len(ws) > 1 and st % int(adapt_every) == 0:
+                w = self._balance(q, xs, loss, hessian, ws)
+            let wv = w
+            let vg = value_and_grad(fn(p) => _weighted(self._terms(p, xs, loss, hessian), wv))(q)
+            var g = vg[1]
+            if clip is not none:
+                var tot = 0.0
+                for l in _leaves(g):
+                    tot = tot + float(sum(l * l))
+                let nrm = sqrt(tot)
+                if nrm > clip:
+                    g = tree_map(fn(t) => t * (clip / (nrm + 1e-12)), g)
+            set_lr(self.opt, _schedule(self.steps_done + st, self.steps_done + int(epochs), lr, wu, floor))
+            q = self.opt.step(q, g)
+            last = float(vg[0])
+            self.history.append(last)
+            if verbose and every and (st % int(every) == 0 or st == int(epochs) - 1):
+                print(f"epoch {self.steps_done + st}: loss {last:.3e}")
+        self.params = q.net
+        if self.unknowns is not none:
+            var kk = {}
+            for name in keys(q.k):
+                kk[name] = q.k[name] * self.k_scale
+            self.unknowns = kk
+        self.weights = w
+        self.steps_done = self.steps_done + int(epochs)
+        return record(loss=last, epochs=self.steps_done, seconds=_now() - t0, weights=w, k=self.k())
+
+    fn _balance(self, q, x, loss, hessian, w):
+        # gradient-norm balancing (Wang, Wang and Perdikaris 2023): every term's weight is the total size of the
+        # terms' gradients over the size of its own, so each one pulls the network equally hard; a moving average
+        # keeps the weights steady
+        let n = len(w)
+        var norms = []
+        for i in range(n):
+            let gi = grad(fn(p) => self._terms(p, x, loss, hessian)[i])(q)
+            var tot = 0.0
+            for l in _leaves(gi.net):
+                tot = tot + float(sum(l * l))
+            norms.append(sqrt(tot))
+        let total = sum(norms)
+        var out = []
+        for i in range(n):
+            let lam = min(max(total / max(norms[i], 1e-12), 1e-2), 1e3)
+            out.append(0.9 * w[i] + 0.1 * lam if self.steps_done > 0 or len(self.history) > 0 else lam)
+        return out
+
+fn _weighted(terms, w):
+    var tot = terms[0] * w[0]
+    for i in range(1, len(terms)):
+        tot = tot + terms[i] * w[i]
+    return tot
+
+fn _schedule(step, total, lr, warmup, floor):
+    if step < warmup:
+        return lr * (step + 1) / warmup
+    let p = min(1.0, (step - warmup) / max(1, total - warmup))
+    return floor + (lr - floor) * 0.5 * (1.0 + cos(pi * p))
+
+fn mlp(sizes, act="tanh", seed=0, fourier=0, sigma=1.0, unknowns=none, dtype="float64"):
+    # a network sizes[0] inputs -> sizes[-1] outputs; fourier=F maps the inputs to 2F features first
+    var n = Net()
+    n.sizes = list(sizes)
+    n.act = str(act)
+    n.dtype = str(dtype)
+    var first = int(sizes[0])
+    if fourier:
+        n.fourier = tensor(randn(int(sizes[0]), int(fourier), seed=int(seed) * 31 + 7) * (2.0 * pi * float(sigma)), dtype)
+        first = 2 * int(fourier)
+    n.params = init_layers([first] + list(sizes)[1:], act, seed, dtype)
+    if unknowns is not none:
+        var k = {}
+        for name in keys(unknowns):
+            k[name] = tensor(float(unknowns[name]), dtype)
+        n.unknowns = k
+    n.history = []
+    return n
+
+# =============================================================================== small helpers for equations
+fn laplacian(d2u, out=0) = sum(d2u[:, :, out], axis=1)
+fn divergence(du, outs) = sum(stack([du[:, i, outs[i]] for i in range(len(outs))], axis=1), axis=1)
+fn mse(r) = mean(r * r)

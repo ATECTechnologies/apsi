@@ -77,7 +77,7 @@ let order = parallel.channel()
 fn napper(name, secs):
     parallel.sleep(secs)
     order.send(name)
-let ns = [parallel.spawn(napper, "slow", 0.06), parallel.spawn(napper, "fast", 0.01), parallel.spawn(napper, "mid", 0.03)]
+let ns = [parallel.spawn(napper, "slow", 0.2), parallel.spawn(napper, "fast", 0.01), parallel.spawn(napper, "mid", 0.08)]
 print([order.recv() for i in range(3)])
 let tm = parallel.channel()
 try:

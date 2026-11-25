@@ -24,3 +24,5 @@ tests/native_aot/app.log
 tests/native_aot/app.jsonl
 tests/native_aot/lab_runs/
 tests/native_aot/df_out.csv
+tests/native_aot/llm_*.jsonl
+tests/native_aot/llm_chat_model.apsim

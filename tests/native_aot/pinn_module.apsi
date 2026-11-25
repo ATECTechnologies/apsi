@@ -1,0 +1,54 @@
+# use pinn: exact derivatives in one pass, forward and inverse problems, Fourier features, adaptive weights
+use pinn
+
+# derivatives: the Taylor-mode stack against nested autodiff (first, second and mixed)
+let net = pinn.mlp([2, 8, 8, 2], act="sin", fourier=4, sigma=0.5, seed=1)
+print(net)
+let x = pinn.box([0.0, -1.0], [1.0, 1.0], 6, seed=2)
+let r = net.derivatives(x, hessian=true)
+print(shape(r.u), shape(r.du), shape(r.d2u), shape(r.hess))
+fn f(p) = net.u(reshape(p, 1, 2))[0, 1]
+let p0 = x[3]
+let g = grad(f)(p0)
+let h0 = grad(fn(p) => grad(f)(p)[0])(p0)
+let h1 = grad(fn(p) => grad(f)(p)[1])(p0)
+print("first:", float(max(abs(r.du[3, :, 1] - g))) < 1e-9)
+print("second:", float(abs(r.d2u[3, 0, 1] - h0[0])) < 1e-9, float(abs(r.d2u[3, 1, 1] - h1[1])) < 1e-9)
+print("mixed:", float(abs(r.hess[3, 0, 1, 1] - h0[1])) < 1e-9, float(abs(r.hess[3, 1, 0, 1] - h1[0])) < 1e-9)
+for act in ["tanh", "sigmoid", "softplus", "silu"]:
+    let n2 = pinn.mlp([1, 6, 1], act=act, seed=4)
+    let t = tensor([[0.3]])
+    let d = n2.derivatives(t)
+    let fu = fn(s) => n2.u(reshape(s, 1, 1))[0, 0]
+    let gg = grad(fu)(tensor([0.3]))
+    let gg2 = grad(fn(s) => grad(fu)(s)[0])(tensor([0.3]))
+    print(act, float(abs(d.du[0, 0, 0] - gg[0])) < 1e-9, float(abs(d.d2u[0, 0, 0] - gg2[0])) < 1e-9)
+
+# forward: u'' + 4u = 0, u(0) = 1, u'(0) = 0 (cos 2t), the two terms balanced by their gradients
+let osc = pinn.mlp([1, 24, 24, 1], act="tanh", seed=0)
+let ts = reshape(linspace(0.0, 2.0, 40), 40, 1)
+fn osc_loss(x, u, du, d2u):
+    return [mean((d2u[:, 0, 0] + 4.0 * u[:, 0]) ** 2), (u[0, 0] - 1.0) ** 2 + du[0, 0, 0] ** 2]
+let ro = osc.fit(ts, osc_loss, epochs=1500, lr=1e-2, adapt=true, verbose=false)
+print("oscillator:", float(max(abs(osc.u(ts)[:, 0] - cos(2.0 * ts[:, 0])))) < 0.005, ro.epochs, len(osc.history))
+
+# inverse: the same equation with its constant unknown, from 12 measurements
+let td = reshape(linspace(0.0, 2.0, 12), 12, 1)
+let ud = cos(2.0 * td[:, 0])
+fn inv_loss(x, u, du, d2u, k):
+    return [mean((d2u[:, 0, 0] + k["w"] * u[:, 0]) ** 2), mean((u[0:12, 0] - ud) ** 2)]
+let inv = pinn.mlp([1, 24, 24, 1], act="tanh", seed=2, unknowns={"w": 1.0})
+let ri = inv.fit(concat([td, ts], axis=0), inv_loss, epochs=1000, lr=1e-2, verbose=false)
+print("inverse:", abs(ri.k["w"] - 4.0) < 0.5)
+
+# 2D Poisson with Fourier features: -lap u = 2 pi^2 sin(pi x) sin(pi y), u = 0 on the edges
+let inner = pinn.box([0.0, 0.0], [1.0, 1.0], 192, seed=1)
+let edge = pinn.faces([0.0, 0.0], [1.0, 1.0], 64, seed=2)
+print(shape(inner), shape(edge), shape(pinn.grid([0.0, 0.0], [1.0, 1.0], 3)))
+fn poisson(x, u, du, d2u):
+    let rhs = 2.0 * pi * pi * sin(pi * x[0:192, 0]) * sin(pi * x[0:192, 1])
+    return [pinn.mse(pinn.laplacian(d2u)[0:192] + rhs), pinn.mse(u[192:256, 0])]
+let pn = pinn.mlp([2, 32, 32, 1], act="tanh", fourier=8, sigma=0.5, seed=3)
+pn.fit(concat([inner, edge], axis=0), poisson, epochs=600, lr=5e-3, adapt=true, verbose=false)
+let test = pinn.grid([0.1, 0.1], [0.9, 0.9], 5)
+print("poisson:", float(max(abs(pn.u(test)[:, 0] - sin(pi * test[:, 0]) * sin(pi * test[:, 1])))) < 0.05)

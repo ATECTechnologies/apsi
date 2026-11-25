@@ -1,0 +1,13 @@
+true 128 true
+trained: true 120
+Apsi is a programming language for science and AI.
+The sky is blue.
+I am a small model trained in Apsi.
+2 plus 2 is 4. | true 0 true true
+cache: true
+lora: true true
+Apsi is a programming language for science and AI.
+I am a small model trained in Apsi.
+loaded: The sky is blue. 4 2
+longer context: 192 2.0
+custom: true 1225
