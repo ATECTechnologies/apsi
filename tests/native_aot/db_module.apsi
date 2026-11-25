@@ -31,6 +31,6 @@ try:
     lite.query("select ?", 1, 2)
 except db.DatabaseError as e:
     print("error:", e)
-print(lite.query("select 1, 'a''b', null, 2.5").one())
+print(lite.query("select 1, 'a''b', null, 2.5, x'41', ?", b"\x00z").one())
 print(lite.query("select name, price * qty as value from item order by value desc").to_dataframe())
 lite.close()

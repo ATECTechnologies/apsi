@@ -1,0 +1,12 @@
+let b = b"A\x00z'q"
+print(b, len(b), type(b), b[0], b[1:3], b[-1], list(b), b + b"!", b * 2, 65 in b, b"z'" in b)
+let s = "héllo ✓"
+let e = s.encode()
+print(e, len(e), e.decode(), e.hex(), bytes.fromhex("48 69"), bytes([104, 105]), bytes(3), bytes("abc", "utf-8"))
+print(b"a,b,,c".split(b","), b"-".join([b"x", b"y"]), b"  pad ".strip(), b"abc".upper(), b"abcabc".count(b"bc"), b"abc".find(b"c"))
+print(b"abc" == b"abc", b"abc" < b"abd", {b"k": 1}[b"k"], isinstance(b, bytes), isinstance("x", bytes), str(b"x\n"), b'"q"')
+print(b"\xff\xfe".decode("utf-8", "replace"), "ß".encode("latin-1"), b"\xdf".decode("latin-1"))
+try:
+    b"\xff".decode()
+except UnicodeDecodeError as err:
+    print("decode error:", err)

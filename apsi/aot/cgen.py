@@ -1715,6 +1715,15 @@ finally:
     def e_Str(self, e):
         return self.k_str(e.value)
 
+    def e_Bytes(self, e):
+        b = bytes(e.value)
+        key = ("y", b)
+        if key not in self.consts:
+            self.consts[key] = len(self.consts)
+            lit = "".join(f"\\{ch:03o}" for ch in b)
+            self.const_init.append(f'K[{self.consts[key]}] = a_bytes("{lit}", {len(b)});')
+        return f"K[{self.consts[key]}]"
+
     def e_Bool(self, e):
         return f"a_bool({int(e.value)})"
 

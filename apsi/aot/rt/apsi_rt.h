@@ -17,7 +17,7 @@ typedef struct AV {
 
 typedef enum {
     O_STR = 1, O_LIST, O_TUPLE, O_DICT, O_SET, O_FUNC, O_CLASS, O_INST, O_BOUND, O_RANGE, O_ITER, O_CELL, O_BUILTIN,
-    O_SLICE, O_QTY, O_GEN, O_TENSOR, O_NODE
+    O_SLICE, O_QTY, O_GEN, O_TENSOR, O_NODE, O_BYTES     /* O_BYTES: an AStr whose characters are bytes */
 } AKind;
 
 typedef struct AObj { struct AObj *gcnext; uint8_t kind, mark; } AObj;
@@ -84,6 +84,7 @@ extern const char *a_file, *a_source;
 /* ------------------------------------------------------------------ objects */
 AV a_str(const char *s);
 AV a_strn(const char *s, int64_t n);
+AV a_bytes(const char *s, int64_t n);
 AV a_list(int64_t n, AV *items);
 AV a_tuple(int64_t n, AV *items);
 AV a_dict(void);

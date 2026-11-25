@@ -19,6 +19,7 @@ static struct {
     int (*column_bytes)(sqlite3_stmt *, int); const void *(*column_blob)(sqlite3_stmt *, int);
     int (*bind_int64)(sqlite3_stmt *, int, long long); int (*bind_double)(sqlite3_stmt *, int, double);
     int (*bind_text)(sqlite3_stmt *, int, const char *, int, void (*)(void *)); int (*bind_null)(sqlite3_stmt *, int);
+    int (*bind_blob)(sqlite3_stmt *, int, const void *, int, void (*)(void *));
     int (*bind_parameter_count)(sqlite3_stmt *);
     const char *(*errmsg)(sqlite3 *); int (*changes)(sqlite3 *);
     int (*exec)(sqlite3 *, const char *, void *, void *, char **); void (*free_)(void *);
@@ -61,7 +62,7 @@ static int sq_load(void) {
     SQ(column_count, "column_count"); SQ(column_name, "column_name"); SQ(column_type, "column_type");
     SQ(column_int64, "column_int64"); SQ(column_double, "column_double"); SQ(column_text, "column_text");
     SQ(column_bytes, "column_bytes"); SQ(column_blob, "column_blob"); SQ(bind_int64, "bind_int64");
-    SQ(bind_double, "bind_double"); SQ(bind_text, "bind_text"); SQ(bind_null, "bind_null");
+    SQ(bind_double, "bind_double"); SQ(bind_text, "bind_text"); SQ(bind_null, "bind_null"); SQ(bind_blob, "bind_blob");
     SQ(bind_parameter_count, "bind_parameter_count"); SQ(errmsg, "errmsg"); SQ(changes, "changes"); SQ(exec, "exec");
     SQ(free_, "free"); SQ(busy_timeout, "busy_timeout");
     #undef SQ
@@ -97,6 +98,7 @@ static AV sq_query(AV hv, AV sqlv, AV params) {
         if (v.t == T_NONE) rc = sq.bind_null(st, i + 1);
         else if (v.t == T_INT || v.t == T_BOOL) rc = sq.bind_int64(st, i + 1, (long long)v.i);
         else if (v.t == T_FLOAT) rc = sq.bind_double(st, i + 1, v.f);
+        else if (a_is(v, O_BYTES) && sq.bind_blob) rc = sq.bind_blob(st, i + 1, ((AStr *)v.o)->s, (int)((AStr *)v.o)->len, (void (*)(void *))(intptr_t)-1);
         else if (a_is(v, O_STR)) rc = sq.bind_text(st, i + 1, ((AStr *)v.o)->s, (int)((AStr *)v.o)->len, (void (*)(void *))(intptr_t)-1);
         else { AV s = a_to_str(v); rc = sq.bind_text(st, i + 1, ((AStr *)s.o)->s, (int)((AStr *)s.o)->len, (void (*)(void *))(intptr_t)-1); }
         if (rc) { sq.finalize(st); return sq_err(sq.errmsg(db)); }
@@ -115,7 +117,8 @@ static AV sq_query(AV hv, AV sqlv, AV params) {
             if (t == 1) v = a_int(sq.column_int64(st, j));
             else if (t == 2) v = a_float(sq.column_double(st, j));
             else if (t == 5) v = A_NONE;
-            else { const unsigned char *s = t == 4 ? (const unsigned char *)sq.column_blob(st, j) : sq.column_text(st, j); int n = sq.column_bytes(st, j); v = a_strn(s ? (const char *)s : "", n); }
+            else if (t == 4) { const void *s = sq.column_blob(st, j); int n = sq.column_bytes(st, j); v = a_bytes(s ? (const char *)s : "", n); }
+            else { const unsigned char *s = sq.column_text(st, j); int n = sq.column_bytes(st, j); v = a_strn(s ? (const char *)s : "", n); }
             a_list_append((AList *)row.o, v);
         }
         a_list_append((AList *)rows.o, row); a_ntmp--;

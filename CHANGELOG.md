@@ -24,6 +24,7 @@
   transformer language models, `fit`), `models` (safetensors and `.apsim` checkpoints, interchangeable with
   `apsi run`), `web` (an HTTP/1.1 server on Apsi's own event loop), `crypto` (SHA-2, SHA-3, BLAKE2, HMAC, scrypt), `special`, `signal`, `config`, `env`, `log`,
   `physics` (constants, formulas with units, fields) and `pde` (heat, waves, advection, Poisson, Navier–Stokes, CG), `mechanics`, `precision`, `lab`, `sys` / `gpu`, `tokens`, `dataframe` (group-by, joins, sorts and CSV parsing in C), `db.sqlite` (on the system's SQLite library).
+- Native `bytes`: literals, indexing, slicing, iteration, `+` / `*`, `in`, `decode` / `encode`, `hex` / `bytes.fromhex`, `split` / `join` / `replace` / `strip`, as keys; SQLite BLOBs and the crypto functions take them; `UnicodeDecodeError`, `ConnectionRefusedError` and more built-in exceptions.
 - Native `with` follows Python: `__exit__` gets the exception and can swallow it, several items work; `except module.Error`; `obj.__class__`; `type(x) == SomeClass`.
 - `apsi run`: `db.sqlite` raises `db.DatabaseError` for SQLite errors, and `transaction()` commits (it used to fail with "no transaction is active").
 - Native classes: rich comparisons return what `__lt__` / `__eq__` … return (with Python's reflected fallback), `__invert__`, `__getattr__`; `~` on tensors; `read_text` reads `\r\n` as `\n` like `apsi run`.

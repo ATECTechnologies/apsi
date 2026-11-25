@@ -122,7 +122,7 @@ These programs keep running with `apsi run`. A native build that reaches one of 
 
 - graph networks, mixtures of experts and `fit_batches` in `layers`; GGUF, ONNX and PyTorch files in `models`;
   `text_dataset`, `train_tokenizer` and Parquet in `data`; websockets and TLS in `web` (serve HTTPS through a
-  reverse proxy); `tokens.focus` / `fit_chat` / `outline` (they read Python syntax trees); `db.postgres` / `redis` / `mysql` / `mongo` (no network client yet), BLOB columns (no `bytes` type yet); the modules `rl`, `torch`, `quantum`, `medical`
+  reverse proxy); `tokens.focus` / `fit_chat` / `outline` (they read Python syntax trees); `db.postgres` / `redis` / `mysql` / `mongo` (no network client yet); the modules `rl`, `torch`, `quantum`, `medical`
 - Python modules (`pyimport`, `import numpy`), except `asyncio`
 - random numbers: native programs use their own generator, so a seed gives different numbers than in `apsi run`
   (the same seed always gives the same numbers in native programs)
