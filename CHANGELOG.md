@@ -38,6 +38,11 @@
 - Native classes: rich comparisons return what `__lt__` / `__eq__` … return (with Python's reflected fallback), `__invert__`, `__getattr__`; `~` on tensors; `read_text` reads `\r\n` as `\n` like `apsi run`.
 - The native compiler (`apsi.aot`, its runtime and libraries) is now part of the installed package.
 - Native `json_str` takes `separators`, `sort_keys` and `ensure_ascii`, as in `apsi run`.
+- **`use llm`** (one Apsi file for `apsi run` and native programs): a language model in a few lines — data from files, folders, globs or `{source: weight}`, BPE / character / byte tokenizers, grouped-query attention with RoPE and SwiGLU, a mixture of experts, answer-only training for question / answer data, AdamW with warm-up and cosine decay, LoRA fine-tuning with replay, chats that keep their key / value cache, history fitted to the context, longer contexts by position interpolation, and your own forward / init functions trained by the same machinery. See docs/LLM.md.
+- **`use pinn`** (one Apsi file for both): physics-informed networks with first, second and mixed derivatives in one stacked pass, Fourier features, losses of several terms balanced by their gradient sizes, collocation points drawn again during training, and physical constants learned with the network.
+- Native `rand` / `randn` / `randint` / `permutation` / `seed` draw exactly the numbers `apsi run` draws (NumPy's Generator: PCG64, the ziggurat, Lemire's bounded integers), so a native program trains and samples like `apsi run`.
+- Native gradients of gradients of gradients (values recorded by three nested `grad` calls), comparisons and `tensor()` / `astype` of traced values, and the derivatives of `sign`, `floor`, `asin`, `acos`, `log2`, `log10`, `erf`, `rsqrt`.
+- Native arithmetic on 0-d tensors gives plain numbers, as NumPy does; `float()` of a one-element tensor; `max(x)` of a number. `type()` of a 0-d tensor is `Tensor[float64]` in `apsi run` too.
 - Native format specs take `#` (`{255:#06x}` → `0x00ff`); the format names `bf16`, `int8`, … print as in `apsi run`.
 - Native `grad` nests across variables (a gradient in one argument differentiated in another), as in `apsi run`.
 - Operators of a class (`__mul__`, `__radd__`, …) now win over tensors on either side; `round(tensor, n)` natively.

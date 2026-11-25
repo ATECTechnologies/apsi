@@ -33,6 +33,44 @@ works: systems of equations (several outputs), coefficients that depend on `x`, 
 the parts. `examples/44_physics_networks.apsi` learns the heat equation (error 0.001 against the exact solution) and
 a damped oscillator with `sin` activations.
 
+## `use pinn`: the same thing in a few lines, natively too
+
+`use pinn` is written in Apsi and is the same file for `apsi run` and for native programs (`apsi build --native`).
+A network is one object: build it, train it with `fit`, ask it with `u` or `derivatives`.
+
+```apsi
+use pinn
+
+# u'' + 4u = 0, u(0) = 1, u'(0) = 0
+let net = pinn.mlp([1, 24, 24, 1], act="tanh")
+let t = reshape(linspace(0.0, 2.0, 40), 40, 1)
+fn loss(x, u, du, d2u):
+    return [mean((d2u[:, 0, 0] + 4.0 * u[:, 0]) ** 2),           # the equation
+            (u[0, 0] - 1.0) ** 2 + du[0, 0, 0] ** 2]              # the initial conditions
+let r = net.fit(t, loss, epochs=1500, lr=1e-2, adapt=true)
+print(net.u(t))
+```
+
+- **Derivatives in one pass.** Every layer carries the values and their first and second derivatives along each
+  input in one stacked matrix product (Taylor mode). `u [N, m]`, `du [N, d, m]`, `d2u [N, d, m]`; with
+  `hessian=true` the loss also gets `hess [N, d, d, m]` with the mixed derivatives (elasticity, cross-diffusion,
+  Navier–Stokes in primitive variables). They agree with nested `grad` to rounding.
+- **Networks.** `act=` `tanh`, `sin`, `cos`, `sigmoid`, `softplus`, `silu`, `linear`; `fourier=F, sigma=s` maps the
+  inputs to `sin` / `cos` of `2πxB` first (B random, fixed), so a network learns fine detail and high frequencies;
+  any number of outputs for systems of equations; `dtype="float64"` by default.
+- **A loss of several terms.** Return a list (equation, boundaries, initial conditions, data). `adapt=true` sets
+  their weights from the sizes of their gradients (gradient-norm balancing) every `adapt_every` steps, so no term
+  drowns the others; the weights are in `r.weights` and kept for the next `fit`.
+- **Inverse problems.** `pinn.mlp(..., unknowns={"nu": 0.05})` learns physical constants with the network; the loss
+  gets them as a last argument `k` (`k["nu"]`), `r.k` / `net.k()` read them. They learn `k_lr` times faster than the
+  weights (default 10).
+- **Points.** `pinn.box(lo, hi, n)` inside a box, `pinn.faces(lo, hi, n)` on its boundary, `pinn.grid(lo, hi, n)`;
+  `points=fn(step) => …` draws new collocation points every `resample_every` steps.
+- **Training.** Adam with warm-up and a cosine schedule down to `min_lr`, `clip=` for the gradient norm, `every=`
+  prints the loss. Helpers for equations: `pinn.laplacian(d2u)`, `pinn.divergence(du, outs)`, `pinn.mse(r)`.
+- **Your own parts.** `pinn.taylor(net, params, x, hessian)` and `pinn.act3(name, z)` are plain functions: copy
+  one, change it (another activation, another layer), and the rest keeps working.
+
 ## On the GPU and on the processor
 
 `backend="auto"` takes the GPU when there is one and the network is made of linear layers and smooth activations
