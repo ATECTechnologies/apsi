@@ -1,0 +1,89 @@
+use parallel
+
+fn square(x) = x * x
+let t = parallel.spawn(square, 7)
+print(t.wait(), t.done(), t)
+print(parallel.wait_all([parallel.spawn(square, i) for i in range(5)]))
+print(parallel.wait_any([parallel.spawn(square, 3), parallel.spawn(square, 4)]))
+print(parallel.parallel_reduce(range(10), square, fn(a, b) => a + b, 0))
+var hits = parallel.atomic(0)
+parallel.parallel_for(range(100), fn(i) => hits.add(i))
+print(hits.get())
+hits.set(5)
+print(hits.add(), hits.get())
+
+# producer / consumer over a bounded channel
+let ch = parallel.channel(2)
+fn produce(n):
+    for i in range(n):
+        ch.send(i * 10)
+    ch.close()
+    return "produced"
+let p = parallel.spawn(produce, 6)
+var got = []
+for x in ch:
+    got.append(x)
+print(got, p.wait(), len(ch))
+try:
+    ch.send(1)
+except RuntimeError as e:
+    print("error:", e)
+try:
+    ch.recv()
+except RuntimeError as e:
+    print("error:", e)
+
+# a pipeline of tasks
+let a = parallel.channel()
+let b = parallel.channel()
+fn stage1():
+    for i in range(5):
+        a.send(i)
+    a.close()
+fn stage2():
+    for x in a:
+        b.send(x + 100)
+    b.close()
+let s1 = parallel.spawn(stage1)
+let s2 = parallel.spawn(stage2)
+print([x for x in b])
+parallel.wait_all([s1, s2])
+
+# errors come back from wait
+fn boom(x):
+    raise ValueError(f"bad {x}")
+let bt = parallel.spawn(boom, 3)
+try:
+    bt.wait()
+except ValueError as e:
+    print("caught:", e)
+
+# locks
+let lk = parallel.lock()
+var total = []
+fn addit(k):
+    lk.run(fn() => total.append(k))
+parallel.parallel_for(range(1, 11), addit)
+print(sum(total))
+let lam = fn(x) => x
+print(square.__name__, lam.__name__, parallel.spawn(lam, 1).wait())
+lk.acquire()
+lk.acquire()
+lk.release()
+lk.release()
+
+# sleeping tasks finish in time order
+let order = parallel.channel()
+fn napper(name, secs):
+    parallel.sleep(secs)
+    order.send(name)
+let ns = [parallel.spawn(napper, "slow", 0.06), parallel.spawn(napper, "fast", 0.01), parallel.spawn(napper, "mid", 0.03)]
+print([order.recv() for i in range(3)])
+let tm = parallel.channel()
+try:
+    tm.recv(timeout=0.02)
+except RuntimeError as e:
+    print("error:", e)
+print(parallel.cpu_count() >= 1, parallel.set_threads(2).threads)
+let bres = parallel.bench(fn() => sum(range(1000)), repeat=3)
+print(bres.runs, bres.best > 0[s])

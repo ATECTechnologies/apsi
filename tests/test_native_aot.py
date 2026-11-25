@@ -62,6 +62,18 @@ def test_c_and_cpp_sources(tmp_path):
 
 
 @pytest.mark.skipif(CC is None, reason="no C compiler")
+def test_ffi_module(tmp_path):
+    """use ffi: ffi.cload and ffi.f64 / ffi.ptr_f64 / ... are the built-in C interface."""
+    from apsi.aot.build import build
+    prog = os.path.join(HERE, "native_ffi", "app_module.apsi")
+    exe = build(prog, str(tmp_path / "app_module"))
+    want = subprocess.run([sys.executable, "-m", "apsi", "run", prog, "--allow-ffi"], capture_output=True, text=True,
+                          cwd=os.path.dirname(HERE))
+    got = subprocess.run([exe], capture_output=True, text=True)
+    assert got.stdout == want.stdout == "32.0\n[10., 20., 30.]\n5\n3.0\n5.0\n"
+
+
+@pytest.mark.skipif(CC is None, reason="no C compiler")
 def test_async_event_loop(tmp_path):
     """async fn / await with the native asyncio: the same output as Python's asyncio under apsi run."""
     from apsi.aot.build import build

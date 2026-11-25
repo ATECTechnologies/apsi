@@ -114,6 +114,8 @@ backward pass walks its graph iteratively, so very deep graphs cannot overflow t
 | `net`, `http_get`, `http_post_json` | HTTP and HTTPS requests: WinHTTP on Windows; sockets and the system's OpenSSL on Linux and macOS (`HTTPS_PROXY` / `NO_PROXY`, `APSI_CA_FILE`); redirects, `HTTPError` |
 | `quantum` | grid Schrödinger solver, split-operator evolution, operators, `expm`, spins, qubits and gates, density matrices, entanglement, hydrogen (complex128 tensors; `measure` draws from the native generator) |
 | `rl` | CartPole, GridWorld and bandit environments, discounted returns, GAE, PPO, DQN, REINFORCE, evaluation, preference / DPO / IPO losses, KL-penalised rewards, GRPO advantages, PPO clip loss, sequence log-probabilities, MCTS, beam search, best-of-n |
+| `parallel` | tasks (`spawn`, `wait_all`, `wait_any`), channels, locks, atomics, `parallel_for` / `parallel_reduce`, `sleep`, `set_threads`, `bench`: tasks take turns on stacks of their own (tensor kernels inside them use every core) |
+| `ffi` | `ffi.cload` and the C type names, the same as the built-in `cload` |
 | `scale` | training plans for 1B … 2T-parameter models (TP × PP × DP layout, recomputation, memory per GPU, GPUs, days), inference memory, the GPU table |
 | `hp` | decimals of 2 to 100 000 significant digits with Python's decimal arithmetic, rounding and text: roots, exp / ln / log10, trigonometric and hyperbolic functions, exact sums and dot products, LU solve / det / inv, factorial, gamma |
 | `layout` | C structs with natural or packed alignment, little / big endian, bit fields, arrays, nested structs, `pack` / `unpack`, views over a `bytearray`, C headers with static assertions, device register maps |

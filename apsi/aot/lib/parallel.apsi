@@ -1,0 +1,247 @@
+# use parallel: tasks, channels, locks, atomics and parallel loops for native programs. A task runs on a stack of its
+# own and the tasks take turns: one runs until it finishes or waits (task.wait, channel.recv / send, lock, sleep),
+# then the next one goes on. Tensor kernels inside a task still use every core. A task starts when it is spawned.
+
+var _tasks = []                 # spawned, not finished
+var _ops = [0]                  # changes that can let a waiting task go on
+var _current = [none]           # the task running now (none: the program itself)
+var _deadlines = []             # times at which a timed wait or a sleep ends
+
+fn _now() = __time()
+fn _seconds(t) = float(si_magnitude(t))
+
+class Task:
+    var gen = none
+    var name = "task"
+    var finished = false
+    var result = none
+    var error = none
+    var cancelled = false
+    fn wait(self, timeout=none):
+        let me = self
+        _block_until(fn() => me.finished, timeout, "wait: timed out")
+        if self.error != none:
+            raise self.error
+        return self.result
+    fn done(self) = self.finished
+    fn cancel(self) = false
+    fn __str__(self) = f"<task {self.name} {'done' if self.finished else 'running'}>"
+    fn __repr__(self) = self.__str__()
+
+fn _step(t):
+    if t.finished:
+        return
+    let prev = _current[0]
+    _current[0] = t
+    try:
+        let r = __gen_step(t.gen, none)
+        if not r[0]:
+            t.finished = true
+            t.result = r[1]
+    except BaseException as e:
+        t.finished = true
+        t.error = e
+    _current[0] = prev
+    if t.finished:
+        _ops[0] = _ops[0] + 1
+        var i = 0
+        while i < len(_tasks):
+            if _tasks[i] == t:
+                _tasks.pop(i)
+                break
+            i = i + 1
+
+fn _round():
+    let before = _ops[0]
+    for t in list(_tasks):
+        _step(t)
+    return _ops[0] != before
+
+# wait until ready() is true: a task hands over to the others; the program runs the tasks until it is
+fn _block_until(ready, timeout=none, msg="timed out"):
+    if ready():
+        return
+    let deadline = none if timeout == none else _now() + _seconds(timeout)
+    if deadline != none:
+        _deadlines.append(deadline)
+    try:
+        while not ready():
+            if deadline != none and _now() >= deadline:
+                raise RuntimeError(msg)
+            if __in_task():
+                __suspend("waiting")
+            else:
+                if len(_tasks) == 0 and deadline == none:
+                    raise RuntimeError("deadlock: waiting for something no task can do")
+                if not _round() and not ready():
+                    var soon = none
+                    for d in _deadlines:
+                        if soon == none or d < soon:
+                            soon = d
+                    if soon == none:
+                        raise RuntimeError("deadlock: every task is waiting")
+                    __sleep(min(max(soon - _now(), 0.0005), 0.05))
+    finally:
+        if deadline != none:
+            _deadlines.remove(deadline)
+
+fn _fname(f):
+    let n = getattr(f, "name", none)
+    if isinstance(n, str):
+        return n
+    let m = getattr(f, "__name__", none)
+    return m if isinstance(m, str) else "task"
+
+fn spawn(f, *args, **kwargs):
+    var t = Task()
+    t.name = _fname(f)
+    t.gen = __task(f, *args, **kwargs)
+    _tasks.append(t)
+    _step(t)
+    return t
+
+fn wait_all(tasks, timeout=none) = [t.wait(timeout) for t in tasks]
+
+fn wait_any(tasks, timeout=none):
+    let ts = list(tasks)
+    fn any_done():
+        for t in ts:
+            if t.finished:
+                return true
+        return false
+    _block_until(any_done, timeout, "wait_any: timed out")
+    for i in range(len(ts)):
+        if ts[i].finished:
+            if ts[i].error != none:
+                raise ts[i].error
+            return (i, ts[i].result)
+
+class Channel:
+    var items = []
+    var capacity = 0
+    var closed = false
+    fn send(self, x, timeout=none):
+        if self.closed:
+            raise RuntimeError("send on a closed channel")
+        if self.capacity > 0:
+            let me = self
+            _block_until(fn() => len(me.items) < me.capacity or me.closed, timeout, "send: timed out")
+        self.items.append(x)
+        _ops[0] = _ops[0] + 1
+    fn recv(self, timeout=none):
+        let me = self
+        _block_until(fn() => len(me.items) > 0 or me.closed, timeout, "recv: timed out")
+        if len(self.items) == 0:
+            raise RuntimeError("recv on a closed, empty channel")
+        _ops[0] = _ops[0] + 1
+        return self.items.pop(0)
+    fn close(self):
+        if not self.closed:
+            self.closed = true
+            _ops[0] = _ops[0] + 1
+    fn __len__(self) = len(self.items) + (1 if self.closed else 0)      # apsi run's queue keeps an end marker
+    fn __iter__(self) = _ChanIter(self)
+
+class _ChanIterC:
+    var ch = none
+    fn __iter__(self) = self
+    fn __next__(self):
+        let c = self.ch
+        _block_until(fn() => len(c.items) > 0 or c.closed)
+        if len(c.items) == 0:
+            raise StopIteration()
+        _ops[0] = _ops[0] + 1
+        return c.items.pop(0)
+
+fn _ChanIter(ch):
+    var it = _ChanIterC()
+    it.ch = ch
+    return it
+
+fn channel(capacity=0):
+    var c = Channel()
+    c.items = []
+    c.capacity = int(capacity)
+    return c
+
+class Lock:
+    var owner = none
+    var count = 0
+    fn acquire(self):
+        let me = self
+        let who = _current[0]
+        _block_until(fn() => me.count == 0 or me.owner == who)
+        self.owner = who
+        self.count = self.count + 1
+    fn release(self):
+        if self.count == 0:
+            raise RuntimeError("cannot release un-acquired lock")
+        self.count = self.count - 1
+        if self.count == 0:
+            self.owner = none
+            _ops[0] = _ops[0] + 1
+    fn run(self, f, *args):
+        self.acquire()
+        try:
+            return f(*args)
+        finally:
+            self.release()
+
+fn lock() = Lock()
+
+class Atomic:
+    var v = 0
+    fn add(self, d=1):
+        self.v = self.v + d
+        return self.v
+    fn set(self, v):
+        self.v = v
+    fn get(self) = self.v
+
+fn atomic(value=0):
+    var a = Atomic()
+    a.v = value
+    return a
+
+fn parallel_for(items, f, workers=none):
+    let ts = [spawn(f, x) for x in list(items)]
+    for t in ts:
+        t.wait()
+    return none
+
+fn parallel_reduce(items, f, combine, init, workers=none):
+    let ts = [spawn(f, x) for x in list(items)]
+    var acc = init
+    for t in ts:
+        acc = combine(acc, t.wait())
+    return acc
+
+fn set_threads(n):
+    let k = int(n)
+    __set_threads(k)
+    return record(threads=k, applied="pool+blas")
+
+fn cpu_count() = __cpu_count()
+
+fn sleep(t):
+    let s = _seconds(t)
+    if not __in_task():
+        if len(_tasks) == 0:
+            __sleep(s)
+            return
+    let wake = _now() + s
+    _deadlines.append(wake)
+    try:
+        _block_until(fn() => _now() >= wake)
+    finally:
+        _deadlines.remove(wake)
+
+fn bench(f, repeat=5, warmup=1):
+    for i in range(int(warmup)):
+        f()
+    var ts = []
+    for i in range(int(repeat)):
+        let t0 = __time()
+        f()
+        ts.append(__time() - t0)
+    return record(best=min(ts) * 1[s], mean=sum(ts) / len(ts) * 1[s], runs=len(ts))

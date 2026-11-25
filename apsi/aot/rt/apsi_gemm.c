@@ -74,6 +74,8 @@ static void *pool_thread(void *p)
     return NULL;
 #endif
 }
+static int pool_cap = 0;                  /* set_threads(n): work is split for at most n threads */
+void a_set_threads(int n) { pool_cap = n > 0 ? n : 0; }
 int a_threads(void) {
     if (!pool_n) {
         const char *e = getenv("APSI_THREADS");
@@ -96,7 +98,7 @@ int a_threads(void) {
 #endif
         }
     }
-    return pool_n;
+    return pool_cap && pool_cap < pool_n ? pool_cap : pool_n;
 }
 static volatile int pool_busy = 0;
 /* run fn(ctx, 0 .. ntasks-1) on every core; nested calls run in the calling thread */

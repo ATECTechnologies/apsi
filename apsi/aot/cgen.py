@@ -38,6 +38,42 @@ def _builtin_names():
 
 
 BUILTINS = _builtin_names()
+
+FFI_NAMES = {"cload", "ptr_f64", "ptr_f32", "ptr_i64", "ptr_i32", "ptr_u8", "ptr_void", "void", "u8", "u16", "u32", "u64",
+             "i8", "i16", "i32", "i64", "f32", "f64"}
+
+
+def ffi_rewrite(prog):
+    """`use ffi`: ffi.cload / ffi.f64 / ... are the built-in cload and C type names (cload("x.c") is compiled in)."""
+    aliases = set()
+
+    def find(n):
+        if isinstance(n, A.Use) and n.path == "ffi" and not n.py and n.names is None:
+            aliases.add(n.alias or "ffi")
+        if isinstance(n, A.AST):
+            for f in n._fields:
+                find(getattr(n, f))
+        elif isinstance(n, list):
+            for x in n:
+                find(x)
+    find(prog)
+    if not aliases:
+        return prog
+
+    def fix(n):
+        if isinstance(n, A.Attr) and isinstance(n.obj, A.Name) and n.obj.id in aliases and n.name in FFI_NAMES:
+            r = A.Name(n.name)
+            r.line, r.col = n.line, n.col
+            return r
+        if isinstance(n, A.AST):
+            for f in n._fields:
+                setattr(n, f, fix(getattr(n, f)))
+        elif isinstance(n, list):
+            return [fix(x) for x in n]
+        elif isinstance(n, tuple):
+            return tuple(fix(x) for x in n)
+        return n
+    return fix(prog)
 PRELUDE = os.path.join(os.path.dirname(__file__), "prelude.apsi")
 
 
@@ -748,6 +784,8 @@ class CGen:
                           f"and the program's own files. `apsi run` has every module.", s)
 
     def use_names(self, s):
+        if s.path == "ffi" and not s.py:
+            return [a for n, a in (s.names or []) if a and a != n]
         r = self.resolve_use(s)
         if s.names is not None:
             return [a or n for n, a in s.names]
@@ -767,7 +805,7 @@ class CGen:
         from ..parser import parse, static_public
         with open(path, encoding="utf-8-sig") as fh:
             text = fh.read()
-            prog = parse(text)
+            prog = ffi_rewrite(parse(text))
         self.n_mods += 1
         mid = self.n_mods
         cname = f"mod{mid}_body"
@@ -790,6 +828,13 @@ class CGen:
         return self.local_mods[path]
 
     def s_Use(self, s):
+        if s.path == "ffi" and not s.py:
+            for n, a in (s.names or []):
+                if n not in FFI_NAMES or n == "cload":
+                    raise NativeError(f"use ffi ({n}): import cload as `use ffi` and call ffi.cload(...)", s)
+                if a and a != n:
+                    self.store(a, self.k_builtin(n))
+            return
         r = self.resolve_use(s)
         if r[0] == "native":
             members = r[2]
@@ -885,6 +930,7 @@ class CGen:
 
     # ---- program
     def program(self, prog):
+        prog = ffi_rewrite(prog)
         self.analyzer = Analyzer(self.use_names)
         self.mod_scope = self.analyzer.run(prog)
         main = self.function_body("apsi_main", self.mod_scope, "<module>", None, prog.body, None)

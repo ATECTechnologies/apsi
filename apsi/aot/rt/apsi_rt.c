@@ -1520,7 +1520,7 @@ typedef struct AGen {
 #endif
 } AGen;
 static AGen *a_cur_gen = NULL;
-static const char *gen_name(AObj *o) { return ((AGen *)o)->fn->name; }
+static const char *gen_name(AObj *o) { return ((AGen *)o)->fn ? ((AGen *)o)->fn->name : "task"; }
 #define GEN_STACK (512 * 1024)
 
 static void gen_mark(AGen *g) {
@@ -1625,6 +1625,10 @@ AV a_yield(AV v) {
     gen_switch_out(g);
     return g->value;                              /* what the caller sent (none for next()) */
 }
+/* a task of `use parallel`: any callable run on a stack of its own, switched to and from cooperatively */
+static AV task_body(AFunc *fn, int n, AV *a, ADict *kw) { (void)fn; return a_call(a[0], n - 1, a + 1, kw); }
+AV a_task_new(int n, AV *args, ADict *kw) { AV g = a_gen_new(NULL, task_body, n, args, kw); ((AGen *)g.o)->coro = 2; return g; }
+int a_in_task(void) { return a_cur_gen && a_cur_gen->coro == 2; }
 AV a_coro_new(AFunc *fn, AFnCode body, int n, AV *args, ADict *kw) { AV g = a_gen_new(fn, body, n, args, kw); ((AGen *)g.o)->coro = 1; return g; }
 /* await x: drive the coroutine x; whatever it yields (a request for the event loop) goes up to ours */
 AV a_await(AV x) {
@@ -1761,6 +1765,11 @@ AV a_getattr(AV o, const char *name) {
     if (a_is(o, O_INST) && !strcmp(name, "__class__")) return a_obj(((AInst *)o.o)->cls);
     if (a_is(o, O_BUILTIN) && !strcmp(((ABuiltin *)o.o)->name, "bytes") && !strcmp(name, "fromhex")) return a_builtin("fromhex", b_bytes_fromhex, A_NONE);
     if (a_is(o, O_STR) && !strcmp(name, "__name__")) return o;          /* type(x).__name__: type() gives the name */
+    if (!strcmp(name, "__name__") && (a_is(o, O_FUNC) || a_is(o, O_BUILTIN) || a_is(o, O_BOUND))) {
+        AV f = a_is(o, O_BOUND) ? ((ABound *)o.o)->fn : o;
+        if (a_is(f, O_FUNC)) return a_str(((AFunc *)f.o)->name);
+        if (a_is(f, O_BUILTIN)) return a_str(((ABuiltin *)f.o)->name);
+    }
     if (a_is(o, O_INST)) {
         AInst *s = (AInst *)o.o; AV v;
         if (a_dict_get(s->attrs, a_str(name), &v)) return v;

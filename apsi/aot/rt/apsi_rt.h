@@ -96,7 +96,8 @@ AV a_cplx_builtin(const char *name, int n, AV *a, struct ADict *kw); int a_cplx_
 AV a_dec_binop(int op, AV a, AV b); AV a_dec_unop(int op, AV a); int a_dec_cmp(AV a, AV b, int *ok); int a_dec_truthy(AV v);
 char *a_dec_text(AV v); char *a_dec_format(AV v, const char *spec); uint64_t a_dec_hash(AV v); double a_dec_float(AV v);
 int a_dec_wants(const char *name, int n, AV *a); AV a_dec_builtin(const char *name, int n, AV *a); AV a_dec_attr(AV v, const char *name);
-AV a_cplx_attr(AV v, const char *name); AV a_cplx_iter_list(AV v); const char *a_cplx_type(AV v);
+AV a_cplx_attr(AV v, const char *name);
+AV a_task_new(int n, AV *args, struct ADict *kw); int a_in_task(void); AV a_cplx_iter_list(AV v); const char *a_cplx_type(AV v);
 void a_float_repr(double x, char *out, size_t cap); const char *a_tname(AV v); void a_slice_bounds(AV slice, int64_t n, int64_t *lo, int64_t *hi, int64_t *st);
 AV a_list(int64_t n, AV *items);
 AV a_tuple(int64_t n, AV *items);
