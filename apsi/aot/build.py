@@ -124,7 +124,7 @@ def build(path, out=None, opt="-O3", keep_c=False, target=None):
     if not windows:
         cmd += ["-lm", "-lpthread", "-ldl"]
     elif "msvc" not in (target or "") and not cc.lower().endswith("cl.exe"):
-        cmd += ["-static", "-lm", "-lws2_32", "-lbcrypt"]               # MinGW: one file with nothing to install beside it
+        cmd += ["-static", "-lm", "-lws2_32", "-lbcrypt", "-lwinhttp"]               # MinGW: one file with nothing to install beside it
     if extra:                                   # C / C++ files the program cload()s: built into it, symbols exported
         from .csource import CXX_SUFFIXES, cxx_of, cxx_include_flags
         objs, any_cxx = [], False

@@ -417,12 +417,24 @@ static int lib_algo(AV v) {
     if (a < 0) a_error("ValueError", "unknown hash '%s'; use one of blake2b, blake2s, md5, sha1, sha256, sha3_256, sha3_512, sha512", name);
     return a;
 }
-BI(lb_hash) { (void)self; (void)kw; AStr *s = lib_str(a[0], "hash"); uint8_t d[64]; int k = hash_of(n > 1 ? lib_algo(a[1]) : H_SHA256, s->s, (size_t)s->len, d); return hex_of(d, (size_t)k); }
+BI(lb_hash) {
+    (void)self; (void)kw; AStr *s = lib_str(a[0], "hash"); uint8_t d[64]; int k = hash_of(n > 1 ? lib_algo(a[1]) : H_SHA256, s->s, (size_t)s->len, d);
+    if (n > 2 && !strcmp(lib_str(a[2], "hash")->s, "raw")) return a_bytes((const char *)d, k);
+    return hex_of(d, (size_t)k);
+}
+/* __pbkdf2(password, salt, iterations, length): PBKDF2-HMAC-SHA256 as raw bytes */
+BI(lb_pbkdf2) {
+    (void)self; (void)kw; (void)n; AStr *p = lib_str(a[0], "pbkdf2"), *sl = lib_str(a[1], "pbkdf2"); int64_t it = a[2].i, dk = n > 3 ? a[3].i : 32;
+    if (it < 1 || dk < 1 || dk > 1024) a_error("ValueError", "pbkdf2: bad iterations or length");
+    uint8_t *o = (uint8_t *)malloc((size_t)dk); pbkdf2_sha256((const uint8_t *)p->s, (size_t)p->len, (const uint8_t *)sl->s, (size_t)sl->len, (uint64_t)it, o, (size_t)dk);
+    AV r = a_bytes((const char *)o, dk); free(o); return r;
+}
 /* __hmac(key, message, algo, form): form "hex" | "b64u" | "b64" */
 BI(lb_hmac) {
     (void)self; (void)kw; AStr *k = lib_str(a[0], "hmac"), *m = lib_str(a[1], "hmac"); uint8_t d[64];
     int len = hmac_of(lib_algo(a[2]), (const uint8_t *)k->s, (size_t)k->len, (const uint8_t *)m->s, (size_t)m->len, d);
     const char *form = n > 3 ? lib_str(a[3], "hmac")->s : "hex";
+    if (!strcmp(form, "raw")) return a_bytes((const char *)d, len);
     if (!strcmp(form, "b64u")) return b64_enc(d, (size_t)len, 1);
     if (!strcmp(form, "b64")) return b64_enc(d, (size_t)len, 0);
     return hex_of(d, (size_t)len);
@@ -432,7 +444,10 @@ BI(lb_b64dec) {
     (void)self; (void)kw; (void)n; AStr *s = lib_str(a[0], "b64decode"); uint8_t *o = (uint8_t *)malloc((size_t)s->len + 3);
     int64_t k = b64_dec(s->s, (size_t)s->len, o);
     if (k < 0) { free(o); a_error("ValueError", "b64decode: not Base64 text"); }
-    AV r = a_strn((const char *)o, k); free(o); return r;
+    if (n > 1 && !strcmp(lib_str(a[1], "b64decode")->s, "raw")) { AV r = a_bytes((const char *)o, k); free(o); return r; }
+    AV raw = a_bytes((const char *)o, k); free(o);                  /* text: UTF-8 with replacement, as apsi run */
+    int sp = a_ntmp; A_PUSH(raw); AV args[2] = {a_str("utf-8"), a_str("replace")}; A_PUSH(args[0]); A_PUSH(args[1]);
+    AV r = a_call(a_getattr(raw, "decode"), 2, args, NULL); a_ntmp = sp; return r;
 }
 BI(lb_crc32) { (void)self; (void)kw; (void)n; AStr *s = lib_str(a[0], "crc32"); return a_int(crc32_of((const uint8_t *)s->s, (size_t)s->len)); }
 BI(lb_secure_eq) { (void)self; (void)kw; (void)n; AStr *x = lib_str(a[0], "secure_equal"), *y = lib_str(a[1], "secure_equal"); return a_bool(ct_equal((const uint8_t *)x->s, (size_t)x->len, (const uint8_t *)y->s, (size_t)y->len)); }
@@ -440,6 +455,7 @@ BI(lb_secure_eq) { (void)self; (void)kw; (void)n; AStr *x = lib_str(a[0], "secur
 BI(lb_random_bytes) {
     (void)self; (void)kw; int64_t k = n ? a[0].i : 32; if (k < 0 || k > 1 << 20) a_error("ValueError", "random bytes: 0 to 1048576");
     uint8_t *b = (uint8_t *)malloc((size_t)k + 1); os_random(b, (size_t)k);
+    if (n > 1 && !strcmp(lib_str(a[1], "random")->s, "raw")) { AV r = a_bytes((const char *)b, k); free(b); return r; }
     AV r = n > 1 && !strcmp(lib_str(a[1], "random")->s, "b64u") ? b64_enc(b, (size_t)k, 1) : k <= 128 ? hex_of(b, (size_t)k) : A_NONE;
     if (r.t == T_NONE) { char *h = (char *)malloc((size_t)k * 2); static const char *hx = "0123456789abcdef"; for (int64_t i = 0; i < k; i++) { h[2 * i] = hx[b[i] >> 4]; h[2 * i + 1] = hx[b[i] & 15]; } r = a_strn(h, 2 * k); free(h); }
     free(b); return r;

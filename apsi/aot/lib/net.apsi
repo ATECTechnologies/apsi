@@ -1,0 +1,135 @@
+# use net (and http_get / http_post_json without a use, as in apsi run): HTTP and HTTPS requests from native
+# programs. Windows sends them through WinHTTP (the system's TLS, certificates and proxy settings); Linux and macOS
+# through the system's OpenSSL, with HTTPS_PROXY / HTTP_PROXY / NO_PROXY honoured. Redirects are followed (at most 5,
+# as apsi run), an answer of 400 or more is an HTTPError, and credentials inside URLs are refused.
+
+class HTTPError(ConnectionError):
+    var code = 0
+    var reason = ""
+    var headers = {}
+    var body = b""
+
+class Response:
+    var status = 0
+    var reason = ""
+    var headers = {}
+    var body = b""
+    var url = ""
+    fn text(self) = self.body.decode("utf-8", "replace")
+    fn json(self) = json_parse(self.body.decode("utf-8"))
+    fn __str__(self) = f"<Response [{self.status}]>"
+
+let _MAX_BODY = 64 * 1024 * 1024
+
+fn _check_url(url, what):
+    let u = str(url)
+    let low = u.lower()
+    if not (low.startswith("http://") or low.startswith("https://")):
+        raise PermissionError(f"{what}: only http:// and https:// URLs are allowed")
+    let rest = u[u.find("://") + 3:]
+    var hostpart = rest
+    for ch in ["/", "?", "#"]:
+        let k = hostpart.find(ch)
+        if k >= 0:
+            hostpart = hostpart[0:k]
+    if "@" in hostpart:
+        raise PermissionError(f"{what}: credentials inside URLs are not allowed (use a header)")
+    return u
+
+fn _raise_net(r):
+    let kind = r[1]
+    let msg = r[2]
+    if kind == "TimeoutError":
+        raise TimeoutError(msg)
+    if kind == "ConnectionRefusedError":
+        raise ConnectionRefusedError(msg)
+    if kind == "PermissionError":
+        raise PermissionError(msg)
+    if kind == "ValueError":
+        raise ValueError(msg)
+    raise ConnectionError(msg)
+
+fn _join(base, loc):
+    if loc.lower().startswith("http://") or loc.lower().startswith("https://"):
+        return loc
+    let i = base.find("://") + 3
+    var j = len(base)
+    for ch in ["/", "?", "#"]:
+        let k = base.find(ch, i)
+        if k >= 0 and k < j:
+            j = k
+    let origin = base[0:j]
+    if loc.startswith("//"):
+        return base[0:i - 2] + loc
+    if loc.startswith("/"):
+        return origin + loc
+    var path = base[j:]
+    let q = path.find("?")
+    if q >= 0:
+        path = path[0:q]
+    let slash = path.rfind("/")
+    return origin + (path[0:slash + 1] if slash >= 0 else "/") + loc
+
+fn request(method, url, headers=none, body=none, timeout=30, what="request()"):
+    var u = _check_url(url, what)
+    var m = str(method).upper()
+    var data = body
+    if isinstance(data, str):
+        data = data.encode()
+    var hs = [["User-Agent", f"apsi/{__apsi_version()}"]]
+    if headers != none:
+        for k in headers:
+            hs.append([str(k), str(headers[k])])
+    var hops = 0
+    while true:
+        let r = __net("request", m, u, hs, data, float(timeout))
+        if isinstance(r, tuple) and len(r) == 3 and r[0] == "error":
+            _raise_net(r)
+        var hd = {}
+        for pr in r[2]:
+            hd[pr[0]] = pr[1]
+        var loc = none
+        for pr in r[2]:
+            if pr[0].lower() == "location":
+                loc = pr[1]
+        let status = r[0]
+        if (status == 301 or status == 302 or status == 303 or status == 307 or status == 308) and loc != none:
+            if (status == 307 or status == 308) and m != "GET" and m != "HEAD":
+                _http_error(status, r[1], hd, r[3])
+            hops = hops + 1
+            if hops > 5:
+                raise HTTPError(f"HTTP Error {status}: The HTTP server returned a redirect error that would lead to an infinite loop.")
+            u = _check_url(_join(u, loc), what + " (redirect)")
+            if m != "GET" and m != "HEAD":
+                m = "GET"
+                data = none
+                hs = [pr for pr in hs if pr[0].lower() != "content-type" and pr[0].lower() != "content-length"]
+            continue
+        if status >= 400:
+            _http_error(status, r[1], hd, r[3])
+        if len(r[3]) > _MAX_BODY:
+            raise RuntimeError(f"{what}: response larger than {_MAX_BODY} bytes (set APSI_HTTP_MAX_BYTES)")
+        var resp = Response()
+        resp.status = status
+        resp.reason = r[1]
+        resp.headers = hd
+        resp.body = r[3]
+        resp.url = u
+        return resp
+
+fn _http_error(status, reason, hd, body):
+    var e = HTTPError(f"HTTP Error {status}: {reason}")
+    e.code = status
+    e.reason = reason
+    e.headers = hd
+    e.body = body
+    raise e
+
+fn http_get(url, timeout=30) = request("GET", url, none, none, timeout, "http_get()").body.decode("utf-8", "replace")
+
+fn http_post_json(url, data, timeout=30):
+    let body = json_str(data, ensure_ascii=true).encode()
+    return json_parse(request("POST", url, {"Content-Type": "application/json"}, body, timeout, "http_post_json()").body.decode("utf-8"))
+
+fn get(url, headers=none, timeout=30) = request("GET", url, headers, none, timeout, "get()")
+fn post(url, body=none, headers=none, timeout=30) = request("POST", url, headers, body, timeout, "post()")

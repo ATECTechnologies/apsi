@@ -5,6 +5,7 @@
 use dataframe as _df
 
 class DatabaseError(RuntimeError):
+    var __report_kind__ = true
     var code = none
     var detail = none
 
@@ -107,11 +108,10 @@ fn _result(cols, rows, status, rowcount):
     return r
 
 fn _ident(name):
-    let s = str(name)
-    for part in s.split("."):
-        if part == "" or not all([c.isalnum() or c == "_" for c in part]) or ("0" <= part[0] and part[0] <= "9"):
-            raise DatabaseError("not a plain identifier: " + _pyrepr(s))
-    return s
+    let n = str(name)
+    if not n.replace("_", "").replace(".", "").isalnum():
+        return "\"" + n.replace("\"", "\"\"") + "\""
+    return ".".join([("\"" + p + "\"" if p.lower() != p else p) for p in n.split(".")])
 
 fn _dollars(sql):
     # $1 -> ?1 (SQLite's numbered parameters), outside quotes as apsi run's regex does everywhere
@@ -192,11 +192,696 @@ fn sqlite(path=":memory:"):
     c.h = _ok(__sqlite("open", c.path))
     return c
 
+# ------------------------------------------------------------------ network connections
+fn _netcall(r):
+    if isinstance(r, tuple) and len(r) == 3 and r[0] == "error":
+        if r[1] == "TimeoutError":
+            raise TimeoutError(r[2])
+        if r[1] == "ConnectionRefusedError":
+            raise ConnectionRefusedError(r[2])
+        raise ConnectionError(r[2])
+    return r
+
+fn _unquote(s):
+    var out = b""
+    var i = 0
+    let b = s.encode()
+    while i < len(b):
+        if b[i] == 37 and i + 2 < len(b) + 0:
+            out = out + bytes.fromhex(b[i + 1:i + 3].decode())
+            i = i + 3
+        else:
+            out = out + b[i:i + 1]
+            i = i + 1
+    return out.decode("utf-8", "replace")
+
+# scheme://user:pass@host:port/path?query -> record
+fn _parse_url(url):
+    let u = str(url)
+    let k = u.find("://")
+    let scheme = u[0:k].lower() if k >= 0 else ""
+    var rest = u[k + 3:] if k >= 0 else u
+    var query = ""
+    let q = rest.find("?")
+    if q >= 0:
+        query = rest[q + 1:]
+        rest = rest[0:q]
+    var path = ""
+    let sl = rest.find("/")
+    if sl >= 0:
+        path = rest[sl:]
+        rest = rest[0:sl]
+    var user = none
+    var password = none
+    let at = rest.rfind("@")
+    if at >= 0:
+        let cred = rest[0:at]
+        rest = rest[at + 1:]
+        let c = cred.find(":")
+        if c >= 0:
+            user = _unquote(cred[0:c])
+            password = _unquote(cred[c + 1:])
+        else:
+            user = _unquote(cred)
+    var host = rest
+    var port = none
+    if rest.startswith("["):
+        let rb = rest.find("]")
+        host = rest[1:rb]
+        if rb + 1 < len(rest) and rest[rb + 1] == ":":
+            port = int(rest[rb + 2:])
+    else:
+        let c = rest.rfind(":")
+        if c >= 0:
+            host = rest[0:c]
+            port = int(rest[c + 1:])
+    var params = {}
+    if query != "":
+        for part in query.split("&"):
+            let e = part.find("=")
+            if e >= 0:
+                params[_unquote(part[0:e])] = _unquote(part[e + 1:])
+    return record(scheme=scheme, host=host if host != "" else none, port=port, user=user, password=password, path=path, params=params)
+
+fn _plainv(v):
+    if v == none:
+        return none
+    if isinstance(v, str) or isinstance(v, bytes) or isinstance(v, int) or isinstance(v, float):
+        return v
+    try:
+        return v.reveal()
+    except:
+        return str(v)
+
+class _Sock:
+    var h = 0
+    var buf = b""
+    var pos = 0
+    fn send(self, data):
+        _netcall(__net("send", self.h, data))
+    fn _fill(self):
+        let chunk = _netcall(__net("recv", self.h, 65536))
+        if len(chunk) == 0:
+            raise ConnectionError("the server closed the connection")
+        if self.pos > 0:
+            self.buf = self.buf[self.pos:]
+            self.pos = 0
+        self.buf = self.buf + chunk
+    fn line(self):
+        while true:
+            let i = self.buf.find(b"\r\n", self.pos)
+            if i >= 0:
+                let out = self.buf[self.pos:i]
+                self.pos = i + 2
+                return out
+            self._fill()
+    fn read(self, n):
+        while len(self.buf) - self.pos < n:
+            self._fill()
+        let out = self.buf[self.pos:self.pos + n]
+        self.pos = self.pos + n
+        return out
+    fn close(self):
+        __net("close", self.h)
+
+fn _connect(host, port, timeout):
+    var s = _Sock()
+    s.h = _netcall(__net("connect", str(host), int(port), float(timeout)))
+    return s
+
+let _REDIS_ALIAS = {"delete": ["DEL"], "type_": ["TYPE"], "exec_": ["EXEC"]}
+let _REDIS_PAIRS = {"HGETALL", "CONFIG GET", "XINFO", "HRANDFIELD"}
+
+fn _redis_pack(args):
+    var out = b"*" + str(len(args)).encode() + b"\r\n"
+    for a in args:
+        var b = none
+        if isinstance(a, bytes):
+            b = a
+        elif isinstance(a, bool):
+            b = b"1" if a else b"0"
+        elif isinstance(a, dict) or isinstance(a, list):
+            b = json_str(a, ensure_ascii=true).encode()
+        elif isinstance(a, float):
+            b = repr(a).encode()
+        else:
+            b = str(a).encode()
+        out = out + b"$" + str(len(b)).encode() + b"\r\n" + b + b"\r\n"
+    return out
+
+fn _redis_shape(args, r):
+    if isinstance(r, list) and len(args) > 0:
+        var name = str(args[0]).upper()
+        if name == "CONFIG" and len(args) > 1:
+            name = "CONFIG " + str(args[1]).upper()
+        if name in _REDIS_PAIRS and len(r) % 2 == 0:
+            var d = {}
+            for i in range(0, len(r), 2):
+                d[r[i]] = r[i + 1]
+            return d
+    return r
+
+fn _redis_cmd(name):
+    if name in _REDIS_ALIAS:
+        return _REDIS_ALIAS[name]
+    return name.upper().replace("_", " ").split()
+
+class Redis:
+    var s = none
+    var host = "localhost"
+    var port = 6379
+    var decode = true
+    fn _reply(self):
+        let line = self.s.line()
+        let t = line[0:1]
+        let rest = line[1:]
+        if t == b"+":
+            return rest.decode() if self.decode else rest
+        if t == b"-":
+            return RedisError(rest.decode())
+        if t == b":":
+            return int(rest.decode())
+        if t == b"$":
+            let n = int(rest.decode())
+            if n < 0:
+                return none
+            let data = self.s.read(n + 2)[0:n]
+            return data.decode("utf-8", "replace") if self.decode else data
+        if t == b"*":
+            let n = int(rest.decode())
+            if n < 0:
+                return none
+            return [self._reply() for i in range(n)]
+        raise RedisError("unexpected reply " + str(line[0:40]))
+    fn command(self, *args):
+        self.s.send(_redis_pack(args))
+        let r = self._reply()
+        if isinstance(r, RedisError):
+            raise r
+        return _redis_shape(args, r)
+    fn pipeline(self):
+        var p = _Pipeline()
+        p.conn = self
+        p.cmds = []
+        return p
+    fn subscribe(self, *channels):
+        self.s.send(_redis_pack(["SUBSCRIBE"] + list(channels)))
+        for c in channels:
+            self._reply()
+        let me = self
+        fn listen():
+            while true:
+                let m = me._reply()
+                if isinstance(m, list) and len(m) > 0 and (m[0] == "message" or m[0] == b"message"):
+                    yield (m[1], m[2])
+        return listen()
+    fn publish(self, channel, message) = self.command("PUBLISH", channel, message)
+    fn __getattr__(self, name):
+        if name.startswith("_"):
+            raise AttributeError(name)
+        let cmd = _redis_cmd(name)
+        let me = self
+        return fn(*args) => me.command(*(cmd + list(args)))
+    fn close(self):
+        self.s.close()
+    fn __enter__(self) = self
+    fn __exit__(self, kind, value, tb):
+        self.close()
+        return false
+    fn __str__(self) = f"<redis {self.host}:{self.port}>"
+
+class _Pipeline:
+    var conn = none
+    var cmds = []
+    fn command(self, *args):
+        self.cmds.append(list(args))
+        return self
+    fn __getattr__(self, name):
+        if name.startswith("_"):
+            raise AttributeError(name)
+        let cmd = _redis_cmd(name)
+        let me = self
+        return fn(*args) => me.command(*(cmd + list(args)))
+    fn execute(self):
+        let c = self.conn
+        var data = b""
+        for a in self.cmds:
+            data = data + _redis_pack(a)
+        c.s.send(data)
+        let cmds = self.cmds
+        var out = []
+        for a in cmds:
+            let r = c._reply()
+            out.append(r if isinstance(r, RedisError) else _redis_shape(a, r))
+        self.cmds = []
+        return out
+
+fn redis(url=none, host="localhost", port=6379, password=none, db=0, username=none, timeout=10.0, decode=true, tls=false):
+    var h = host
+    var pt = port
+    var pw = _plainv(password)
+    var user = username
+    var dbn = db
+    var secure = tls
+    if url != none:
+        let u = _parse_url(_plainv(url))
+        h = u.host if u.host != none else h
+        pt = u.port if u.port != none else pt
+        if u.password != none:
+            pw = u.password
+        if u.user != none and u.user != "":
+            user = u.user
+        if u.path != "" and u.path != "/":
+            dbn = int(u.path[1:])
+        secure = secure or u.scheme == "rediss"
+    var r = Redis()
+    r.host = h
+    r.port = pt
+    r.decode = decode
+    r.s = _connect(h, pt, timeout)
+    if secure:
+        let t = __net("tls", r.s.h, str(h))
+        if t != none:
+            _netcall(t)
+    __net("timeout", r.s.h, 0.0)
+    if pw:
+        if user:
+            r.command("AUTH", user, pw)
+        else:
+            r.command("AUTH", pw)
+    if dbn:
+        r.command("SELECT", dbn)
+    return r
+
+# ------------------------------------------------------------------ PostgreSQL (the v3 wire protocol)
+fn _i32(n) = bytes([(n >> 24) & 255, (n >> 16) & 255, (n >> 8) & 255, n & 255])
+fn _i16(n) = bytes([(n >> 8) & 255, n & 255])
+fn _r32(b, o):
+    let v = (b[o] << 24) | (b[o + 1] << 16) | (b[o + 2] << 8) | b[o + 3]
+    return v - 4294967296 if v >= 2147483648 else v
+fn _r16(b, o):
+    let v = (b[o] << 8) | b[o + 1]
+    return v - 65536 if v >= 32768 else v
+
+let _PG_INT = {20, 21, 23, 26, 28}
+let _PG_FLOAT = {700, 701}
+let _PG_ARRAY_INNER = {1007: 23, 1016: 20, 1005: 21, 1021: 700, 1022: 701, 1009: 25, 1015: 25, 1000: 16}
+let _PG_ARRAY_OIDS = {1000, 1005, 1007, 1016, 1021, 1022, 1009, 1015, 1014, 1231, 2951, 1115, 1182, 1001}
+
+fn _pg_decode(oid, raw):
+    let s = raw.decode("utf-8")
+    if oid in _PG_INT:
+        return int(s)
+    if oid in _PG_FLOAT or oid == 1700:
+        return float(s)
+    if oid == 16:
+        return s == "t"
+    if oid == 114 or oid == 3802:
+        return json_parse(s)
+    if oid == 17:
+        return bytes.fromhex(s[2:]) if s.startswith("\\x") else s.encode()
+    if oid == 1184 and len(s) >= 3 and (s[len(s) - 3] == "+" or s[len(s) - 3] == "-"):
+        return s + ":00"
+    if oid in _PG_ARRAY_INNER:
+        return _pg_array(s, _PG_ARRAY_INNER[oid])
+    return s
+
+fn _pg_array(s, inner):
+    let body = s[1:len(s) - 1]
+    if body == "":
+        return []
+    var out = []
+    var cur = ""
+    var q = false
+    var esc = false
+    var quoted = false
+    for ch in body:
+        if esc:
+            cur = cur + ch
+            esc = false
+        elif ch == "\\":
+            esc = true
+        elif ch == "\"":
+            q = not q
+            quoted = true
+        elif ch == "," and not q:
+            out.append([cur, quoted])
+            cur = ""
+            quoted = false
+        else:
+            cur = cur + ch
+    out.append([cur, quoted])
+    return [none if (v[0] == "NULL" and not v[1]) else _pg_decode(inner, v[0].encode()) for v in out]
+
+fn _num(x) = (isinstance(x, int) or isinstance(x, float)) and not isinstance(x, bool)
+
+fn _pg_encode(v):
+    if v == none:
+        return none
+    if isinstance(v, bool):
+        return b"t" if v else b"f"
+    if isinstance(v, bytes):
+        return b"\\x" + v.hex().encode()
+    if isinstance(v, list):
+        if all([_num(x) for x in v]):
+            return ("{" + ",".join([repr(x) for x in v]) + "}").encode()
+        return json_str(v).encode()
+    if isinstance(v, dict):
+        return json_str(v).encode()
+    if isinstance(v, float):
+        return repr(v).encode()
+    return str(v).encode()
+
+fn _pg_array_literal(v):
+    var parts = []
+    for x in v:
+        if x == none:
+            parts.append("NULL")
+        elif isinstance(x, list) or isinstance(x, tuple):
+            parts.append(_pg_array_literal(x))
+        else:
+            let t = _pg_encode(x).decode()
+            parts.append("\"" + t.replace("\\", "\\\\").replace("\"", "\\\"") + "\"")
+    return "{" + ",".join(parts) + "}"
+
+fn _pg_param(v, oid):
+    if (isinstance(v, list) or isinstance(v, tuple)) and (oid in _PG_ARRAY_OIDS or (oid == 0 and isinstance(v, tuple))):
+        return _pg_array_literal(v).encode()
+    if isinstance(v, list) or isinstance(v, tuple) or isinstance(v, dict):
+        return json_str(list(v) if isinstance(v, tuple) else v).encode()
+    return _pg_encode(v)
+
+fn _pg_msg(kind, payload=b"") = kind + _i32(len(payload) + 4) + payload
+
+fn _split0(b):
+    var out = []
+    var i = 0
+    while i <= len(b):
+        let j = b.find(b"\x00", i)
+        if j < 0:
+            out.append(b[i:])
+            break
+        out.append(b[i:j])
+        i = j + 1
+    return out
+
+class Postgres:
+    var s = none
+    var host = "localhost"
+    var port = 5432
+    var user = "postgres"
+    var database = "postgres"
+    var params = {}
+    var notices = []
+    var notifications = []
+    var _stmts = {}
+    var _n = 0
+    var pid = 0
+    var secret = 0
+    fn _msg(self):
+        let head = self.s.read(5)
+        return [head[0:1], self.s.read(_r32(head, 1) - 4)]
+    fn _error(self, payload):
+        var f = {}
+        for part in _split0(payload):
+            if len(part) > 0:
+                f[part[0:1].decode()] = part[1:].decode("utf-8", "replace")
+        var msg = f.get("S", "ERROR") + ": " + f.get("M", "")
+        if "D" in f:
+            msg = msg + " (" + f["D"] + ")"
+        var e = DatabaseError(msg)
+        e.code = f.get("C", none)
+        e.detail = f.get("D", none)
+        return e
+    fn _need_pw(self, password):
+        if password == none:
+            raise DatabaseError("the server asks for a password (put it in the URL, password=…, or PGPASSWORD)")
+    fn _auth(self, password):
+        while true:
+            let m = self._msg()
+            let kind = m[0]
+            let p = m[1]
+            if kind == b"R":
+                let code = _r32(p, 0)
+                if code == 0:
+                    continue
+                if code == 3:
+                    self._need_pw(password)
+                    self.s.send(_pg_msg(b"p", password.encode() + b"\x00"))
+                elif code == 5:
+                    self._need_pw(password)
+                    let inner = __hash(password + self.user, "md5")
+                    let outer = "md5" + __hash(inner.encode() + p[4:8], "md5")
+                    self.s.send(_pg_msg(b"p", outer.encode() + b"\x00"))
+                elif code == 10:
+                    self._need_pw(password)
+                    self._scram(password, p[4:])
+                else:
+                    raise DatabaseError(f"unsupported authentication method {code}")
+            elif kind == b"S":
+                let kv = _split0(p)
+                self.params[kv[0].decode()] = kv[1].decode()
+            elif kind == b"K":
+                self.pid = _r32(p, 0)
+                self.secret = _r32(p, 4)
+            elif kind == b"E":
+                raise self._error(p)
+            elif kind == b"Z":
+                return
+    fn _scram(self, password, mechs):
+        if mechs.find(b"SCRAM-SHA-256") < 0:
+            raise DatabaseError("the server offers no supported SASL mechanism")
+        let nonce = __b64enc(__random_bytes(18, "raw"), false)
+        let first_bare = f"n=,r={nonce}"
+        self.s.send(_pg_msg(b"p", b"SCRAM-SHA-256\x00" + _i32(len(first_bare) + 3) + b"n,," + first_bare.encode()))
+        var m = self._msg()
+        if m[0] == b"E":
+            raise self._error(m[1])
+        let server_first = m[1][4:].decode()
+        var attrs = {}
+        for x in server_first.split(","):
+            let k = x.find("=")
+            attrs[x[0:k]] = x[k + 1:]
+        if not attrs["r"].startswith(nonce):
+            raise DatabaseError("SCRAM: the server nonce does not extend ours")
+        let salt = __b64dec(attrs["s"], "raw")
+        let salted = __pbkdf2(password, salt, int(attrs["i"]), 32)
+        let client_key = __hmac(salted, b"Client Key", "sha256", "raw")
+        let stored = __hash(client_key, "sha256", "raw")
+        let final_wo = "c=biws,r=" + attrs["r"]
+        let auth_msg = (first_bare + "," + server_first + "," + final_wo).encode()
+        let sig = __hmac(stored, auth_msg, "sha256", "raw")
+        let proof = __b64enc(bytes([bxor(client_key[i], sig[i]) for i in range(len(sig))]), false)
+        self.s.send(_pg_msg(b"p", (final_wo + ",p=" + proof).encode()))
+        m = self._msg()
+        if m[0] == b"E":
+            raise self._error(m[1])
+        let server_key = __hmac(salted, b"Server Key", "sha256", "raw")
+        let want = __b64enc(__hmac(server_key, auth_msg, "sha256", "raw"), false)
+        var got = {}
+        for x in m[1][4:].decode().split(","):
+            let k = x.find("=")
+            got[x[0:k]] = x[k + 1:]
+        if not __secure_eq(got.get("v", ""), want):
+            raise DatabaseError("SCRAM: the server's signature is wrong (not the server you think)")
+    fn _read_until_ready(self):
+        var cols = none
+        var oids = none
+        var rows = []
+        var status = ""
+        var err = none
+        while true:
+            let m = self._msg()
+            let kind = m[0]
+            let p = m[1]
+            if kind == b"D":
+                let n = _r16(p, 0)
+                var off = 2
+                var vals = []
+                for i in range(n):
+                    let ln = _r32(p, off)
+                    off = off + 4
+                    if ln < 0:
+                        vals.append(none)
+                    else:
+                        vals.append(_pg_decode(oids[i], p[off:off + ln]))
+                        off = off + ln
+                rows.append(vals)
+            elif kind == b"T":
+                let n = _r16(p, 0)
+                var off = 2
+                cols = []
+                oids = []
+                for i in range(n):
+                    let e = p.find(b"\x00", off)
+                    cols.append(p[off:e].decode())
+                    off = e + 1
+                    oids.append(_r32(p, off + 6))
+                    off = off + 18
+            elif kind == b"C":
+                status = p[0:len(p) - 1].decode()
+            elif kind == b"E":
+                err = self._error(p)
+            elif kind == b"N":
+                self.notices.append(str(self._error(p)))
+            elif kind == b"A":
+                let pid = _r32(p, 0)
+                let parts = _split0(p[4:])
+                self.notifications.append((parts[0].decode(), parts[1].decode(), pid))
+            elif kind == b"Z":
+                if err != none:
+                    raise err
+                let parts = status.split()
+                let last = parts[len(parts) - 1] if len(parts) > 0 else ""
+                let count = int(last) if last != "" and last.isdigit() else len(rows)
+                return _result(cols if cols != none else [], rows, status, count)
+    fn _prepare(self, sql):
+        if sql in self._stmts:
+            return self._stmts[sql]
+        self._n = self._n + 1
+        let name = f"apsi_{self._n}".encode()
+        self.s.send(_pg_msg(b"P", name + b"\x00" + sql.encode() + b"\x00" + _i16(0)) + _pg_msg(b"D", b"S" + name + b"\x00") + _pg_msg(b"S"))
+        var oids = []
+        var err = none
+        while true:
+            let m = self._msg()
+            if m[0] == b"t":
+                let n = _r16(m[1], 0)
+                oids = [_r32(m[1], 2 + 4 * i) for i in range(n)]
+            elif m[0] == b"E":
+                err = self._error(m[1])
+            elif m[0] == b"Z":
+                break
+        if err != none:
+            raise err
+        if len(self._stmts) >= 256:
+            let old_sql = list(self._stmts.keys())[0]
+            let old = self._stmts[old_sql][0]
+            self._stmts.pop(old_sql)
+            self.s.send(_pg_msg(b"C", b"S" + old + b"\x00") + _pg_msg(b"S"))
+            self._read_until_ready()
+        self._stmts[sql] = [name, oids]
+        return self._stmts[sql]
+    fn query(self, sql, *params):
+        let st = self._prepare(str(sql))
+        let name = st[0]
+        let oids = st[1]
+        var bind = b"\x00" + name + b"\x00" + _i16(0) + _i16(len(params))
+        for i in range(len(params)):
+            let v = _pg_param(params[i], oids[i] if i < len(oids) else 0)
+            bind = bind + (_i32(-1) if v == none else _i32(len(v)) + v)
+        bind = bind + _i16(0)
+        self.s.send(_pg_msg(b"B", bind) + _pg_msg(b"D", b"P\x00") + _pg_msg(b"E", b"\x00" + _i32(0)) + _pg_msg(b"S"))
+        return self._read_until_ready()
+    fn execute(self, sql):
+        self.s.send(_pg_msg(b"Q", str(sql).encode() + b"\x00"))
+        return self._read_until_ready()
+    fn insert_many(self, table, rows, columns=none, chunk=1000):
+        var rs = []
+        for r in rows:
+            rs.append(list(r.values()) if isinstance(r, dict) else list(r))
+        if len(rs) == 0:
+            return 0
+        let ncol = len(rs[0])
+        let cols = " (" + ", ".join([_ident(c) for c in columns]) + ")" if columns != none else ""
+        var total = 0
+        with self.transaction():
+            for i in range(0, len(rs), chunk):
+                let part = rs[i:i + chunk]
+                var groups = []
+                for k in range(len(part)):
+                    groups.append("(" + ", ".join([f"${k * ncol + j + 1}" for j in range(ncol)]) + ")")
+                var flat = []
+                for r in part:
+                    for v in r:
+                        flat.append(v)
+                total = total + self.query(f"insert into {_ident(table)}{cols} values " + ", ".join(groups), *flat).rowcount
+        return total
+    fn transaction(self):
+        var t = _Tx()
+        t.conn = self
+        return t
+    fn listen(self, channel):
+        self.execute(f"listen {_ident(channel)}")
+    fn notify(self, channel, payload=""):
+        self.query("select pg_notify($1, $2)", channel, payload)
+    fn poll(self, timeout=0.0):
+        if len(self.notifications) == 0 and timeout:
+            __net("timeout", self.s.h, float(timeout))
+            try:
+                let m = self._msg()
+                if m[0] == b"A":
+                    let pid = _r32(m[1], 0)
+                    let parts = _split0(m[1][4:])
+                    self.notifications.append((parts[0].decode(), parts[1].decode(), pid))
+            except TimeoutError:
+                pass
+            __net("timeout", self.s.h, 0.0)
+        let out = self.notifications
+        self.notifications = []
+        return out
+    fn close(self):
+        try:
+            self.s.send(_pg_msg(b"X"))
+        except Exception:
+            pass
+        self.s.close()
+    fn __enter__(self) = self
+    fn __exit__(self, kind, value, tb):
+        self.close()
+        return false
+    fn __str__(self) = f"<postgres {self.user}@{self.host}:{self.port}/{self.database}>"
+
+fn postgres(url=none, host="localhost", port=5432, user=none, password=none, database=none, timeout=10.0, sslmode=none, application_name="apsi"):
+    var h = host
+    var pt = port
+    var us = user
+    var pw = _plainv(password)
+    var dbn = database
+    var mode = sslmode
+    if url != none:
+        let u = _parse_url(_plainv(url))
+        h = u.host if u.host != none else h
+        pt = u.port if u.port != none else pt
+        if u.user != none and u.user != "":
+            us = u.user
+        if u.password != none:
+            pw = u.password
+        if u.path != "" and u.path != "/":
+            dbn = u.path[1:]
+        if "sslmode" in u.params:
+            mode = u.params["sslmode"]
+    if not us:
+        us = getenv("PGUSER") or "postgres"
+    if pw == none:
+        pw = getenv("PGPASSWORD")
+    if not dbn:
+        dbn = us
+    var c = Postgres()
+    c.host = h
+    c.port = pt
+    c.user = us
+    c.database = dbn
+    c.params = {}
+    c.notices = []
+    c.notifications = []
+    c._stmts = {}
+    c.s = _connect(h, pt, timeout)
+    if mode == "require" or mode == "verify-ca" or mode == "verify-full":
+        c.s.send(_i32(8) + _i32(80877103))
+        if c.s.read(1) != b"S":
+            raise DatabaseError("the server does not support TLS")
+        _netcall(__net("tls", c.s.h, str(h)) or none)
+    __net("timeout", c.s.h, 0.0)
+    var body = b""
+    for kv in [["user", us], ["database", dbn], ["application_name", application_name], ["client_encoding", "UTF8"]]:
+        body = body + kv[0].encode() + b"\x00" + str(kv[1]).encode() + b"\x00"
+    body = body + b"\x00"
+    c.s.send(_i32(len(body) + 8) + _i32(196608) + body)
+    c._auth(pw)
+    return c
+
 fn _net_only(name) = DatabaseError(f"db.{name}() needs a network client that native programs do not have yet; run this program with apsi run")
-fn postgres(url=none, **kw):
-    raise _net_only("postgres")
-fn redis(url=none, **kw):
-    raise _net_only("redis")
 fn mysql(url=none, **kw):
     raise _net_only("mysql")
 fn mariadb(url=none, **kw):

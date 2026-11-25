@@ -126,3 +126,91 @@ def test_runtime_version_matches():
     import apsi
     src = (Path(apsi.__file__).parent / "aot" / "rt" / "apsi_lib.c").read_text(encoding="utf-8")
     assert re.search(r'#define APSI_VERSION "([^"]+)"', src).group(1) == apsi.__version__
+
+
+@pytest.mark.skipif(CC is None, reason="no C compiler")
+def test_http_client_native(tmp_path):
+    """http_get / http_post_json / redirects / errors against a local server (HTTPS is checked by the Windows test)."""
+    import http.server
+    import json
+    import threading
+
+    class H(http.server.BaseHTTPRequestHandler):
+        def log_message(self, *a):
+            pass
+
+        def _send(self, code, body, extra=()):
+            self.send_response(code)
+            for k, v in extra:
+                self.send_header(k, v)
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def do_GET(self):
+            if self.path == "/redir":
+                return self._send(302, b"", [("Location", "/hello?x=1")])
+            if self.path.startswith("/hello"):
+                return self._send(200, ("héllo " + self.path).encode())
+            return self._send(404, b"no")
+
+        def do_POST(self):
+            d = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+            self._send(200, json.dumps({"got": d}).encode())
+
+    srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), H)
+    port = srv.server_address[1]
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    src = tmp_path / "client.apsi"
+    src.write_text(f'''let base = "http://127.0.0.1:{port}"
+print(http_get(base + "/hello"))
+print(http_get(base + "/redir"))
+print(http_post_json(base + "/p", {{"a": [1, 2]}}))
+try:
+    http_get(base + "/missing")
+except Exception as e:
+    print("error:", e)
+''', encoding="utf-8")
+    from apsi.aot.build import build
+    exe = build(str(src), str(tmp_path / "client"))
+    got = subprocess.run([exe], capture_output=True, text=True, encoding="utf-8", timeout=60)
+    srv.shutdown()
+    assert got.returncode == 0, got.stderr
+    assert got.stdout.splitlines() == ["héllo /hello", "héllo /hello?x=1", '{"got": {"a": [1, 2]}}',
+                                       "error: HTTP Error 404: Not Found"]
+
+
+def _native_matches_host(tmp_path, src_text, name):
+    from apsi.aot.build import build
+    src = tmp_path / f"{name}.apsi"
+    src.write_text(src_text, encoding="utf-8")
+    env = dict(os.environ, PYTHONPATH=os.path.dirname(HERE) + os.pathsep + os.environ.get("PYTHONPATH", ""))
+    want = subprocess.run([sys.executable, "-m", "apsi", "run", "--allow-net", "--allow-env", str(src)], capture_output=True,
+                          text=True, cwd=str(tmp_path), env=env, timeout=120)
+    exe = build(str(src), str(tmp_path / name))
+    got = subprocess.run([exe], capture_output=True, text=True, cwd=str(tmp_path), timeout=120)
+    assert got.stdout == want.stdout, (got.stdout, got.stderr, want.stderr)
+
+
+@pytest.mark.skipif(CC is None or shutil.which("redis-server") is None, reason="needs redis-server")
+def test_redis_native(tmp_path):
+    import socket
+    import time
+    s = socket.socket()
+    s.bind(("127.0.0.1", 0))
+    port = s.getsockname()[1]
+    s.close()
+    srv = subprocess.Popen(["redis-server", "--port", str(port), "--save", "", "--appendonly", "no", "--requirepass", "sekret"],
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    try:
+        time.sleep(0.5)
+        prog = open(os.path.join(HERE, "native_net", "redis.apsi"), encoding="utf-8").read().replace("PORT", str(port))
+        _native_matches_host(tmp_path, prog, "redis_client")
+    finally:
+        srv.terminate()
+
+
+@pytest.mark.skipif(CC is None or not os.environ.get("APSI_TEST_PG_URL"), reason="set APSI_TEST_PG_URL to a PostgreSQL server")
+def test_postgres_native(tmp_path):
+    prog = open(os.path.join(HERE, "native_net", "postgres.apsi"), encoding="utf-8").read().replace("PG_URL", os.environ["APSI_TEST_PG_URL"])
+    _native_matches_host(tmp_path, prog, "pg_client")

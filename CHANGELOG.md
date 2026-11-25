@@ -23,7 +23,8 @@
   (pipelines), `layers` (MLPs, CNNs, recurrent layers, attention with grouped-query heads / RoPE / QK norm,
   transformer language models, `fit`), `models` (safetensors and `.apsim` checkpoints, interchangeable with
   `apsi run`), `web` (an HTTP/1.1 server on Apsi's own event loop), `crypto` (SHA-2, SHA-3, BLAKE2, HMAC, scrypt), `special`, `signal`, `config`, `env`, `log`,
-  `physics` (constants, formulas with units, fields) and `pde` (heat, waves, advection, Poisson, Navier–Stokes, CG), `mechanics`, `precision`, `lab`, `sys` / `gpu`, `tokens`, `dataframe` (group-by, joins, sorts and CSV parsing in C), `db.sqlite` (on the system's SQLite library).
+  `physics` (constants, formulas with units, fields) and `pde` (heat, waves, advection, Poisson, Navier–Stokes, CG), `mechanics`, `precision`, `lab`, `sys` / `gpu`, `tokens`, `dataframe` (group-by, joins, sorts and CSV parsing in C), `db.sqlite` (on the system's SQLite library), `db.postgres` and `db.redis` (in Apsi on native TCP), `net` with `http_get` / `http_post_json` (WinHTTP on Windows, OpenSSL elsewhere).
+- Native errors raised inside Apsi's own library are reported at the line of the program that called it, with the program's own call chain.
 - Native `bytes`: literals, indexing, slicing, iteration, `+` / `*`, `in`, `decode` / `encode`, `hex` / `bytes.fromhex`, `split` / `join` / `replace` / `strip`, as keys; SQLite BLOBs and the crypto functions take them; `UnicodeDecodeError`, `ConnectionRefusedError` and more built-in exceptions.
 - Native `with` follows Python: `__exit__` gets the exception and can swallow it, several items work; `except module.Error`; `obj.__class__`; `type(x) == SomeClass`.
 - `apsi run`: `db.sqlite` raises `db.DatabaseError` for SQLite errors, and `transaction()` commits (it used to fail with "no transaction is active").

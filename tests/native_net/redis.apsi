@@ -1,0 +1,25 @@
+use db
+let r = db.redis("redis://:sekret@127.0.0.1:PORT/2")
+r.flushdb()
+print(r.set("hits", 0), r.incr("hits"), r.incr("hits"), r.get("hits"), r.get("nope"))
+r.hset("user:1", "name", "ann", "age", 31)
+print(r.hgetall("user:1"), r.hget("user:1", "name"))
+let p = r.pipeline()
+for i in range(5):
+    p.rpush("queue", i)
+p.lrange("queue", 0, -1)
+print(p.execute())
+print(r.lrange("queue", 1, 3), r.command("LLEN", "queue"), r.delete("queue"), r.exists("queue"), r.type_("user:1"))
+r.set("j", {"a": [1, 2], "u": "ß"})
+print(r.get("j"), r.set("b", true), r.get("b"), r.set("f", 2.5), r.incrbyfloat("f", 0.25), r.config_get("databases"))
+try:
+    r.incr("user:1")
+except db.RedisError as e:
+    print("error:", e)
+print(r)
+r.close()
+try:
+    db.redis("redis://127.0.0.1:PORT/0")
+    print("no auth ok")
+except Exception as e:
+    print("unauth fine")

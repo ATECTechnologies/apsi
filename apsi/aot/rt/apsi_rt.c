@@ -359,6 +359,23 @@ static void print_source_line(int line, int col) {
     const char *e = strchr(p, '\n'); int n = e ? (int)(e - p) : (int)strlen(p);
     fprintf(stderr, "    %.*s\n    %*s^\n", n, p, col > 1 ? col - 1 : 0, "");
 }
+static const char **mod_files, **mod_srcs; static const unsigned char *mod_lib; static int mod_n;
+void a_modules(const char **files, const char **sources, const unsigned char *internal, int n) { mod_files = files; mod_srcs = sources; mod_lib = internal; mod_n = n; }
+static AV class_lookup(AClass *c, const char *name);
+static int frame_internal(const AFrame *f) { return f->mod > 0 && f->mod < mod_n && mod_lib[f->mod]; }
+static void print_line_of(const char *src, int line, int col) {
+    if (!src) return;
+    const char *p = src; int l = 1;
+    while (*p && l < line) { if (*p == '\n') l++; p++; }
+    if (!*p) return;
+    const char *e = strchr(p, '\n'); int n = e ? (int)(e - p) : (int)strlen(p);
+    fprintf(stderr, "    %.*s\n    %*s^\n", n, p, col > 1 ? col - 1 : 0, "");
+}
+static int exc_reports_kind(AInst *s) {                         /* library errors print as "DatabaseError: ..." */
+    if (!s) return 0;
+    AV v = class_lookup(s->cls, "__report_kind__");
+    return v.t != 255 && a_truthy(v);
+}
 _Noreturn void a_raise(AV exc) {
     if (a_is(exc, O_CLASS)) exc = make_exc(exc, a_str(""));
     if (a_is(exc, O_STR)) exc = make_exc(a_exc_classes[31], exc);     /* raise "message" */
@@ -366,11 +383,17 @@ _Noreturn void a_raise(AV exc) {
     if (!a_handler) {
         AV msg = a_to_str(exc);
         AInst *s = a_is(exc, O_INST) ? (AInst *)exc.o : NULL;
-        int pos = a_frame ? a_frame->pos : 0, line = pos >> 12, col = pos & 4095;
+        AFrame *at = a_frame;                                    /* the error is shown where the program's own code is */
+        while (at && frame_internal(at) && at->prev) at = at->prev;
+        if (at && frame_internal(at)) at = a_frame;
+        int pos = at ? at->pos : 0, line = pos >> 12, col = pos & 4095;
+        const char *file = at && at->mod > 0 && at->mod < mod_n ? mod_files[at->mod] : a_file;
+        const char *src = at && at->mod > 0 && at->mod < mod_n ? mod_srcs[at->mod] : a_source;
         fflush(stdout);
-        fprintf(stderr, "%s:%d:%d: RuntimeError: %s: %s\n", a_file, line, col, s ? s->cls->name->s : "Exception", STR(msg)->s);
-        print_source_line(line, col);
-        for (AFrame *f = a_frame; f; f = f->prev) if (f->name && strcmp(f->name, "<module>")) fprintf(stderr, "  in %s()\n", f->name);
+        if (exc_reports_kind(s)) fprintf(stderr, "%s:%d:%d: %s: %s\n", file, line, col, s->cls->name->s, STR(msg)->s);
+        else fprintf(stderr, "%s:%d:%d: RuntimeError: %s: %s\n", file, line, col, s ? s->cls->name->s : "Exception", STR(msg)->s);
+        print_line_of(src, line, col);
+        for (AFrame *f = at; f; f = f->prev) if (f->name && strncmp(f->name, "<module", 7) && !frame_internal(f)) fprintf(stderr, "  in %s()\n", f->name);
         exit(1);
     }
     AHandler *h = a_handler;

@@ -60,7 +60,8 @@ static inline AV a_obj(void *o) { AV v; v.t = T_OBJ; v.o = (AObj *)o; return v; 
 static inline int a_is(AV v, AKind k) { return v.t == T_OBJ && v.o->kind == k; }
 
 /* ------------------------------------------------------------------ memory */
-typedef struct AFrame { struct AFrame *prev; int n; AV *slots; const char *name; int pos; } AFrame;   /* pos: line << 12 | column */
+typedef struct AFrame { struct AFrame *prev; int n; AV *slots; const char *name; int pos; int mod; } AFrame;   /* pos: line << 12 | column; mod: the file (0: the program) */
+void a_modules(const char **files, const char **sources, const unsigned char *internal, int n);
 extern AFrame *a_frame;
 void a_gc_safe(void);
 void a_gc_full(void);                       /* collect now (the card ran out of memory) */                      /* a safe point: collects when enough was allocated */

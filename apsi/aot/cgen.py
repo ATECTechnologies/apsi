@@ -76,6 +76,7 @@ NATIVE_MODULES = {
 # names apsi run has without a `use` (the interpreter puts the precision module's names in the globals)
 AUTO_LIB = {n: "precision" for n in ("quantize", "dequantize", "round_to", "qmatmul", "quant_error", "format_info",
                                       "fp8_e4m3", "fp8_e5m2", "fp6_e3m2", "fp6_e2m3", "fp4_e2m1", "fp8", "bf8", "e4m3", "e5m2", "fp6", "fp4")}
+AUTO_LIB.update({"http_get": "net", "http_post_json": "net"})
 
 # Python modules a native program gets as Apsi library modules (`import asyncio`, pyimport("asyncio"))
 PY_NATIVE = {"asyncio"}
@@ -680,6 +681,7 @@ class CGen:
         self.mod_scope = None
         self.analyzer = None
         self.mod_id = 0              # which file's globals: 0 the program, 1.. its modules
+        self.mod_info = {}           # module id -> (file, source or None, part of Apsi's own library)
         self.base_dir = os.path.dirname(os.path.abspath(filename)) if filename else "."
         self.local_mods = {}         # path -> (id, init function, public names)
         self.compiling = set()       # module files being compiled now
@@ -764,12 +766,17 @@ class CGen:
             return self.local_mods[path]
         from ..parser import parse, static_public
         with open(path, encoding="utf-8-sig") as fh:
-            prog = parse(fh.read())
+            text = fh.read()
+            prog = parse(text)
         self.n_mods += 1
         mid = self.n_mods
         cname = f"mod{mid}_body"
         pub = list(static_public(prog))
         self.local_mods[path] = (mid, cname, pub)
+        aot_dir = os.path.dirname(os.path.abspath(__file__))
+        internal = os.path.abspath(path).startswith(os.path.join(aot_dir, "lib") + os.sep) or \
+            os.path.abspath(path) == os.path.abspath(PRELUDE)
+        self.mod_info[mid] = (path, None if internal else text, internal)
         self.compiling.add(path)
         saved = (self.fn, self.mod_scope, self.analyzer, self.mod_id, self.base_dir)
         self.fn = None
@@ -897,6 +904,17 @@ class CGen:
         out.append("    a_init(argc, argv);")
         out.append(f"    a_file = {cstr(self.filename)};")
         out.append(f"    a_source = {cstr(self.source)};")
+        if self.mod_info:
+            n = max(self.mod_info) + 1
+            files = ["NULL"] * n
+            srcs = ["NULL"] * n
+            libs = ["0"] * n
+            for mid, (path, text, internal) in self.mod_info.items():
+                files[mid] = cstr(os.path.relpath(path) if not internal else os.path.basename(path))
+                srcs[mid] = cstr(text) if text is not None else "NULL"
+                libs[mid] = "1" if internal else "0"
+            out.append(f"    static const char *mf[] = {{{', '.join(files)}}}; static const char *ms[] = {{{', '.join(srcs)}}};")
+            out.append(f"    static const unsigned char ml[] = {{{', '.join(libs)}}}; a_modules(mf, ms, ml, {n});")
         from ..units import _DISPLAY_MAP
         names = [f"{{{self.dim_c(d)}, {cstr(n)}}}" for d, n in _DISPLAY_MAP.items()]
         out.append(f"    static const AUnitName un[] = {{{', '.join(names)}}};")
@@ -920,6 +938,7 @@ class CGen:
         """Compile one function into self.fns; returns its Fn."""
         outer = self.fn
         fn = Fn(cname, scope, name)
+        fn.mod = self.mod_id
         self.fn = fn
         self.fns.append(fn)
         self.params(params or [])
@@ -950,7 +969,7 @@ class CGen:
                 f"    AV S[{nslots}]; enum {{ T = {fn.nlocal} }};",
                 f"    for (int i = 0; i < {nslots}; i++) S[i] = A_NONE;",
                 "    if (self) S[0] = a_obj(self);",
-                f"    AFrame fr = {{a_frame, {nslots}, S, {cstr(name)}, 0}}; a_frame = &fr;",
+                f"    AFrame fr = {{a_frame, {nslots}, S, {cstr(name)}, 0, {fn.mod}}}; a_frame = &fr;",
                 "    (void)n; (void)args; (void)kw;"]
         fn.text = head + fn.lines + ["}"]
         self.fn = outer
