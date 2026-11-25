@@ -80,7 +80,8 @@ def compile_shared(src, cache_dir=None):
         cmd[1:1] = ["-fPIC"]
     else:
         from .toolchain import link_flags
-        cmd += link_flags(tool) + (["-static-libgcc"] + (["-static-libstdc++"] if cxx else []) if "clang" not in os.path.basename(tool).lower() else ["-static"])
+        cmd[1:1] = link_flags(tool)
+        cmd += ["-static-libgcc"] + (["-static-libstdc++"] if cxx else []) if "clang" not in os.path.basename(tool).lower() else ["-static"]
     cmd[1:1] = ["-std=c++17"] if cxx else ["-std=gnu11"]
     r = subprocess.run(cmd, capture_output=True, text=True)
     if r.returncode != 0:

@@ -116,6 +116,8 @@ def build(path, out=None, opt="-O3", keep_c=False, target=None):
     elif not os.environ.get("APSI_PORTABLE"):
         cmd[1:1] = ["-march=native", "-mprefer-vector-width=512"]   # built where it runs: every vector unit it has
     cmd[1:1] = ["-fno-math-errno"]
+    from .toolchain import link_flags
+    cmd[1:1] = link_flags(cc, target)             # llvm-mingw: compiler-rt, libunwind, libc++, lld
     flags = [x for x in cmd[1:] if x not in (cfile, "-o", out)]
     objs_rt = runtime_objects(cc, flags, rt_src, target)
     windows = os.name == "nt" or "windows" in (target or "") or "mingw" in (target or "")
@@ -130,7 +132,7 @@ def build(path, out=None, opt="-O3", keep_c=False, target=None):
             if f.lower().endswith(CXX_SUFFIXES):
                 any_cxx = True
                 o = os.path.join(work, f"cxx{i}.o")
-                rc = subprocess.run([cxx_of(cc), opt, "-std=c++17"] + cxx_include_flags(cxx_of(cc)) + ["-I", os.path.dirname(f), "-c", f, "-o", o]
+                rc = subprocess.run([cxx_of(cc), opt, "-std=c++17"] + (["-target", target] if target else []) + link_flags(cc, target) + cxx_include_flags(cxx_of(cc)) + ["-I", os.path.dirname(f), "-c", f, "-o", o]
                                     + (["-fPIC"] if os.name != "nt" else []), capture_output=True, text=True)
                 if rc.returncode != 0:
                     shutil.rmtree(work, ignore_errors=True)
@@ -149,8 +151,6 @@ def build(path, out=None, opt="-O3", keep_c=False, target=None):
             cmd.insert(cmd.index("-o"), o)
         windows_t = os.name == "nt" or "windows" in (target or "") or "mingw" in (target or "")
         cmd += ["-Wl,--export-all-symbols"] if windows_t else (["-rdynamic"] if sys.platform != "darwin" else [])
-    from .toolchain import link_flags
-    cmd += link_flags(cc, target)
     at = cmd.index("-o")                       # the runtime's objects: after any `-x c` (read as objects, not as C)
     cmd[at:at] = (["-x", "none"] if "-x" in cmd[:at] and cmd[:at][::-1][cmd[:at][::-1].index("-x") - 1] != "none"
                   else []) + objs_rt

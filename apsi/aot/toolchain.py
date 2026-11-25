@@ -50,6 +50,8 @@ def trim(tree):
         full = os.path.join(tree, name)
         if name == "bin":
             for f in os.listdir(full):
+                if f.endswith(".cfg"):
+                    continue                      # clang's configuration (target, runtime libraries, lld)
                 if not f.startswith(KEEP_BIN) or f.startswith(("clang-tidy", "clang-format", "clangd", "clang-scan", "lldb")):
                     p = os.path.join(full, f)
                     if os.path.isfile(p) and not f.endswith(".dll"):
@@ -128,8 +130,15 @@ if __name__ == "__main__":
 
 
 def link_flags(cc, target=None):
-    """clang for Windows links with lld itself: the triple-named `ld` in some llvm-mingw folders is a shell script
-    that Windows cannot start (error 0xC1)."""
+    """What llvm-mingw's configuration files say, given on the command line: the target, compiler-rt, libunwind,
+    libc++ and lld. Without them clang for Windows looks for libgcc and libstdc++, which llvm-mingw does not have
+    ('unable to find library -lgcc', 'cmath' not found), and for a triple-named `ld` that Windows cannot start."""
     name = os.path.basename(cc).lower()
     windows = os.name == "nt" or "windows" in (target or "") or "mingw" in (target or "")
-    return ["-fuse-ld=lld"] if windows and "clang" in name else []
+    if not (windows and "clang" in name) or "msvc" in (target or ""):
+        return []
+    flags = ["-rtlib=compiler-rt", "-unwindlib=libunwind", "-stdlib=libc++", "-fuse-ld=lld",
+             "-Wno-unused-command-line-argument"]
+    if not target:
+        flags.insert(0, "--target=x86_64-w64-mingw32")
+    return flags
