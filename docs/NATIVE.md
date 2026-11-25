@@ -75,6 +75,14 @@ stays exact float32. `apsi cuda` shows what is found and `apsi cuda install` add
 [GPU.md](GPU.md#cuda-libraries)). Freed card memory is kept for reuse (up to a quarter of the card, or
 `APSI_GPU_CACHE_MB`) and given back when an allocation would fail.
 
+### Programs converted from Python
+
+`apsi convert prog.py` writes `use pycompat` at the top; such a program builds natively too and prints what Python
+prints: `None` / `True`, `'strings'` inside lists, CPython's order for sets of Ints, `%`-formatting, `str.format`,
+`type(x)` as the type, `@property` (with setters), `@staticmethod`, `@classmethod`, `super().__init__()`, `__name__`,
+`frozenset`, `issubclass`, and native stand-ins for `math`, `collections` (Counter, defaultdict, deque, namedtuple,
+OrderedDict), `functools`, `itertools`, `typing`, `dataclasses`, `copy` and `sys`.
+
 ### Numbers
 
 Ints have no size limit, as in `apsi run`: a result beyond 64 bits becomes an Int of any size (`2 ** 200`,
@@ -139,7 +147,8 @@ These programs keep running with `apsi run`. A native build that reaches one of 
 - graph networks, mixtures of experts and `fit_batches` in `layers`; GGUF, ONNX and PyTorch files in `models`;
   `text_dataset`, `train_tokenizer` and Parquet in `data`; websockets and TLS in `web` (serve HTTPS through a
   reverse proxy); `tokens.focus` / `fit_chat` / `outline` (they read Python syntax trees); `db.mysql` / `mongo`, `db.pool`, PostgreSQL / Redis over TLS on Windows; `layout`'s `numpy_dtype()`
-- the modules `hub`, `memory`, `rt` (camera and video), `python` and `pycompat` (programs converted from Python)
+- the modules `hub`, `memory`, `rt` (camera and video), `python`; in programs converted from Python, Python modules
+  other than math, collections, functools, itertools, typing, dataclasses, copy and sys
 - Python modules (`pyimport`, `import numpy`), except `asyncio`
 - random numbers: native programs use their own generator, so a seed gives different numbers than in `apsi run`
   (the same seed always gives the same numbers in native programs)

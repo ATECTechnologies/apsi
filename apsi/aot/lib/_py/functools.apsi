@@ -1,0 +1,53 @@
+# Python's functools for converted programs
+fn reduce(f, iterable, *initial):
+    let xs = list(iterable)
+    var i = 0
+    var acc = none
+    if len(initial) > 0:
+        acc = initial[0]
+    else:
+        if len(xs) == 0:
+            raise TypeError("reduce() of empty iterable with no initial value")
+        acc = xs[0]
+        i = 1
+    while i < len(xs):
+        acc = f(acc, xs[i])
+        i = i + 1
+    return acc
+
+fn partial(f, *a, **k):
+    fn call(*b, **k2):
+        var kk = dict(k)
+        kk.update(k2)
+        return f(*(list(a) + list(b)), **kk)
+    return call
+
+fn _memo(f):
+    var cache = {}
+    fn call(*args):
+        let key = tuple(args)
+        if key in cache:
+            return cache[key]
+        let v = f(*args)
+        cache[key] = v
+        return v
+    return call
+
+fn lru_cache(maxsize=128, typed=false):
+    if callable(maxsize) and not isinstance(maxsize, int):
+        return _memo(maxsize)
+    return _memo
+
+fn cache(f) = _memo(f)
+fn wraps(wrapped, *a, **k) = fn(f) => f
+fn cmp_to_key(cmp):
+    class K:
+        fn __init__(self, obj):
+            self.obj = obj
+        fn __lt__(self, other) = cmp(self.obj, other.obj) < 0
+        fn __gt__(self, other) = cmp(self.obj, other.obj) > 0
+        fn __eq__(self, other) = cmp(self.obj, other.obj) == 0
+        fn __le__(self, other) = cmp(self.obj, other.obj) <= 0
+        fn __ge__(self, other) = cmp(self.obj, other.obj) >= 0
+    return K
+fn total_ordering(cls) = cls

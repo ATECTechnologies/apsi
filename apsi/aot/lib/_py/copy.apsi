@@ -1,0 +1,22 @@
+# copy for converted programs
+fn copy(x):
+    if isinstance(x, list):
+        return list(x)
+    if isinstance(x, dict):
+        return dict(x)
+    if isinstance(x, set):
+        return set(x)
+    return x
+fn deepcopy(x, memo=none):
+    if isinstance(x, list):
+        return [deepcopy(v) for v in x]
+    if isinstance(x, tuple):
+        return tuple([deepcopy(v) for v in x])
+    if isinstance(x, dict):
+        var d = {}
+        for k in x:
+            d[k] = deepcopy(x[k])
+        return d
+    if isinstance(x, set):
+        return set(x)
+    return x

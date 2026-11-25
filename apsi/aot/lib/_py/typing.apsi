@@ -1,0 +1,36 @@
+# typing for converted programs: the annotations are not checked, so every name is a plain marker
+class _Any:
+    fn __getitem__(self, k) = self
+    fn __call__(self, *a, **k) = a[0] if len(a) > 0 else none
+    fn __or__(self, other) = self
+let Any = _Any()
+let List = Any
+let Dict = Any
+let Set = Any
+let FrozenSet = Any
+let Tuple = Any
+let Optional = Any
+let Union = Any
+let Callable = Any
+let Iterable = Any
+let Iterator = Any
+let Generator = Any
+let Sequence = Any
+let Mapping = Any
+let MutableMapping = Any
+let Type = Any
+let TypeVar = Any
+let Generic = Any
+let Literal = Any
+let ClassVar = Any
+let Final = Any
+let NoReturn = Any
+let Protocol = Any
+let Annotated = Any
+let Deque = Any
+let DefaultDict = Any
+fn cast(t, v) = v
+fn overload(f) = f
+fn final(f) = f
+let TYPE_CHECKING = false
+fn NamedTuple(*a, **k) = Any

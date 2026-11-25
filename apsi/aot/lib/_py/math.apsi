@@ -1,0 +1,105 @@
+# Python's math for converted programs
+let pi = 3.141592653589793
+let e = 2.718281828459045
+let tau = 6.283185307179586
+let inf = __builtin("float")("inf")
+let nan = __builtin("float")("nan")
+let sqrt = __builtin("sqrt")
+let exp = __builtin("exp")
+let sin = __builtin("sin")
+let cos = __builtin("cos")
+let tan = __builtin("tan")
+let asin = __builtin("asin")
+let acos = __builtin("acos")
+let atan = __builtin("atan")
+let atan2 = __builtin("atan2")
+let sinh = __builtin("sinh")
+let cosh = __builtin("cosh")
+let tanh = __builtin("tanh")
+let hypot = __builtin("hypot")
+let erf = __builtin("erf")
+let erfc = __builtin("erfc")
+let gamma = __builtin("gamma")
+let lgamma = __builtin("lgamma")
+let log2 = __builtin("log2")
+let log10 = __builtin("log10")
+let log1p = __builtin("log1p")
+let expm1 = __builtin("expm1")
+let factorial = __builtin("factorial")
+let comb = __builtin("comb")
+let _ln = __builtin("log")
+let _float = __builtin("float")
+let _int = __builtin("int")
+fn log(x, base=none) = _ln(x) if base == none else _ln(x) / _ln(base)
+fn floor(x) = _int(__builtin("floor")(x))
+fn ceil(x) = _int(__builtin("ceil")(x))
+fn trunc(x) = _int(x)
+fn fabs(x) = _float(abs(x))
+fn pow(x, y) = _float(x) ** y
+fn copysign(x, y) = abs(_float(x)) if (y > 0 or (y == 0 and 1.0 / _float(y) > 0)) else -abs(_float(x))
+fn degrees(x) = x * 180.0 / pi
+fn radians(x) = x * pi / 180.0
+fn isfinite(x) = not (x != x or x == inf or x == -inf)
+fn isinf(x) = x == inf or x == -inf
+fn isnan(x) = x != x
+fn isclose(a, b, rel_tol=1e-09, abs_tol=0.0) = a == b or abs(a - b) <= max(rel_tol * max(abs(a), abs(b)), abs_tol)
+fn gcd(*xs):
+    var g = 0
+    for x in xs:
+        var a = abs(g)
+        var b = abs(x)
+        while b:
+            let t = a % b
+            a = b
+            b = t
+        g = a
+    return g
+fn lcm(*xs):
+    var l = 1
+    for x in xs:
+        if x == 0:
+            return 0
+        l = abs(l * x) // gcd(l, x)
+    return l
+fn isqrt(n):
+    if n < 0:
+        raise ValueError("isqrt() argument must be nonnegative")
+    if n == 0:
+        return 0
+    var x = _int(__builtin("sqrt")(_float(n)))
+    while x * x > n:
+        x = x - 1
+    while (x + 1) * (x + 1) <= n:
+        x = x + 1
+    return x
+fn prod(xs, start=1):
+    var p = start
+    for x in xs:
+        p = p * x
+    return p
+fn fsum(xs):
+    var s = 0.0
+    var c = 0.0
+    for x in xs:
+        let y = x - c
+        let t = s + y
+        c = (t - s) - y
+        s = t
+    return s
+fn perm(n, k=none):
+    let kk = n if k == none else k
+    var p = 1
+    for i in range(n - kk + 1, n + 1):
+        p = p * i
+    return p
+fn modf(x):
+    let i = _float(_int(x))
+    return (x - i, i)
+fn frexp(x):
+    if x == 0:
+        return (0.0, 0)
+    var e = _int(floor(log2(abs(x)))) + 1
+    var m = x / 2.0 ** e
+    return (m, e)
+fn ldexp(x, i) = x * 2.0 ** i
+fn dist(p, q) = sqrt(sum([(a - b) ** 2 for a, b in zip(p, q)]))

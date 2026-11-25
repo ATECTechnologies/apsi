@@ -1,0 +1,220 @@
+# Python's collections for programs converted from Python (pyimport("collections") / pyfrom in native programs)
+
+class Counter:
+    fn __init__(self, iterable=none, **kw):
+        self.data = {}
+        if iterable != none:
+            self.update(iterable)
+        for k in kw:
+            self.data[k] = self.data.get(k, 0) + kw[k]
+    fn update(self, iterable=none, **kw):
+        if iterable != none:
+            if isinstance(iterable, dict) or isinstance(iterable, Counter):
+                for k in iterable:
+                    self.data[k] = self.data.get(k, 0) + iterable[k]
+            else:
+                for k in iterable:
+                    self.data[k] = self.data.get(k, 0) + 1
+        for k in kw:
+            self.data[k] = self.data.get(k, 0) + kw[k]
+    fn subtract(self, iterable):
+        if isinstance(iterable, dict) or isinstance(iterable, Counter):
+            for k in iterable:
+                self.data[k] = self.data.get(k, 0) - iterable[k]
+        else:
+            for k in iterable:
+                self.data[k] = self.data.get(k, 0) - 1
+    fn __getitem__(self, k) = self.data.get(k, 0)
+    fn __setitem__(self, k, v):
+        self.data[k] = v
+    fn __delitem__(self, k):
+        self.data.pop(k)
+    fn __contains__(self, k) = k in self.data
+    fn __len__(self) = len(self.data)
+    fn __iter__(self) = iter(list(self.data.keys()))
+    fn __eq__(self, other) = self.data == (other.data if isinstance(other, Counter) else other)
+    fn keys(self) = self.data.keys()
+    fn values(self) = self.data.values()
+    fn items(self) = self.data.items()
+    fn get(self, k, default=none) = self.data.get(k, default)
+    fn pop(self, k, *d) = self.data.pop(k, *d)
+    fn total(self) = sum(self.data.values())
+    fn elements(self):
+        var out = []
+        for k in self.data:
+            for i in range(self.data[k]):
+                out.append(k)
+        return iter(out)
+    fn most_common(self, n=none):
+        let ks = list(self.data.keys())
+        let order = sorted(range(len(ks)), key=fn(i) => -self.data[ks[i]])
+        let items = [(ks[i], self.data[ks[i]]) for i in order]
+        return items if n == none else items[0:n]
+    fn copy(self) = Counter(self.data)
+    fn __add__(self, other):
+        var c = Counter()
+        for k in self.data:
+            c.data[k] = self.data[k]
+        for k in other.data:
+            c.data[k] = c.data.get(k, 0) + other.data[k]
+        for k in list(c.data.keys()):
+            if c.data[k] <= 0:
+                c.data.pop(k)
+        return c
+    fn __sub__(self, other):
+        var c = Counter()
+        for k in self.data:
+            let v = self.data[k] - other.data.get(k, 0)
+            if v > 0:
+                c.data[k] = v
+        return c
+    fn __repr__(self):
+        if len(self.data) == 0:
+            return "Counter()"
+        let parts = [repr(kv[0]) + ": " + repr(kv[1]) for kv in self.most_common()]
+        return "Counter({" + ", ".join(parts) + "})"
+    fn __str__(self) = self.__repr__()
+
+fn _type_text(f):
+    let n = getattr(f, "__name__", none)
+    if f == list or f == dict or f == set or f == int or f == float or f == str or f == tuple:
+        return f"<class '{n}'>"
+    return repr(f)
+
+class defaultdict:
+    fn __init__(self, default_factory=none, *args):
+        self.default_factory = default_factory
+        self.data = dict(*args) if len(args) > 0 else {}
+    fn __getitem__(self, k):
+        if k in self.data:
+            return self.data[k]
+        if self.default_factory == none:
+            raise KeyError(k)
+        let v = self.default_factory()
+        self.data[k] = v
+        return v
+    fn __setitem__(self, k, v):
+        self.data[k] = v
+    fn __delitem__(self, k):
+        self.data.pop(k)
+    fn __contains__(self, k) = k in self.data
+    fn __len__(self) = len(self.data)
+    fn __iter__(self) = iter(list(self.data.keys()))
+    fn __eq__(self, other) = self.data == (other.data if isinstance(other, defaultdict) else other)
+    fn keys(self) = self.data.keys()
+    fn values(self) = self.data.values()
+    fn items(self) = self.data.items()
+    fn get(self, k, default=none) = self.data.get(k, default)
+    fn pop(self, k, *d) = self.data.pop(k, *d)
+    fn setdefault(self, k, v=none) = self.data.setdefault(k, v)
+    fn update(self, other):
+        self.data.update(other)
+    fn copy(self):
+        var d = defaultdict(self.default_factory)
+        d.data = dict(self.data)
+        return d
+    fn __repr__(self) = f"defaultdict({_type_text(self.default_factory)}, {repr(self.data)})"
+    fn __str__(self) = self.__repr__()
+
+class deque:
+    fn __init__(self, iterable=[], maxlen=none):
+        self.maxlen = maxlen
+        self.items = []
+        for x in iterable:
+            self.append(x)
+    fn append(self, x):
+        self.items.append(x)
+        if self.maxlen != none and len(self.items) > self.maxlen:
+            self.items.pop(0)
+    fn appendleft(self, x):
+        self.items.insert(0, x)
+        if self.maxlen != none and len(self.items) > self.maxlen:
+            self.items.pop()
+    fn pop(self):
+        if len(self.items) == 0:
+            raise IndexError("pop from an empty deque")
+        return self.items.pop()
+    fn popleft(self):
+        if len(self.items) == 0:
+            raise IndexError("pop from an empty deque")
+        return self.items.pop(0)
+    fn extend(self, xs):
+        for x in xs:
+            self.append(x)
+    fn extendleft(self, xs):
+        for x in xs:
+            self.appendleft(x)
+    fn rotate(self, n=1):
+        if len(self.items) == 0:
+            return
+        let k = n % len(self.items)
+        self.items = self.items[len(self.items) - k:] + self.items[0:len(self.items) - k]
+    fn clear(self):
+        self.items = []
+    fn count(self, x) = self.items.count(x)
+    fn index(self, x) = self.items.index(x)
+    fn remove(self, x):
+        self.items.remove(x)
+    fn reverse(self):
+        self.items.reverse()
+    fn __len__(self) = len(self.items)
+    fn __getitem__(self, i) = self.items[i]
+    fn __setitem__(self, i, v):
+        self.items[i] = v
+    fn __iter__(self) = iter(list(self.items))
+    fn __contains__(self, x) = x in self.items
+    fn __eq__(self, other) = self.items == (other.items if isinstance(other, deque) else other)
+    fn __bool__(self) = len(self.items) > 0
+    fn __repr__(self) = f"deque({repr(self.items)})" if self.maxlen == none else f"deque({repr(self.items)}, maxlen={self.maxlen})"
+    fn __str__(self) = self.__repr__()
+
+fn OrderedDict(*args, **kw):
+    var d = dict(*args) if len(args) > 0 else {}
+    for k in kw:
+        d[k] = kw[k]
+    return d
+
+class _NT:
+    fn __getitem__(self, i) = getattr(self, self._fields[i]) if isinstance(i, int) else [getattr(self, f) for f in self._fields][i]
+    fn __len__(self) = len(self._fields)
+    fn __iter__(self) = iter([getattr(self, f) for f in self._fields])
+    fn __eq__(self, other) = isinstance(other, _NT) and list(self) == list(other)
+    fn __hash__(self) = hash(tuple(list(self)))
+    fn _asdict(self):
+        var d = {}
+        for f in self._fields:
+            d[f] = getattr(self, f)
+        return d
+    fn _replace(self, **kw):
+        var vals = [kw[f] if f in kw else getattr(self, f) for f in self._fields]
+        return self._make(vals)
+    fn __repr__(self) = self._name + "(" + ", ".join([f + "=" + repr(getattr(self, f)) for f in self._fields]) + ")"
+    fn __str__(self) = self.__repr__()
+
+fn namedtuple(typename, field_names, defaults=none, rename=false, module=none):
+    let fields = field_names.replace(",", " ").split() if isinstance(field_names, str) else list(field_names)
+    let defs = list(defaults) if defaults != none else []
+    fn make(*args, **kw):
+        var t = _NT()
+        __setraw(t, "_fields", tuple(fields))
+        __setraw(t, "_name", typename)
+        let nd = len(fields) - len(defs)
+        for i in range(len(fields)):
+            let f = fields[i]
+            if i < len(args):
+                __setraw(t, f, args[i])
+            elif f in kw:
+                __setraw(t, f, kw[f])
+            elif i >= nd:
+                __setraw(t, f, defs[i - nd])
+            else:
+                raise TypeError(f"{typename}() missing required argument: '{f}'")
+        __setraw(t, "_make", fn(vals) => make(*vals))
+        return t
+    return make
+
+fn ChainMap(*maps):
+    var d = {}
+    for i in range(len(maps) - 1, -1, -1):
+        d.update(maps[i])
+    return d

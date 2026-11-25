@@ -273,3 +273,20 @@ print(s.count, s.spacing, s.positions, s.volume[:, 0, 0])
 print(m.window_level(d.pixels, 40, 400))
 '''
     _native_matches_host(tmp_path, prog, "dicom")
+
+
+@pytest.mark.skipif(CC is None, reason="no C compiler")
+@pytest.mark.parametrize("name", ["classes", "stdlib", "program", "text"])
+def test_converted_python_native(tmp_path, name):
+    """A Python program, converted by apsi convert (use pycompat) and built natively, prints what Python prints."""
+    import shutil
+    from apsi.aot.build import build
+    src = os.path.join(HERE, "native_py", name + ".py")
+    shutil.copy(src, tmp_path / (name + ".py"))
+    conv = subprocess.run([sys.executable, "-m", "apsi", "convert", str(tmp_path / (name + ".py")), "-o",
+                           str(tmp_path / (name + ".apsi"))], capture_output=True, text=True, cwd=os.path.dirname(HERE))
+    assert conv.returncode == 0, conv.stderr
+    want = subprocess.run([sys.executable, src], capture_output=True, text=True, cwd=tmp_path)
+    exe = build(str(tmp_path / (name + ".apsi")), str(tmp_path / name))
+    got = subprocess.run([exe], capture_output=True, text=True, cwd=tmp_path)
+    assert got.stdout == want.stdout, got.stderr

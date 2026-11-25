@@ -1,0 +1,46 @@
+# use pycompat in a native program (the first line of what apsi convert writes): Python's text for None, True,
+# 'strings' and ranges, and the Python built-ins Apsi does not have. Python modules the program imports come from
+# lib/_py (math, collections, functools, itertools, typing, dataclasses, copy, sys).
+__pymode(true)
+
+fn issubclass(c, base) = __subclass(c, base)
+class _FrozenSet:
+    fn __iter__(self) = iter(list(self.s))
+    fn __len__(self) = len(self.s)
+    fn __contains__(self, x) = x in self.s
+    fn __eq__(self, o) = self.s == (o.s if isinstance(o, _FrozenSet) else o)
+    fn __hash__(self) = hash(tuple(sorted([hash(x) for x in self.s])))
+    fn __or__(self, o) = frozenset(set(self.s) | set(o))
+    fn __and__(self, o) = frozenset(set(self.s) & set(o))
+    fn __sub__(self, o) = frozenset(set(self.s) - set(o))
+    fn union(self, *os):
+        var r = set(self.s)
+        for o in os:
+            r = r | set(o)
+        return frozenset(r)
+    fn intersection(self, o) = frozenset(set(self.s) & set(o))
+    fn issubset(self, o) = all([x in o for x in self.s])
+    fn issuperset(self, o) = all([x in self.s for x in o])
+    fn __repr__(self) = "frozenset()" if len(self.s) == 0 else "frozenset(" + repr(self.s) + ")"
+    fn __str__(self) = self.__repr__()
+fn frozenset(xs=[]):
+    var f = _FrozenSet()
+    __setraw(f, "s", set(xs))
+    return f
+fn ascii(x) = repr(x)
+fn vars(o) = __rec_dict(o) if __is_rec(o) else {}
+fn delattr(o, name):
+    raise AttributeError(f"delattr('{name}') is not available in native programs")
+class property:
+    fn __init__(self, fget=none, fset=none, fdel=none, doc=none):
+        self.fget = fget
+        self.fset = fset
+    fn setter(self, f) = property(self.fget, f)
+    fn getter(self, f) = property(f, self.fset)
+class staticmethod:
+    fn __init__(self, f):
+        self.f = f
+    fn __call__(self, *a, **k) = self.f(*a, **k)
+class classmethod:
+    fn __init__(self, f):
+        self.f = f

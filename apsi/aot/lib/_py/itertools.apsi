@@ -1,0 +1,184 @@
+# Python's itertools for converted programs (finite ones give lists; count / cycle / repeat stay lazy)
+fn combinations(iterable, r):
+    let pool = list(iterable)
+    let n = len(pool)
+    var out = []
+    if r > n:
+        return iter(out)
+    var idx = list(range(r))
+    out.append(tuple([pool[i] for i in idx]))
+    while true:
+        var i = r - 1
+        while i >= 0 and idx[i] == i + n - r:
+            i = i - 1
+        if i < 0:
+            return iter(out)
+        idx[i] = idx[i] + 1
+        for j in range(i + 1, r):
+            idx[j] = idx[j - 1] + 1
+        out.append(tuple([pool[k] for k in idx]))
+
+fn combinations_with_replacement(iterable, r):
+    let pool = list(iterable)
+    let n = len(pool)
+    var out = []
+    if n == 0 and r > 0:
+        return iter(out)
+    var idx = [0] * r
+    out.append(tuple([pool[i] for i in idx]))
+    while true:
+        var i = r - 1
+        while i >= 0 and idx[i] == n - 1:
+            i = i - 1
+        if i < 0:
+            return iter(out)
+        let v = idx[i] + 1
+        for j in range(i, r):
+            idx[j] = v
+        out.append(tuple([pool[k] for k in idx]))
+
+fn permutations(iterable, r=none):
+    let pool = list(iterable)
+    let n = len(pool)
+    let rr = n if r == none else r
+    var out = []
+    fn rec(prefix, used):
+        if len(prefix) == rr:
+            out.append(tuple([pool[i] for i in prefix]))
+            return
+        for i in range(n):
+            if not used[i]:
+                used[i] = true
+                prefix.append(i)
+                rec(prefix, used)
+                prefix.pop()
+                used[i] = false
+    if rr <= n:
+        rec([], [false] * n)
+    return iter(out)
+
+fn product(*iterables, repeat=1):
+    var pools = []
+    for k in range(repeat):
+        for it in iterables:
+            pools.append(list(it))
+    var result = [[]]
+    for pool in pools:
+        result = [x + [y] for x in result for y in pool]
+    return iter([tuple(p) for p in result])
+
+fn chain(*iterables):
+    var out = []
+    for it in iterables:
+        for x in it:
+            out.append(x)
+    return iter(out)
+
+fn accumulate(iterable, func=none, initial=none):
+    var out = []
+    var acc = initial
+    var first = initial == none
+    if initial != none:
+        out.append(initial)
+    for x in iterable:
+        if first:
+            acc = x
+            first = false
+        else:
+            acc = func(acc, x) if func != none else acc + x
+        out.append(acc)
+    return iter(out)
+
+fn groupby(iterable, key=none):
+    var out = []
+    var cur = []
+    var ck = none
+    var started = false
+    for x in iterable:
+        let k = key(x) if key != none else x
+        if started and k == ck:
+            cur.append(x)
+        else:
+            if started:
+                out.append((ck, iter(cur)))
+            ck = k
+            cur = [x]
+            started = true
+    if started:
+        out.append((ck, iter(cur)))
+    return iter(out)
+
+fn count(start=0, step=1):
+    var n = start
+    while true:
+        yield n
+        n = n + step
+
+fn cycle(iterable):
+    let xs = list(iterable)
+    if len(xs) == 0:
+        return
+    while true:
+        for x in xs:
+            yield x
+
+fn repeat(obj, times=none):
+    if times == none:
+        while true:
+            yield obj
+    else:
+        for i in range(times):
+            yield obj
+
+fn islice(iterable, *args):
+    var start = 0
+    var stop = none
+    var step = 1
+    if len(args) == 1:
+        stop = args[0]
+    elif len(args) >= 2:
+        start = args[0] if args[0] != none else 0
+        stop = args[1]
+        if len(args) > 2 and args[2] != none:
+            step = args[2]
+    var i = 0
+    var nxt = start
+    for x in iterable:
+        if stop != none and i >= stop:
+            return
+        if i == nxt:
+            yield x
+            nxt = nxt + step
+        i = i + 1
+
+fn starmap(f, iterable) = iter([f(*a) for a in iterable])
+fn zip_longest(*its, fillvalue=none):
+    let ls = [list(i) for i in its]
+    var n = 0
+    for l in ls:
+        n = max(n, len(l))
+    return iter([tuple([l[i] if i < len(l) else fillvalue for l in ls]) for i in range(n)])
+fn takewhile(pred, iterable):
+    var out = []
+    for x in iterable:
+        if not pred(x):
+            break
+        out.append(x)
+    return iter(out)
+fn dropwhile(pred, iterable):
+    var out = []
+    var dropping = true
+    for x in iterable:
+        if dropping and pred(x):
+            continue
+        dropping = false
+        out.append(x)
+    return iter(out)
+fn filterfalse(pred, iterable) = iter([x for x in iterable if not (pred(x) if pred != none else x)])
+fn compress(data, selectors) = iter([d for d, s in zip(data, selectors) if s])
+fn pairwise(iterable):
+    let xs = list(iterable)
+    return iter([(xs[i], xs[i + 1]) for i in range(len(xs) - 1)])
+fn tee(iterable, n=2):
+    let xs = list(iterable)
+    return tuple([iter(list(xs)) for i in range(n)])

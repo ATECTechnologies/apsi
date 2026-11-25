@@ -115,7 +115,9 @@ AUTO_LIB = {n: "precision" for n in ("quantize", "dequantize", "round_to", "qmat
 AUTO_LIB.update({"http_get": "net", "http_post_json": "net"})
 
 # Python modules a native program gets as Apsi library modules (`import asyncio`, pyimport("asyncio"))
-PY_NATIVE = {"asyncio"}
+PY_NATIVE = {"asyncio": "asyncio", "math": "_py/math", "collections": "_py/collections", "functools": "_py/functools",
+             "itertools": "_py/itertools", "typing": "_py/typing", "dataclasses": "_py/dataclasses", "copy": "_py/copy",
+             "sys": "_py/sys"}
 
 # C types in cload(...).fn(name, [types], result): C spelling, AV -> C, C -> AV
 FFI = {
@@ -765,6 +767,8 @@ class CGen:
         """('native', module, {name: builtin}) | ('local', path)"""
         from ..apsil import local_module
         lib = os.path.join(os.path.dirname(__file__), "lib", s.path.replace(".", os.sep) + ".apsi")
+        if s.py and s.path in PY_NATIVE:
+            lib = os.path.join(os.path.dirname(__file__), "lib", PY_NATIVE[s.path].replace("/", os.sep) + ".apsi")
         if os.path.isfile(lib) and (not s.py or s.path in PY_NATIVE) and local_module(s.path, self.base_dir) is None:
             return ("local", os.path.abspath(lib))
         if s.path in NATIVE_MODULES and not s.py:
@@ -1796,6 +1800,8 @@ finally:
         return "A_NONE"
 
     def e_Name(self, e):
+        if e.id == "__name__" and self.where("__name__")[0] in ("builtin", "global") and "__name__" not in self.mod_scope.bound:
+            return self.k_str("__main__" if self.mod_id in (0, None) else os.path.splitext(os.path.basename(self.mod_info[self.mod_id][0]))[0])
         return self.load(e.id, e)
 
     def e_FStr(self, e):
@@ -2081,12 +2087,19 @@ finally:
 
     def e_Call(self, e):
         f = e.func
-        # pyimport("asyncio"): the native asyncio (Apsi's event loop over coroutines)
-        if isinstance(f, A.Name) and f.id == "pyimport" and "pyimport" not in self.mod_scope.bound and len(e.args) == 1 \
-                and isinstance(e.args[0], A.Str) and e.args[0].value in PY_NATIVE:
+        # pyimport("asyncio") / pyimport("math") / pyfrom("collections", "Counter"): the native stand-ins (lib/_py)
+        if isinstance(f, A.Name) and f.id in ("pyimport", "pyfrom") and f.id not in self.mod_scope.bound \
+                and len(e.args) >= 1 and isinstance(e.args[0], A.Str) and e.args[0].value in PY_NATIVE \
+                and (f.id == "pyimport" and len(e.args) == 1 or f.id == "pyfrom" and len(e.args) == 2
+                     and isinstance(e.args[1], A.Str)):
             r = self.resolve_use(A.Use(e.args[0].value, None, None, True))
             mid, cname, pub = self.local_module(r[1])
             self.emit(f"if (!M[{mid}]) {{ M[{mid}] = 1; {cname}(NULL, 0, NULL, NULL); }}")
+            if f.id == "pyfrom":
+                n = e.args[1].value
+                if n not in pub:
+                    raise NativeError(f"cannot import name '{n}' from '{e.args[0].value}' in a native program", e)
+                return self.hold(f"a_gload(G[{self.gslot(n, mid)}], {cstr(n)})")
             return self.module_obj(e.args[0].value, [(n, f"a_gload(G[{self.gslot(n, mid)}], {cstr(n)})") for n in pub])
         # cload("file.c"): a C / C++ source next to the program is compiled into it
         if isinstance(f, A.Name) and f.id == "cload" and "cload" not in self.mod_scope.bound and len(e.args) == 1 \

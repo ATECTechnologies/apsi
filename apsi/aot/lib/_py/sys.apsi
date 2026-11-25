@@ -1,0 +1,11 @@
+# sys for converted programs
+let maxsize = 9223372036854775807
+let argv = __argv()
+let platform = "win32" if _native_info()["os"] == "windows" else ("darwin" if _native_info()["os"] == "macos" else "linux")
+let version = "3.12 (native Apsi " + __apsi_version() + ")"
+fn exit(code=0):
+    raise SystemExit(code)
+fn getrecursionlimit() = 100000
+fn setrecursionlimit(n):
+    pass
+let byteorder = "little"

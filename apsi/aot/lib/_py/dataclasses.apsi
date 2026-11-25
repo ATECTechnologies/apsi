@@ -1,0 +1,7 @@
+# dataclasses for converted programs: a native class with annotated fields already has the constructor and the text
+fn dataclass(cls=none, **kw):
+    if cls == none:
+        return fn(c) => c
+    return cls
+fn field(default=none, default_factory=none, **kw) = default_factory() if default_factory != none else default
+fn asdict(obj) = __rec_dict(obj) if __is_rec(obj) else {k: getattr(obj, k) for k in getattr(obj, "__dict__", {})}

@@ -517,6 +517,7 @@ int a_eq(AV a, AV b) {
     if (a.t == T_NONE) return 1;
     if (a.o == b.o) return 1;
     if (a.o->kind != b.o->kind) return 0;
+    if (a.o->kind == O_BUILTIN) { ABuiltin *x = (ABuiltin *)a.o, *y = (ABuiltin *)b.o; return x->fn == y->fn && !strcmp(x->name, y->name) && x->self.t == y->self.t && x->self.i == y->self.i; }
     switch (a.o->kind) {
     case O_STR: case O_BYTES: return STR(a)->len == STR(b)->len && !memcmp(STR(a)->s, STR(b)->s, (size_t)STR(a)->len);
     case O_LIST: case O_TUPLE: {
@@ -626,21 +627,63 @@ static void py_str_repr(SB *b, AStr *s) {       /* Python's repr, for the messag
         if (c == q || c == '\\') { sb_put(b, "\\", 1); sb_put(b, &c, 1); }
         else if (c == '\n') sb_puts(b, "\\n");
         else if (c == '\t') sb_puts(b, "\\t");
+        else if (c == '\r') sb_puts(b, "\\r");
+        else if ((unsigned char)c < 32 || c == 127) { char e[8]; snprintf(e, sizeof e, "\\x%02x", (unsigned char)c); sb_puts(b, e); }
         else sb_put(b, &c, 1);
     }
     sb_put(b, &q, 1);
 }
+int a_pymode = 0;                                   /* `use pycompat`: Python's text for None, True, 'strings', ranges */
+/* CPython's iteration order of a set of Ints (use pycompat): the elements, added in order, into CPython's table
+   (linear probes of 9, then perturbation; resized to 4 x used when two thirds full). NULL when not all are Ints. */
+static AV *py_set_order(ADict *d, int64_t *count) {
+    int64_t n = 0;
+    for (int64_t i = 0; i < d->nent; i++) if (d->e[i].used) { AV k = d->e[i].k; if (k.t != T_INT && k.t != T_BOOL) return NULL; n++; }
+    size_t mask = 7, fill = 0; AV *tab = (AV *)calloc(8, sizeof(AV)); char *full = (char *)calloc(8, 1);
+    for (int64_t ei = 0; ei < d->nent; ei++) {
+        if (!d->e[ei].used) continue;
+        AV key = d->e[ei].k; int64_t hv = key.i == -1 ? -2 : key.i; size_t h = (size_t)hv, perturb = h, i = h & mask;
+        for (;;) {
+            size_t probes = (i + 9 <= mask) ? 9 : 0, j = i; int placed = 0;
+            for (size_t p = 0; p <= probes; p++, j++) if (!full[j]) { tab[j] = key; full[j] = 1; placed = 1; break; }
+            if (placed) break;
+            perturb >>= 5; i = (i * 5 + 1 + perturb) & mask;
+        }
+        fill++;
+        if (fill * 5 >= mask * 3) {                              /* set_table_resize(used * 4) */
+            size_t used = fill, newsize = 8, minused = used > 50000 ? used * 2 : used * 4;
+            while (newsize <= minused) newsize <<= 1;
+            AV *nt = (AV *)calloc(newsize, sizeof(AV)); char *nf = (char *)calloc(newsize, 1); size_t nmask = newsize - 1;
+            for (size_t q = 0; q <= mask; q++) if (full[q]) {
+                AV k2 = tab[q]; int64_t hv2 = k2.i == -1 ? -2 : k2.i; size_t h2 = (size_t)hv2, pert = h2, ii = h2 & nmask;
+                for (;;) {
+                    if (!nf[ii]) break;
+                    int found = 0;
+                    if (ii + 9 <= nmask) for (size_t jj = 1; jj <= 9; jj++) if (!nf[ii + jj]) { ii = ii + jj; found = 1; break; }
+                    if (found) break;
+                    pert >>= 5; ii = (ii * 5 + 1 + pert) & nmask;
+                }
+                nt[ii] = k2; nf[ii] = 1;
+            }
+            free(tab); free(full); tab = nt; full = nf; mask = nmask;
+        }
+    }
+    AV *out = (AV *)malloc(sizeof(AV) * (size_t)(n ? n : 1)); int64_t k = 0;
+    for (size_t q = 0; q <= mask; q++) if (full[q]) out[k++] = tab[q];
+    free(tab); free(full); *count = k; return out;
+}
+
 static void repr_into(SB *b, AV v, int repr) {
     char t[64];
     switch (v.t) {
-    case T_NONE: sb_puts(b, "none"); return;
-    case T_BOOL: sb_puts(b, v.i ? "true" : "false"); return;
+    case T_NONE: sb_puts(b, a_pymode ? "None" : "none"); return;
+    case T_BOOL: sb_puts(b, v.i ? (a_pymode ? "True" : "true") : (a_pymode ? "False" : "false")); return;
     case T_INT: snprintf(t, sizeof t, "%lld", (long long)v.i); sb_puts(b, t); return;
     case T_FLOAT: float_repr(v.f, t, sizeof t); sb_puts(b, t); return;
     default: break;
     }
     switch (v.o->kind) {
-    case O_STR: if (repr) str_repr(b, STR(v)); else sb_put(b, STR(v)->s, STR(v)->len); return;
+    case O_STR: if (repr) { if (a_pymode) py_str_repr(b, STR(v)); else str_repr(b, STR(v)); } else sb_put(b, STR(v)->s, STR(v)->len); return;
     case O_BYTES: {                                            /* b'...' as Python writes it */
         AStr *s = STR(v); int sq = 0, dq = 0;
         for (int64_t i = 0; i < s->len; i++) { if (s->s[i] == '\'') sq = 1; else if (s->s[i] == '"') dq = 1; }
@@ -669,6 +712,10 @@ static void repr_into(SB *b, AV v, int repr) {
     case O_DICT: case O_SET: {
         int set = v.o->kind == O_SET, first = 1;
         if (set && DICT(v)->len == 0) { sb_puts(b, "set()"); return; }
+        if (set && a_pymode) {
+            int64_t cnt; AV *ord = py_set_order(DICT(v), &cnt);
+            if (ord) { sb_puts(b, "{"); for (int64_t i = 0; i < cnt; i++) { if (i) sb_puts(b, ", "); repr_into(b, ord[i], 1); } sb_puts(b, "}"); free(ord); return; }
+        }
         sb_puts(b, "{");
         for (int64_t i = 0; i < DICT(v)->nent; i++) {
             ADEnt *e = &DICT(v)->e[i];
@@ -683,12 +730,21 @@ static void repr_into(SB *b, AV v, int repr) {
     }
     case O_RANGE: {
         ARange *r = (ARange *)v.o;
-        if (r->step == 1) snprintf(t, sizeof t, "%lld..%lld", (long long)r->start, (long long)r->stop);
+        if (a_pymode) snprintf(t, sizeof t, r->step == 1 ? "range(%lld, %lld)" : "range(%lld, %lld, %lld)", (long long)r->start, (long long)r->stop, (long long)r->step);
+        else if (r->step == 1) snprintf(t, sizeof t, "%lld..%lld", (long long)r->start, (long long)r->stop);
         else snprintf(t, sizeof t, "range(%lld, %lld, %lld)", (long long)r->start, (long long)r->stop, (long long)r->step);
         sb_puts(b, t); return;
     }
     case O_FUNC: sb_puts(b, "<fn "); sb_puts(b, ((AFunc *)v.o)->name); sb_puts(b, ">"); return;
-    case O_BUILTIN: sb_puts(b, "<builtin "); sb_puts(b, ((ABuiltin *)v.o)->name); sb_puts(b, ">"); return;
+    case O_BUILTIN: {
+        const char *bn = ((ABuiltin *)v.o)->name;
+        if (a_pymode) {
+            static const char *types[] = {"int", "float", "str", "list", "dict", "tuple", "set", "bool", "bytes", "bytearray", "complex", "object", "type", NULL};
+            for (int i = 0; types[i]; i++) if (!strcmp(bn, types[i])) { sb_puts(b, "<class '"); sb_puts(b, bn); sb_puts(b, "'>"); return; }
+            sb_puts(b, "<built-in function "); sb_puts(b, bn); sb_puts(b, ">"); return;
+        }
+        sb_puts(b, "<builtin "); sb_puts(b, bn); sb_puts(b, ">"); return;
+    }
     case O_CLASS:
         if (((AClass *)v.o)->is_struct) { sb_puts(b, "<struct "); sb_puts(b, ((AClass *)v.o)->name->s); sb_puts(b, ">"); return; }
         for (int i = 0; i < A_NEXC; i++) if (a_exc_classes[i].t == T_OBJ && a_exc_classes[i].o == v.o) {   /* a built-in exception */
@@ -1074,6 +1130,54 @@ static const char *tname(AV v) {
 }
 static const char *const a_dn[] = {"", "__add__", "__sub__", "__mul__", "__truediv__", "__floordiv__", "__mod__", "__pow__", "__matmul__", "__and__", "__or__", "__xor__", "__lshift__", "__rshift__"};
 static const char *const a_rn[] = {"", "__radd__", "__rsub__", "__rmul__", "__rtruediv__", "__rfloordiv__", "__rmod__", "__rpow__", "__rmatmul__", "__rand__", "__ror__", "__rxor__", "__rlshift__", "__rrshift__"};
+/* "…%s…%5.2f…" % args, as Python (use pycompat): flags - + space # 0, width, .precision, d i u f F e E g G x X o c s r a %, %(key)s */
+static AV py_percent(AV fmt, AV args) {
+    AStr *f = STR(fmt); SB out = {0}; int sp = a_ntmp; A_PUSH(fmt); A_PUSH(args);
+    int is_seq = a_is(args, O_TUPLE); int64_t ai = 0, na = is_seq ? LIST(args)->len : 1;
+    for (int64_t i = 0; i < f->len; i++) {
+        char c = f->s[i];
+        if (c != '%') { sb_put(&out, &c, 1); continue; }
+        i++; if (i >= f->len) a_error("ValueError", "incomplete format");
+        if (f->s[i] == '%') { sb_puts(&out, "%"); continue; }
+        AV val; int have = 0;
+        if (f->s[i] == '(') {
+            int64_t j = i + 1; while (j < f->len && f->s[j] != ')') j++;
+            AV key = a_strn(f->s + i + 1, j - i - 1); A_PUSH(key); val = a_getitem(args, key); have = 1; i = j + 1;
+        }
+        char flags[8]; int nf = 0; while (i < f->len && strchr("-+ #0", f->s[i]) && nf < 6) flags[nf++] = f->s[i++]; flags[nf] = 0;
+        char width[24] = "", prec[24] = ""; int nw = 0, npr = -1;
+        if (i < f->len && f->s[i] == '*') { AV w = LIST(args)->v[ai++]; snprintf(width, sizeof width, "%lld", (long long)w.i); i++; }
+        else while (i < f->len && f->s[i] >= '0' && f->s[i] <= '9' && nw < 20) width[nw++] = f->s[i++];
+        if (nw) width[nw] = 0;
+        if (i < f->len && f->s[i] == '.') { i++; npr = 0; while (i < f->len && f->s[i] >= '0' && f->s[i] <= '9' && npr < 20) prec[npr++] = f->s[i++]; prec[npr] = 0; }
+        if (i >= f->len) a_error("ValueError", "incomplete format");
+        char t = f->s[i];
+        if (!have) { if (ai >= na) a_error("TypeError", "not enough arguments for format string"); val = is_seq ? LIST(args)->v[ai++] : (ai++, args); }
+        int left = strchr(flags, '-') != NULL, zero = strchr(flags, '0') != NULL && !left, alt = strchr(flags, '#') != NULL;
+        char sign = strchr(flags, '+') ? '+' : strchr(flags, ' ') ? ' ' : 0;
+        char spec[96]; AV txt;
+        if (t == 's' || t == 'r' || t == 'a') {
+            AV sv = t == 's' ? a_to_str(val) : a_repr(val); A_PUSH(sv);
+            if (npr >= 0) { int64_t k = atoi(prec); if (k < STR(sv)->nchars) sv = a_getitem(sv, a_slice(a_int(0), a_int(k), A_NONE)); A_PUSH(sv); }
+            snprintf(spec, sizeof spec, "%s%s", left ? "<" : ">", width); txt = a_format(sv, spec);
+        } else if (t == 'c') {
+            AV sv = a_is(val, O_STR) ? val : a_call(a_global_builtin("chr"), 1, &val, NULL); A_PUSH(sv);
+            snprintf(spec, sizeof spec, "%s%s", left ? "<" : ">", width); txt = a_format(sv, spec);
+        } else {
+            AV nv = val;
+            if (strchr("diuxXoc", t)) { if (nv.t == T_FLOAT) nv = a_int((int64_t)nv.f); else if (!(nv.t == T_INT || nv.t == T_BOOL || a_is(nv, O_BIG))) a_error("TypeError", "%%%c format: a real number is required, not %s", t, tname(nv)); if (nv.t == T_BOOL) nv = a_int(nv.i); }
+            else { if (nv.t == T_INT || nv.t == T_BOOL) nv = a_float((double)nv.i); else if (nv.t != T_FLOAT && !a_is(nv, O_BIG) && !a_is(nv, O_DEC)) a_error("TypeError", "must be real number, not %s", tname(nv)); }
+            char tt = t == 'i' || t == 'u' ? 'd' : t;
+            char sg[2] = {sign, 0};
+            snprintf(spec, sizeof spec, "%s%s%s%s%s%s%s%c", left ? "<" : "", sg, alt ? "#" : "", zero ? "0" : "", width, npr >= 0 ? "." : "", npr >= 0 ? prec : "", tt);
+            if (tt == 'f' || tt == 'F' || tt == 'e' || tt == 'E' || tt == 'g' || tt == 'G') { if (npr < 0) { snprintf(spec, sizeof spec, "%s%s%s%s%s.6%c", left ? "<" : "", sg, alt ? "#" : "", zero ? "0" : "", width, tt); } }
+            A_PUSH(nv); txt = a_format(nv, spec);
+        }
+        sb_put(&out, STR(txt)->s, STR(txt)->len);
+    }
+    if (is_seq && ai < na) a_error("TypeError", "not all arguments converted during string formatting");
+    a_ntmp = sp; return sb_done(&out);
+}
 AV a_binop(int op, AV a, AV b) {
     if ((a.t == T_OBJ && a.o->kind == O_DEC) || (b.t == T_OBJ && b.o->kind == O_DEC)) return a_dec_binop(op, a, b);
     if ((a.t == T_OBJ && a.o->kind == O_BIG) || (b.t == T_OBJ && b.o->kind == O_BIG)) {
@@ -1157,7 +1261,7 @@ AV a_binop(int op, AV a, AV b) {
         if ((a_is(a, O_STR) || a_is(a, O_LIST) || a_is(a, O_TUPLE)) && (b.t == T_INT || b.t == T_BOOL)) return seq_repeat(a, b.i);
         if ((a_is(b, O_STR) || a_is(b, O_LIST) || a_is(b, O_TUPLE)) && (a.t == T_INT || a.t == T_BOOL)) return seq_repeat(b, a.i);
     }
-    if (op == OP_MOD && a_is(a, O_STR)) a_error("TypeError", "%%-formatting of strings: use an f-string");
+    if (op == OP_MOD && a_is(a, O_STR)) { if (a_pymode) return py_percent(a, b); a_error("TypeError", "%%-formatting of strings: use an f-string"); }
     if ((op == OP_OR || op == OP_AND || op == OP_SUB || op == OP_XOR) && a_is(a, O_SET) && a_is(b, O_SET)) {
         AV r = a_set();
         ADict *x = DICT(a), *y = DICT(b);
@@ -1291,8 +1395,8 @@ int a_compare(int op, AV a, AV b) {
     switch (op) {
     case OP_EQ: return a_eq(a, b);
     case OP_NE: return !a_eq(a, b);
-    case OP_IS: return a.t == b.t && (a.t == T_NONE || a.i == b.i);
-    case OP_ISNOT: return !(a.t == b.t && (a.t == T_NONE || a.i == b.i));
+    case OP_IS: if (a_is(a, O_BUILTIN) && a_is(b, O_BUILTIN)) return a_eq(a, b); return a.t == b.t && (a.t == T_NONE || a.i == b.i);
+    case OP_ISNOT: if (a_is(a, O_BUILTIN) && a_is(b, O_BUILTIN)) return !a_eq(a, b); return !(a.t == b.t && (a.t == T_NONE || a.i == b.i));
     case OP_IN: return a_contains(b, a);
     case OP_NOTIN: return !a_contains(b, a);
     default: break;
@@ -1688,7 +1792,12 @@ AV a_iter(AV o) {
     case O_LIST: case O_TUPLE: return new_iter(IT_SEQ, o);
     case O_STR: return new_iter(IT_STR, o);
     case O_BYTES: case O_BYTEARRAY: return new_iter(IT_BYTES, o);
-    case O_DICT: case O_SET: return new_iter(IT_DICT, o);
+    case O_DICT: case O_SET:
+        if (a_pymode && o.o->kind == O_SET) {
+            int64_t cnt; AV *ord = py_set_order(DICT(o), &cnt);
+            if (ord) { AV l = a_list(cnt, ord); free(ord); return new_iter(IT_SEQ, l); }
+        }
+        return new_iter(IT_DICT, o);
     case O_RANGE: {
         ARange *r = (ARange *)o.o; AV it = new_iter(IT_RANGE, o);
         ((AIter *)it.o)->pos = r->start; ((AIter *)it.o)->end = r->stop; ((AIter *)it.o)->step = r->step;
@@ -1772,10 +1881,26 @@ static AV class_lookup(AClass *c, const char *name) {
 }
 static AV method_of(AV self, const char *name);
 static AV b_bytes_fromhex(int n, AV *a, ADict *kw, AV self);
+/* property / classmethod / staticmethod objects (made by pycompat): instances of classes with these names */
+static AV b_unbound(int n, AV *a, ADict *kw, AV self) {       /* str.lower, list.append …: the method of the first argument */
+    if (n < 1) a_error("TypeError", "unbound method %s needs an argument", STR(self)->s);
+    AV m = a_attr(a[0], STR(self)->s); return a_call(m, n - 1, a + 1, kw);
+}
+static int descr_kind(AV v) {
+    if (!a_is(v, O_INST)) return 0;
+    const char *n = ((AInst *)v.o)->cls->name->s;
+    return !strcmp(n, "property") ? 1 : !strcmp(n, "classmethod") ? 2 : !strcmp(n, "staticmethod") ? 3 : 0;
+}
+static AV descr_field(AV d, const char *f) { AV v; if (a_dict_get(((AInst *)d.o)->attrs, a_str(f), &v)) return v; return A_NONE; }
 AV a_getattr(AV o, const char *name) {
     if (a_is(o, O_INST) && !strcmp(name, "__class__")) return a_obj(((AInst *)o.o)->cls);
     if (a_is(o, O_BUILTIN) && !strcmp(((ABuiltin *)o.o)->name, "bytes") && !strcmp(name, "fromhex")) return a_builtin("fromhex", b_bytes_fromhex, A_NONE);
     if (a_is(o, O_STR) && !strcmp(name, "__name__")) return o;          /* type(x).__name__: type() gives the name */
+    if (a_is(o, O_BUILTIN) && strcmp(name, "__name__")) {
+        const char *bn = ((ABuiltin *)o.o)->name;
+        if (!strcmp(bn, "str") || !strcmp(bn, "list") || !strcmp(bn, "dict") || !strcmp(bn, "set") || !strcmp(bn, "bytes") || !strcmp(bn, "tuple") || !strcmp(bn, "int") || !strcmp(bn, "float"))
+            return a_builtin(name, b_unbound, a_str(name));
+    }
     if (!strcmp(name, "__name__") && (a_is(o, O_FUNC) || a_is(o, O_BUILTIN) || a_is(o, O_BOUND))) {
         AV f = a_is(o, O_BOUND) ? ((ABound *)o.o)->fn : o;
         if (a_is(f, O_FUNC)) return a_str(((AFunc *)f.o)->name);
@@ -1783,17 +1908,29 @@ AV a_getattr(AV o, const char *name) {
     }
     if (a_is(o, O_INST)) {
         AInst *s = (AInst *)o.o; AV v;
-        if (a_dict_get(s->attrs, a_str(name), &v)) return v;
+        if (a_dict_get(s->attrs, a_str(name), &v)) {
+            int k = descr_kind(v);                       /* a class's property / classmethod copied into the object */
+            if (!k) return v;
+            if (k == 1) { AV g = descr_field(v, "fget"); return a_call(g, 1, &o, NULL); }
+            if (k == 2) return a_bound(a_obj(s->cls), descr_field(v, "f"));
+            return descr_field(v, "f");
+        }
         v = class_lookup(s->cls, name);
         if (v.t != 255) {
             if (a_is(v, O_FUNC)) return a_bound(o, v);
+            switch (descr_kind(v)) {
+            case 1: { AV g = descr_field(v, "fget"); if (g.t == T_NONE) a_error("AttributeError", "property '%s' has no getter", name); return a_call(g, 1, &o, NULL); }
+            case 2: return a_bound(a_obj(s->cls), descr_field(v, "f"));
+            case 3: return descr_field(v, "f");
+            default: break;
+            }
             return v;
         }
         v.t = 255; return v;
     }
     if (a_is(o, O_CLASS)) {
         AV v = class_lookup((AClass *)o.o, name);
-        if (v.t != 255) return v;
+        if (v.t != 255) { int k = descr_kind(v); if (k == 2) return a_bound(o, descr_field(v, "f")); if (k == 3) return descr_field(v, "f"); return v; }
         if (!strcmp(name, "__name__")) return a_obj(((AClass *)o.o)->name);
         return v;
     }
@@ -1868,6 +2005,8 @@ AV a_attr(AV o, const char *name) {
 }
 void a_setattr(AV o, const char *name, AV v) {
     if (a_is(o, O_INST)) {
+        AV pd = class_lookup(((AInst *)o.o)->cls, name);
+        if (descr_kind(pd) == 1) { AV st = descr_field(pd, "fset"); if (st.t == T_NONE) a_error("AttributeError", "property '%s' has no setter", name); AV args[2] = {o, v}; a_call(st, 2, args, NULL); return; }
         AV f = class_lookup(((AInst *)o.o)->cls, "__setattr__");      /* the class decides what x.name = v does */
         if (f.t != 255 && a_is(f, O_FUNC)) { int sp = a_ntmp; AV args[3] = {o, a_str(name), v}; A_PUSH(args[1]); a_call(f, 3, args, NULL); a_ntmp = sp; return; }
         a_dict_set(((AInst *)o.o)->attrs, a_str(name), v); return;
@@ -1875,9 +2014,11 @@ void a_setattr(AV o, const char *name, AV v) {
     if (a_is(o, O_CLASS)) { a_dict_set(((AClass *)o.o)->attrs, a_str(name), v); return; }
     a_error("AttributeError", "cannot set attribute '%s' on '%s'", name, tname(o));
 }
+static AV b_noop_init(int n, AV *a, ADict *kw, AV self) { (void)n; (void)a; (void)kw; (void)self; return A_NONE; }
 AV a_super_attr(AV self, AV cls, const char *name) {
     AClass *c = a_is(cls, O_CLASS) ? ((AClass *)cls.o)->base : NULL;
     AV v = c ? class_lookup(c, name) : (AV){.t = 255};
+    if (v.t == 255 && !strcmp(name, "__init__")) return a_builtin("__init__", b_noop_init, self);   /* object.__init__ */
     if (v.t == 255) a_error("AttributeError", "'super' object has no attribute '%s'", name);
     return a_is(v, O_FUNC) ? a_bound(self, v) : v;
 }
@@ -2409,6 +2550,51 @@ static AV m_set_isdisjoint(int n, AV *a, ADict *kw, AV s) { (void)n; (void)kw; A
 static AV m_set_pop(int n, AV *a, ADict *kw, AV s) { (void)n; (void)a; (void)kw; ADict *S = DICT(s); for (int64_t i = 0; i < S->nent; i++) if (S->e[i].used) { AV k = S->e[i].k; a_dict_del(S, k); return k; } a_error("KeyError", "pop from an empty set"); }
 static AV m_dict_popitem(int n, AV *a, ADict *kw, AV s) { (void)n; (void)a; (void)kw; ADict *D = DICT(s); for (int64_t i = D->nent - 1; i >= 0; i--) if (D->e[i].used) { AV p[2] = {D->e[i].k, D->e[i].v}; AV t = a_tuple(2, p); a_dict_del(D, p[0]); return t; } a_error("KeyError", "popitem(): the dictionary is empty"); }
 
+/* "…{}…{0}…{name!r:>8}…".format(*args, **kw), Python's format strings */
+static AV str_format_impl(AV fmt, int n, AV *a, ADict *kw, AV mapping) {
+    AStr *f = STR(fmt); SB out = {0}; int64_t auto_i = 0; int sp = a_ntmp;
+    for (int64_t i = 0; i < f->len; i++) {
+        char c = f->s[i];
+        if (c == '}' ) { if (i + 1 < f->len && f->s[i + 1] == '}') i++; sb_put(&out, "}", 1); continue; }
+        if (c != '{') { sb_put(&out, &c, 1); continue; }
+        if (i + 1 < f->len && f->s[i + 1] == '{') { sb_put(&out, "{", 1); i++; continue; }
+        int64_t j = i + 1, depth = 1;
+        while (j < f->len && depth) { if (f->s[j] == '{') depth++; else if (f->s[j] == '}') depth--; if (depth) j++; }
+        if (j >= f->len) a_error("ValueError", "Single '{' encountered in format string");
+        /* field [!conv][:spec] */
+        int64_t k = i + 1, e = k; while (e < j && f->s[e] != '!' && f->s[e] != ':') e++;
+        AV val; int64_t fe = k; while (fe < e && f->s[fe] != '.' && f->s[fe] != '[') fe++;
+        if (fe == k) { if (auto_i >= n) a_error("IndexError", "Replacement index %lld out of range for positional args tuple", (long long)auto_i); val = a[auto_i++]; }
+        else if (f->s[k] >= '0' && f->s[k] <= '9') { int64_t idx = strtoll(f->s + k, NULL, 10); if (idx >= n) a_error("IndexError", "Replacement index %lld out of range for positional args tuple", (long long)idx); val = a[idx]; }
+        else {
+            AV key = a_strn(f->s + k, fe - k); A_PUSH(key);
+            if (mapping.t != T_NONE) val = a_getitem(mapping, key);
+            else { AV v; if (!kw || !a_dict_get(kw, key, &v)) a_error("KeyError", "'%s'", STR(key)->s); val = v; }
+        }
+        A_PUSH(val);
+        while (fe < e) {                                          /* .attr and [key] after the name */
+            if (f->s[fe] == '.') { int64_t g = fe + 1; while (g < e && f->s[g] != '.' && f->s[g] != '[') g++; AV nm = a_strn(f->s + fe + 1, g - fe - 1); A_PUSH(nm); val = a_attr(val, STR(nm)->s); A_PUSH(val); fe = g; }
+            else { int64_t g = fe + 1; while (g < e && f->s[g] != ']') g++; AV ky; int dig = 1; for (int64_t q = fe + 1; q < g; q++) if (f->s[q] < '0' || f->s[q] > '9') dig = 0;
+                ky = dig ? a_int(strtoll(f->s + fe + 1, NULL, 10)) : a_strn(f->s + fe + 1, g - fe - 1); A_PUSH(ky); val = a_getitem(val, ky); A_PUSH(val); fe = g + 1; }
+        }
+        char conv = 0; int64_t ps = e;
+        if (ps < j && f->s[ps] == '!') { conv = f->s[ps + 1]; ps += 2; }
+        AV spec = a_str("");
+        if (ps < j && f->s[ps] == ':') { AV raw = a_strn(f->s + ps + 1, j - ps - 1); A_PUSH(raw); spec = strchr(STR(raw)->s, '{') ? str_format_impl(raw, n, a, kw, mapping) : raw; }
+        A_PUSH(spec);
+        if (conv == 'r' || conv == 'a') val = a_repr(val); else if (conv == 's') val = a_to_str(val);
+        A_PUSH(val);
+        AV piece;
+        if (STR(spec)->len == 0) piece = a_to_str(val);
+        else if (a_is(val, O_INST)) { AV fm = a_getattr(val, "__format__"); piece = fm.t != 255 ? a_call(fm, 1, &spec, NULL) : a_format(a_to_str(val), STR(spec)->s); }
+        else piece = a_format(val, STR(spec)->s);
+        sb_put(&out, STR(piece)->s, STR(piece)->len);
+        i = j;
+    }
+    a_ntmp = sp; return sb_done(&out);
+}
+static AV m_str_format(int n, AV *a, ADict *kw, AV s) { return str_format_impl(s, n, a, kw, A_NONE); }
+static AV m_str_format_map(int n, AV *a, ADict *kw, AV s) { (void)n; (void)kw; return str_format_impl(s, 0, NULL, NULL, a[0]); }
 static AV method_of(AV o, const char *name) {
     AV none; none.t = 255; none.i = 0;
     if (o.t != T_OBJ) return none;
@@ -2427,7 +2613,7 @@ static AV method_of(AV o, const char *name) {
         M("reverse", m_ba_reverse); M("clear", m_ba_clear); M("copy", m_ba_copy);
         break;
     case O_STR:
-        M("encode", m_str_encode);
+        M("encode", m_str_encode); M("format", m_str_format); M("format_map", m_str_format_map);
         M("upper", m_str_upper); M("lower", m_str_lower); M("strip", m_str_strip); M("lstrip", m_str_lstrip);
         M("rstrip", m_str_rstrip); M("split", m_str_split); M("join", m_str_join); M("replace", m_str_replace);
         M("startswith", m_str_startswith); M("endswith", m_str_endswith); M("find", m_str_find); M("count", m_str_count);
@@ -2604,6 +2790,15 @@ void a_dim_names(const AUnitName *names, int n) { dim_names = names; n_dim_names
 static AV b_type(int n, AV *a, ADict *kw, AV self) {      /* the type's name, as apsi run shows it */
     (void)n; (void)kw; (void)self;
     AV v = a[0];
+    if (a_pymode) {                                            /* Python: the type itself (int, float, str, …) */
+        const char *pn = NULL;
+        switch (v.t) { case T_BOOL: pn = "bool"; break; case T_INT: pn = "int"; break; case T_FLOAT: pn = "float"; break; default: break; }
+        if (v.t == T_OBJ) switch (v.o->kind) { case O_STR: pn = "str"; break; case O_BIG: pn = "int"; break; case O_LIST: pn = "list"; break; case O_TUPLE: pn = "tuple"; break;
+            case O_DICT: pn = "dict"; break; case O_SET: pn = "set"; break; case O_BYTES: pn = "bytes"; break; case O_BYTEARRAY: pn = "bytearray"; break; case O_COMPLEX: pn = "complex"; break;
+            case O_INST: return a_obj(((AInst *)v.o)->cls); default: break; }
+        if (pn) return a_global_builtin(pn);
+        if (v.t == T_NONE) return a_str("NoneType");
+    }
     switch (v.t) { case T_NONE: return a_str("None"); case T_BOOL: return a_str("Bool"); case T_INT: return a_str("Int"); case T_FLOAT: return a_str("Float"); default: break; }
     switch (v.o->kind) {
     case O_STR: return a_str("Str"); case O_BYTES: return a_str("bytes"); case O_BYTEARRAY: return a_str("bytearray"); case O_DEC: return a_str("Decimal"); case O_BIG: return a_str("Int"); case O_COMPLEX: case O_CTENSOR: return a_str(a_cplx_type(v)); case O_LIST: return a_str("List"); case O_TUPLE: return a_str("Tuple"); case O_DICT: return a_str("Dict");
@@ -3043,12 +3238,16 @@ void a_init(int argc, char **argv) {
 AV a_attrk(AV o, AV key) {
     if (a_is(o, O_INST)) {
         AInst *s = (AInst *)o.o; AV v;
-        if (a_dict_get(s->attrs, key, &v)) return v;
-        for (AClass *c = s->cls; c; c = c->base) if (a_dict_get(c->attrs, key, &v)) return a_is(v, O_FUNC) ? a_bound(o, v) : v;
+        if (a_dict_get(s->attrs, key, &v)) { if (!a_is(v, O_INST) || !descr_kind(v)) return v; return a_attr(o, STR(key)->s); }
+        for (AClass *c = s->cls; c; c = c->base) if (a_dict_get(c->attrs, key, &v)) { if (a_is(v, O_INST) && descr_kind(v)) return a_attr(o, STR(key)->s); return a_is(v, O_FUNC) ? a_bound(o, v) : v; }
     }
     return a_attr(o, STR(key)->s);
 }
 void a_setattrk(AV o, AV key, AV v) {
+    if (a_is(o, O_INST) && a_is(key, O_STR)) {
+        AV pd = class_lookup(((AInst *)o.o)->cls, STR(key)->s);
+        if (descr_kind(pd) == 1) { AV st = descr_field(pd, "fset"); if (st.t == T_NONE) a_error("AttributeError", "property '%s' has no setter", STR(key)->s); AV args[2] = {o, v}; a_call(st, 2, args, NULL); return; }
+    }
     if (a_is(o, O_INST)) {
         AClass *c = ((AInst *)o.o)->cls;
         if (c->has_setattr == 0) { AV f = class_lookup(c, "__setattr__"); c->has_setattr = f.t != 255 && a_is(f, O_FUNC) ? 1 : -1; }
