@@ -1,0 +1,638 @@
+# use rl: reinforcement learning, learning from preferences (RLHF, DPO, GRPO) and search for native programs, the
+# same methods as apsi run. Environments, PPO, DQN and REINFORCE draw from the native random generator, so a seed
+# gives different (but repeatable) episodes than in apsi run; everything deterministic gives the same numbers.
+
+fn _v(x):
+    let p = si_magnitude(x)
+    return tensor(p, f64) if isinstance(p, list) or ndim(p) > 0 else float(p)
+fn _val(x) = stop_gradient(x) if ndim(x) > 0 else x
+fn _seed(seed):
+    if seed != none:
+        __builtin("seed")(int(seed))
+fn _uniform(lo, hi, n, m) = lo + (hi - lo) * rand(n, m)
+fn _clamp(x, lo, hi) = clip(x, lo, hi)
+fn _ilist(t) = [int(v) for v in t.tolist()] if str(type(t)).startswith("Tensor") else [int(v) for v in t]
+
+# =============================================================================== environments
+class CartPole:
+    var n = 1
+    var max_steps = 500
+    var obs_dim = 4
+    var n_actions = 2
+    var state = none
+    var t = []
+    var returns = []
+    var episode_returns = []
+    fn reset(self, seed=none):
+        _seed(seed)
+        self.state = _uniform(-0.05, 0.05, self.n, 4)
+        self.t = [0] * self.n
+        self.returns = [0.0] * self.n
+        return self.state * 1.0
+    fn step(self, actions):
+        let a = _ilist(reshape(_v(actions), -1))
+        let S = self.state.tolist()
+        let g = 9.8
+        let mc = 1.0
+        let mp = 0.1
+        let l = 0.5
+        let fmag = 10.0
+        let tau = 0.02
+        var new = []
+        var done = []
+        var trunc = []
+        for i in range(self.n):
+            let x = S[i][0]
+            let xd = S[i][1]
+            let th = S[i][2]
+            let thd = S[i][3]
+            let force = fmag if a[i] == 1 else -fmag
+            let ct = cos(th)
+            let st = sin(th)
+            let total = mc + mp
+            let pml = mp * l
+            let temp = (force + pml * thd ** 2 * st) / total
+            let thacc = (g * st - ct * temp) / (l * (4.0 / 3.0 - mp * ct ** 2 / total))
+            let xacc = temp - pml * thacc * ct / total
+            let nx = x + tau * xd
+            let nxd = xd + tau * xacc
+            let nth = th + tau * thd
+            let nthd = thd + tau * thacc
+            new.append([nx, nxd, nth, nthd])
+            self.t[i] = self.t[i] + 1
+            let dn = abs(nx) > 2.4 or abs(nth) > 12 * 2 * pi / 360
+            done.append(1.0 if dn else 0.0)
+            trunc.append(1.0 if (self.t[i] >= self.max_steps and not dn) else 0.0)
+            self.returns[i] = self.returns[i] + 1.0
+        let final = tensor(new)
+        for i in range(self.n):
+            if done[i] or trunc[i]:
+                self.episode_returns.append(self.returns[i])
+                new[i] = _uniform(-0.05, 0.05, 1, 4).tolist()[0]
+                self.t[i] = 0
+                self.returns[i] = 0.0
+        self.state = tensor(new)
+        return record(obs=self.state * 1.0, reward=ones(self.n), done=tensor(done), truncated=tensor(trunc), final_obs=final)
+
+class GridWorld:
+    var size = 5
+    var n = 1
+    var obs_dim = 25
+    var n_actions = 4
+    var pos = []
+    var t = []
+    var returns = []
+    var episode_returns = []
+    fn _obs(self):
+        var o = zeros(self.n, self.obs_dim)
+        for i in range(self.n):
+            o[i, self.pos[i][0] * self.size + self.pos[i][1]] = 1.0
+        return o
+    fn reset(self, seed=none):
+        _seed(seed)
+        self.pos = [[0, 0] for i in range(self.n)]
+        self.t = [0] * self.n
+        self.returns = [0.0] * self.n
+        return self._obs()
+    fn step(self, actions):
+        let a = _ilist(reshape(_v(actions), -1))
+        let moves = [[-1, 0], [1, 0], [0, -1], [0, 1]]
+        var reward = []
+        var goal = []
+        var trunc = []
+        for i in range(self.n):
+            let d = moves[a[i]]
+            self.pos[i] = [min(max(self.pos[i][0] + d[0], 0), self.size - 1), min(max(self.pos[i][1] + d[1], 0), self.size - 1)]
+            self.t[i] = self.t[i] + 1
+            let gl = self.pos[i][0] == self.size - 1 and self.pos[i][1] == self.size - 1
+            goal.append(1.0 if gl else 0.0)
+            reward.append(1.0 if gl else -0.01)
+            trunc.append(1.0 if (self.t[i] >= 4 * self.size * self.size and not gl) else 0.0)
+            self.returns[i] = self.returns[i] + reward[i]
+        let final = self._obs()
+        for i in range(self.n):
+            if goal[i] or trunc[i]:
+                self.episode_returns.append(self.returns[i])
+                self.pos[i] = [0, 0]
+                self.t[i] = 0
+                self.returns[i] = 0.0
+        return record(obs=self._obs(), reward=tensor(reward), done=tensor(goal), truncated=tensor(trunc), final_obs=final)
+
+class Bandit:
+    var k = 10
+    var n = 1
+    var means = none
+    var obs_dim = 1
+    var n_actions = 10
+    var episode_returns = []
+    fn reset(self, seed=none) = ones(self.n, 1)
+    fn step(self, actions):
+        let a = _ilist(reshape(_v(actions), -1))
+        let noise = randn(self.n).tolist()
+        let r = [float(self.means[a[i]]) + noise[i] for i in range(self.n)]
+        for v in r:
+            self.episode_returns.append(v)
+        return record(obs=ones(self.n, 1), reward=tensor(r), done=ones(self.n), truncated=zeros(self.n), final_obs=ones(self.n, 1))
+
+fn cartpole(n=1, seed=none, max_steps=500):
+    _seed(seed)
+    var e = CartPole()
+    e.n = int(n)
+    e.max_steps = int(max_steps)
+    e.state = zeros(e.n, 4)
+    e.t = [0] * e.n
+    e.returns = [0.0] * e.n
+    e.episode_returns = []
+    return e
+
+fn gridworld(size=5, n=1, seed=none):
+    _seed(seed)
+    var e = GridWorld()
+    e.size = int(size)
+    e.n = int(n)
+    e.obs_dim = e.size * e.size
+    e.pos = [[0, 0] for i in range(e.n)]
+    e.t = [0] * e.n
+    e.returns = [0.0] * e.n
+    e.episode_returns = []
+    return e
+
+fn bandit(arms=10, n=1, seed=none):
+    _seed(seed)
+    var e = Bandit()
+    e.k = int(arms)
+    e.n = int(n)
+    e.n_actions = e.k
+    e.means = randn(e.k)
+    e.episode_returns = []
+    return e
+
+# =============================================================================== returns and advantages
+fn discounted_returns(rewards, dones, gamma=0.99, last_value=none):
+    let r = _v(rewards)
+    let d = _v(dones)
+    let T = shape(r)[0]
+    var run = zeros_like(r[0]) * 1.0 if ndim(r) > 1 else 0.0
+    if last_value != none:
+        run = _v(last_value) * 1.0
+    var rows = [none] * T
+    for t in range(T - 1, -1, -1):
+        run = r[t] + gamma * run * (1.0 - d[t])
+        rows[t] = run
+    return stack(rows) if ndim(r) > 1 else tensor([float(v) for v in rows])
+
+fn gae(rewards, values, dones, last_values, gamma=0.99, lam=0.95):
+    let r = _v(rewards)
+    let v = _v(values)
+    let d = _v(dones)
+    let nv = _v(last_values)
+    let T = shape(r)[0]
+    var last = zeros_like(r[0]) * 1.0 if ndim(r) > 1 else 0.0
+    var rows = [none] * T
+    for t in range(T - 1, -1, -1):
+        let next_v = nv if t == T - 1 else v[t + 1]
+        let nonterm = 1.0 - d[t]
+        let delta = r[t] + gamma * next_v * nonterm - v[t]
+        last = delta + gamma * lam * nonterm * last
+        rows[t] = last
+    let adv = stack(rows) if ndim(r) > 1 else tensor([float(x) for x in rows])
+    return record(advantages=adv, returns=adv + v)
+
+# =============================================================================== distributions
+fn categorical_log_prob(logits, actions):
+    let lp = log_softmax(logits, axis=-1)
+    let a = _ilist(reshape(_v(actions), -1))
+    return lp[(tensor(list(range(len(a))), "int64"), tensor(a, "int64"))]
+
+fn categorical_entropy(logits):
+    let lp = log_softmax(logits, axis=-1)
+    return -sum(exp(lp) * lp, axis=-1)
+
+fn _gumbel(shape_) = -log(-log(clip(rand(*shape_), 1e-300, 1.0)))
+
+fn categorical_sample(logits, seed=none, rng=none):
+    _seed(seed)
+    let lg = _v(_val(logits))
+    let g = _gumbel(list(shape(lg)))
+    return argmax(lg + g, axis=-1)
+
+fn gaussian_log_prob(mean, log_std, actions):
+    let z = (actions - mean) / exp(log_std)
+    let per = -0.5 * z * z - log_std - 0.5 * log(2 * pi)
+    return sum(per, axis=-1)
+
+fn gaussian_entropy(log_std) = sum(log_std + 0.5 * log(2 * pi * e), axis=-1)
+
+fn sample_token(logits, temperature=1.0, top_k=none, top_p=none, seed=none):
+    var lg = _v(_val(logits))
+    if temperature == 0:
+        return argmax(lg, axis=-1)
+    lg = lg / float(temperature)
+    let rows = lg.tolist() if ndim(lg) > 1 else [lg.tolist()]
+    var out_rows = []
+    for row in rows:
+        var r = list(row)
+        if top_k:
+            let k = int(top_k)
+            let kth = sorted(r)[len(r) - k]
+            r = [(-inf if v < kth else v) for v in r]
+        if top_p != none and top_p < 1.0:
+            let order = sorted(list(range(len(r))), key=fn(i) => -r[i])
+            let sl = [r[i] for i in order]
+            let mx = sl[0]
+            let ex = [exp(v - mx) for v in sl]
+            let tot = sum(ex)
+            var cum = 0.0
+            var keep = []
+            for i in range(len(sl)):
+                let pr = ex[i] / tot
+                keep.append(cum <= float(top_p))
+                cum = cum + pr
+            var nr = [-inf] * len(r)
+            for i in range(len(sl)):
+                nr[order[i]] = sl[i] if keep[i] else -inf
+            r = nr
+        out_rows.append(r)
+    let res = categorical_sample(tensor(out_rows), seed)
+    return res if ndim(lg) > 1 else res[0]
+
+# =============================================================================== optimisation (torch_compat's Adam and clip)
+class _Adam:
+    var lr = 3e-4
+    var b1 = 0.9
+    var b2 = 0.999
+    var eps = 1e-8
+    var t = 0
+    var m = none
+    var v = none
+    fn step(self, params, grads):
+        if self.m == none:
+            self.m = tree_map(fn(g) => zeros_like(g) if ndim(g) > 0 else 0.0, grads)
+            self.v = tree_map(fn(g) => zeros_like(g) if ndim(g) > 0 else 0.0, grads)
+        self.t = self.t + 1
+        let b1 = self.b1
+        let b2 = self.b2
+        self.m = tree_map(fn(m, g) => b1 * m + (1 - b1) * g, self.m, grads)
+        self.v = tree_map(fn(v, g) => b2 * v + (1 - b2) * g * g, self.v, grads)
+        let step = self.lr / (1 - b1 ** self.t)
+        let sq = sqrt(1 - b2 ** self.t)
+        let eps = self.eps
+        return tree_map(fn(p, m, v) => p - step * m / (sqrt(v) / sq + eps), params, self.m, self.v)
+
+fn _adam(lr, eps=1e-8):
+    var o = _Adam()
+    o.lr = lr
+    o.eps = eps
+    return o
+
+fn _clip(grads, max_norm):
+    if not max_norm:
+        return grads
+    var total = 0.0
+    for g in tree_leaves(grads):
+        total = total + float(sum(g * g))
+    total = sqrt(total)
+    let coef = min(float(max_norm) / (total + 1e-6), 1.0)
+    return tree_map(fn(g) => g * coef, grads)
+
+fn _split(out):
+    if (isinstance(out, list) or isinstance(out, tuple)) and len(out) == 2:
+        return out
+    if __is_rec(out):
+        return [out.logits, out.value]
+    raise RuntimeError("the model must return [logits, value]")
+
+fn _rows_at(T, idx) = T[tensor(idx, "int64")]
+
+# =============================================================================== algorithms
+fn ppo(env, model, params, total_steps=100000, rollout=128, epochs=4, minibatch=256, lr=3e-4, gamma=0.99, lam=0.95, clip=0.2,
+       vf_coef=0.5, ent_coef=0.0, max_grad_norm=0.5, normalize_advantages=true, anneal_lr=true, seed=0, verbose=false, opt=none):
+    _seed(seed)
+    let n = env.n
+    var obs = env.reset(seed)
+    var op = opt if opt != none else _adam(lr, 1e-5)
+    let updates = max(1, int(total_steps) // (rollout * n))
+    var log_ = []
+    var p = params
+    for u in range(updates):
+        if anneal_lr:
+            op.lr = lr * (1.0 - u / updates)
+        var O = []
+        var A = []
+        var LP = []
+        var V = []
+        var R = []
+        var D = []
+        for t in range(rollout):
+            let out = _split(model(p, obs))
+            let lg = _v(_val(out[0]))
+            let a = categorical_sample(lg)
+            let lsm = log_softmax(lg, axis=-1)
+            let r = env.step(a)
+            O.append(obs)
+            A.append(a)
+            LP.append(lsm[(arange(n, dtype="int64"), tensor(a, "int64"))])
+            V.append(reshape(_v(_val(out[1])), n))
+            var rew = r.reward * 1.0
+            if float(sum(r.truncated)) > 0:
+                let fo = _split(model(p, r.final_obs))
+                rew = rew + gamma * reshape(_v(_val(fo[1])), n) * r.truncated
+            R.append(rew)
+            D.append(where(r.done > r.truncated, r.done, r.truncated))
+            obs = r.obs
+        let lv = _split(model(p, obs))
+        let g = gae(stack(R), stack(V), stack(D), reshape(_v(_val(lv[1])), n), gamma, lam)
+        let bO = concat(O)
+        let bA = concat(A)
+        let bLP = concat(LP)
+        let bAdv = reshape(g.advantages, -1)
+        let bRet = reshape(g.returns, -1)
+        let N = shape(bO)[0]
+        for ep in range(int(epochs)):
+            let perm = _ilist(permutation(N))
+            for s in range(0, N, int(minibatch)):
+                let idx = perm[s:s + int(minibatch)]
+                var adv = _rows_at(bAdv, idx)
+                if normalize_advantages and len(idx) > 1:
+                    adv = (adv - mean(adv)) / (std(adv) + 1e-8)
+                let o_ = _rows_at(bO, idx)
+                let a_ = _rows_at(bA, idx)
+                let lp_ = _rows_at(bLP, idx)
+                let ret_ = _rows_at(bRet, idx)
+                fn loss(q):
+                    let out = _split(model(q, o_))
+                    let nlp = categorical_log_prob(out[0], a_)
+                    let ratio = exp(nlp - lp_)
+                    let s1 = ratio * adv
+                    let s2 = _clamp(ratio, 1 - clip, 1 + clip) * adv
+                    let pg = -mean(where(stop_gradient(s1) < stop_gradient(s2), s1, s2))
+                    let vl = mean((reshape(out[1], -1) - ret_) ** 2)
+                    let ent = mean(categorical_entropy(out[0]))
+                    return pg + vf_coef * vl - ent_coef * ent
+                let vg = value_and_grad(loss)(p)
+                p = op.step(p, _clip(vg[1], float(max_grad_norm) if max_grad_norm else none))
+        let er = env.episode_returns
+        let recent = er[max(0, len(er) - 20):]
+        log_.append(sum(recent) / len(recent) if len(recent) > 0 else 0.0)
+        if verbose and (u % max(1, updates // 10) == 0 or u == updates - 1):
+            print(f"update {u + 1}/{updates}: mean return {log_[len(log_) - 1]:.1f}")
+    return record(params=p, episode_returns=list(env.episode_returns), mean_returns=log_, updates=updates)
+
+fn dqn(env, model, params, total_steps=50000, buffer_size=50000, batch_size=64, lr=1e-3, gamma=0.99, learning_starts=1000,
+       train_every=1, target_every=500, eps_start=1.0, eps_end=0.05, eps_fraction=0.3, double=true, max_grad_norm=10.0,
+       seed=0, verbose=false):
+    _seed(seed)
+    let n = env.n
+    var obs = env.reset(seed)
+    let B = int(buffer_size)
+    var bo = []
+    var bn = []
+    var ba = []
+    var br = []
+    var bd = []
+    var ptr = 0
+    var p = params
+    var target = params
+    var op = _adam(lr)
+    let steps = int(total_steps) // n
+    for t in range(steps):
+        let eps = eps_end + (eps_start - eps_end) * max(0.0, 1 - t / max(1, eps_fraction * steps))
+        let q = _v(_val(model(p, obs)))
+        let qa = _ilist(argmax(q, axis=1))
+        let nact = shape(q)[1]
+        var a = []
+        for i in range(n):
+            a.append(randint(0, nact) if float(rand()) < eps else qa[i])
+        let r = env.step(tensor(a, "int64"))
+        let ol = obs.tolist()
+        let fl = r.final_obs.tolist()
+        for i in range(n):
+            let row = [ol[i], a[i], float(r.reward[i]), fl[i], float(r.done[i])]
+            if len(bo) < B:
+                bo.append(row[0])
+                ba.append(row[1])
+                br.append(row[2])
+                bn.append(row[3])
+                bd.append(row[4])
+            else:
+                bo[ptr] = row[0]
+                ba[ptr] = row[1]
+                br[ptr] = row[2]
+                bn[ptr] = row[3]
+                bd[ptr] = row[4]
+            ptr = (ptr + 1) % B
+        obs = r.obs
+        if len(bo) >= learning_starts and t % train_every == 0:
+            let idx = [randint(0, len(bo)) for k in range(batch_size)]
+            let BO = tensor([bo[i] for i in idx])
+            let BN = tensor([bn[i] for i in idx])
+            let BA = [ba[i] for i in idx]
+            let qn_t = _v(_val(model(target, BN)))
+            var qn = none
+            if double:
+                let an = _ilist(argmax(_v(_val(model(p, BN))), axis=1))
+                qn = qn_t[(arange(batch_size, dtype="int64"), tensor(an, "int64"))]
+            else:
+                qn = max(qn_t, axis=1)
+            let y = tensor([br[i] for i in idx]) + gamma * (1 - tensor([bd[i] for i in idx])) * qn
+            fn loss(q2):
+                let qs = model(q2, BO)
+                let d = qs[(arange(batch_size, dtype="int64"), tensor(BA, "int64"))] - y
+                let ad = abs(stop_gradient(d))
+                return mean(where(ad <= 1.0, 0.5 * d * d, abs(d) - 0.5))
+            let vg = value_and_grad(loss)(p)
+            p = op.step(p, _clip(vg[1], max_grad_norm))
+        if t % target_every == 0:
+            target = p
+        if verbose and t % max(1, steps // 10) == 0:
+            let er = env.episode_returns
+            let rec = er[max(0, len(er) - 20):]
+            print(f"step {t * n}: mean return {sum(rec) / len(rec) if len(rec) > 0 else 0:.2f}  ε={eps:.2f}")
+    return record(params=p, episode_returns=list(env.episode_returns))
+
+fn reinforce(env, model, params, episodes=500, lr=1e-2, gamma=0.99, seed=0, max_steps=1000):
+    _seed(seed)
+    var op = _adam(lr)
+    var baseline = 0.0
+    var totals = []
+    var p = params
+    for ep in range(int(episodes)):
+        var obs = env.reset(none if ep else seed)
+        var O = []
+        var A = []
+        var R = []
+        for st in range(int(max_steps)):
+            let lg = _v(_val(model(p, obs)))
+            let a = categorical_sample(lg)
+            let r = env.step(a)
+            O.append(obs[0])
+            A.append(int(a[0]))
+            R.append(float(r.reward[0]))
+            obs = r.obs
+            if float(r.done[0]) or float(r.truncated[0]):
+                break
+        let G = discounted_returns(tensor(R), zeros(len(R)), gamma)
+        baseline = 0.9 * baseline + 0.1 * float(mean(G))
+        let adv = G - baseline
+        let Oa = stack(O)
+        fn loss(q) = -mean(categorical_log_prob(model(q, Oa), A) * adv)
+        let vg = value_and_grad(loss)(p)
+        p = op.step(p, vg[1])
+        totals.append(sum(R))
+    return record(params=p, episode_returns=totals)
+
+fn evaluate(env, policy, episodes=10, seed=0):
+    env.episode_returns = []
+    var obs = env.reset(seed)
+    var guard = 0
+    while len(env.episode_returns) < episodes and guard < 10000000:
+        obs = env.step(_v(policy(obs))).obs
+        guard = guard + 1
+    let rets = env.episode_returns[0:episodes]
+    return record(mean=sum(rets) / len(rets) if len(rets) > 0 else 0.0, returns=rets)
+
+# =============================================================================== learning from preferences
+fn _log_sigmoid(x) = -softplus(-x)
+
+fn preference_loss(r_chosen, r_rejected, margin=0.0) = -mean(_log_sigmoid(r_chosen - r_rejected - margin))
+
+fn dpo_loss(policy_chosen, policy_rejected, ref_chosen, ref_rejected, beta=0.1, label_smoothing=0.0):
+    let logits = (policy_chosen - policy_rejected) - (ref_chosen - ref_rejected)
+    let ls = float(label_smoothing)
+    let loss = -mean(_log_sigmoid(beta * logits) * (1 - ls) + _log_sigmoid(-beta * logits) * ls)
+    let cr = beta * (_v(_val(policy_chosen)) - _v(_val(ref_chosen)))
+    let rr = beta * (_v(_val(policy_rejected)) - _v(_val(ref_rejected)))
+    return record(loss=loss, chosen_rewards=cr, rejected_rewards=rr, accuracy=float(mean(tensor(cr > rr, f64))))
+
+fn ipo_loss(policy_chosen, policy_rejected, ref_chosen, ref_rejected, tau=0.1):
+    let h = (policy_chosen - ref_chosen) - (policy_rejected - ref_rejected)
+    let d = h - 1.0 / (2.0 * tau)
+    return mean(d * d)
+
+fn kl_penalized_rewards(rewards, logp, ref_logp, beta=0.05):
+    var out = -float(beta) * (_v(logp) - _v(ref_logp))
+    let r = reshape(_v(rewards), -1)
+    let T = shape(out)[1]
+    for b in range(shape(out)[0]):
+        out[b, T - 1] = float(out[b, T - 1]) + float(r[b])
+    return out
+
+fn grpo_advantages(rewards, group_size, eps=1e-6):
+    let r = reshape(_v(rewards), -1, int(group_size))
+    let m = mean(r, axis=1, keepdims=true)
+    let s = std(r, axis=1, keepdims=true)
+    return reshape((r - m) / (s + eps), -1)
+
+fn ppo_clip_loss(logp, old_logp, advantages, clip=0.2, mask=none):
+    let ratio = exp(logp - old_logp)
+    let s1 = ratio * advantages
+    let s2 = _clamp(ratio, 1 - clip, 1 + clip) * advantages
+    let obj = where(stop_gradient(s1) < stop_gradient(s2), s1, s2)
+    if mask == none:
+        return -mean(obj)
+    let m = _v(mask)
+    return -sum(obj * m) / max(float(sum(m)), 1.0)
+
+fn sequence_log_prob(logits, tokens, mask=none):
+    let lp = log_softmax(logits, axis=-1)
+    let tk = _v(tokens)
+    let V = shape(lp)[2]
+    let oh = tensor(reshape(tensor(tk, f64), shape(tk)[0], shape(tk)[1], 1) == reshape(arange(V) * 1.0, 1, 1, V), f64)
+    var picked = sum(lp * oh, axis=-1)
+    if mask != none:
+        picked = picked * _v(mask)
+    return sum(picked, axis=-1)
+
+# =============================================================================== search
+class _Node:
+    var state = none
+    var parent = none
+    var action = none
+    var children = []
+    var untried = []
+    var visits = 0
+    var value = 0.0
+
+fn _node(state, parent, action, untried):
+    var nd = _Node()
+    nd.state = state
+    nd.parent = parent
+    nd.action = action
+    nd.children = []
+    nd.untried = list(untried)
+    return nd
+
+fn mcts(state, legal_actions, apply, is_terminal, reward, simulations=1000, c=1.41, rollout_depth=200, seed=0, two_player=false):
+    _seed(seed)
+    let root = _node(state, none, none, legal_actions(state))
+    for sim in range(int(simulations)):
+        var node = root
+        while len(node.untried) == 0 and len(node.children) > 0:
+            let lg = log(node.visits)
+            var best = node.children[0]
+            var bv = -inf
+            for ch in node.children:
+                let v = ch.value / ch.visits + c * sqrt(lg / ch.visits)
+                if v > bv:
+                    bv = v
+                    best = ch
+            node = best
+        if len(node.untried) > 0 and not is_terminal(node.state):
+            let a = node.untried.pop(randint(0, len(node.untried)))
+            let s2 = apply(node.state, a)
+            let child = _node(s2, node, a, [] if is_terminal(s2) else legal_actions(s2))
+            node.children.append(child)
+            node = child
+        var s = node.state
+        var depth = 0
+        var flips = 0
+        while not is_terminal(s) and depth < rollout_depth:
+            let acts = legal_actions(s)
+            s = apply(s, acts[randint(0, len(acts))])
+            depth = depth + 1
+            flips = flips + 1
+        var v = float(reward(s))
+        if two_player and flips % 2 == 1:
+            v = -v
+        while node != none:
+            node.visits = node.visits + 1
+            node.value = node.value + v
+            if two_player:
+                v = -v
+            node = node.parent
+    var best = root.children[0]
+    for ch in root.children:
+        if ch.visits > best.visits:
+            best = ch
+    var visits = {}
+    var values = {}
+    for ch in root.children:
+        visits[str(ch.action)] = ch.visits
+        values[str(ch.action)] = ch.value / ch.visits
+    return record(action=best.action, visits=visits, values=values)
+
+fn beam_search(step, start, beam_width=4, max_len=20, eos=none):
+    var beams = [[list(start), 0.0, false]]
+    for it in range(int(max_len)):
+        var cand = []
+        for b in beams:
+            if b[2]:
+                cand.append(b)
+                continue
+            let lp = [float(v) for v in reshape(_v(step(b[0])), -1)]
+            let top = sorted(list(range(len(lp))), key=fn(i) => -lp[i])[0:beam_width]
+            for t in top:
+                cand.append([b[0] + [t], b[1] + lp[t], eos != none and t == int(eos)])
+        cand = sorted(cand, key=fn(b) => -b[1])
+        beams = cand[0:beam_width]
+        if all([b[2] for b in beams]):
+            break
+    return [record(tokens=b[0], score=b[1]) for b in beams]
+
+fn best_of_n(candidates, score):
+    let sc = [float(_v(score(c))) for c in candidates]
+    var i = 0
+    for k in range(len(sc)):
+        if sc[k] > sc[i]:
+            i = k
+    return record(best=candidates[i], index=i, scores=sc)

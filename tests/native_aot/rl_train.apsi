@@ -1,0 +1,41 @@
+use rl
+use nn
+
+fn init(s):
+    seed(s)
+    return {"w1": randn(4, 32) * 0.3, "b1": zeros(32), "wp": randn(32, 2) * 0.1, "bp": zeros(2), "wv": randn(32, 1) * 0.1, "bv": zeros(1)}
+fn model(p, x):
+    let h = tanh(x @ p["w1"] + p["b1"])
+    return [h @ p["wp"] + p["bp"], h @ p["wv"] + p["bv"]]
+var env = rl.cartpole(n=4, seed=0)
+let res = rl.ppo(env, model, init(0), total_steps=40000, rollout=64, epochs=4, minibatch=128, lr=3e-3, seed=0)
+let mr = res.mean_returns
+print("ppo improved", mr[len(mr) - 1] > mr[0])
+fn pol(p) = fn(o) => argmax(model(p, o)[0], axis=-1)
+let ev = rl.evaluate(rl.cartpole(n=1), pol(res.params), episodes=3, seed=1)
+print("eval", ev.mean > 100)
+
+fn qinit():
+    seed(1)
+    return {"w1": randn(4, 32) * 0.3, "b1": zeros(32), "w2": randn(32, 2) * 0.1, "b2": zeros(2)}
+fn qnet(p, x) = tanh(x @ p["w1"] + p["b1"]) @ p["w2"] + p["b2"]
+let dq = rl.dqn(rl.cartpole(n=1), qnet, qinit(), total_steps=3000, learning_starts=500, target_every=200)
+print("dqn episodes", len(dq.episode_returns) > 0)
+fn pinit():
+    seed(2)
+    return {"w": randn(9, 4) * 0.1}
+fn pnet(p, x) = x @ p["w"]
+let rf = rl.reinforce(rl.gridworld(size=3), pnet, pinit(), episodes=30, lr=0.05)
+print("reinforce", len(rf.episode_returns))
+var b = rl.bandit(arms=5, n=2, seed=3)
+print(shape(b.step(tensor([0, 1])).reward))
+
+# tic-tac-toe-ish: count game, take 1 or 2, whoever takes last wins
+fn legal(s) = [a for a in [1, 2] if a <= s[0]]
+fn apply(s, a) = [s[0] - a, 1 - s[1]]
+fn term(s) = s[0] == 0
+fn rew(s) = 1.0
+let m = rl.mcts([4, 0], legal, apply, term, rew, simulations=2000, two_player=true)
+print("mcts", m.action)
+print(rl.sample_token(tensor([0.0, 10.0, 0.0]), top_k=1))
+print(rl.sample_token(tensor([[0.0, 10.0, 0.0], [9.0, 0.0, 0.0]]), top_p=0.5))
