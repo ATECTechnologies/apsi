@@ -1,0 +1,27 @@
+use tokens
+
+let rows = [{"id": 1, "customer": "ann", "total": 12.5, "tags": ["a", "b"]}, {"id": 2, "customer": "bob \"jr\"", "total": 7.0, "tags": []},
+            {"id": 3, "customer": "ชื่อไทย", "total": none, "tags": ["x"]}]
+let text = tokens.pack(rows)
+print(text)
+print(tokens.unpack(text) == rows, tokens.pack({"a": [1, 2]}), tokens.unpack(tokens.pack([1, 2, 3])))
+print(tokens.count(text), tokens.count(json_str(rows, indent=2)), tokens.count("hello   world\n\n\n\n\n\n\n\n\n\nabc123456 ไทย 😀 x.y"))
+print(tokens.savings(json_str(rows, indent=2), text))
+let log = "\n".join([f"2026-01-0{i % 3} INFO request handled successfully path=/api/v1/items" if i % 2 == 0 else f"line {i} § special" for i in range(12)])
+let d = tokens.dedupe(log)
+print(d)
+print(tokens.expand(d) == log, tokens.dedupe("short\nlines"), tokens.expand(tokens.dedupe("a §1\nb")) == "a §1\nb")
+let old = "alpha\nbeta\ngamma\ndelta\nepsilon\nzeta\neta"
+let new = "alpha\nBETA\ngamma\ndelta\nnew line\nepsilon\neta\ntheta"
+let df = tokens.diff(old, new)
+print(df)
+print(tokens.patch(old, df) == new, tokens.diff("", "x"), tokens.patch("a\nb", tokens.diff("a\nb", "")) == "")
+let big_old = "\n".join([f"row {i % 7} value {i % 5}" for i in range(60)])
+let big_new = "\n".join([f"row {i % 7} value {(i * 3) % 5}" for i in range(55)])
+let bd = tokens.diff(big_old, big_new)
+print(len(bd), tokens.patch(big_old, bd) == big_new, bd[0:80])
+let b = tokens.best(rows)
+print(b[1], tokens.restore(b[0], b[1]) == rows)
+let b2 = tokens.best(log)
+print(b2[1], tokens.restore(b2[0], b2[1]) == log)
+print(tokens.pack_jsonl("{\"a\": 1, \"b\": 2}\n\n{\"a\": 3, \"b\": 4}\n"), tokens.exact())

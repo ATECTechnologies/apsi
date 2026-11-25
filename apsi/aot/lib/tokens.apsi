@@ -1,0 +1,303 @@
+# use tokens: send fewer tokens to a language model without losing information, in native programs. Every
+# transform is reversible (unpack(pack(x)) == x, expand(dedupe(t)) == t, patch(old, diff(old, new)) == new) and
+# gives the same text as apsi run. count() is the estimate apsi run uses when tiktoken is not installed.
+
+fn _dumps(v) = json_str(v, separators=(",", ":"))
+
+fn _is_letter(c) = ("a" <= c and c <= "z") or ("A" <= c and c <= "Z")
+fn _is_digit(c) = "0" <= c and c <= "9"
+fn _is_space(c) = c == " " or c == "\t" or c == "\n" or c == "\r" or c == "\f" or c == "\v" or (ord(c) >= 128 and c.isspace())
+
+fn count(text, model="gpt-4o"):
+    let t = text if isinstance(text, str) else _dumps(text)
+    let n = len(t)
+    var total = 0
+    var i = 0
+    while i < n:
+        let c = t[i]
+        let o = ord(c)
+        if _is_letter(c):
+            var k = 1
+            while k < 12 and i + k < n and _is_letter(t[i + k]):
+                k = k + 1
+            total = total + 1
+            i = i + k
+        elif _is_digit(c):
+            var k = 1
+            while k < 3 and i + k < n and _is_digit(t[i + k]):
+                k = k + 1
+            total = total + 1
+            i = i + k
+        elif o >= 128:
+            total = total + (1 if o < 0x800 else 2)
+            i = i + 1
+        elif _is_space(c):
+            var k = 1
+            while i + k < n and _is_space(t[i + k]):
+                k = k + 1
+            if not (k == 1 and c == " "):
+                total = total + max(1, k // 8)
+            i = i + k
+        else:
+            total = total + 1
+            i = i + 1
+    return total
+
+fn exact() = false
+
+class Savings:
+    var before = 0
+    var after = 0
+    var saved = 0
+    var percent = 0.0
+    var ratio = 0.0
+    fn __str__(self) = f"{self.before:,} → {self.after:,} tokens (estimated): {self.percent:.1f} % saved ({self.ratio:.2f}× fewer)"
+
+fn savings(before, after, model="gpt-4o"):
+    var s = Savings()
+    s.before = count(before, model)
+    s.after = count(after, model)
+    s.saved = s.before - s.after
+    s.percent = 100.0 * s.saved / s.before if s.before else 0.0
+    s.ratio = s.before / s.after if s.after else inf
+    return s
+
+fn _uniform(v):
+    if not isinstance(v, list) or len(v) < 2:
+        return none
+    for r in v:
+        if not isinstance(r, dict):
+            return none
+    let keys = list(v[0].keys())
+    if len(keys) == 0:
+        return none
+    for r in v:
+        if list(r.keys()) != keys:
+            return none
+    return keys
+
+fn pack(value):
+    let keys = _uniform(value)
+    if keys == none:
+        return _dumps(value)
+    var lines = ["@table " + _dumps(keys)]
+    for r in value:
+        let row = _dumps([r[k] for k in keys])
+        lines.append(row[1:len(row) - 1])
+    return "\n".join(lines)
+
+fn unpack(text):
+    if text.startswith("@table "):
+        let nl = text.find("\n")
+        let head = text if nl < 0 else text[0:nl]
+        let body = "" if nl < 0 else text[nl + 1:]
+        let keys = json_parse(head[7:])
+        var out = []
+        if body != "":
+            for line in body.split("\n"):
+                let vals = json_parse("[" + line + "]")
+                var d = {}
+                for i in range(min(len(keys), len(vals))):
+                    d[keys[i]] = vals[i]
+                out.append(d)
+        return out
+    return json_parse(text)
+
+fn pack_jsonl(text) = pack([json_parse(line) for line in text.splitlines() if line.strip() != ""])
+
+fn dedupe(text, min_chars=24, min_count=2):
+    let t = text.replace("§", "§§")
+    let lines = t.split("\n")
+    var freq = {}
+    var order = []
+    for ln in lines:
+        if len(ln) >= min_chars:
+            if ln not in freq:
+                freq[ln] = 0
+                order.append(ln)
+            freq[ln] = freq[ln] + 1
+    let reps = [ln for ln in order if freq[ln] >= min_count]
+    if len(reps) == 0:
+        return "@plain\n" + t
+    var ids = {}
+    for i in range(len(reps)):
+        ids[reps[i]] = i + 1
+    var out = [f"@refs {len(reps)}"] + reps
+    for ln in lines:
+        out.append(f"§{ids[ln]}" if ln in ids else ln)
+    return "\n".join(out)
+
+fn _isdigits(s):
+    if s == "":
+        return false
+    for c in s:
+        if not _is_digit(c):
+            return false
+    return true
+
+fn expand(text):
+    if text.startswith("@plain\n"):
+        return text[7:].replace("§§", "§")
+    let nl = text.find("\n")
+    let head = text if nl < 0 else text[0:nl]
+    let rest = "" if nl < 0 else text[nl + 1:]
+    let n = int(head.split()[1])
+    let parts = rest.split("\n")
+    let reps = parts[0:n]
+    var out = []
+    for ln in parts[n:]:
+        if ln.startswith("§") and not ln.startswith("§§") and _isdigits(ln[1:]):
+            out.append(reps[int(ln[1:]) - 1])
+        else:
+            out.append(ln)
+    return "\n".join(out).replace("§§", "§")
+
+# difflib.SequenceMatcher(None, a, b, autojunk=False).get_opcodes(), the same blocks as Python
+fn _longest(a, b2j, alo, ahi, blo, bhi, b):
+    var besti = alo
+    var bestj = blo
+    var bestsize = 0
+    var j2len = {}
+    for i in range(alo, ahi):
+        var nj = {}
+        for j in b2j.get(a[i], []):
+            if j < blo:
+                continue
+            if j >= bhi:
+                break
+            let k = j2len.get(j - 1, 0) + 1
+            nj[j] = k
+            if k > bestsize:
+                besti = i - k + 1
+                bestj = j - k + 1
+                bestsize = k
+        j2len = nj
+    while besti > alo and bestj > blo and a[besti - 1] == b[bestj - 1]:
+        besti = besti - 1
+        bestj = bestj - 1
+        bestsize = bestsize + 1
+    while besti + bestsize < ahi and bestj + bestsize < bhi and a[besti + bestsize] == b[bestj + bestsize]:
+        bestsize = bestsize + 1
+    return [besti, bestj, bestsize]
+
+fn _opcodes(a, b):
+    var b2j = {}
+    for j in range(len(b)):
+        if b[j] not in b2j:
+            b2j[b[j]] = []
+        b2j[b[j]].append(j)
+    var queue = [[0, len(a), 0, len(b)]]
+    var blocks = []
+    while len(queue) > 0:
+        let q = queue.pop()
+        let m = _longest(a, b2j, q[0], q[1], q[2], q[3], b)
+        if m[2] > 0:
+            blocks.append(m)
+            if q[0] < m[0] and q[2] < m[1]:
+                queue.append([q[0], m[0], q[2], m[1]])
+            if m[0] + m[2] < q[1] and m[1] + m[2] < q[3]:
+                queue.append([m[0] + m[2], q[1], m[1] + m[2], q[3]])
+    blocks = sorted(blocks)
+    var merged = []
+    var i1 = 0
+    var j1 = 0
+    var k1 = 0
+    for blk in blocks:
+        if i1 + k1 == blk[0] and j1 + k1 == blk[1]:
+            k1 = k1 + blk[2]
+        else:
+            if k1 > 0:
+                merged.append([i1, j1, k1])
+            i1 = blk[0]
+            j1 = blk[1]
+            k1 = blk[2]
+    if k1 > 0:
+        merged.append([i1, j1, k1])
+    merged.append([len(a), len(b), 0])
+    var ops = []
+    var i = 0
+    var j = 0
+    for blk in merged:
+        var tag = ""
+        if i < blk[0] and j < blk[1]:
+            tag = "replace"
+        elif i < blk[0]:
+            tag = "delete"
+        elif j < blk[1]:
+            tag = "insert"
+        if tag != "":
+            ops.append([tag, i, blk[0], j, blk[1]])
+        i = blk[0] + blk[2]
+        j = blk[1] + blk[2]
+        if blk[2] > 0:
+            ops.append(["equal", blk[0], i, blk[1], j])
+    return ops
+
+fn diff(old, new):
+    let a = old.split("\n")
+    let b = new.split("\n")
+    var ops = []
+    for op in _opcodes(a, b):
+        if op[0] == "equal":
+            ops.append(f"={op[2] - op[1]}")
+            continue
+        if op[2] > op[1]:
+            ops.append(f"-{op[2] - op[1]}")
+        for line in b[op[3]:op[4]]:
+            ops.append("+" + line)
+    return "\n".join(ops)
+
+fn patch(old, delta):
+    let a = old.split("\n")
+    var out = []
+    var i = 0
+    if delta == "":
+        return ""
+    for op in delta.split("\n"):
+        if op.startswith("="):
+            let n = int(op[1:])
+            for line in a[i:i + n]:
+                out.append(line)
+            i = i + n
+        elif op.startswith("-"):
+            i = i + int(op[1:])
+        elif op.startswith("+"):
+            out.append(op[1:])
+    return "\n".join(out)
+
+fn best(value, model="gpt-4o"):
+    var cands = []
+    if isinstance(value, str):
+        cands = [["plain", value], ["dedupe", dedupe(value)]]
+    else:
+        let p = pack(value)
+        cands = [["pack", p], ["pack+dedupe", dedupe(p)]]
+    var bi = 0
+    var bc = count(cands[0][1], model)
+    for k in range(1, len(cands)):
+        let c = count(cands[k][1], model)
+        if c < bc:
+            bc = c
+            bi = k
+    return (cands[bi][1], cands[bi][0])
+
+fn restore(text, method):
+    if method == "plain":
+        return text
+    if method == "dedupe":
+        return expand(text)
+    if method == "pack":
+        return unpack(text)
+    if method == "pack+dedupe":
+        return unpack(expand(text))
+    raise ValueError(f"unknown method '{method}'")
+
+fn _host_only(name) = RuntimeError(f"tokens.{name}() reads Python syntax trees and runs with apsi run; native programs have pack, dedupe, diff, best and count")
+fn focus(context, query="", budget=2000, model="gpt-4o", keep=none, kind="auto", map=true, outlines=true):
+    raise _host_only("focus")
+fn unfold(f, which=none):
+    raise _host_only("unfold")
+fn fit_chat(messages, budget=8000, model="gpt-4o", keep_last=4):
+    raise _host_only("fit_chat")
+fn outline(source):
+    raise _host_only("outline")

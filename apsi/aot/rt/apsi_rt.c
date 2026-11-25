@@ -2330,6 +2330,9 @@ static AV b_write_text(int n, AV *a, ADict *kw, AV self) {
 }
 
 /* ---- JSON */
+static const char *js_item = NULL, *js_key = NULL;    /* json_str(separators=..., sort_keys=..., ensure_ascii=...) */
+static int js_sort = 0, js_ascii = 0;
+static int js_key_cmp(const void *x, const void *y) { const AV *a = (const AV *)x, *b = (const AV *)y; return strcmp(STR(a[0])->s, STR(b[0])->s); }
 static void json_out(SB *b, AV v, int indent, int depth) {
     char t[64];
     switch (v.t) {
@@ -2339,6 +2342,7 @@ static void json_out(SB *b, AV v, int indent, int depth) {
     case T_FLOAT: if (isnan(v.f)) sb_puts(b, "NaN"); else if (isinf(v.f)) sb_puts(b, v.f > 0 ? "Infinity" : "-Infinity"); else { float_repr(v.f, t, sizeof t); sb_puts(b, t); } return;
     default: break;
     }
+    const char *isep = js_item ? js_item : indent ? "," : ", ", *ksep = js_key ? js_key : ": ";
     #define NL() do { if (indent) { sb_puts(b, "\n"); for (int _i = 0; _i < indent * (depth + 1); _i++) sb_puts(b, " "); } } while (0)
     #define NLEND() do { if (indent) { sb_puts(b, "\n"); for (int _i = 0; _i < indent * depth; _i++) sb_puts(b, " "); } } while (0)
     switch (v.o->kind) {
@@ -2348,7 +2352,16 @@ static void json_out(SB *b, AV v, int indent, int depth) {
             unsigned char ch = (unsigned char)s->s[i];
             if (ch == '"') sb_puts(b, "\\\""); else if (ch == '\\') sb_puts(b, "\\\\"); else if (ch == '\n') sb_puts(b, "\\n");
             else if (ch == '\t') sb_puts(b, "\\t"); else if (ch == '\r') sb_puts(b, "\\r");
+            else if (ch == '\b') sb_puts(b, "\\b"); else if (ch == '\f') sb_puts(b, "\\f");
             else if (ch < 0x20) { snprintf(t, sizeof t, "\\u%04x", ch); sb_puts(b, t); }
+            else if (ch >= 0x80 && js_ascii) {                     /* \uXXXX, with surrogate pairs past U+FFFF */
+                uint32_t cp; int k = ch >= 0xF0 ? 3 : ch >= 0xE0 ? 2 : 1;
+                cp = ch & (ch >= 0xF0 ? 7 : ch >= 0xE0 ? 15 : 31);
+                for (int q = 0; q < k && i + 1 < s->len; q++) cp = (cp << 6) | ((unsigned char)s->s[++i] & 63);
+                if (cp >= 0x10000) { cp -= 0x10000; snprintf(t, sizeof t, "\\u%04x\\u%04x", 0xD800 + (cp >> 10), 0xDC00 + (cp & 1023)); }
+                else snprintf(t, sizeof t, "\\u%04x", cp);
+                sb_puts(b, t);
+            }
             else sb_put(b, (char *)&ch, 1);
         }
         sb_puts(b, "\""); return;
@@ -2356,18 +2369,22 @@ static void json_out(SB *b, AV v, int indent, int depth) {
     case O_LIST: case O_TUPLE: {
         AList *l = LIST(v); sb_puts(b, "[");
         if (!l->len) { sb_puts(b, "]"); return; }
-        for (int64_t i = 0; i < l->len; i++) { if (i) sb_puts(b, indent ? "," : ", "); NL(); json_out(b, l->v[i], indent, depth + 1); }
+        for (int64_t i = 0; i < l->len; i++) { if (i) sb_puts(b, isep); NL(); json_out(b, l->v[i], indent, depth + 1); }
         NLEND(); sb_puts(b, "]"); return;
     }
     case O_DICT: {
-        ADict *d = DICT(v); int first = 1; sb_puts(b, "{");
+        ADict *d = DICT(v); sb_puts(b, "{");
         if (!d->len) { sb_puts(b, "}"); return; }
-        for (int64_t i = 0; i < d->nent; i++) {
-            if (!d->e[i].used) continue;
-            if (!first) sb_puts(b, indent ? "," : ", ");
-            first = 0; NL();
-            json_out(b, a_to_str(d->e[i].k), indent, depth + 1); sb_puts(b, ": "); json_out(b, d->e[i].v, indent, depth + 1);
+        int sp = a_ntmp; int64_t m = 0;
+        AV *kv = (AV *)malloc(sizeof(AV) * 2 * (size_t)d->len);
+        for (int64_t i = 0; i < d->nent; i++) if (d->e[i].used) { kv[2 * m] = a_to_str(d->e[i].k); A_PUSH(kv[2 * m]); kv[2 * m + 1] = d->e[i].v; m++; }
+        if (js_sort) qsort(kv, (size_t)m, 2 * sizeof(AV), js_key_cmp);
+        for (int64_t i = 0; i < m; i++) {
+            if (i) sb_puts(b, isep);
+            NL();
+            json_out(b, kv[2 * i], indent, depth + 1); sb_puts(b, ksep); json_out(b, kv[2 * i + 1], indent, depth + 1);
         }
+        free(kv); a_ntmp = sp;
         NLEND(); sb_puts(b, "}"); return;
     }
     default: a_error("TypeError", "cannot write a %s as JSON", tname(v));
@@ -2436,7 +2453,16 @@ static AV json_in(JP *j) {
     if (isf) { double d = strtod(s, &end); if (end == s) a_error("ValueError", "JSON: bad value"); j->p = end; return a_float(d); }
     long long i = strtoll(s, &end, 10); if (end == s) a_error("ValueError", "JSON: bad value near '%.10s'", s); j->p = end; return a_int(i);
 }
-static AV b_json_str(int n, AV *a, ADict *kw, AV self) { (void)self; AV ind = kwarg(kw, "indent", n > 1 ? a[1] : A_NONE); SB b = {0}; json_out(&b, a[0], ind.t == T_INT ? (int)ind.i : 0, 0); return sb_done(&b); }
+static AV b_json_str(int n, AV *a, ADict *kw, AV self) {
+    (void)self; AV ind = kwarg(kw, "indent", n > 1 ? a[1] : A_NONE), sep = kwarg(kw, "separators", A_NONE);
+    const char *oi = js_item, *ok = js_key; int os = js_sort, oa = js_ascii;
+    if ((a_is(sep, O_TUPLE) || a_is(sep, O_LIST)) && LIST(sep)->len == 2) { js_item = STR(a_to_str(LIST(sep)->v[0]))->s; js_key = STR(a_to_str(LIST(sep)->v[1]))->s; }
+    js_sort = a_truthy(kwarg(kw, "sort_keys", a_bool(0))); js_ascii = a_truthy(kwarg(kw, "ensure_ascii", a_bool(0)));
+    SB b = {0}; int sp = a_ntmp; A_PUSH(sep);
+    json_out(&b, a[0], ind.t == T_INT ? (int)ind.i : 0, 0);
+    a_ntmp = sp; js_item = oi; js_key = ok; js_sort = os; js_ascii = oa;
+    return sb_done(&b);
+}
 static AV b_json_parse(int n, AV *a, ADict *kw, AV self) { (void)n; (void)kw; (void)self; JP j = {STR(a_to_str(a[0]))->s}; AV v = json_in(&j); jws(&j); if (*j.p) a_error("ValueError", "JSON: extra data"); return v; }
 static AV b_load_json(int n, AV *a, ADict *kw, AV self) { (void)n; (void)kw; AV t = b_read_text(1, a, NULL, self); int sp = a_ntmp; A_PUSH(t); AV r = b_json_parse(1, &t, NULL, self); a_ntmp = sp; return r; }
 static AV b_save_json(int n, AV *a, ADict *kw, AV self) { (void)n; (void)kw; SB b = {0}; json_out(&b, a[1], 2, 0); AV s = sb_done(&b); AV w[2] = {a[0], s}; return b_write_text(2, w, NULL, self); }

@@ -23,7 +23,8 @@
   (pipelines), `layers` (MLPs, CNNs, recurrent layers, attention with grouped-query heads / RoPE / QK norm,
   transformer language models, `fit`), `models` (safetensors and `.apsim` checkpoints, interchangeable with
   `apsi run`), `web` (an HTTP/1.1 server on Apsi's own event loop), `crypto` (SHA-2, SHA-3, BLAKE2, HMAC, scrypt), `special`, `signal`, `config`, `env`, `log`,
-  `physics` (constants, formulas with units, fields) and `pde` (heat, waves, advection, Poisson, Navier–Stokes, CG), `mechanics`, `precision`, `lab`, `sys` / `gpu`.
+  `physics` (constants, formulas with units, fields) and `pde` (heat, waves, advection, Poisson, Navier–Stokes, CG), `mechanics`, `precision`, `lab`, `sys` / `gpu`, `tokens`.
+- Native `json_str` takes `separators`, `sort_keys` and `ensure_ascii`, as in `apsi run`.
 - Native format specs take `#` (`{255:#06x}` → `0x00ff`); the format names `bf16`, `int8`, … print as in `apsi run`.
 - Native `grad` nests across variables (a gradient in one argument differentiated in another), as in `apsi run`.
 - Operators of a class (`__mul__`, `__radd__`, …) now win over tensors on either side; `round(tensor, n)` natively.
