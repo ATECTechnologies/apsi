@@ -331,14 +331,14 @@ static void dv_ln(DV *r, const DV *x, int64_t prec) {
     DV one; dv_init(&one); dv_one(&one);
     if (dv_cmp(x, &one) == 0) { dv_free(&one); r->sign = 0; r->exp = 0; r->c.n = 0; return; }
     DV t; dv_init(&t); dv_add(&t, x, &one, 1, 0);                          /* x - 1, exactly */
-    int64_t near = dv_adj(&t) < 0 ? -dv_adj(&t) : 0;           /* digits lost to x - e^y when x is near 1 */
+    int64_t nearloss = dv_adj(&t) < 0 ? -dv_adj(&t) : 0;           /* digits lost to x - e^y when x is near 1 */
     int64_t e10; double m0 = dv_to_double_approx(x, &e10); double y0 = log(m0) + (double)e10 * log(10.0);
     if (dv_adj(&t) < -8) { int64_t te; double tm = dv_to_double_approx(&t, &te); y0 = tm * pow(10.0, (double)te); }
     int64_t wp = prec + 12, steps[64]; int ns = 0; int64_t p = wp; while (p > 14 && ns < 60) { steps[ns++] = p; p = p / 3 + 2; }
     DV y, ey, num, den, two; dv_init(&y); dv_init(&ey); dv_init(&num); dv_init(&den); dv_init(&two);
     dv_from_double(&y, y0); dv_round(&y, 17);
     for (int i = ns - 1; i >= -1; i--) {
-        int64_t pp = (i >= 0 ? steps[i] : wp) + near + 5;
+        int64_t pp = (i >= 0 ? steps[i] : wp) + nearloss + 5;
         dv_exp(&ey, &y, pp);
         dv_add(&num, x, &ey, 1, pp); dv_add(&den, x, &ey, 0, pp);
         if (dv_zero(&num)) continue;
