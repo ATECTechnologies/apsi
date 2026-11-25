@@ -1,0 +1,38 @@
+# Python's operator for converted programs
+fn add(a, b) = a + b
+fn sub(a, b) = a - b
+fn mul(a, b) = a * b
+fn truediv(a, b) = a / b
+fn floordiv(a, b) = a // b
+fn mod(a, b) = a % b
+fn pow(a, b) = a ** b
+fn neg(a) = -a
+fn pos(a) = a
+fn abs(a) = __builtin("abs")(a)
+fn eq(a, b) = a == b
+fn ne(a, b) = a != b
+fn lt(a, b) = a < b
+fn le(a, b) = a <= b
+fn gt(a, b) = a > b
+fn ge(a, b) = a >= b
+fn not_(a) = not a
+fn truth(a) = bool(a)
+fn contains(a, b) = b in a
+fn getitem(a, b) = a[b]
+fn concat(a, b) = a + b
+fn and_(a, b) = a & b
+fn or_(a, b) = a | b
+fn is_(a, b) = a is b
+fn is_not(a, b) = a is not b
+fn index(a) = int(a)
+fn itemgetter(*items):
+    if len(items) == 1:
+        let i = items[0]
+        return fn(o) => o[i]
+    return fn(o) => tuple([o[i] for i in items])
+fn attrgetter(*names):
+    if len(names) == 1:
+        let n = names[0]
+        return fn(o) => getattr(o, n)
+    return fn(o) => tuple([getattr(o, n) for n in names])
+fn methodcaller(name, *args, **kw) = fn(o) => getattr(o, name)(*args, **kw)

@@ -1,0 +1,61 @@
+# Python's heapq for converted programs (the same sift order as CPython, so heaps print the same)
+fn _siftdown(heap, startpos, pos0):
+    var pos = pos0
+    let newitem = heap[pos]
+    while pos > startpos:
+        let parentpos = (pos - 1) // 2
+        let parent = heap[parentpos]
+        if newitem < parent:
+            heap[pos] = parent
+            pos = parentpos
+            continue
+        break
+    heap[pos] = newitem
+fn _siftup(heap, pos0):
+    var pos = pos0
+    let endpos = len(heap)
+    let startpos = pos
+    let newitem = heap[pos]
+    var childpos = 2 * pos + 1
+    while childpos < endpos:
+        let rightpos = childpos + 1
+        if rightpos < endpos and not (heap[childpos] < heap[rightpos]):
+            childpos = rightpos
+        heap[pos] = heap[childpos]
+        pos = childpos
+        childpos = 2 * pos + 1
+    heap[pos] = newitem
+    _siftdown(heap, startpos, pos)
+fn heappush(heap, item):
+    heap.append(item)
+    _siftdown(heap, 0, len(heap) - 1)
+fn heappop(heap):
+    let lastelt = heap.pop()
+    if len(heap) > 0:
+        let returnitem = heap[0]
+        heap[0] = lastelt
+        _siftup(heap, 0)
+        return returnitem
+    return lastelt
+fn heapreplace(heap, item):
+    let returnitem = heap[0]
+    heap[0] = item
+    _siftup(heap, 0)
+    return returnitem
+fn heappushpop(heap, item):
+    if len(heap) > 0 and heap[0] < item:
+        let r = heap[0]
+        heap[0] = item
+        _siftup(heap, 0)
+        return r
+    return item
+fn heapify(x):
+    for i in range(len(x) // 2 - 1, -1, -1):
+        _siftup(x, i)
+fn nlargest(n, iterable, key=none) = sorted(list(iterable), key=key, reverse=true)[0:n] if key != none else sorted(list(iterable), reverse=true)[0:n]
+fn nsmallest(n, iterable, key=none) = sorted(list(iterable), key=key)[0:n] if key != none else sorted(list(iterable))[0:n]
+fn merge(*iterables, key=none, reverse=false):
+    var out = []
+    for it in iterables:
+        out.extend(list(it))
+    return iter(sorted(out, key=key, reverse=reverse) if key != none else sorted(out, reverse=reverse))

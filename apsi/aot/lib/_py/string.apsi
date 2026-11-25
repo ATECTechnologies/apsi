@@ -1,0 +1,11 @@
+# Python's string constants for converted programs
+let ascii_lowercase = "abcdefghijklmnopqrstuvwxyz"
+let ascii_uppercase = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+let ascii_letters = ascii_lowercase + ascii_uppercase
+let digits = "0123456789"
+let hexdigits = "0123456789abcdefABCDEF"
+let octdigits = "01234567"
+let punctuation = "!\"#$%&'()*+,-./:;<=>?@[\\]^_`{|}~"
+let whitespace = " \t\n\r\x0b\x0c"
+let printable = digits + ascii_letters + punctuation + whitespace
+fn capwords(s, sep=none) = (sep if sep != none else " ").join([w.capitalize() for w in s.split(sep)])

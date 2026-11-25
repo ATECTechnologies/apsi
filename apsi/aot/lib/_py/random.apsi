@@ -1,0 +1,247 @@
+# Python's random for converted programs: CPython's Mersenne Twister and its algorithms, so random.seed(n) gives the
+# same numbers as Python
+let _ln = __builtin("log")
+let _sqrt = __builtin("sqrt")
+let _cos = __builtin("cos")
+let _sin = __builtin("sin")
+let _exp = __builtin("exp")
+let _floor = __builtin("floor")
+let _int = __builtin("int")
+let _TWOPI = 6.283185307179586
+let _NV = 4 * _exp(-0.5) / _sqrt(2.0)
+var _state = [false, none]
+
+fn _ready():
+    if not _state[0]:
+        __mt("fresh")
+        _state[0] = true
+
+fn _words(a):
+    var x = abs(a)
+    var key = []
+    while x > 0:
+        key.append(x % 4294967296)
+        x = x // 4294967296
+    return key
+
+fn seed(a=none, version=2):
+    _state[0] = true
+    _state[1] = none
+    if a == none:
+        __mt("fresh")
+        return
+    var v = a
+    if isinstance(v, str):
+        let raw = v.encode()
+        let full = raw + __hash(raw, "sha512", "raw")
+        var n = 0
+        for b in full:
+            n = n * 256 + b
+        v = n
+    elif isinstance(v, bytes):
+        var n = 0
+        for b in v + __hash(v, "sha512", "raw"):
+            n = n * 256 + b
+        v = n
+    elif isinstance(v, float):
+        v = hash(v)
+    __mt("seed", _words(_int(v)))
+
+fn random():
+    _ready()
+    return __mt("random")
+
+fn getrandbits(k):
+    _ready()
+    if k <= 0:
+        return 0
+    if k <= 32:
+        return __mt("u32") // (2 ** (32 - k))
+    var r = 0
+    var shift = 0
+    var left = k
+    while left > 0:
+        var w = __mt("u32")
+        if left < 32:
+            w = w // (2 ** (32 - left))
+        r = r + w * 2 ** shift
+        shift = shift + 32
+        left = left - 32
+    return r
+
+fn _bit_length(n):
+    var k = 0
+    var x = n
+    while x > 0:
+        x = x // 2
+        k = k + 1
+    return k
+
+fn _randbelow(n):
+    let k = _bit_length(n)
+    var r = getrandbits(k)
+    while r >= n:
+        r = getrandbits(k)
+    return r
+
+fn randrange(start, stop=none, step=1):
+    let istart = _int(start)
+    if stop == none:
+        if step != 1:
+            raise TypeError("Missing a non-None stop argument")
+        if istart > 0:
+            return _randbelow(istart)
+        raise ValueError("empty range for randrange()")
+    let istop = _int(stop)
+    let width = istop - istart
+    if step == 1:
+        if width > 0:
+            return istart + _randbelow(width)
+        raise ValueError(f"empty range in randrange({istart}, {istop})")
+    let n = (width + step - 1) // step if step > 0 else (width + step + 1) // step
+    if n <= 0:
+        raise ValueError("empty range for randrange()")
+    return istart + step * _randbelow(n)
+
+fn randint(a, b) = randrange(a, b + 1)
+
+fn choice(seq):
+    if len(seq) == 0:
+        raise IndexError("Cannot choose from an empty sequence")
+    return seq[_randbelow(len(seq))]
+
+fn shuffle(x):
+    for i in range(len(x) - 1, 0, -1):
+        let j = _randbelow(i + 1)
+        let t = x[i]
+        x[i] = x[j]
+        x[j] = t
+
+fn sample(population, k, counts=none):
+    let pop = list(population)
+    let n = len(pop)
+    if k < 0 or k > n:
+        raise ValueError("Sample larger than population or is negative")
+    var result = [none] * k
+    var setsize = 21
+    if k > 5:
+        setsize = setsize + 4 ** _int(__builtin("ceil")(_ln(k * 3) / _ln(4)))
+    if n <= setsize:
+        var pool = list(pop)
+        for i in range(k):
+            let j = _randbelow(n - i)
+            result[i] = pool[j]
+            pool[j] = pool[n - i - 1]
+    else:
+        var selected = set()
+        for i in range(k):
+            var j = _randbelow(n)
+            while j in selected:
+                j = _randbelow(n)
+            selected.add(j)
+            result[i] = pop[j]
+    return result
+
+fn uniform(a, b) = a + (b - a) * random()
+
+fn _bisect_right(a, x, lo, hi):
+    var l = lo
+    var h = hi
+    while l < h:
+        let mid = (l + h) // 2
+        if x < a[mid]:
+            h = mid
+        else:
+            l = mid + 1
+    return l
+
+fn choices(population, weights=none, cum_weights=none, k=1):
+    let n = len(population)
+    var cw = cum_weights
+    if cw == none:
+        if weights == none:
+            let nf = n + 0.0
+            return [population[_int(_floor(random() * nf))] for i in range(k)]
+        cw = []
+        var acc = 0
+        for w in weights:
+            acc = acc + w
+            cw.append(acc)
+    let total = cw[len(cw) - 1] + 0.0
+    return [population[_bisect_right(cw, random() * total, 0, n - 1)] for i in range(k)]
+
+fn gauss(mu=0.0, sigma=1.0):
+    var z = _state[1]
+    _state[1] = none
+    if z == none:
+        let x2pi = random() * _TWOPI
+        let g2rad = _sqrt(-2.0 * _ln(1.0 - random()))
+        z = _cos(x2pi) * g2rad
+        _state[1] = _sin(x2pi) * g2rad
+    return mu + z * sigma
+
+fn normalvariate(mu=0.0, sigma=1.0):
+    var z = 0.0
+    while true:
+        let u1 = random()
+        let u2 = 1.0 - random()
+        z = _NV * (u1 - 0.5) / u2
+        if z * z / 4.0 <= -_ln(u2):
+            break
+    return mu + z * sigma
+
+fn expovariate(lambd=1.0) = -_ln(1.0 - random()) / lambd
+
+fn triangular(low=0.0, high=1.0, mode=none):
+    var u = random()
+    if high == low:
+        return low
+    var c = 0.5 if mode == none else (mode - low) / (high - low)
+    var lo = low
+    var hi = high
+    if u > c:
+        u = 1.0 - u
+        c = 1.0 - c
+        lo = high
+        hi = low
+    return lo + (hi - lo) * _sqrt(u * c)
+
+fn getstate() = [__mt("getstate"), _state[1]]
+fn setstate(st):
+    __mt("setstate", st[0])
+    _state[0] = true
+    _state[1] = st[1]
+
+class Random:
+    fn __init__(self, x=none):
+        let saved = __mt("getstate")
+        let g = _state[1]
+        seed(x)
+        self._st = __mt("getstate")
+        self._g = none
+        __mt("setstate", saved)
+        _state[1] = g
+    fn _run(self, f, *a):
+        let saved = __mt("getstate")
+        let g = _state[1]
+        __mt("setstate", self._st)
+        _state[1] = self._g
+        let r = f(*a)
+        self._st = __mt("getstate")
+        self._g = _state[1]
+        __mt("setstate", saved)
+        _state[1] = g
+        return r
+    fn seed(self, x=none):
+        self._run(seed, x)
+    fn random(self) = self._run(random)
+    fn randint(self, a, b) = self._run(randint, a, b)
+    fn randrange(self, *a) = self._run(randrange, *a)
+    fn choice(self, s) = self._run(choice, s)
+    fn shuffle(self, x):
+        self._run(shuffle, x)
+    fn sample(self, p, k) = self._run(sample, p, k)
+    fn uniform(self, a, b) = self._run(uniform, a, b)
+    fn gauss(self, mu=0.0, sigma=1.0) = self._run(gauss, mu, sigma)
+    fn getrandbits(self, k) = self._run(getrandbits, k)
+    fn choices(self, population, weights=none, k=1) = self._run(fn() => choices(population, weights, none, k))

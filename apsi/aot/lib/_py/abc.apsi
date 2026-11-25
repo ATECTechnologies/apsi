@@ -1,0 +1,5 @@
+# Python's abc for converted programs: abstract classes are plain classes natively
+class ABC:
+    pass
+fn abstractmethod(f) = f
+let ABCMeta = none

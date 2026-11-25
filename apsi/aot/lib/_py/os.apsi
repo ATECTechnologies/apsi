@@ -1,0 +1,70 @@
+# Python's os (and os.path) for converted programs
+let sep = "\\" if _native_info()["os"] == "windows" else "/"
+let linesep = "\r\n" if _native_info()["os"] == "windows" else "\n"
+let name = "nt" if _native_info()["os"] == "windows" else "posix"
+class _Environ:
+    fn get(self, k, default=none):
+        let v = getenv(k)
+        return default if v == none else v
+    fn __getitem__(self, k):
+        let v = getenv(k)
+        if v == none:
+            raise KeyError(k)
+        return v
+    fn __contains__(self, k) = getenv(k) != none
+    fn __setitem__(self, k, v):
+        __setenv(k, v)
+    fn keys(self) = __environ_names()
+let environ = _Environ()
+fn getenv(k, default=none):
+    let v = __builtin("getenv")(k)
+    return default if v == none else v
+fn getcwd() = __fs("cwd", ".")
+fn listdir(p=".") = __fs("list", p)
+fn makedirs(p, exist_ok=false):
+    if __fs("isdir", p):
+        if not exist_ok:
+            raise FileExistsError(f"[Errno 17] File exists: '{p}'")
+        return
+    __fs("mkdir", p)
+fn mkdir(p):
+    __fs("mkdir", p)
+fn remove(p):
+    __fs("remove", p)
+fn unlink(p):
+    __fs("remove", p)
+fn rename(a, b):
+    __fs("rename", a, b)
+fn cpu_count() = __cpu_count()
+
+class _Path:
+    fn join(self, *parts):
+        var out = ""
+        for p in parts:
+            if p.startswith("/") or (len(p) > 1 and p[1] == ":"):
+                out = p
+            elif out == "" or out.endswith("/") or out.endswith("\\"):
+                out = out + p
+            else:
+                out = out + sep + p
+        return out
+    fn exists(self, p) = __fs("isfile", p) or __fs("isdir", p)
+    fn isfile(self, p) = __fs("isfile", p)
+    fn isdir(self, p) = __fs("isdir", p)
+    fn basename(self, p) = p.replace("\\", "/").split("/")[-1]
+    fn dirname(self, p):
+        let q = p.replace("\\", "/")
+        let i = q.rfind("/")
+        return "" if i < 0 else (p[0:i] if i > 0 else p[0:1])
+    fn split(self, p) = (self.dirname(p), self.basename(p))
+    fn splitext(self, p):
+        let b = self.basename(p)
+        let i = b.rfind(".")
+        if i <= 0:
+            return (p, "")
+        let cut = len(p) - (len(b) - i)
+        return (p[0:cut], p[cut:])
+    fn abspath(self, p) = p if p.startswith("/") else self.join(getcwd(), p)
+    fn getsize(self, p) = __fs("size", p)
+    fn expanduser(self, p) = p.replace("~", getenv("HOME", getenv("USERPROFILE", "~")), 1) if p.startswith("~") else p
+let path = _Path()

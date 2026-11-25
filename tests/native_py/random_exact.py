@@ -1,0 +1,12 @@
+import random
+random.seed(42)
+print(random.random(), random.randint(1, 100), random.choice("abcdef"), random.randrange(0, 50, 5), random.uniform(1, 2))
+xs = list(range(10)); random.shuffle(xs); print(xs)
+print(random.sample(range(100), 5), random.sample(range(10), 7), random.choices("xyz", k=4), random.choices([1, 2, 3], weights=[5, 1, 1], k=5))
+print(round(random.gauss(0, 1), 12), round(random.normalvariate(5, 2), 12), round(random.expovariate(2.0), 12), random.getrandbits(70))
+random.seed("hello")
+print(random.random(), random.randint(0, 10 ** 12))
+r = random.Random(7)
+print(r.random(), r.randint(1, 6), random.random())
+random.seed(2 ** 80 + 12345)
+print(random.random(), round(random.triangular(0, 10, 3), 12))

@@ -1,0 +1,9 @@
+# Python's time for converted programs
+fn time() = __time()
+fn perf_counter() = __time()
+fn monotonic() = __time()
+fn process_time() = clock()
+fn sleep(s):
+    __sleep(float(s))
+fn time_ns() = int(__time() * 1e9)
+fn perf_counter_ns() = int(__time() * 1e9)

@@ -1,0 +1,28 @@
+# Python's json for converted programs
+let _jstr = __builtin("json_str")
+let _jparse = __builtin("json_parse")
+fn dumps(obj, indent=none, sort_keys=false, ensure_ascii=true, separators=none, default=none, **kw):
+    if indent != none:
+        return _indent(obj, indent, 0, sort_keys, ensure_ascii)
+    let sep = separators if separators != none else (", ", ": ")
+    return _jstr(obj, separators=sep, sort_keys=sort_keys, ensure_ascii=ensure_ascii)
+fn _indent(o, ind, level, sk, ea):
+    let pad = (" " * ind if isinstance(ind, int) else ind)
+    let cur = pad * (level + 1)
+    let end = pad * level
+    if isinstance(o, dict):
+        if len(o) == 0:
+            return "{}"
+        let ks = sorted(list(o.keys())) if sk else list(o.keys())
+        return "{\n" + ",\n".join([cur + _jstr(str(k), ensure_ascii=ea) + ": " + _indent(o[k], ind, level + 1, sk, ea) for k in ks]) + "\n" + end + "}"
+    if isinstance(o, list) or isinstance(o, tuple):
+        if len(o) == 0:
+            return "[]"
+        return "[\n" + ",\n".join([cur + _indent(v, ind, level + 1, sk, ea) for v in o]) + "\n" + end + "]"
+    return _jstr(o, separators=(", ", ": "), ensure_ascii=ea)
+fn loads(s, **kw) = _jparse(s if isinstance(s, str) else s.decode())
+fn dump(obj, fp, **kw):
+    fp.write(dumps(obj, **kw))
+fn load(fp, **kw) = loads(fp.read())
+class JSONDecodeError(ValueError):
+    pass

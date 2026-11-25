@@ -276,7 +276,7 @@ print(m.window_level(d.pixels, 40, 400))
 
 
 @pytest.mark.skipif(CC is None, reason="no C compiler")
-@pytest.mark.parametrize("name", ["classes", "stdlib", "program", "text"])
+@pytest.mark.parametrize("name", ["classes", "stdlib", "program", "text", "random_exact", "modules"])
 def test_converted_python_native(tmp_path, name):
     """A Python program, converted by apsi convert (use pycompat) and built natively, prints what Python prints."""
     import shutil

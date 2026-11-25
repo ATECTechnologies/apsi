@@ -1,0 +1,51 @@
+# Python's statistics for converted programs
+let _sqrt = __builtin("sqrt")
+class StatisticsError(ValueError):
+    pass
+fn _data(xs):
+    let d = list(xs)
+    if len(d) == 0:
+        raise StatisticsError("no data points")
+    return d
+fn mean(xs):
+    let d = _data(xs)
+    let s = sum(d)
+    let m = s / len(d)
+    return int(m) if all([isinstance(v, int) for v in d]) and m == int(m) and false else m
+fn fmean(xs) = float(sum(_data(xs))) / len(list(xs))
+fn median(xs):
+    let d = sorted(_data(xs))
+    let n = len(d)
+    if n % 2 == 1:
+        return d[n // 2]
+    return (d[n // 2 - 1] + d[n // 2]) / 2
+fn median_low(xs):
+    let d = sorted(_data(xs))
+    let n = len(d)
+    return d[n // 2] if n % 2 == 1 else d[n // 2 - 1]
+fn median_high(xs):
+    let d = sorted(_data(xs))
+    return d[len(d) // 2]
+fn mode(xs):
+    let d = _data(xs)
+    var counts = {}
+    for v in d:
+        counts[v] = counts.get(v, 0) + 1
+    var best = d[0]
+    for v in counts:
+        if counts[v] > counts[best]:
+            best = v
+    return best
+fn _ss(d):
+    let m = sum(d) / len(d)
+    return sum([(v - m) * (v - m) for v in d])
+fn variance(xs, xbar=none):
+    let d = _data(xs)
+    if len(d) < 2:
+        raise StatisticsError("variance requires at least two data points")
+    return _ss(d) / (len(d) - 1)
+fn pvariance(xs, mu=none):
+    let d = _data(xs)
+    return _ss(d) / len(d)
+fn stdev(xs, xbar=none) = _sqrt(variance(xs))
+fn pstdev(xs, mu=none) = _sqrt(pvariance(xs))

@@ -1767,7 +1767,7 @@ int a_is_coro(AV v) { return a_is(v, O_GEN) && ((AGen *)v.o)->coro; }
 static AV m_gen_send(int n, AV *a, ADict *kw, AV s) { (void)kw; AV v; if (!gen_resume((AGen *)s.o, n ? a[0] : A_NONE, &v)) a_error("StopIteration", ""); return v; }
 
 /* =================================================================== iteration */
-enum { IT_SEQ = 1, IT_STR, IT_DICT, IT_RANGE, IT_INST, IT_ENUM, IT_ZIP, IT_MAP, IT_FILTER, IT_REV, IT_BYTES };
+enum { IT_SEQ = 1, IT_STR, IT_DICT, IT_RANGE, IT_INST, IT_ENUM, IT_ZIP, IT_MAP, IT_FILTER, IT_REV, IT_BYTES, IT_SMAP };
 static AV new_iter(int kind, AV src) {
     AIter *it = (AIter *)a_alloc(sizeof(AIter), O_ITER);
     it->kind = kind; it->src = src; it->aux = A_NONE;
@@ -1854,6 +1854,7 @@ int a_next(AV itv, AV *out) {
         a_ntmp = sp; *out = a_obj(t); return 1;
     }
     case IT_MAP: { AV v; if (!a_next(it->aux, &v)) return 0; *out = a_call(it->src, 1, &v, NULL); return 1; }
+    case IT_SMAP: { AV v; if (!a_next(it->aux, &v)) return 0; int sp = a_ntmp; A_PUSH(v); *out = a_call(it->src, (int)LIST(v)->len, LIST(v)->v, NULL); a_ntmp = sp; return 1; }
     case IT_FILTER: {
         AV v;
         while (a_next(it->aux, &v)) if (it->src.t == T_NONE ? a_truthy(v) : a_truthy(a_call(it->src, 1, &v, NULL))) { *out = v; return 1; }
@@ -2744,7 +2745,10 @@ static AV b_sorted(int n, AV *a, ADict *kw, AV self) { (void)n; (void)self; AV l
 static AV b_reversed(int n, AV *a, ADict *kw, AV self) { (void)n; (void)kw; (void)self; AV l = (a_is(a[0], O_LIST) || a_is(a[0], O_TUPLE)) ? a[0] : collect(a[0]); AV it = new_iter(IT_REV, l); ((AIter *)it.o)->pos = LIST(l)->len - 1; return it; }
 static AV b_enumerate(int n, AV *a, ADict *kw, AV self) { (void)kw; (void)self; AV src = a_iter(a[0]); AV it = new_iter(IT_ENUM, a[0]); ((AIter *)it.o)->aux = src; ((AIter *)it.o)->pos = n > 1 ? a[1].i : 0; return it; }
 static AV b_zip(int n, AV *a, ADict *kw, AV self) { (void)kw; (void)self; AList *its = new_list(n, O_LIST); int sp = a_ntmp; A_PUSH(a_obj(its)); for (int i = 0; i < n; i++) its->v[i] = A_NONE; for (int i = 0; i < n; i++) its->v[i] = a_iter(a[i]); a_ntmp = sp; AV it = new_iter(IT_ZIP, A_NONE); ((AIter *)it.o)->aux = a_obj(its); return it; }
-static AV b_map(int n, AV *a, ADict *kw, AV self) { (void)n; (void)kw; (void)self; AV src = a_iter(a[1]); AV it = new_iter(IT_MAP, a[0]); ((AIter *)it.o)->aux = src; return it; }
+static AV b_zip(int n, AV *a, ADict *kw, AV self);
+static AV b_map(int n, AV *a, ADict *kw, AV self) { (void)n; (void)kw; (void)self;
+    if (n > 2) { int sp = a_ntmp; AV z = b_zip(n - 1, a + 1, NULL, A_NONE); A_PUSH(z); AV it = new_iter(IT_SMAP, a[0]); ((AIter *)it.o)->aux = z; a_ntmp = sp; return it; }
+    AV src = a_iter(a[1]); AV it = new_iter(IT_MAP, a[0]); ((AIter *)it.o)->aux = src; return it; }
 static AV b_filter(int n, AV *a, ADict *kw, AV self) { (void)n; (void)kw; (void)self; AV src = a_iter(a[1]); AV it = new_iter(IT_FILTER, a[0]); ((AIter *)it.o)->aux = src; return it; }
 static AV b_any(int n, AV *a, ADict *kw, AV self) { (void)n; (void)kw; (void)self; int sp = a_ntmp; AV it = a_iter(a[0]), x; A_PUSH(it); while (a_next(it, &x)) if (a_truthy(x)) { a_ntmp = sp; return a_bool(1); } a_ntmp = sp; return a_bool(0); }
 static AV b_all(int n, AV *a, ADict *kw, AV self) { (void)n; (void)kw; (void)self; int sp = a_ntmp; AV it = a_iter(a[0]), x; A_PUSH(it); while (a_next(it, &x)) if (!a_truthy(x)) { a_ntmp = sp; return a_bool(0); } a_ntmp = sp; return a_bool(1); }

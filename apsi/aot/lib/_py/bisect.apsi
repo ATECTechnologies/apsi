@@ -1,0 +1,28 @@
+# Python's bisect for converted programs
+fn bisect_right(a, x, lo=0, hi=none, key=none):
+    var l = lo
+    var h = len(a) if hi == none else hi
+    while l < h:
+        let mid = (l + h) // 2
+        if x < (key(a[mid]) if key != none else a[mid]):
+            h = mid
+        else:
+            l = mid + 1
+    return l
+fn bisect_left(a, x, lo=0, hi=none, key=none):
+    var l = lo
+    var h = len(a) if hi == none else hi
+    while l < h:
+        let mid = (l + h) // 2
+        if (key(a[mid]) if key != none else a[mid]) < x:
+            l = mid + 1
+        else:
+            h = mid
+    return l
+fn bisect(a, x, lo=0, hi=none, key=none) = bisect_right(a, x, lo, hi, key)
+fn insort_right(a, x, lo=0, hi=none, key=none):
+    a.insert(bisect_right(a, key(x) if key != none else x, lo, hi, key), x)
+fn insort_left(a, x, lo=0, hi=none, key=none):
+    a.insert(bisect_left(a, key(x) if key != none else x, lo, hi, key), x)
+fn insort(a, x, lo=0, hi=none, key=none):
+    insort_right(a, x, lo, hi, key)

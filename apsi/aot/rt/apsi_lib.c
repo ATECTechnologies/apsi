@@ -808,6 +808,44 @@ BI(lb_upk) {
     }
 }
 BI(lb_dec);
+/* __mt(op, …): CPython's Mersenne Twister, so Python's random gives the same numbers in native programs
+   ("seed", [32-bit words]) ("u32") ("random") ("state") */
+static uint32_t mt[624]; static int mti = 625;
+static void mt_init(uint32_t s) { mt[0] = s; for (mti = 1; mti < 624; mti++) mt[mti] = 1812433253u * (mt[mti - 1] ^ (mt[mti - 1] >> 30)) + (uint32_t)mti; }
+static void mt_init_by_array(const uint32_t *key, int len) {
+    mt_init(19650218u); int i = 1, j = 0;
+    for (int k = 624 > len ? 624 : len; k; k--) { mt[i] = (mt[i] ^ ((mt[i - 1] ^ (mt[i - 1] >> 30)) * 1664525u)) + key[j] + (uint32_t)j; i++; j++; if (i >= 624) { mt[0] = mt[623]; i = 1; } if (j >= len) j = 0; }
+    for (int k = 623; k; k--) { mt[i] = (mt[i] ^ ((mt[i - 1] ^ (mt[i - 1] >> 30)) * 1566083941u)) - (uint32_t)i; i++; if (i >= 624) { mt[0] = mt[623]; i = 1; } }
+    mt[0] = 0x80000000u;
+}
+static uint32_t mt_u32(void) {
+    static const uint32_t mag01[2] = {0, 0x9908b0dfu}; uint32_t y;
+    if (mti >= 624) {
+        if (mti == 625) mt_init(5489u);
+        int kk;
+        for (kk = 0; kk < 624 - 397; kk++) { y = (mt[kk] & 0x80000000u) | (mt[kk + 1] & 0x7fffffffu); mt[kk] = mt[kk + 397] ^ (y >> 1) ^ mag01[y & 1]; }
+        for (; kk < 623; kk++) { y = (mt[kk] & 0x80000000u) | (mt[kk + 1] & 0x7fffffffu); mt[kk] = mt[kk + (397 - 624)] ^ (y >> 1) ^ mag01[y & 1]; }
+        y = (mt[623] & 0x80000000u) | (mt[0] & 0x7fffffffu); mt[623] = mt[396] ^ (y >> 1) ^ mag01[y & 1];
+        mti = 0;
+    }
+    y = mt[mti++]; y ^= y >> 11; y ^= (y << 7) & 0x9d2c5680u; y ^= (y << 15) & 0xefc60000u; y ^= y >> 18;
+    return y;
+}
+BI(lb_mt) {
+    (void)self; (void)kw; const char *op = lib_str(a[0], "__mt")->s;
+    if (!strcmp(op, "seed")) {
+        AList *l = (AList *)a[1].o; int len = (int)l->len; uint32_t *key = (uint32_t *)malloc(sizeof(uint32_t) * (size_t)(len ? len : 1));
+        for (int i = 0; i < len; i++) key[i] = (uint32_t)l->v[i].i;
+        if (!len) { key[0] = 0; len = 1; }
+        mt_init_by_array(key, len); free(key); return A_NONE;
+    }
+    if (!strcmp(op, "u32")) return a_int((int64_t)mt_u32());
+    if (!strcmp(op, "random")) { uint32_t x = mt_u32() >> 5, y = mt_u32() >> 6; return a_float((x * 67108864.0 + y) * (1.0 / 9007199254740992.0)); }
+    if (!strcmp(op, "getstate")) { AV l = a_list(0, NULL); int sp = a_ntmp; A_PUSH(l); for (int i = 0; i < 624; i++) a_list_append((AList *)l.o, a_int(mt[i])); a_list_append((AList *)l.o, a_int(mti)); a_ntmp = sp; return l; }
+    if (!strcmp(op, "setstate")) { AList *l = (AList *)a[1].o; if (l->len != 625) a_error("ValueError", "state vector is the wrong size"); for (int i = 0; i < 624; i++) mt[i] = (uint32_t)l->v[i].i; mti = (int)l->v[624].i; return A_NONE; }
+    if (!strcmp(op, "fresh")) { uint32_t k[4]; k[0] = (uint32_t)time(NULL); k[1] = (uint32_t)(uintptr_t)&k; k[2] = (uint32_t)clock(); k[3] = 0x9e3779b9u; mt_init_by_array(k, 4); return A_NONE; }
+    (void)n; a_error("ValueError", "__mt: unknown operation '%s'", op); return A_NONE;
+}
 extern int a_pymode;
 BI(lb_subclass) {                                             /* __subclass(C, B): C is B or derives from it */
     (void)self; (void)kw; (void)n;
@@ -853,5 +891,5 @@ static const TEnt lib_builtins[] = {
     {"__password_hash", lb_password_hash}, {"__password_verify", lb_password_verify},
     {"__la", lb_la}, {"__fft", lb_fft}, {"__special", lb_special}, {"__conv2d", lb_conv2d}, {"__maxpool2d", lb_maxpool2d},
     {"__time", lb_time}, {"__sleep", lb_sleep}, {"__fs", lb_fs}, {"__st_load", lb_st_load}, {"__st_save", lb_st_save},
-    {"__npy_load", lb_npy_load}, {"__npy_save", lb_npy_save}, {"__http_serve", lb_http_serve}, {"__is_dev", lb_is_dev}, {"__frombuffer", lb_frombuffer}, {"__pk", lb_pk}, {"__dec", lb_dec}, {"__pymode", lb_pymode}, {"__subclass", lb_subclass}, {"__task", lb_task}, {"__in_task", lb_in_task}, {"__suspend", lb_suspend}, {"__cpu_count", lb_cpu_count}, {"__set_threads", lb_set_threads}, {"__setraw", lb_setraw}, {"__upk", lb_upk}, {"__frame", lb_frame}, {"__sqlite", lb_sqlite}, {"__net", lb_net}, {"__ct", lb_ct}, {"__is_cplx", lb_is_cplx}, {"__ckron", lb_ckron}, {"__is_traced", lb_is_traced}, {"__qfmt", lb_qfmt}, {"__apsi_version", lb_apsi_version}, {"__arity", lb_arity}, {"__localtime", lb_localtime}, {"__isatty", lb_isatty}, {"__rec_dict", lb_rec_dict}, {"__is_rec", lb_is_rec}, {"__argv", lb_argv}, {"__environ_names", lb_environ_names}, {"__builtin", lb_builtin}, {"__setenv", lb_setenv}, {"__gen_step", lb_gen_step}, {"__is_coro", lb_is_coro},
+    {"__npy_load", lb_npy_load}, {"__npy_save", lb_npy_save}, {"__http_serve", lb_http_serve}, {"__is_dev", lb_is_dev}, {"__frombuffer", lb_frombuffer}, {"__pk", lb_pk}, {"__dec", lb_dec}, {"__mt", lb_mt}, {"__pymode", lb_pymode}, {"__subclass", lb_subclass}, {"__task", lb_task}, {"__in_task", lb_in_task}, {"__suspend", lb_suspend}, {"__cpu_count", lb_cpu_count}, {"__set_threads", lb_set_threads}, {"__setraw", lb_setraw}, {"__upk", lb_upk}, {"__frame", lb_frame}, {"__sqlite", lb_sqlite}, {"__net", lb_net}, {"__ct", lb_ct}, {"__is_cplx", lb_is_cplx}, {"__ckron", lb_ckron}, {"__is_traced", lb_is_traced}, {"__qfmt", lb_qfmt}, {"__apsi_version", lb_apsi_version}, {"__arity", lb_arity}, {"__localtime", lb_localtime}, {"__isatty", lb_isatty}, {"__rec_dict", lb_rec_dict}, {"__is_rec", lb_is_rec}, {"__argv", lb_argv}, {"__environ_names", lb_environ_names}, {"__builtin", lb_builtin}, {"__setenv", lb_setenv}, {"__gen_step", lb_gen_step}, {"__is_coro", lb_is_coro},
     {NULL, NULL}};
