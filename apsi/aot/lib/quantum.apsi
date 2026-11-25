@@ -1,0 +1,436 @@
+# use quantum: quantum mechanics for native programs, the same methods as apsi run: the Schrödinger equation on a
+# grid, split-operator time evolution, operators and matrix exponentials, spins and qubits (gates, measurement,
+# density matrices, entanglement), and hydrogen. States and operators are complex128 tensors. Eigenvectors may
+# differ from apsi run's by a phase; everything measurable is the same. measure() draws from the native generator.
+use linalg as _la
+use special as _sp
+use sci as _sci
+
+let HBAR = 1.054571817e-34
+let M_E = 9.1093837015e-31
+let EV = 1.602176634e-19
+let _SQ2 = 1 / sqrt(2)
+
+fn _f(x):
+    let p = si_magnitude(x)
+    return tensor(p, f64) if isinstance(p, list) or ndim(p) > 0 else float(p)
+fn _s(x) = float(si_magnitude(x))
+fn _c(x) = __ct(si_magnitude(x))
+fn _cx(re, im) = complex(re, im)
+fn _I(n) = __ct(eye(n), zeros(n, n))
+fn _mat(rows) = tensor([[complex(v) if not __is_cplx(v) else v for v in r] for r in rows], "complex128")
+
+fn _potential(V, x):
+    if callable(V):
+        let v = _f(V(x))
+        return v if ndim(v) > 0 else ones_like(x) * v
+    let v = _f(V)
+    return v * ones_like(x) if ndim(v) == 0 else v
+
+# =================================================================== wave mechanics
+fn schrodinger1d(V, x, mass=M_E, n=5, hbar=HBAR):
+    let xg = _f(x)
+    if ndim(xg) != 1 or len(xg) < 3:
+        raise RuntimeError("x must be a 1-D grid with at least 3 points")
+    let h = float(xg[1] - xg[0])
+    let N = len(xg)
+    for i in range(1, N):
+        if abs(float(xg[i] - xg[i - 1]) - h) > 1e-6 * abs(h):
+            raise RuntimeError("x must be uniformly spaced")
+    let m = _s(mass)
+    let hb = _s(hbar)
+    let k = int(n)
+    let Vg = _potential(V, xg)
+    let t = hb * hb / (2 * m * h * h)
+    var H = zeros(N, N)
+    for i in range(N):
+        H[i, i] = float(Vg[i]) + 2.5 * t
+        if i + 1 < N:
+            H[i, i + 1] = -(4 / 3) * t
+            H[i + 1, i] = -(4 / 3) * t
+        if i + 2 < N:
+            H[i, i + 2] = (1 / 12) * t
+            H[i + 2, i] = (1 / 12) * t
+    let r = _la.eigh(H)
+    let w = r[0]
+    let U = r[1]
+    var rows = []
+    for i in range(k):
+        var col = U[:, i] / sqrt(h)
+        let mx = float(max(abs(col)))
+        var j = 0
+        while j < N and abs(float(col[j])) <= 1e-3 * mx:
+            j = j + 1
+        if float(col[j]) < 0:
+            col = -col
+        rows.append(col)
+    return record(energies=w[0:k], energies_ev=w[0:k] / EV, psi=stack(rows), x=xg)
+
+fn gaussian_packet(x, x0, sigma, k0=0.0):
+    let xg = _f(x)
+    let s = _s(sigma)
+    let psi = exp(__ct(-((xg - _s(x0)) ** 2) / (4 * s * s), _s(k0) * xg))
+    return psi / sqrt(float(sum(abs(psi) ** 2)) * float(xg[1] - xg[0]))
+
+fn evolve1d(psi0, V, x, dt, steps, mass=M_E, hbar=HBAR, every=1):
+    let xg = _f(x)
+    var psi = _c(psi0).copy()
+    let h = float(xg[1] - xg[0])
+    let m = _s(mass)
+    let hb = _s(hbar)
+    let k = _s(dt)
+    let n = int(steps)
+    let Vg = _potential(V, xg)
+    let kk = 2 * pi * _sci.fftfreq(len(xg), h)
+    let half_v = exp(__ct(zeros_like(Vg), -0.5 * Vg * k / hb))
+    let kin = exp(__ct(zeros_like(kk), -hb * kk * kk * k / (2 * m)))
+    let ev = max(1, int(every))
+    var frames = [psi.copy()]
+    var ts = [0.0]
+    for i in range(n):
+        psi = half_v * _sci.ifft(kin * _sci.fft(half_v * psi))
+        if (i + 1) % ev == 0:
+            frames.append(psi.copy())
+            ts.append((i + 1) * k)
+    let F = stack(frames)
+    let P = abs(F) ** 2
+    return record(t=tensor(ts), psi=F, norm=sum(P, axis=1) * h, x_mean=sum(P * reshape(xg, 1, -1), axis=1) * h)
+
+fn probability(psi, x, a, b):
+    let xg = _f(x)
+    let p = abs(_c(psi)) ** 2
+    let lo = _s(a)
+    let hi = _s(b)
+    var tot = 0.0
+    for i in range(len(xg)):
+        if float(xg[i]) >= lo and float(xg[i]) <= hi:
+            tot = tot + float(p[i])
+    return tot * float(xg[1] - xg[0])
+
+fn expect_x(psi, x):
+    let xg = _f(x)
+    let p = abs(_c(psi)) ** 2
+    return float(sum(p * xg)) / float(sum(p))
+
+fn expect_p(psi, x, hbar=HBAR):
+    let xg = _f(x)
+    let ps = _c(psi)
+    let h = float(xg[1] - xg[0])
+    let kk = 2 * pi * _sci.fftfreq(len(xg), h)
+    let d = _sci.ifft(__ct(zeros_like(kk), kk) * _sci.fft(ps))
+    return float((sum(ps.conj() * complex(0.0, -_s(hbar)) * d)).real) / float(sum(abs(ps) ** 2))
+
+fn uncertainty(psi, x, hbar=HBAR):
+    let xg = _f(x)
+    let ps = _c(psi)
+    var p = abs(ps) ** 2
+    p = p / float(sum(p))
+    let mx = float(sum(p * xg))
+    let dx = sqrt(max(float(sum(p * (xg - mx) ** 2)), 0.0))
+    let h = float(xg[1] - xg[0])
+    let kk = 2 * pi * _sci.fftfreq(len(xg), h)
+    var pk = abs(_sci.fft(ps)) ** 2
+    pk = pk / float(sum(pk))
+    let hb = _s(hbar)
+    let mk = float(sum(pk * kk))
+    let dp = hb * sqrt(max(float(sum(pk * (kk - mk) ** 2)), 0.0))
+    return record(dx=dx, dp=dp, product=dx * dp)
+
+# =================================================================== operators
+fn dagger(A) = transpose(_c(A).conj())
+
+fn commutator(A, B):
+    let a = _c(A)
+    let b = _c(B)
+    return a @ b - b @ a
+
+fn anticommutator(A, B):
+    let a = _c(A)
+    let b = _c(B)
+    return a @ b + b @ a
+
+fn kron(*mats):
+    var ms = list(mats)
+    if len(ms) == 1 and (isinstance(ms[0], list) or isinstance(ms[0], tuple)):
+        ms = list(ms[0])
+    var out = _c(ms[0])
+    for m in ms[1:]:
+        out = __ckron(out, _c(m))
+    return out
+
+fn _norm1(A):
+    var best = 0.0
+    let n = shape(A)[1]
+    for j in range(n):
+        best = max(best, float(sum(abs(A[:, j]))))
+    return best
+
+fn expm(A):
+    var M = _c(A)
+    let nrm = _norm1(M)
+    let s = max(0, int(ceil(log2(nrm / 5.4)))) if nrm > 5.4 else 0
+    M = M / (2.0 ** s)
+    let b = [64764752532480000.0, 32382376266240000.0, 7771770303897600.0, 1187353796428800.0, 129060195264000.0,
+             10559470521600.0, 670442572800.0, 33522128640.0, 1323241920.0, 40840800.0, 960960.0, 16380.0, 182.0, 1.0]
+    let I = _I(shape(M)[0])
+    let A2 = M @ M
+    let A4 = A2 @ A2
+    let A6 = A4 @ A2
+    let U = M @ (A6 @ (b[13] * A6 + b[11] * A4 + b[9] * A2) + b[7] * A6 + b[5] * A4 + b[3] * A2 + b[1] * I)
+    let Vm = A6 @ (b[12] * A6 + b[10] * A4 + b[8] * A2) + b[6] * A6 + b[4] * A4 + b[2] * A2 + b[0] * I
+    var R = _la.solve(Vm - U, Vm + U)
+    for i in range(s):
+        R = R @ R
+    return R
+
+fn _diag_phase(w, f):
+    return exp(__ct(zeros_like(w), f * w))
+
+fn expm_hermitian(H, t=1.0, hbar=1.0):
+    let r = _la.eigh(_c(H))
+    let U = r[1]
+    let ph = _diag_phase(r[0], -_s(t) / _s(hbar))
+    return (U * reshape(ph, 1, -1)) @ transpose(U.conj())
+
+fn time_evolution(H, psi0, times, hbar=1.0):
+    let r = _la.eigh(_c(H))
+    let w = r[0]
+    let U = r[1]
+    let c = transpose(U.conj()) @ _c(psi0)
+    let tv = _f(times)
+    let ts = [float(v) for v in tv] if ndim(tv) > 0 else [float(tv)]
+    return stack([U @ (_diag_phase(w, -t / _s(hbar)) * c) for t in ts])
+
+fn pauli():
+    return record(I=_I(2), X=_mat([[0, 1], [1, 0]]), Y=_mat([[0, -complex(0, 1)], [complex(0, 1), 0]]), Z=_mat([[1, 0], [0, -1]]))
+
+fn spin_ops(s=0.5, hbar=1.0):
+    let s2 = int(round(2 * float(s)))
+    if s2 < 1 or abs(2 * float(s) - s2) > 1e-12:
+        raise RuntimeError("spin must be a positive multiple of 1/2")
+    let sv = s2 / 2
+    let m = [sv - i for i in range(s2 + 1)]
+    let hb = _s(hbar)
+    var Sp = zeros(s2 + 1, s2 + 1, dtype="complex128")
+    for i in range(1, s2 + 1):
+        Sp[i - 1, i] = hb * sqrt(sv * (sv + 1) - m[i] * (m[i] + 1))
+    let Sm = transpose(Sp.conj())
+    var Sz = zeros(s2 + 1, s2 + 1, dtype="complex128")
+    for i in range(s2 + 1):
+        Sz[i, i] = hb * m[i]
+    let Sx = (Sp + Sm) / 2
+    let Sy = (Sp - Sm) / complex(0, 2)
+    return record(x=Sx, y=Sy, z=Sz, plus=Sp, minus=Sm, squared=Sx @ Sx + Sy @ Sy + Sz @ Sz)
+
+# =================================================================== qubits
+let I = _I(2)
+let X = _mat([[0, 1], [1, 0]])
+let Y = _mat([[0, -complex(0, 1)], [complex(0, 1), 0]])
+let Z = _mat([[1, 0], [0, -1]])
+let H = _mat([[1, 1], [1, -1]]) * _SQ2
+let S = _mat([[1, 0], [0, complex(0, 1)]])
+let T = _mat([[1, 0], [0, complex(cos(pi / 4), sin(pi / 4))]])
+let CNOT = _mat([[1, 0, 0, 0], [0, 1, 0, 0], [0, 0, 0, 1], [0, 0, 1, 0]])
+let CZ = _mat([[1, 0, 0, 0], [0, 1, 0, 0], [0, 0, 1, 0], [0, 0, 0, -1]])
+let SWAP = _mat([[1, 0, 0, 0], [0, 0, 1, 0], [0, 1, 0, 0], [0, 0, 0, 1]])
+let gates = record(I=I, X=X, Y=Y, Z=Z, H=H, S=S, T=T, CNOT=CNOT, CZ=CZ, SWAP=SWAP)
+
+fn rx(theta):
+    let t = _s(theta) / 2
+    return _mat([[cos(t), complex(0, -sin(t))], [complex(0, -sin(t)), cos(t)]])
+
+fn ry(theta):
+    let t = _s(theta) / 2
+    return _mat([[cos(t), -sin(t)], [sin(t), cos(t)]])
+
+fn rz(theta):
+    let t = _s(theta) / 2
+    return _mat([[complex(cos(t), -sin(t)), 0], [0, complex(cos(t), sin(t))]])
+
+fn phase(phi):
+    let p = _s(phi)
+    return _mat([[1, 0], [0, complex(cos(p), sin(p))]])
+
+fn controlled(gate):
+    let G = _c(gate)
+    let d = shape(G)[0]
+    var out = _I(2 * d)
+    for i in range(d):
+        for j in range(d):
+            out[d + i, d + j] = G[i, j]
+    return out
+
+fn ket(bits):
+    let b = [int(c) for c in bits]
+    for c in b:
+        if c != 0 and c != 1:
+            raise RuntimeError("ket() takes a string or list of 0/1")
+    var v = zeros(2 ** len(b), dtype="complex128")
+    var idx = 0
+    for c in b:
+        idx = idx * 2 + c
+    v[idx] = 1
+    return v
+
+fn bra(bits) = ket(bits).conj()
+
+fn _nq(state):
+    let d = shape(state)[0]
+    let n = int(round(log2(d)))
+    if 2 ** n != d:
+        raise RuntimeError("state dimension must be a power of 2")
+    return n
+
+fn apply(state, gate, targets):
+    let psi = _c(state)
+    let G = _c(gate)
+    let tg = [int(targets)] if isinstance(targets, int) else [int(t) for t in targets]
+    let n = _nq(psi)
+    let k = len(tg)
+    if shape(G) != (2 ** k, 2 ** k):
+        raise RuntimeError(f"a gate on {k} qubit(s) must be {2 ** k}×{2 ** k}")
+    for t in tg:
+        if t < 0 or t >= n or tg.count(t) > 1:
+            raise RuntimeError("invalid target qubits")
+    let rest = [i for i in range(n) if i not in tg]
+    let order = tg + rest
+    var T_ = permute(reshape(psi, *([2] * n)), order)
+    T_ = reshape(G @ reshape(T_, 2 ** k, -1), *([2] * n))
+    var inv = [0] * n
+    for i in range(n):
+        inv[order[i]] = i
+    return reshape(permute(T_, inv), -1)
+
+fn probabilities(state) = abs(_c(state)) ** 2
+
+fn measure(state, shots=1000, seed=none):
+    let p = probabilities(state)
+    let n = _nq(_c(state))
+    if seed != none:
+        __builtin("seed")(int(seed))
+    let tot = float(sum(p))
+    var cum = []
+    var acc = 0.0
+    for v in p:
+        acc = acc + float(v) / tot
+        cum.append(acc)
+    var counts = [0] * len(cum)
+    for s in range(int(shots)):
+        let u = float(rand())
+        var j = 0
+        while j < len(cum) - 1 and u >= cum[j]:
+            j = j + 1
+        counts[j] = counts[j] + 1
+    var d = {}
+    for i in range(len(counts)):
+        if counts[i]:
+            d["b" + format(i, f"0{n}b")] = counts[i]
+    return record(**d)
+
+fn density(state):
+    let v = _c(state)
+    return reshape(v, -1, 1) * reshape(v.conj(), 1, -1)
+
+fn partial_trace(rho, keep, n=none):
+    let R = _c(rho)
+    let nq = int(n) if n != none else _nq(R)
+    let kp = [int(keep)] if isinstance(keep, int) else [int(k) for k in keep]
+    let drop = [i for i in range(nq) if i not in kp]
+    let perm = kp + drop + [nq + i for i in kp] + [nq + i for i in drop]
+    let dk = 2 ** len(kp)
+    let dd = 2 ** len(drop)
+    let T_ = reshape(permute(reshape(R, *([2] * (2 * nq))), perm), dk, dd, dk, dd)
+    var out = zeros(dk, dk, dtype="complex128")
+    for a in range(dk):
+        for b in range(dk):
+            var acc = complex(0.0, 0.0)
+            for j in range(dd):
+                acc = acc + T_[a, j, b, j]
+            out[a, b] = acc
+    return out
+
+fn entropy(rho, base=2):
+    let w = _la.eigvalsh(_c(rho))
+    var s = 0.0
+    for v in w:
+        if float(v) > 1e-15:
+            s = s + float(v) * log(float(v))
+    return -s / log(float(base))
+
+fn _trace(M):
+    var t = complex(0.0, 0.0)
+    for i in range(shape(M)[0]):
+        t = t + M[i, i]
+    return t
+
+fn purity(rho):
+    let R = _c(rho)
+    return _trace(R @ R).real
+
+fn fidelity(a, b):
+    var A = _c(a)
+    var B = _c(b)
+    if ndim(A) == 1 and ndim(B) == 1:
+        return abs(sum(A.conj() * B)) ** 2
+    if ndim(A) == 1:
+        A = density(A)
+    if ndim(B) == 1:
+        B = density(B)
+    let r = _la.eigh(A)
+    let U = r[1]
+    let sw = __ct(sqrt(where(r[0] > 0, r[0], zeros_like(r[0]))), zeros_like(r[0]))
+    let sA = (U * reshape(sw, 1, -1)) @ transpose(U.conj())
+    let ev = _la.eigvalsh(sA @ B @ sA)
+    var acc = 0.0
+    for v in ev:
+        acc = acc + sqrt(max(float(v), 0.0))
+    return acc ** 2
+
+fn bloch(state):
+    var R = _c(state)
+    if ndim(R) == 1:
+        R = density(R)
+    return tensor([_trace(R @ X).real, _trace(R @ Y).real, _trace(R @ Z).real])
+
+fn ghz(n):
+    var v = zeros(2 ** int(n), dtype="complex128")
+    v[0] = _SQ2
+    v[2 ** int(n) - 1] = _SQ2
+    return v
+
+fn bell(k=0):
+    let v = {0: [1, 0, 0, 1], 1: [1, 0, 0, -1], 2: [0, 1, 1, 0], 3: [0, 1, -1, 0]}[int(k)]
+    return tensor([complex(float(x) * _SQ2, 0.0) for x in v], "complex128")
+
+fn concurrence(rho):
+    var R = _c(rho)
+    if ndim(R) == 1:
+        R = density(R)
+    let yy = __ckron(Y, Y)
+    let Rt = yy @ R.conj() @ yy
+    # R Rt has real, non-negative eigenvalues: those of its real form, each twice
+    let M = R @ Rt
+    let A = tensor(M.real, f64)
+    let B = tensor(M.imag, f64)
+    let e = _la.eig(concat([concat([A, -B], axis=1), concat([B, A], axis=1)], axis=0))
+    var vals = sorted([float(v) for v in (e[0].real if __is_cplx(e[0]) else e[0])], reverse=true)
+    var ev = []
+    for i in range(0, len(vals), 2):
+        ev.append(sqrt(max(vals[i], 0.0)))
+    return max(0.0, ev[0] - ev[1] - ev[2] - ev[3])
+
+# =================================================================== atoms
+fn hydrogen_energy(n, Z=1):
+    let v = _f(n)
+    let r = -13.605693122994 * float(Z) ** 2 / v ** 2
+    return float(r) if ndim(r) == 0 else r
+
+fn hydrogen_radial(n, l, r):
+    let N = int(n)
+    let L = int(l)
+    if not (0 <= L and L < N):
+        raise RuntimeError("need 0 ≤ l < n")
+    let rr = _f(r)
+    let rho = 2 * rr / N
+    let norm = sqrt((2 / N) ** 3 * factorial(N - L - 1) / (2 * N * factorial(N + L)))
+    return norm * exp(-rho / 2) * rho ** L * _sp.laguerre(N - L - 1, rho, 2 * L + 1)

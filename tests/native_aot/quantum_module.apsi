@@ -1,0 +1,33 @@
+use quantum as q
+
+fn r6(x) = round(float(x), 6) + 0.0
+fn rl(t) = [round(float(v), 6) + 0.0 for v in t]
+
+print(q.ket("01"), q.bra("1"), q.ghz(2), q.bell(3))
+let p = q.pauli()
+print(p.Y, q.commutator(p.X, p.Y), q.anticommutator(p.X, p.X))
+print(q.gates.H @ q.ket("0"), q.dagger(q.gates.S), q.kron(p.X, p.Z))
+let st = q.apply(q.apply(q.ket("00"), q.gates.H, 0), q.gates.CNOT, [0, 1])
+print(st, rl(q.probabilities(st)))
+print(q.apply(q.ket("010"), q.gates.X, [2]), q.apply(q.ket("10"), q.gates.SWAP, [0, 1]))
+let rho = q.density(st)
+print(rho, r6(q.purity(rho)), r6(q.entropy(q.partial_trace(rho, [0]))), q.partial_trace(rho, [1]))
+print(r6(q.concurrence(st)), r6(q.concurrence(q.ket("01"))), r6(q.fidelity(st, q.bell(0))), r6(q.fidelity(rho, q.density(q.bell(0)))))
+print(rl(q.bloch(q.ket("0"))), rl(q.bloch(q.gates.H @ q.ket("0"))), rl(q.bloch(q.ry(0.7) @ q.ket("0"))))
+print(q.rx(0.5), q.rz(1.0), q.phase(0.25), q.controlled(q.gates.X))
+let E = q.expm(q.kron(p.X, p.Y) * complex(0, 0.3))
+print(rl(abs(E[0])), rl([v.real for v in E[1]]))
+let U = q.expm_hermitian(p.X, 0.4)
+print(rl([v.real for v in U[0]]), rl([v.imag for v in U[0]]))
+let traj = q.time_evolution(p.Z * 0.5 + p.X * 0.2, q.ket("0"), [0.0, 1.0, 2.0])
+print([rl(abs(r) ** 2) for r in traj])
+let sp = q.spin_ops(1)
+print(sp.z, rl(abs(sp.plus[0])), sp.squared)
+print(r6(q.hydrogen_energy(2)), rl(q.hydrogen_energy(tensor([1.0, 3.0]))), rl(q.hydrogen_radial(2, 1, tensor([0.5, 1.0, 4.0]))))
+let x = linspace(-10, 10, 200)
+let sch = q.schrodinger1d(fn(z) => 0.5 * z * z, x, mass=1, n=3, hbar=1)
+print(rl(sch.energies), rl(sch.psi[0][95:100]), shape(sch.psi))
+let g = q.gaussian_packet(x, -2.0, 1.0, 3.0)
+print(r6(q.probability(g, x, -3, -1)), r6(q.expect_x(g, x)), r6(q.expect_p(g, x, 1)), rl([q.uncertainty(g, x, 1).dx, q.uncertainty(g, x, 1).dp]))
+let ev = q.evolve1d(g, fn(z) => 0.0 * z, x, 0.01, 50, mass=1, hbar=1, every=25)
+print(rl(ev.t), rl(ev.norm), rl(ev.x_mean), shape(ev.psi))

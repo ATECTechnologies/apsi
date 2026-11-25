@@ -443,6 +443,7 @@ AV a_cplx_builtin(const char *name, int n, AV *a, ADict *kw) {
     if (!strcmp(name, "tanh")) return ct_map(a[0], 6);
     if (!strcmp(name, "reshape")) { int64_t sh[MAXD]; int nd = ct_shape_args(n - 1, a + 1, sh); return ct_reshape(a[0], nd, sh); }
     if (!strcmp(name, "flatten")) { int64_t sh[1] = {-1}; return ct_reshape(a[0], 1, sh); }
+    if (!strcmp(name, "permute")) { int perm[MAXD]; int nd = 0; if (n == 2 && (a_is(a[1], O_LIST) || a_is(a[1], O_TUPLE))) { AList *l = (AList *)a[1].o; for (int64_t i = 0; i < l->len; i++) perm[nd++] = (int)l->v[i].i; } else for (int i = 1; i < n; i++) perm[nd++] = (int)a[i].i; return ct_permute(a[0], nd, perm); }
     if (!strcmp(name, "transpose")) {
         if (n > 1) { int perm[MAXD]; int nd = 0; if (a_is(a[1], O_LIST) || a_is(a[1], O_TUPLE)) { AList *l = (AList *)a[1].o; for (int64_t i = 0; i < l->len; i++) perm[nd++] = (int)l->v[i].i; } else for (int i = 1; i < n; i++) perm[nd++] = (int)a[i].i; return ct_permute(a[0], nd, perm); }
         return ct_transpose(as_ct(a[0]));
@@ -524,3 +525,4 @@ BI(lb_ct) {
     a_ntmp = sp; return ct_result(out);
 }
 BI(lb_is_cplx) { (void)kw; (void)self; return a_bool(n && (is_ct(a[0]) || is_cx(a[0]))); }
+BI(lb_ckron) { (void)self; (void)kw; (void)n; return ct_kron(a[0], a[1]); }

@@ -6,11 +6,71 @@ fn _sq(a, what):
     if len(s) != 2 or s[0] != s[1]:
         raise ShapeError(f"{what}() needs a square matrix, got shape {s}")
 
-fn solve(a, b) = __la("solve", a, b)
+# complex matrices: the real form [[A, -B], [B, A]] of A + iB, solved / diagonalised by the real routines
+fn _embed(m):
+    let A = tensor(m.real, f64)
+    let B = tensor(m.imag, f64)
+    return concat([concat([A, -B], axis=1), concat([B, A], axis=1)], axis=0)
 
-fn inv(a) = __la("inv", a)
+fn _csolve(a, b):
+    let n = shape(a)[0]
+    let bc = __ct(b)
+    let vec = ndim(bc) == 1
+    let bm = reshape(bc, n, 1) if vec else bc
+    let rhs = concat([tensor(bm.real, f64), tensor(bm.imag, f64)], axis=0)
+    let x = __la("solve", _embed(__ct(a)), rhs)
+    let out = __ct(x[0:n], x[n:2 * n])
+    return reshape(out, n) if vec else out
 
-fn det(a) = __la("det", a)
+fn _ceigh(a):
+    # eigenvalues come in equal pairs; one complex vector per pair, kept orthonormal (degenerate ones too)
+    let m = __ct(a)
+    let n = shape(m)[0]
+    let r = __la("eigh", _embed(m))
+    let w = r[0]
+    let V = r[1]
+    var vals = []
+    var vecs = []
+    for j in range(2 * n):
+        if len(vecs) == n:
+            break
+        var v = __ct(V[0:n, j], V[n:2 * n, j])
+        for u in vecs:
+            v = v - u * sum(u.conj() * v)
+        let nv = sqrt(float(sum(abs(v) ** 2)))
+        if nv > 0.5:
+            vecs.append(v / nv)
+            vals.append(float(w[j]))
+    return (tensor(vals), transpose(stack(vecs)))
+
+fn solve(a, b) = _csolve(a, b) if __is_cplx(a) or __is_cplx(b) else __la("solve", a, b)
+
+fn inv(a) = _csolve(a, __ct(eye(shape(a)[0]), zeros(shape(a)[0], shape(a)[0]))) if __is_cplx(a) else __la("inv", a)
+
+fn det(a):
+    if not __is_cplx(a):
+        return __la("det", a)
+    # LU with partial pivoting on the complex matrix
+    var m = __ct(a).copy()
+    let n = shape(m)[0]
+    var d = complex(1.0, 0.0)
+    for k in range(n):
+        var p = k
+        for i in range(k + 1, n):
+            if abs(m[i, k]) > abs(m[p, k]):
+                p = i
+        if abs(m[p, k]) == 0:
+            return complex(0.0, 0.0)
+        if p != k:
+            let row = m[k, :].copy()
+            m[k, :] = m[p, :]
+            m[p, :] = row
+            d = -d
+        d = d * m[k, k]
+        for i in range(k + 1, n):
+            let f = m[i, k] / m[k, k]
+            m[i, :] = m[i, :] - f * m[k, :]
+    return d
 
 fn slogdet(a):
     let d = __la("det", a)
@@ -47,9 +107,9 @@ fn cholesky(a) = __la("cholesky", a)
 
 fn qr(a) = __la("qr", a)
 
-fn eigh(a) = __la("eigh", a)
+fn eigh(a) = _ceigh(a) if __is_cplx(a) else __la("eigh", a)
 
-fn eigvalsh(a) = __la("eigh", a)[0]
+fn eigvalsh(a) = eigh(a)[0]
 
 fn eig(a):
     let r = __la("eig", a)
@@ -88,6 +148,8 @@ fn matrix_power(a, k):
     return result
 
 fn kron(a, b):
+    if __is_cplx(a) or __is_cplx(b):
+        return __ckron(a, b)
     let sa = shape(a)
     let sb = shape(b)
     let r = reshape(a, sa[0], 1, sa[1], 1) * reshape(b, 1, sb[0], 1, sb[1])

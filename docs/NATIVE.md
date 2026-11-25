@@ -112,6 +112,7 @@ backward pass walks its graph iteratively, so very deep graphs cannot overflow t
 | `dataframe` | typed columns, expressions, filter / select / group by / join / sort / window, CSV (parsed in C), JSON, the same table printout |
 | `db` | SQLite through the SQLite library the system already has (Windows 10+, Linux, macOS; `APSI_SQLITE` names another); PostgreSQL (the wire protocol: SCRAM-SHA-256 / md5 / password, prepared statements, arrays, json, bytea, LISTEN / NOTIFY) and Redis (pipelines, pub/sub, every command by name) written in Apsi on native TCP connections. `numeric` comes back as a float and dates as text |
 | `net`, `http_get`, `http_post_json` | HTTP and HTTPS requests: WinHTTP on Windows; sockets and the system's OpenSSL on Linux and macOS (`HTTPS_PROXY` / `NO_PROXY`, `APSI_CA_FILE`); redirects, `HTTPError` |
+| `quantum` | grid Schrödinger solver, split-operator evolution, operators, `expm`, spins, qubits and gates, density matrices, entanglement, hydrogen (complex128 tensors; `measure` draws from the native generator) |
 | `env`, `log` | `.env` files and secrets; leveled logging to the console and rotating text / JSON files, timers, reading logs back |
 
 Convolutions and max pooling run as C kernels (image columns and the packed matrix product) with their gradients,
@@ -123,7 +124,7 @@ These programs keep running with `apsi run`. A native build that reaches one of 
 
 - graph networks, mixtures of experts and `fit_batches` in `layers`; GGUF, ONNX and PyTorch files in `models`;
   `text_dataset`, `train_tokenizer` and Parquet in `data`; websockets and TLS in `web` (serve HTTPS through a
-  reverse proxy); `tokens.focus` / `fit_chat` / `outline` (they read Python syntax trees); `db.mysql` / `mongo`, `db.pool`, PostgreSQL / Redis over TLS on Windows; the modules `rl`, `torch`, `quantum`, `medical`
+  reverse proxy); `tokens.focus` / `fit_chat` / `outline` (they read Python syntax trees); `db.mysql` / `mongo`, `db.pool`, PostgreSQL / Redis over TLS on Windows; the modules `rl`, `torch`, `medical`
 - Python modules (`pyimport`, `import numpy`), except `asyncio`
 - random numbers: native programs use their own generator, so a seed gives different numbers than in `apsi run`
   (the same seed always gives the same numbers in native programs)
