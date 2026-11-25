@@ -1,0 +1,30 @@
+use precision
+
+for f in [f16, bf16, fp8, fp8_e5m2, fp6, fp6_e2m3, fp4, int8, int4, uint8, fp64, fp32]:
+    print(format_info(f))
+let x = tensor([0.1, -0.333, 1.5, 2.71828, -7.25, 100.0, 0.0, 1e-4, 3.0e3, -0.0])
+for f in [f16, bf16, fp8, fp8_e5m2, fp6, fp6_e2m3, fp4, int8, int4, uint8]:
+    let r = round_to(x, f)
+    print(f, [round(float(v), 7) for v in r], round(quant_error(x, f), 9))
+for f in [bf16, fp8, fp8_e5m2, fp6, fp4, int8, int4, uint8]:
+    let q = quantize(x, f)
+    print(q, nbytes(q), q.ndim)
+print([float(v) for v in round_to(x, fp8, scale=1.0)])
+print([float(v) for v in round_to(x, bf16, scale=1.0)])
+print(round_to(3.14159, fp8, scale=1.0), round_to(3.14159, f16), round_to(3.14159, bf16), round_to(0.1, fp32))
+var w = zeros(3, 4)
+for i in range(3):
+    for j in range(4):
+        w[i, j] = (i + 1) * sin(1.0 + i * 4 + j) * 10 ** i
+let qw = quantize(w, int8, axis=0)
+print(qw, nbytes(qw))
+print([round(float(v), 5) for v in reshape(dequantize(qw), -1)])
+print([round(float(v), 5) for v in reshape(round_to(w, fp8, axis=1), -1)])
+let qa = quantize(w, fp8)
+let qb = quantize(transpose(w), fp8)
+print([round(float(v), 3) for v in reshape(qmatmul(qa, qb), -1)])
+print(nbytes(w), nbytes(tensor([1.0, 2.0], f32)))
+print(round_to(2.5[m], fp4), round_to(tensor([1.0, 2.6]) * 1.0[kg], int4, scale=1.0))
+print(dequantize(quantize(9.81[m/s^2], fp8_e5m2)))
+fn loss(v) = sum(round_to(v, fp8) * v)
+print([round(float(g), 6) for g in grad(loss)(tensor([0.3, 1.7, -2.2]))])

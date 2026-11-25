@@ -1,0 +1,232 @@
+# use lab: reproducible research for native programs: seeds, provenance, experiment logs, measurement
+# formatting and tables (Markdown, LaTeX, CSV). The same files and text as apsi run.
+var _SEED = [none]
+
+fn set_seed(s):
+    let v = int(s)
+    seed(v)
+    _SEED[0] = v
+    return v
+
+fn provenance():
+    let i = _native_info()
+    return record(apsi=__apsi_version(), python=none, numpy=none, os=platform(), machine=i["arch"],
+                  cpu=i["arch"], cores=i["threads"], gpus=[gpu_info()] if gpu_available() else [],
+                  seed=_SEED[0], time_utc=__localtime("utc"))
+
+fn _plain(v):
+    if __is_rec(v):
+        var d = {}
+        let f = __rec_dict(v)
+        for k in f:
+            d[k] = _plain(f[k])
+        return d
+    let unit = __unit_str(v)
+    if unit != none:
+        return {"value": _plain(si_magnitude(v)), "unit": unit}
+    if isinstance(v, dict):
+        var d = {}
+        for k in v:
+            d[str(k)] = _plain(v[k])
+        return d
+    if isinstance(v, list) or isinstance(v, tuple):
+        return [_plain(x) for x in v]
+    if str(type(v)).startswith("Tensor"):
+        var count = 1
+        for d in shape(v):
+            count = count * d
+        return tolist(v) if count <= 10000 else {"shape": list(shape(v)), "mean": float(mean(v))}
+    if isinstance(v, float) and (v != v or v == inf or v == -inf):
+        return str(v)
+    if v == none or isinstance(v, int) or isinstance(v, float) or isinstance(v, str) or isinstance(v, bool):
+        return v
+    return str(v)
+
+fn _num(x) = float(si_magnitude(x))
+
+fn sigfig(x, n=3):
+    let v = _num(x)
+    if v == 0 or v != v or v == inf or v == -inf:
+        return v
+    return round(v, -int(floor(log10(abs(v)))) + int(n) - 1)
+
+fn format_measurement(value, uncertainty, unit=none):
+    let v = _num(value)
+    let u = abs(_num(uncertainty))
+    var s = ""
+    if u == 0 or u != u or u == inf:
+        s = f"{v:g}"
+    else:
+        let e = int(floor(log10(u)))
+        let lead = int(u / 10.0 ** e)
+        let digits = 2 if lead < 3 else 1
+        var dec = -(e - digits + 1)
+        let ur = round(u, dec)
+        if ur >= 10.0 ** (e + 1):
+            dec = dec - 1
+        if dec > 0:
+            s = format(v, f".{dec}f") + f"({int(round(u * 10.0 ** dec))})"
+        else:
+            let q = 10 ** (-dec)
+            s = f"{int(round(v / q) * q)}({int(round(u / q) * q)})"
+    return f"{s} {unit}" if unit else s
+
+fn _cell(c):
+    if isinstance(c, float):
+        return f"{c:.6g}"
+    return str(c)
+
+fn _rows(rows, headers):
+    var rs = [rows] if __is_rec(rows) else rows
+    var hs = headers
+    if len(rs) > 0 and __is_rec(rs[0]):
+        if hs == none:
+            hs = list(__rec_dict(rs[0]).keys())
+        rs = [[__rec_dict(r).get(h, "") for h in hs] for r in rs]
+    if hs == none:
+        raise RuntimeError("give headers, or rows as records")
+    return ([str(h) for h in hs], [[_cell(c) for c in r] for r in rs])
+
+fn table_markdown(rows, headers=none):
+    let t = _rows(rows, headers)
+    let h = t[0]
+    var out = ["| " + " | ".join(h) + " |", "|" + "|".join(["---" for x in h]) + "|"]
+    for r in t[1]:
+        out.append("| " + " | ".join(r) + " |")
+    return "\n".join(out)
+
+fn _tex(s):
+    var t = s
+    for pair in [["\\", "\\textbackslash{}"], ["&", "\\&"], ["%", "\\%"], ["$", "\\$"], ["#", "\\#"],
+                 ["_", "\\_"], ["{", "\\{"], ["}", "\\}"], ["~", "\\textasciitilde{}"], ["^", "\\^{}"]]:
+        t = t.replace(pair[0], pair[1])
+    return t
+
+fn table_latex(rows, headers=none, caption=none, label=none):
+    let t = _rows(rows, headers)
+    let h = t[0]
+    var out = ["\\begin{table}[ht]", "\\centering"]
+    if caption:
+        out.append("\\caption{" + _tex(str(caption)) + "}")
+    if label:
+        out.append("\\label{" + str(label) + "}")
+    out.append("\\begin{tabular}{" + "l" * len(h) + "}")
+    out.append("\\toprule")
+    out.append(" & ".join([_tex(x) for x in h]) + " \\\\")
+    out.append("\\midrule")
+    for r in t[1]:
+        out.append(" & ".join([_tex(x) for x in r]) + " \\\\")
+    out.append("\\bottomrule")
+    out.append("\\end{tabular}")
+    out.append("\\end{table}")
+    return "\n".join(out)
+
+fn _q(s):
+    if "," in s or "\"" in s or "\n" in s:
+        return "\"" + s.replace("\"", "\"\"") + "\""
+    return s
+
+fn table_csv(rows, headers=none):
+    let t = _rows(rows, headers)
+    var lines = [",".join([_q(x) for x in t[0]])]
+    for r in t[1]:
+        lines.append(",".join([_q(x) for x in r]))
+    return "\n".join(lines) + "\n"
+
+fn _hex(n) = __random_bytes(n)
+
+fn _metrics(metrics, kw):
+    var m = {}
+    if metrics != none:
+        let src = __rec_dict(metrics) if __is_rec(metrics) else metrics
+        for k in src:
+            m[k] = src[k]
+    for k in kw:
+        m[k] = kw[k]
+    return m
+
+fn experiment(name, params=none, folder="experiments"):
+    let nm = str(name)
+    if nm == "" or "/" in nm or "\\" in nm or ":" in nm or nm.startswith("."):
+        raise RuntimeError("experiment name must be a plain file name")
+    let dir = str(folder)
+    let path = dir + "/" + nm + ".jsonl"
+    __fs("mkdir", dir, none)
+    let run = _hex(6)
+    let t0 = __time()
+    var state = {"steps": 0, "done": false}
+    fn write(kind, data):
+        if state["done"]:
+            raise RuntimeError("this experiment run is finished")
+        var rec = {"run": run, "kind": kind, "t": round(__time() - t0, 6)}
+        for k in data:
+            rec[k] = _plain(data[k])
+        __fs("append", path, json_str(rec) + "\n")
+    write("start", {"name": nm, "params": _plain(params) if params != none else {}, "provenance": _plain(provenance())})
+    fn log(step=none, metrics=none, **kw):
+        state["steps"] = state["steps"] + 1
+        write("log", {"step": step if step != none else state["steps"], "metrics": _metrics(metrics, kw)})
+    fn note(text):
+        write("note", {"text": str(text)})
+    fn result(metrics=none, **kw):
+        write("result", {"metrics": _metrics(metrics, kw)})
+    fn finish():
+        write("finish", {"seconds": round(__time() - t0, 3), "logs": state["steps"]})
+        state["done"] = true
+        return path
+    return record(run=run, path=path, log=log, note=note, result=result, finish=finish)
+
+fn _rec(v):
+    if isinstance(v, dict):
+        var d = {}
+        for k in v:
+            d[str(k)] = _rec(v[k])
+        return record(**d)
+    if isinstance(v, list):
+        return [_rec(x) for x in v]
+    return v
+
+fn load_runs(folder="experiments", name=none):
+    let base = str(folder)
+    var files = []
+    if name:
+        files = [name + ".jsonl"]
+    else:
+        files = sorted([f for f in __fs("list", base, none) if f.endswith(".jsonl")])
+    var runs = {}
+    var order = []
+    for f in files:
+        let p = base + "/" + f
+        if not exists(p):
+            continue
+        for line in read_text(p).splitlines():
+            if line.strip() == "":
+                continue
+            var r = none
+            try:
+                r = json_parse(line)
+            except:
+                continue
+            let id = r.get("run")
+            if id not in runs:
+                runs[id] = {"run": id, "name": f[0:len(f) - 6], "params": {}, "logs": [], "result": none, "notes": [],
+                            "provenance": none, "finished": false}
+                order.append(id)
+            var d = runs[id]
+            let k = r.get("kind")
+            if k == "start":
+                d["params"] = r.get("params", {})
+                d["provenance"] = r.get("provenance")
+            elif k == "log":
+                var e = {"step": r.get("step")}
+                let m = r.get("metrics") or {}
+                for key in m:
+                    e[key] = m[key]
+                d["logs"].append(e)
+            elif k == "note":
+                d["notes"].append(r.get("text"))
+            elif k == "result":
+                d["result"] = r.get("metrics")
+            elif k == "finish":
+                d["finished"] = true
+    return [_rec(runs[id]) for id in order]

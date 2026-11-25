@@ -1,0 +1,26 @@
+use lab
+
+print(set_seed(42), sigfig(123456.0, 3), sigfig(0.00123456, 2), sigfig(0.0), sigfig(9.81[m/s^2], 2))
+print(format_measurement(9.8123, 0.0312), format_measurement(9.8123, 0.0312, "m/s^2"), format_measurement(1234.5, 23.0),
+      format_measurement(1234.5, 230.0), format_measurement(0.5, 0.0), format_measurement(1.23456, 0.0196))
+let rows = [record(name="run a", loss=0.123456789, acc=0.9), record(name="b_2 & co", loss=1.5e-5, acc=1)]
+print(table_markdown(rows))
+print(table_latex(rows, caption="Results 100%", label="tab:r"))
+print(table_csv([["a,b", 1.0, "q\"x"], ["c", 2, "d"]], ["col 1", "n", "s"]))
+let p = provenance()
+print(p.apsi, p.seed, len(p.time_utc), p.time_utc.endswith("Z"))
+let ex = experiment("demo", {"lr": 0.01, "layers": [2, 3]}, folder="lab_runs")
+ex.log(1, {"loss": 0.5})
+ex.log(metrics=record(loss=0.25), acc=0.75)
+ex.note("half way")
+ex.result(loss=0.1, g=9.81[m/s^2], w=tensor([1.0, 2.0]))
+let path = ex.finish()
+print(path.endswith("demo.jsonl"), len(ex.run))
+let runs = load_runs("lab_runs", "demo")
+let r = runs[len(runs) - 1]
+print(r.name, r.params.lr, r.params.layers, len(r.logs), r.logs[1].step, r.logs[1].loss, r.logs[1].acc, r.notes,
+      r.result.loss, r.result.g.unit, r.result.w, r.finished)
+try:
+    ex.note("late")
+except RuntimeError as e:
+    print("error:", e)

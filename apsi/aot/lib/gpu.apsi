@@ -1,0 +1,14 @@
+# use sys / use gpu: the machine a native program runs on, and moving tensors between it and the GPU.
+fn cpu_threads() = native_threads()
+fn device() = "cuda:0" if gpu_available() else "cpu"
+fn to_device(x, dev=none):
+    let d = str(dev if dev != none else device())
+    return to_gpu(x) if d.startswith("cuda") or d == "gpu" else to_cpu(x)
+fn hardware():
+    let i = _native_info()
+    return record(os=i["os"], arch=i["arch"], threads=i["threads"], simd=i["simd"], engine=i["engine"],
+                  gpu_available=gpu_available(), gpu=gpu_info() if gpu_available() else "none")
+let gpu_available = __builtin("gpu_available")
+let gpu_info = __builtin("gpu_info")
+let to_gpu = __builtin("to_gpu")
+let to_cpu = __builtin("to_cpu")

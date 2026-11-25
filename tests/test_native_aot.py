@@ -4,6 +4,7 @@ import os
 import shutil
 import subprocess
 import sys
+from pathlib import Path
 
 import pytest
 
@@ -118,3 +119,10 @@ def test_http_server_native(tmp_path):
     finally:
         proc.terminate()
         proc.wait(timeout=10)
+
+
+def test_runtime_version_matches():
+    import re
+    import apsi
+    src = (Path(apsi.__file__).parent / "aot" / "rt" / "apsi_lib.c").read_text(encoding="utf-8")
+    assert re.search(r'#define APSI_VERSION "([^"]+)"', src).group(1) == apsi.__version__

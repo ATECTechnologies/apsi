@@ -105,6 +105,9 @@ backward pass walks its graph iteratively, so very deep graphs cannot overflow t
 | `physics` | constants, the formulas with their units, `fields` (gradient, laplacian), `meshgrid` |
 | `pde` | tridiagonal solves, heat (Crank–Nicolson, ADI), waves, advection, fast Poisson solvers, pseudo-spectral Navier–Stokes, CG, BiCGSTAB |
 | `mechanics` | integrators, Hamiltonian / Lagrangian flows (by autodiff), N-body, orbits, rigid bodies, normal modes, beams, trusses |
+| `precision` | FP16, BF16, FP8 (E4M3 / E5M2), FP6, FP4, INT8 / INT4 / UINT8: bit-exact rounding, quantised tensors, `round_to` with straight-through gradients (its names work without `use`, as in `apsi run`) |
+| `lab` | seeds, provenance, experiment logs, `format_measurement`, Markdown / LaTeX / CSV tables |
+| `sys`, `gpu` | `device`, `to_device`, `hardware`, `cpu_threads`, GPU info |
 | `env`, `log` | `.env` files and secrets; leveled logging to the console and rotating text / JSON files, timers, reading logs back |
 
 Convolutions and max pooling run as C kernels (image columns and the packed matrix product) with their gradients,

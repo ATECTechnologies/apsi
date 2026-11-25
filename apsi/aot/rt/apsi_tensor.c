@@ -149,8 +149,8 @@ static int dt_from_name(AV d) {
     if (d.t == T_NONE) return -1;
     const char *s = a_is(d, O_STR) ? ((AStr *)d.o)->s : "";
     if (!strcmp(s, "float64") || !strcmp(s, "f64") || !strcmp(s, "fp64")) return DT_F64;
-    if (!strcmp(s, "float32") || !strcmp(s, "f32") || !strcmp(s, "fp32")) return DT_F32;
-    if (!strcmp(s, "int64") || !strcmp(s, "i64") || !strcmp(s, "int")) return DT_I64;
+    if (!strcmp(s, "float32") || !strcmp(s, "f32") || !strcmp(s, "fp32") || !strcmp(s, "f16") || !strcmp(s, "fp16") || !strcmp(s, "bf16")) return DT_F32;
+    if (!strcmp(s, "int64") || !strcmp(s, "i64") || !strcmp(s, "int") || !strcmp(s, "int8") || !strcmp(s, "uint8") || !strcmp(s, "int4") || !strcmp(s, "i32")) return DT_I64;
     if (!strcmp(s, "bool")) return DT_BOOL;
     a_error("ValueError", "unknown dtype '%s'", s);
 }

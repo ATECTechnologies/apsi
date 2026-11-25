@@ -22,3 +22,4 @@ experiments/
 apsi/MANIFEST.json
 tests/native_aot/app.log
 tests/native_aot/app.jsonl
+tests/native_aot/lab_runs/

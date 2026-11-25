@@ -73,6 +73,10 @@ NATIVE_MODULES = {
                          "compose", "partial"),
 }
 
+# names apsi run has without a `use` (the interpreter puts the precision module's names in the globals)
+AUTO_LIB = {n: "precision" for n in ("quantize", "dequantize", "round_to", "qmatmul", "quant_error", "format_info",
+                                      "fp8_e4m3", "fp8_e5m2", "fp6_e3m2", "fp6_e2m3", "fp4_e2m1", "fp8", "bf8", "e4m3", "e5m2", "fp6", "fp4")}
+
 # Python modules a native program gets as Apsi library modules (`import asyncio`, pyimport("asyncio"))
 PY_NATIVE = {"asyncio"}
 
@@ -837,6 +841,11 @@ class CGen:
         if name in prelude_names() and os.path.abspath(PRELUDE) not in self.compiling:
             mid = self.local_module(os.path.abspath(PRELUDE))[0]
             return ("prelude", mid, self.gslot(name, mid))
+        if name in AUTO_LIB:
+            lib = os.path.abspath(os.path.join(os.path.dirname(__file__), "lib", AUTO_LIB[name] + ".apsi"))
+            if lib not in self.compiling:
+                mid = self.local_module(lib)[0]
+                return ("prelude", mid, self.gslot(name, mid))
         return ("global", self.gslot(name))      # bound at run time later (or a NameError then)
 
     def load(self, name, node=None):

@@ -660,12 +660,13 @@ AV a_format(AV v, const char *spec) {
     if (p[0] && (p[1] == '<' || p[1] == '>' || p[1] == '^' || p[1] == '=')) { fill = p[0]; align = p[1]; p += 2; }
     else if (*p == '<' || *p == '>' || *p == '^' || *p == '=') align = *p++;
     if (*p == '+' || *p == '-' || *p == ' ') sign = *p++;
+    int alt = 0; if (*p == '#') { alt = 1; p++; }                 /* 0x / 0o / 0b prefixes */
     if (*p == '0') { zero = 1; p++; }
     if (*p >= '0' && *p <= '9') { width = 0; while (*p >= '0' && *p <= '9') width = width * 10 + (*p++ - '0'); }
     if (*p == ',' || *p == '_') { comma = 1; p++; }
     if (*p == '.') { p++; prec = 0; while (*p >= '0' && *p <= '9') prec = prec * 10 + (*p++ - '0'); }
     if (*p) type = *p;
-    char body[512];
+    char body[512]; int pre = 0;                                  /* sign and 0x prefix: padding with '=' goes after them */
     if (num(v) && type != 's') {
         double f = fval(v);
         int isint = (v.t == T_INT || v.t == T_BOOL) && (type == 0 || type == 'd' || type == 'x' || type == 'X' || type == 'b' || type == 'o');
@@ -676,9 +677,13 @@ AV a_format(AV v, const char *spec) {
             else if (type == 'o') snprintf(body, sizeof body, "%llo", i < 0 ? -i : i);
             else if (type == 'b') { char t[80]; int k = 0; unsigned long long u = (unsigned long long)(i < 0 ? -i : i); do { t[k++] = (char)('0' + (u & 1)); u >>= 1; } while (u); for (int j = 0; j < k; j++) body[j] = t[k - 1 - j]; body[k] = 0; }
             else snprintf(body, sizeof body, "%lld", i < 0 ? -i : i);
+            if (alt && (type == 'x' || type == 'X' || type == 'o' || type == 'b')) {
+                memmove(body + 2, body, strlen(body) + 1); body[0] = '0'; body[1] = type;
+            }
             if (comma) { char t[512]; int n = (int)strlen(body), o = 0; for (int j = 0; j < n; j++) { t[o++] = body[j]; if ((n - j - 1) % 3 == 0 && j < n - 1) t[o++] = ','; } t[o] = 0; strcpy(body, t); }
-            if (i < 0) { memmove(body + 1, body, strlen(body) + 1); body[0] = '-'; }
-            else if (sign == '+' || sign == ' ') { memmove(body + 1, body, strlen(body) + 1); body[0] = sign; }
+            if (alt && (type == 'x' || type == 'X' || type == 'o' || type == 'b')) pre = 2;
+            if (i < 0) { memmove(body + 1, body, strlen(body) + 1); body[0] = '-'; pre++; }
+            else if (sign == '+' || sign == ' ') { memmove(body + 1, body, strlen(body) + 1); body[0] = sign; pre++; }
         } else {
             char t = type ? type : (prec >= 0 ? 'g' : 0);
             if (t == 0) { float_repr(f, body, sizeof body); }
@@ -712,8 +717,11 @@ AV a_format(AV v, const char *spec) {
     int pad = width - bl;
     if (align == '<') { sb_puts(&b, body); for (int i = 0; i < pad; i++) sb_put(&b, &fill, 1); }
     else if (align == '^') { for (int i = 0; i < pad / 2; i++) sb_put(&b, &fill, 1); sb_puts(&b, body); for (int i = 0; i < pad - pad / 2; i++) sb_put(&b, &fill, 1); }
-    else if (align == '=' && (body[0] == '-' || body[0] == '+' || body[0] == ' ')) { sb_put(&b, body, 1); for (int i = 0; i < pad; i++) sb_put(&b, &fill, 1); sb_puts(&b, body + 1); }
-    else { for (int i = 0; i < pad; i++) sb_put(&b, &fill, 1); sb_puts(&b, body); }
+    else {
+        if (align == '=' && !pre && (body[0] == '-' || body[0] == '+' || body[0] == ' ')) pre = 1;
+        if (align != '=') pre = 0;
+        sb_put(&b, body, pre); for (int i = 0; i < pad; i++) sb_put(&b, &fill, 1); sb_puts(&b, body + pre);
+    }
     return sb_done(&b);
 }
 AV a_concat_strs(int n, AV *parts) {
@@ -755,6 +763,10 @@ static void unit_string(SB *b, const int16_t *d) {
         for (int i = 0; i < 7; i++) if (d[i] < 0) { if (k++) sb_puts(b, "\302\267"); sb_puts(b, base[i]); if (d[i] != -60) { sb_puts(b, "^"); exp_str(b, -d[i]); } }
         if (nden > 1) sb_puts(b, ")");
     }
+}
+static AV b_unit_str(int n, AV *a, ADict *kw, AV self) {      /* __unit_str(q): the SI unit of a quantity, as apsi run's unit_string */
+    (void)kw; (void)self; if (!n || !a_is(a[0], O_QTY)) return A_NONE;          /* none: not a quantity */
+    SB b = {0}; unit_string(&b, ((AQty *)a[0].o)->dim); AV r = a_str(b.p ? b.p : ""); free(b.p); return r;
 }
 static const char *dim_desc(const int16_t *d, char *buf, size_t n) {
     if (dimless(d)) { snprintf(buf, n, "a dimensionless number"); return buf; }
@@ -2502,7 +2514,7 @@ static const BEnt a_builtins[] = {
     {"gamma", b_gamma}, {"beta", b_beta}, {"factorial", b_factorial}, {"comb", b_comb}, {"seed", b_seed},
     {"rand", b_rand}, {"randn", b_randn}, {"randint", b_randint}, {"permutation", b_permutation}, {"seed_push", b_seed_push}, {"seed_pop", b_seed_pop},
     {"exists", b_exists}, {"read_text", b_read_text}, {"write_text", b_write_text}, {"json_str", b_json_str},
-    {"json_parse", b_json_parse}, {"load_json", b_load_json}, {"save_json", b_save_json},
+    {"json_parse", b_json_parse}, {"__unit_str", b_unit_str}, {"load_json", b_load_json}, {"save_json", b_save_json},
     {"cpu_threads", b_cpu_threads}, {"clock", b_clock}, {"getenv", b_getenv}, {"write_out", b_write_out},
     {"write_err", b_write_err}, {"flush_out", b_flush_out}, {"isnan", b_isnan}, {"isfinite", b_isfinite},
     {"hex", b_hex}, {"oct", b_oct}, {"bin", b_bin}, {"callable", b_callable}, {"getattr", b_getattr},
@@ -2518,9 +2530,11 @@ AV a_global_builtin(const char *name) {
     if (!strcmp(name, "IOError") || !strcmp(name, "EnvironmentError")) return a_exc_classes[17];
     if (!strcmp(name, "pi")) return a_float(3.141592653589793);
     if (!strcmp(name, "tau")) return a_float(6.283185307179586);
-    static const char *dtypes[][2] = {{"f64", "float64"}, {"fp64", "float64"}, {"f32", "float32"}, {"fp32", "float32"},
-        {"f16", "float32"}, {"fp16", "float32"}, {"bf16", "float32"}, {"i64", "int64"}, {"i32", "int64"}, {"int8", "int64"},
-        {"uint8", "int64"}, {"int4", "int64"}};
+    /* the storage formats are named as in apsi run (use precision reads the name); a tensor stores them as
+       float32 / int64 */
+    static const char *dtypes[][2] = {{"f64", "float64"}, {"fp64", "fp64"}, {"f32", "float32"}, {"fp32", "fp32"},
+        {"f16", "f16"}, {"fp16", "fp16"}, {"bf16", "bf16"}, {"i64", "int64"}, {"i32", "int64"}, {"int8", "int8"},
+        {"uint8", "uint8"}, {"int4", "int4"}};
     for (size_t i = 0; i < sizeof dtypes / sizeof *dtypes; i++) if (!strcmp(name, dtypes[i][0])) return a_str(dtypes[i][1]);
     static const char *ctypes_[] = {"ptr_f64", "ptr_f32", "ptr_i64", "ptr_i32", "ptr_u8", "ptr_void", "void", "cstr", "u8", "u16", "u32", "u64", "i8", "i16"};
     for (size_t i = 0; i < sizeof ctypes_ / sizeof *ctypes_; i++) if (!strcmp(name, ctypes_[i])) return a_str(ctypes_[i]);

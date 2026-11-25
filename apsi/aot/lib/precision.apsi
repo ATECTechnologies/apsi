@@ -1,0 +1,217 @@
+# use precision: numeric formats for native programs: FP64, FP32, FP16, BF16, FP8 (E4M3 / E5M2), FP6 (E3M2 /
+# E2M3), FP4 (E2M1), INT8, INT4 and UINT8, with round-to-nearest-even conversion bit-exact with apsi run, scaled
+# quantisation (per tensor or per channel), FP32 decoding and straight-through gradients for round_to.
+
+let fp8_e4m3 = "fp8_e4m3"
+let fp8_e5m2 = "fp8_e5m2"
+let fp6_e3m2 = "fp6_e3m2"
+let fp6_e2m3 = "fp6_e2m3"
+let fp4_e2m1 = "fp4_e2m1"
+let fp8 = "fp8"
+let bf8 = "bf8"
+let e4m3 = "e4m3"
+let e5m2 = "e5m2"
+let fp6 = "fp6"
+let fp4 = "fp4"
+
+let _ALIASES = {"fp64": "f64", "fp32": "f32", "fp16": "f16", "fp8": "fp8_e4m3", "bf8": "fp8_e5m2", "e4m3": "fp8_e4m3",
+                "e5m2": "fp8_e5m2", "fp6": "fp6_e3m2", "fp4": "fp4_e2m1", "float64": "f64", "float32": "f32",
+                "float16": "f16"}
+# name: (bits, kind, max)
+let _FORMATS = {"f64": [64, "native", 1.7976931348623157e308], "f32": [32, "native", 3.4028234663852886e38],
+                "f16": [16, "native", 65504.0], "bf16": [16, "bf16", 3.3895313892515355e38],
+                "fp8_e4m3": [8, "minifloat", 448.0], "fp8_e5m2": [8, "minifloat", 57344.0],
+                "fp6_e3m2": [6, "minifloat", 28.0], "fp6_e2m3": [6, "minifloat", 7.5], "fp4_e2m1": [4, "minifloat", 6.0],
+                "int8": [8, "int", 127.0], "int4": [4, "int", 7.0], "uint8": [8, "uint", 255.0]}
+
+fn _name(f):
+    let n = str(f)
+    let m = _ALIASES.get(n, n)
+    if m not in _FORMATS:
+        raise RuntimeError(f"unknown numeric format '{m}'; choose one of {', '.join(list(_FORMATS.keys()))}")
+    return m
+
+fn _plain(x):
+    let p = si_magnitude(x)
+    return tensor(p, f64) if isinstance(p, list) or ndim(p) > 0 else float(p)
+
+fn _count(shp):
+    var c = 1
+    for d in shp:
+        c = c * d
+    return c
+
+class QTensor:
+    var codes = none
+    var scale = 1.0
+    var fmt = ""
+    var shape = []
+    var ndim = 0
+    var nbytes = 0
+    var axis = none
+    var zero = 0.0
+    var unit = none
+    fn _size(self):
+        let n = _count(self.shape)
+        let bits = _FORMATS[self.fmt][0]
+        var b = n
+        if bits == 16:
+            b = 2 * n
+        elif bits == 4:
+            b = (n + 1) // 2
+        elif bits == 6:
+            b = (n + 3) // 4 * 3
+        if not isinstance(self.scale, float):
+            b = b + 4 * _count(shape(self.scale))
+        return b
+    fn dequantize(self) = dequantize(self)
+    fn __str__(self) = f"QTensor[{'x'.join([str(d) for d in self.shape])}, {self.fmt}, {self.nbytes} bytes]"
+
+fn _scale_for(x, mx, axis):
+    let a = abs(x)
+    if axis == none:
+        let m = float(max(a)) if ndim(x) > 0 and _count(shape(x)) > 0 else (abs(float(x)) if ndim(x) == 0 else 0.0)
+        return m / mx if m > 0 else 1.0
+    let nd = ndim(x)
+    let ax = axis % nd
+    var m = a
+    for i in range(nd):
+        if i != ax:
+            m = max(m, axis=i, keepdims=true)
+    return tensor(where(m > 0, m / mx, ones_like(m)), f32)
+
+fn _unit_of(x):
+    if __unit_str(x) == none:
+        return none
+    let mag = _plain(x)
+    if ndim(mag) == 0:
+        return x / float(mag) if float(mag) != 0 else none
+    let flat = reshape(mag, -1)
+    for i in range(len(flat)):
+        if float(flat[i]) != 0:
+            return reshape(x, -1)[i] / float(flat[i])
+    return none
+
+fn quantize(x, fmt, scale="auto", axis=none):
+    let name = _name(fmt)
+    let info = _FORMATS[name]
+    let xv = _plain(x)
+    if info[1] == "native":
+        if name == "f64":
+            return xv
+        if name == "f32":
+            return tensor(xv, f32) if ndim(xv) > 0 else float(__qfmt(xv, "f32", "enc"))
+        return __qfmt(__qfmt(xv, "f16", "enc"), "f16", "dec")
+    let shp = list(shape(xv)) if ndim(xv) > 0 else []
+    var q = QTensor()
+    q.fmt = name
+    q.shape = shp
+    q.unit = _unit_of(x)
+    q.ndim = len(shp)
+    if info[1] == "bf16":
+        let s = 1.0 if scale == "auto" else float(scale)
+        q.codes = __qfmt(xv / s, "bf16", "enc")
+        q.scale = s
+        q.nbytes = q._size()
+        return q
+    if info[1] == "uint":
+        let n = _count(shp)
+        let lo = float(min(xv)) if n > 0 and ndim(xv) > 0 else (float(xv) if ndim(xv) == 0 else 0.0)
+        let hi = float(max(xv)) if n > 0 and ndim(xv) > 0 else (float(xv) if ndim(xv) == 0 else 1.0)
+        let s = (hi - lo) / 255.0 if hi > lo else 1.0
+        q.codes = clip(round((xv - lo) / s), 0, 255)
+        q.scale = s
+        q.zero = lo
+        q.axis = "zero"
+        q.nbytes = q._size()
+        return q
+    var s = _scale_for(xv, info[2], axis) if scale == "auto" else float(scale)
+    let y = xv / (tensor(s, f64) if not isinstance(s, float) else s)
+    q.codes = __qfmt(y, name, "enc")
+    q.scale = s
+    q.axis = axis
+    q.nbytes = q._size()
+    return q
+
+fn dequantize(q):
+    if not isinstance(q, QTensor):
+        q.nbytes = q._size()
+        return q
+    let info = _FORMATS[q.fmt]
+    let sc = tensor(q.scale, f32)
+    let scalar = len(q.shape) == 0
+    let codes = reshape(tensor(q.codes, f64), 1) if scalar else q.codes
+    var v = none
+    if info[1] == "uint":
+        v = tensor(codes, f32) * sc + tensor(q.zero, f32)
+    elif info[1] == "int":
+        v = tensor(codes, f32) * sc
+    else:
+        v = tensor(__qfmt(codes, q.fmt, "dec"), f32) * sc
+    if scalar:
+        v = float(v[0])
+    if q.unit != none:
+        return v * q.unit
+    return v
+
+fn round_to(x, fmt, scale="auto", axis=none):
+    let name = _name(fmt)
+    if __unit_str(x) != none:
+        let mag = _plain(x)
+        let r = round_to(mag, name, scale, axis)
+        if ndim(mag) == 0:
+            return x * (r / float(mag)) if float(mag) != 0 else x * 0.0
+        return x * where(mag == 0, zeros_like(mag), r / where(mag == 0, ones_like(mag), mag))
+    if __is_traced(x):
+        let r = round_to(stop_gradient(x), name, scale, axis)
+        return x + stop_gradient(r - x)                       # the rounded value, with straight-through gradients
+    let info = _FORMATS[name]
+    let xv = _plain(x)
+    if info[1] == "native":
+        if name == "f64":
+            return xv
+        let r = __qfmt(__qfmt(xv, name, "enc"), name, "dec") if name == "f16" else __qfmt(xv, "f32", "enc")
+        return r
+    let r = dequantize(quantize(xv, name, scale, axis))
+    return tensor(r, f64) if ndim(r) > 0 else float(r)
+
+fn qmatmul(a, b):
+    let av = dequantize(a) if isinstance(a, QTensor) else tensor(_plain(a), f32)
+    let bv = dequantize(b) if isinstance(b, QTensor) else tensor(_plain(b), f32)
+    return av @ bv
+
+fn nbytes(x):
+    if isinstance(x, QTensor):
+        return x.nbytes
+    let v = si_magnitude(x)
+    if isinstance(v, list):
+        return 8 * len(v)
+    if ndim(v) == 0:
+        return 8
+    let per = 4 if str(v.dtype) == "float32" else 8
+    return per * _count(shape(v))
+
+fn quant_error(x, fmt, axis=none):
+    let xv = _plain(x)
+    let r = round_to(xv, fmt, "auto", axis)
+    var denom = sqrt(float(mean(xv * xv)))
+    if denom == 0:
+        denom = 1.0
+    return sqrt(float(mean((r - xv) ** 2))) / denom
+
+fn format_info(fmt):
+    let name = _name(fmt)
+    let info = _FORMATS[name]
+    if name == "f64":
+        return record(name="f64", bits=64, max=info[2], eps=2.0 ** -52, tiny=2.2250738585072014e-308)
+    if name == "f32":
+        return record(name="f32", bits=32, max=info[2], eps=2.0 ** -23, tiny=2.0 ** -126)
+    if name == "f16":
+        return record(name="f16", bits=16, max=info[2], eps=2.0 ** -10, tiny=2.0 ** -14)
+    if name == "bf16":
+        return record(name="bf16", bits=16, max=info[2], eps=2.0 ** -7, tiny=2.0 ** -126)
+    if info[1] == "minifloat":
+        let m = {"fp8_e4m3": [3, 2.0 ** -9, 253], "fp8_e5m2": [2, 2.0 ** -16, 247], "fp6_e3m2": [2, 0.0625, 63],
+                 "fp6_e2m3": [3, 0.125, 63], "fp4_e2m1": [1, 0.5, 15]}[name]
+        return record(name=name, bits=info[0], max=info[2], eps=2.0 ** -m[0], tiny=m[1], values=m[2])
+    return record(name=name, bits=info[0], max=info[2], eps=1.0, tiny=1.0)

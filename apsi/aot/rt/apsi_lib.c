@@ -649,6 +649,14 @@ BI(lb_localtime) {
     localtime_r(&sec, &tmv);
 #endif
     char b[64];
+    if (!strcmp(form, "utc")) {                                  /* 2026-01-02T03:04:05Z */
+#ifdef _WIN32
+        gmtime_s(&tmv, &sec);
+#else
+        gmtime_r(&sec, &tmv);
+#endif
+        strftime(b, sizeof b, "%Y-%m-%dT%H:%M:%SZ", &tmv); return a_str(b);
+    }
     if (!strcmp(form, "date")) strftime(b, sizeof b, "%Y-%m-%d", &tmv);
     else if (!strcmp(form, "iso")) {
         char z[16]; strftime(z, sizeof z, "%z", &tmv); size_t k = strftime(b, sizeof b, "%Y-%m-%dT%H:%M:%S", &tmv);
@@ -664,6 +672,92 @@ BI(lb_isatty) {
     return a_bool(isatty(2));
 #endif
 }
+/* ------------------------------------------------------------------ numeric formats (use precision)
+   __qfmt(x, fmt, "enc" | "dec"): round-to-nearest-even codes of BF16, the OCP minifloats (FP8 E4M3 / E5M2,
+   FP6 E3M2 / E2M3, FP4 E2M1) and symmetric integers, and their decoded FP32 values: bit-exact with apsi run. */
+typedef struct { int kind, e, m, bias, finite_only, nan_top, qmax; } QFmt;   /* kind: 1 bf16, 2 minifloat, 3 int */
+static int qfmt_get(const char *nm, QFmt *f) {
+    memset(f, 0, sizeof *f);
+    if (!strcmp(nm, "bf16")) { f->kind = 1; return 1; }
+    if (!strcmp(nm, "f16")) { f->kind = 4; return 1; }
+    if (!strcmp(nm, "f32")) { f->kind = 5; return 1; }
+    static const struct { const char *n; int e, m, b, fo, nt; } mf[] = {
+        {"fp8_e4m3", 4, 3, 7, 1, 1}, {"fp8_e5m2", 5, 2, 15, 0, 0}, {"fp6_e3m2", 3, 2, 3, 1, 0},
+        {"fp6_e2m3", 2, 3, 1, 1, 0}, {"fp4_e2m1", 2, 1, 1, 1, 0}};
+    for (int i = 0; i < 5; i++) if (!strcmp(nm, mf[i].n)) { f->kind = 2; f->e = mf[i].e; f->m = mf[i].m; f->bias = mf[i].b; f->finite_only = mf[i].fo; f->nan_top = mf[i].nt; return 1; }
+    if (!strcmp(nm, "int8")) { f->kind = 3; f->qmax = 127; return 1; }
+    if (!strcmp(nm, "int4")) { f->kind = 3; f->qmax = 7; return 1; }
+    return 0;
+}
+static double qmf_value(const QFmt *f, int code) {
+    int e = code >> f->m, m = code & ((1 << f->m) - 1), top = (1 << f->e) - 1;
+    double v = e == 0 ? ((double)m / (1 << f->m)) * pow(2.0, 1 - f->bias) : (1 + (double)m / (1 << f->m)) * pow(2.0, e - f->bias);
+    if (!f->finite_only && e == top) v = m == 0 ? INFINITY : NAN;
+    if (f->nan_top && e == top && m == (1 << f->m) - 1) v = NAN;
+    return v;
+}
+static uint16_t d2h(double x) {                          /* float64 -> IEEE half, round to nearest even (as numpy) */
+    uint16_t sg = signbit(x) ? 0x8000 : 0; double a = fabs(x);
+    if (a != a) return 0x7E00;
+    if (a >= 65520.0) return sg | 0x7C00;
+    if (a < ldexp(1.0, -14)) return sg | (uint16_t)rint(a / ldexp(1.0, -24));
+    int ex; frexp(a, &ex); int e = ex - 1; double q = rint((ldexp(a, -e) - 1) * 1024);
+    if (q >= 1024) { q = 0; e++; }
+    if (e > 15) return sg | 0x7C00;
+    return sg | (uint16_t)((e + 15) << 10) | (uint16_t)q;
+}
+static double h2d(uint16_t h) {
+    int e = (h >> 10) & 31, m = h & 1023; double v;
+    if (e == 0) v = ldexp((double)m, -24); else if (e == 31) v = m ? NAN : INFINITY; else v = ldexp(1 + m / 1024.0, e - 15);
+    return (h & 0x8000) ? -v : v;
+}
+BI(lb_qfmt) {
+    (void)self; (void)kw; if (n < 3) a_error("TypeError", "__qfmt(x, fmt, op)");
+    QFmt f; if (!qfmt_get(lib_str(a[1], "precision")->s, &f)) a_error("ValueError", "unknown numeric format '%s'", lib_str(a[1], "precision")->s);
+    int dec = !strcmp(lib_str(a[2], "precision")->s, "dec");
+    ATensor *X = lf64(a[0], "precision"); int sp = a_ntmp; A_PUSH(a_obj(X));
+    ATensor *Y = t_new(DT_F64, X->nd, X->sh); A_PUSH(a_obj(Y));
+    const double *x = (const double *)X->p; double *y = (double *)Y->p; int64_t cnt = X->n;
+    if (f.kind == 4) for (int64_t i = 0; i < cnt; i++) y[i] = dec ? h2d((uint16_t)(int64_t)x[i]) : (double)d2h(x[i]);
+    else if (f.kind == 5) for (int64_t i = 0; i < cnt; i++) y[i] = (float)x[i];
+    else if (f.kind == 1) {
+        for (int64_t i = 0; i < cnt; i++) {
+            if (!dec) { float v = (float)x[i]; uint32_t u; memcpy(&u, &v, 4);
+                        y[i] = v != v ? (double)0x7FC0 : (double)(uint16_t)(((uint64_t)u + 0x7FFF + ((u >> 16) & 1)) >> 16); }
+            else { uint32_t u = (uint32_t)(int64_t)x[i] << 16; float v; memcpy(&v, &u, 4); y[i] = v; }
+        }
+    } else if (f.kind == 3) {
+        for (int64_t i = 0; i < cnt; i++) {
+            if (dec) { y[i] = (float)x[i]; continue; }
+            double r = rint(x[i]); if (r > f.qmax) r = f.qmax; if (r < -f.qmax) r = -f.qmax; if (r != r) r = 0; y[i] = r + 0.0;   /* an int8 code has no -0 */
+        }
+    } else {
+        int nm = f.e + f.m, ncode = 1 << nm; double tab[128]; int ord[128], k = 0, nan_code = ncode - 1, have_nan = 0;
+        for (int c = 0; c < ncode; c++) { tab[c] = qmf_value(&f, c); if (tab[c] != tab[c] && !have_nan) { nan_code = c; have_nan = 1; } }
+        for (int c = 0; c < ncode; c++) if (isfinite(tab[c])) ord[k++] = c;
+        for (int i = 1; i < k; i++) { int c = ord[i], j = i; while (j > 0 && tab[ord[j - 1]] > tab[c]) { ord[j] = ord[j - 1]; j--; } ord[j] = c; }
+        double mx = tab[ord[k - 1]];
+        for (int64_t i = 0; i < cnt; i++) {
+            if (dec) {
+                int64_t c = (int64_t)x[i]; double mag = tab[c & (ncode - 1)]; y[i] = (float)(((c >> nm) & 1) ? -mag : mag); continue;
+            }
+            double v = x[i];
+            if (v != v) { y[i] = nan_code; continue; }
+            int sg = signbit(v) ? 1 : 0; double ac = fabs(v); if (ac > mx) ac = mx;
+            int lo = 0, hi = k;                                   /* searchsorted (left) */
+            while (lo < hi) { int mid = (lo + hi) / 2; if (tab[ord[mid]] < ac) lo = mid + 1; else hi = mid; }
+            int idx = lo < 1 ? 1 : lo > k - 1 ? k - 1 : lo;
+            double l = tab[ord[idx - 1]], h = tab[ord[idx]];
+            int pick = (ac - l) > (h - ac) || ((ac - l) == (h - ac) && (ord[idx] & 1) == 0);
+            y[i] = (double)((pick ? ord[idx] : ord[idx - 1]) | (sg << nm));
+        }
+    }
+    a_ntmp = sp;
+    return X->nd == 0 ? a_float(y[0]) : a_obj(Y);
+}
+BI(lb_is_traced) { (void)kw; (void)self; return a_bool(n && is_n(a[0])); }   /* recorded by grad() */
+#define APSI_VERSION "2.6.6"                                  /* kept equal to apsi.__version__ by the tests */
+BI(lb_apsi_version) { (void)n; (void)a; (void)kw; (void)self; return a_str(APSI_VERSION); }
 BI(lb_arity) {                                                /* required positional parameters of an Apsi function */
     (void)kw; (void)self; AV f = n ? a[0] : A_NONE; int d = n > 1 ? (int)a[1].i : -1;
     if (a_is(f, O_BOUND)) { AV g = ((ABound *)f.o)->fn; if (a_is(g, O_FUNC) && ((AFunc *)g.o)->nreq > 0) return a_int(((AFunc *)g.o)->nreq - 1); return a_int(d); }
@@ -677,5 +771,5 @@ static const TEnt lib_builtins[] = {
     {"__password_hash", lb_password_hash}, {"__password_verify", lb_password_verify},
     {"__la", lb_la}, {"__fft", lb_fft}, {"__special", lb_special}, {"__conv2d", lb_conv2d}, {"__maxpool2d", lb_maxpool2d},
     {"__time", lb_time}, {"__sleep", lb_sleep}, {"__fs", lb_fs}, {"__st_load", lb_st_load}, {"__st_save", lb_st_save},
-    {"__npy_load", lb_npy_load}, {"__npy_save", lb_npy_save}, {"__http_serve", lb_http_serve}, {"__is_dev", lb_is_dev}, {"__arity", lb_arity}, {"__localtime", lb_localtime}, {"__isatty", lb_isatty}, {"__rec_dict", lb_rec_dict}, {"__is_rec", lb_is_rec}, {"__argv", lb_argv}, {"__environ_names", lb_environ_names}, {"__builtin", lb_builtin}, {"__setenv", lb_setenv}, {"__gen_step", lb_gen_step}, {"__is_coro", lb_is_coro},
+    {"__npy_load", lb_npy_load}, {"__npy_save", lb_npy_save}, {"__http_serve", lb_http_serve}, {"__is_dev", lb_is_dev}, {"__is_traced", lb_is_traced}, {"__qfmt", lb_qfmt}, {"__apsi_version", lb_apsi_version}, {"__arity", lb_arity}, {"__localtime", lb_localtime}, {"__isatty", lb_isatty}, {"__rec_dict", lb_rec_dict}, {"__is_rec", lb_is_rec}, {"__argv", lb_argv}, {"__environ_names", lb_environ_names}, {"__builtin", lb_builtin}, {"__setenv", lb_setenv}, {"__gen_step", lb_gen_step}, {"__is_coro", lb_is_coro},
     {NULL, NULL}};
