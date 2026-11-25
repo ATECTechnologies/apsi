@@ -1,0 +1,1976 @@
+# use torch: PyTorch's layers, losses, optimizers and schedulers for native programs, with the semantics of apsi run's
+# torch module (apsi/torch_compat.py): PyTorch's defaults, shapes, parameter names and update rules, so models and
+# state_dicts move between PyTorch, apsi run and native programs. Parameters drawn by init(seed) come from the native
+# random generator; everything after that (forward, losses, gradients, optimizer steps) gives the same numbers.
+
+use layers
+
+let _float = __builtin("float")
+let _max = __builtin("max")
+let _min = __builtin("min")
+let _sum = __builtin("sum")
+let _abs = __builtin("abs")
+
+let _b_relu = __builtin("relu")
+let _b_gelu = __builtin("gelu")
+let _b_tanh = __builtin("tanh")
+let _b_sigmoid = __builtin("sigmoid")
+let _b_softmax = __builtin("softmax")
+let _b_log_softmax = __builtin("log_softmax")
+let _b_softplus = __builtin("softplus")
+
+fn _shape(x) = list(shape(x)) if not (isinstance(x, int) or isinstance(x, float)) else []
+fn _nd(x) = len(_shape(x))
+fn _tuple(v, n):
+    if isinstance(v, list) or isinstance(v, tuple):
+        return [int(a) for a in v]
+    return [int(v)] * n
+fn _prod(xs):
+    var p = 1
+    for v in xs:
+        p = p * v
+    return p
+fn _raw(x) = stop_gradient(x) if not (isinstance(x, int) or isinstance(x, float)) else x
+fn _seed_for(seed, i) = none if seed == none else int(seed) * 7919 + i
+fn _setseed(seed):
+    if seed != none:
+        __builtin("seed")(int(seed))
+fn _uniform(bound, shp) = (rand(*shp) * 2.0 - 1.0) * bound
+fn _neg_inf(shp) = full(shp, -inf)
+fn _is_float_tensor(t) = not (isinstance(t, int) or isinstance(t, float) or isinstance(t, bool)) and (str(t.dtype).startswith("float"))
+fn _is_bool_tensor(t) = not (isinstance(t, int) or isinstance(t, float) or isinstance(t, bool)) and str(t.dtype) == "bool"
+fn _sl(x, axis, lo, hi, step=1):
+    # x sliced along one axis
+    let nd = _nd(x)
+    let a = axis % nd
+    if a == 0:
+        return x[lo:hi:step]
+    if a == 1:
+        return x[:, lo:hi:step]
+    if a == 2:
+        return x[:, :, lo:hi:step]
+    if a == 3:
+        return x[:, :, :, lo:hi:step]
+    if a == 4:
+        return x[:, :, :, :, lo:hi:step]
+    let p = [a] + [i for i in range(nd) if i != a]
+    var inv = [0] * nd
+    for i in range(nd):
+        inv[p[i]] = i
+    return permute(permute(x, *p)[lo:hi:step], *inv)
+
+# =============================================================================== base layer
+class TorchLayer:
+    var name = "Module"
+    var training = true
+    fn init(self, seed=0) = record()
+    fn __call__(self, params, *xs, train=none, **kw):
+        let mode = self.training if train == none else bool(train)
+        return self.forward(params, *xs, train=mode, **kw)
+    fn apply(self, params, x, train=false, **ctx) = self.forward(params, x, train=bool(train))
+    fn forward(self, p, x, train=false):
+        raise NotImplementedError()
+    fn children(self) = []
+    fn describe(self) = self.name
+    fn __str__(self) = self.describe()
+    fn __repr__(self) = self.describe()
+    fn train(self, mode=true) = _set_mode(self, mode)
+    fn eval(self) = _set_mode(self, false)
+
+fn _set_mode(layer, mode):
+    layer.training = bool(mode)
+    if isinstance(layer, TorchLayer):
+        for c in layer.children():
+            _set_mode(c[1], mode)
+    return layer
+
+# =============================================================================== activations
+fn _leaky(x, negative_slope=0.01) = where(_raw(x) > 0, x, x * negative_slope)
+fn _elu(x, alpha=1.0) = where(_raw(x) > 0, x, alpha * (exp(where(_raw(x) > 0, 0.0 * x, x)) - 1.0))
+fn _selu(x) = 1.0507009873554804934193349852946 * _elu(x, 1.6732632423543772848170429916717)
+fn _celu(x, alpha=1.0) = where(_raw(x) > 0, x, alpha * (exp(where(_raw(x) > 0, 0.0 * x, x) / alpha) - 1.0))
+fn _softplus(x, beta=1.0, threshold=20.0):
+    let bx = x * beta
+    return where(_raw(bx) > threshold, x, _b_softplus(where(_raw(bx) > threshold, 0.0 * bx, bx)) / beta)
+fn _hardtanh(x, min_val=-1.0, max_val=1.0):
+    let r = _raw(x)
+    return where(r < min_val, min_val + 0.0 * x, where(r > max_val, max_val + 0.0 * x, x))
+fn _relu6(x) = _hardtanh(_b_relu(x), 0.0, 6.0)
+fn _hardsigmoid(x) = _hardtanh(x / 6.0 + 0.5, 0.0, 1.0)
+fn _hardswish(x) = x * _hardsigmoid(x)
+fn _mish(x) = x * _b_tanh(_b_softplus(x))
+fn _silu(x) = x * _b_sigmoid(x)
+fn _gelu(x, approximate="none") = _b_gelu(x, "tanh" if approximate == "tanh" else "none")
+fn _softsign(x) = x / (1.0 + abs(x))
+fn _tanhshrink(x) = x - _b_tanh(x)
+fn _glu(x, dim=-1):
+    let n = _shape(x)[dim] // 2
+    return _sl(x, dim, 0, n) * _b_sigmoid(_sl(x, dim, n, 2 * n))
+fn _softmax(x, dim=none) = _b_softmax(x, axis=-1 if dim == none else int(dim))
+fn _log_softmax(x, dim=none) = _b_log_softmax(x, axis=-1 if dim == none else int(dim))
+fn _relu(x) = _b_relu(x)
+fn _tanh(x) = _b_tanh(x)
+fn _sigmoid(x) = _b_sigmoid(x)
+fn _identity(x) = x
+
+let ACT_FUNCS = {"relu": _relu, "gelu": _gelu, "silu": _silu, "tanh": _tanh, "sigmoid": _sigmoid, "softmax": _softmax,
+                 "log_softmax": _log_softmax, "leaky_relu": _leaky, "elu": _elu, "selu": _selu, "celu": _celu,
+                 "softplus": _softplus, "mish": _mish, "hardtanh": _hardtanh, "relu6": _relu6, "hardswish": _hardswish,
+                 "hardsigmoid": _hardsigmoid, "softsign": _softsign, "tanhshrink": _tanhshrink, "glu": _glu,
+                 "identity": _identity}
+let ACT_CLASSES = {"ReLU": "relu", "GELU": "gelu", "SiLU": "silu", "Tanh": "tanh", "Sigmoid": "sigmoid",
+                   "Softmax": "softmax", "LogSoftmax": "log_softmax", "LeakyReLU": "leaky_relu", "ELU": "elu",
+                   "SELU": "selu", "CELU": "celu", "Softplus": "softplus", "Mish": "mish", "Hardtanh": "hardtanh",
+                   "ReLU6": "relu6", "Hardswish": "hardswish", "Hardsigmoid": "hardsigmoid", "Softsign": "softsign",
+                   "Tanhshrink": "tanhshrink", "GLU": "glu", "Identity": "identity"}
+let _ACT_ARGS = {"softmax": ["dim"], "log_softmax": ["dim"], "leaky_relu": ["negative_slope"], "elu": ["alpha"],
+                 "celu": ["alpha"], "softplus": ["beta", "threshold"], "hardtanh": ["min_val", "max_val"],
+                 "glu": ["dim"], "gelu": ["approximate"]}
+
+class Activation(TorchLayer):
+    fn __init__(self, f, *args, **kw):
+        self.fn_name = f
+        let names = _ACT_ARGS.get(f, [])
+        var d = {}
+        for i in range(_min(len(names), len(args))):
+            d[names[i]] = args[i]
+        for k in kw:
+            if k in names:
+                d[k] = kw[k]
+        self.kw = d
+        var nm = f
+        for c in ACT_CLASSES:
+            if ACT_CLASSES[c] == f and nm == f:
+                nm = c
+        self.name = nm
+    fn forward(self, p, x, train=false) = ACT_FUNCS[self.fn_name](x, **self.kw)
+
+fn _act(f):
+    fn make(*args, inplace=false, **kw) = Activation(f, *args, **kw)
+    return make
+
+let ReLU = _act("relu")
+let GELU = _act("gelu")
+let SiLU = _act("silu")
+let Tanh = _act("tanh")
+let Sigmoid = _act("sigmoid")
+let Softmax = _act("softmax")
+let LogSoftmax = _act("log_softmax")
+let LeakyReLU = _act("leaky_relu")
+let ELU = _act("elu")
+let SELU = _act("selu")
+let CELU = _act("celu")
+let Softplus = _act("softplus")
+let Mish = _act("mish")
+let Hardtanh = _act("hardtanh")
+let ReLU6 = _act("relu6")
+let Hardswish = _act("hardswish")
+let Hardsigmoid = _act("hardsigmoid")
+let Softsign = _act("softsign")
+let Tanhshrink = _act("tanhshrink")
+let GLU = _act("glu")
+let Identity = _act("identity")
+fn relu(x) = _b_relu(x)
+fn gelu(x, approximate="none") = _gelu(x, approximate)
+fn tanh(x) = _b_tanh(x)
+fn sigmoid(x) = _b_sigmoid(x)
+fn softmax(x, dim=none) = _softmax(x, dim)
+fn log_softmax(x, dim=none) = _log_softmax(x, dim)
+fn softplus(x, beta=1.0, threshold=20.0) = _softplus(x, beta, threshold)
+let relu6 = _relu6
+let leaky_relu = _leaky
+let elu = _elu
+let selu = _selu
+let celu = _celu
+let mish = _mish
+let hardtanh = _hardtanh
+let hardswish = _hardswish
+let hardsigmoid = _hardsigmoid
+let softsign = _softsign
+let tanhshrink = _tanhshrink
+let glu = _glu
+let silu = _silu
+let identity = _identity
+
+class PReLU(TorchLayer):
+    fn __init__(self, num_parameters=1, init=0.25):
+        self.name = "PReLU"
+        self.n = int(num_parameters)
+        self.init_v = _float(init)
+    fn init(self, seed=0) = record(weight=full([self.n], self.init_v))
+    fn forward(self, p, x, train=false):
+        let nd = _nd(x)
+        let w = p.weight if self.n == 1 or nd < 2 else reshape(p.weight, *([1, self.n] + [1] * (nd - 2)))
+        return where(_raw(x) >= 0, x, w * x)
+
+# =============================================================================== dense
+class Linear(TorchLayer):
+    fn __init__(self, in_features, out_features, bias=true, device=none, dtype=none):
+        self.name = "Linear"
+        self.i = int(in_features)
+        self.o = int(out_features)
+        self.bias = bool(bias)
+    fn init(self, seed=0):
+        _setseed(seed)
+        let b = 1 / sqrt(self.i) if self.i else 0
+        let w = _uniform(b, [self.o, self.i])
+        return record(weight=w, bias=_uniform(b, [self.o])) if self.bias else record(weight=w)
+    fn forward(self, p, x, train=false):
+        let y = x @ transpose(p.weight)
+        return y + p.bias if self.bias else y
+    fn describe(self) = f"Linear({self.i} → {self.o})"
+
+class Bilinear(TorchLayer):
+    fn __init__(self, in1_features, in2_features, out_features, bias=true):
+        self.name = "Bilinear"
+        self.a = int(in1_features)
+        self.b = int(in2_features)
+        self.o = int(out_features)
+        self.bias = bool(bias)
+    fn init(self, seed=0):
+        _setseed(seed)
+        let bd = 1 / sqrt(self.a)
+        let w = _uniform(bd, [self.o, self.a, self.b])
+        return record(weight=w, bias=_uniform(bd, [self.o])) if self.bias else record(weight=w)
+    fn forward(self, p, x1, x2, train=false):
+        let outs = [sum((x1 @ p.weight[k]) * x2, axis=-1) for k in range(self.o)]
+        let y = stack(outs, axis=-1)
+        return y + p.bias if self.bias else y
+
+class Dropout(TorchLayer):
+    fn __init__(self, p=0.5, inplace=false):
+        self.name = "Dropout"
+        self.p = _float(p)
+    fn forward(self, p, x, train=false) = dropout(x, self.p, train)
+
+class Flatten(TorchLayer):
+    fn __init__(self, start_dim=1, end_dim=-1):
+        self.name = "Flatten"
+        self.s = int(start_dim)
+        self.e = int(end_dim)
+    fn forward(self, p, x, train=false) = flatten(x, self.s, self.e)
+
+class Unflatten(TorchLayer):
+    fn __init__(self, dim, unflattened_size):
+        self.name = "Unflatten"
+        self.dim = int(dim)
+        self.sizes = [int(s) for s in unflattened_size]
+    fn forward(self, p, x, train=false):
+        let sh = _shape(x)
+        let d = self.dim % len(sh)
+        return reshape(x, *(sh[0:d] + self.sizes + sh[d + 1:]))
+
+class Embedding(TorchLayer):
+    fn __init__(self, num_embeddings, embedding_dim, padding_idx=none, max_norm=none, scale_grad_by_freq=false, sparse=false, _weight=none):
+        self.name = "Embedding"
+        self.n = int(num_embeddings)
+        self.d = int(embedding_dim)
+        self.pad = none if padding_idx == none else int(padding_idx) % self.n
+        if max_norm != none:
+            raise RuntimeError("Embedding(max_norm=…) is not supported")
+    fn init(self, seed=0):
+        _setseed(seed)
+        var w = randn(self.n, self.d)
+        if self.pad != none:
+            w[self.pad] = 0.0
+        return record(weight=w)
+    fn forward(self, p, idx, train=false) = embedding(idx, p.weight, self.pad)
+
+# =============================================================================== convolution and pooling
+fn _pad_axis(x, axis, lo, hi, value):
+    if lo == 0 and hi == 0:
+        return x
+    var parts = []
+    let sh = _shape(x)
+    if lo:
+        var s1 = list(sh)
+        s1[axis] = lo
+        parts.append(full(s1, value))
+    parts.append(x)
+    if hi:
+        var s2 = list(sh)
+        s2[axis] = hi
+        parts.append(full(s2, value))
+    return concat(parts, axis=axis)
+
+fn _conv2(x, w, stride, padding, dilation, groups):
+    # x [N, C, H, W], w [O, C/groups, kh, kw]
+    if dilation[0] == 1 and dilation[1] == 1 and groups == 1 and stride[0] == stride[1] and padding[0] == padding[1] and not __is_dev(x) and not __is_dev(w):
+        return __conv2d(x, w, stride[0], padding[0])
+    let xp = _pad_axis(_pad_axis(x, 2, padding[0], padding[0], 0.0), 3, padding[1], padding[1], 0.0)
+    let ws = _shape(w)
+    let xs = _shape(xp)
+    let O = ws[0]
+    let Cg = ws[1]
+    let kh = ws[2]
+    let kw = ws[3]
+    let OH = (xs[2] - dilation[0] * (kh - 1) - 1) // stride[0] + 1
+    let OW = (xs[3] - dilation[1] * (kw - 1) - 1) // stride[1] + 1
+    let og = O // groups
+    var outs = []
+    for g in range(groups):
+        let xg = xp[:, g * Cg:(g + 1) * Cg]
+        let wg = w[g * og:(g + 1) * og]
+        var acc = none
+        for i in range(kh):
+            for j in range(kw):
+                let r0 = i * dilation[0]
+                let c0 = j * dilation[1]
+                let patch = xg[:, :, r0:r0 + stride[0] * (OH - 1) + 1:stride[0], c0:c0 + stride[1] * (OW - 1) + 1:stride[1]]
+                let term = permute(patch, 0, 2, 3, 1) @ transpose(wg[:, :, i, j])
+                acc = term if acc == none else acc + term
+        outs.append(acc)
+    let y = outs[0] if groups == 1 else concat(outs, axis=-1)
+    return permute(y, 0, 3, 1, 2)
+
+class _ConvNd(TorchLayer):
+    fn __init__(self, nd, in_channels, out_channels, kernel_size, stride=1, padding=0, dilation=1, groups=1, bias=true, padding_mode="zeros", device=none, dtype=none):
+        self.nd = nd
+        self.cin = int(in_channels)
+        self.cout = int(out_channels)
+        self.k = _tuple(kernel_size, nd)
+        self.stride = _tuple(stride, nd)
+        self.dil = _tuple(dilation, nd)
+        self.groups = int(groups)
+        self.bias = bool(bias)
+        if padding_mode != "zeros":
+            raise RuntimeError(f"Conv padding_mode='{padding_mode}' is not supported (only 'zeros')")
+        if self.cin % self.groups or self.cout % self.groups:
+            raise ShapeError("in_channels and out_channels must be divisible by groups")
+        if isinstance(padding, str):
+            if padding == "valid":
+                self.pad = [0] * nd
+            elif padding == "same":
+                for s in self.stride:
+                    if s != 1:
+                        raise RuntimeError("padding='same' needs stride 1")
+                let tot = [self.dil[i] * (self.k[i] - 1) for i in range(nd)]
+                for t in tot:
+                    if t % 2:
+                        raise RuntimeError("padding='same' with an even kernel is not supported")
+                self.pad = [t // 2 for t in tot]
+            else:
+                raise RuntimeError(f"unknown padding '{padding}'")
+        else:
+            self.pad = _tuple(padding, nd)
+        self.name = f"Conv{nd}d"
+    fn init(self, seed=0):
+        _setseed(seed)
+        let fan_in = self.cin // self.groups * _prod(self.k)
+        let b = 1 / sqrt(fan_in)
+        let w = _uniform(b, [self.cout, self.cin // self.groups] + self.k)
+        return record(weight=w, bias=_uniform(b, [self.cout])) if self.bias else record(weight=w)
+    fn forward(self, p, x0, train=false):
+        var x = x0
+        let squeeze = _nd(x) == self.nd + 1
+        if squeeze:
+            x = reshape(x, 1, *_shape(x))
+        var y = none
+        if self.nd == 1:
+            let s = _shape(x)
+            let x4 = reshape(x, s[0], s[1], 1, s[2])
+            let ws = _shape(p.weight)
+            let w4 = reshape(p.weight, ws[0], ws[1], 1, ws[2])
+            let y4 = _conv2(x4, w4, [1, self.stride[0]], [0, self.pad[0]], [1, self.dil[0]], self.groups)
+            let ys = _shape(y4)
+            y = reshape(y4, ys[0], ys[1], ys[3])
+        else:
+            y = _conv2(x, p.weight, self.stride, self.pad, self.dil, self.groups)
+        if self.bias:
+            y = y + reshape(p.bias, *([1, self.cout] + [1] * self.nd))
+        return y[0] if squeeze else y
+    fn describe(self) = f"{self.name}({self.cin} → {self.cout}, k={tuple(self.k)})"
+
+fn Conv1d(*a, **k) = _ConvNd(1, *a, **k)
+fn Conv2d(*a, **k) = _ConvNd(2, *a, **k)
+
+fn _pool_out(L, k, s, p, d, ceil_):
+    let num = L + 2 * p - d * (k - 1) - 1
+    var o = (-((-num) // s) if ceil_ else num // s) + 1
+    if ceil_ and (o - 1) * s >= L + p:
+        o = o - 1
+    return o
+
+fn _pool(x0, kind, k0, s0, p0, nd, ceil_=false, count_include_pad=true, divisor_override=none):
+    var x = x0
+    let squeeze = _nd(x) == nd + 1
+    if squeeze:
+        x = reshape(x, 1, *_shape(x))
+    let one = nd == 1
+    var k = list(k0)
+    var s = list(s0)
+    var p = list(p0)
+    if one:
+        let sh1 = _shape(x)
+        x = reshape(x, sh1[0], sh1[1], 1, sh1[2])
+        k = [1] + k
+        s = [1] + s
+        p = [0] + p
+    let sh = _shape(x)
+    let H = sh[2]
+    let W = sh[3]
+    let OH = _pool_out(H, k[0], s[0], p[0], 1, ceil_)
+    let OW = _pool_out(W, k[1], s[1], p[1], 1, ceil_)
+    let eh = _max(0, (OH - 1) * s[0] + k[0] - H - p[0])
+    let ew = _max(0, (OW - 1) * s[1] + k[1] - W - p[1])
+    let fill = -inf if kind == "max" else 0.0
+    let xp = _pad_axis(_pad_axis(x, 2, p[0], eh, fill), 3, p[1], ew, fill)
+    var cells = []
+    for i in range(k[0]):
+        for j in range(k[1]):
+            cells.append(xp[:, :, i:i + s[0] * (OH - 1) + 1:s[0], j:j + s[1] * (OW - 1) + 1:s[1]])
+    let win = stack(cells, axis=-1)
+    var out = none
+    if kind == "max":
+        out = max(win, axis=-1)
+    else:
+        out = sum(win, axis=-1)
+        var div = none
+        if divisor_override:
+            div = full([OH, OW], _float(divisor_override))
+        else:
+            var rows = []
+            for a in range(OH):
+                var row = []
+                for b in range(OW):
+                    let hs = a * s[0] - p[0]
+                    let ws_ = b * s[1] - p[1]
+                    if count_include_pad:
+                        row.append(_float((_min(hs + k[0], H + p[0]) - hs) * (_min(ws_ + k[1], W + p[1]) - ws_)))
+                    else:
+                        row.append(_float((_min(hs + k[0], H) - _max(hs, 0)) * (_min(ws_ + k[1], W) - _max(ws_, 0))))
+                rows.append(row)
+            div = tensor(rows)
+        out = out / div
+    if one:
+        let so = _shape(out)
+        out = reshape(out, so[0], so[1], so[3])
+    return out[0] if squeeze else out
+
+class _Pool(TorchLayer):
+    fn __init__(self, kind, nd, kernel_size, stride=none, padding=0, dilation=1, return_indices=false, ceil_mode=false, count_include_pad=true, divisor_override=none):
+        self.kind = kind
+        self.nd = nd
+        self.k = _tuple(kernel_size, nd)
+        self.s = _tuple(stride if stride != none else kernel_size, nd)
+        self.p = _tuple(padding, nd)
+        if _tuple(dilation, nd) != [1] * nd:
+            raise RuntimeError("pooling with dilation is not supported")
+        if return_indices:
+            raise RuntimeError("pooling with return_indices=True is not supported")
+        self.ceil = bool(ceil_mode)
+        self.cip = bool(count_include_pad)
+        self.div = divisor_override
+        self.name = f"{'Max' if kind == 'max' else 'Avg'}Pool{nd}d"
+    fn forward(self, p, x, train=false) = _pool(x, self.kind, self.k, self.s, self.p, self.nd, self.ceil, self.cip, self.div)
+
+fn MaxPool1d(kernel_size, stride=none, padding=0, dilation=1, return_indices=false, ceil_mode=false) = _Pool("max", 1, kernel_size, stride, padding, dilation, return_indices, ceil_mode)
+fn MaxPool2d(kernel_size, stride=none, padding=0, dilation=1, return_indices=false, ceil_mode=false) = _Pool("max", 2, kernel_size, stride, padding, dilation, return_indices, ceil_mode)
+fn AvgPool1d(kernel_size, stride=none, padding=0, ceil_mode=false, count_include_pad=true) = _Pool("avg", 1, kernel_size, stride, padding, 1, false, ceil_mode, count_include_pad)
+fn AvgPool2d(kernel_size, stride=none, padding=0, ceil_mode=false, count_include_pad=true, divisor_override=none) = _Pool("avg", 2, kernel_size, stride, padding, 1, false, ceil_mode, count_include_pad, divisor_override)
+
+fn _red(t, kind, axis) = mean(t, axis=axis) if kind == "avg" else max(t, axis=axis)
+
+fn _adaptive(x, out, kind, nd):
+    let shp = _shape(x)
+    let sizes = shp[len(shp) - nd:]
+    let ot = _tuple(out, nd) if not (isinstance(out, list) or isinstance(out, tuple)) else list(out)
+    let outs = [sizes[i] if ot[i] == none else int(ot[i]) for i in range(nd)]
+    var even = true
+    for i in range(nd):
+        if sizes[i] % outs[i] != 0:
+            even = false
+    if even:
+        let k = [sizes[i] // outs[i] for i in range(nd)]
+        return _pool(x, kind, k, k, [0] * nd, nd)
+    let lead = len(shp) - nd
+    if nd == 1:
+        let L = sizes[0]
+        let O = outs[0]
+        return stack([_red(_sl(x, lead, i * L // O, -((-(i + 1) * L) // O)), kind, -1) for i in range(O)], axis=-1)
+    let H = sizes[0]
+    let W = sizes[1]
+    let OH = outs[0]
+    let OW = outs[1]
+    var rows = []
+    for i in range(OH):
+        let h0 = i * H // OH
+        let h1 = -((-(i + 1) * H) // OH)
+        var cols = []
+        for j in range(OW):
+            let w0 = j * W // OW
+            let w1 = -((-(j + 1) * W) // OW)
+            let cell = _sl(_sl(x, lead, h0, h1), lead + 1, w0, w1)
+            cols.append(_red(_red(cell, kind, -1), kind, -1))
+        rows.append(stack(cols, axis=-1))
+    return stack(rows, axis=-2)
+
+class _Adaptive(TorchLayer):
+    fn __init__(self, kind, nd, output_size):
+        self.kind = kind
+        self.nd = nd
+        self.out = output_size
+        self.name = f"Adaptive{'Avg' if kind == 'avg' else 'Max'}Pool{nd}d"
+    fn forward(self, p, x, train=false) = _adaptive(x, self.out, self.kind, self.nd)
+
+fn AdaptiveAvgPool1d(output_size) = _Adaptive("avg", 1, output_size)
+fn AdaptiveAvgPool2d(output_size) = _Adaptive("avg", 2, output_size)
+fn AdaptiveMaxPool1d(output_size, return_indices=false) = _Adaptive("max", 1, output_size)
+fn AdaptiveMaxPool2d(output_size, return_indices=false) = _Adaptive("max", 2, output_size)
+
+# =============================================================================== normalisation
+class _BatchNorm(TorchLayer):
+    fn __init__(self, nd, num_features, eps=1e-5, momentum=0.1, affine=true, track_running_stats=true, device=none, dtype=none):
+        self.c = int(num_features)
+        self.eps = _float(eps)
+        self.mom = momentum
+        self.affine = bool(affine)
+        self.track = bool(track_running_stats)
+        self.name = f"BatchNorm{nd}d"
+        self.reset_buffers()
+    fn reset_buffers(self):
+        self.running_mean = zeros(self.c)
+        self.running_var = ones(self.c)
+        self.num_batches_tracked = 0
+    fn init(self, seed=0) = record(weight=ones(self.c), bias=zeros(self.c)) if self.affine else record()
+    fn buffers(self) = {"running_mean": self.running_mean, "running_var": self.running_var, "num_batches_tracked": tensor(self.num_batches_tracked, "int64")} if self.track else {}
+    fn set_buffer(self, name, value):
+        if name == "running_mean":
+            self.running_mean = tensor(value, "float64") * 1.0
+        elif name == "running_var":
+            self.running_var = tensor(value, "float64") * 1.0
+        elif name == "num_batches_tracked":
+            self.num_batches_tracked = int(value)
+    fn forward(self, p, x, train=false):
+        let nd = _nd(x)
+        let axes = (0,) if nd == 2 else tuple([0] + list(range(2, nd)))
+        let bshape = [1, self.c] + [1] * (nd - 2)
+        var y = none
+        if train or not self.track:
+            let m = mean(x, axis=axes, keepdims=true)
+            let d = x - m
+            let v = mean(d * d, axis=axes, keepdims=true)
+            if train and self.track:
+                let xr = _raw(x)
+                let n = _prod(_shape(xr)) / self.c
+                let bm = mean(xr, axis=axes)
+                let dr = xr - mean(xr, axis=axes, keepdims=true)
+                let bv = mean(dr * dr, axis=axes) * (n / _max(n - 1, 1))
+                self.num_batches_tracked = self.num_batches_tracked + 1
+                let f = (1.0 / self.num_batches_tracked) if self.mom == none else _float(self.mom)
+                self.running_mean = (1 - f) * self.running_mean + f * bm
+                self.running_var = (1 - f) * self.running_var + f * bv
+            y = d / sqrt(v + self.eps)
+        else:
+            y = (x - reshape(self.running_mean, *bshape)) / sqrt(reshape(self.running_var, *bshape) + self.eps)
+        if self.affine:
+            y = y * reshape(p.weight, *bshape) + reshape(p.bias, *bshape)
+        return y
+
+fn BatchNorm1d(*a, **k) = _BatchNorm(1, *a, **k)
+fn BatchNorm2d(*a, **k) = _BatchNorm(2, *a, **k)
+
+fn _nshape(s) = [int(v) for v in s] if (isinstance(s, list) or isinstance(s, tuple)) else [int(s)]
+
+class LayerNorm(TorchLayer):
+    fn __init__(self, normalized_shape, eps=1e-5, elementwise_affine=true, bias=true, device=none, dtype=none):
+        self.name = "LayerNorm"
+        self.shape = _nshape(normalized_shape)
+        self.eps = _float(eps)
+        self.affine = bool(elementwise_affine)
+        self.has_bias = bool(bias)
+    fn init(self, seed=0):
+        if not self.affine:
+            return record()
+        return record(weight=ones(*self.shape), bias=zeros(*self.shape)) if self.has_bias else record(weight=ones(*self.shape))
+    fn forward(self, p, x, train=false):
+        var y = layer_norm(x, self.shape, none, none, self.eps)
+        if self.affine:
+            y = y * p.weight
+            if self.has_bias:
+                y = y + p.bias
+        return y
+
+class RMSNorm(TorchLayer):
+    fn __init__(self, normalized_shape, eps=none, elementwise_affine=true, device=none, dtype=none):
+        self.name = "RMSNorm"
+        self.shape = _nshape(normalized_shape)
+        self.eps = eps
+        self.affine = bool(elementwise_affine)
+    fn init(self, seed=0) = record(weight=ones(*self.shape)) if self.affine else record()
+    fn forward(self, p, x, train=false):
+        let axes = tuple(range(-len(self.shape), 0))
+        let e = (1.1920928955078125e-07 if str(x.dtype) == "float32" else 2.220446049250313e-16) if self.eps == none else _float(self.eps)
+        let y = x / sqrt(mean(x * x, axis=axes, keepdims=true) + e)
+        return y * p.weight if self.affine else y
+
+class GroupNorm(TorchLayer):
+    fn __init__(self, num_groups, num_channels, eps=1e-5, affine=true, device=none, dtype=none):
+        self.name = "GroupNorm"
+        self.g = int(num_groups)
+        self.c = int(num_channels)
+        self.eps = _float(eps)
+        self.affine = bool(affine)
+    fn init(self, seed=0) = record(weight=ones(self.c), bias=zeros(self.c)) if self.affine else record()
+    fn forward(self, p, x, train=false):
+        let sh = _shape(x)
+        let xg = reshape(x, sh[0], self.g, -1)
+        let m = mean(xg, axis=-1, keepdims=true)
+        let d = xg - m
+        let v = mean(d * d, axis=-1, keepdims=true)
+        var y = reshape(d / sqrt(v + self.eps), *sh)
+        if self.affine:
+            let bs = [1, self.c] + [1] * (len(sh) - 2)
+            y = y * reshape(p.weight, *bs) + reshape(p.bias, *bs)
+        return y
+
+# =============================================================================== recurrent
+class _RNNBase(TorchLayer):
+    fn __init__(self, mode, input_size, hidden_size, num_layers=1, bias=true, batch_first=false, dropout=0.0, bidirectional=false, nonlinearity="tanh", proj_size=0, device=none, dtype=none):
+        if proj_size:
+            raise RuntimeError("LSTM(proj_size=…) is not supported")
+        self.mode = mode
+        self.i = int(input_size)
+        self.h = int(hidden_size)
+        self.L = int(num_layers)
+        self.bias = bool(bias)
+        self.bf = bool(batch_first)
+        self.drop = _float(dropout)
+        self.bi = bool(bidirectional)
+        self.nonlin = nonlinearity
+        self.gates = {"LSTM": 4, "GRU": 3, "RNN": 1}[mode]
+        self.name = mode
+    fn _names(self):
+        var out = []
+        for layer in range(self.L):
+            for d in range(2 if self.bi else 1):
+                out.append([layer, d, f"_l{layer}{'_reverse' if d else ''}"])
+        return out
+    fn init(self, seed=0):
+        _setseed(seed)
+        let b = 1 / sqrt(self.h)
+        var out = {}
+        let G = self.gates * self.h
+        for nm in self._names():
+            let nin = self.i if nm[0] == 0 else self.h * (2 if self.bi else 1)
+            out["weight_ih" + nm[2]] = _uniform(b, [G, nin])
+            out["weight_hh" + nm[2]] = _uniform(b, [G, self.h])
+            if self.bias:
+                out["bias_ih" + nm[2]] = _uniform(b, [G])
+                out["bias_hh" + nm[2]] = _uniform(b, [G])
+        return record(**out)
+    fn _cell(self, xw, h, c, Whh, bhh):
+        let H = self.h
+        var hw = h @ transpose(Whh)
+        if bhh != none:
+            hw = hw + bhh
+        if self.mode == "LSTM":
+            let z = xw + hw
+            let i = _b_sigmoid(z[:, 0:H])
+            let f = _b_sigmoid(z[:, H:2 * H])
+            let g = _b_tanh(z[:, 2 * H:3 * H])
+            let o = _b_sigmoid(z[:, 3 * H:4 * H])
+            let c2 = f * c + i * g
+            return [o * _b_tanh(c2), c2]
+        if self.mode == "GRU":
+            let r = _b_sigmoid(xw[:, 0:H] + hw[:, 0:H])
+            let zg = _b_sigmoid(xw[:, H:2 * H] + hw[:, H:2 * H])
+            let n = _b_tanh(xw[:, 2 * H:3 * H] + r * hw[:, 2 * H:3 * H])
+            return [(1.0 - zg) * n + zg * h, none]
+        let a = xw + hw
+        return [_b_tanh(a) if self.nonlin == "tanh" else _b_relu(a), none]
+    fn forward(self, p, x0, hx=none, train=false):
+        var x = x0
+        let unbatched = _nd(x) == 2
+        if unbatched:
+            let s = _shape(x)
+            x = reshape(x, 1, s[0], s[1]) if self.bf else reshape(x, s[0], 1, s[1])
+        if not self.bf:
+            x = swapaxes(x, 0, 1)
+        let N = _shape(x)[0]
+        let T = _shape(x)[1]
+        let D = 2 if self.bi else 1
+        var h0 = none
+        var c0 = none
+        if hx != none:
+            if self.mode == "LSTM":
+                h0 = hx[0]
+                c0 = hx[1]
+            else:
+                h0 = hx
+            if unbatched:
+                h0 = reshape(h0, _shape(h0)[0], 1, _shape(h0)[-1])
+                if c0 != none:
+                    c0 = reshape(c0, _shape(c0)[0], 1, _shape(c0)[-1])
+        var hn = []
+        var cn = []
+        var inp = x
+        for layer in range(self.L):
+            var outs_dir = []
+            for d in range(D):
+                let sfx = f"_l{layer}{'_reverse' if d else ''}"
+                let Wih = p["weight_ih" + sfx]
+                let Whh = p["weight_hh" + sfx]
+                let bih = p["bias_ih" + sfx] if self.bias else none
+                let bhh = p["bias_hh" + sfx] if self.bias else none
+                var xw_all = inp @ transpose(Wih)
+                if bih != none:
+                    xw_all = xw_all + bih
+                let k = layer * D + d
+                var h = h0[k] if h0 != none else zeros(N, self.h)
+                var c = (c0[k] if c0 != none else zeros(N, self.h)) if self.mode == "LSTM" else none
+                let steps = range(T - 1, -1, -1) if d else range(T)
+                var seq = [none] * T
+                for t in steps:
+                    let hc = self._cell(xw_all[:, t, :], h, c, Whh, bhh)
+                    h = hc[0]
+                    c = hc[1]
+                    seq[t] = h
+                outs_dir.append(stack(seq, axis=1))
+                hn.append(h)
+                if self.mode == "LSTM":
+                    cn.append(c)
+            inp = outs_dir[0] if D == 1 else concat(outs_dir, axis=-1)
+            if self.drop and train and layer < self.L - 1:
+                inp = dropout(inp, self.drop, true)
+        var out = inp if self.bf else swapaxes(inp, 0, 1)
+        var h_n = stack(hn, axis=0)
+        if unbatched:
+            out = out[0] if self.bf else out[:, 0]
+            h_n = h_n[:, 0]
+        if self.mode == "LSTM":
+            var c_n = stack(cn, axis=0)
+            if unbatched:
+                c_n = c_n[:, 0]
+            return (out, (h_n, c_n))
+        return (out, h_n)
+    fn describe(self) = f"{self.mode}({self.i} → {self.h}, layers={self.L}{', bidirectional' if self.bi else ''})"
+
+fn LSTM(*a, **k) = _RNNBase("LSTM", *a, **k)
+fn GRU(*a, **k) = _RNNBase("GRU", *a, **k)
+fn RNN(*a, nonlinearity="tanh", **k) = _RNNBase("RNN", *a, nonlinearity=nonlinearity, **k)
+
+# =============================================================================== attention
+fn _xavier(shp):
+    let b = sqrt(6.0 / (shp[1] + shp[0]))
+    return _uniform(b, shp)
+
+fn _triu_mask(L, S, value):
+    # value above the diagonal, 0 elsewhere
+    var rows = []
+    for i in range(L):
+        rows.append([value if j > i else 0.0 for j in range(S)])
+    return tensor(rows)
+
+fn _additive(m):
+    if _is_bool_tensor(m):
+        return where(m, -inf, 0.0)
+    return tensor(m, "float64") * 1.0
+
+fn _merge_masks(attn_mask, key_padding_mask, N, H, L, S):
+    var total = none
+    if attn_mask != none:
+        let add = _additive(attn_mask)
+        total = reshape(add, N, H, L, S) if _nd(add) == 3 else reshape(add, 1, 1, L, S)
+    if key_padding_mask != none:
+        let add2 = reshape(_additive(key_padding_mask), N, 1, 1, S)
+        total = add2 if total == none else total + add2
+    return total
+
+fn scaled_dot_product_attention(query, key, value, attn_mask=none, dropout_p=0.0, is_causal=false, scale=none, train=true):
+    let L = _shape(query)[-2]
+    let S = _shape(key)[-2]
+    let E = _shape(query)[-1]
+    let sc = (1.0 / sqrt(E)) if scale == none else _float(scale)
+    var s = (query @ swapaxes(key, -2, -1)) * sc
+    if is_causal:
+        s = s + _triu_mask(L, S, -inf)
+    if attn_mask != none:
+        s = s + (where(attn_mask, 0.0, -inf) if _is_bool_tensor(attn_mask) else attn_mask)
+    var w = _b_softmax(s, axis=-1)
+    if dropout_p and train:
+        w = dropout(w, dropout_p, true)
+    return w @ value
+
+class MultiheadAttention(TorchLayer):
+    fn __init__(self, embed_dim, num_heads, dropout=0.0, bias=true, add_bias_kv=false, add_zero_attn=false, kdim=none, vdim=none, batch_first=false, device=none, dtype=none):
+        self.name = "MultiheadAttention"
+        self.E = int(embed_dim)
+        self.H = int(num_heads)
+        if self.E % self.H:
+            raise ShapeError("embed_dim must be divisible by num_heads")
+        if add_bias_kv or add_zero_attn:
+            raise RuntimeError("MultiheadAttention(add_bias_kv / add_zero_attn) is not supported")
+        self.drop = _float(dropout)
+        self.bias = bool(bias)
+        self.bf = bool(batch_first)
+        self.kdim = int(kdim) if kdim != none else self.E
+        self.vdim = int(vdim) if vdim != none else self.E
+        self.same = self.kdim == self.E and self.vdim == self.E
+    fn init(self, seed=0):
+        _setseed(seed)
+        var out = {}
+        if self.same:
+            out["in_proj_weight"] = _xavier([3 * self.E, self.E])
+        else:
+            out["q_proj_weight"] = _xavier([self.E, self.E])
+            out["k_proj_weight"] = _xavier([self.E, self.kdim])
+            out["v_proj_weight"] = _xavier([self.E, self.vdim])
+        if self.bias:
+            out["in_proj_bias"] = zeros(3 * self.E)
+        let b = 1 / sqrt(self.E)
+        var op = {"weight": _uniform(b, [self.E, self.E])}
+        if self.bias:
+            op["bias"] = zeros(self.E)
+        out["out_proj"] = record(**op)
+        return record(**out)
+    fn forward(self, p, query0, key0=none, value0=none, key_padding_mask=none, need_weights=true, attn_mask=none, average_attn_weights=true, is_causal=false, train=false):
+        var query = query0
+        var key = query if key0 == none else key0
+        var value = key if value0 == none else value0
+        var kpm = key_padding_mask
+        let unbatched = _nd(query) == 2
+        if unbatched:
+            if self.bf:
+                query = reshape(query, 1, *_shape(query))
+                key = reshape(key, 1, *_shape(key))
+                value = reshape(value, 1, *_shape(value))
+            else:
+                query = reshape(query, _shape(query)[0], 1, _shape(query)[1])
+                key = reshape(key, _shape(key)[0], 1, _shape(key)[1])
+                value = reshape(value, _shape(value)[0], 1, _shape(value)[1])
+            if kpm != none:
+                kpm = reshape(kpm, 1, *_shape(kpm))
+        if not self.bf:
+            query = swapaxes(query, 0, 1)
+            key = swapaxes(key, 0, 1)
+            value = swapaxes(value, 0, 1)
+        let qs = _shape(query)
+        let N = qs[0]
+        let L = qs[1]
+        let E = qs[2]
+        let S = _shape(key)[1]
+        let H = self.H
+        let hd = self.E // self.H
+        var Wq = none
+        var Wk = none
+        var Wv = none
+        if self.same:
+            Wq = p.in_proj_weight[0:E]
+            Wk = p.in_proj_weight[E:2 * E]
+            Wv = p.in_proj_weight[2 * E:3 * E]
+        else:
+            Wq = p.q_proj_weight
+            Wk = p.k_proj_weight
+            Wv = p.v_proj_weight
+        var q = query @ transpose(Wq)
+        var k = key @ transpose(Wk)
+        var v = value @ transpose(Wv)
+        if self.bias:
+            q = q + p.in_proj_bias[0:E]
+            k = k + p.in_proj_bias[E:2 * E]
+            v = v + p.in_proj_bias[2 * E:3 * E]
+        q = permute(reshape(q, N, L, H, hd), 0, 2, 1, 3)
+        k = permute(reshape(k, N, S, H, hd), 0, 2, 1, 3)
+        v = permute(reshape(v, N, S, H, hd), 0, 2, 1, 3)
+        var scores = (q @ swapaxes(k, -2, -1)) * (1.0 / sqrt(hd))
+        var am = attn_mask
+        if is_causal and am == none:
+            am = _triu_mask(L, S, 1.0) > 0.5
+        let mask = _merge_masks(am, kpm, N, H, L, S)
+        if mask != none:
+            scores = scores + mask
+        let w = _b_softmax(scores, axis=-1)
+        let wd = dropout(w, self.drop, true) if (self.drop and train) else w
+        var o = reshape(permute(wd @ v, 0, 2, 1, 3), N, L, E)
+        o = o @ transpose(p.out_proj.weight)
+        if self.bias:
+            o = o + p.out_proj.bias
+        if not self.bf:
+            o = swapaxes(o, 0, 1)
+        var weights = none
+        if need_weights:
+            weights = mean(w, axis=1) if average_attn_weights else w
+        if unbatched:
+            o = o[0] if self.bf else o[:, 0]
+            if weights != none:
+                weights = weights[0]
+        return (o, weights)
+    fn describe(self) = f"MultiheadAttention({self.E}, heads={self.H})"
+
+fn _act_apply(a, x):
+    if isinstance(a, str):
+        return ACT_FUNCS[a](x)
+    return a(x)
+
+class TransformerEncoderLayer(TorchLayer):
+    fn __init__(self, d_model, nhead, dim_feedforward=2048, dropout=0.1, activation="relu", layer_norm_eps=1e-5, batch_first=false, norm_first=false, bias=true, device=none, dtype=none):
+        self.name = "TransformerEncoderLayer"
+        self.d = int(d_model)
+        self.ff = int(dim_feedforward)
+        self.drop = _float(dropout)
+        self.act = activation
+        self.bf = bool(batch_first)
+        self.norm_first = bool(norm_first)
+        self.self_attn = MultiheadAttention(d_model, nhead, dropout=dropout, bias=bias, batch_first=batch_first)
+        self.linear1 = Linear(d_model, dim_feedforward, bias=bias)
+        self.linear2 = Linear(dim_feedforward, d_model, bias=bias)
+        self.norm1 = LayerNorm(d_model, eps=layer_norm_eps, bias=bias)
+        self.norm2 = LayerNorm(d_model, eps=layer_norm_eps, bias=bias)
+    fn children(self) = [["self_attn", self.self_attn], ["linear1", self.linear1], ["linear2", self.linear2], ["norm1", self.norm1], ["norm2", self.norm2]]
+    fn init(self, seed=0):
+        var d = {}
+        let ch = self.children()
+        for i in range(len(ch)):
+            d[ch[i][0]] = ch[i][1].init(_seed_for(seed, i))
+        return record(**d)
+    fn _sa(self, p, x, mask, kpm, causal, train):
+        let r = self.self_attn(p.self_attn, x, x, x, attn_mask=mask, key_padding_mask=kpm, need_weights=false, is_causal=causal, train=train)
+        return dropout(r[0], self.drop, train)
+    fn _ffn(self, p, x, train):
+        let h = dropout(_act_apply(self.act, self.linear1(p.linear1, x)), self.drop, train)
+        return dropout(self.linear2(p.linear2, h), self.drop, train)
+    fn forward(self, p, src, src_mask=none, src_key_padding_mask=none, is_causal=false, train=false):
+        var x = src
+        if self.norm_first:
+            x = x + self._sa(p, self.norm1(p.norm1, x), src_mask, src_key_padding_mask, is_causal, train)
+            x = x + self._ffn(p, self.norm2(p.norm2, x), train)
+        else:
+            x = self.norm1(p.norm1, x + self._sa(p, x, src_mask, src_key_padding_mask, is_causal, train))
+            x = self.norm2(p.norm2, x + self._ffn(p, x, train))
+        return x
+
+class TransformerDecoderLayer(TorchLayer):
+    fn __init__(self, d_model, nhead, dim_feedforward=2048, dropout=0.1, activation="relu", layer_norm_eps=1e-5, batch_first=false, norm_first=false, bias=true, device=none, dtype=none):
+        self.name = "TransformerDecoderLayer"
+        self.d = int(d_model)
+        self.drop = _float(dropout)
+        self.act = activation
+        self.norm_first = bool(norm_first)
+        self.self_attn = MultiheadAttention(d_model, nhead, dropout=dropout, bias=bias, batch_first=batch_first)
+        self.multihead_attn = MultiheadAttention(d_model, nhead, dropout=dropout, bias=bias, batch_first=batch_first)
+        self.linear1 = Linear(d_model, dim_feedforward, bias=bias)
+        self.linear2 = Linear(dim_feedforward, d_model, bias=bias)
+        self.norm1 = LayerNorm(d_model, eps=layer_norm_eps, bias=bias)
+        self.norm2 = LayerNorm(d_model, eps=layer_norm_eps, bias=bias)
+        self.norm3 = LayerNorm(d_model, eps=layer_norm_eps, bias=bias)
+    fn children(self) = [["self_attn", self.self_attn], ["multihead_attn", self.multihead_attn], ["linear1", self.linear1], ["linear2", self.linear2], ["norm1", self.norm1], ["norm2", self.norm2], ["norm3", self.norm3]]
+    fn init(self, seed=0):
+        var d = {}
+        let ch = self.children()
+        for i in range(len(ch)):
+            d[ch[i][0]] = ch[i][1].init(_seed_for(seed, i))
+        return record(**d)
+    fn forward(self, p, tgt, memory, tgt_mask=none, memory_mask=none, tgt_key_padding_mask=none, memory_key_padding_mask=none, tgt_is_causal=false, memory_is_causal=false, train=false):
+        let me = self
+        fn sa(x):
+            let r = me.self_attn(p.self_attn, x, x, x, attn_mask=tgt_mask, key_padding_mask=tgt_key_padding_mask, need_weights=false, is_causal=tgt_is_causal, train=train)
+            return dropout(r[0], me.drop, train)
+        fn ca(x):
+            let r = me.multihead_attn(p.multihead_attn, x, memory, memory, attn_mask=memory_mask, key_padding_mask=memory_key_padding_mask, need_weights=false, is_causal=memory_is_causal, train=train)
+            return dropout(r[0], me.drop, train)
+        fn ff(x):
+            let h = dropout(_act_apply(me.act, me.linear1(p.linear1, x)), me.drop, train)
+            return dropout(me.linear2(p.linear2, h), me.drop, train)
+        var x = tgt
+        if self.norm_first:
+            x = x + sa(self.norm1(p.norm1, x))
+            x = x + ca(self.norm2(p.norm2, x))
+            x = x + ff(self.norm3(p.norm3, x))
+        else:
+            x = self.norm1(p.norm1, x + sa(x))
+            x = self.norm2(p.norm2, x + ca(x))
+            x = self.norm3(p.norm3, x + ff(x))
+        return x
+
+fn _copy_layer(layer):
+    # a fresh layer with the same settings (the layers here keep their settings as plain values)
+    if isinstance(layer, TransformerEncoderLayer):
+        return TransformerEncoderLayer(layer.d, layer.self_attn.H, layer.ff, layer.drop, layer.act, layer.norm1.eps, layer.bf, layer.norm_first, layer.linear1.bias)
+    if isinstance(layer, TransformerDecoderLayer):
+        return TransformerDecoderLayer(layer.d, layer.self_attn.H, layer.linear1.o, layer.drop, layer.act, layer.norm1.eps, layer.self_attn.bf, layer.norm_first, layer.linear1.bias)
+    return layer
+
+class _Stack(TorchLayer):
+    fn __init__(self, layer, num_layers, norm=none, kind="encoder"):
+        self.layers = [_copy_layer(layer) for i in range(int(num_layers))]
+        self.norm = norm
+        self.kind = kind
+        self.name = "TransformerEncoder" if kind == "encoder" else "TransformerDecoder"
+    fn children(self):
+        var out = [[f"layers.{i}", self.layers[i]] for i in range(len(self.layers))]
+        if self.norm != none:
+            out.append(["norm", self.norm])
+        return out
+    fn init(self, seed=0):
+        var d = {"layers": [self.layers[i].init(_seed_for(seed, i)) for i in range(len(self.layers))]}
+        if self.norm != none:
+            d["norm"] = self.norm.init(_seed_for(seed, 999))
+        return record(**d)
+    fn forward(self, p, x0, *rest, train=false, **kw0):
+        var kw = {}
+        for k in kw0:
+            if k != "enable_nested_tensor":
+                kw[k] = kw0[k]
+        if "mask" in kw:
+            kw["src_mask"] = kw.pop("mask")
+        var x = x0
+        for i in range(len(self.layers)):
+            x = self.layers[i](p.layers[i], x, *rest, train=train, **kw)
+        if self.norm != none:
+            x = self.norm(p.norm, x)
+        return x
+
+fn TransformerEncoder(encoder_layer, num_layers, norm=none, enable_nested_tensor=true, mask_check=true) = _Stack(encoder_layer, num_layers, norm, "encoder")
+fn TransformerDecoder(decoder_layer, num_layers, norm=none) = _Stack(decoder_layer, num_layers, norm, "decoder")
+
+class Transformer(TorchLayer):
+    fn __init__(self, d_model=512, nhead=8, num_encoder_layers=6, num_decoder_layers=6, dim_feedforward=2048, dropout=0.1, activation="relu", custom_encoder=none, custom_decoder=none, layer_norm_eps=1e-5, batch_first=false, norm_first=false, bias=true, device=none, dtype=none):
+        self.name = "Transformer"
+        let enc = TransformerEncoderLayer(d_model, nhead, dim_feedforward, dropout, activation, layer_norm_eps, batch_first, norm_first, bias)
+        let dec = TransformerDecoderLayer(d_model, nhead, dim_feedforward, dropout, activation, layer_norm_eps, batch_first, norm_first, bias)
+        self.encoder = custom_encoder or TransformerEncoder(enc, num_encoder_layers, LayerNorm(d_model, eps=layer_norm_eps, bias=bias))
+        self.decoder = custom_decoder or TransformerDecoder(dec, num_decoder_layers, LayerNorm(d_model, eps=layer_norm_eps, bias=bias))
+    fn children(self) = [["encoder", self.encoder], ["decoder", self.decoder]]
+    fn init(self, seed=0) = record(encoder=self.encoder.init(_seed_for(seed, 1)), decoder=self.decoder.init(_seed_for(seed, 2)))
+    fn forward(self, p, src, tgt, src_mask=none, tgt_mask=none, memory_mask=none, src_key_padding_mask=none, tgt_key_padding_mask=none, memory_key_padding_mask=none, src_is_causal=none, tgt_is_causal=none, memory_is_causal=false, train=false):
+        let mem = self.encoder(p.encoder, src, src_mask=src_mask, src_key_padding_mask=src_key_padding_mask, train=train)
+        return self.decoder(p.decoder, tgt, mem, tgt_mask=tgt_mask, memory_mask=memory_mask, tgt_key_padding_mask=tgt_key_padding_mask, memory_key_padding_mask=memory_key_padding_mask, train=train)
+    fn generate_square_subsequent_mask(self, sz=none) = generate_square_subsequent_mask(self if sz == none else sz)
+
+fn generate_square_subsequent_mask(sz) = _triu_mask(int(sz), int(sz), -inf)
+
+# =============================================================================== containers
+class Sequential(TorchLayer):
+    fn __init__(self, *layers0):
+        self.name = "Sequential"
+        var ls = list(layers0)
+        if len(ls) == 1 and (isinstance(ls[0], list) or isinstance(ls[0], tuple)):
+            ls = list(ls[0])
+        self.layers = ls
+    fn children(self) = [[str(i), self.layers[i]] for i in range(len(self.layers))]
+    fn init(self, seed=0) = [self.layers[i].init(_seed_for(seed, i)) if hasattr(self.layers[i], "init") else record() for i in range(len(self.layers))]
+    fn forward(self, p, x0, train=false):
+        var x = x0
+        for i in range(len(self.layers)):
+            x = self.layers[i](p[i], x, train=train)
+        return x
+    fn __len__(self) = len(self.layers)
+    fn __getitem__(self, i) = self.layers[i]
+
+fn ModuleList(mods=[]) = list(mods)
+
+fn Module(init, forward, name="model", parts=none) = layers.custom_layer(init, forward, name, parts)
+
+# =============================================================================== functional
+fn dropout(x, p=0.5, train=true, training=none, inplace=false):
+    let tr = train if training == none else training
+    let pr = _float(p)
+    if not tr or pr <= 0:
+        return x
+    if pr >= 1:
+        return x * 0.0
+    let keep = tensor(rand(*_shape(x)) >= pr, "float64") / (1.0 - pr)
+    return x * keep
+
+fn linear(x, weight, bias=none):
+    let y = x @ transpose(weight)
+    return y + bias if bias != none else y
+
+fn layer_norm(x, normalized_shape, weight=none, bias=none, eps=1e-5):
+    let shp = _nshape(normalized_shape)
+    let axes = tuple(range(-len(shp), 0))
+    let m = mean(x, axis=axes, keepdims=true)
+    let d = x - m
+    let v = mean(d * d, axis=axes, keepdims=true)
+    var y = d / sqrt(v + eps)
+    if weight != none:
+        y = y * weight
+    if bias != none:
+        y = y + bias
+    return y
+
+fn normalize(x, p=2.0, dim=1, eps=1e-12):
+    let n = sum(abs(x) ** p, axis=dim, keepdims=true) ** (1.0 / p)
+    return x / where(_raw(n) > eps, n, eps + 0.0 * n)
+
+fn _ix(idx) = tensor(_raw(idx), "int64")
+
+fn embedding(idx, weight, padding_idx=none):
+    let ix = _ix(idx)
+    let flat = reshape(ix, -1)
+    let d = _shape(weight)[1]
+    var out = reshape(weight[flat], *(_shape(ix) + [d]))
+    if padding_idx != none:
+        let keep = reshape(tensor(ix != padding_idx, "float64"), *(_shape(ix) + [1]))
+        out = out * keep + stop_gradient(out) * (1.0 - keep)
+    return out
+
+fn one_hot(t, num_classes=-1):
+    let ix = _ix(t)
+    let k = int(max(ix)) + 1 if (num_classes == -1 or num_classes == none) else int(num_classes)
+    let E = tensor(eye(k), "int64")
+    return reshape(E[reshape(ix, -1)], *(_shape(ix) + [k]))
+
+fn pad(x, pd, mode="constant", value=0.0):
+    if mode != "constant":
+        raise RuntimeError(f"pad(mode='{mode}') is not supported (only 'constant')")
+    let nd = _nd(x)
+    var out = x
+    for i in range(len(pd) // 2):
+        out = _pad_axis(out, nd - 1 - i, int(pd[2 * i]), int(pd[2 * i + 1]), _float(value))
+    return out
+
+fn flatten(x, start_dim=0, end_dim=-1):
+    let sh = _shape(x)
+    let n = len(sh)
+    let s = start_dim % n
+    let e = end_dim % n
+    return reshape(x, *(sh[0:s] + [_prod(sh[s:e + 1])] + sh[e + 1:]))
+
+fn cosine_similarity(x1, x2, dim=1, eps=1e-8):
+    let num = sum(x1 * x2, axis=dim)
+    let d = sqrt(sum(x1 * x1, axis=dim)) * sqrt(sum(x2 * x2, axis=dim))
+    return num / where(_raw(d) > eps, d, eps + 0.0 * d)
+
+# =============================================================================== losses
+fn _reduce(v, reduction, denom=none):
+    if reduction == "none":
+        return v
+    if reduction == "sum":
+        return sum(v)
+    if reduction == "mean":
+        return sum(v) / denom if denom != none else mean(v)
+    raise RuntimeError(f"reduction must be 'mean', 'sum' or 'none', not '{reduction}'")
+
+fn _class_last(x):
+    let sh = _shape(x)
+    if len(sh) <= 2:
+        return [x, none]
+    let perm = [0] + list(range(2, len(sh))) + [1]
+    return [reshape(permute(x, *perm), -1, sh[1]), sh]
+
+fn _pick(lp, idx):
+    let n = len(idx)
+    return lp[(tensor(list(range(n)), "int64"), tensor(idx, "int64"))]
+
+fn cross_entropy(input, target, weight=none, size_average=none, ignore_index=-100, reduce=none, reduction="mean", label_smoothing=0.0):
+    let cl = _class_last(input)
+    var x = cl[0]
+    let sh = cl[1]
+    let unbatched = _nd(input) == 1
+    if unbatched:
+        x = reshape(x, 1, -1)
+    let C = _shape(x)[1]
+    let lp = _b_log_softmax(x, axis=-1)
+    let tr = _raw(target)
+    let w = none if weight == none else tensor(_raw(weight), "float64")
+    let e = _float(label_smoothing)
+    if _is_float_tensor(tr) and _shape(tr) == _shape(input):
+        var t = tr if sh == none else reshape(permute(tr, *([0] + list(range(2, len(sh))) + [1])), -1, C)
+        if unbatched:
+            t = reshape(t, 1, -1)
+        if e:
+            t = t * (1 - e) + e / C
+        let per = -sum(lp * (t * (w if w != none else 1.0)), axis=-1)
+        if reduction == "mean":
+            return sum(per) / _float(_prod(_shape(per)) if _nd(per) > 0 else 1)
+        return _reduce(per if not unbatched else per[0], reduction)
+    let ti = [int(v) for v in reshape(tensor(tr, "int64"), -1).tolist()]
+    let valid = [1.0 if v != ignore_index else 0.0 for v in ti]
+    let safe = [v if v != ignore_index else 0 for v in ti]
+    let picked = _pick(lp, safe)
+    let wl = w.tolist() if w != none else none
+    let wy = tensor([(wl[safe[i]] if wl != none else 1.0) * valid[i] for i in range(len(safe))])
+    let nll = -picked * wy
+    var per = none
+    if e:
+        let wc = w if w != none else ones(C)
+        let smooth = -sum(lp * wc, axis=-1) * tensor(valid)
+        if reduction == "mean":
+            let denom = _sum(wy.tolist())
+            return (1 - e) * sum(nll) / denom + e / C * sum(smooth) / denom
+        per = (1 - e) * nll + e / C * smooth
+    else:
+        if reduction == "mean":
+            return sum(nll) / _sum(wy.tolist())
+        per = nll
+    if reduction == "none":
+        let out = per if sh == none else reshape(per, *([sh[0]] + sh[2:]))
+        return out[0] if unbatched else out
+    return _reduce(per, reduction)
+
+fn nll_loss(input, target, weight=none, size_average=none, ignore_index=-100, reduce=none, reduction="mean"):
+    let cl = _class_last(input)
+    let x = cl[0]
+    let sh = cl[1]
+    let ti = [int(v) for v in reshape(tensor(_raw(target), "int64"), -1).tolist()]
+    let valid = [1.0 if v != ignore_index else 0.0 for v in ti]
+    let safe = [v if v != ignore_index else 0 for v in ti]
+    let wl = none if weight == none else tensor(_raw(weight), "float64").tolist()
+    let wy = tensor([(wl[safe[i]] if wl != none else 1.0) * valid[i] for i in range(len(safe))])
+    let per = -_pick(x, safe) * wy
+    if reduction == "mean":
+        return sum(per) / _sum(wy.tolist())
+    if reduction == "none" and sh != none:
+        return reshape(per, *([sh[0]] + sh[2:]))
+    return _reduce(per, reduction)
+
+fn mse_loss(input, target, size_average=none, reduce=none, reduction="mean", weight=none):
+    let d = input - target
+    return _reduce(d * d, reduction)
+
+fn l1_loss(input, target, size_average=none, reduce=none, reduction="mean") = _reduce(abs(input - target), reduction)
+
+fn smooth_l1_loss(input, target, size_average=none, reduce=none, reduction="mean", beta=1.0):
+    let d = input - target
+    if beta == 0:
+        return _reduce(abs(d), reduction)
+    return _reduce(where(abs(_raw(d)) < beta, 0.5 * d * d / beta, abs(d) - 0.5 * beta), reduction)
+
+fn huber_loss(input, target, reduction="mean", delta=1.0, weight=none):
+    let d = input - target
+    return _reduce(where(abs(_raw(d)) <= delta, 0.5 * d * d, delta * (abs(d) - 0.5 * delta)), reduction)
+
+fn binary_cross_entropy(input, target, weight=none, size_average=none, reduce=none, reduction="mean"):
+    let safe_p = where(_raw(input) > 0, input, 1.0 + 0.0 * input)
+    let safe_q = where(_raw(input) < 1, 1.0 - input, 1.0 + 0.0 * input)
+    var lp = where(_raw(input) > 0, log(safe_p), -100.0 + 0.0 * input)
+    var lq = where(_raw(input) < 1, log(safe_q), -100.0 + 0.0 * input)
+    lp = where(_raw(lp) > -100.0, lp, -100.0 + 0.0 * lp)
+    lq = where(_raw(lq) > -100.0, lq, -100.0 + 0.0 * lq)
+    var v = -(target * lp + (1.0 - target) * lq)
+    if weight != none:
+        v = v * weight
+    return _reduce(v, reduction)
+
+fn binary_cross_entropy_with_logits(input, target, weight=none, size_average=none, reduce=none, reduction="mean", pos_weight=none):
+    let x = input
+    let neg = where(_raw(x) < 0, -x, 0.0 * x)
+    let lse = log(1.0 + exp(-abs(x))) + neg
+    var v = none
+    if pos_weight != none:
+        v = (1.0 - target) * x + (1.0 + (pos_weight - 1.0) * target) * lse
+    else:
+        v = (1.0 - target) * x + lse
+    if weight != none:
+        v = v * weight
+    return _reduce(v, reduction)
+
+fn kl_div(input, target, size_average=none, reduce=none, reduction="mean", log_target=false):
+    var v = none
+    if log_target:
+        v = exp(target) * (target - input)
+    else:
+        let tr = _raw(target)
+        let safe = where(tr > 0, tr, 1.0 + 0.0 * tr)
+        v = where(tr > 0, target * (log(safe) - input), 0.0 * input)
+    if reduction == "batchmean":
+        return sum(v) / _shape(input)[0]
+    return _reduce(v, reduction)
+
+class _Loss:
+    fn __init__(self, f, kw):
+        self.f = f
+        self.kw = kw
+    fn __call__(self, input, target) = self.f(input, target, **self.kw)
+
+fn _loss_class(f, names):
+    fn make(*args, **kw):
+        var k = {}
+        for i in range(_min(len(names), len(args))):
+            k[names[i]] = args[i]
+        for a in kw:
+            if a != "size_average" and a != "reduce":
+                k[a] = kw[a]
+        if "size_average" in k:
+            k.pop("size_average")
+        if "reduce" in k:
+            k.pop("reduce")
+        return _Loss(f, k)
+    return make
+
+let CrossEntropyLoss = _loss_class(cross_entropy, ["weight", "size_average", "ignore_index", "reduce", "reduction", "label_smoothing"])
+let NLLLoss = _loss_class(nll_loss, ["weight", "size_average", "ignore_index", "reduce", "reduction"])
+let MSELoss = _loss_class(mse_loss, ["size_average", "reduce", "reduction"])
+let L1Loss = _loss_class(l1_loss, ["size_average", "reduce", "reduction"])
+let SmoothL1Loss = _loss_class(smooth_l1_loss, ["size_average", "reduce", "reduction", "beta"])
+let HuberLoss = _loss_class(huber_loss, ["reduction", "delta"])
+let BCELoss = _loss_class(binary_cross_entropy, ["weight", "size_average", "reduce", "reduction"])
+let BCEWithLogitsLoss = _loss_class(binary_cross_entropy_with_logits, ["weight", "size_average", "reduce", "reduction", "pos_weight"])
+let KLDivLoss = _loss_class(kl_div, ["size_average", "reduce", "reduction", "log_target"])
+
+# =============================================================================== optimizers (PyTorch's rules)
+fn _arr(g) = tensor(_raw(g), "float64") * 1.0 if not (isinstance(g, int) or isinstance(g, float)) else _float(g)
+fn _zl(t) = tree_map(fn(a) => zeros_like(a) * 1.0 if not (isinstance(a, int) or isinstance(a, float)) else 0.0, t)
+fn _sqrt(v) = sqrt(v)
+fn _maximum(a, b) = where(a > b, a, b) if not (isinstance(a, float) or isinstance(a, int)) else (a if a > b else b)
+
+class _Optim:
+    fn _setup(self, lr, defaults):
+        self.lr = _float(lr)
+        self.defaults = defaults
+        self.state = none
+        self.t = 0
+        self.initial_lr = self.lr
+    fn __getattr__(self, n):
+        if n == "param_groups":
+            return [{"lr": self.lr}]
+        raise AttributeError(f"'{type(self).__name__}' object has no attribute '{n}'")
+    fn step(self, params, grads):
+        var g = tree_map(_arr, grads)
+        if self.defaults.get("maximize"):
+            g = tree_map(fn(a) => -a, g)
+        let p = tree_map(_arr, params)
+        self.t = self.t + 1
+        if self.state == none:
+            self.state = self.new_state(p)
+        return self.update(p, g)
+    fn zero_grad(self, set_to_none=true) = none
+    fn get_lr(self) = self.lr
+
+class SGD(_Optim):
+    fn __init__(self, params=none, lr=1e-3, momentum=0.0, dampening=0.0, weight_decay=0.0, nesterov=false, maximize=false, foreach=none, differentiable=false, fused=none):
+        self._setup(lr, {"momentum": _float(momentum), "dampening": _float(dampening), "wd": _float(weight_decay), "nesterov": bool(nesterov), "maximize": bool(maximize)})
+    fn new_state(self, p) = {"buf": none}
+    fn update(self, p, g0):
+        let d = self.defaults
+        var g = g0
+        if d["wd"]:
+            g = tree_map(fn(gi, pi) => gi + d["wd"] * pi, g, p)
+        if d["momentum"]:
+            if self.state["buf"] == none:
+                self.state["buf"] = tree_map(fn(a) => a * 1.0, g)
+            else:
+                self.state["buf"] = tree_map(fn(b, gi) => d["momentum"] * b + (1 - d["dampening"]) * gi, self.state["buf"], g)
+            if d["nesterov"]:
+                g = tree_map(fn(gi, b) => gi + d["momentum"] * b, g, self.state["buf"])
+            else:
+                g = self.state["buf"]
+        let lr = self.lr
+        return tree_map(fn(pi, gi) => pi - lr * gi, p, g)
+
+class Adam(_Optim):
+    fn __init__(self, params=none, lr=1e-3, betas=(0.9, 0.999), eps=1e-8, weight_decay=0.0, amsgrad=false, maximize=false, foreach=none, capturable=false, differentiable=false, fused=none, decoupled_weight_decay=false):
+        self._setup(lr, {"b1": _float(betas[0]), "b2": _float(betas[1]), "eps": _float(eps), "wd": _float(weight_decay), "amsgrad": bool(amsgrad), "maximize": bool(maximize)})
+        self.decoupled = bool(decoupled_weight_decay)
+    fn new_state(self, p):
+        var s = {"m": _zl(p), "v": _zl(p)}
+        if self.defaults["amsgrad"]:
+            s["vmax"] = _zl(p)
+        return s
+    fn update(self, p0, g0):
+        let d = self.defaults
+        var p = p0
+        var g = g0
+        let lr = self.lr
+        if d["wd"]:
+            if self.decoupled:
+                p = tree_map(fn(pi) => pi * (1 - lr * d["wd"]), p)
+            else:
+                g = tree_map(fn(gi, pi) => gi + d["wd"] * pi, g, p)
+        let b1 = d["b1"]
+        let b2 = d["b2"]
+        let t = self.t
+        self.state["m"] = tree_map(fn(m, gi) => b1 * m + (1 - b1) * gi, self.state["m"], g)
+        self.state["v"] = tree_map(fn(v, gi) => b2 * v + (1 - b2) * gi * gi, self.state["v"], g)
+        let bc1 = 1 - b1 ** t
+        let bc2 = 1 - b2 ** t
+        var v = self.state["v"]
+        if d["amsgrad"]:
+            self.state["vmax"] = tree_map(_maximum, self.state["vmax"], v)
+            v = self.state["vmax"]
+        let step = lr / bc1
+        let sq = sqrt(bc2)
+        let eps = d["eps"]
+        return tree_map(fn(pi, m, vi) => pi - step * m / (_sqrt(vi) / sq + eps), p, self.state["m"], v)
+
+class AdamW(Adam):
+    fn __init__(self, params=none, lr=1e-3, betas=(0.9, 0.999), eps=1e-8, weight_decay=1e-2, amsgrad=false, maximize=false, foreach=none, capturable=false, differentiable=false, fused=none):
+        self._setup(lr, {"b1": _float(betas[0]), "b2": _float(betas[1]), "eps": _float(eps), "wd": _float(weight_decay), "amsgrad": bool(amsgrad), "maximize": bool(maximize)})
+        self.decoupled = true
+
+class Adamax(_Optim):
+    fn __init__(self, params=none, lr=2e-3, betas=(0.9, 0.999), eps=1e-8, weight_decay=0.0, **rest):
+        self._setup(lr, {"b1": _float(betas[0]), "b2": _float(betas[1]), "eps": _float(eps), "wd": _float(weight_decay)})
+    fn new_state(self, p) = {"m": _zl(p), "u": _zl(p)}
+    fn update(self, p, g0):
+        let d = self.defaults
+        var g = g0
+        if d["wd"]:
+            g = tree_map(fn(gi, pi) => gi + d["wd"] * pi, g, p)
+        self.state["m"] = tree_map(fn(m, gi) => d["b1"] * m + (1 - d["b1"]) * gi, self.state["m"], g)
+        self.state["u"] = tree_map(fn(u, gi) => _maximum(d["b2"] * u, abs(gi) + d["eps"]), self.state["u"], g)
+        let clr = self.lr / (1 - d["b1"] ** self.t)
+        return tree_map(fn(pi, m, u) => pi - clr * m / u, p, self.state["m"], self.state["u"])
+
+class RMSprop(_Optim):
+    fn __init__(self, params=none, lr=1e-2, alpha=0.99, eps=1e-8, weight_decay=0.0, momentum=0.0, centered=false, capturable=false, foreach=none, maximize=false, differentiable=false):
+        self._setup(lr, {"alpha": _float(alpha), "eps": _float(eps), "wd": _float(weight_decay), "mom": _float(momentum), "centered": bool(centered), "maximize": bool(maximize)})
+    fn new_state(self, p) = {"sq": _zl(p), "ga": _zl(p), "buf": _zl(p)}
+    fn update(self, p, g0):
+        let d = self.defaults
+        var g = g0
+        if d["wd"]:
+            g = tree_map(fn(gi, pi) => gi + d["wd"] * pi, g, p)
+        let a = d["alpha"]
+        self.state["sq"] = tree_map(fn(s, gi) => a * s + (1 - a) * gi * gi, self.state["sq"], g)
+        var avg = none
+        if d["centered"]:
+            self.state["ga"] = tree_map(fn(s, gi) => a * s + (1 - a) * gi, self.state["ga"], g)
+            avg = tree_map(fn(s, ga) => _sqrt(s - ga * ga) + d["eps"], self.state["sq"], self.state["ga"])
+        else:
+            avg = tree_map(fn(s) => _sqrt(s) + d["eps"], self.state["sq"])
+        let lr = self.lr
+        if d["mom"]:
+            self.state["buf"] = tree_map(fn(b, gi, av) => d["mom"] * b + gi / av, self.state["buf"], g, avg)
+            return tree_map(fn(pi, b) => pi - lr * b, p, self.state["buf"])
+        return tree_map(fn(pi, gi, av) => pi - lr * gi / av, p, g, avg)
+
+class Adagrad(_Optim):
+    fn __init__(self, params=none, lr=1e-2, lr_decay=0.0, weight_decay=0.0, initial_accumulator_value=0.0, eps=1e-10, foreach=none, maximize=false, differentiable=false, fused=none):
+        self._setup(lr, {"lr_decay": _float(lr_decay), "wd": _float(weight_decay), "init": _float(initial_accumulator_value), "eps": _float(eps), "maximize": bool(maximize)})
+    fn new_state(self, p):
+        let iv = self.defaults["init"]
+        return {"sum": tree_map(fn(a) => zeros_like(a) * 1.0 + iv if not (isinstance(a, float) or isinstance(a, int)) else iv, p)}
+    fn update(self, p, g0):
+        let d = self.defaults
+        var g = g0
+        if d["wd"]:
+            g = tree_map(fn(gi, pi) => gi + d["wd"] * pi, g, p)
+        let clr = self.lr / (1 + (self.t - 1) * d["lr_decay"])
+        self.state["sum"] = tree_map(fn(s, gi) => s + gi * gi, self.state["sum"], g)
+        return tree_map(fn(pi, gi, s) => pi - clr * gi / (_sqrt(s) + d["eps"]), p, g, self.state["sum"])
+
+class NAdam(_Optim):
+    fn __init__(self, params=none, lr=2e-3, betas=(0.9, 0.999), eps=1e-8, weight_decay=0.0, momentum_decay=4e-3, decoupled_weight_decay=false, **rest):
+        self._setup(lr, {"b1": _float(betas[0]), "b2": _float(betas[1]), "eps": _float(eps), "wd": _float(weight_decay), "md": _float(momentum_decay), "dec": bool(decoupled_weight_decay)})
+        self.mu_product = 1.0
+    fn new_state(self, p) = {"m": _zl(p), "v": _zl(p)}
+    fn update(self, p0, g0):
+        let d = self.defaults
+        var p = p0
+        var g = g0
+        let lr = self.lr
+        if d["wd"]:
+            if d["dec"]:
+                p = tree_map(fn(pi) => pi * (1 - lr * d["wd"]), p)
+            else:
+                g = tree_map(fn(gi, pi) => gi + d["wd"] * pi, g, p)
+        let t = self.t
+        let b1 = d["b1"]
+        let b2 = d["b2"]
+        let mu = b1 * (1 - 0.5 * 0.96 ** (t * d["md"]))
+        let mu_next = b1 * (1 - 0.5 * 0.96 ** ((t + 1) * d["md"]))
+        self.mu_product = self.mu_product * mu
+        self.state["m"] = tree_map(fn(m, gi) => b1 * m + (1 - b1) * gi, self.state["m"], g)
+        self.state["v"] = tree_map(fn(v, gi) => b2 * v + (1 - b2) * gi * gi, self.state["v"], g)
+        let bc2 = 1 - b2 ** t
+        let mp = self.mu_product
+        let mpn = self.mu_product * mu_next
+        let eps = d["eps"]
+        return tree_map(fn(pi, gi, m, v) => pi - lr * ((1 - mu) / (1 - mp)) * gi / (_sqrt(v / bc2) + eps) - lr * (mu_next / (1 - mpn)) * m / (_sqrt(v / bc2) + eps), p, g, self.state["m"], self.state["v"])
+
+class RAdam(_Optim):
+    fn __init__(self, params=none, lr=1e-3, betas=(0.9, 0.999), eps=1e-8, weight_decay=0.0, decoupled_weight_decay=false, **rest):
+        self._setup(lr, {"b1": _float(betas[0]), "b2": _float(betas[1]), "eps": _float(eps), "wd": _float(weight_decay), "dec": bool(decoupled_weight_decay)})
+    fn new_state(self, p) = {"m": _zl(p), "v": _zl(p)}
+    fn update(self, p0, g0):
+        let d = self.defaults
+        var p = p0
+        var g = g0
+        let lr = self.lr
+        if d["wd"]:
+            if d["dec"]:
+                p = tree_map(fn(pi) => pi * (1 - lr * d["wd"]), p)
+            else:
+                g = tree_map(fn(gi, pi) => gi + d["wd"] * pi, g, p)
+        let t = self.t
+        let b1 = d["b1"]
+        let b2 = d["b2"]
+        self.state["m"] = tree_map(fn(m, gi) => b1 * m + (1 - b1) * gi, self.state["m"], g)
+        self.state["v"] = tree_map(fn(v, gi) => b2 * v + (1 - b2) * gi * gi, self.state["v"], g)
+        let bc1 = 1 - b1 ** t
+        let bc2 = 1 - b2 ** t
+        let rho_inf = 2 / (1 - b2) - 1
+        let rho_t = rho_inf - 2 * t * b2 ** t / bc2
+        let eps = d["eps"]
+        if rho_t > 5:
+            let rect = sqrt((rho_t - 4) * (rho_t - 2) * rho_inf / ((rho_inf - 4) * (rho_inf - 2) * rho_t))
+            return tree_map(fn(pi, m, v) => pi - lr * (m / bc1) * rect * sqrt(bc2) / (_sqrt(v) + eps), p, self.state["m"], self.state["v"])
+        return tree_map(fn(pi, m) => pi - lr * m / bc1, p, self.state["m"])
+
+# =============================================================================== learning-rate schedulers
+class _Sched:
+    fn _start(self, optimizer, last_epoch=-1):
+        self.opt = optimizer
+        self.base_lr = optimizer.initial_lr
+        self.last_epoch = last_epoch
+        self._last_lr = [optimizer.lr]
+        self.step()
+    fn get_last_lr(self) = list(self._last_lr)
+    fn step(self, epoch=none):
+        self.last_epoch = self.last_epoch + 1
+        self.opt.lr = _float(self.compute())
+        self._last_lr = [self.opt.lr]
+    fn state_dict(self) = record(last_epoch=self.last_epoch, lr=self.opt.lr)
+
+class StepLR(_Sched):
+    fn __init__(self, optimizer, step_size, gamma=0.1, last_epoch=-1):
+        self.step_size = int(step_size)
+        self.gamma = _float(gamma)
+        self._start(optimizer, last_epoch)
+    fn compute(self):
+        let e = self.last_epoch
+        if e == 0 or e % self.step_size:
+            return self.opt.lr
+        return self.opt.lr * self.gamma
+
+class MultiStepLR(_Sched):
+    fn __init__(self, optimizer, milestones, gamma=0.1, last_epoch=-1):
+        self.ms = [int(m) for m in milestones]
+        self.gamma = _float(gamma)
+        self._start(optimizer, last_epoch)
+    fn compute(self):
+        let c = self.ms.count(self.last_epoch)
+        return self.opt.lr * self.gamma ** c if c else self.opt.lr
+
+class ExponentialLR(_Sched):
+    fn __init__(self, optimizer, gamma, last_epoch=-1):
+        self.gamma = _float(gamma)
+        self._start(optimizer, last_epoch)
+    fn compute(self) = self.opt.lr if self.last_epoch == 0 else self.opt.lr * self.gamma
+
+class CosineAnnealingLR(_Sched):
+    fn __init__(self, optimizer, T_max, eta_min=0.0, last_epoch=-1):
+        self.T = int(T_max)
+        self.eta = _float(eta_min)
+        self._start(optimizer, last_epoch)
+    fn compute(self):
+        let e = self.last_epoch
+        let lr = self.opt.lr
+        let T = self.T
+        let eta = self.eta
+        if e == 0:
+            return self.base_lr
+        if (e - 1 - T) % (2 * T) == 0:
+            return lr + (self.base_lr - eta) * (1 - cos(pi / T)) / 2
+        return (1 + cos(pi * e / T)) / (1 + cos(pi * (e - 1) / T)) * (lr - eta) + eta
+
+class CosineAnnealingWarmRestarts(_Sched):
+    fn __init__(self, optimizer, T_0, T_mult=1, eta_min=0.0, last_epoch=-1):
+        self.T0 = int(T_0)
+        self.Ti = int(T_0)
+        self.mult = int(T_mult)
+        self.eta = _float(eta_min)
+        self.Tcur = last_epoch
+        self._start(optimizer, last_epoch)
+    fn step(self, epoch=none):
+        if epoch == none:
+            self.last_epoch = self.last_epoch + 1
+            self.Tcur = self.Tcur + 1
+            if self.Tcur >= self.Ti:
+                self.Tcur = self.Tcur - self.Ti
+                self.Ti = self.Ti * self.mult
+        else:
+            let ep = _float(epoch)
+            if ep >= self.T0:
+                if self.mult == 1:
+                    self.Tcur = ep % self.T0
+                else:
+                    let n = int(log(ep / self.T0 * (self.mult - 1) + 1) / log(self.mult))
+                    self.Tcur = ep - self.T0 * (self.mult ** n - 1) / (self.mult - 1)
+                    self.Ti = self.T0 * self.mult ** n
+            else:
+                self.Ti = self.T0
+                self.Tcur = ep
+            self.last_epoch = int(floor(ep))
+        self.opt.lr = self.eta + (self.base_lr - self.eta) * (1 + cos(pi * self.Tcur / self.Ti)) / 2
+        self._last_lr = [self.opt.lr]
+    fn compute(self) = self.opt.lr
+
+class LinearLR(_Sched):
+    fn __init__(self, optimizer, start_factor=1.0 / 3, end_factor=1.0, total_iters=5, last_epoch=-1):
+        self.sf = _float(start_factor)
+        self.ef = _float(end_factor)
+        self.total = int(total_iters)
+        self._start(optimizer, last_epoch)
+    fn compute(self):
+        let e = self.last_epoch
+        let lr = self.opt.lr
+        if e == 0:
+            return lr * self.sf
+        if e > self.total:
+            return lr
+        return lr * (1.0 + (self.ef - self.sf) / (self.total * self.sf + (e - 1) * (self.ef - self.sf)))
+
+class ConstantLR(_Sched):
+    fn __init__(self, optimizer, factor=1.0 / 3, total_iters=5, last_epoch=-1):
+        self.f = _float(factor)
+        self.total = int(total_iters)
+        self._start(optimizer, last_epoch)
+    fn compute(self):
+        let e = self.last_epoch
+        let lr = self.opt.lr
+        if e == 0:
+            return lr * self.f
+        if e != self.total:
+            return lr
+        return lr * (1.0 / self.f)
+
+class LambdaLR(_Sched):
+    fn __init__(self, optimizer, lr_lambda, last_epoch=-1):
+        self.f = lr_lambda
+        self._start(optimizer, last_epoch)
+    fn compute(self) = self.base_lr * _float(self.f(self.last_epoch))
+
+class MultiplicativeLR(_Sched):
+    fn __init__(self, optimizer, lr_lambda, last_epoch=-1):
+        self.f = lr_lambda
+        self._start(optimizer, last_epoch)
+    fn compute(self) = self.opt.lr * _float(self.f(self.last_epoch)) if self.last_epoch > 0 else self.opt.lr
+
+class PolynomialLR(_Sched):
+    fn __init__(self, optimizer, total_iters=5, power=1.0, last_epoch=-1):
+        self.total = int(total_iters)
+        self.power = _float(power)
+        self._start(optimizer, last_epoch)
+    fn compute(self):
+        let e = self.last_epoch
+        let lr = self.opt.lr
+        if e == 0 or e > self.total:
+            return lr
+        return lr * ((1.0 - e / self.total) / (1.0 - (e - 1) / self.total)) ** self.power
+
+class OneCycleLR(_Sched):
+    fn __init__(self, optimizer, max_lr, total_steps=none, epochs=none, steps_per_epoch=none, pct_start=0.3, anneal_strategy="cos", cycle_momentum=true, base_momentum=0.85, max_momentum=0.95, div_factor=25.0, final_div_factor=1e4, three_phase=false, last_epoch=-1):
+        self.total = int(total_steps) if total_steps != none else int(epochs) * int(steps_per_epoch)
+        self.max_lr = _float(max_lr)
+        self.init_lr = self.max_lr / _float(div_factor)
+        self.min_lr = self.init_lr / _float(final_div_factor)
+        self.cos_ = anneal_strategy == "cos"
+        self.cycle_m = bool(cycle_momentum) and ("b1" in optimizer.defaults or "momentum" in optimizer.defaults)
+        self.bm = _float(base_momentum)
+        self.mm = _float(max_momentum)
+        let p = _float(pct_start)
+        if three_phase:
+            self.phases = [[p * self.total - 1, "init", "max", "max_m", "base_m"], [2 * p * self.total - 2, "max", "init", "base_m", "max_m"], [self.total - 1, "init", "min", "max_m", "max_m"]]
+        else:
+            self.phases = [[p * self.total - 1, "init", "max", "max_m", "base_m"], [self.total - 1, "max", "min", "base_m", "max_m"]]
+        optimizer.lr = self.init_lr
+        optimizer.initial_lr = self.init_lr
+        self.opt = optimizer
+        if self.cycle_m:
+            self._set_m(self.mm)
+        self._start(optimizer, last_epoch)
+    fn _set_m(self, m):
+        let d = self.opt.defaults
+        if "b1" in d:
+            d["b1"] = m
+        else:
+            d["momentum"] = m
+    fn _anneal(self, start, end, pct):
+        if self.cos_:
+            return end + (start - end) / 2.0 * (cos(pi * pct) + 1)
+        return (end - start) * pct + start
+    fn compute(self):
+        let vals = {"init": self.init_lr, "max": self.max_lr, "min": self.min_lr, "max_m": self.mm, "base_m": self.bm}
+        let st = self.last_epoch
+        if st > self.total:
+            raise RuntimeError(f"OneCycleLR stepped {st} times; total_steps is {self.total}")
+        var start = 0.0
+        for i in range(len(self.phases)):
+            let ph = self.phases[i]
+            if st <= ph[0] or i == len(self.phases) - 1:
+                let pct = (st - start) / (ph[0] - start)
+                let lr = self._anneal(vals[ph[1]], vals[ph[2]], pct)
+                if self.cycle_m:
+                    self._set_m(self._anneal(vals[ph[3]], vals[ph[4]], pct))
+                return lr
+            start = ph[0]
+        return self.opt.lr
+
+class CyclicLR(_Sched):
+    fn __init__(self, optimizer, base_lr, max_lr, step_size_up=2000, step_size_down=none, mode="triangular", gamma=1.0, scale_fn=none, scale_mode="cycle", cycle_momentum=true, base_momentum=0.8, max_momentum=0.9, last_epoch=-1):
+        self.lo = _float(base_lr)
+        self.hi = _float(max_lr)
+        let up = _float(step_size_up)
+        let down = _float(step_size_down) if step_size_down != none else up
+        self.total = up + down
+        self.ratio = up / (up + down)
+        self.mode = mode
+        self.gamma = _float(gamma)
+        optimizer.lr = self.lo
+        optimizer.initial_lr = self.lo
+        self._start(optimizer, last_epoch)
+    fn compute(self):
+        let e = self.last_epoch
+        let cycle = floor(1 + e / self.total)
+        let x = 1.0 + e / self.total - cycle
+        let scale = x / self.ratio if x <= self.ratio else (x - 1) / (self.ratio - 1)
+        var f = 1.0
+        if self.mode == "triangular2":
+            f = 1 / (2.0 ** (cycle - 1))
+        elif self.mode != "triangular":
+            f = self.gamma ** e
+        return self.lo + (self.hi - self.lo) * scale * f
+
+class ReduceLROnPlateau:
+    fn __init__(self, optimizer, mode="min", factor=0.1, patience=10, threshold=1e-4, threshold_mode="rel", cooldown=0, min_lr=0.0, eps=1e-8):
+        self.opt = optimizer
+        self.mode = mode
+        self.factor = _float(factor)
+        self.patience = int(patience)
+        self.th = _float(threshold)
+        self.thm = threshold_mode
+        self.cooldown = int(cooldown)
+        self.min_lr = _float(min_lr)
+        self.eps = _float(eps)
+        self.best = inf if mode == "min" else -inf
+        self.bad = 0
+        self.cool = 0
+        self.last_epoch = 0
+        self._last_lr = [optimizer.lr]
+    fn _better(self, a):
+        if self.mode == "min":
+            return a < (self.best * (1 - self.th) if self.thm == "rel" else self.best - self.th)
+        return a > (self.best * (1 + self.th) if self.thm == "rel" else self.best + self.th)
+    fn step(self, metrics, epoch=none):
+        let cur = _float(_raw(metrics))
+        self.last_epoch = self.last_epoch + 1
+        if self._better(cur):
+            self.best = cur
+            self.bad = 0
+        else:
+            self.bad = self.bad + 1
+        if self.cool > 0:
+            self.cool = self.cool - 1
+            self.bad = 0
+        if self.bad > self.patience:
+            let new = _max(self.opt.lr * self.factor, self.min_lr)
+            if self.opt.lr - new > self.eps:
+                self.opt.lr = new
+            self.cool = self.cooldown
+            self.bad = 0
+        self._last_lr = [self.opt.lr]
+    fn get_last_lr(self) = list(self._last_lr)
+
+class SequentialLR:
+    fn __init__(self, optimizer, schedulers, milestones, last_epoch=-1):
+        self.opt = optimizer
+        self.scheds = list(schedulers)
+        self.ms = [int(m) for m in milestones]
+        self.last_epoch = last_epoch + 1
+        self.opt.lr = self.scheds[0]._last_lr[0] if len(self.scheds) > 0 else self.opt.lr
+        self._last_lr = [self.opt.lr]
+    fn step(self):
+        self.last_epoch = self.last_epoch + 1
+        var i = 0
+        while i < len(self.ms) and self.ms[i] <= self.last_epoch:
+            i = i + 1
+        let s = self.scheds[i]
+        if i > 0 and self.ms[i - 1] == self.last_epoch:
+            s.last_epoch = -1
+            s.base_lr = self.opt.initial_lr
+            s.step()
+        else:
+            s.step()
+        self._last_lr = [self.opt.lr]
+    fn get_last_lr(self) = list(self._last_lr)
+
+class ChainedScheduler:
+    fn __init__(self, schedulers, optimizer=none):
+        self.scheds = list(schedulers)
+    fn step(self):
+        for s in self.scheds:
+            s.step()
+    fn get_last_lr(self) = self.scheds[len(self.scheds) - 1].get_last_lr()
+
+# =============================================================================== training helpers
+fn value_and_grad_aux(f):
+    fn run(params):
+        var box = [none]
+        fn lossf(p):
+            let out = f(p)
+            if (isinstance(out, list) or isinstance(out, tuple)) and len(out) == 2:
+                box[0] = out[1]
+                return out[0]
+            return out
+        let vg = value_and_grad(lossf)(params)
+        let aux = tree_map(fn(v) => stop_gradient(v) if not (isinstance(v, int) or isinstance(v, float) or isinstance(v, str) or isinstance(v, bool) or v == none) else v, box[0]) if box[0] != none else none
+        return (_float(vg[0]), aux, vg[1])
+    return run
+
+fn checkpoint_layer(layer, params, *xs, train=none, **kw) = layer(params, *xs, train=train, **kw)
+fn checkpoint(function, *args, use_reentrant=none, **kw) = function(*args, **kw)
+
+fn clip_grad_norm(grads, max_norm, norm_type=2.0, error_if_nonfinite=false):
+    let leaves = [_arr(g) for g in tree_leaves(grads)]
+    let nt = _float(norm_type)
+    var total = 0.0
+    if nt == inf:
+        for l in leaves:
+            total = _max(total, _float(max(abs(l))))
+    elif len(leaves) > 0:
+        var s = 0.0
+        for l in leaves:
+            s = s + _float(sum(abs(l) ** nt))
+        total = s ** (1.0 / nt)
+    let coef = _min(_float(max_norm) / (total + 1e-6), 1.0)
+    return tree_map(fn(g) => _arr(g) * coef, grads)
+
+fn clip_grad_value(grads, clip_value):
+    let c = _float(clip_value)
+    return tree_map(fn(g) => clip(_arr(g), -c, c), grads)
+
+class TensorDataset:
+    fn __init__(self, *tensors):
+        self.tensors = list(tensors)
+        var n = set()
+        for t in self.tensors:
+            n.add(_shape(t)[0])
+        if len(n) != 1:
+            raise ShapeError("TensorDataset: all tensors need the same first dimension")
+        self.n = _shape(self.tensors[0])[0]
+    fn __len__(self) = self.n
+    fn __getitem__(self, i) = tuple([t[i] for t in self.tensors])
+
+fn _collate(items):
+    let first = items[0]
+    if isinstance(first, tuple) or isinstance(first, list):
+        return tuple([_collate([it[k] for it in items]) for k in range(len(first))])
+    if __is_rec(first):
+        let d = __rec_dict(first)
+        var out = {}
+        for k in d:
+            out[k] = _collate([__rec_dict(it)[k] for it in items])
+        return record(**out)
+    return stack([tensor(_raw(it)) if not (isinstance(it, int) or isinstance(it, float)) else tensor(it) for it in items])
+
+class DataLoader:
+    fn __init__(self, dataset, batch_size=1, shuffle=false, sampler=none, batch_sampler=none, num_workers=0, collate_fn=none, pin_memory=false, drop_last=false, timeout=0, worker_init_fn=none, generator=none, prefetch_factor=none, persistent_workers=false, pin_memory_device="", seed=none):
+        self.ds = dataset
+        self.bs = int(batch_size)
+        self.shuffle = bool(shuffle)
+        self.drop = bool(drop_last)
+        self.collate = collate_fn
+        _setseed(seed)
+    fn __len__(self):
+        let n = len(self.ds)
+        return n // self.bs if self.drop else -((-n) // self.bs)
+    fn __iter__(self):
+        let n = len(self.ds)
+        let order = [int(v) for v in permutation(n).tolist()] if self.shuffle else list(range(n))
+        for i in range(0, n, self.bs):
+            let idx = order[i:i + self.bs]
+            if self.drop and len(idx) < self.bs:
+                break
+            if isinstance(self.ds, TensorDataset) and self.collate == none:
+                yield tuple([t[tensor(idx, "int64")] for t in self.ds.tensors])
+            else:
+                let items = [self.ds[j] for j in idx]
+                yield self.collate(items) if self.collate != none else _collate(items)
+
+# =============================================================================== state dicts
+fn _walk(layer, prefix=""):
+    var out = [[prefix, layer]]
+    if isinstance(layer, layers.CustomLayer):
+        let parts = layer.parts
+        if parts != none and __is_rec(parts):
+            let d = __rec_dict(parts)
+            for name in d:
+                let sub = d[name]
+                if isinstance(sub, list):
+                    for i in range(len(sub)):
+                        out.extend(_walk(sub[i], f"{prefix}{name}.{i}."))
+                else:
+                    out.extend(_walk(sub, f"{prefix}{name}."))
+    elif isinstance(layer, TorchLayer):
+        for c in layer.children():
+            out.extend(_walk(c[1], f"{prefix}{c[0]}."))
+    elif hasattr(layer, "layers") and isinstance(getattr(layer, "layers"), list):
+        let ls = getattr(layer, "layers")
+        for i in range(len(ls)):
+            out.extend(_walk(ls[i], f"{prefix}{i}."))
+    return out
+
+fn _flat_params(tree, prefix=""):
+    var out = {}
+    if __is_rec(tree):
+        let d = __rec_dict(tree)
+        for k in d:
+            out.update(_flat_params(d[k], f"{prefix}{k}."))
+    elif isinstance(tree, dict):
+        for k in tree:
+            out.update(_flat_params(tree[k], f"{prefix}{k}."))
+    elif isinstance(tree, list) or isinstance(tree, tuple):
+        for i in range(len(tree)):
+            out.update(_flat_params(tree[i], f"{prefix}{i}."))
+    elif tree != none:
+        out[prefix[0:len(prefix) - 1]] = tree
+    return out
+
+fn state_dict(model, params):
+    var flat = {}
+    let fp = _flat_params(params)
+    for k in fp:
+        flat[k] = _raw(fp[k])
+    for pl in _walk(model):
+        if hasattr(pl[1], "buffers"):
+            let b = pl[1].buffers()
+            for name in b:
+                flat[pl[0] + name] = b[name]
+    return record(**flat)
+
+fn load_state_dict(model, params, state, strict=true):
+    var st = __rec_dict(state) if __is_rec(state) else dict(state)
+    var nested = false
+    for k in st:
+        if __is_rec(st[k]) or isinstance(st[k], list) or isinstance(st[k], dict):
+            nested = true
+    if nested:
+        st = _flat_params(st)
+    let want = _flat_params(params)
+    var used = set()
+    fn arr(v) = tensor(_raw(v), "float64") * 1.0
+    fn rebuild(tree, prefix=""):
+        if __is_rec(tree):
+            let d = __rec_dict(tree)
+            var o = {}
+            for k in d:
+                o[k] = rebuild(d[k], f"{prefix}{k}.")
+            return record(**o)
+        if isinstance(tree, list):
+            return [rebuild(tree[i], f"{prefix}{i}.") for i in range(len(tree))]
+        let name = prefix[0:len(prefix) - 1]
+        if not (name in st):
+            if strict:
+                raise RuntimeError(f"load_state_dict: '{name}' is missing from the state_dict")
+            return tree
+        let a = arr(st[name])
+        if tuple(shape(a)) != tuple(shape(tree)):
+            raise ShapeError(f"load_state_dict: '{name}' has shape {tuple(shape(a))}, the model expects {tuple(shape(tree))}")
+        used.add(name)
+        return a
+    let out = rebuild(params)
+    for pl in _walk(model):
+        if hasattr(pl[1], "buffers"):
+            for name in pl[1].buffers():
+                let key = pl[0] + name
+                if key in st:
+                    pl[1].set_buffer(name, arr(st[key]))
+                    used.add(key)
+    var extra = []
+    for k in st:
+        if not (k in used) and not (k in want):
+            extra.append(k)
+    if strict and len(extra) > 0:
+        let ex = sorted(extra)
+        raise RuntimeError(f"load_state_dict: unexpected keys {', '.join(ex[0:6])}" + (" …" if len(extra) > 6 else ""))
+    return out
+
+fn parameters_count(params):
+    var n = 0
+    for l in tree_leaves(params):
+        n = n + (_prod(_shape(l)) if not (isinstance(l, int) or isinstance(l, float)) else 1)
+    return int(n)

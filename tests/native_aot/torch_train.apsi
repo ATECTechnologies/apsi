@@ -1,0 +1,44 @@
+use torch
+
+fn det(shp, k):
+    var n = 1
+    for s in shp:
+        n = n * s
+    return reshape(sin(arange(n) * 0.37 + k) * 0.5, *shp)
+
+# a model written the way apsi convert writes PyTorch modules
+let fc1 = torch.Linear(4, 16)
+let fc2 = torch.Linear(16, 3)
+let bn = torch.BatchNorm1d(16)
+fn init(seed=0) = record(fc1=record(weight=det([16, 4], 0.1), bias=det([16], 0.2)), bn=bn.init(), fc2=record(weight=det([3, 16], 0.3), bias=det([3], 0.4)))
+fn forward(p, x, train=false) = fc2(p.fc2, torch.relu(bn(p.bn, fc1(p.fc1, x), train=train)))
+let model = torch.Module(init, forward, "Net", record(fc1=fc1, bn=bn, fc2=fc2))
+var params = model.init(0)
+let X = det([32, 4], 0.0) * 4
+let Y = tensor([i % 3 for i in range(32)], "int64")
+let ds = torch.TensorDataset(X, Y)
+let loader = torch.DataLoader(ds, batch_size=8)
+let opt = torch.AdamW(lr=0.05)
+let sched = torch.CosineAnnealingLR(opt, 20)
+let crit = torch.CrossEntropyLoss()
+for epoch in range(5):
+    var total = 0.0
+    for batch in loader:
+        let xb = batch[0]
+        let yb = batch[1]
+        let vg = value_and_grad(fn(p) => crit(model.apply(p, xb, train=true), yb))(params)
+        params = opt.step(params, torch.clip_grad_norm(vg[1], 5.0))
+        total = total + vg[0]
+    sched.step()
+    print(epoch, round(total, 6), round(sched.get_last_lr()[0], 6))
+let logits = model.apply(params, X, train=false)
+print(round(sum(argmax(logits, axis=1) == Y) / 32.0, 4))
+let sd = torch.state_dict(model, params)
+print(keys(sd))
+print(round(sum(sd["bn.running_mean"]), 6), sd["bn.num_batches_tracked"])
+let p2 = torch.load_state_dict(model, model.init(0), sd)
+print(round(sum(model.apply(p2, X, train=false) - logits), 9))
+print(torch.Transformer.generate_square_subsequent_mask(3))
+let lin = torch.Linear(4, 2)
+lin.eval()
+print(lin.training, lin.train().training, torch.checkpoint(fn(a) => a * 2, 3.0))

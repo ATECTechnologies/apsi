@@ -2480,6 +2480,7 @@ static AV b_int(int n, AV *a, ADict *kw, AV self) {
         if (end == STR(st)->s || *end) a_error("ValueError", "invalid literal for int(): '%s'", STR(v)->s);
         return a_int(r);
     }
+    if (a_is_tn(v)) { double d = a_tensor_float(v); if (isnan(d) || isinf(d)) a_error("ValueError", "cannot convert float %f to integer", d); return a_int((int64_t)d); }
     a_error("TypeError", "int() of %s", tname(v));
 }
 static AV b_float(int n, AV *a, ADict *kw, AV self) {

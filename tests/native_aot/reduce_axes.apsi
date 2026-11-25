@@ -1,0 +1,7 @@
+let x = reshape(arange(24) * 0.1, 2, 3, 4)
+print(sum(x, axis=(0, 2)), mean(x, axis=(1, 2), keepdims=true), max(x, axis=(0, 1)), std(x, axis=(0, 2)))
+fn f(t) = sum(mean(t * t, axis=(0, 2)) * tensor([1.0, 2.0, 3.0]))
+print(grad(f)(x))
+fn g(t) = sum(std(t, axis=(1, 2)))
+print(grad(g)(x))
+print(sum(x, axis=(0, 1, 2)), mean(x, axis=(0, 1, 2), keepdims=true))

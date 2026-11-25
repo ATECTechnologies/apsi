@@ -114,6 +114,7 @@ backward pass walks its graph iteratively, so very deep graphs cannot overflow t
 | `net`, `http_get`, `http_post_json` | HTTP and HTTPS requests: WinHTTP on Windows; sockets and the system's OpenSSL on Linux and macOS (`HTTPS_PROXY` / `NO_PROXY`, `APSI_CA_FILE`); redirects, `HTTPError` |
 | `quantum` | grid Schrödinger solver, split-operator evolution, operators, `expm`, spins, qubits and gates, density matrices, entanglement, hydrogen (complex128 tensors; `measure` draws from the native generator) |
 | `rl` | CartPole, GridWorld and bandit environments, discounted returns, GAE, PPO, DQN, REINFORCE, evaluation, preference / DPO / IPO losses, KL-penalised rewards, GRPO advantages, PPO clip loss, sequence log-probabilities, MCTS, beam search, best-of-n |
+| `torch` | PyTorch's layers (Linear … Conv1d/2d with stride, padding, dilation and groups, pooling with ceil mode, batch / layer / group / RMS norm with running statistics, LSTM / GRU / RNN, MultiheadAttention, Transformer encoder / decoder), the functional forms, every loss with weights / ignore_index / label smoothing, SGD … RAdam with PyTorch's update rules, all the learning-rate schedulers, DataLoader, state_dict / load_state_dict; `init(seed)` draws from the native generator |
 | `parallel` | tasks (`spawn`, `wait_all`, `wait_any`), channels, locks, atomics, `parallel_for` / `parallel_reduce`, `sleep`, `set_threads`, `bench`: tasks take turns on stacks of their own (tensor kernels inside them use every core) |
 | `ffi` | `ffi.cload` and the C type names, the same as the built-in `cload` |
 | `scale` | training plans for 1B … 2T-parameter models (TP × PP × DP layout, recomputation, memory per GPU, GPUs, days), inference memory, the GPU table |
@@ -131,7 +132,8 @@ These programs keep running with `apsi run`. A native build that reaches one of 
 
 - graph networks, mixtures of experts and `fit_batches` in `layers`; GGUF, ONNX and PyTorch files in `models`;
   `text_dataset`, `train_tokenizer` and Parquet in `data`; websockets and TLS in `web` (serve HTTPS through a
-  reverse proxy); `tokens.focus` / `fit_chat` / `outline` (they read Python syntax trees); `db.mysql` / `mongo`, `db.pool`, PostgreSQL / Redis over TLS on Windows; `layout`'s `numpy_dtype()`; the module `torch`
+  reverse proxy); `tokens.focus` / `fit_chat` / `outline` (they read Python syntax trees); `db.mysql` / `mongo`, `db.pool`, PostgreSQL / Redis over TLS on Windows; `layout`'s `numpy_dtype()`
+- the modules `hub`, `memory`, `rt` (camera and video), `python` and `pycompat` (programs converted from Python)
 - Python modules (`pyimport`, `import numpy`), except `asyncio`
 - random numbers: native programs use their own generator, so a seed gives different numbers than in `apsi run`
   (the same seed always gives the same numbers in native programs)

@@ -263,6 +263,8 @@ fn logsumexp(xs):
     return log(s) + m
 
 fn keys(d):
+    if __is_rec(d):
+        return list(__rec_dict(d).keys())
     return list(d.keys())
 
 fn chars(s):

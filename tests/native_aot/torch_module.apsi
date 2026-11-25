@@ -1,0 +1,161 @@
+use torch
+
+fn det(shp, k):
+    var n = 1
+    for s in shp:
+        n = n * s
+    return reshape(sin(arange(n) * 0.37 + k) * 0.5, *shp)
+
+fn fixed(model, seed=0):
+    let p0 = model.init(seed)
+    let sd = torch.state_dict(model, p0)
+    var d = {}
+    var k = 0
+    for name in keys(sd):
+        let v = sd[name]
+        if "running" in name or "num_batches" in name:
+            d[name] = v
+        else:
+            d[name] = det(list(shape(v)), k)
+        k = k + 1
+    return torch.load_state_dict(model, p0, record(**d))
+
+fn r(x) = round(x, 6)
+
+let x = det([4, 6], 0.3)
+# --- dense, activations, containers
+let mlp = torch.Sequential(torch.Linear(6, 8), torch.ReLU(), torch.Linear(8, 8), torch.GELU(), torch.Dropout(0.5), torch.Linear(8, 3))
+let pm = fixed(mlp)
+print(mlp.layers[0], len(mlp), torch.parameters_count(pm))
+print(r(mlp(pm, x, train=false)))
+for a in [torch.SiLU(), torch.Tanh(), torch.LeakyReLU(0.2), torch.ELU(), torch.SELU(), torch.CELU(0.5), torch.Softplus(2.0), torch.Mish(), torch.Hardtanh(-0.3, 0.3), torch.ReLU6(), torch.Hardswish(), torch.Hardsigmoid(), torch.Softsign(), torch.Tanhshrink(), torch.Softmax(dim=1), torch.LogSoftmax(dim=-1), torch.GLU(), torch.GELU("tanh")]:
+    print(a, r(sum(a(record(), x * 3))))
+let pr = torch.PReLU()
+print(r(pr(pr.init(), x)))
+let bl = torch.Bilinear(6, 6, 2)
+print(r(bl(fixed(bl), x, x * 2)))
+let em = torch.Embedding(10, 4, padding_idx=0)
+let pe = fixed(em)
+print(r(em(pe, tensor([[1, 0, 3], [9, 2, 0]], "int64"))))
+print(torch.one_hot(tensor([0, 2, 1], "int64")), torch.flatten(det([2, 3, 4], 0), 1).shape, torch.pad(det([2, 2], 0), [1, 2]).shape)
+print(r(torch.normalize(x)), r(torch.cosine_similarity(x, x + 0.1)))
+# --- convolution and pooling
+let img = det([2, 3, 7, 7], 1.0)
+for conv in [torch.Conv2d(3, 4, 3), torch.Conv2d(3, 4, 3, stride=2, padding=1), torch.Conv2d(3, 6, (3, 2), stride=(2, 1), padding=(1, 0), dilation=(1, 2), groups=3), torch.Conv2d(3, 2, 3, padding="same", bias=false)]:
+    let pc = fixed(conv)
+    let y = conv(pc, img)
+    print(conv, y.shape, r(sum(y)), r(y[1, 0, 0]))
+let c1 = torch.Conv1d(3, 2, 3, padding=1)
+let sig = det([2, 3, 9], 0.5)
+print(r(c1(fixed(c1), sig)))
+for pool in [torch.MaxPool2d(2), torch.MaxPool2d(3, 2, 1), torch.AvgPool2d(2), torch.AvgPool2d(3, 2, 1, count_include_pad=false), torch.AvgPool2d(3, 2, 1, ceil_mode=true), torch.MaxPool2d(2, ceil_mode=true), torch.AdaptiveAvgPool2d((2, 3)), torch.AdaptiveMaxPool2d(3), torch.AdaptiveAvgPool2d(1)]:
+    let y = pool(record(), img)
+    print(pool, y.shape, r(sum(y)))
+print(r(torch.MaxPool1d(2)(record(), sig)), r(torch.AvgPool1d(3, 2)(record(), sig)), r(torch.AdaptiveAvgPool1d(4)(record(), sig)))
+# --- normalisation
+let bn = torch.BatchNorm2d(3)
+let pb = fixed(bn)
+let yb = bn(pb, img, train=true)
+print(r(sum(yb)), r(bn.running_mean), r(bn.running_var), bn.num_batches_tracked)
+bn.eval()
+print(r(sum(bn(pb, img))), bn.training)
+let bn1 = torch.BatchNorm1d(6)
+print(r(bn1(fixed(bn1), x, train=true)))
+let ln = torch.LayerNorm(6)
+print(r(ln(fixed(ln), x)))
+let rn = torch.RMSNorm([6])
+print(r(rn(fixed(rn), x)))
+let gn = torch.GroupNorm(1, 3)
+print(r(sum(gn(fixed(gn), img) * img)))
+# --- recurrent
+let seq = det([5, 2, 6], 0.7)
+for rnn in [torch.LSTM(6, 4), torch.GRU(6, 4, num_layers=2), torch.RNN(6, 4, bidirectional=true), torch.LSTM(6, 3, batch_first=true, bidirectional=true)]:
+    let prr = fixed(rnn)
+    let o = rnn(prr, seq)
+    print(rnn, o[0].shape, r(sum(o[0])))
+# --- attention and transformers
+let mha = torch.MultiheadAttention(8, 2)
+let pmh = fixed(mha)
+let q = det([5, 2, 8], 0.2)
+let ao = mha(pmh, q, q, q)
+print(r(sum(ao[0])), ao[1].shape, r(sum(mha(pmh, q, is_causal=true, attn_mask=torch.generate_square_subsequent_mask(5))[0])))
+let kpm = tensor([[false, false, false, true, true], [false, false, false, false, false]])
+print(r(sum(mha(pmh, q, q, q, key_padding_mask=kpm)[0])))
+print(r(torch.scaled_dot_product_attention(q, q, q, is_causal=true)[0]))
+let enc = torch.TransformerEncoder(torch.TransformerEncoderLayer(8, 2, 16, 0.0), 2)
+let penc = fixed(enc)
+print(r(sum(enc(penc, q))), r(sum(enc(penc, q, mask=torch.generate_square_subsequent_mask(5)))))
+let tr = torch.Transformer(8, 2, 1, 1, 16, 0.0, batch_first=true, norm_first=true)
+let ptr = fixed(tr)
+print(r(sum(tr(ptr, det([2, 4, 8], 0.1), det([2, 3, 8], 0.4)))))
+# --- losses and gradients
+let logits = det([4, 3], 0.9) * 3
+let tgt = tensor([0, 2, 1, 2], "int64")
+print(r(torch.cross_entropy(logits, tgt)), r(torch.cross_entropy(logits, tgt, label_smoothing=0.1)), r(torch.cross_entropy(logits, tensor([0, -100, 1, 2], "int64"))))
+print(r(torch.cross_entropy(logits, tgt, weight=tensor([1.0, 2.0, 0.5]), reduction="none")), r(torch.cross_entropy(logits, softmax(det([4, 3], 0.2), dim=1))))
+print(r(torch.nll_loss(log_softmax(logits, dim=1), tgt)), r(torch.mse_loss(logits, logits * 0.5)), r(torch.l1_loss(logits, 0.0 * logits, reduction="sum")))
+print(r(torch.smooth_l1_loss(logits, 0.0 * logits)), r(torch.huber_loss(logits, 0.0 * logits, delta=0.5)), r(torch.binary_cross_entropy(sigmoid(logits), tensor([[1.0, 0.0, 1.0]] * 4))))
+print(r(torch.binary_cross_entropy_with_logits(logits, tensor([[1.0, 0.0, 1.0]] * 4), pos_weight=tensor([2.0, 1.0, 0.5]))), r(torch.kl_div(log_softmax(logits, dim=1), softmax(logits * 0.3, dim=1), reduction="batchmean")))
+let ce = torch.CrossEntropyLoss(label_smoothing=0.05)
+let crit = torch.MSELoss(reduction="sum")
+print(r(ce(logits, tgt)), r(crit(logits, logits + 1)))
+print(r(torch.cross_entropy(det([2, 3, 4], 0.0), tensor([[0, 1, 2, 1], [2, 2, 0, 1]], "int64"))))
+fn loss(p) = torch.cross_entropy(mlp(p, x, train=false), tensor([0, 1, 2, 1], "int64"))
+let vg = value_and_grad(loss)(pm)
+print(r(vg[0]), r(vg[1][0].weight[0]), r(vg[1][5].bias))
+let vga = torch.value_and_grad_aux(fn(p) => [loss(p), mlp(p, x, train=false)])(pm)
+print(r(vga[0]), vga[1].shape, r(vga[2][2].bias))
+# --- optimizers
+for opt in [torch.SGD(lr=0.1), torch.SGD(lr=0.1, momentum=0.9, nesterov=true, weight_decay=0.01), torch.Adam(lr=0.01), torch.AdamW(lr=0.01), torch.Adam(lr=0.01, amsgrad=true, weight_decay=0.1), torch.Adamax(), torch.RMSprop(centered=true, momentum=0.5), torch.Adagrad(lr_decay=0.1), torch.NAdam(), torch.RAdam()]:
+    var p = pm
+    for it in range(8):
+        let gg = value_and_grad(loss)(p)
+        p = opt.step(p, torch.clip_grad_norm(gg[1], 1.0))
+    print(type(opt).__name__, r(loss(p)), opt.param_groups[0]["lr"])
+print(r(torch.clip_grad_value({"a": tensor([3.0, -0.2])}, 0.5)["a"]), r(torch.clip_grad_norm([tensor([3.0, 4.0])], 1.0, norm_type=inf)[0]))
+# --- schedulers
+fn lrs(make, n=12):
+    let o = torch.SGD(lr=0.1, momentum=0.9)
+    let s = make(o)
+    var out = []
+    for i in range(n):
+        s.step()
+        out.append(round(o.lr, 6))
+    return out
+print(lrs(fn(o) => torch.StepLR(o, 3, 0.5)))
+print(lrs(fn(o) => torch.MultiStepLR(o, [2, 5, 5], 0.1)))
+print(lrs(fn(o) => torch.ExponentialLR(o, 0.9)))
+print(lrs(fn(o) => torch.CosineAnnealingLR(o, 5, 0.01)))
+print(lrs(fn(o) => torch.CosineAnnealingWarmRestarts(o, 3, 2)))
+print(lrs(fn(o) => torch.LinearLR(o, 0.25, 1.0, 4)))
+print(lrs(fn(o) => torch.ConstantLR(o, 0.5, 3)))
+print(lrs(fn(o) => torch.LambdaLR(o, fn(e) => 1 / (e + 1))))
+print(lrs(fn(o) => torch.MultiplicativeLR(o, fn(e) => 0.95)))
+print(lrs(fn(o) => torch.PolynomialLR(o, 6, 2.0)))
+print(lrs(fn(o) => torch.OneCycleLR(o, 1.0, total_steps=13)))
+print(lrs(fn(o) => torch.CyclicLR(o, 0.01, 0.1, 3, mode="triangular2")))
+let o2 = torch.SGD(lr=1.0)
+let plat = torch.ReduceLROnPlateau(o2, patience=1, factor=0.5)
+for v in [1.0, 0.9, 0.95, 0.96, 0.97, 0.5, 0.6, 0.7]:
+    plat.step(v)
+print(plat.get_last_lr())
+let o3 = torch.SGD(lr=0.1)
+let sq = torch.SequentialLR(o3, [torch.LinearLR(o3, 0.1, 1.0, 3), torch.ExponentialLR(o3, 0.5)], [3])
+var sl = []
+for i in range(7):
+    sq.step()
+    sl.append(round(o3.lr, 6))
+print(sl)
+# --- data and state dicts
+let ds = torch.TensorDataset(det([10, 3], 0.0), tensor(list(range(10))))
+let dl = torch.DataLoader(ds, batch_size=4)
+print(len(ds), len(dl), [b[0].shape for b in dl], [b[1].tolist() for b in dl])
+print(len(torch.DataLoader(ds, batch_size=4, drop_last=true)), ds[3][1])
+let sd = torch.state_dict(bn, pb)
+print(sorted(keys(sd)))
+let enc_sd = torch.state_dict(enc, penc)
+print(len(keys(enc_sd)), sorted(keys(enc_sd))[0:4])
+try:
+    torch.load_state_dict(mlp, pm, record(**{"0.weight": zeros(8, 6)}))
+except RuntimeError as e:
+    print("error:", e)

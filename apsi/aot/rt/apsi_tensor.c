@@ -1646,9 +1646,44 @@ double a_tensor_float(AV v) { v = to_host(val_of(v)); if (is_t(v)) { if (TT(v)->
 
 /* ---- reductions and shapes, recorded when differentiated */
 static AV axis_kw(int n, AV *a, ADict *kw, int pos) { AV ax = kwget(kw, "axis"); if (ax.t == T_NONE && n > pos) ax = a[pos]; if (ax.t == T_NONE) ax = kwget(kw, "dim"); return ax; }
+static AV red(int op, int n, AV *a, ADict *kw);
+static AV t_reshape_any(AV x, int nd, int64_t *sh);
+/* a reduction over several axes, axis=(0, 2): one axis at a time with the axes kept, then dropped */
+static AV red_axes(int op, AV x, AV axes, int keep, ADict *kw) {
+    AList *l = (AList *)axes.o; int sp = a_ntmp;
+    int nd = TT(as_tensor(val_of(x)))->nd, ax[MAXD], k = 0;
+    for (int64_t i = 0; i < l->len; i++) { int v = (int)l->v[i].i; if (v < 0) v += nd; if (v < 0 || v >= nd) a_error("ValueError", "axis %d is out of range for %d dimensions", (int)l->v[i].i, nd); ax[k++] = v; }
+    AV kd = a_dict(); A_PUSH(kd); a_dict_set((ADict *)kd.o, a_str("keepdims"), a_bool(1));
+    AV dd = kwget(kw, "ddof"); if (dd.t != T_NONE) a_dict_set((ADict *)kd.o, a_str("ddof"), dd);
+    AV r;
+    if (op == R_VAR || op == R_STD) {                         /* mean of the squared deviations over all the axes */
+        AV m = red_axes(R_MEAN, x, axes, 1, NULL); A_PUSH(m);
+        AV d = a_binop(OP_SUB, x, m); A_PUSH(d);
+        AV v = red_axes(R_MEAN, a_binop(OP_MUL, d, d), axes, 1, NULL); A_PUSH(v);
+        int64_t cnt = 1; AV xt = as_tensor(val_of(x)); for (int i = 0; i < k; i++) cnt *= TT(xt)->sh[ax[i]];
+        int ddof = dd.t == T_INT ? (int)dd.i : 0;
+        if (ddof) v = a_binop(OP_MUL, v, a_float((double)cnt / (double)(cnt - ddof)));
+        A_PUSH(v);
+        r = op == R_STD ? a_binop(OP_POW, v, a_float(0.5)) : v;
+    } else {
+        if (op != R_SUM && op != R_MEAN && op != R_MAX && op != R_MIN && op != R_PROD && op != R_ANY && op != R_ALL)
+            a_error("TypeError", "this reduction takes one axis");
+        r = x; A_PUSH(r);
+        for (int i = 0; i < k; i++) { AV args[2] = {r, a_int(ax[i])}; r = red(op, 2, args, (ADict *)kd.o); a_tmp[a_ntmp - 1] = r; }
+    }
+    if (!keep) {
+        AV rt = as_tensor(val_of(r)); int64_t sh[MAXD]; int m = 0;
+        for (int i = 0; i < TT(rt)->nd; i++) { int drop = 0; for (int j = 0; j < k; j++) if (ax[j] == i) drop = 1; if (!drop) sh[m++] = TT(rt)->sh[i]; }
+        A_PUSH(r); r = t_reshape_any(r, m, sh);
+        if (m == 0 && !is_n(r)) r = a_float(t_get(TT(as_tensor(r)), 0));
+    }
+    a_ntmp = sp; return r;
+}
+static AV t_reshape_any(AV x, int nd, int64_t *sh);
 static AV red(int op, int n, AV *a, ADict *kw) {
     AV x = a[0], axis = axis_kw(n, a, kw, 1);
     int keep = a_truthy(kwget(kw, "keepdims")) || a_truthy(kwget(kw, "keepdim"));
+    if ((a_is(axis, O_LIST) || a_is(axis, O_TUPLE)) && (is_t(x) || is_n(x))) return red_axes(op, x, axis, keep, kw);
     if (a_is(x, O_LIST) || a_is(x, O_TUPLE)) {
         int has_t = 0; AList *l = (AList *)x.o;
         for (int64_t i = 0; i < l->len; i++) if (is_t(l->v[i]) || is_n(l->v[i])) has_t = 1;
