@@ -37,14 +37,63 @@ static void bn_sub(BN *r, const BN *a, const BN *b) {                 /* a >= b;
     for (int64_t i = 0; i < a->n; i++) { int64_t s = (int64_t)a->d[i] - (i < b->n ? b->d[i] : 0) - br; br = s < 0; t.d[i] = (uint32_t)(br ? s + DB : s); }
     t.n = a->n; bn_norm(&t); bn_free(r); *r = t;
 }
+/* column by column (Comba): the products of a column summed in 128 bits, one carry division per column */
+static void bn_mul_comba(uint32_t *out, const uint32_t *a, int64_t na, const uint32_t *b, int64_t nb) {
+    unsigned __int128 acc = 0;
+    for (int64_t k = 0; k < na + nb - 1; k++) {
+        int64_t lo = k - nb + 1 > 0 ? k - nb + 1 : 0, hi = k < na - 1 ? k : na - 1;
+        uint64_t part = 0; int cnt = 0;
+        for (int64_t i = lo; i <= hi; i++) {
+            part += (uint64_t)a[i] * b[k - i];
+            if (++cnt == 17) { acc += part; part = 0; cnt = 0; }   /* 17 products of < 1e18 stay below 2^64 */
+        }
+        acc += part;
+        uint64_t low = (uint64_t)(acc % DB); out[k] = (uint32_t)low; acc /= DB;
+    }
+    int64_t k = na + nb - 1; out[k] = (uint32_t)(acc % DB);
+}
+/* Karatsuba above a few dozen limbs: (a1 B + a0)(b1 B + b0) with three products of half the size */
+static void bn_mul_rec(uint32_t *out, const uint32_t *a, int64_t na, const uint32_t *b, int64_t nb) {
+    if (na < 48 || nb < 48) {
+        if (na == 0 || nb == 0) { memset(out, 0, sizeof(uint32_t) * (size_t)(na + nb)); return; }
+        bn_mul_comba(out, a, na, b, nb); return;
+    }
+    int64_t h = (na > nb ? na : nb) / 2;
+    if (h >= na || h >= nb) {                                 /* very unequal sizes: split the longer one */
+        const uint32_t *L = na >= nb ? a : b, *S = na >= nb ? b : a; int64_t nl = na >= nb ? na : nb, nsh = na >= nb ? nb : na;
+        memset(out, 0, sizeof(uint32_t) * (size_t)(na + nb));
+        uint32_t *tmp = (uint32_t *)malloc(sizeof(uint32_t) * (size_t)(nsh * 2 + 2));
+        for (int64_t off = 0; off < nl; off += nsh) {
+            int64_t len = nl - off < nsh ? nl - off : nsh;
+            bn_mul_rec(tmp, L + off, len, S, nsh);
+            uint32_t c = 0; int64_t i;
+            for (i = 0; i < len + nsh; i++) { uint32_t v = out[off + i] + tmp[i] + c; c = v >= DB; out[off + i] = c ? v - DB : v; }
+            for (i = off + len + nsh; c && i < na + nb; i++) { uint32_t v = out[i] + c; c = v >= DB; out[i] = c ? v - DB : v; }
+        }
+        free(tmp); return;
+    }
+    BN a0 = {(uint32_t *)a, h, h}, a1 = {(uint32_t *)a + h, na - h, na - h}, b0 = {(uint32_t *)b, h, h}, b1 = {(uint32_t *)b + h, nb - h, nb - h};
+    BN x0, x1, sa, sb, m; bn_init(&x0); bn_init(&x1); bn_init(&sa); bn_init(&sb); bn_init(&m);
+    BN a0n, b0n; bn_init(&a0n); bn_init(&b0n); bn_copy(&a0n, &a0); bn_norm(&a0n); bn_copy(&b0n, &b0); bn_norm(&b0n);
+    BN a1n, b1n; bn_init(&a1n); bn_init(&b1n); bn_copy(&a1n, &a1); bn_norm(&a1n); bn_copy(&b1n, &b1); bn_norm(&b1n);
+    bn_reserve(&x0, 2 * h + 1); bn_mul_rec(x0.d, a0n.d, a0n.n, b0n.d, b0n.n); x0.n = a0n.n + b0n.n; bn_norm(&x0);
+    bn_reserve(&x1, a1n.n + b1n.n + 1); bn_mul_rec(x1.d, a1n.d, a1n.n, b1n.d, b1n.n); x1.n = a1n.n + b1n.n; bn_norm(&x1);
+    bn_add(&sa, &a0n, &a1n); bn_add(&sb, &b0n, &b1n);
+    bn_reserve(&m, sa.n + sb.n + 1); bn_mul_rec(m.d, sa.d, sa.n, sb.d, sb.n); m.n = sa.n + sb.n; bn_norm(&m);
+    bn_sub(&m, &m, &x0); bn_sub(&m, &m, &x1);
+    memset(out, 0, sizeof(uint32_t) * (size_t)(na + nb));
+    const BN *parts[3] = {&x0, &m, &x1}; int64_t offs[3] = {0, h, 2 * h};
+    for (int q = 0; q < 3; q++) {
+        uint32_t c = 0; int64_t i, off = offs[q];
+        for (i = 0; i < parts[q]->n; i++) { uint32_t v = out[off + i] + parts[q]->d[i] + c; c = v >= DB; out[off + i] = c ? v - DB : v; }
+        for (i = off + parts[q]->n; c && i < na + nb; i++) { uint32_t v = out[i] + c; c = v >= DB; out[i] = c ? v - DB : v; }
+    }
+    bn_free(&x0); bn_free(&x1); bn_free(&sa); bn_free(&sb); bn_free(&m); bn_free(&a0n); bn_free(&b0n); bn_free(&a1n); bn_free(&b1n);
+}
 static void bn_mul(BN *r, const BN *a, const BN *b) {
     if (!a->n || !b->n) { r->n = 0; return; }
-    BN t; bn_init(&t); bn_reserve(&t, a->n + b->n); memset(t.d, 0, sizeof(uint32_t) * (size_t)(a->n + b->n));
-    for (int64_t i = 0; i < a->n; i++) {
-        uint64_t c = 0, x = a->d[i]; if (!x) continue;
-        for (int64_t j = 0; j < b->n; j++) { uint64_t p = x * b->d[j] + t.d[i + j] + c; t.d[i + j] = (uint32_t)(p % DB); c = p / DB; }
-        int64_t k = i + b->n; while (c) { uint64_t p = (uint64_t)t.d[k] + c; t.d[k] = (uint32_t)(p % DB); c = p / DB; k++; }
-    }
+    BN t; bn_init(&t); bn_reserve(&t, a->n + b->n + 1);
+    bn_mul_rec(t.d, a->d, a->n, b->d, b->n);
     t.n = a->n + b->n; bn_norm(&t); bn_free(r); *r = t;
 }
 static void bn_mul_small(BN *a, uint32_t m) {
@@ -105,14 +154,21 @@ static void bn_divmod(const BN *a, const BN *b, BN *q, BN *r) {     /* q, r: fre
     bn_free(&v);
 }
 /* q = a / 10^k; returns how the dropped part compares with half a unit: 0 nothing, 1 below, 2 half, 3 above */
+static int bn_digit(const BN *a, int64_t pos) { int64_t l = pos / 9; if (l >= a->n) return 0; return (int)((a->d[l] / P10[pos % 9]) % 10); }
+static int bn_any_below(const BN *a, int64_t pos) {          /* a digit below position pos is not zero */
+    int64_t l = pos / 9; for (int64_t i = 0; i < l && i < a->n; i++) if (a->d[i]) return 1;
+    return l < a->n && (a->d[l] % P10[pos % 9]) != 0;
+}
 static int bn_split10(const BN *a, int64_t k, BN *q) {
     if (k <= 0) { bn_copy(q, a); return 0; }
-    if (k > bn_ndigits(a) + 1) { q->n = 0; return a->n ? 1 : 0; }
-    BN p, r; bn_init(&p); bn_init(&r); bn_pow10(&p, k);
-    bn_divmod(a, &p, q, &r);
-    int cls = 0;
-    if (r.n) { bn_mul_small(&r, 2); int c = bn_cmp(&r, &p); cls = c < 0 ? 1 : c == 0 ? 2 : 3; }
-    bn_free(&p); bn_free(&r); return cls;
+    if (k > bn_ndigits(a) + 1) { int nz = a->n != 0; q->n = 0; return nz ? 1 : 0; }
+    int d = bn_digit(a, k - 1), rest = bn_any_below(a, k - 1);
+    int cls = d > 5 || (d == 5 && rest) ? 3 : d == 5 ? 2 : (d || rest) ? 1 : 0;
+    int64_t l = k / 9; BN t; bn_init(&t);
+    if (l < a->n) { bn_reserve(&t, a->n - l); memcpy(t.d, a->d + l, sizeof(uint32_t) * (size_t)(a->n - l)); t.n = a->n - l; }
+    if (k % 9) bn_div_small(&t, P10[k % 9]);
+    bn_norm(&t); bn_free(q); *q = t;
+    return cls;
 }
 static void bn_from_digits(BN *a, const char *s, int64_t len) {
     a->n = 0; bn_reserve(a, len / 9 + 2);
@@ -249,6 +305,9 @@ static void dv_div(DV *r, const DV *a, const DV *b, int64_t prec) {    /* Python
     int sign = a->sign ^ b->sign;
     if (dv_zero(a)) { r->sign = sign; r->exp = a->exp - b->exp; r->c.n = 0; return; }
     if (prec <= 0) prec = 28;
+    if (b->c.n == 1 && b->c.d[0] == 1) {                        /* by ±10^e: exact, then rounded */
+        BN c; bn_init(&c); bn_copy(&c, &a->c); bn_free(&r->c); r->c = c; r->sign = sign; r->exp = a->exp - b->exp; dv_round(r, prec); return;
+    }
     int64_t shift = bn_ndigits(&b->c) - bn_ndigits(&a->c) + prec + 1, e = a->exp - b->exp - shift;
     BN op1, op2, q, rm; bn_init(&op1); bn_init(&op2); bn_init(&q); bn_init(&rm);
     bn_copy(&op1, &a->c); bn_copy(&op2, &b->c);
@@ -288,15 +347,23 @@ static void dv_sqrt(DV *r, const DV *x, int64_t prec) {                 /* Pytho
     dv_round(r, prec);
 }
 /* x ** k for an integer k: exact when it fits in prec digits, else correctly rounded with guard digits */
-static void dv_powi(DV *r, const DV *x, int64_t k, int64_t prec) {
+static void dv_powi_(DV *r, const DV *x, int64_t k, int64_t prec, int ideal_exp);
+static void dv_powi(DV *r, const DV *x, int64_t k, int64_t prec) { dv_powi_(r, x, k, prec, 1); }
+static void dv_powi_(DV *r, const DV *x, int64_t k, int64_t prec, int ideal_exp) {
+    if (k == 0 && dv_zero(x)) a_error("InvalidOperation", "[<class 'decimal.InvalidOperation'>]");
     if (k == 0) { r->sign = 0; r->exp = 0; bn_set_u64(&r->c, 1); return; }
-    if (k < 0) { DV p, one; dv_init(&p); dv_init(&one); int64_t wp = prec > 0 ? prec + 10 : 60; dv_powi(&p, x, -k, wp + 10); dv_set_int(&one, 1); dv_div(r, &one, &p, prec > 0 ? prec : 28); dv_free(&p); dv_free(&one); return; }
+    if (k < 0) { DV p, one; dv_init(&p); dv_init(&one); int64_t wp = prec > 0 ? prec + 10 : 60; dv_powi_(&p, x, -k, wp + 10, 0); dv_set_int(&one, 1); dv_div(r, &one, &p, prec > 0 ? prec : 28); dv_free(&p); dv_free(&one); return; }
     int64_t nd = bn_ndigits(&x->c);
     int exactly = prec <= 0 || (double)nd * (double)k <= 4.0 * (double)prec + 60;
     int64_t wp = exactly ? 0 : prec + 20 + (int64_t)(log10((double)k) + 1) * 2;
     DV base, acc; dv_init(&base); dv_init(&acc); dv_copy(&base, x); dv_set_int(&acc, 1);
+    int64_t z = 0; while (base.c.n && bn_low_digit(&base.c) == 0) { bn_div_small(&base.c, 10); base.exp++; z++; }   /* 10^z apart */
     uint64_t m = (uint64_t)k;
     while (m) { if (m & 1) dv_mul(&acc, &acc, &base, wp); m >>= 1; if (m) dv_mul(&base, &base, &base, wp); }
+    if (ideal_exp && exactly && z && acc.c.n) {                            /* back to the exponent Python keeps: x.exp · k */
+        int64_t ideal = x->exp * k, room = (prec > 0 ? prec : INT64_MAX / 4) - bn_ndigits(&acc.c);
+        int64_t to = acc.exp - room > ideal ? acc.exp - room : ideal; if (to < acc.exp) dv_rescale(&acc, to);
+    }
     dv_free(&base); dv_free(r); *r = acc; dv_round(r, prec);
 }
 static void dv_one(DV *x) { x->sign = 0; x->exp = 0; bn_set_u64(&x->c, 1); }

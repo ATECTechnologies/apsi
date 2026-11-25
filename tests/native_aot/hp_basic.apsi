@@ -10,3 +10,6 @@ print(f"{x:.5f} {hp.pi():.3e} {hp.pi():10.4f}|", str(x), repr(x))
 print(hp.float(hp.pi()), int(hp.num("7.9")), hp.str(hp.pi(), 10), hp.digits())
 print(hp.num(1) / hp.num(8), hp.num(10) / hp.num(4), hp.num("1.00") * hp.num("2.0"), hp.num(100).sqrt() if false else 0)
 print(hp.ln(10), hp.log10(1000), hp.exp(0), hp.ln(1), hp.pow(2, 0.5), hp.pow(2, 10), hp.factorial(30), hp.gamma(0.5))
+for s in ["1.0", "10", "0.10", "2.50", "100", "1E+2", "120"]:
+    let x = hp.num(s)
+    print(x ** 2, x ** 3, x ** 0, x ** 1, x ** -1 if x != 0 else 0, x ** 25)
