@@ -231,7 +231,7 @@ static void print_rec(TB *b, ATensor *t, int ax, int64_t off, int64_t stride_tot
         if (last) {
             char s[64]; elem_text(t, off + i, s, width);
             int k = (int)strlen(s);
-            if (i > 0 && line + k + 2 > 100) { tb_put(b, "\n"); for (int q = 0; q <= indent; q++) tb_put(b, " "); line = indent + 1; }
+            if (i > 0 && line + k + 2 > 100) { if (b->n && b->p[b->n - 1] == ' ') b->p[--b->n] = 0; tb_put(b, "\n"); for (int q = 0; q <= indent; q++) tb_put(b, " "); line = indent + 1; }
             tb_put(b, s); line += k;
             if (i < len - 1) { tb_put(b, ", "); line += 2; }
         } else {
@@ -2213,6 +2213,7 @@ static const TEnt tensor_overrides[] = {
 #include "apsi_frame.c"
 #include "apsi_sqlite.c"
 #include "apsi_net.c"
+#include "apsi_cplx.c"
 ABuiltinFn a_tensor_builtin(const char *name, int override_only) {
     for (const TEnt *e = tensor_overrides; e->name; e++) if (!strcmp(e->name, name)) return e->fn;
     if (override_only) return NULL;

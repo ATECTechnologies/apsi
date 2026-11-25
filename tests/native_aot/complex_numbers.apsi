@@ -1,0 +1,17 @@
+let z = complex(1, 2)
+print(z, z * z, abs(z), z.real, z.imag, z.conjugate())
+let t = tensor([1.0, 2.0]) * z
+print(t, type(t), t.dtype)
+print(type(z), type(tensor([z])), tensor([z]).dtype, exp(z), sqrt(complex(-1, 0)), abs(tensor([z])), tensor([z]).real, tensor([[z]]).T)
+print(tensor([z, 1]).tolist(), tensor([z, z])[0], sum(tensor([z, z])), tensor([z]) @ tensor([z]))
+let q = zeros(2, dtype="complex128")
+print(q, 2 * complex(0, 1), z / complex(0, 1), z ** 2, z ** 0.5, 1 - z, z == complex(1, 2), z != 1)
+let m = tensor([[complex(0, 0), complex(0, -1)], [complex(0, 1), complex(0, 0)]])
+print(m)
+print(m @ m, m * 2.5, m - 1, -m)
+print(tensor([complex(1.5, -2.25), complex(-0.001, 1e5)]), tensor([complex(1e-6, 1), complex(3, 4)]))
+var w = zeros(3, dtype="complex128")
+w[1] = complex(2, 3)
+w[0] = 5
+print(w, w[1:], len(w), [x for x in w], w.conj(), reshape(w, 3, 1).shape)
+print(isinstance(z, complex), {complex(1, 0): "a"}[complex(1, 0)], complex(2), complex(1, 2) + complex(0, 1) * complex(0, 1))

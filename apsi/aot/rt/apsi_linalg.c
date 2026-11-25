@@ -393,15 +393,26 @@ BI(lb_la) {
 }
 
 /* ------------------------------------------------------------------ FFT: radix 2, other lengths by Bluestein's algorithm */
+/* cos and sin of 2 pi m / n, from the quadrant and the nearer edge of it: exact at the quarter turns and symmetric,
+   so that a transform of real or symmetric data leaves no round-off where the result is exactly zero */
+static void sincos2pi(int64_t m, int64_t n, double *c, double *s) {
+    m %= n; if (m < 0) m += n;
+    unsigned __int128 m4 = (unsigned __int128)m * 4;
+    int q = (int)(m4 / (unsigned __int128)n); int64_t r = (int64_t)(m4 % (unsigned __int128)n);     /* angle = (q + r / n) pi / 2 */
+    double cc, ss;
+    if (r == 0) { cc = 1; ss = 0; }
+    else if (2 * r <= n) { double t = M_PI / 2 * (double)r / (double)n; cc = cos(t); ss = sin(t); }
+    else { double t = M_PI / 2 * (double)(n - r) / (double)n; cc = sin(t); ss = cos(t); }
+    switch (q & 3) { case 0: *c = cc; *s = ss; break; case 1: *c = -ss; *s = cc; break; case 2: *c = -cc; *s = -ss; break; default: *c = ss; *s = -cc; break; }
+}
 static void fft2(double *re, double *im, int64_t n, int inv) {
     for (int64_t i = 1, j = 0; i < n; i++) {
         int64_t bit = n >> 1; for (; j & bit; bit >>= 1) j ^= bit; j ^= bit;
         if (i < j) { double t = re[i]; re[i] = re[j]; re[j] = t; t = im[i]; im[i] = im[j]; im[j] = t; }
     }
     for (int64_t len = 2; len <= n; len <<= 1) {
-        double ang = (inv ? 2 : -2) * M_PI / (double)len;
         for (int64_t k = 0; k < len / 2; k++) {
-            double wr = cos(ang * (double)k), wi = sin(ang * (double)k);
+            double wr, wi; sincos2pi(inv ? k : -k, len, &wr, &wi);
             for (int64_t i = k; i < n; i += len) {
                 int64_t j = i + len / 2; double xr = re[j] * wr - im[j] * wi, xi = re[j] * wi + im[j] * wr;
                 re[j] = re[i] - xr; im[j] = im[i] - xi; re[i] += xr; im[i] += xi;
@@ -417,11 +428,10 @@ static void fft_mixed(double *re, double *im, int64_t n, int inv, double *tr, do
     int64_t m = n / p;
     for (int64_t r = 0; r < p; r++) for (int64_t j = 0; j < m; j++) { tr[r * m + j] = re[j * p + r]; ti[r * m + j] = im[j * p + r]; }
     for (int64_t r = 0; r < p; r++) fft_mixed(tr + r * m, ti + r * m, m, inv, re, im);   /* re / im: scratch of the right size */
-    double sg = inv ? 2 * M_PI : -2 * M_PI;
     for (int64_t k = 0; k < n; k++) {
         double sr = 0, si = 0; int64_t km = k % m;
         for (int64_t r = 0; r < p; r++) {
-            int64_t e = (r * k) % n; double c = cos(sg * (double)e / (double)n), s = sin(sg * (double)e / (double)n);
+            int64_t e = (r * k) % n; double c, s; sincos2pi(inv ? e : -e, n, &c, &s);
             double xr = tr[r * m + km], xi = ti[r * m + km];
             sr += xr * c - xi * s; si += xr * s + xi * c;
         }
@@ -446,7 +456,7 @@ static void fft_any(double *re, double *im, int64_t n, int inv) {
     double *wr = (double *)malloc(sizeof(double) * (size_t)n), *wi = (double *)malloc(sizeof(double) * (size_t)n);
     for (int64_t k = 0; k < n; k++) {
         int64_t k2 = (int64_t)(((unsigned __int128)k * (unsigned __int128)k) % (unsigned __int128)(2 * n));
-        double ang = (inv ? 1 : -1) * M_PI * (double)k2 / (double)n; wr[k] = cos(ang); wi[k] = sin(ang);
+        sincos2pi(inv ? k2 : -k2, 2 * n, &wr[k], &wi[k]);
         ar[k] = re[k] * wr[k] - im[k] * wi[k]; ai[k] = re[k] * wi[k] + im[k] * wr[k];
         br[k] = wr[k]; bi[k] = -wi[k]; if (k) { br[m - k] = wr[k]; bi[m - k] = -wi[k]; }
     }

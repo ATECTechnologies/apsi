@@ -18,7 +18,7 @@ fn _last(x, axis):
 fn _undo(x, back) = x if back == none else permute(x, *back)
 
 fn _parts(x):
-    if isinstance(x, Complex):
+    if __is_cplx(x):
         return (tensor(x.re, f64), tensor(x.im, f64))
     return (tensor(x, f64), none)
 
