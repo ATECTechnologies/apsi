@@ -1375,7 +1375,14 @@ AV a_getitem(AV o, AV i) {
         int64_t k = norm_index(i, a_len(o));
         return a_int(r->start + k * r->step);
     }
-    case O_INST: { AV f = a_getattr(o, "__getitem__"); if (f.t != 255) return a_call(f, 1, &i, NULL); break; }
+    case O_INST: {
+        AV f = a_getattr(o, "__getitem__"); if (f.t != 255) return a_call(f, 1, &i, NULL);
+        if (a_is(i, O_STR) && !strcmp(((AInst *)o.o)->cls->name->s, "record")) {    /* rec["field"], as apsi run */
+            AV v; if (a_dict_get(((AInst *)o.o)->attrs, i, &v)) return v;
+            a_error("KeyError", "%s", STR(i)->s);
+        }
+        break;
+    }
     default: break;
     }
     a_error("TypeError", "'%s' object is not subscriptable", tname(o));

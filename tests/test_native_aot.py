@@ -214,3 +214,50 @@ def test_redis_native(tmp_path):
 def test_postgres_native(tmp_path):
     prog = open(os.path.join(HERE, "native_net", "postgres.apsi"), encoding="utf-8").read().replace("PG_URL", os.environ["APSI_TEST_PG_URL"])
     _native_matches_host(tmp_path, prog, "pg_client")
+
+
+def _dicom_bytes(rows, cols, pixels, z=0.0, inst=1, signed=True):
+    """A small uncompressed DICOM file (explicit VR little endian), as scanners write them."""
+    import struct
+
+    def el(g, e, vr, val):
+        if isinstance(val, str):
+            val = val.encode("latin-1")
+            if len(val) % 2:
+                val += b" "
+        if vr in (b"OB", b"OW", b"SQ", b"UN", b"UT"):
+            return struct.pack("<HH", g, e) + vr + b"\0\0" + struct.pack("<I", len(val)) + val
+        return struct.pack("<HH", g, e) + vr + struct.pack("<H", len(val)) + val
+    ts = el(0x0002, 0x0010, b"UI", "1.2.840.10008.1.2.1\0")
+    meta = el(0x0002, 0x0000, b"UL", struct.pack("<I", len(ts))) + ts
+    body = (el(0x0008, 0x0060, b"CS", "CT") + el(0x0010, 0x0010, b"PN", "Doe^Jane") +
+            el(0x0018, 0x0050, b"DS", "2.5") + el(0x0020, 0x0013, b"IS", str(inst)) +
+            el(0x0020, 0x0032, b"DS", f"0\\0\\{z}") + el(0x0020, 0x0037, b"DS", "1\\0\\0\\0\\1\\0") +
+            el(0x0028, 0x0002, b"US", struct.pack("<H", 1)) + el(0x0028, 0x0010, b"US", struct.pack("<H", rows)) +
+            el(0x0028, 0x0011, b"US", struct.pack("<H", cols)) + el(0x0028, 0x0030, b"DS", "0.7\\0.7") +
+            el(0x0028, 0x0100, b"US", struct.pack("<H", 16)) + el(0x0028, 0x0101, b"US", struct.pack("<H", 12)) +
+            el(0x0028, 0x0103, b"US", struct.pack("<H", 1 if signed else 0)) +
+            el(0x0028, 0x1050, b"DS", "40") + el(0x0028, 0x1051, b"DS", "400") +
+            el(0x0028, 0x1052, b"DS", "-1024") + el(0x0028, 0x1053, b"DS", "1") +
+            el(0x7FE0, 0x0010, b"OW", struct.pack("<%dh" % len(pixels), *pixels)))
+    return b"\0" * 128 + b"DICM" + meta + body
+
+
+@pytest.mark.skipif(CC is None, reason="no C compiler")
+def test_dicom_native(tmp_path):
+    (tmp_path / "one.dcm").write_bytes(_dicom_bytes(3, 4, [0, 100, 2047, -2048, 5, 6, 7, 8, 1000, 1100, 1200, 4095]))
+    series = tmp_path / "series"
+    series.mkdir()
+    for k, z in enumerate([5.0, 0.0, 2.5]):
+        (series / f"s{k}.dcm").write_bytes(_dicom_bytes(2, 2, [k, k + 1, k + 2, k + 3], z=z, inst=k + 1))
+    prog = f'''use medical as m
+let d = m.read_dicom("{(tmp_path / 'one.dcm').as_posix()}")
+print(d.rows, d.columns, d.modality, d.pixel_spacing, d.slice_thickness, d.window_center, d.rescale_intercept, d.bits_stored)
+print(d.pixels)
+let d2 = m.read_dicom("{(tmp_path / 'one.dcm').as_posix()}", include_identifiers=true)
+print(d2.patient_name)
+let s = m.read_dicom_series("{series.as_posix()}")
+print(s.count, s.spacing, s.positions, s.volume[:, 0, 0])
+print(m.window_level(d.pixels, 40, 400))
+'''
+    _native_matches_host(tmp_path, prog, "dicom")

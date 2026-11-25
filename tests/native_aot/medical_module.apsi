@@ -1,0 +1,58 @@
+use medical as m
+
+fn r6(x) = round(float(x), 6) + 0.0
+fn rl(t) = [round(float(v), 6) + 0.0 for v in t]
+fn rr(rec, keys) = [r6(rec[k]) if not isinstance(rec[k], list) else rl(rec[k]) for k in keys]
+
+print(rl(m.pk_one_compartment(100, 10, tensor([0.0, 1.0, 2.0, 6.0]), CL=2)), r6(m.pk_one_compartment(100, 10, 3.0, ke=0.3)))
+print(rl(m.pk_one_compartment(100, 10, tensor([0.5, 2.0, 8.0]), ke=0.2, route="oral", ka=1.1, F=0.8, tau=6, doses=2)))
+print(rl(m.pk_one_compartment(100, 10, tensor([0.5, 2.0, 8.0]), ke=0.2, route="infusion", infusion_time=1.0)))
+let p2 = m.pk_two_compartment(100, 5, 0.3, 0.5, 0.2, tensor([0.0, 1.0, 5.0]))
+print(rl(p2.c), r6(p2.alpha), r6(p2.beta), r6(p2.t_half_beta))
+let tt = tensor([0.0, 0.5, 1.0, 2.0, 4.0, 6.0, 8.0, 12.0, 24.0])
+let cc = tensor([0.0, 4.1, 6.3, 7.2, 5.9, 4.4, 3.2, 1.8, 0.35])
+let nc = m.nca(tt, cc, dose=100)
+print(r6(nc.cmax), r6(nc.tmax), r6(nc.auc_last), r6(nc.auc_inf), r6(nc.lambda_z), nc.lambda_z_points, r6(nc.t_half), r6(nc.cl), r6(nc.vz), r6(nc.mrt), r6(nc.auc_extrap_percent))
+let s = m.sir(0.3, 0.1, 990, 10, days=100, dt=0.5)
+print(r6(s.peak_day), r6(s.peak_infected), r6(s.attack_rate), r6(s.R0), shape(s.S))
+let se = m.seir(0.4, 0.2, 0.1, 990, 5, 5, days=120, dt=0.5)
+print(r6(se.peak_day), r6(se.peak_infected), r6(se.attack_rate))
+print(r6(m.final_size(2.5)), m.final_size(0.8))
+let ir = m.incidence_rate(12, 1500.0, per=1000)
+print(r6(ir.rate), rl(ir.ci))
+print(rr(m.risk_measures(30, 70, 15, 85), ["rr", "rr_ci", "odds_ratio", "or_ci", "rd", "rd_ci", "nnt", "nnt_ci", "attributable_fraction"]))
+print(rr(m.mantel_haenszel([[[10, 20], [5, 25]], [[8, 12], [6, 14]], [[15, 30], [9, 40]]]), ["odds_ratio", "or_ci", "rr", "rr_ci", "cmh_statistic", "p"]))
+print(rr(m.diagnostic_metrics(90, 15, 10, 185), ["sensitivity", "sensitivity_ci", "specificity", "ppv", "npv_ci", "lr_positive", "lr_positive_ci", "lr_negative", "dor", "dor_ci", "youden", "f1"]))
+let sc = tensor([0.9, 0.8, 0.75, 0.7, 0.6, 0.55, 0.5, 0.4, 0.3, 0.2, 0.8, 0.35])
+let lb = tensor([1, 1, 0, 1, 1, 0, 0, 1, 0, 0, 1, 0])
+let ro = m.roc(sc, lb)
+print(r6(ro.auc), r6(ro.auc_se), rl(ro.auc_ci), r6(ro.youden_threshold), rl(ro.fpr), rl(ro.tpr))
+print(rr(m.roc_compare(sc, sc * sc + tensor([0.1, 0.0, 0.2, 0.0, 0.0, 0.1, 0.0, 0.0, 0.3, 0.0, 0.0, 0.0]), lb), ["auc1", "auc2", "z", "p"]))
+print(rr(m.cohen_kappa(["a", "b", "a", "c", "b", "a", "a", "c"], ["a", "b", "b", "c", "b", "a", "c", "c"]), ["kappa", "se", "ci", "observed", "expected"]))
+print(r6(m.brier_score(tensor([0.9, 0.2, 0.7]), tensor([1, 0, 0]))))
+let time = tensor([5.0, 8.0, 8.0, 12.0, 15.0, 20.0, 22.0, 30.0, 31.0, 40.0])
+let ev = tensor([1, 1, 0, 1, 0, 1, 1, 0, 1, 0])
+let km = m.kaplan_meier(time, ev)
+print(rl(km.survival), rl(km.se), km.at_risk, r6(km.median), rl(km.ci[:, 0]))
+let grp = ["a", "b", "a", "b", "a", "b", "a", "b", "a", "b"]
+print(rr(m.logrank(time, ev, grp), ["statistic", "p"]), rl(m.logrank(time, ev, grp).expected))
+let X = tensor([[1.0, 0.5], [0.0, 1.5], [1.0, 2.0], [0.0, 0.2], [1.0, 1.1], [0.0, 0.7], [1.0, 3.0], [0.0, 2.2], [1.0, 0.1], [0.0, 1.9]])
+let cx = m.cox_ph(time, ev, X, names=["treat", "dose"])
+print(rl(cx.params), rl(cx.se), rl(cx.p), r6(cx.loglik), r6(cx.lr_statistic), r6(cx.concordance), cx.iterations, rl(cx.hazard_ratio))
+print(r6(m.concordance_index(time, tensor([3.0, 2.0, 2.5, 1.0, 1.5, 0.5, 0.8, 0.2, 0.4, 0.1]), ev)))
+print(r6(m.bmi(70, 1.75)), r6(m.bmi(70[kg], 175[cm])), r6(m.bsa(70, 175)), r6(m.bsa(70, 175, method="dubois")))
+print(r6(m.egfr_ckd_epi_2021(1.1, 60, "female")), r6(m.egfr_ckd_epi_2021(0.8, 40, "male")), r6(m.cockcroft_gault(60, 70, 1.0, "f")))
+print(r6(m.qtc(400, rr=0.8)), r6(m.qtc(400, hr=75, method="bazett")), r6(m.qtc(400, rr=0.8, method="framingham")), r6(m.qtc(400, hr=75, method="hodges")))
+print(r6(m.mean_arterial_pressure(120, 80)), r6(m.ideal_body_weight(180, "m")), r6(m.anion_gap(140, 104, 24, potassium=4)))
+var ecg = []
+for i in range(2000):
+    let tm = i / 250.0
+    let ph = (tm % 0.8) / 0.8
+    ecg.append(exp(-((ph - 0.3) ** 2) / 0.0004) + 0.1 * sin(2 * pi * 1.3 * tm))
+let rp = m.ecg_rpeaks(tensor(ecg), 250)
+print(rp.indices, rl(rp.rr), r6(rp.mean_heart_rate))
+let rrs = tensor([0.8 + 0.05 * sin(i * 0.7) for i in range(100)])
+let hv = m.hrv(rrs)
+print(rr(hv, ["mean_rr", "sdnn", "rmssd", "sdsd", "pnn50", "mean_hr", "lf", "hf", "lf_hf"]))
+print(rl(m.window_level(tensor([-1000.0, 0.0, 40.0, 240.0, 1000.0]), 40, 400)))
+print(m.DISCLAIMER)

@@ -1,0 +1,1170 @@
+# use medical: computation for medical and health research in native programs, the same methods and results as
+# apsi run: pharmacokinetics, epidemic models and epidemiology, diagnostic accuracy, survival analysis, clinical
+# formulas, ECG and heart-rate variability, and DICOM images.
+# For research and education. Not a medical device; do not use on its own to make decisions about the care of a
+# patient.
+use stats as _st
+use signal as _dsp
+use linalg as _la
+use sci as _sci
+
+let DISCLAIMER = "For research and education. Not a medical device; do not use on its own to make decisions about the care of a patient."
+
+fn _isq(x) = __unit_str(x) != none
+fn _v(x):
+    let p = si_magnitude(x)
+    return tensor(p, f64) if isinstance(p, list) or ndim(p) > 0 else float(p)
+fn _vec(x):
+    let p = si_magnitude(x)
+    return reshape(tensor(p, f64), -1) if isinstance(p, list) or ndim(p) > 0 else tensor([float(p)])
+fn _s(x) = float(si_magnitude(x))
+fn _out(r) = float(r) if ndim(r) == 0 else r
+fn _z(level) = __special("ndtri", (1 + float(level)) / 2)
+fn _phi(z) = 0.5 * erfc(-z / sqrt(2.0))
+fn _isfin(x) = x == x and x != inf and x != -inf
+fn _sumv(t):
+    var s = 0.0
+    for v in t:
+        s = s + float(v)
+    return s
+
+# =================================================================== pharmacokinetics
+fn pk_one_compartment(dose, V, t, CL=none, ke=none, route="iv", ka=none, F=1.0, tau=none, doses=1, infusion_time=none):
+    let D = _s(dose)
+    let Vd = _s(V)
+    let tt = _v(t)
+    var k = 0.0
+    if ke == none:
+        if CL == none:
+            raise RuntimeError("give CL or ke")
+        k = _s(CL) / Vd
+    else:
+        k = _s(ke)
+    let n = int(doses)
+    let T = _s(tau) if tau != none else 0.0
+    if n > 1 and T <= 0:
+        raise RuntimeError("repeated dosing needs tau > 0")
+    var c = zeros_like(tt * 1.0) if ndim(tt) > 0 else 0.0
+    for i in range(n):
+        let s = tt - i * T
+        let on = s >= 0
+        let sv = where(on, s, zeros_like(s)) if ndim(tt) > 0 else (s if s >= 0 else 0.0)
+        var ci = none
+        if route == "iv":
+            ci = D / Vd * exp(-k * sv)
+        elif route == "infusion":
+            let Ti = _s(infusion_time) if infusion_time != none else none
+            if not Ti or Ti <= 0:
+                raise RuntimeError("infusion needs infusion_time > 0")
+            let R = D / Ti
+            let up = R / (k * Vd) * (1 - exp(-k * sv))
+            let down = R / (k * Vd) * (1 - exp(-k * Ti)) * exp(-k * (sv - Ti))
+            ci = where(sv <= Ti, up, down) if ndim(tt) > 0 else (up if sv <= Ti else down)
+        elif route == "oral":
+            if ka == none:
+                raise RuntimeError("oral dosing needs ka")
+            let a = _s(ka)
+            let f = float(F)
+            if abs(a - k) < 1e-12 * max(a, k):
+                ci = f * D * k * sv * exp(-k * sv) / Vd
+            else:
+                ci = f * D * a / (Vd * (a - k)) * (exp(-k * sv) - exp(-a * sv))
+        else:
+            raise RuntimeError("route must be \"iv\", \"infusion\" or \"oral\"")
+        c = c + (where(on, ci, zeros_like(ci)) if ndim(tt) > 0 else (ci if on else 0.0))
+    return _out(c)
+
+fn pk_two_compartment(dose, V1, k10, k12, k21, t):
+    let D = _s(dose)
+    let V = _s(V1)
+    let a10 = _s(k10)
+    let a12 = _s(k12)
+    let a21 = _s(k21)
+    let tt = _v(t)
+    let s = a10 + a12 + a21
+    let disc = sqrt(s * s - 4 * a10 * a21)
+    let al = (s + disc) / 2
+    let be = (s - disc) / 2
+    let A = D / V * (al - a21) / (al - be)
+    let B = D / V * (a21 - be) / (al - be)
+    let c = A * exp(-al * tt) + B * exp(-be * tt)
+    return record(c=_out(c), alpha=al, beta=be, A=A, B=B, t_half_alpha=log(2.0) / al, t_half_beta=log(2.0) / be)
+
+fn _lambda_z(t, c, tmax_index, npoints=none):
+    var idx = []
+    for i in range(tmax_index + 1, len(t)):
+        if c[i] > 0:
+            idx.append(i)
+    if len(idx) < 3:
+        return none
+    var best = none
+    let choices = [int(npoints)] if npoints else list(range(3, len(idx) + 1))
+    for n in choices:
+        let sel = idx[len(idx) - n:]
+        let x = [t[i] for i in sel]
+        let y = [log(c[i]) for i in sel]
+        let A = tensor([[1.0, xv] for xv in x])
+        let coef = _la.lstsq(A, tensor(y))
+        let cf = coef[0] if isinstance(coef, tuple) or isinstance(coef, list) else coef
+        let b0 = float(cf[0])
+        let b1 = float(cf[1])
+        if b1 >= 0:
+            continue
+        var ss = 0.0
+        var rr = 0.0
+        let my = sum(y) / n
+        for q in range(n):
+            let res = y[q] - (b0 + b1 * x[q])
+            rr = rr + res * res
+            ss = ss + (y[q] - my) ** 2
+        let r2 = 1 - rr / ss if ss > 0 else 1.0
+        let adj = 1 - (1 - r2) * (n - 1) / (n - 2)
+        if best == none or adj > best[0] + 1e-4 or (abs(adj - best[0]) <= 1e-4 and n > best[3]):
+            best = [adj, -b1, r2, n, sel[0]]
+    return best
+
+fn nca(t, c, dose=none, route="extravascular", lambda_points=none):
+    let tt = [float(v) for v in _vec(t)]
+    let cc = [float(v) for v in _vec(c)]
+    let n = len(tt)
+    if n != len(cc) or n < 3:
+        raise RuntimeError("nca needs matching time and concentration arrays (at least 3 points)")
+    for i in range(n - 1):
+        if tt[i + 1] - tt[i] <= 0:
+            raise RuntimeError("times must be increasing")
+    var imax = 0
+    for i in range(n):
+        if cc[i] > cc[imax]:
+            imax = i
+    var auc = 0.0
+    var aumc = 0.0
+    for i in range(n - 1):
+        let dt = tt[i + 1] - tt[i]
+        let c1 = cc[i]
+        let c2 = cc[i + 1]
+        if c2 < c1 and c2 > 0 and c1 > 0 and i >= imax:
+            let k = log(c1 / c2) / dt
+            auc = auc + (c1 - c2) / k
+            aumc = aumc + (c1 * tt[i] - c2 * tt[i + 1]) / k + (c1 - c2) / k ** 2
+        else:
+            auc = auc + (c1 + c2) / 2 * dt
+            aumc = aumc + (c1 * tt[i] + c2 * tt[i + 1]) / 2 * dt
+    var last = n - 1
+    var anypos = false
+    for i in range(n):
+        if cc[i] > 0:
+            last = i
+            anypos = true
+    if not anypos:
+        last = n - 1
+    let lz = _lambda_z(tt, cc, imax, lambda_points)
+    var out = {"cmax": cc[imax], "tmax": tt[imax], "auc_last": auc, "aumc_last": aumc, "clast": cc[last], "tlast": tt[last]}
+    if lz != none:
+        let adj = lz[0]
+        let lam = lz[1]
+        let auc_inf = auc + cc[last] / lam
+        let aumc_inf = aumc + cc[last] * tt[last] / lam + cc[last] / lam ** 2
+        out["lambda_z"] = lam
+        out["lambda_z_r2"] = lz[2]
+        out["lambda_z_adj_r2"] = adj
+        out["lambda_z_points"] = lz[3]
+        out["t_half"] = log(2.0) / lam
+        out["auc_inf"] = auc_inf
+        out["aumc_inf"] = aumc_inf
+        out["auc_extrap_percent"] = 100 * (auc_inf - auc) / auc_inf
+        out["mrt"] = aumc_inf / auc_inf
+        if dose != none:
+            let D = _s(dose)
+            out["cl"] = D / auc_inf
+            out["vz"] = D / (lam * auc_inf)
+            if route == "iv":
+                out["vss"] = D / auc_inf * aumc_inf / auc_inf
+    else:
+        out["lambda_z"] = nan
+        out["t_half"] = nan
+        out["auc_inf"] = nan
+        out["note"] = "terminal phase not identifiable"
+    return record(**out)
+
+# =================================================================== epidemiology
+fn _rk4_system(f, y0, days, dt):
+    let n = int(round(_s(days) / _s(dt)))
+    let h = _s(days) / n
+    var y = tensor(y0, f64)
+    var out = [y]
+    for i in range(n):
+        let k1 = f(y)
+        let k2 = f(y + h / 2 * k1)
+        let k3 = f(y + h / 2 * k2)
+        let k4 = f(y + h * k3)
+        y = y + h / 6 * (k1 + 2 * k2 + 2 * k3 + k4)
+        out.append(y)
+    return (arange(n + 1) * h, stack(out))
+
+fn _argmax_col(Y, j):
+    var k = 0
+    let n = shape(Y)[0]
+    var best = float(Y[0, j])
+    for i in range(1, n):
+        if float(Y[i, j]) > best:
+            best = float(Y[i, j])
+            k = i
+    return k
+
+fn sir(beta, gamma, S0, I0, R0=0.0, days=160, dt=0.1):
+    let b = _s(beta)
+    let g = _s(gamma)
+    let N = _s(S0) + _s(I0) + _s(R0)
+    fn f(y):
+        let inf_ = b * float(y[0]) * float(y[1]) / N
+        return tensor([-inf_, inf_ - g * float(y[1]), g * float(y[1])])
+    let r = _rk4_system(f, [_s(S0), _s(I0), _s(R0)], days, dt)
+    let t = r[0]
+    let Y = r[1]
+    let k = _argmax_col(Y, 1)
+    let last = shape(Y)[0] - 1
+    return record(t=t, S=Y[:, 0], I=Y[:, 1], R=Y[:, 2], peak_day=float(t[k]), peak_infected=float(Y[k, 1]), R0=b / g,
+                  attack_rate=(float(Y[last, 2]) - _s(R0)) / N)
+
+fn seir(beta, sigma, gamma, S0, E0, I0, R0=0.0, days=200, dt=0.1):
+    let b = _s(beta)
+    let s_ = _s(sigma)
+    let g = _s(gamma)
+    let N = _s(S0) + _s(E0) + _s(I0) + _s(R0)
+    fn f(y):
+        let inf_ = b * float(y[0]) * float(y[2]) / N
+        return tensor([-inf_, inf_ - s_ * float(y[1]), s_ * float(y[1]) - g * float(y[2]), g * float(y[2])])
+    let r = _rk4_system(f, [_s(S0), _s(E0), _s(I0), _s(R0)], days, dt)
+    let t = r[0]
+    let Y = r[1]
+    let k = _argmax_col(Y, 2)
+    let last = shape(Y)[0] - 1
+    return record(t=t, S=Y[:, 0], E=Y[:, 1], I=Y[:, 2], R=Y[:, 3], peak_day=float(t[k]), peak_infected=float(Y[k, 2]),
+                  R0=b / g, attack_rate=(float(Y[last, 3]) - _s(R0)) / N)
+
+fn final_size(R0):
+    let r = _s(R0)
+    if r <= 1:
+        return 0.0
+    var z = 1 - exp(-r)
+    for i in range(200):
+        let g = z - 1 + exp(-r * z)
+        let d = 1 - r * exp(-r * z)
+        let z2 = z - g / d
+        if abs(z2 - z) < 1e-15:
+            return z2
+        z = z2
+    return z
+
+fn incidence_rate(cases, person_time, level=0.95, per=1.0):
+    let k = int(cases)
+    let T = _s(person_time)
+    let a = 1 - float(level)
+    let lo = 0.0 if k == 0 else float(_st.chi2(2 * k).ppf(a / 2)) / 2
+    let hi = float(_st.chi2(2 * k + 2).ppf(1 - a / 2)) / 2
+    let f = _s(per)
+    return record(rate=k / T * f, ci=[lo / T * f, hi / T * f], cases=k, person_time=T)
+
+fn risk_measures(a, b, c, d, level=0.95):
+    let A = float(a)
+    let B = float(b)
+    let C = float(c)
+    let D = float(d)
+    let z = _z(level)
+    let r1 = A / (A + B)
+    let r0 = C / (C + D)
+    let rr = r1 / r0 if r0 > 0 else inf
+    let se_lrr = sqrt(1 / A - 1 / (A + B) + 1 / C - 1 / (C + D)) if A > 0 and C > 0 else inf
+    let orr = A * D / (B * C) if B * C > 0 else inf
+    let se_lor = sqrt(1 / A + 1 / B + 1 / C + 1 / D) if min(A, B, C, D) > 0 else inf
+    let rd = r1 - r0
+    let se_rd = sqrt(r1 * (1 - r1) / (A + B) + r0 * (1 - r0) / (C + D))
+    let rd_ci = [rd - z * se_rd, rd + z * se_rd]
+    let nnt = 1 / rd if rd != 0 else inf
+    let nnt_ci = [1 / rd_ci[1], 1 / rd_ci[0]] if rd_ci[0] * rd_ci[1] > 0 else [nan, nan]
+    return record(risk_exposed=r1, risk_unexposed=r0, rr=rr, rr_ci=[rr * exp(-z * se_lrr), rr * exp(z * se_lrr)],
+                  odds_ratio=orr, or_ci=[orr * exp(-z * se_lor), orr * exp(z * se_lor)], rd=rd, rd_ci=rd_ci, nnt=nnt,
+                  nnt_ci=nnt_ci, attributable_fraction=(rr - 1) / rr if rr != 0 and rr != inf else nan)
+
+fn mantel_haenszel(tables, level=0.95):
+    let T = tensor(tables, f64)
+    if ndim(T) != 3 or shape(T)[1] != 2 or shape(T)[2] != 2:
+        raise RuntimeError("mantel_haenszel needs a list of 2×2 tables")
+    let a = T[:, 0, 0]
+    let b = T[:, 0, 1]
+    let c = T[:, 1, 0]
+    let d = T[:, 1, 1]
+    let n = a + b + c + d
+    let R = a * d / n
+    let S = b * c / n
+    let Rs = _sumv(R)
+    let Ss = _sumv(S)
+    let or_mh = Rs / Ss
+    let P = (a + d) / n
+    let Q = (b + c) / n
+    let vr = _sumv(P * R) / (2 * Rs ** 2) + _sumv(P * S + Q * R) / (2 * Rs * Ss) + _sumv(Q * S) / (2 * Ss ** 2)
+    let z = _z(level)
+    let se = sqrt(vr)
+    let n1 = a + b
+    let n0 = c + d
+    let m1 = a + c
+    let rr_num = _sumv(a * n0 / n)
+    let rr_den = _sumv(c * n1 / n)
+    let rr_mh = rr_num / rr_den
+    let var_rr = _sumv((n1 * n0 * m1 - a * c * n) / n ** 2) / (rr_num * rr_den)
+    let se_rr = sqrt(var_rr)
+    let Ea = n1 * m1 / n
+    let Va = n1 * n0 * m1 * (n - m1) / (n ** 2 * (n - 1))
+    let cmh = (abs(_sumv(a) - _sumv(Ea)) - 0.5) ** 2 / _sumv(Va)
+    return record(odds_ratio=or_mh, or_ci=[or_mh * exp(-z * se), or_mh * exp(z * se)], rr=rr_mh,
+                  rr_ci=[rr_mh * exp(-z * se_rr), rr_mh * exp(z * se_rr)], cmh_statistic=cmh,
+                  p=float(_st.chi2(1).sf(cmh)), strata=shape(T)[0])
+
+# =================================================================== diagnostic accuracy
+fn _wilson(k, n, level) = _st.proportion_ci(int(k), int(n), level) if n > 0 else [nan, nan]
+
+fn diagnostic_metrics(tp, fp, fn_, tn, level=0.95):
+    let TP = int(tp)
+    let FP = int(fp)
+    let FN = int(fn_)
+    let TN = int(tn)
+    let z = _z(level)
+    let sens = TP / (TP + FN) if TP + FN else nan
+    let spec = TN / (TN + FP) if TN + FP else nan
+    let ppv = TP / (TP + FP) if TP + FP else nan
+    let npv = TN / (TN + FN) if TN + FN else nan
+    let n = TP + FP + FN + TN
+    let lrp = sens / (1 - spec) if spec < 1 else inf
+    let lrn = (1 - sens) / spec if spec > 0 else inf
+    fn lr_ci(lr, x1, n1, x2, n2):
+        if not (x1 > 0 and x2 > 0) or not _isfin(lr):
+            return [nan, nan]
+        let se = sqrt(1 / x1 - 1 / n1 + 1 / x2 - 1 / n2)
+        return [lr * exp(-z * se), lr * exp(z * se)]
+    let dor = (TP * TN) / (FP * FN) if FP * FN else inf
+    let se_dor = sqrt(1 / TP + 1 / FP + 1 / FN + 1 / TN) if min(TP, FP, FN, TN) > 0 else inf
+    return record(sensitivity=sens, sensitivity_ci=_wilson(TP, TP + FN, level), specificity=spec,
+                  specificity_ci=_wilson(TN, TN + FP, level), ppv=ppv, ppv_ci=_wilson(TP, TP + FP, level), npv=npv,
+                  npv_ci=_wilson(TN, TN + FN, level), accuracy=(TP + TN) / n, accuracy_ci=_wilson(TP + TN, n, level),
+                  prevalence=(TP + FN) / n, lr_positive=lrp, lr_positive_ci=lr_ci(lrp, TP, TP + FN, FP, FP + TN),
+                  lr_negative=lrn, lr_negative_ci=lr_ci(lrn, FN, TP + FN, TN, FP + TN), dor=dor,
+                  dor_ci=[dor * exp(-z * se_dor), dor * exp(z * se_dor)] if _isfin(se_dor) else [nan, nan],
+                  youden=sens + spec - 1, f1=2 * TP / (2 * TP + FP + FN) if TP else 0.0)
+
+fn _midrank(x):
+    let n = len(x)
+    let order = sorted(list(range(n)), key=fn(i) => x[i])
+    var r = [0.0] * n
+    var i = 0
+    while i < n:
+        var j = i
+        while j + 1 < n and x[order[j + 1]] == x[order[i]]:
+            j = j + 1
+        for k in range(i, j + 1):
+            r[order[k]] = (i + j) / 2 + 1
+        i = j + 1
+    return r
+
+fn _delong(scores, y):
+    var pos = []
+    var neg = []
+    for i in range(len(scores)):
+        if y[i] == 1:
+            pos.append(scores[i])
+        else:
+            neg.append(scores[i])
+    let m = len(pos)
+    let n = len(neg)
+    let tz = _midrank(pos + neg)
+    let tx = _midrank(pos)
+    let ty = _midrank(neg)
+    var s = 0.0
+    for i in range(m):
+        s = s + tz[i]
+    let auc = (s - m * (m + 1) / 2) / (m * n)
+    let v10 = [(tz[i] - tx[i]) / n for i in range(m)]
+    let v01 = [1 - (tz[m + i] - ty[i]) / m for i in range(n)]
+    return [auc, v10, v01]
+
+fn _var1(v):
+    let n = len(v)
+    let m = sum(v) / n
+    var s = 0.0
+    for x in v:
+        s = s + (x - m) ** 2
+    return s / (n - 1)
+
+fn _cov(a, b):
+    let n = len(a)
+    let ma = sum(a) / n
+    let mb = sum(b) / n
+    var s = 0.0
+    for i in range(n):
+        s = s + (a[i] - ma) * (b[i] - mb)
+    return s / (n - 1)
+
+fn roc(scores, labels, level=0.95):
+    let s = [float(v) for v in _vec(scores)]
+    let y = [float(v) for v in _vec(labels)]
+    var bad = len(s) != len(y)
+    var has0 = false
+    var has1 = false
+    for v in y:
+        if v == 0:
+            has0 = true
+        elif v == 1:
+            has1 = true
+        else:
+            bad = true
+    if bad or not has0 or not has1:
+        raise RuntimeError("roc needs scores and 0/1 labels of the same length, with both classes present")
+    let order = sorted(list(range(len(s))), key=fn(i) => -s[i])
+    let ss = [s[i] for i in order]
+    let yy = [y[i] for i in order]
+    var distinct = []
+    for i in range(len(ss) - 1):
+        if ss[i + 1] - ss[i] != 0:
+            distinct.append(i)
+    distinct.append(len(ss) - 1)
+    var cum = []
+    var acc = 0.0
+    for v in yy:
+        acc = acc + v
+        cum.append(acc)
+    let P = acc
+    let N = len(yy) - acc
+    var tpr = [0.0]
+    var fpr = [0.0]
+    var thr = [inf]
+    for k in distinct:
+        tpr.append(cum[k] / P)
+        fpr.append((k + 1 - cum[k]) / N)
+        thr.append(ss[k])
+    let dl = _delong(s, [int(v) for v in y])
+    let auc = dl[0]
+    let se = sqrt(_var1(dl[1]) / len(dl[1]) + _var1(dl[2]) / len(dl[2]))
+    let z = _z(level)
+    var j = 0
+    for i in range(len(tpr)):
+        if tpr[i] - fpr[i] > tpr[j] - fpr[j]:
+            j = i
+    return record(fpr=tensor(fpr), tpr=tensor(tpr), thresholds=tensor(thr), auc=auc, auc_se=se,
+                  auc_ci=[max(0.0, auc - z * se), min(1.0, auc + z * se)], youden_threshold=thr[j],
+                  youden_sensitivity=tpr[j], youden_specificity=1 - fpr[j])
+
+fn roc_compare(scores1, scores2, labels):
+    let y = [int(v) for v in _vec(labels)]
+    let d1 = _delong([float(v) for v in _vec(scores1)], y)
+    let d2 = _delong([float(v) for v in _vec(scores2)], y)
+    let m = len(d1[1])
+    let n = len(d1[2])
+    let S00 = _cov(d1[1], d1[1]) / m + _cov(d1[2], d1[2]) / n
+    let S11 = _cov(d2[1], d2[1]) / m + _cov(d2[2], d2[2]) / n
+    let S01 = _cov(d1[1], d2[1]) / m + _cov(d1[2], d2[2]) / n
+    let vr = S00 + S11 - 2 * S01
+    let zs = (d1[0] - d2[0]) / sqrt(vr) if vr > 0 else 0.0
+    return record(auc1=d1[0], auc2=d2[0], difference=d1[0] - d2[0], z=zs, p=2 * _phi(-abs(zs)), test="DeLong paired AUC test")
+
+fn cohen_kappa(a, b, level=0.95):
+    let x = list(a.tolist() if str(type(a)).startswith("Tensor") else a)
+    let y = list(b.tolist() if str(type(b)).startswith("Tensor") else b)
+    if len(x) != len(y):
+        raise RuntimeError("both raters must rate the same items")
+    var seen = {}
+    for v in x + y:
+        seen[v] = true
+    let cats = sorted(list(seen.keys()), key=fn(v) => str(v))
+    let k = len(cats)
+    var ix = {}
+    for i in range(k):
+        ix[cats[i]] = i
+    var M = [[0.0] * k for i in range(k)]
+    for i in range(len(x)):
+        M[ix[x[i]]][ix[y[i]]] = M[ix[x[i]]][ix[y[i]]] + 1
+    let n = float(len(x))
+    let p = [[M[i][j] / n for j in range(k)] for i in range(k)]
+    var po = 0.0
+    for i in range(k):
+        po = po + p[i][i]
+    let r = [sum(p[i]) for i in range(k)]
+    let c = [sum([p[i][j] for i in range(k)]) for j in range(k)]
+    var pe = 0.0
+    for i in range(k):
+        pe = pe + r[i] * c[i]
+    let kappa = (po - pe) / (1 - pe)
+    var term1 = 0.0
+    for i in range(k):
+        term1 = term1 + p[i][i] * (1 - (r[i] + c[i]) * (1 - kappa)) ** 2
+    var t2 = 0.0
+    for i in range(k):
+        for j in range(k):
+            if i != j:
+                t2 = t2 + p[i][j] * (c[i] + r[j]) ** 2
+    let term2 = (1 - kappa) ** 2 * t2
+    let term3 = (kappa - pe * (1 - kappa)) ** 2
+    let se = sqrt(max(term1 + term2 - term3, 0.0) / (n * (1 - pe) ** 2))
+    let z = _z(level)
+    return record(kappa=kappa, se=se, ci=[kappa - z * se, kappa + z * se], observed=po, expected=pe)
+
+fn brier_score(prob, outcome):
+    let p = _vec(prob)
+    let y = _vec(outcome)
+    return float(mean((p - y) ** 2))
+
+# =================================================================== survival analysis
+fn _uniq(v) = sorted(list(set(v)))
+
+fn kaplan_meier(time, event, level=0.95):
+    let t = [float(v) for v in _vec(time)]
+    let e = [float(v) for v in _vec(event)]
+    if len(t) != len(e):
+        raise RuntimeError("time and event must have the same length")
+    let times = _uniq(t)
+    var at_risk = []
+    var events = []
+    var cens = []
+    var surv = []
+    var ses = []
+    var lo = []
+    var hi = []
+    var S = 1.0
+    var V = 0.0
+    let z = _z(level)
+    for u in times:
+        var n = 0
+        var d = 0
+        var c = 0
+        for i in range(len(t)):
+            if t[i] >= u:
+                n = n + 1
+            if t[i] == u:
+                if e[i] == 1:
+                    d = d + 1
+                elif e[i] == 0:
+                    c = c + 1
+        if d:
+            S = S * (1 - d / n)
+            V = V + (d / (n * (n - d)) if n > d else inf)
+        at_risk.append(n)
+        events.append(d)
+        cens.append(c)
+        surv.append(S)
+        ses.append(S * sqrt(V) if _isfin(V) else nan)
+        if 0 < S and S < 1 and _isfin(V):
+            let lls = log(-log(S))
+            let se_l = sqrt(V) / abs(log(S))
+            lo.append(exp(-exp(lls + z * se_l)))
+            hi.append(exp(-exp(lls - z * se_l)))
+        else:
+            lo.append(S if S == 1 else 0.0)
+            hi.append(S if S == 1 else (1.0 if S > 0 else 0.0))
+    var median = inf
+    for i in range(len(surv)):
+        if surv[i] <= 0.5:
+            median = times[i]
+            break
+    return record(times=tensor(times), at_risk=tensor(at_risk, "int64"), events=tensor(events, "int64"),
+                  censored=tensor(cens, "int64"), survival=tensor(surv), se=tensor(ses),
+                  ci=stack([tensor(lo), tensor(hi)], axis=1), median=median)
+
+fn logrank(time, event, group):
+    let t = [float(v) for v in _vec(time)]
+    let e = [float(v) for v in _vec(event)]
+    let g = list(group.tolist() if str(type(group)).startswith("Tensor") else group)
+    var seen = {}
+    for x in g:
+        seen[x] = true
+    let labels = sorted(list(seen.keys()), key=fn(v) => str(v))
+    let k = len(labels)
+    if k < 2:
+        raise RuntimeError("logrank needs at least two groups")
+    var gi = {}
+    for i in range(k):
+        gi[labels[i]] = i
+    var O = [0.0] * k
+    var E = [0.0] * k
+    var Vm = [[0.0] * k for i in range(k)]
+    var evt = []
+    for i in range(len(t)):
+        if e[i] == 1:
+            evt.append(t[i])
+    for u in _uniq(evt):
+        var nj = [0.0] * k
+        var dj = [0.0] * k
+        var n = 0.0
+        var d = 0.0
+        for i in range(len(t)):
+            if t[i] >= u:
+                n = n + 1
+                nj[gi[g[i]]] = nj[gi[g[i]]] + 1
+            if t[i] == u and e[i] == 1:
+                d = d + 1
+                dj[gi[g[i]]] = dj[gi[g[i]]] + 1
+        for j in range(k):
+            O[j] = O[j] + dj[j]
+            E[j] = E[j] + d * nj[j] / n
+        if n > 1:
+            let f = d * (n - d) / (n * n * (n - 1))
+            for a in range(k):
+                for b in range(k):
+                    Vm[a][b] = Vm[a][b] + f * ((nj[a] * n if a == b else 0.0) - nj[a] * nj[b])
+    let diff = tensor([O[j] - E[j] for j in range(k - 1)])
+    let Vs = tensor([[Vm[a][b] for b in range(k - 1)] for a in range(k - 1)])
+    let stat = float(sum(diff * _la.solve(Vs, diff)))
+    return record(statistic=stat, p=float(_st.chi2(k - 1).sf(stat)), df=k - 1, observed=tensor(O), expected=tensor(E),
+                  groups=labels, test="log-rank")
+
+fn cox_ph(time, event, X, names=none, level=0.95, max_iter=50):
+    let t0 = [float(v) for v in _vec(time)]
+    let e0 = [float(v) for v in _vec(event)]
+    var Z0 = _v(X)
+    if ndim(Z0) == 1:
+        Z0 = reshape(Z0, -1, 1)
+    let n = shape(Z0)[0]
+    let p = shape(Z0)[1]
+    let nm = list(names) if names != none else [f"x{i + 1}" for i in range(p)]
+    let order = sorted(list(range(n)), key=fn(i) => -t0[i])
+    let t = [t0[i] for i in order]
+    let e = [e0[i] for i in order]
+    let Zl = Z0.tolist()
+    let Z = [[float(v) for v in Zl[i]] for i in order]
+    var mu = [0.0] * p
+    for row in Z:
+        for j in range(p):
+            mu[j] = mu[j] + row[j] / n
+    let Zc = [[row[j] - mu[j] for j in range(p)] for row in Z]
+    fn loglik(beta):
+        let eta = [sum([Zc[i][j] * beta[j] for j in range(p)]) for i in range(n)]
+        let w = [exp(v) for v in eta]
+        var ll = 0.0
+        var g = [0.0] * p
+        var Hm = [[0.0] * p for i in range(p)]
+        var rs = 0.0
+        var rz = [0.0] * p
+        var rzz = [[0.0] * p for i in range(p)]
+        var i = 0
+        while i < n:
+            var j = i
+            while j < n and t[j] == t[i]:
+                j = j + 1
+            for k in range(i, j):
+                rs = rs + w[k]
+                for a in range(p):
+                    rz[a] = rz[a] + w[k] * Zc[k][a]
+                    for b in range(p):
+                        rzz[a][b] = rzz[a][b] + w[k] * Zc[k][a] * Zc[k][b]
+            var ds = []
+            for k in range(i, j):
+                if e[k] == 1:
+                    ds.append(k)
+            let d = len(ds)
+            if d:
+                var ts = 0.0
+                var tz = [0.0] * p
+                var tzz = [[0.0] * p for q in range(p)]
+                for k in ds:
+                    ts = ts + w[k]
+                    ll = ll + eta[k]
+                    for a in range(p):
+                        tz[a] = tz[a] + w[k] * Zc[k][a]
+                        g[a] = g[a] + Zc[k][a]
+                        for b in range(p):
+                            tzz[a][b] = tzz[a][b] + w[k] * Zc[k][a] * Zc[k][b]
+                for l in range(d):
+                    let f = l / d
+                    let s0 = rs - f * ts
+                    let s1 = [rz[a] - f * tz[a] for a in range(p)]
+                    ll = ll - log(s0)
+                    for a in range(p):
+                        g[a] = g[a] - s1[a] / s0
+                        for b in range(p):
+                            Hm[a][b] = Hm[a][b] - ((rzz[a][b] - f * tzz[a][b]) / s0 - s1[a] * s1[b] / s0 ** 2)
+            i = j
+        return [ll, g, Hm]
+    fn step_of(Hm, g):
+        var st_ = none
+        try:
+            st_ = [float(v) for v in _la.solve(-tensor(Hm), tensor(g))]
+        except Exception:
+            st_ = none
+        if st_ == none or not all([_isfin(v) for v in st_]):
+            raise RuntimeError("cox_ph: the likelihood has no finite maximum (a covariate separates events from non-events, so a hazard ratio is 0 or infinite); remove or combine that covariate, or use a penalized model")
+        return st_
+    var beta = [0.0] * p
+    var r = loglik(beta)
+    let ll0 = r[0]
+    var ll = ll0
+    var g = r[1]
+    var Hm = r[2]
+    var it = 0
+    for itn in range(int(max_iter)):
+        it = itn
+        var step = step_of(Hm, g)
+        var nb = [beta[a] + step[a] for a in range(p)]
+        var nr = loglik(nb)
+        var half = 0
+        while nr[0] < ll - 1e-12 and half < 30:
+            step = [v / 2 for v in step]
+            nb = [beta[a] + step[a] for a in range(p)]
+            nr = loglik(nb)
+            half = half + 1
+        beta = nb
+        g = nr[1]
+        Hm = nr[2]
+        let conv = abs(nr[0] - ll) < 1e-12 * (1 + abs(nr[0]))
+        ll = nr[0]
+        var mx = 0.0
+        for v in step:
+            mx = max(mx, abs(v))
+        if conv and mx < 1e-9:
+            break
+    var bmax = 0.0
+    for v in beta:
+        bmax = max(bmax, abs(v))
+    if bmax > 30:
+        raise RuntimeError("cox_ph: the likelihood has no finite maximum (a covariate separates events from non-events, so a hazard ratio is 0 or infinite); remove or combine that covariate")
+    let cov = _la.inv(-tensor(Hm))
+    let bt = tensor(beta)
+    let se = tensor([sqrt(float(cov[a, a])) for a in range(p)])
+    let zv = bt / se
+    let pv = tensor([2 * _phi(-abs(float(v))) for v in zv])
+    let zq = _z(level)
+    let lr = 2 * (ll - ll0)
+    let risk = [sum([Z[i][j] * beta[j] for j in range(p)]) for i in range(n)]
+    var coef = {}
+    for a in range(p):
+        coef[nm[a]] = beta[a]
+    return record(coef=record(**coef), params=bt, se=se, z=zv, p=pv, hazard_ratio=exp(bt),
+                  hr_ci=exp(stack([bt - zq * se, bt + zq * se], axis=1)), names=nm, loglik=ll, loglik_null=ll0,
+                  lr_statistic=lr, lr_p=float(_st.chi2(p).sf(lr)), concordance=concordance_index(tensor(t), tensor(risk), tensor(e)),
+                  cov=cov, iterations=it + 1, test="Cox proportional hazards (Efron ties)")
+
+fn concordance_index(time, risk, event, higher_is_worse=true):
+    let t = [float(v) for v in _vec(time)]
+    var r = [float(v) for v in _vec(risk)]
+    let e = [float(v) for v in _vec(event)]
+    if not higher_is_worse:
+        r = [-v for v in r]
+    var num = 0.0
+    var den = 0.0
+    for i in range(len(t)):
+        if e[i] != 1:
+            continue
+        for j in range(len(t)):
+            if t[j] > t[i] or (t[j] == t[i] and e[j] == 0):
+                den = den + 1
+                if r[i] > r[j]:
+                    num = num + 1
+                elif r[i] == r[j]:
+                    num = num + 0.5
+    return num / den if den else nan
+
+# =================================================================== clinical formulas
+fn _kg(x) = _s(x)
+fn _cm(x) = _s(x) * 100 if _isq(x) else _s(x)
+
+fn bmi(weight, height):
+    let h = _s(height)
+    if not _isq(height) and h > 3:
+        raise RuntimeError("height must be in metres (or give a quantity such as 175cm)")
+    return _kg(weight) / (h * h)
+
+fn bsa(weight, height, method="mosteller"):
+    let w = _kg(weight)
+    let hcm = _cm(height)
+    if method == "mosteller":
+        return sqrt(w * hcm / 3600)
+    if method == "dubois":
+        return 0.007184 * w ** 0.425 * hcm ** 0.725
+    raise RuntimeError("method must be \"mosteller\" or \"dubois\"")
+
+fn _female(sex) = str(sex).lower() in ["f", "female", "woman"]
+
+fn egfr_ckd_epi_2021(creatinine, age, sex):
+    let scr = _s(creatinine)
+    let a = _s(age)
+    let fem = _female(sex)
+    if not (str(sex).lower() in ["f", "female", "woman", "m", "male", "man"]):
+        raise RuntimeError("sex must be \"female\" or \"male\"")
+    let k = 0.7 if fem else 0.9
+    let al = -0.241 if fem else -0.302
+    return 142 * min(scr / k, 1) ** al * max(scr / k, 1) ** -1.2 * 0.9938 ** a * (1.012 if fem else 1.0)
+
+fn cockcroft_gault(age, weight, creatinine, sex) = (140 - _s(age)) * _kg(weight) / (72 * _s(creatinine)) * (0.85 if _female(sex) else 1.0)
+
+fn qtc(qt, rr=none, hr=none, method="fridericia"):
+    let q = _s(qt) * (1000 if _isq(qt) else 1)
+    if rr == none and hr == none:
+        raise RuntimeError("give rr (s) or hr (bpm)")
+    let r = _s(rr) if rr != none else 60.0 / _s(hr)
+    let h = 60.0 / r
+    if method == "bazett":
+        return q / sqrt(r)
+    if method == "fridericia":
+        return q / r ** (1 / 3)
+    if method == "framingham":
+        return q + 154 * (1 - r)
+    if method == "hodges":
+        return q + 1.75 * (h - 60)
+    raise RuntimeError("method must be \"bazett\", \"fridericia\", \"framingham\" or \"hodges\"")
+
+fn mean_arterial_pressure(systolic, diastolic) = _s(diastolic) + (_s(systolic) - _s(diastolic)) / 3
+
+fn ideal_body_weight(height, sex):
+    let inches = _cm(height) / 2.54
+    return (45.5 if _female(sex) else 50.0) + 2.3 * (inches - 60)
+
+fn anion_gap(sodium, chloride, bicarbonate, potassium=none) = _s(sodium) + (_s(potassium) if potassium != none else 0.0) - _s(chloride) - _s(bicarbonate)
+
+# =================================================================== physiological signals
+fn _percentile(v, q):
+    let s = sorted(v)
+    let pos = (len(s) - 1) * q / 100
+    let lo = int(floor(pos))
+    let hi = min(lo + 1, len(s) - 1)
+    return s[lo] + (s[hi] - s[lo]) * (pos - lo)
+
+fn _median(v) = _percentile(v, 50)
+
+fn _gradient(y):
+    let n = len(y)
+    var g = [0.0] * n
+    if n < 2:
+        return g
+    g[0] = y[1] - y[0]
+    g[n - 1] = y[n - 1] - y[n - 2]
+    for i in range(1, n - 1):
+        g[i] = (y[i + 1] - y[i - 1]) / 2
+    return g
+
+fn ecg_rpeaks(ecg, fs, min_rr=0.25):
+    let x = _vec(ecg)
+    let f = _s(fs)
+    let xs = [float(v) for v in x]
+    if len(xs) < int(2 * f):
+        raise RuntimeError("need at least 2 seconds of ECG")
+    let y = _dsp.bandpass(x, 5.0, min(15.0, 0.45 * f), f, order=2)
+    let yl = [float(v) for v in y]
+    let dy = _gradient(yl)
+    let sq = tensor([v * v for v in dy])
+    let integ = [float(v) for v in _dsp.moving_average(sq, max(1, int(0.15 * f)))]
+    let dist = max(1, int(min_rr * f))
+    let cand = _dsp.find_peaks(tensor(integ), distance=dist)
+    let ci = [int(v) for v in cand.indices]
+    if len(ci) == 0:
+        return record(indices=zeros(0, dtype="int64"), times=zeros(0), rr=zeros(0), heart_rate=zeros(0), mean_heart_rate=nan)
+    let h = [integ[i] for i in ci]
+    let thr = 0.35 * _percentile(h, 90)
+    let peaks = [ci[k] for k in range(len(ci)) if h[k] >= thr]
+    let w = max(1, int(0.075 * f))
+    var ymax = yl[0]
+    var ymin = yl[0]
+    for v in yl:
+        ymax = max(ymax, v)
+        ymin = min(ymin, v)
+    let sgn = 1.0 if abs(ymax) >= abs(ymin) else -1.0
+    var refined = set()
+    for p in peaks:
+        let lo = max(0, p - w)
+        let hi = min(len(xs), p + w + 1)
+        let seg = xs[lo:hi]
+        let md = _median(seg)
+        var bi = 0
+        for k in range(len(seg)):
+            if sgn * (seg[k] - md) > sgn * (seg[bi] - md):
+                bi = k
+        refined.add(lo + bi)
+    let idx0 = sorted(list(refined))
+    var keep = [idx0[0]] if len(idx0) > 0 else []
+    for p in idx0[1:]:
+        if p - keep[len(keep) - 1] >= dist:
+            keep.append(p)
+    let times = [p / f for p in keep]
+    let rr = [times[i + 1] - times[i] for i in range(len(times) - 1)]
+    let hr = [60.0 / v for v in rr]
+    return record(indices=tensor(keep, "int64"), times=tensor(times), rr=tensor(rr) if len(rr) > 0 else zeros(0),
+                  heart_rate=tensor(hr) if len(hr) > 0 else zeros(0),
+                  mean_heart_rate=60.0 / (sum(rr) / len(rr)) if len(rr) > 0 else nan)
+
+fn hrv(rr, frequency_domain=true):
+    let r = [float(v) for v in _vec(rr)]
+    if len(r) < 3:
+        raise RuntimeError("need at least 3 RR intervals")
+    let ms = [v * 1000 for v in r]
+    let d = [ms[i + 1] - ms[i] for i in range(len(ms) - 1)]
+    let mm = sum(ms) / len(ms)
+    let md = sum(d) / len(d)
+    var out = {"mean_rr": mm, "sdnn": sqrt(sum([(v - mm) ** 2 for v in ms]) / (len(ms) - 1)),
+               "rmssd": sqrt(sum([v * v for v in d]) / len(d)), "sdsd": sqrt(sum([(v - md) ** 2 for v in d]) / (len(d) - 1)),
+               "pnn50": 100 * len([v for v in d if abs(v) > 50]) / len(d), "mean_hr": 60000 / mm}
+    if frequency_domain and sum(r) >= 60:
+        var t = []
+        var acc = 0.0
+        for v in r:
+            acc = acc + v
+            t.append(acc)
+        let fsr = 4.0
+        var grid = []
+        var gv = t[0]
+        let ng = int(ceil((t[len(t) - 1] - t[0]) * fsr))
+        for i in range(ng):
+            grid.append(t[0] + i / fsr)
+        let tach = _sci.interp(tensor(grid), tensor(t), tensor(ms))
+        let w = _dsp.welch(tach - float(mean(tach)), fsr, nperseg=min(256, len(grid)))
+        let df = float(w.f[1] - w.f[0])
+        var lf = 0.0
+        var hf = 0.0
+        for i in range(len(w.f)):
+            let fv = float(w.f[i])
+            if fv >= 0.04 and fv < 0.15:
+                lf = lf + float(w.psd[i])
+            if fv >= 0.15 and fv < 0.4:
+                hf = hf + float(w.psd[i])
+        out["lf"] = lf * df
+        out["hf"] = hf * df
+        out["lf_hf"] = (lf * df) / (hf * df) if hf > 0 else inf
+    return record(**out)
+
+# =================================================================== DICOM
+let _LONG_VR = {"OB", "OW", "OF", "SQ", "UT", "UN", "UC", "UR", "OD", "OL", "OV", "SV", "UV"}
+let _WANT = {"0008,0060": "modality", "0008,0070": "manufacturer", "0008,0020": "study_date",
+             "0008,103E": "series_description", "0018,0050": "slice_thickness", "0018,0088": "slice_spacing",
+             "0020,0013": "instance_number", "0020,0032": "image_position", "0020,0037": "image_orientation",
+             "0028,0002": "samples_per_pixel", "0028,0004": "photometric", "0028,0008": "frames",
+             "0028,0010": "rows", "0028,0011": "columns", "0028,0030": "pixel_spacing", "0028,0100": "bits_allocated",
+             "0028,0101": "bits_stored", "0028,0103": "pixel_representation", "0028,1050": "window_center",
+             "0028,1051": "window_width", "0028,1052": "rescale_intercept", "0028,1053": "rescale_slope",
+             "0002,0010": "transfer_syntax", "0028,0006": "planar"}
+let _IDENT = {"0010,0010": "patient_name", "0010,0020": "patient_id", "0010,0030": "patient_birth_date",
+              "0010,0040": "patient_sex", "0008,0080": "institution"}
+let _US = {"0028,0002", "0028,0010", "0028,0011", "0028,0100", "0028,0101", "0028,0103", "0028,0006"}
+let _TS = {"1.2.840.10008.1.2": ["<", false], "1.2.840.10008.1.2.1": ["<", true], "1.2.840.10008.1.2.2": [">", true]}
+
+fn _u16(b, o, le) = b[o] | (b[o + 1] << 8) if le else (b[o] << 8) | b[o + 1]
+fn _u32(b, o, le) = (b[o] | (b[o + 1] << 8) | (b[o + 2] << 16) | (b[o + 3] << 24)) if le else ((b[o] << 24) | (b[o + 1] << 16) | (b[o + 2] << 8) | b[o + 3])
+fn _hex4(v) = format(v, "04X")
+
+fn _dcm_value(tag, raw, le):
+    if tag in _US:
+        return _u16(raw, 0, le) if len(raw) >= 2 else none
+    let s = _strip0(raw.decode("latin-1"))
+    if tag in ["0028,0030", "0020,0032", "0020,0037", "0028,1050", "0028,1051"]:
+        try:
+            let v = [float(p) for p in s.split("\\") if p.strip() != ""]
+            return v if len(v) != 1 else v[0]
+        except ValueError:
+            return s
+    if tag in ["0018,0050", "0018,0088", "0028,1052", "0028,1053"]:
+        try:
+            return float(s.split("\\")[0])
+        except ValueError:
+            return s
+    if tag in ["0020,0013", "0028,0008"]:
+        try:
+            return int(float(s))
+        except ValueError:
+            return s
+    return s
+
+fn _strip0(s):
+    var a = 0
+    var b = len(s)
+    while a < b and (s[a] == "\x00" or s[a] == " "):
+        a = a + 1
+    while b > a and (s[b - 1] == "\x00" or s[b - 1] == " "):
+        b = b - 1
+    return s[a:b]
+
+fn _parse_dicom(buf, include_identifiers):
+    var pos = 132 if len(buf) >= 132 and buf[128:132] == b"DICM" else 0
+    var info = {}
+    var ident = {}
+    var le = true
+    var explicit = true
+    var meta_end = none
+    var pixel = none
+    let n = len(buf)
+    fn need(k, at):
+        if at + k > n:
+            raise RuntimeError("DICOM file is truncated or damaged")
+    while pos + 8 <= n:
+        let in_meta = meta_end == none or pos < meta_end
+        var e_le = le
+        var e_exp = explicit
+        if in_meta and buf[pos] == 2 and buf[pos + 1] == 0:
+            e_le = true
+            e_exp = true
+        let g = _u16(buf, pos, e_le)
+        let el = _u16(buf, pos + 2, e_le)
+        let tag = _hex4(g) + "," + _hex4(el)
+        if g == 0xFFFE:
+            pos = pos + 8
+            continue
+        var ln = 0
+        var vr = "??"
+        if e_exp:
+            vr = buf[pos + 4:pos + 6].decode("latin-1")
+            if vr in _LONG_VR:
+                need(12, pos)
+                ln = _u32(buf, pos + 8, e_le)
+                pos = pos + 12
+            else:
+                ln = _u16(buf, pos + 6, e_le)
+                pos = pos + 8
+        else:
+            ln = _u32(buf, pos + 4, e_le)
+            pos = pos + 8
+        if tag == "7FE0,0010":
+            if ln == 0xFFFFFFFF:
+                raise RuntimeError("compressed (encapsulated) DICOM pixel data is not supported; convert the file to an uncompressed transfer syntax first (e.g. with dcmdjpeg or gdcmconv)")
+            need(ln, pos)
+            pixel = [pos, ln]
+            pos = pos + ln
+            continue
+        if ln == 0xFFFFFFFF:
+            var depth = 1
+            while depth and pos + 8 <= n:
+                let gg = _u16(buf, pos, e_le)
+                let ee = _u16(buf, pos + 2, e_le)
+                let ll = _u32(buf, pos + 4, e_le)
+                if gg == 0xFFFE and ee == 0xE0DD:
+                    depth = depth - 1
+                    pos = pos + 8
+                elif gg == 0xFFFE and ee == 0xE000:
+                    pos = pos + (8 if ll == 0xFFFFFFFF else 8 + ll)
+                elif gg == 0xFFFE and ee == 0xE00D:
+                    pos = pos + 8
+                else:
+                    var l2 = 0
+                    if e_exp:
+                        let v2 = buf[pos + 4:pos + 6].decode("latin-1")
+                        if v2 in _LONG_VR:
+                            l2 = _u32(buf, pos + 8, e_le)
+                            pos = pos + 12
+                        else:
+                            l2 = _u16(buf, pos + 6, e_le)
+                            pos = pos + 8
+                    else:
+                        l2 = _u32(buf, pos + 4, e_le)
+                        pos = pos + 8
+                    if l2 == 0xFFFFFFFF:
+                        depth = depth + 1
+                    else:
+                        pos = pos + l2
+            continue
+        need(ln, pos)
+        let raw = buf[pos:pos + ln]
+        pos = pos + ln
+        if tag == "0002,0000" and ln == 4:
+            meta_end = pos + _u32(raw, 0, true)
+        if tag in _WANT:
+            info[_WANT[tag]] = _dcm_value(tag, raw, e_le)
+            if tag == "0002,0010":
+                let ts = info["transfer_syntax"]
+                if ts not in _TS:
+                    raise RuntimeError(f"DICOM transfer syntax {ts} (compressed) is not supported; convert the file to an uncompressed syntax first (e.g. with dcmdjpeg or gdcmconv)")
+                le = _TS[ts][0] == "<"
+                explicit = _TS[ts][1]
+        elif include_identifiers and tag in _IDENT:
+            ident[_IDENT[tag]] = _dcm_value(tag, raw, e_le)
+    return [info, ident, pixel, le]
+
+fn _dicom_pixels(buf, info, pixel, le):
+    let rows = info.get("rows", none)
+    let cols = info.get("columns", none)
+    if pixel == none or not rows or not cols:
+        return none
+    let bits = info.get("bits_allocated", 16)
+    let signed = info.get("pixel_representation", 0) == 1
+    let spp = info.get("samples_per_pixel", 1) or 1
+    let frames = info.get("frames", 1) or 1
+    if bits != 8 and bits != 16 and bits != 32:
+        raise RuntimeError(f"{bits}-bit DICOM pixels are not supported")
+    let count = rows * cols * spp * frames
+    if pixel[1] < count * (bits // 8):
+        raise RuntimeError(f"DICOM pixel data is shorter than {rows}×{cols}×{frames} images (file damaged?)")
+    var a = __frombuffer(buf, pixel[0], count, bits // 8, signed, le)
+    if spp > 1:
+        if info.get("planar", 0) == 1:
+            a = permute(reshape(a, frames, spp, rows, cols), 0, 2, 3, 1)
+        else:
+            a = reshape(a, frames, rows, cols, spp)
+    else:
+        a = reshape(a, frames, rows, cols)
+    if frames == 1:
+        a = a[0]
+    let stored = info.get("bits_stored", bits)
+    if signed and stored < bits:
+        a = where(a >= 2.0 ** (stored - 1), a - 2.0 ** stored, a)
+    var slope = info.get("rescale_slope", 1.0)
+    var icpt = info.get("rescale_intercept", 0.0)
+    slope = slope if isinstance(slope, float) else 1.0
+    icpt = icpt if isinstance(icpt, float) else 0.0
+    return a * slope + icpt
+
+fn window_level(image, center, width):
+    let a = _v(image)
+    let c = _s(center)
+    let w = _s(width)
+    return clip((a - (c - 0.5 - (w - 1) / 2)) / (w - 1), 0, 1)
+
+fn _base(p):
+    var s = str(p).replace("\\", "/")
+    let k = s.rfind("/")
+    return s[k + 1:] if k >= 0 else s
+
+fn read_dicom(path, include_identifiers=false):
+    let buf = __fs("readb", str(path), none)
+    var parsed = none
+    var px = none
+    try:
+        parsed = _parse_dicom(buf, include_identifiers)
+        px = _dicom_pixels(buf, parsed[0], parsed[2], parsed[3])
+    except IndexError as e:
+        raise RuntimeError(f"{_base(path)} is not a readable DICOM file ({e})")
+    except ValueError as e:
+        raise RuntimeError(f"{_base(path)} is not a readable DICOM file ({e})")
+    if px == none:
+        raise RuntimeError(f"{_base(path)} has no image data")
+    var info = parsed[0]
+    for k in parsed[1]:
+        info[k] = parsed[1][k]
+    info["pixels"] = px
+    return record(**info)
+
+fn read_dicom_series(folder, include_identifiers=false):
+    let base = str(folder)
+    var slices = []
+    for name in sorted(__fs("list", base, none)):
+        let p = base + "/" + name
+        if not __fs("isfile", p, none):
+            continue
+        let head = __fs("readb", p, none)
+        if len(head) < 132 or head[128:132] != b"DICM":
+            continue
+        slices.append(read_dicom(p, include_identifiers))
+    if len(slices) == 0:
+        raise RuntimeError("no DICOM files found")
+    let f0 = __rec_dict(slices[0])
+    let ori = f0.get("image_orientation", none)
+    var key = none
+    if isinstance(ori, list) and len(ori) == 6:
+        let nrm = [ori[1] * ori[5] - ori[2] * ori[4], ori[2] * ori[3] - ori[0] * ori[5], ori[0] * ori[4] - ori[1] * ori[3]]
+        key = fn(s) => sum([nrm[i] * __rec_dict(s).get("image_position", [0, 0, 0])[i] for i in range(3)])
+    else:
+        key = fn(s) => float(__rec_dict(s).get("instance_number", 0))
+    slices = sorted(slices, key=key)
+    let vol = stack([s.pixels for s in slices])
+    let pos = [float(key(s)) for s in slices]
+    var dz = 0.0
+    if len(slices) > 1:
+        dz = _median([pos[i + 1] - pos[i] for i in range(len(pos) - 1)])
+    else:
+        dz = float(f0.get("slice_thickness", 1.0))
+    var ps = f0.get("pixel_spacing", [1.0, 1.0])
+    ps = ps if isinstance(ps, list) else [ps, ps]
+    var meta = {}
+    for k in __rec_dict(slices[0]):
+        if k != "pixels":
+            meta[k] = __rec_dict(slices[0])[k]
+    return record(volume=vol, spacing=[abs(dz), ps[0], ps[1]], positions=tensor(pos), count=len(slices), info=record(**meta))

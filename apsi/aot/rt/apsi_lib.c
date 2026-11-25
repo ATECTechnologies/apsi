@@ -107,6 +107,16 @@ BI(lb_fs) {
         AStr *s = lib_str(a[2], "append_text"); fwrite(s->s, 1, (size_t)s->len, f); fclose(f); return A_NONE;
     }
     if (!strcmp(op, "cwd")) { char b[4096]; if (!getcwd(b, sizeof b)) return a_str("."); return a_str(b); }
+    if (!strcmp(op, "readb")) {                                      /* the whole file as bytes */
+        FILE *f = fopen(path, "rb"); if (!f) a_error("FileNotFoundError", "no such file: '%s'", path);
+        fseek(f, 0, SEEK_END); long sz = ftell(f); fseek(f, 0, SEEK_SET); if (sz < 0) sz = 0;
+        char *buf = (char *)malloc((size_t)sz + 1); size_t got = fread(buf, 1, (size_t)sz, f); fclose(f);
+        AV r = a_bytes(buf, (int64_t)got); free(buf); return r;
+    }
+    if (!strcmp(op, "writeb")) {
+        AStr *d = lib_str(a[2], "fs"); FILE *f = fopen(path, "wb"); if (!f) a_error("OSError", "cannot write '%s': %s", path, strerror(errno));
+        fwrite(d->s, 1, (size_t)d->len, f); fclose(f); return A_NONE;
+    }
     a_error("ValueError", "fs: unknown operation '%s'", op);
 }
 
@@ -756,6 +766,19 @@ BI(lb_qfmt) {
     return X->nd == 0 ? a_float(y[0]) : a_obj(Y);
 }
 BI(lb_is_traced) { (void)kw; (void)self; return a_bool(n && is_n(a[0])); }   /* recorded by grad() */
+/* __frombuffer(bytes, offset, count, size, signed, little): integers packed in bytes as a float64 tensor */
+BI(lb_frombuffer) {
+    (void)self; (void)kw; (void)n; AStr *b = lib_str(a[0], "frombuffer"); int64_t off = a[1].i, cnt = a[2].i, sz = a[3].i; int sg = a_truthy(a[4]), le = a_truthy(a[5]);
+    if (sz != 1 && sz != 2 && sz != 4 && sz != 8) a_error("ValueError", "frombuffer: size 1, 2, 4 or 8");
+    if (off < 0 || cnt < 0 || off + cnt * sz > b->len) a_error("ValueError", "frombuffer: the data is shorter than %lld values", (long long)cnt);
+    int64_t sh[1] = {cnt}; ATensor *T = t_new(DT_F64, 1, sh); double *o = (double *)T->p; const unsigned char *p = (const unsigned char *)b->s + off;
+    for (int64_t i = 0; i < cnt; i++, p += sz) {
+        uint64_t u = 0; for (int k = 0; k < sz; k++) u |= (uint64_t)p[le ? k : sz - 1 - k] << (8 * k);
+        if (sg && sz < 8 && (u >> (8 * sz - 1)) & 1) u |= ~0ULL << (8 * sz);
+        o[i] = sg ? (double)(int64_t)u : (double)u;
+    }
+    return a_obj(T);
+}
 #define APSI_VERSION "2.6.6"                                  /* kept equal to apsi.__version__ by the tests */
 BI(lb_apsi_version) { (void)n; (void)a; (void)kw; (void)self; return a_str(APSI_VERSION); }
 BI(lb_frame);
@@ -777,5 +800,5 @@ static const TEnt lib_builtins[] = {
     {"__password_hash", lb_password_hash}, {"__password_verify", lb_password_verify},
     {"__la", lb_la}, {"__fft", lb_fft}, {"__special", lb_special}, {"__conv2d", lb_conv2d}, {"__maxpool2d", lb_maxpool2d},
     {"__time", lb_time}, {"__sleep", lb_sleep}, {"__fs", lb_fs}, {"__st_load", lb_st_load}, {"__st_save", lb_st_save},
-    {"__npy_load", lb_npy_load}, {"__npy_save", lb_npy_save}, {"__http_serve", lb_http_serve}, {"__is_dev", lb_is_dev}, {"__frame", lb_frame}, {"__sqlite", lb_sqlite}, {"__net", lb_net}, {"__ct", lb_ct}, {"__is_cplx", lb_is_cplx}, {"__ckron", lb_ckron}, {"__is_traced", lb_is_traced}, {"__qfmt", lb_qfmt}, {"__apsi_version", lb_apsi_version}, {"__arity", lb_arity}, {"__localtime", lb_localtime}, {"__isatty", lb_isatty}, {"__rec_dict", lb_rec_dict}, {"__is_rec", lb_is_rec}, {"__argv", lb_argv}, {"__environ_names", lb_environ_names}, {"__builtin", lb_builtin}, {"__setenv", lb_setenv}, {"__gen_step", lb_gen_step}, {"__is_coro", lb_is_coro},
+    {"__npy_load", lb_npy_load}, {"__npy_save", lb_npy_save}, {"__http_serve", lb_http_serve}, {"__is_dev", lb_is_dev}, {"__frombuffer", lb_frombuffer}, {"__frame", lb_frame}, {"__sqlite", lb_sqlite}, {"__net", lb_net}, {"__ct", lb_ct}, {"__is_cplx", lb_is_cplx}, {"__ckron", lb_ckron}, {"__is_traced", lb_is_traced}, {"__qfmt", lb_qfmt}, {"__apsi_version", lb_apsi_version}, {"__arity", lb_arity}, {"__localtime", lb_localtime}, {"__isatty", lb_isatty}, {"__rec_dict", lb_rec_dict}, {"__is_rec", lb_is_rec}, {"__argv", lb_argv}, {"__environ_names", lb_environ_names}, {"__builtin", lb_builtin}, {"__setenv", lb_setenv}, {"__gen_step", lb_gen_step}, {"__is_coro", lb_is_coro},
     {NULL, NULL}};
