@@ -97,6 +97,8 @@ def build(path, out=None, opt="-O3", keep_c=False, target=None):
     if out is None:
         out = os.path.splitext(path)[0] + (".exe" if os.name == "nt" or (target or "").endswith("windows-msvc")
                                            else "")
+    if (os.name == "nt" or "windows" in (target or "") or "mingw" in (target or "")) and not out.lower().endswith(".exe"):
+        out += ".exe"                       # Windows runs programs by their .exe name
     work = tempfile.mkdtemp(prefix="apsi-native-")
     cfile = os.path.join(work, "program.c")
     with open(cfile, "w", encoding="utf-8") as f:

@@ -9,7 +9,15 @@ import pytest
 
 HERE = os.path.dirname(__file__)
 PROGS = sorted(glob.glob(os.path.join(HERE, "native_aot", "*.apsi")))
-CC = shutil.which("clang") or shutil.which("gcc")
+def _cc():
+    try:
+        from apsi.aot.build import find_cc
+        return find_cc()                 # the bundled / fetched toolchain on Windows, clang or gcc elsewhere
+    except Exception:
+        return shutil.which("clang") or shutil.which("gcc")
+
+
+CC = _cc()
 
 
 @pytest.mark.skipif(CC is None, reason="no C compiler")

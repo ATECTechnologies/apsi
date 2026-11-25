@@ -14,6 +14,8 @@
 #ifndef NOMINMAX
 #define NOMINMAX
 #endif
+#include <winsock2.h>                       /* before windows.h: the HTTP server's sockets (apsi_lib.c) */
+#include <ws2tcpip.h>
 #include <windows.h>
 #else
 #include <pthread.h>
@@ -2066,7 +2068,9 @@ BI(tb_gpu_info) {
     UNUSED;
     if (!a_gpu_available()) return a_str(a_gpu_name());
     size_t f, tot; a_gpu_info(&f, &tot);
-    char s[400]; snprintf(s, sizeof s, "%s, %.1f GB free of %.1f GB", a_gpu_name(), f / 1e9, tot / 1e9);
+    const char *a_gpu_blas(void); const char *bl = a_gpu_blas(); const char *m = getenv("APSI_GPU_MATH");
+    char s[900]; snprintf(s, sizeof s, "%s, %.1f GB free of %.1f GB, matrix products: %s%s%s", a_gpu_name(), f / 1e9, tot / 1e9,
+                          bl ? "cuBLAS " : "Apsi kernels", bl ? bl : "", bl && m ? (strcmp(m, "tf32") == 0 ? " (TF32 Tensor Cores)" : strcmp(m, "bf16") == 0 ? " (BF16 Tensor Cores)" : strcmp(m, "f16") == 0 ? " (FP16 Tensor Cores)" : "") : "");
     return a_str(s);
 }
 BI(tb_gpu_sync) { UNUSED; a_gpu_sync(); return A_NONE; }

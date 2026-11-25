@@ -1,0 +1,53 @@
+# The card from a native program: correctness against the processor, then speed. Run by TEST_APSI_2.6.6_NATIVE.bat.
+use nn
+use sys
+
+fn max_abs(t) = float(max(abs(t)))
+print("gpu_available:", gpu_available())
+if not gpu_available():
+    print("gpu: none (", gpu_info(), ")")
+    exit(0)
+print("gpu:", gpu_info())
+seed(1)
+let a = tensor(randn(513, 385), f32)
+let b = tensor(randn(385, 257), f32)
+let ref = a @ b
+let got = to_host(to_gpu(a) @ to_gpu(b))
+let err = max_abs(got - ref) / max_abs(ref)
+print("matmul 513x385x257 relative error:", err, "PASS" if err < 1e-3 else "FAIL")
+let ab = tensor(randn(4, 33, 17), f32)
+let bb = tensor(randn(4, 17, 9), f32)
+let errb = max_abs(to_host(to_gpu(ab) @ to_gpu(bb)) - ab @ bb)
+print("batched matmul error:", errb, "PASS" if errb < 1e-3 else "FAIL")
+let x = tensor(randn(1000, 64), f32)
+let e1 = max_abs(to_host(softmax(to_gpu(x), axis=-1)) - softmax(x, axis=-1))
+let e2 = max_abs(to_host(sum(to_gpu(x) * to_gpu(x), axis=0)) - sum(x * x, axis=0))
+let e3 = max_abs(to_host(tanh(to_gpu(x)) + relu(to_gpu(x))) - (tanh(x) + relu(x)))
+print("softmax / sum / elementwise errors:", e1, e2, e3, "PASS" if max(e1, max(e2 / 100.0, e3)) < 1e-3 else "FAIL")
+# a small network trained on the card: the loss must fall
+let X = to_gpu(tensor(randn(256, 16), f32))
+let Y = to_gpu(tensor(randn(256, 4), f32))
+var p = to_gpu([tensor(randn(16, 64), f32) * 0.2, tensor(zeros(64), f32), tensor(randn(64, 4), f32) * 0.2, tensor(zeros(4), f32)])
+fn loss(q) = mean((relu(X @ q[0] + q[1]) @ q[2] + q[3] - Y) ** 2)
+let vg = value_and_grad(loss)
+var first = 0.0
+var last = 0.0
+for i in range(100):
+    let r = vg(p)
+    if i == 0:
+        first = float(r[0])
+    last = float(r[0])
+    p = [p[k] - 0.05 * r[1][k] for k in range(4)]
+print("training on the card: loss", round(first, 4), "->", round(last, 4), "PASS" if last < first else "FAIL")
+# speed: 2048^3 float32 products
+let n = int(getenv("APSI_BENCH_N", "2048"))
+let ga = to_gpu(tensor(randn(n, n), f32))
+let gb = to_gpu(tensor(randn(n, n), f32))
+var gc = ga @ gb
+let warm = to_host(gc[0, 0:1])
+let t0 = clock()
+for i in range(10):
+    gc = ga @ gb
+let done = to_host(gc[0, 0:1])
+let dt = float((clock() - t0) / u.s)
+print(f"matmul {n} x10:", round(dt, 3), "s =", round(10 * 2.0 * n * n * n / dt / 1e12, 2), "TFLOP/s")
