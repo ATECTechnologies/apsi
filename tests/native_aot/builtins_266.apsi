@@ -6,3 +6,6 @@ print(nan_to_num(tensor([1.0, nan, inf, -inf])))
 print(derivative(fn(x) => x ** 3, 2.0), jacobian(fn(v) => v * v)(tensor([1.0, 2.0])), hessian(fn(v) => sum(v ** 3))(tensor([1.0, 2.0])))
 print(laplace(fn(v) => sum(v ** 2))(tensor([1.0, 2.0, 3.0])))
 print("abc".title(), "a,b,c".rsplit(",", 1), "x".center(5, "*"), "42".zfill(5), {1, 2}.union({3}), "Hello".swapcase())
+
+# Unicode case mappings, as Python
+print("ÄÉΣ ΟΔΟΣ Привет straße".lower(), "straße ǆ ﬁ".upper())

@@ -2293,8 +2293,58 @@ static AV b_bytes_fromhex(int n, AV *a, ADict *kw, AV self) {
     if (hi >= 0) { free(b.p); a_error("ValueError", "non-hexadecimal number found in fromhex() arg at position %lld", (long long)t->len); }
     AV r = a_bytes(b.p ? b.p : "", b.n); free(b.p); return r;
 }
-static AV m_str_upper(int n, AV *a, ADict *kw, AV s) { (void)n; (void)a; (void)kw; AV r = a_strn(STR(s)->s, STR(s)->len); for (int64_t i = 0; i < STR(r)->len; i++) if (STR(r)->s[i] >= 'a' && STR(r)->s[i] <= 'z') STR(r)->s[i] -= 32; return r; }
-static AV m_str_lower(int n, AV *a, ADict *kw, AV s) { (void)n; (void)a; (void)kw; AV r = a_strn(STR(s)->s, STR(s)->len); for (int64_t i = 0; i < STR(r)->len; i++) if (STR(r)->s[i] >= 'A' && STR(r)->s[i] <= 'Z') STR(r)->s[i] += 32; return r; }
+#include "apsi_case.h"
+static const uint32_t *case_find(const uint32_t (*t)[4], uint32_t n, uint32_t cp) {
+    uint32_t lo = 0, hi = n;
+    while (lo < hi) { uint32_t mid = (lo + hi) / 2; if (t[mid][0] < cp) lo = mid + 1; else hi = mid; }
+    return lo < n && t[lo][0] == cp ? t[lo] : NULL;
+}
+static int utf8_dec(const unsigned char *p, int64_t n, uint32_t *cp) {
+    if (p[0] < 0x80 || n < 2) { *cp = p[0]; return 1; }
+    if ((p[0] & 0xE0) == 0xC0) { *cp = ((p[0] & 0x1Fu) << 6) | (p[1] & 0x3Fu); return 2; }
+    if ((p[0] & 0xF0) == 0xE0 && n >= 3) { *cp = ((p[0] & 0x0Fu) << 12) | ((p[1] & 0x3Fu) << 6) | (p[2] & 0x3Fu); return 3; }
+    if (n >= 4) { *cp = ((p[0] & 0x07u) << 18) | ((p[1] & 0x3Fu) << 12) | ((p[2] & 0x3Fu) << 6) | (p[3] & 0x3Fu); return 4; }
+    *cp = p[0]; return 1;
+}
+static void utf8_put(SB *b, uint32_t c) {
+    char t[4]; int k;
+    if (c < 0x80) { t[0] = (char)c; k = 1; }
+    else if (c < 0x800) { t[0] = (char)(0xC0 | (c >> 6)); t[1] = (char)(0x80 | (c & 0x3F)); k = 2; }
+    else if (c < 0x10000) { t[0] = (char)(0xE0 | (c >> 12)); t[1] = (char)(0x80 | ((c >> 6) & 0x3F)); t[2] = (char)(0x80 | (c & 0x3F)); k = 3; }
+    else { t[0] = (char)(0xF0 | (c >> 18)); t[1] = (char)(0x80 | ((c >> 12) & 0x3F)); t[2] = (char)(0x80 | ((c >> 6) & 0x3F)); t[3] = (char)(0x80 | (c & 0x3F)); k = 4; }
+    sb_put(b, t, k);
+}
+static int cased_cp(uint32_t c) {
+    if ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z')) return 1;
+    return c >= 0x80 && (case_find(case_lower, case_lower_n, c) || case_find(case_upper, case_upper_n, c));
+}
+/* str.lower / str.upper with Python's Unicode mappings (ß -> SS, final sigma, ...); ASCII stays a byte loop */
+static AV str_case(AV s, int up) {
+    const unsigned char *p = (const unsigned char *)STR(s)->s; int64_t n = STR(s)->len, i;
+    for (i = 0; i < n && p[i] < 0x80; i++) {}
+    if (i == n) {
+        AV r = a_strn(STR(s)->s, n);
+        for (int64_t j = 0; j < n; j++) { char c = STR(r)->s[j]; if (up ? (c >= 'a' && c <= 'z') : (c >= 'A' && c <= 'Z')) STR(r)->s[j] = (char)(c + (up ? -32 : 32)); }
+        return r;
+    }
+    SB b = {0}; uint32_t prev = 0;
+    for (i = 0; i < n; ) {
+        uint32_t c; int k = utf8_dec(p + i, n - i, &c);
+        if (c < 0x80) { char ch = (char)c; if (up ? (ch >= 'a' && ch <= 'z') : (ch >= 'A' && ch <= 'Z')) ch = (char)(ch + (up ? -32 : 32)); sb_put(&b, &ch, 1); }
+        else if (!up && c == 0x3A3) {             /* sigma at the end of a word is final */
+            uint32_t nx = 0; int has_next = 0;
+            if (i + k < n) { utf8_dec(p + i + k, n - i - k, &nx); has_next = 1; }
+            utf8_put(&b, (prev && cased_cp(prev) && !(has_next && cased_cp(nx))) ? 0x3C2 : 0x3C3);
+        } else {
+            const uint32_t *m = up ? case_find(case_upper, case_upper_n, c) : case_find(case_lower, case_lower_n, c);
+            if (m) { for (int j = 1; j < 4 && m[j]; j++) utf8_put(&b, m[j]); } else sb_put(&b, (const char *)p + i, k);
+        }
+        prev = c; i += k;
+    }
+    return sb_done(&b);
+}
+static AV m_str_upper(int n, AV *a, ADict *kw, AV s) { (void)n; (void)a; (void)kw; return str_case(s, 1); }
+static AV m_str_lower(int n, AV *a, ADict *kw, AV s) { (void)n; (void)a; (void)kw; return str_case(s, 0); }
 static int is_ws(char c) { return c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == '\f' || c == '\v'; }
 static AV strip_any(AV s, int n, AV *a, int left, int right) {
     const char *p = STR(s)->s; int64_t lo = 0, hi = STR(s)->len;
@@ -3066,9 +3116,25 @@ static AV b_read_text(int n, AV *a, ADict *kw, AV self) {
     }
     return sb_done(&b);
 }
+/* open for writing; a missing parent folder is made first (as apsi run does) */
+#ifdef _WIN32
+#include <direct.h>
+#define A_MKDIR(x) _mkdir(x)
+#else
+#include <sys/stat.h>
+#define A_MKDIR(x) mkdir(x, 0777)
+#endif
+FILE *a_fopen_w(const char *path, const char *mode) {
+    FILE *f = fopen(path, mode);
+    if (f) return f;
+    char buf[4096]; size_t n = strlen(path); if (n >= sizeof buf) return NULL;
+    memcpy(buf, path, n + 1);
+    for (size_t i = 1; i < n; i++) if (buf[i] == '/' || buf[i] == '\\') { char c = buf[i]; buf[i] = 0; A_MKDIR(buf); buf[i] = c; }
+    return fopen(path, mode);
+}
 static AV b_write_text(int n, AV *a, ADict *kw, AV self) {
     (void)n; (void)kw; (void)self;
-    const char *p = STR(a_to_str(a[0]))->s; FILE *f = fopen(p, "wb");
+    const char *p = STR(a_to_str(a[0]))->s; FILE *f = a_fopen_w(p, "wb");
     if (!f) a_error("OSError", "cannot write '%s'", p);
     AV s = a_to_str(a[1]); fwrite(STR(s)->s, 1, (size_t)STR(s)->len, f); fclose(f);
     return A_NONE;

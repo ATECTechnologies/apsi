@@ -1,0 +1,13 @@
+<tokenizer BPE, 266 tokens> [264, 83, 257, 220, 66, 64, 83, 261, 64, 83, 220, 263] 39
+the cat sat on the mat. Ünïcode ไทย!
+decoder cpu
+"RRR��" 12 7
+[215, 163, 91, 45, 240, 45, 45, 45]
+none "be brief
+User: hi
+Assistant:"
+["[CLS]", "the", "cat", "##s", "sat", "on", "a", "cafe", "mat", "[UNK]", "run", "##ning", "!", "[SEP]"] [2, 5, 6, 10, 7, 8, 12, 14, 9, 1, 16, 17, 15, 3]
+the cats sat on a cafe mat running!
+(2, 8) [-0.7591, -0.178, 0.202, 0.7647, 1.5028, -0.9929, -1.0499, 0.5105]
+0.8866
+POS 0.6163

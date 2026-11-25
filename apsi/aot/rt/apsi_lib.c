@@ -103,7 +103,7 @@ BI(lb_fs) {
     }
     if (!strcmp(op, "rename")) { if (rename(path, lib_str(a[2], "fs")->s)) a_error("OSError", "cannot rename '%s': %s", path, strerror(errno)); return A_NONE; }
     if (!strcmp(op, "append")) {
-        FILE *f = fopen(path, "ab"); if (!f) a_error("IOError", "cannot open '%s': %s", path, strerror(errno));
+        FILE *f = a_fopen_w(path, "ab"); if (!f) a_error("IOError", "cannot open '%s': %s", path, strerror(errno));
         AStr *s = lib_str(a[2], "append_text"); fwrite(s->s, 1, (size_t)s->len, f); fclose(f); return A_NONE;
     }
     if (!strcmp(op, "cwd")) { char b[4096]; if (!getcwd(b, sizeof b)) return a_str("."); return a_str(b); }
@@ -114,7 +114,7 @@ BI(lb_fs) {
         AV r = a_bytes(buf, (int64_t)got); free(buf); return r;
     }
     if (!strcmp(op, "writeb")) {
-        AStr *d = lib_str(a[2], "fs"); FILE *f = fopen(path, "wb"); if (!f) a_error("OSError", "cannot write '%s': %s", path, strerror(errno));
+        AStr *d = lib_str(a[2], "fs"); FILE *f = a_fopen_w(path, "wb"); if (!f) a_error("OSError", "cannot write '%s': %s", path, strerror(errno));
         fwrite(d->s, 1, (size_t)d->len, f); fclose(f); return A_NONE;
     }
     a_error("ValueError", "fs: unknown operation '%s'", op);
@@ -261,7 +261,7 @@ BI(lb_st_save) {
         ts[k] = TT(t); nm[k++] = STR(D->e[i].k)->s;
     }
     char tmp[4200]; snprintf(tmp, sizeof tmp, "%s.tmp", path);
-    FILE *f = fopen(tmp, "wb"); if (!f) { free(ts); free(nm); a_error("IOError", "cannot write '%s': %s", path, strerror(errno)); }
+    FILE *f = a_fopen_w(tmp, "wb"); if (!f) { free(ts); free(nm); a_error("IOError", "cannot write '%s': %s", path, strerror(errno)); }
     /* the header first in a memory buffer, so its length is known */
     char *hb = NULL; size_t hl = 0;
 #ifdef _WIN32
@@ -341,7 +341,7 @@ BI(lb_npy_save) {
     if (t->nd > 1) k--;
     k += snprintf(head + k, sizeof head - (size_t)k, "), }");
     int total = 10 + k + 1; int pad = (64 - total % 64) % 64;
-    FILE *f = fopen(path, "wb"); if (!f) a_error("IOError", "cannot write '%s': %s", path, strerror(errno));
+    FILE *f = a_fopen_w(path, "wb"); if (!f) a_error("IOError", "cannot write '%s': %s", path, strerror(errno));
     unsigned char pre[10] = {0x93, 'N', 'U', 'M', 'P', 'Y', 1, 0, 0, 0}; int hl = k + pad + 1; pre[8] = (unsigned char)hl; pre[9] = (unsigned char)(hl >> 8);
     int ok = fwrite(pre, 1, 10, f) == 10 && fwrite(head, 1, (size_t)k, f) == (size_t)k;
     for (int i = 0; i < pad; i++) ok = ok && fputc(' ', f) != EOF;

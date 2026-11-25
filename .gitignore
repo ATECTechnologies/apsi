@@ -26,3 +26,5 @@ tests/native_aot/lab_runs/
 tests/native_aot/df_out.csv
 tests/native_aot/llm_*.jsonl
 tests/native_aot/llm_chat_model.apsim
+tests/native_aot/hub_llama/
+tests/native_aot/hub_bert/

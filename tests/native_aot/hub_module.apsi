@@ -1,0 +1,119 @@
+# use hub natively: tokenizers from tokenizer.json, an encoder and a decoder run from local folders
+use hub
+use models
+
+fn b2u():
+    var bs = list(range(33, 127)) + list(range(161, 173)) + list(range(174, 256))
+    var cs = list(bs)
+    var n = 0
+    for b in range(256):
+        if b not in bs:
+            bs.append(b)
+            cs.append(256 + n)
+            n = n + 1
+    return [chr(c) for c in cs]
+
+fn mkdir_p(p):
+    return none
+
+# ---- a byte-level BPE tokenizer and a tiny Llama
+mkdir_p("hub_llama")
+var vocab = {}
+let chars = b2u()
+for i in range(256):
+    vocab[chars[i]] = i
+let merges = ["Ġ t", "h e", "Ġt he", "Ġ a", "i n", "Ġ s", "e r", "o n"]
+for m in merges:
+    vocab[m.replace(" ", "")] = len(vocab)
+let bpe = {"version": "1.0", "added_tokens": [{"id": 264, "content": "<s>", "special": true}, {"id": 265, "content": "</s>", "special": true}],
+           "normalizer": none, "pre_tokenizer": {"type": "ByteLevel", "add_prefix_space": false, "use_regex": true},
+           "post_processor": {"type": "TemplateProcessing", "single": [{"SpecialToken": {"id": "<s>", "type_id": 0}}, {"Sequence": {"id": "A", "type_id": 0}}], "pair": []},
+           "decoder": {"type": "ByteLevel"}, "model": {"type": "BPE", "vocab": vocab, "merges": merges}}
+write_text("hub_llama/tokenizer.json", json_str(bpe))
+let V = 266
+let cfg = {"model_type": "llama", "hidden_size": 16, "num_hidden_layers": 2, "num_attention_heads": 4, "num_key_value_heads": 2,
+           "intermediate_size": 32, "vocab_size": V, "max_position_embeddings": 128, "rms_norm_eps": 1e-6, "rope_theta": 10000.0,
+           "eos_token_id": 265}
+write_text("hub_llama/config.json", json_str(cfg))
+var w = {}
+var s = 1
+fn r(*dims):
+    s = s + 1
+    return tensor(randn(*dims, seed=s) * 0.3, "float32")
+w["model.embed_tokens.weight"] = r(V, 16)
+for i in range(2):
+    let p = f"model.layers.{i}."
+    w[p + "input_layernorm.weight"] = tensor(ones(16), "float32")
+    w[p + "post_attention_layernorm.weight"] = tensor(ones(16), "float32")
+    w[p + "self_attn.q_proj.weight"] = r(16, 16)
+    w[p + "self_attn.k_proj.weight"] = r(8, 16)
+    w[p + "self_attn.v_proj.weight"] = r(8, 16)
+    w[p + "self_attn.o_proj.weight"] = r(16, 16)
+    w[p + "mlp.gate_proj.weight"] = r(32, 16)
+    w[p + "mlp.up_proj.weight"] = r(32, 16)
+    w[p + "mlp.down_proj.weight"] = r(16, 32)
+w["model.norm.weight"] = tensor(ones(16), "float32")
+models.save_safetensors("hub_llama/model.safetensors", w)
+
+let tok = hub.tokenizer_from_file("hub_llama/tokenizer.json")
+let e = tok.encode("the cat sat on the mat. Ünïcode ไทย!")
+print(tok, e.ids[0:12], len(e.ids))
+print(tok.decode(e.ids))
+let lm = hub.model_from_folder("hub_llama")
+print(lm.kind, lm.device)
+let out = lm.generate("the theory", max_new_tokens=12)
+print(repr(out), lm.last_tokens, lm.last_prompt_tokens)
+print(lm.net.generate([264, 10, 20, 30], max_new_tokens=8))
+print(lm.chat_format(), repr(lm.chat_prompt("hi", system="be brief")))
+
+# ---- a WordPiece tokenizer and a tiny BERT
+mkdir_p("hub_bert")
+let words = ["[PAD]", "[UNK]", "[CLS]", "[SEP]", "[MASK]", "the", "cat", "sat", "on", "mat", "##s", "dog", "a", ".", "cafe", "!", "run", "##ning"]
+var wv = {}
+for i in range(len(words)):
+    wv[words[i]] = i
+let wp = {"version": "1.0", "added_tokens": [{"id": 0, "content": "[PAD]", "special": true}, {"id": 1, "content": "[UNK]", "special": true},
+          {"id": 2, "content": "[CLS]", "special": true}, {"id": 3, "content": "[SEP]", "special": true}, {"id": 4, "content": "[MASK]", "special": true}],
+          "normalizer": {"type": "BertNormalizer", "clean_text": true, "handle_chinese_chars": true, "strip_accents": none, "lowercase": true},
+          "pre_tokenizer": {"type": "BertPreTokenizer"},
+          "post_processor": {"type": "BertProcessing", "sep": ["[SEP]", 3], "cls": ["[CLS]", 2]},
+          "decoder": {"type": "WordPiece", "prefix": "##"},
+          "model": {"type": "WordPiece", "unk_token": "[UNK]", "continuing_subword_prefix": "##", "max_input_chars_per_word": 100, "vocab": wv}}
+write_text("hub_bert/tokenizer.json", json_str(wp))
+let bv = len(words)
+write_text("hub_bert/config.json", json_str({"model_type": "bert", "hidden_size": 8, "num_hidden_layers": 1, "num_attention_heads": 2,
+           "intermediate_size": 16, "vocab_size": bv, "max_position_embeddings": 32, "type_vocab_size": 2, "layer_norm_eps": 1e-12,
+           "hidden_act": "gelu", "id2label": {"0": "NEG", "1": "POS"}}))
+var bw = {}
+bw["bert.embeddings.word_embeddings.weight"] = r(bv, 8)
+bw["bert.embeddings.position_embeddings.weight"] = r(32, 8)
+bw["bert.embeddings.token_type_embeddings.weight"] = r(2, 8)
+bw["bert.embeddings.LayerNorm.weight"] = tensor(ones(8), "float32")
+bw["bert.embeddings.LayerNorm.bias"] = tensor(zeros(8), "float32")
+let p = "bert.encoder.layer.0."
+for nm in ["attention.self.query", "attention.self.key", "attention.self.value", "attention.output.dense"]:
+    bw[p + nm + ".weight"] = r(8, 8)
+    bw[p + nm + ".bias"] = r(8)
+bw[p + "attention.output.LayerNorm.weight"] = tensor(ones(8), "float32")
+bw[p + "attention.output.LayerNorm.bias"] = tensor(zeros(8), "float32")
+bw[p + "intermediate.dense.weight"] = r(16, 8)
+bw[p + "intermediate.dense.bias"] = r(16)
+bw[p + "output.dense.weight"] = r(8, 16)
+bw[p + "output.dense.bias"] = r(8)
+bw[p + "output.LayerNorm.weight"] = tensor(ones(8), "float32")
+bw[p + "output.LayerNorm.bias"] = tensor(zeros(8), "float32")
+bw["bert.pooler.dense.weight"] = r(8, 8)
+bw["bert.pooler.dense.bias"] = r(8)
+bw["classifier.weight"] = r(2, 8)
+bw["classifier.bias"] = r(2)
+models.save_safetensors("hub_bert/model.safetensors", bw)
+let wt = hub.tokenizer_from_file("hub_bert/tokenizer.json")
+let we = wt.encode("The cats sat on a Café mat, running!")
+print(we.tokens, we.ids)
+print(wt.decode(we.ids))
+let bm = hub.model_from_folder("hub_bert")
+let emb = bm.embed(["the cat sat", "a dog"])
+print(shape(emb), [round(float(v), 4) for v in emb[0].tolist()])
+print(round(bm.similarity("the cat sat on the mat", "a dog running"), 4))
+let c = bm.classify("the cat sat")
+print(c["label"], round(c["score"], 4))

@@ -6,6 +6,7 @@
 #include <stdint.h>
 #include <stddef.h>
 #include <setjmp.h>
+#include <stdio.h>
 
 typedef enum { T_NONE = 0, T_BOOL, T_INT, T_FLOAT, T_OBJ } ATag;
 
@@ -192,7 +193,7 @@ void *a_csym(AV lib, const char *name);
 double a_c_f64(AV v); int64_t a_c_i64(AV v); const char *a_c_str(AV v);
 void *a_tensor_ptr(AV v, int kind, const char *what);
 AV a_module(const char *name, int n, const char **names, AV *vals);
-uint64_t a_rand_u64(void); double a_rand_f(void); double a_rand_n(void); void a_seed(uint64_t x); int64_t a_rand_int(int64_t lo, int64_t hi); AV a_ellipsis(void);
+uint64_t a_rand_u64(void); double a_rand_f(void); double a_rand_n(void); void a_seed(uint64_t x); int64_t a_rand_int(int64_t lo, int64_t hi); AV a_ellipsis(void); FILE *a_fopen_w(const char *path, const char *mode);
 extern AV (*a_tensor_random)(int kind, int n, AV *shape, AV lo, AV hi);           /* o.name, AttributeError if missing */
 
 enum { OP_ADD = 1, OP_SUB, OP_MUL, OP_DIV, OP_FLOORDIV, OP_MOD, OP_POW, OP_MATMUL, OP_AND, OP_OR, OP_XOR, OP_SHL, OP_SHR,

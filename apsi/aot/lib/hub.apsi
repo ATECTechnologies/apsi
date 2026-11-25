@@ -1,0 +1,1592 @@
+# use hub in native programs: models, tokenizers and files from the Hugging Face Hub, run by Apsi itself.
+#   files / info / search / download / snapshot / config / load / tokenizer / model (network: --allow-net=huggingface.co
+#   as in apsi run), model_from_folder / tokenizer_from_file (local), login / logout / offline / cache_dir / clear_cache
+# Models: encoders (bert, roberta, xlm-roberta, distilbert, camembert: embed, similarity, classify, tokens,
+# fill_mask) and decoders (gpt2, llama, mistral, qwen2, qwen3, gemma: generate, chat, conversation), on the processor
+# in float32. The cache is the one apsi run uses (~/.apsi/hub, APSI_HUB_CACHE); a download is read into memory whole.
+
+let _re = pyimport("re")
+
+class HubError(RuntimeError):
+    var kind = "HubError"
+
+var _state = {"token": none, "offline": false}
+
+fn _env(name):
+    let v = getenv(name)
+    return none if v is none or v == "" else v
+
+let ENDPOINT = (_env("HF_ENDPOINT") if _env("HF_ENDPOINT") is not none else "https://huggingface.co").rstrip("/")
+_state["offline"] = _env("APSI_HUB_OFFLINE") in ["1", "true", "yes"]
+
+fn _join(*parts):
+    var out = parts[0]
+    for p in parts[1:]:
+        out = out + ("" if out.endswith("/") else "/") + p
+    return out
+
+fn cache_dir():
+    var d = _env("APSI_HUB_CACHE")
+    if d is none:
+        let home = _env("HOME") if _env("HOME") is not none else (_env("USERPROFILE") if _env("USERPROFILE") is not none else ".")
+        d = _join(home, ".apsi", "hub")
+    __fs("mkdir", d)
+    return d
+
+fn _repo_ok(repo):
+    if _re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*(/[A-Za-z0-9][A-Za-z0-9._-]*)?", str(repo)) is none or ".." in str(repo):
+        raise HubError(f"not a Hub repository name: {repr(repo)} (expected owner/name)")
+    return str(repo)
+
+fn _file_ok(name):
+    let n = str(name)
+    if n == "" or n.startswith("/") or ".." in n.split("/") or "\\" in n:
+        raise HubError(f"not a file name inside a repository: {repr(name)}")
+    return n
+
+fn _token(tok=none):
+    if tok is not none:
+        return str(tok)
+    if _state["token"] is not none:
+        return _state["token"]
+    return _env("HF_TOKEN")
+
+fn login(token):
+    _state["token"] = str(token)
+    return true
+fn logout():
+    _state["token"] = none
+fn offline(on=true):
+    _state["offline"] = bool(on)
+    return _state["offline"]
+
+fn _rmtree(p):
+    if __fs("isdir", p):
+        for f in __fs("list", p):
+            _rmtree(_join(p, f))
+        __fs("rmdir", p)
+    elif __fs("isfile", p):
+        __fs("remove", p)
+
+fn clear_cache(repo=none):
+    _rmtree(_join(cache_dir(), "models", repo.replace("/", "--")) if repo is not none else cache_dir())
+
+# ------------------------------------------------------------------ HTTP
+fn _host(url):
+    let rest = url[url.find("://") + 3:]
+    var h = rest
+    for ch in ["/", "?", "#", ":"]:
+        let k = h.find(ch)
+        if k >= 0:
+            h = h[0:k]
+    return h.lower()
+
+fn _quote(s):
+    var out = ""
+    for b in str(s).encode("utf-8"):
+        let c = chr(b)
+        if c.isalnum() or c in "-_.~/":
+            out = out + c
+        else:
+            out = out + "%" + f"{b:02X}"
+    return out
+
+fn _request(method, url, tok=none, follow=true):
+    # [status, headers (lower-case names), body bytes, final url]; the token only goes to the Hub's own host
+    if _state["offline"]:
+        raise HubError("hub is offline (hub.offline(false) or unset APSI_HUB_OFFLINE)")
+    var u = url
+    var hops = 0
+    while true:
+        var hs = [["User-Agent", "apsi-hub/2.6.6"]]
+        let t = _token(tok)
+        if t is not none and _host(u) == _host(ENDPOINT):
+            hs.append(["Authorization", f"Bearer {t}"])
+        let r = __net("request", method, u, hs, none, 60.0)
+        if isinstance(r, tuple) and len(r) == 3 and r[0] == "error":
+            raise HubError(f"cannot reach {_host(u)}: {r[2]}")
+        var hd = {}
+        for pr in r[2]:
+            hd[pr[0].lower()] = pr[1]
+        let st = r[0]
+        if st in [301, 302, 303, 307, 308] and "location" in hd:
+            if not follow:
+                return [st, hd, r[3], u]
+            hops = hops + 1
+            if hops > 8:
+                raise HubError("too many redirects")
+            let loc = hd["location"]
+            u = loc if loc.startswith("http") else ENDPOINT + loc if loc.startswith("/") else u[0:u.rfind("/") + 1] + loc
+            continue
+        if st >= 400:
+            let what = {401: "needs a token (hub.login(\"hf_…\") or HF_TOKEN), or the repository does not exist",
+                        403: "the token has no access — for a gated model, accept its terms on the model page first",
+                        404: "not found (check the repository name, file name and revision)",
+                        429: "the Hub is rate-limiting requests; wait a minute or log in with a token"}
+            raise HubError(f"Hugging Face Hub: {what[st] if st in what else r[1]} ({st}, {u.split('?')[0]})")
+        return [st, hd, r[3], u]
+
+fn _json(url, tok=none) = json_parse(_request("GET", url, tok)[2].decode("utf-8"))
+
+fn info(repo, revision=none, token=none, kind="model"):
+    _repo_ok(repo)
+    let base = {"model": "models", "dataset": "datasets", "space": "spaces"}[kind]
+    return _json(f"{ENDPOINT}/api/{base}/{repo}" + (f"/revision/{_quote(revision)}" if revision is not none else ""), token)
+
+fn _cached_files(repo, kind):
+    let root = _join(cache_dir(), kind + "s", repo.replace("/", "--"))
+    var out = []
+    fn walk(d, rel):
+        if not __fs("isdir", d):
+            return none
+        for f in __fs("list", d):
+            let p = _join(d, f)
+            let r = f if rel == "" else rel + "/" + f
+            if __fs("isdir", p):
+                walk(p, r)
+            elif not (f.endswith(".part") or f.endswith(".lock")) and "/" in r:
+                let name = r[r.find("/") + 1:]
+                if name not in out:
+                    out.append(name)
+        return none
+    walk(root, "")
+    return out
+
+fn files(repo, revision=none, token=none, kind="model"):
+    if _state["offline"]:
+        return sorted(_cached_files(repo, kind))
+    let i = info(repo, revision, token, kind)
+    return [s["rfilename"] for s in (i["siblings"] if "siblings" in i else [])]
+
+fn search(query="", task=none, limit=20, sort="downloads"):
+    var url = f"{ENDPOINT}/api/models?search={_quote(query)}&limit={int(limit)}&sort={_quote(sort)}&direction=-1"
+    if task is not none:
+        url = url + f"&pipeline_tag={_quote(task)}"
+    return [{"id": r["id"] if "id" in r else r.get("modelId"), "task": r.get("pipeline_tag"), "downloads": r.get("downloads"),
+             "likes": r.get("likes")} for r in _json(url)]
+
+fn _refs(repo, kind) = _join(cache_dir(), kind + "s", repo.replace("/", "--"), "refs.json")
+
+fn _remember_ref(path, rev, commit):
+    var d = json_parse(read_text(path)) if __fs("isfile", path) else {}
+    if rev != commit:
+        d[rev] = commit
+        write_text(path, json_str(d))
+
+fn _local(repo, kind, commit, name) = _join(cache_dir(), kind + "s", repo.replace("/", "--"), commit, name)
+
+fn _mkparent(p):
+    let k = p.rfind("/")
+    if k > 0:
+        __fs("mkdir", p[0:k])
+
+fn download(repo, filename, revision="main", token=none, kind="model", progress=true):
+    # one file -> its local path (cached by commit, SHA-256 checked when the Hub gives it)
+    _repo_ok(repo)
+    let name = _file_ok(filename)
+    let rev = revision if revision is not none else "main"
+    let refs = _refs(repo, kind)
+    if _state["offline"]:
+        var commit = rev
+        if __fs("isfile", refs):
+            let d = json_parse(read_text(refs))
+            if rev in d:
+                commit = d[rev]
+        let p = _local(repo, kind, commit, name)
+        if __fs("isfile", p):
+            return p
+        raise HubError(f"{repo}/{name} is not in the cache and the hub is offline")
+    let prefix = {"model": "", "dataset": "datasets/", "space": "spaces/"}[kind]
+    let url = f"{ENDPOINT}/{prefix}{repo}/resolve/{_quote(rev)}/{_quote(name)}"
+    let head = _request("HEAD", url, token, false)
+    let hd = head[1]
+    let commit = hd["x-repo-commit"] if "x-repo-commit" in hd else rev
+    var etag = hd["x-linked-etag"] if "x-linked-etag" in hd else (hd["etag"] if "etag" in hd else "")
+    etag = etag.strip("\"")
+    if etag.startswith("W/"):
+        etag = etag[2:].strip("\"")
+    let size = int(hd["x-linked-size"] if "x-linked-size" in hd else (hd["content-length"] if "content-length" in hd else "0"))
+    let path = _local(repo, kind, commit, name)
+    if __fs("isfile", path) and (size == 0 or __fs("size", path) == size):
+        _remember_ref(refs, rev, commit)
+        return path
+    _mkparent(path)
+    if progress and size > (32 << 20):
+        print(f"  {name}: {size / 1048576.0:,.0f} MB")
+    let body = _request("GET", url, token)[2]
+    if size and len(body) != size:
+        raise HubError(f"{name}: download ended at {len(body):,} of {size:,} bytes; run again")
+    if _re.fullmatch(r"[0-9a-f]{64}", etag) is not none and __hash(body, "sha256") != etag:
+        raise HubError(f"{name}: the downloaded file does not match the Hub's SHA-256")
+    __fs("writeb", path + ".part", body)
+    __fs("rename", path + ".part", path)
+    _remember_ref(refs, rev, commit)
+    return path
+
+fn _glob_ok(name, pats):
+    for p in pats:
+        let rx = "^" + _re.escape(p).replace("\\*", ".*").replace("\\?", ".") + "$"
+        if _re.match(rx, name) is not none or _re.match(rx, name.split("/")[-1]) is not none:
+            return true
+    return false
+
+fn snapshot(repo, patterns=["*.json", "*.safetensors", "*.txt", "*.model"], revision="main", token=none, kind="model"):
+    # the files matching patterns -> the local folder holding them
+    var folder = none
+    for f in files(repo, revision, token, kind):
+        if _glob_ok(f, patterns):
+            let p = download(repo, f, revision, token, kind)
+            folder = p[0:len(p) - len(f) - 1]
+    if folder is none:
+        raise HubError(f"{repo} has no files matching {patterns}")
+    return folder
+
+fn config(repo, revision="main", token=none) = json_parse(read_text(download(repo, "config.json", revision, token)))
+
+fn load(repo, filename=none, revision="main", token=none, dtype=none):
+    # the weights of a repository as {name: tensor} (sharded checkpoints too)
+    var names = [filename] if filename is not none else none
+    if names is none:
+        let fs = files(repo, revision, token)
+        if "model.safetensors.index.json" in fs:
+            let idx = json_parse(read_text(download(repo, "model.safetensors.index.json", revision, token)))
+            names = sorted(list(set(idx["weight_map"].values())))
+        elif "model.safetensors" in fs:
+            names = ["model.safetensors"]
+        else:
+            names = [f for f in fs if f.endswith(".safetensors")]
+        if len(names) == 0:
+            raise HubError(f"{repo} has no safetensors weights")
+    var out = {}
+    for n in names:
+        let w = __st_load(download(repo, n, revision, token), none, false)[0]
+        for k in keys(w):
+            out[k] = w[k] if dtype is none else tensor(w[k], dtype)
+    return out
+
+fn tokenizer(repo, revision="main", token=none) = tokenizer_from_file(download(repo, "tokenizer.json", revision, token))
+
+fn model(repo, revision="main", token=none, device="auto", update=false, gpu_layers=none, memory="auto"):
+    let folder = snapshot(repo, ["*.json", "*.safetensors", "*.txt", "*.model"], revision, token)
+    return _make_model(folder, repo)
+
+fn model_from_folder(folder, device="auto", gpu_layers=none, memory="auto") = _make_model(folder, folder)
+
+fn pipeline(task, repo, revision="main", token=none):
+    var p = Pipeline()
+    if task not in _TASKS:
+        raise HubError(f"unknown task '{task}' (tasks: {', '.join(list(keys(_TASKS)))})")
+    p.task = task
+    p.model = model(repo, revision, token)
+    return p
+
+fn devices() = []
+fn gpu_status() = {}
+
+# ------------------------------------------------------------------ tokenizers (tokenizer.json)
+fn _bytes_to_unicode():
+    var bs = list(range(33, 127)) + list(range(161, 173)) + list(range(174, 256))
+    var cs = list(bs)
+    var n = 0
+    for b in range(256):
+        if b not in bs:
+            bs.append(b)
+            cs.append(256 + n)
+            n = n + 1
+    var d = {}
+    for i in range(len(bs)):
+        d[bs[i]] = chr(cs[i])
+    return d
+
+let _B2U = _bytes_to_unicode()
+var _U2B = {}
+for k in keys(_B2U):
+    _U2B[_B2U[k]] = k
+let _GPT2 = _re.compile(r"""'s|'t|'re|'ve|'m|'ll|'d| ?[^\W\d_]+| ?\d+| ?(?:[^\s\w]|_)+|\s+(?!\S)|\s+""")
+let _ACC_FROM = "ÀÁÂÃÄÅÇÈÉÊËÌÍÎÏÑÒÓÔÕÖÙÚÛÜÝàáâãäåçèéêëìíîïñòóôõöùúûüýÿĀāĂăĄąĆćĈĉĊċČčĎďĒēĔĕĖėĘęĚěĜĝĞğĠġĢģĤĥĨĩĪīĬĭĮįİĴĵĶķĹĺĻļĽľŃńŅņŇňŌōŎŏŐőŔŕŖŗŘřŚśŜŝŞşŠšŢţŤťŨũŪūŬŭŮůŰűŲųŴŵŶŷŸŹźŻżŽžƠơƯưǍǎǏǐǑǒǓǔǕǖǗǘǙǚǛǜǞǟǠǡǢǣǦǧǨǩǪǫǬǭǮǯǰǴǵǸǹǺǻǼǽǾǿȀȁȂȃȄȅȆȇȈȉȊȋȌȍȎȏȐȑȒȓȔȕȖȗȘșȚțȞȟȦȧȨȩȪȫȬȭȮȯȰȱȲȳḀḁḂḃḄḅḆḇḈḉḊḋḌḍḎḏḐḑḒḓḔḕḖḗḘḙḚḛḜḝḞḟḠḡḢḣḤḥḦḧḨḩḪḫḬḭḮḯḰḱḲḳḴḵḶḷḸḹḺḻḼḽḾḿṀṁṂṃṄṅṆṇṈṉṊṋṌṍṎṏṐṑṒṓṔṕṖṗṘṙṚṛṜṝṞṟṠṡṢṣṤṥṦṧṨṩṪṫṬṭṮṯṰṱṲṳṴṵṶṷṸṹṺṻṼṽṾṿẀẁẂẃẄẅẆẇẈẉẊẋẌẍẎẏẐẑẒẓẔẕẖẗẘẙẛẠạẢảẤấẦầẨẩẪẫẬậẮắẰằẲẳẴẵẶặẸẹẺẻẼẽẾếỀềỂểỄễỆệỈỉỊịỌọỎỏỐốỒồỔổỖỗỘộỚớỜờỞởỠỡỢợỤụỦủỨứỪừỬửỮữỰựỲỳỴỵỶỷỸỹ"
+let _ACC_TO = "AAAAAACEEEEIIIINOOOOOUUUUYaaaaaaceeeeiiiinooooouuuuyyAaAaAaCcCcCcCcDdEeEeEeEeEeGgGgGgGgHhIiIiIiIiIJjKkLlLlLlNnNnNnOoOoOoRrRrRrSsSsSsSsTtTtUuUuUuUuUuUuWwYyYZzZzZzOoUuAaIiOoUuUuUuUuUuAaAaÆæGgKkOoOoƷʒjGgNnAaÆæØøAaAaEeEeIiIiOoOoRrRrUuUuSsTtHhAaEeOoOoOoOoYyAaBbBbBbCcDdDdDdDdDdEeEeEeEeEeFfGgHhHhHhHhHhIiIiKkKkKkLlLlLlLlMmMmMmNnNnNnNnOoOoOoOoPpPpRrRrRrRrSsSsSsSsSsTtTtTtTtUuUuUuUuUuVvVvWwWwWwWwWwXxXxYyZzZzZzhtwyſAaAaAaAaAaAaAaAaAaAaAaAaEeEeEeEeEeEeEeEeIiIiOoOoOoOoOoOoOoOoOoOoOoOoUuUuUuUuUuUuUuYyYyYyYy"
+var _ACC = {}
+for i in range(len(_ACC_FROM)):
+    _ACC[_ACC_FROM[i]] = _ACC_TO[i]
+
+fn _strip_accents(s):
+    var out = []
+    for c in s:
+        let o = ord(c)
+        if o >= 0x300 and o <= 0x36F:
+            continue
+        out.append(_ACC[c] if c in _ACC else c)
+    return "".join(out)
+
+fn _cjk(c):
+    let o = ord(c)
+    return (o >= 0x4E00 and o <= 0x9FFF) or (o >= 0x3400 and o <= 0x4DBF) or (o >= 0x20000 and o <= 0x2A6DF) or (o >= 0x2A700 and o <= 0x2B73F) or (o >= 0x2B740 and o <= 0x2B81F) or (o >= 0x2B820 and o <= 0x2CEAF) or (o >= 0xF900 and o <= 0xFAFF) or (o >= 0x2F800 and o <= 0x2FA1F)
+
+fn _control(c):
+    let o = ord(c)
+    return (o < 32 and c not in "\t\n\r") or (o >= 0x7F and o <= 0x9F) or (o >= 0x200B and o <= 0x200F) or o == 0xFEFF or (o >= 0x202A and o <= 0x202E) or (o >= 0x2060 and o <= 0x2064) or o == 0xAD
+
+fn _zs(c):
+    let o = ord(c)
+    return o == 32 or o == 0xA0 or o == 0x1680 or (o >= 0x2000 and o <= 0x200A) or o == 0x202F or o == 0x205F or o == 0x3000
+
+let _LETTERS = "a-zA-ZªµºÀ-ÖØ-öø-ʯͰ-ϿЀ-ԯԱ-ևא-תؠ-يٱ-ۓऀ-हก-ะเ-ๆᄀ-ᇿぁ-ゖァ-ヺ㐀-䶿一-鿿가-힣"
+let _NUMBERS = "0-9٠-٩۰-۹०-९๐-๙０-９"
+
+fn _py_regex(pat):
+    # \p{L} / \p{N} / \p{M} (as in tokenizer.json) for Apsi's regular expressions
+    var out = []
+    var i = 0
+    var depth = 0
+    while i < len(pat):
+        let c = pat[i]
+        if c == "\\" and i + 1 < len(pat):
+            let two = pat[i:i + 5]
+            if two in ["\\p{L}", "\\p{N}", "\\p{M}", "\\P{L}", "\\P{N}"]:
+                let kind = two[3]
+                let neg = two[1] == "P"
+                if depth:
+                    out.append({"L": _LETTERS, "N": _NUMBERS, "M": "̀-ͯ"}[kind])
+                else:
+                    let cls = {"L": "[^\\W\\d_]", "N": "\\d", "M": "[̀-ͯ]"}[kind]
+                    out.append(({"L": "[\\W\\d_]", "N": "\\D"}[kind] if kind in "LN" else cls) if neg else cls)
+                i = i + 5
+                continue
+            out.append(pat[i:i + 2])
+            i = i + 2
+            continue
+        if c == "[":
+            depth = depth + 1
+        elif c == "]" and depth:
+            depth = depth - 1
+        out.append(c)
+        i = i + 1
+    return "".join(out)
+
+class Encoding:
+    var ids = []
+    var tokens = []
+    var attention_mask = []
+    fn __repr__(self) = f"Encoding(ids={self.ids}, tokens={self.tokens})"
+    fn __str__(self) = self.__repr__()
+
+fn _encoding(ids, toks):
+    var e = Encoding()
+    e.ids = ids
+    e.tokens = toks
+    e.attention_mask = [1] * len(ids)
+    return e
+
+fn _hex2(b) = "0123456789ABCDEF"[b // 16] + "0123456789ABCDEF"[b % 16]
+
+class Tokenizer:
+    var spec = none
+    var type = "BPE"
+    var vocab = {}
+    var inv = {}
+    var unk = none
+    var unk_id = none
+    var added = {}
+    var special = []
+    var norms = []
+    var pres = []
+    var byte_level = false
+    var metaspace = none
+    var post = none
+    var ranks = {}
+    var byte_fallback = false
+    var cache = {}
+    var prefix = "##"
+    var max_chars = 100
+    var scores = {}
+    var max_len = 1
+    var min_score = 0.0
+    var added_re = none
+
+    fn _normalize(self, s0):
+        var s = s0
+        for n in self.norms:
+            let t = n.get("type")
+            if t == "BertNormalizer":
+                if n.get("clean_text", true):
+                    var o = []
+                    for c in s:
+                        if ord(c) == 0 or ord(c) == 0xFFFD or _control(c):
+                            continue
+                        o.append(" " if c in "\t\n\r" or _zs(c) else c)
+                    s = "".join(o)
+                if n.get("handle_chinese_chars", true):
+                    var o2 = []
+                    for c in s:
+                        o2.append(f" {c} " if _cjk(c) else c)
+                    s = "".join(o2)
+                let lower = n.get("lowercase", true)
+                var strip = n.get("strip_accents")
+                if strip is none:
+                    strip = lower
+                if lower:
+                    s = s.lower()
+                if strip:
+                    s = _strip_accents(s)
+            elif t == "Lowercase":
+                s = s.lower()
+            elif t == "StripAccents" or t == "NFD" or t == "NFKD":
+                if t == "StripAccents":
+                    s = _strip_accents(s)
+            elif t == "Prepend":
+                s = n["prepend"] + s
+            elif t == "Replace":
+                let pat = n["pattern"]
+                s = _re.sub(pat["Regex"], n["content"], s) if "Regex" in pat else s.replace(pat["String"], n["content"])
+            elif t == "Strip":
+                s = s.strip()
+        return s
+
+    fn _pretokenize(self, s):
+        var words = [s]
+        for p in self.pres:
+            let t = p.get("type")
+            if t == "BertPreTokenizer" or t == "WhitespaceSplit" or t == "Whitespace":
+                var out = []
+                for w in words:
+                    if t == "BertPreTokenizer":
+                        out.extend(_re.findall(r"\w+|[^\w\s]", w))
+                    elif t == "Whitespace":
+                        out.extend(_re.findall(r"\w+|[^\w\s]+", w))
+                    else:
+                        out.extend(w.split())
+                words = out
+            elif t == "ByteLevel":
+                var out = []
+                for w0 in words:
+                    var w = w0
+                    if p.get("add_prefix_space") and not w.startswith(" "):
+                        w = " " + w
+                    let pieces = _GPT2.findall(w) if p.get("use_regex", true) else [w]
+                    for piece in pieces:
+                        out.append("".join([_B2U[b] for b in piece.encode("utf-8")]))
+                words = out
+            elif t == "Metaspace":
+                let rep = p.get("replacement", "▁")
+                var out = []
+                for w0 in words:
+                    var w = w0.replace(" ", rep)
+                    let scheme = p.get("prepend_scheme", "always" if p.get("add_prefix_space", true) else "never")
+                    if scheme != "never" and not w.startswith(rep):
+                        w = rep + w
+                    if p.get("split", true):
+                        out.extend([x for x in _re.split("(?=" + _re.escape(rep) + ")", w) if x])
+                    else:
+                        out.append(w)
+                words = out
+            elif t == "Digits":
+                var out = []
+                for w in words:
+                    out.extend(_re.findall(r"\d|\D+", w) if p.get("individual_digits") else _re.findall(r"\d+|\D+", w))
+                words = out
+            elif t == "Split":
+                let pat = p["pattern"]["Regex"] if "Regex" in p["pattern"] else _re.escape(p["pattern"].get("String", ""))
+                let rx = _re.compile("(" + _py_regex(pat) + ")")
+                var out = []
+                for w in words:
+                    out.extend([x for x in rx.split(w) if x])
+                words = out
+            elif t == "Punctuation":
+                var out = []
+                for w in words:
+                    out.extend(_re.findall(r"[^\W_]+|[^\w\s]|_|\s+", w))
+                words = out
+        return words
+
+    fn _merge(self, word):
+        var parts = [c for c in word]
+        while len(parts) > 1:
+            var best = -1
+            var bi = -1
+            for i in range(len(parts) - 1):
+                let key = parts[i] + " " + parts[i + 1]
+                if key in self.ranks:
+                    let r = self.ranks[key]
+                    if best < 0 or r < best:
+                        best = r
+                        bi = i
+            if best < 0:
+                break
+            let a = parts[bi]
+            let b = parts[bi + 1]
+            var merged = []
+            var i = 0
+            while i < len(parts):
+                if i < len(parts) - 1 and parts[i] == a and parts[i + 1] == b:
+                    merged.append(a + b)
+                    i = i + 2
+                else:
+                    merged.append(parts[i])
+                    i = i + 1
+            parts = merged
+        return parts
+
+    fn _bpe(self, word):
+        if word in self.cache:
+            return self.cache[word]
+        var out = []
+        for p in self._merge(word):
+            if p in self.vocab:
+                out.append(p)
+            elif self.byte_fallback:
+                for b in p.encode("utf-8"):
+                    out.append("<0x" + _hex2(b) + ">")
+            elif self.unk is not none:
+                out.append(self.unk)
+        if len(self.cache) > 200000:
+            self.cache = {}
+        self.cache[word] = out
+        return out
+
+    fn _wordpiece(self, word):
+        if len(word) > self.max_chars:
+            return [self.unk]
+        var out = []
+        var start = 0
+        while start < len(word):
+            var end = len(word)
+            var cur = none
+            while start < end:
+                var sub = word[start:end]
+                if start > 0:
+                    sub = self.prefix + sub
+                if sub in self.vocab:
+                    cur = sub
+                    break
+                end = end - 1
+            if cur is none:
+                return [self.unk]
+            out.append(cur)
+            start = end
+        return out
+
+    fn _unigram(self, word):
+        if word in self.cache:
+            return self.cache[word]
+        let n = len(word)
+        var best_s = [-1e300] * (n + 1)
+        var best_i = [-1] * (n + 1)
+        var best_p = [none] * (n + 1)
+        best_s[0] = 0.0
+        let unk_score = self.min_score - 10.0
+        for i in range(n):
+            if best_s[i] <= -1e299:
+                continue
+            let base = best_s[i]
+            var found = false
+            for j in range(i + 1, min(n, i + self.max_len) + 1):
+                let piece = word[i:j]
+                if piece in self.scores:
+                    if j == i + 1:
+                        found = true
+                    let sc = base + self.scores[piece][1]
+                    if sc > best_s[j]:
+                        best_s[j] = sc
+                        best_i[j] = i
+                        best_p[j] = piece
+            if not found:
+                let sc = base + unk_score
+                if sc > best_s[i + 1]:
+                    best_s[i + 1] = sc
+                    best_i[i + 1] = i
+                    best_p[i + 1] = none
+        var pieces = []
+        var j = n
+        while j > 0:
+            let i = best_i[j]
+            pieces.append([best_p[j], word[i:j]])
+            j = i
+        pieces.reverse()
+        var out = []
+        for pt in pieces:
+            if pt[0] is not none:
+                out.append(pt[0])
+            elif self.byte_fallback:
+                for b in pt[1].encode("utf-8"):
+                    out.append("<0x" + _hex2(b) + ">")
+            elif len(out) > 0 and out[len(out) - 1] == self.unk:
+                continue
+            else:
+                out.append(self.unk)
+        self.cache[word] = out
+        return out
+
+    fn _tokens(self, text):
+        let chunks = self.added_re.split(text) if self.added_re is not none else [text]
+        var toks = []
+        for k in range(len(chunks)):
+            let chunk = chunks[k]
+            if chunk is none or chunk == "":
+                continue
+            if self.added_re is not none and k % 2 == 1:
+                toks.append(chunk)
+                continue
+            for w in self._pretokenize(self._normalize(chunk)):
+                toks.extend(self._bpe(w) if self.type == "BPE" else (self._unigram(w) if self.type == "Unigram" else self._wordpiece(w)))
+        return toks
+
+    fn _post(self, a, b):
+        let p = self.post
+        let procs = p.get("processors", [p]) if p.get("type") == "Sequence" else [p]
+        for q in procs:
+            let t = q.get("type")
+            if t == "TemplateProcessing":
+                let tpl = q["pair"] if b is not none else q["single"]
+                var out = []
+                for item in tpl:
+                    if "SpecialToken" in item:
+                        out.append(item["SpecialToken"]["id"])
+                    else:
+                        out.extend(a if item["Sequence"]["id"] == "A" else (b if b is not none else []))
+                return out
+            if t == "BertProcessing":
+                return [q["cls"][0]] + a + [q["sep"][0]] + ((b + [q["sep"][0]]) if b is not none else [])
+            if t == "RobertaProcessing":
+                return [q["cls"][0]] + a + [q["sep"][0]] + (([q["sep"][0]] + b + [q["sep"][0]]) if b is not none else [])
+        return a + (b if b is not none else [])
+
+    fn encode(self, text, pair=none, add_special_tokens=true):
+        var toks = self._tokens(text)
+        let toks2 = self._tokens(pair) if pair is not none else none
+        if add_special_tokens and self.post is not none:
+            toks = self._post(toks, toks2)
+        elif toks2 is not none:
+            toks = toks + toks2
+        let unk = self.vocab.get(self.unk, 0) if self.unk is not none else 0
+        return _encoding([self.added[t] if t in self.added else self.vocab.get(t, unk) for t in toks], toks)
+
+    fn __call__(self, text, pair=none, add_special_tokens=true) = self.encode(text, pair, add_special_tokens)
+
+    fn decode(self, ids, skip_special_tokens=true):
+        var toks = [self.inv.get(int(i), "") for i in ids]
+        if skip_special_tokens:
+            toks = [t for t in toks if t not in self.special]
+        if self.type == "WordPiece":
+            let text = " ".join(toks).replace(" " + self.prefix, "")
+            return _re.sub(r" ([.,!?;:')])", r"\1", text)
+        if self.byte_level:
+            var bs = []
+            for c in "".join(toks):
+                bs.append(_U2B[c] if c in _U2B else 0)
+            return bytes(bs).decode("utf-8", "replace")
+        var raw = []
+        for t in toks:
+            let m = _re.fullmatch(r"<0x([0-9A-Fa-f]{2})>", t)
+            if m is not none:
+                raw.append(int(m.group(1), 16))
+            else:
+                raw.extend(list(t.encode("utf-8")))
+        var text = bytes(raw).decode("utf-8", "replace")
+        let dec = self.spec.get("decoder") or {}
+        let decs = dec.get("decoders", [dec]) if dec else []
+        var rep = self.metaspace.get("replacement") if self.metaspace is not none else none
+        if rep is none:
+            for d in decs:
+                if d.get("type") == "Metaspace":
+                    rep = d.get("replacement", "▁")
+                    break
+        if rep is none:
+            for d in decs:
+                if d.get("type") == "Replace" and d.get("content") == " " and "String" in d["pattern"]:
+                    rep = d["pattern"]["String"]
+                    break
+        if rep is none:
+            for n in self.norms:
+                if n.get("type") == "Prepend":
+                    rep = "▁"
+        if rep:
+            text = text.replace(rep, " ")
+            if text.startswith(" "):
+                text = text[1:]
+        return text
+
+    fn vocab_size(self):
+        var m = -1
+        for k in keys(self.vocab):
+            m = max(m, self.vocab[k])
+        for k in keys(self.added):
+            m = max(m, self.added[k])
+        return m + 1
+    fn __repr__(self) = f"<tokenizer {self.type}, {self.vocab_size():,} tokens>"
+    fn __str__(self) = self.__repr__()
+
+fn tokenizer_from_spec(spec):
+    var t = Tokenizer()
+    t.spec = spec
+    let m = spec["model"]
+    t.type = m.get("type") or ("WordPiece" if "continuing_subword_prefix" in m and "merges" not in m else "BPE")
+    t.cache = {}
+    if t.type == "Unigram":
+        var sc = {}
+        var vocab = {}
+        var mx = 1
+        var mn = 0.0
+        let vs = m["vocab"]
+        for i in range(len(vs)):
+            sc[vs[i][0]] = [i, float(vs[i][1])]
+            vocab[vs[i][0]] = i
+            mx = max(mx, len(vs[i][0]))
+            mn = float(vs[i][1]) if i == 0 else min(mn, float(vs[i][1]))
+        t.scores = sc
+        t.vocab = vocab
+        t.max_len = mx
+        t.min_score = mn
+        t.unk_id = m.get("unk_id")
+        t.byte_fallback = bool(m.get("byte_fallback"))
+        t.unk = vs[t.unk_id][0] if t.unk_id is not none else none
+    else:
+        t.vocab = m["vocab"]
+        t.unk = m.get("unk_token")
+    var inv = {}
+    for k in keys(t.vocab):
+        inv[t.vocab[k]] = k
+    var added = {}
+    var special = []
+    for a in spec.get("added_tokens", []):
+        added[a["content"]] = a["id"]
+        inv[a["id"]] = a["content"]
+        if a.get("special"):
+            special.append(a["content"])
+    t.inv = inv
+    t.added = added
+    t.special = set(special)
+    let norm = spec.get("normalizer") or {}
+    let pre = spec.get("pre_tokenizer") or {}
+    t.norms = norm.get("normalizers", [norm]) if norm else []
+    t.pres = pre.get("pretokenizers", [pre]) if pre else []
+    t.byte_level = false
+    t.metaspace = none
+    for p in t.pres:
+        if p.get("type") == "ByteLevel":
+            t.byte_level = true
+        if p.get("type") == "Metaspace" and t.metaspace is none:
+            t.metaspace = p
+    t.post = spec.get("post_processor")
+    if t.type == "BPE":
+        var ranks = {}
+        let merges = m.get("merges", [])
+        for i in range(len(merges)):
+            let x = merges[i]
+            ranks[x if isinstance(x, str) else x[0] + " " + x[1]] = i
+        t.ranks = ranks
+        t.byte_fallback = bool(m.get("byte_fallback"))
+    elif t.type == "WordPiece":
+        t.prefix = m.get("continuing_subword_prefix", "##")
+        t.max_chars = m.get("max_input_chars_per_word", 100)
+    elif t.type != "Unigram":
+        raise HubError(f"tokenizer model '{t.type}' is not supported natively (WordPiece, BPE and Unigram are)")
+    if len(added) > 0:
+        let alts = sorted(list(keys(added)), key=fn(a) => -len(a))
+        t.added_re = _re.compile("(" + "|".join([_re.escape(a) for a in alts]) + ")")
+    return t
+
+fn tokenizer_from_file(path) = tokenizer_from_spec(json_parse(read_text(path)))
+
+# ------------------------------------------------------------------ the networks
+fn _ln(x, w, b, eps):
+    let m = mean(x, axis=-1, keepdims=true)
+    let d = x - m
+    return d / sqrt(mean(d * d, axis=-1, keepdims=true) + eps) * w + b
+
+fn _rms(x, w, eps, offset=0.0) = x / sqrt(mean(x * x, axis=-1, keepdims=true) + eps) * (w + offset)
+
+fn _act(name, x):
+    let n = (name if name is not none else "gelu").lower()
+    if n == "gelu" or n == "gelu_python":
+        return 0.5 * x * (1.0 + erf(x * 0.7071067811865476))
+    if n in ["gelu_new", "gelu_pytorch_tanh", "gelu_fast", "gelu_tanh"]:
+        return 0.5 * x * (1.0 + tanh(0.7978845608028654 * (x + 0.044715 * x * x * x)))
+    if n == "silu" or n == "swish":
+        return x / (1.0 + exp(-x))
+    if n == "relu":
+        return where(x > 0, x, 0.0)
+    if n == "tanh":
+        return tanh(x)
+    raise HubError(f"activation '{name}' is not supported natively")
+
+fn _clampmin(x, lo) = where(x > lo, x, lo)
+
+fn _softmax(x):
+    let e = exp(x - max(x, axis=-1, keepdims=true))
+    return e / sum(e, axis=-1, keepdims=true)
+
+class _Weights:
+    var w = {}
+    var t = {}
+    fn has(self, k) = k in self.w
+    fn get(self, k, required=true):
+        if k in self.w:
+            return self.w[k]
+        if required:
+            raise HubError(f"the checkpoint has no weight '{k}'")
+        return none
+    fn tr(self, k):
+        # [in, out] for x @ W (checkpoints store [out, in]); made once
+        if k not in self.t:
+            self.t[k] = swapaxes(self.get(k), 0, 1) + 0.0
+        return self.t[k]
+    fn lin(self, x, k, bias=none):
+        let y = x @ self.tr(k + ".weight")
+        let b = bias if bias is not none else k + ".bias"
+        return y + self.w[b] if b in self.w else y
+
+fn _strip(W, prefixes):
+    for p in prefixes:
+        var any_ = false
+        for k in keys(W):
+            if k.startswith(p):
+                any_ = true
+                break
+        if any_:
+            var out = {}
+            for k in keys(W):
+                out[k[len(p):] if k.startswith(p) else k] = W[k]
+            return out
+    return W
+
+let ENCODERS = ["bert", "roberta", "xlm-roberta", "distilbert", "camembert"]
+let DECODERS = ["gpt2", "llama", "mistral", "qwen2", "qwen3", "gemma"]
+
+class Encoder:
+    var cfg = {}
+    var type = "bert"
+    var distil = false
+    var W = none
+    var eps = 1e-12
+    var heads = 1
+    var layers = 1
+    var act = "gelu"
+    var pad = 0
+    fn g(self, k, required=true) = self.W.get(k, required)
+    fn hidden(self, ids, mask):
+        let B = shape(ids)[0]
+        let T = shape(ids)[1]
+        var x = none
+        let we = self.g("embeddings.word_embeddings.weight")
+        let pe = self.g("embeddings.position_embeddings.weight")
+        if self.distil:
+            x = _ln(we[ids] + pe[0:T], self.g("embeddings.LayerNorm.weight"), self.g("embeddings.LayerNorm.bias"), 1e-12)
+        else:
+            var pos = none
+            if self.type in ["roberta", "xlm-roberta", "camembert"]:
+                let m = tensor(ids != self.pad, "int64")
+                pos = cumsum(m, axis=1) * m + self.pad
+            else:
+                pos = tensor([[i for i in range(T)] for b in range(B)], "int64")
+            var e = we[ids] + pe[pos]
+            let te = self.g("embeddings.token_type_embeddings.weight", false)
+            if te is not none:
+                e = e + te[0]
+            x = _ln(e, self.g("embeddings.LayerNorm.weight"), self.g("embeddings.LayerNorm.bias"), self.eps)
+        let neg = reshape((1.0 - mask) * -1e9, B, 1, 1, T)
+        let H = shape(x)[2]
+        let nh = self.heads
+        let dh = H // nh
+        for i in range(self.layers):
+            var q = none
+            var k = none
+            var v = none
+            var p = ""
+            if self.distil:
+                p = f"transformer.layer.{i}."
+                q = self.W.lin(x, p + "attention.q_lin")
+                k = self.W.lin(x, p + "attention.k_lin")
+                v = self.W.lin(x, p + "attention.v_lin")
+            else:
+                p = f"encoder.layer.{i}."
+                q = self.W.lin(x, p + "attention.self.query")
+                k = self.W.lin(x, p + "attention.self.key")
+                v = self.W.lin(x, p + "attention.self.value")
+            q = permute(reshape(q, B, T, nh, dh), 0, 2, 1, 3)
+            k = permute(reshape(k, B, T, nh, dh), 0, 2, 1, 3)
+            v = permute(reshape(v, B, T, nh, dh), 0, 2, 1, 3)
+            let att = _softmax(q @ swapaxes(k, -2, -1) * (1.0 / sqrt(dh)) + neg)
+            let ctx = reshape(permute(att @ v, 0, 2, 1, 3), B, T, H)
+            if self.distil:
+                let a = self.W.lin(ctx, p + "attention.out_lin")
+                x = _ln(a + x, self.g(p + "sa_layer_norm.weight"), self.g(p + "sa_layer_norm.bias"), 1e-12)
+                let f = self.W.lin(_act(self.act, self.W.lin(x, p + "ffn.lin1")), p + "ffn.lin2")
+                x = _ln(f + x, self.g(p + "output_layer_norm.weight"), self.g(p + "output_layer_norm.bias"), 1e-12)
+            else:
+                let a = self.W.lin(ctx, p + "attention.output.dense")
+                x = _ln(a + x, self.g(p + "attention.output.LayerNorm.weight"), self.g(p + "attention.output.LayerNorm.bias"), self.eps)
+                let f = self.W.lin(_act(self.act, self.W.lin(x, p + "intermediate.dense")), p + "output.dense")
+                x = _ln(f + x, self.g(p + "output.LayerNorm.weight"), self.g(p + "output.LayerNorm.bias"), self.eps)
+        return x
+    fn pooled(self, x):
+        if not self.W.has("pooler.dense.weight"):
+            return x[:, 0]
+        return tanh(self.W.lin(x[:, 0], "pooler.dense"))
+    fn classify(self, x):
+        let W = self.W
+        if W.has("classifier.out_proj.weight"):
+            return W.lin(tanh(W.lin(x[:, 0], "classifier.dense")), "classifier.out_proj")
+        if W.has("pre_classifier.weight"):
+            let h = W.lin(x[:, 0], "pre_classifier")
+            return W.lin(where(h > 0, h, 0.0), "classifier")
+        if W.has("classifier.weight"):
+            return W.lin(self.pooled(x), "classifier")
+        raise HubError("this checkpoint has no classification head (it is a base model): use embed() instead")
+    fn token_logits(self, x):
+        if not self.W.has("classifier.weight"):
+            raise HubError("this checkpoint has no token-classification head")
+        return self.W.lin(x, "classifier")
+    fn _dec(self, x, name, alt, bias_names):
+        let dec = self.W.tr(name if self.W.has(name) else alt)
+        var y = x @ dec
+        for b in bias_names:
+            if self.W.has(b):
+                return y + self.W.get(b)
+        return y
+    fn mlm_logits(self, x):
+        let W = self.W
+        if W.has("cls.predictions.transform.dense.weight"):
+            let h = _ln(_act(self.act, W.lin(x, "cls.predictions.transform.dense")), W.get("cls.predictions.transform.LayerNorm.weight"), W.get("cls.predictions.transform.LayerNorm.bias"), self.eps)
+            return self._dec(h, "cls.predictions.decoder.weight", "embeddings.word_embeddings.weight", ["cls.predictions.bias", "cls.predictions.decoder.bias"])
+        if W.has("lm_head.dense.weight"):
+            let h = _ln(_act("gelu", W.lin(x, "lm_head.dense")), W.get("lm_head.layer_norm.weight"), W.get("lm_head.layer_norm.bias"), self.eps)
+            return self._dec(h, "lm_head.decoder.weight", "embeddings.word_embeddings.weight", ["lm_head.bias", "lm_head.decoder.bias"])
+        if W.has("vocab_transform.weight"):
+            let h = _ln(_act("gelu", W.lin(x, "vocab_transform")), W.get("vocab_layer_norm.weight"), W.get("vocab_layer_norm.bias"), 1e-12)
+            return self._dec(h, "vocab_projector.weight", "embeddings.word_embeddings.weight", ["vocab_projector.bias"])
+        raise HubError("this checkpoint has no masked-language-model head")
+
+fn _cfg(c, k, default=none) = c[k] if k in c and c[k] is not none else default
+
+class Decoder:
+    var cfg = {}
+    var type = ""
+    var gpt2 = false
+    var gemma = false
+    var W = none
+    var L = 1
+    var nh = 1
+    var kvh = 1
+    var H = 1
+    var dh = 1
+    var eps = 1e-6
+    var ctx = 4096
+    var act = "silu"
+    var inv_freq = none
+    var rot = 0
+    var rope_scale = 1.0
+    var window = none
+    var last = none
+    fn g(self, k, required=true) = self.W.get(k, required)
+    fn _rope_init(self, cfg):
+        let base = float(_cfg(cfg, "rope_theta", 10000.0))
+        let rot = int(self.dh * float(_cfg(cfg, "partial_rotary_factor", 1.0)))
+        var inv = [1.0 / base ** (float(i) / rot) for i in range(0, rot, 2)]
+        let sc = _cfg(cfg, "rope_scaling", {})
+        let kind = _cfg(sc, "rope_type", _cfg(sc, "type"))
+        if kind == "llama3":
+            let factor = float(sc["factor"])
+            let lo = float(_cfg(sc, "low_freq_factor", 1.0))
+            let hi = float(_cfg(sc, "high_freq_factor", 4.0))
+            let old = float(_cfg(sc, "original_max_position_embeddings", 8192))
+            var out = []
+            for f in inv:
+                let wave = 2 * pi / f
+                let smooth = (old / wave - lo) / (hi - lo)
+                if wave > old / lo:
+                    out.append(f / factor)
+                elif wave >= old / hi:
+                    out.append((1 - smooth) * f / factor + smooth * f)
+                else:
+                    out.append(f)
+            inv = out
+        elif kind == "linear":
+            inv = [f / float(sc["factor"]) for f in inv]
+        elif kind == "yarn":
+            let factor = float(sc["factor"])
+            let old = float(_cfg(sc, "original_max_position_embeddings", _cfg(cfg, "max_position_embeddings", 4096) / factor))
+            let fast = float(_cfg(sc, "beta_fast", 32))
+            let slow = float(_cfg(sc, "beta_slow", 1))
+            fn corr(n_rot) = rot * log(old / (n_rot * 2 * pi)) / (2 * log(base))
+            let lo_ = max(floor(corr(fast)), 0)
+            var hi_ = min(ceil(corr(slow)), rot - 1)
+            if lo_ == hi_:
+                hi_ = hi_ + 0.001
+            var out = []
+            for i in range(len(inv)):
+                let ramp = min(1.0, max(0.0, (i - lo_) / (hi_ - lo_)))
+                let keep = 1 - ramp
+                out.append(inv[i] / factor * (1 - keep) + inv[i] * keep)
+            inv = out
+            let att = _cfg(sc, "attention_factor")
+            self.rope_scale = float(att) if att else (0.1 * log(factor) + 1.0 if factor > 1 else 1.0)
+        elif kind is not none and kind != "default":
+            raise HubError(f"rope scaling '{kind}' is not supported natively (supported: llama3, linear, yarn)")
+        self.inv_freq = tensor(inv)
+        self.rot = rot
+    fn _rope(self, x, pos):
+        let f = reshape(tensor(pos, "float64"), len(pos), 1) * reshape(self.inv_freq, 1, shape(self.inv_freq)[0])
+        let emb = concat([f, f], axis=-1)
+        let c = tensor(cos(emb) * self.rope_scale, "float32")
+        let s = tensor(sin(emb) * self.rope_scale, "float32")
+        let hd = shape(x)[3]
+        let r = x[:, :, :, 0:self.rot]
+        let half = self.rot // 2
+        let rh = concat([-r[:, :, :, half:self.rot], r[:, :, :, 0:half]], axis=-1)
+        let out = r * c + rh * s
+        return concat([out, x[:, :, :, self.rot:hd]], axis=-1) if self.rot < hd else out
+    fn _layer(self, i, x, cache, pos, causal, T):
+        let W = self.W
+        var q = none
+        var k = none
+        var v = none
+        var p = ""
+        if self.gpt2:
+            p = f"h.{i}."
+            let h = _ln(x, self.g(p + "ln_1.weight"), self.g(p + "ln_1.bias"), self.eps)
+            let qkv = h @ self.g(p + "attn.c_attn.weight") + self.g(p + "attn.c_attn.bias")
+            let Hh = shape(qkv)[2] // 3
+            q = qkv[:, :, 0:Hh]
+            k = qkv[:, :, Hh:2 * Hh]
+            v = qkv[:, :, 2 * Hh:3 * Hh]
+        else:
+            p = f"model.layers.{i}."
+            let h = _rms(x, self.g(p + "input_layernorm.weight"), self.eps, 1.0 if self.gemma else 0.0)
+            q = W.lin(h, p + "self_attn.q_proj")
+            k = W.lin(h, p + "self_attn.k_proj")
+            v = W.lin(h, p + "self_attn.v_proj")
+        q = permute(reshape(q, 1, T, self.nh, self.dh), 0, 2, 1, 3)
+        k = permute(reshape(k, 1, T, self.kvh, self.dh), 0, 2, 1, 3)
+        v = permute(reshape(v, 1, T, self.kvh, self.dh), 0, 2, 1, 3)
+        if not self.gpt2:
+            if W.has(p + "self_attn.q_norm.weight"):
+                q = _rms(q, W.get(p + "self_attn.q_norm.weight"), self.eps)
+                k = _rms(k, W.get(p + "self_attn.k_norm.weight"), self.eps)
+            q = self._rope(q, pos)
+            k = self._rope(k, pos)
+        let ck = cache[i][0]
+        if ck is not none:
+            k = concat([ck, k], axis=2)
+            v = concat([cache[i][1], v], axis=2)
+        cache[i] = [k, v]
+        let rep = self.nh // self.kvh
+        var kk = k
+        var vv = v
+        if rep > 1:
+            let S = shape(k)[2]
+            kk = reshape(stack([k] * rep, axis=2), 1, self.nh, S, self.dh)
+            vv = reshape(stack([v] * rep, axis=2), 1, self.nh, S, self.dh)
+        let sc = _cfg(self.cfg, "query_pre_attn_scalar")
+        let scale = 1.0 / sqrt(sc) if sc else 1.0 / sqrt(self.dh)
+        let att = _softmax(q @ swapaxes(kk, -2, -1) * scale + causal)
+        let o = reshape(permute(att @ vv, 0, 2, 1, 3), 1, T, self.nh * self.dh)
+        var y = x
+        if self.gpt2:
+            y = y + (o @ self.g(p + "attn.c_proj.weight") + self.g(p + "attn.c_proj.bias"))
+            let h2 = _ln(y, self.g(p + "ln_2.weight"), self.g(p + "ln_2.bias"), self.eps)
+            let m = _act("gelu_new", h2 @ self.g(p + "mlp.c_fc.weight") + self.g(p + "mlp.c_fc.bias"))
+            y = y + (m @ self.g(p + "mlp.c_proj.weight") + self.g(p + "mlp.c_proj.bias"))
+        else:
+            y = y + W.lin(o, p + "self_attn.o_proj")
+            let h2 = _rms(y, self.g(p + "post_attention_layernorm.weight"), self.eps, 1.0 if self.gemma else 0.0)
+            let gate = W.lin(h2, p + "mlp.gate_proj")
+            let up = W.lin(h2, p + "mlp.up_proj")
+            y = y + W.lin(_act(self.act, gate) * up, p + "mlp.down_proj")
+        return y
+    fn new_cache(self) = [[none, none] for i in range(self.L)]
+    fn forward(self, ids, cache, start, last=false):
+        let T = len(ids)
+        let pos = [start + i for i in range(T)]
+        let it = tensor([ids], "int64")
+        var x = none
+        if self.gpt2:
+            x = self.g("wte.weight")[it] + reshape(self.g("wpe.weight")[tensor(pos, "int64")], 1, T, self.H)
+        else:
+            x = self.g("model.embed_tokens.weight")[it]
+            if self.gemma:
+                x = x * sqrt(float(self.H))
+        let total = start + T
+        var cm = [[0.0 if j <= start + r else -1e9 for j in range(total)] for r in range(T)]
+        if self.window is not none and total > self.window:
+            cm = [[cm[r][j] if (start + r) - j < self.window else -1e9 for j in range(total)] for r in range(T)]
+        let causal = tensor(cm, "float32")
+        for i in range(self.L):
+            x = self._layer(i, x, cache, pos, causal, T)
+        if last:
+            x = x[:, T - 1:T]
+        if self.gpt2:
+            x = _ln(x, self.g("ln_f.weight"), self.g("ln_f.bias"), self.eps)
+        else:
+            x = _rms(x, self.g("model.norm.weight"), self.eps, 1.0 if self.gemma else 0.0)
+        var logits = x @ self._head()
+        let cap = _cfg(self.cfg, "final_logit_softcapping")
+        if cap:
+            logits = tanh(logits / cap) * cap
+        return logits
+    fn _head(self):
+        if self.gpt2:
+            return self.W.tr("lm_head.weight" if self.W.has("lm_head.weight") else "wte.weight")
+        return self.W.tr("lm_head.weight" if self.W.has("lm_head.weight") else "model.embed_tokens.weight")
+    fn generate(self, ids0, max_new_tokens=64, temperature=0.0, top_k=0, top_p=1.0, eos=none, seed=none,
+                repetition_penalty=1.0, stream=none):
+        var ids = list(ids0)
+        var n_new = int(max_new_tokens)
+        if len(ids) + n_new > self.ctx:
+            n_new = max(0, self.ctx - len(ids))
+        if seed is not none:
+            _set_seed(int(seed))
+        var cache = none
+        var done = 0
+        if self.last is not none:
+            let fed0 = self.last[1]
+            var n = 0
+            let lim = min(len(fed0), len(ids) - 1)
+            while n < lim and fed0[n] == ids[n]:
+                n = n + 1
+            if n >= 16:
+                cache = [[c[0][:, :, 0:n], c[1][:, :, 0:n]] if c[0] is not none else [none, none] for c in self.last[0]]
+                done = n
+        if cache is none:
+            cache = self.new_cache()
+        var fed = list(ids)
+        var logits = self.forward(ids[done:], cache, done, true)
+        var seen = set(ids)
+        let stops = set(eos if eos is not none else [])
+        var out = []
+        for step in range(n_new):
+            var lg = [float(v) for v in logits[0, 0].tolist()]
+            if repetition_penalty != 1.0:
+                for t in seen:
+                    if t >= 0 and t < len(lg):
+                        lg[t] = lg[t] / repetition_penalty if lg[t] > 0 else lg[t] * repetition_penalty
+            var nxt = 0
+            if not temperature:
+                for j in range(len(lg)):
+                    if lg[j] > lg[nxt]:
+                        nxt = j
+            else:
+                nxt = _sample(lg, temperature, top_k, top_p)
+            if nxt in stops:
+                break
+            out.append(nxt)
+            seen.add(nxt)
+            if stream is not none:
+                stream(nxt)
+            if step + 1 == n_new:
+                break
+            logits = self.forward([nxt], cache, len(fed), true)
+            fed.append(nxt)
+        self.last = [cache, fed]
+        return out
+
+let _set_seed = seed
+
+fn _sample(lg, temperature, top_k, top_p):
+    let mx = max(lg)
+    var order = sorted(list(range(len(lg))), key=fn(i) => -lg[i])
+    if top_k and int(top_k) < len(lg):
+        order = order[0:int(top_k)]
+    var e = [exp((lg[i] - mx) / temperature) for i in order]
+    if top_p < 1.0:
+        let Z = sum([exp((v - mx) / temperature) for v in lg]) if not top_k else sum(e)
+        var c = 0.0
+        var keep = len(e)
+        for j in range(len(e)):
+            c = c + e[j] / Z
+            if c >= top_p:
+                keep = j + 1
+                break
+        order = order[0:keep]
+        e = e[0:keep]
+    let u = rand() * sum(e)
+    var acc = 0.0
+    for j in range(len(e)):
+        acc = acc + e[j]
+        if acc > u:
+            return order[j]
+    return order[len(order) - 1]
+
+fn _read_weights(folder):
+    var W = {}
+    let idx = _join(folder, "model.safetensors.index.json")
+    var shards = []
+    if __fs("isfile", idx):
+        shards = sorted(list(set(json_parse(read_text(idx))["weight_map"].values())))
+    else:
+        shards = ["model.safetensors"]
+    for s in shards:
+        let w = __st_load(_join(folder, s), none, false)[0]
+        for k in keys(w):
+            W[k] = tensor(w[k], "float32")
+    return W
+
+fn _build(cfg, W):
+    let t = _cfg(cfg, "model_type", "")
+    var ws = _Weights()
+    ws.t = {}
+    if t in ENCODERS:
+        var e = Encoder()
+        e.cfg = cfg
+        e.type = t
+        e.distil = t == "distilbert"
+        ws.w = _strip(W, ["distilbert."] if e.distil else ["bert.", "roberta.", "xlm_roberta.", "model."])
+        e.W = ws
+        e.eps = float(_cfg(cfg, "layer_norm_eps", 1e-12))
+        e.heads = int(_cfg(cfg, "num_attention_heads", _cfg(cfg, "n_heads")))
+        e.layers = int(_cfg(cfg, "num_hidden_layers", _cfg(cfg, "n_layers")))
+        e.act = _cfg(cfg, "hidden_act", _cfg(cfg, "activation", "gelu"))
+        e.pad = int(_cfg(cfg, "pad_token_id", 1 if t in ["roberta", "xlm-roberta"] else 0))
+        return e
+    if t in DECODERS:
+        var d = Decoder()
+        d.cfg = cfg
+        d.type = t
+        d.gpt2 = t == "gpt2"
+        if d.gpt2:
+            ws.w = _strip(W, ["transformer."])
+            d.L = int(cfg["n_layer"])
+            d.nh = int(cfg["n_head"])
+            d.kvh = d.nh
+            d.H = int(cfg["n_embd"])
+            d.dh = d.H // d.nh
+            d.eps = float(_cfg(cfg, "layer_norm_epsilon", 1e-5))
+            d.ctx = int(_cfg(cfg, "n_positions", 1024))
+        else:
+            ws.w = W
+            d.L = int(cfg["num_hidden_layers"])
+            d.nh = int(cfg["num_attention_heads"])
+            d.kvh = int(_cfg(cfg, "num_key_value_heads", d.nh))
+            d.H = int(cfg["hidden_size"])
+            d.dh = int(_cfg(cfg, "head_dim", d.H // d.nh))
+            d.eps = float(_cfg(cfg, "rms_norm_eps", 1e-6))
+            d.ctx = int(_cfg(cfg, "max_position_embeddings", 4096))
+            d.gemma = t.startswith("gemma")
+            d.act = _cfg(cfg, "hidden_activation", _cfg(cfg, "hidden_act", "silu"))
+        d.W = ws
+        if not d.gpt2:
+            d._rope_init(cfg)
+        d.window = _cfg(cfg, "sliding_window") if _cfg(cfg, "use_sliding_window", true) else none
+        return d
+    raise HubError(f"model type '{t}' does not run natively yet (natively: {', '.join(sorted(ENCODERS + DECODERS))})")
+
+# ------------------------------------------------------------------ the model object
+fn _messages(messages, system=none):
+    var ms = [{"role": "user", "content": messages}] if isinstance(messages, str) else list(messages if messages is not none else [])
+    var out = []
+    for m0 in ms:
+        let m = {"role": "user", "content": m0} if isinstance(m0, str) else m0
+        var role = str(m.get("role", "user")).lower()
+        let content = m.get("content", m.get("text", ""))
+        if role in ["bot", "model", "ai"]:
+            role = "assistant"
+        if role not in ["system", "user", "assistant"]:
+            raise HubError(f"unknown chat role '{role}' (use system, user or assistant)")
+        out.append({"role": role, "content": str(content)})
+    if system is not none:
+        out = [{"role": "system", "content": str(system)}] + [m for m in out if m["role"] != "system"]
+    if len(out) == 0:
+        raise HubError("chat() needs at least one message")
+    return out
+
+class Model:
+    var folder = ""
+    var name = ""
+    var config = {}
+    var net = none
+    var tokenizer = none
+    var kind = "encoder"
+    var device = "cpu"
+    var labels = {}
+    var pooling = "mean"
+    var normalize = false
+    var gen = {}
+    var fmt = none
+    var last_tokens = 0
+    var last_prompt_tokens = 0
+    fn plan(self) = {"cpu": {"layers": self.net.L if self.kind == "decoder" else self.net.layers}}
+    fn _need_tok(self):
+        if self.tokenizer is none:
+            raise HubError(f"{self.name} has no tokenizer.json; pass token ids instead of text")
+        return self.tokenizer
+    fn _batch(self, texts, max_length=none):
+        let single = isinstance(texts, str)
+        let ts = [texts] if single else list(texts)
+        let tok = self._need_tok()
+        let encs = [tok.encode(t) for t in ts]
+        var limit = max_length if max_length is not none else int(_cfg(self.config, "max_position_embeddings", 512))
+        if _cfg(self.config, "model_type") in ["roberta", "xlm-roberta", "camembert"]:
+            limit = limit - 2
+        let ids = [e.ids[0:limit] for e in encs]
+        var T = 0
+        for i in ids:
+            T = max(T, len(i))
+        let pad = _cfg(self.config, "pad_token_id", 0) or 0
+        let arr = tensor([i + [pad] * (T - len(i)) for i in ids], "int64")
+        let mask = tensor([[1.0] * len(i) + [0.0] * (T - len(i)) for i in ids], "float32")
+        return [single, arr, mask, encs]
+    fn hidden(self, texts):
+        let b = self._batch(texts)
+        let h = self.net.hidden(b[1], b[2])
+        return h[0] if b[0] else h
+    fn embed(self, texts, normalize=none):
+        if self.kind != "encoder":
+            raise HubError("embed() needs an encoder model (BERT, RoBERTa, MiniLM, E5, BGE …)")
+        let b = self._batch(texts)
+        let mask = b[2]
+        let h = self.net.hidden(b[1], mask)
+        let m3 = reshape(mask, shape(mask)[0], shape(mask)[1], 1)
+        var v = none
+        if self.pooling == "cls":
+            v = h[:, 0]
+        elif self.pooling == "max":
+            v = max(where(m3 > 0, h, -1e9), axis=1)
+        else:
+            v = sum(h * m3, axis=1) / _clampmin(sum(mask, axis=1, keepdims=true), 1e-9)
+        if (self.normalize if normalize is none else normalize):
+            v = v / _clampmin(sqrt(sum(v * v, axis=-1, keepdims=true)), 1e-12)
+        return v[0] if b[0] else v
+    fn similarity(self, a, b):
+        let v = self.embed([a, b], true)
+        return float(sum(v[0] * v[1]))
+    fn classify(self, texts, top_k=1):
+        let b = self._batch(texts)
+        let logits = self.net.classify(self.net.hidden(b[1], b[2]))
+        let multi = _cfg(self.config, "problem_type") == "multi_label_classification"
+        var probs = none
+        if multi:
+            probs = 1.0 / (1.0 + exp(-logits))
+        else:
+            probs = _softmax(logits)
+        var out = []
+        for r in range(shape(probs)[0]):
+            let p = probs[r].tolist()
+            let order = sorted(list(range(len(p))), key=fn(i) => -p[i])[0:max(1, int(top_k))]
+            let rows = [{"label": self.labels[i] if i in self.labels else f"LABEL_{i}", "score": float(p[i])} for i in order]
+            out.append(rows[0] if top_k == 1 else rows)
+        return out[0] if b[0] else out
+    fn tokens(self, text):
+        let b = self._batch(text)
+        let p = _softmax(self.net.token_logits(self.net.hidden(b[1], b[2]))[0])
+        var out = []
+        let toks = b[3][0].tokens
+        for i in range(min(len(toks), shape(p)[0])):
+            if toks[i] in self.tokenizer.special:
+                continue
+            let row = p[i].tolist()
+            var j = 0
+            for c in range(len(row)):
+                if row[c] > row[j]:
+                    j = c
+            out.append({"token": toks[i], "label": self.labels[j] if j in self.labels else f"LABEL_{j}", "score": float(row[j])})
+        return out
+    fn fill_mask(self, text, top_k=5):
+        let tok = self._need_tok()
+        let b = self._batch(text)
+        let logits = self.net.mlm_logits(self.net.hidden(b[1], b[2]))[0]
+        let masks = [t for t in keys(tok.added) if "mask" in t.lower()]
+        var pos = -1
+        let toks = b[3][0].tokens
+        for i in range(len(toks)):
+            if toks[i] in masks and pos < 0:
+                pos = i
+        if pos < 0:
+            raise HubError(f"the text has no mask token ({', '.join(sorted(masks)) if len(masks) > 0 else '[MASK]'})")
+        let p = _softmax(logits[pos]).tolist()
+        let top = sorted(list(range(len(p))), key=fn(i) => -p[i])[0:int(top_k)]
+        return [{"token": tok.decode([i]).strip(), "id": i, "score": float(p[i])} for i in top]
+    fn generate(self, prompt, max_new_tokens=64, temperature=0.0, top_k=0, top_p=1.0, seed=none,
+                repetition_penalty=1.0, stream=none, add_special_tokens=true):
+        if self.kind != "decoder":
+            raise HubError("generate() needs a decoder model (GPT-2, Llama, Mistral, Qwen, Gemma)")
+        let tok = self._need_tok()
+        let ids = tok.encode(prompt, none, add_special_tokens).ids if isinstance(prompt, str) else list(prompt)
+        return self._run(ids, max_new_tokens, temperature, top_k, top_p, seed, repetition_penalty, stream, [])
+    fn _run(self, ids, max_new_tokens, temperature, top_k, top_p, seed, repetition_penalty, stream, extra_stops):
+        let tok = self._need_tok()
+        let e0 = _cfg(self.gen, "eos_token_id", _cfg(self.config, "eos_token_id"))
+        var eos = e0 if isinstance(e0, list) else ([e0] if e0 is not none else [])
+        for t in extra_stops:
+            if t not in eos:
+                eos.append(t)
+        var done = []
+        var at = [0, 0]
+        fn emit(t):
+            done.append(t)
+            let before = tok.decode(done[at[0]:at[1]], true)
+            let text = tok.decode(done[at[0]:], true)
+            if len(text) > len(before) and not text.endswith("�"):
+                at[0] = at[1]
+                at[1] = len(done)
+                stream(text[len(before):])
+        self.last_prompt_tokens = len(ids)
+        let out = self.net.generate(ids, max_new_tokens, temperature, top_k, top_p, eos, seed, repetition_penalty, emit if stream is not none else none)
+        self.last_tokens = len(out)
+        return tok.decode(out, true)
+    fn chat_format(self):
+        if self.fmt is none:
+            var t = ""
+            let tc = _join(self.folder, "tokenizer_config.json")
+            if __fs("isfile", tc):
+                let d = json_parse(read_text(tc))
+                let ct = d.get("chat_template") or ""
+                t = " ".join([str(x.get("template", "")) for x in ct if isinstance(x, dict)]) if isinstance(ct, list) else str(ct)
+            let added = self.tokenizer.added if self.tokenizer is not none else {}
+            if "<|start_header_id|>" in t or ("<|start_header_id|>" in added and t == ""):
+                self.fmt = "llama3"
+            elif "<start_of_turn>" in t or ("<start_of_turn>" in added and t == ""):
+                self.fmt = "gemma"
+            elif "<|im_start|>" in t or ("<|im_start|>" in added and t == ""):
+                self.fmt = "chatml"
+            elif "[INST]" in t:
+                self.fmt = "mistral"
+            else:
+                self.fmt = "none"
+        return self.fmt
+    fn chat_prompt(self, messages, system=none):
+        let msgs = _messages(messages, system)
+        let f = self.chat_format()
+        if f == "llama3":
+            var s = "<|begin_of_text|>"
+            for m in msgs:
+                s = s + f"<|start_header_id|>{m['role']}<|end_header_id|>\n\n{m['content']}<|eot_id|>"
+            return s + "<|start_header_id|>assistant<|end_header_id|>\n\n"
+        if f == "gemma":
+            var s = "<bos>"
+            var pre = ""
+            for m in msgs:
+                if m["role"] == "system":
+                    pre = pre + m["content"] + "\n\n"
+                    continue
+                let role = "model" if m["role"] == "assistant" else "user"
+                s = s + f"<start_of_turn>{role}\n{(pre if role == 'user' else '') + m['content']}<end_of_turn>\n"
+                if role == "user":
+                    pre = ""
+            return s + "<start_of_turn>model\n"
+        if f == "mistral":
+            var s = "<s>"
+            var pre = ""
+            for m in msgs:
+                if m["role"] == "system":
+                    pre = pre + m["content"] + "\n\n"
+                elif m["role"] == "user":
+                    s = s + f"[INST] {pre}{m['content']} [/INST]"
+                    pre = ""
+                else:
+                    s = s + f" {m['content']}</s>"
+            return s
+        if f == "chatml":
+            var s = ""
+            for m in msgs:
+                s = s + f"<|im_start|>{m['role']}\n{m['content']}<|im_end|>\n"
+            return s + "<|im_start|>assistant\n"
+        var s = ""
+        for m in msgs:
+            s = s + {"system": "", "user": "User: ", "assistant": "Assistant: "}[m["role"]] + m["content"] + "\n"
+        return s + "Assistant:"
+    fn _stops(self):
+        let added = self.tokenizer.added if self.tokenizer is not none else {}
+        return [added[t] for t in ["<|im_end|>", "<|eot_id|>", "<end_of_turn>", "<|endoftext|>", "</s>", "<|end_of_text|>"] if t in added]
+    fn chat(self, messages, system=none, max_new_tokens=512, temperature=0.7, top_p=0.9, top_k=0, repetition_penalty=1.1,
+            seed=none, stream=none):
+        if self.kind != "decoder":
+            raise HubError("chat() needs a decoder model (Llama, Mistral, Qwen, Gemma, …)")
+        let tok = self._need_tok()
+        let msgs = _messages(messages, system)
+        let window = int(_cfg(self.config, "max_position_embeddings", _cfg(self.config, "n_positions", 4096)))
+        let budget = max(64, min(window, 32768) - int(max_new_tokens) - 8)
+        let sys_msgs = [m for m in msgs if m["role"] == "system"]
+        var rest = [m for m in msgs if m["role"] != "system"]
+        var ids = tok.encode(self.chat_prompt(sys_msgs + rest), none, false).ids
+        while len(ids) > budget and len(rest) > 1:
+            rest = rest[2:] if len(rest) > 2 else rest[1:]
+            ids = tok.encode(self.chat_prompt(sys_msgs + rest), none, false).ids
+        if len(ids) > budget:
+            ids = ids[len(ids) - budget:]
+        return self._run(ids, max_new_tokens, temperature, top_k, top_p, seed, repetition_penalty, stream, self._stops()).strip()
+    fn conversation(self, system=none, **options):
+        var c = Conversation()
+        c.model = self
+        c.system = system
+        c.options = dict(options)
+        c.history = []
+        return c
+    fn to(self, device):
+        return self.device
+    fn __repr__(self) = f"<model {self.name}: {_cfg(self.config, 'model_type')} {self.kind} on {self.device}>"
+    fn __str__(self) = self.__repr__()
+
+class Conversation:
+    var model = none
+    var system = none
+    var options = {}
+    var history = []
+    fn say(self, text, stream=none, **options):
+        var o = dict(self.options)
+        for k in keys(options):
+            o[k] = options[k]
+        self.history.append({"role": "user", "content": str(text)})
+        var reply = ""
+        try:
+            reply = self.model.chat(self.history, system=self.system, stream=stream, **o)
+        except Exception as e:
+            self.history.pop()
+            raise
+        self.history.append({"role": "assistant", "content": reply})
+        return reply
+    fn reset(self, system=none):
+        self.history = []
+        if system is not none:
+            self.system = system
+    fn transcript(self) = "\n\n".join([("You" if m["role"] == "user" else "Assistant") + ": " + m["content"] for m in self.history])
+    fn __repr__(self) = f"<conversation with {self.model.name}: {len(self.history)} messages>"
+
+let _TASKS = {"feature-extraction": "embed", "sentence-similarity": "embed", "embeddings": "embed",
+                 "text-classification": "classify", "sentiment-analysis": "classify", "token-classification": "tokens",
+                 "ner": "tokens", "fill-mask": "fill_mask", "text-generation": "generate"}
+
+class Pipeline:
+    var task = ""
+    var model = none
+    fn __call__(self, *a, **k):
+        let m = self.model
+        let f = _TASKS[self.task]
+        if f == "embed":
+            return m.embed(*a, **k)
+        if f == "classify":
+            return m.classify(*a, **k)
+        if f == "tokens":
+            return m.tokens(*a, **k)
+        if f == "fill_mask":
+            return m.fill_mask(*a, **k)
+        return m.generate(*a, **k)
+    fn __repr__(self) = f"<pipeline {self.task}: {self.model.name}>"
+
+fn _make_model(folder, name):
+    var m = Model()
+    m.folder = folder
+    m.name = name
+    let cfg = json_parse(read_text(_join(folder, "config.json")))
+    m.config = cfg
+    m.net = _build(cfg, _read_weights(folder))
+    let tj = _join(folder, "tokenizer.json")
+    m.tokenizer = tokenizer_from_file(tj) if __fs("isfile", tj) else none
+    m.kind = "encoder" if isinstance(m.net, Encoder) else "decoder"
+    var labels = {}
+    let i2l = _cfg(cfg, "id2label", {})
+    for k in keys(i2l):
+        labels[int(k)] = i2l[k]
+    m.labels = labels
+    m.pooling = "mean"
+    m.normalize = false
+    let mj = _join(folder, "modules.json")
+    if __fs("isfile", mj):
+        for mod in json_parse(read_text(mj)):
+            if "Normalize" in mod.get("type", ""):
+                m.normalize = true
+        let pj = _join(folder, "1_Pooling", "config.json")
+        if __fs("isfile", pj):
+            let pc = json_parse(read_text(pj))
+            m.pooling = "cls" if pc.get("pooling_mode_cls_token") else ("max" if pc.get("pooling_mode_max_tokens") else "mean")
+    let gc = _join(folder, "generation_config.json")
+    m.gen = json_parse(read_text(gc)) if __fs("isfile", gc) else {}
+    return m
