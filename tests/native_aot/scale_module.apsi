@@ -1,0 +1,23 @@
+use scale
+print(scale.number("21B"), scale.number("1.5T"), scale.number(7), scale.number("2_000"))
+for args in [["7B", "H100", none], ["70B", "H100", none], ["405B", "H100", none], ["1T", "B200", "32B"], ["2T", "GB200", "64B"], ["1B", "RTX4090", none]]:
+    let p = scale.plan(params=args[0], gpu=args[1], active=args[2])
+    print(p.summary)
+    print(p.layout, p.gpus, p.min_gpus, p.nodes, p.memory_per_gpu_gb, p.days, p.gpu_hours, p.batch_tokens, p.steps, p.model_states_gb, p.dataset_gb, p.recompute, p.notes)
+let q = scale.plan(params="13B", gpus=64, gpu="A100", precision="fp8", optimizer="adam8bit")
+print(q.summary, q.precision, q.flops)
+let r = scale.plan(params="70B", days=30, gpu="H200", seq=8192, tokens="15T")
+print(r)
+let c = scale.plan(params="3B", gpu=record(memory=48, tflops=200.0), days=10)
+print(c.summary)
+print(scale.inference("70B"), scale.inference("405B", precision="fp8", context=128000, batch=4))
+print(scale.inference("8B", gpu="RTX4090", precision="int4"))
+print(len(scale.gpu_table()), scale.gpu_table()[0])
+try:
+    scale.plan(params="7B", gpu="TPU")
+except ValueError as e:
+    print(e)
+try:
+    scale.plan(params="7B", active="8B")
+except ValueError as e:
+    print(e)
