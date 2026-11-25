@@ -1,0 +1,635 @@
+# use mechanics: classical mechanics for native programs, the same methods as apsi run: integrators,
+# Hamiltonian and Lagrangian dynamics (equations of motion by automatic differentiation), N-body gravity,
+# orbits, rigid bodies, vibrations and structures. Inputs may be numbers, lists, tensors or quantities;
+# results are SI values.
+use linalg
+
+let G_NEWTON = 6.67430e-11
+let _Y1 = 1 / (2 - 2 ** (1 / 3))
+let _Y0 = -(2 ** (1 / 3)) / (2 - 2 ** (1 / 3))
+
+fn _plain(x):
+    if isinstance(x, list) or isinstance(x, tuple):
+        return [_plain(e) for e in x]
+    return si_magnitude(x)
+
+fn _v(x):
+    let p = _plain(x)
+    if isinstance(p, list) or ndim(p) > 0:
+        return tensor(p, f64)
+    return float(p)
+
+fn _s(x) = float(si_magnitude(x))
+fn _diag(d):
+    let n = len(d)
+    return tensor([[float(d[i]) if i == j else 0.0 for j in range(n)] for i in range(n)])
+
+fn _c(x) = x * 1.0 if ndim(x) > 0 else x
+
+fn _call_accel(f):
+    let n = __arity(f, 3)
+    if n >= 3:
+        return fn(x, v, t) => _v(f(x, v, t))
+    if n == 2:
+        return fn(x, v, t) => _v(f(x, v))
+    return fn(x, v, t) => _v(f(x))
+
+fn _rows(xs) = stack(xs) if ndim(xs[0]) > 0 else tensor(xs, f64)
+
+# ------------------------------------------------------------------ generic second-order integration
+fn simulate(accel, x0, v0, dt, steps, method="verlet", t0=0.0, every=1):
+    let a = _call_accel(accel)
+    var x = _c(_v(x0))
+    var v = _c(_v(v0))
+    let h = _s(dt)
+    let n = int(steps)
+    var t = _s(t0)
+    let ev = max(1, int(every))
+    var ts = [t]
+    var xs = [x]
+    var vs = [v]
+    fn verlet(x, v, t, h, acc):
+        let vh = v + 0.5 * h * acc
+        let xn = x + h * vh
+        let an = a(xn, vh, t + h)
+        return (xn, vh + 0.5 * h * an, an)
+    if method == "verlet":
+        var acc = a(x, v, t)
+        for i in range(n):
+            let r = verlet(x, v, t, h, acc)
+            x = r[0]
+            v = r[1]
+            acc = r[2]
+            t = t + h
+            if (i + 1) % ev == 0:
+                ts.append(t)
+                xs.append(x)
+                vs.append(v)
+    elif method == "yoshida4":
+        var acc = a(x, v, t)
+        for i in range(n):
+            for w in [_Y1, _Y0, _Y1]:
+                let r = verlet(x, v, t, w * h, acc)
+                x = r[0]
+                v = r[1]
+                acc = r[2]
+                t = t + w * h
+            if (i + 1) % ev == 0:
+                ts.append(t)
+                xs.append(x)
+                vs.append(v)
+    elif method == "rk4":
+        for i in range(n):
+            let k1x = v
+            let k1v = a(x, v, t)
+            let k2x = v + 0.5 * h * k1v
+            let k2v = a(x + 0.5 * h * k1x, v + 0.5 * h * k1v, t + 0.5 * h)
+            let k3x = v + 0.5 * h * k2v
+            let k3v = a(x + 0.5 * h * k2x, v + 0.5 * h * k2v, t + 0.5 * h)
+            let k4x = v + h * k3v
+            let k4v = a(x + h * k3x, v + h * k3v, t + h)
+            x = x + h / 6 * (k1x + 2 * k2x + 2 * k3x + k4x)
+            v = v + h / 6 * (k1v + 2 * k2v + 2 * k3v + k4v)
+            t = t + h
+            if (i + 1) % ev == 0:
+                ts.append(t)
+                xs.append(x)
+                vs.append(v)
+    else:
+        raise ValueError("method must be \"verlet\", \"yoshida4\" or \"rk4\"")
+    return record(t=tensor(ts), x=_rows(xs), v=_rows(vs))
+
+# ------------------------------------------------------------------ Hamiltonian and Lagrangian dynamics
+fn hamiltonian_flow(H, q0, p0, dt, steps, method="leapfrog", every=1):
+    fn Hq(q, p) = _v(grad(fn(u) => H(u, p))(q))
+    fn Hp(q, p) = _v(grad(fn(w) => H(q, w))(p))
+    var q = _c(_v(q0))
+    var p = _c(_v(p0))
+    let h = _s(dt)
+    let n = int(steps)
+    let ev = max(1, int(every))
+    var ts = [0.0]
+    var qs = [q]
+    var ps = [p]
+    var t = 0.0
+    for i in range(n):
+        if method == "leapfrog":
+            p = p - 0.5 * h * Hq(q, p)
+            q = q + h * Hp(q, p)
+            p = p - 0.5 * h * Hq(q, p)
+        elif method == "rk4":
+            let k1q = Hp(q, p)
+            let k1p = -Hq(q, p)
+            let k2q = Hp(q + h / 2 * k1q, p + h / 2 * k1p)
+            let k2p = -Hq(q + h / 2 * k1q, p + h / 2 * k1p)
+            let k3q = Hp(q + h / 2 * k2q, p + h / 2 * k2p)
+            let k3p = -Hq(q + h / 2 * k2q, p + h / 2 * k2p)
+            let k4q = Hp(q + h * k3q, p + h * k3p)
+            let k4p = -Hq(q + h * k3q, p + h * k3p)
+            q = q + h / 6 * (k1q + 2 * k2q + 2 * k3q + k4q)
+            p = p + h / 6 * (k1p + 2 * k2p + 2 * k3p + k4p)
+        else:
+            raise ValueError("method must be \"leapfrog\" or \"rk4\"")
+        t = t + h
+        if (i + 1) % ev == 0:
+            ts.append(t)
+            qs.append(q)
+            ps.append(p)
+    let E = tensor([_s(H(qs[k], ps[k])) for k in range(len(qs))])
+    return record(t=tensor(ts), q=_rows(qs), p=_rows(ps), energy=E)
+
+fn _atleast1(x) = reshape(tensor(x, f64), 1) if ndim(x) == 0 else x
+fn _atleast2(x) = reshape(tensor(x, f64), 1, 1) if ndim(x) == 0 else x
+
+fn _jac(f, x):
+    let y = f(x)
+    let m = shape(y)[0]
+    var rows = []
+    for i in range(m):
+        rows.append(grad(fn(z) => f(z)[i])(x))
+    return stack(rows)
+
+fn lagrangian_flow(L, q0, qdot0, dt, steps, every=1):
+    let scalar = ndim(_v(q0)) == 0
+    fn dLq(q, v) = grad(fn(u) => L(u, v))(q)
+    fn dLv(q, v) = grad(fn(w) => L(q, w))(v)
+    fn acc(q, v):
+        let qt = float(q[0]) if scalar else q
+        let vt = float(v[0]) if scalar else v
+        let gq = _atleast1(_v(dLq(qt, vt)))
+        var M = none
+        var C = none
+        if scalar:
+            M = _atleast2(_v(grad(fn(w) => dLv(qt, w))(vt)))
+            C = _atleast2(_v(grad(fn(u) => dLv(u, vt))(qt)))
+        else:
+            M = _atleast2(_v(_jac(fn(w) => dLv(qt, w), vt)))
+            C = _atleast2(_v(_jac(fn(u) => dLv(u, vt), qt)))
+        return solve(M, gq - C @ v)
+    var q = _c(_atleast1(_v(q0)))
+    var v = _c(_atleast1(_v(qdot0)))
+    let h = _s(dt)
+    let n = int(steps)
+    let ev = max(1, int(every))
+    var ts = [0.0]
+    var qs = [q]
+    var vs = [v]
+    var t = 0.0
+    for i in range(n):
+        let k1q = v
+        let k1v = acc(q, v)
+        let k2q = v + h / 2 * k1v
+        let k2v = acc(q + h / 2 * k1q, v + h / 2 * k1v)
+        let k3q = v + h / 2 * k2v
+        let k3v = acc(q + h / 2 * k2q, v + h / 2 * k2v)
+        let k4q = v + h * k3v
+        let k4v = acc(q + h * k3q, v + h * k3v)
+        q = q + h / 6 * (k1q + 2 * k2q + 2 * k3q + k4q)
+        v = v + h / 6 * (k1v + 2 * k2v + 2 * k3v + k4v)
+        t = t + h
+        if (i + 1) % ev == 0:
+            ts.append(t)
+            qs.append(q)
+            vs.append(v)
+    fn energy(q, v):
+        let qt = float(q[0]) if scalar else q
+        let vt = float(v[0]) if scalar else v
+        return float(sum(_atleast1(_v(dLv(qt, vt))) * v)) - _s(L(qt, vt))
+    let E = tensor([energy(qs[k], vs[k]) for k in range(len(qs))])
+    var Q = stack(qs)
+    var V = stack(vs)
+    if scalar:
+        Q = Q[:, 0]
+        V = V[:, 0]
+    return record(t=tensor(ts), q=Q, qdot=V, energy=E)
+
+# ------------------------------------------------------------------ N-body gravity
+fn _nbody_acc(x, m, G, eps2):
+    let N = shape(x)[0]
+    let D = shape(x)[1]
+    let d = reshape(x, 1, N, D) - reshape(x, N, 1, D)          # d[i, j] = x_j - x_i
+    let r2 = sum(d * d, axis=-1) + eps2
+    let off = where(eye(N) > 0, zeros(N, N), r2 ** -1.5)
+    return G * sum(d * reshape(reshape(m, 1, N) * off, N, N, 1), axis=1)
+
+fn nbody(masses, x0, v0, dt, steps, G=G_NEWTON, softening=0.0, method="yoshida4", every=1):
+    let m = reshape(_v(masses), -1)
+    var x = _v(x0) * 1.0
+    var v = _v(v0) * 1.0
+    if shape(x) != shape(v) or shape(x)[0] != len(m):
+        raise ValueError("masses, positions and velocities must describe the same bodies")
+    let Gv = _s(G)
+    let eps2 = _s(softening) ** 2
+    let h = _s(dt)
+    let n = int(steps)
+    let ev = max(1, int(every))
+    var ws = none
+    if method == "verlet":
+        ws = [1.0]
+    elif method == "yoshida4":
+        ws = [_Y1, _Y0, _Y1]
+    else:
+        raise ValueError("method must be \"yoshida4\" or \"verlet\"")
+    let nb = len(m)
+    let ml = [float(e) for e in m]
+    fn energy(x, v):
+        let N = shape(x)[0]
+        let D = shape(x)[1]
+        let d = reshape(x, 1, N, D) - reshape(x, N, 1, D)
+        let r = tolist(sqrt(sum(d * d, axis=-1) + eps2))
+        var pe = 0.0
+        for i in range(nb):
+            for j in range(i + 1, nb):
+                pe = pe + ml[i] * ml[j] / r[i][j]
+        return 0.5 * float(sum(m * sum(v * v, axis=-1))) - Gv * pe
+    fn ang(x, v):
+        if shape(x)[1] == 2:
+            return float(sum(m * (x[:, 0] * v[:, 1] - x[:, 1] * v[:, 0])))
+        var acc = zeros(3)
+        for i in range(nb):
+            acc = acc + ml[i] * cross(x[i], v[i])
+        return acc
+    fn mom(v) = sum(reshape(m, nb, 1) * v, axis=0)
+    var acc = _nbody_acc(x, m, Gv, eps2)
+    var ts = [0.0]
+    var xs = [x]
+    var vs = [v]
+    var E = [energy(x, v)]
+    var P = [mom(v)]
+    var Lm = [ang(x, v)]
+    var t = 0.0
+    for i in range(n):
+        for w in ws:
+            let vh = v + 0.5 * w * h * acc
+            x = x + w * h * vh
+            acc = _nbody_acc(x, m, Gv, eps2)
+            v = vh + 0.5 * w * h * acc
+        t = t + h
+        if (i + 1) % ev == 0:
+            ts.append(t)
+            xs.append(x)
+            vs.append(v)
+            E.append(energy(x, v))
+            P.append(mom(v))
+            Lm.append(ang(x, v))
+    var drift = 0.0
+    for e in E:
+        drift = max(drift, abs(e - E[0]))
+    return record(t=tensor(ts), x=stack(xs), v=stack(vs), energy=tensor(E), momentum=stack(P),
+                  angular_momentum=_rows(Lm), energy_drift=drift / abs(E[0]))
+
+# ------------------------------------------------------------------ orbits
+fn _kepler1(M, e):
+    let Mw = (M + pi) % (2 * pi) - pi
+    var E = pi * sign(Mw) if e > 0.8 else Mw + e * sin(Mw)
+    for k in range(50):
+        let f = E - e * sin(E) - Mw
+        let d = f / (1 - e * cos(E))
+        E = E - d
+        if abs(d) < 1e-15:
+            break
+    return E + (M - Mw)
+
+fn kepler_solve(M, e):
+    let Mv = _v(M)
+    let ee = _s(e)
+    if not (0 <= ee and ee < 1):
+        raise ValueError("kepler_solve needs 0 ≤ e < 1")
+    if ndim(Mv) == 0:
+        return _kepler1(float(Mv), ee)
+    let flat = [_kepler1(float(z), ee) for z in reshape(Mv, -1)]
+    return reshape(tensor(flat), *shape(Mv))
+
+fn _norm(z) = sqrt(float(sum(z * z)))
+fn _clip1(x) = max(-1.0, min(1.0, x))
+fn _dot3(a, b) = float(sum(a * b))
+
+fn orbit_elements(r, v, mu):
+    let R = _v(r)
+    let V = _v(v)
+    let m = _s(mu)
+    let h = cross(R, V)
+    let nvec = cross(tensor([0.0, 0, 1]), h)
+    let rn = _norm(R)
+    let vn = _norm(V)
+    let hn = _norm(h)
+    let nn = _norm(nvec)
+    let evec = ((vn * vn - m / rn) * R - _dot3(R, V) * V) / m
+    let e = _norm(evec)
+    let energy = vn * vn / 2 - m / rn
+    let a = -m / (2 * energy) if abs(e - 1) > 1e-12 else inf
+    let inc = acos(_clip1(float(h[2]) / hn))
+    let raan = atan2(float(nvec[1]), float(nvec[0])) % (2 * pi) if nn > 1e-12 else 0.0
+    var argp = 0.0
+    var nu = 0.0
+    if e > 1e-12:
+        argp = acos(_clip1(_dot3(nvec, evec) / (nn * e))) if nn > 1e-12 else atan2(float(evec[1]), float(evec[0])) % (2 * pi)
+        if nn > 1e-12 and float(evec[2]) < 0:
+            argp = 2 * pi - argp
+        nu = acos(_clip1(_dot3(evec, R) / (e * rn)))
+        if _dot3(R, V) < 0:
+            nu = 2 * pi - nu
+    else:
+        let ref = nvec / nn if nn > 1e-12 else tensor([1.0, 0, 0])
+        nu = atan2(_dot3(cross(ref, R), h) / hn, _dot3(ref, R)) % (2 * pi)
+    return record(a=a, e=e, i=inc, raan=raan, argp=argp, nu=nu, energy=energy, h=hn,
+                  period=2 * pi * sqrt(a ** 3 / m) if e < 1 else inf)
+
+fn _rz(t) = tensor([[cos(t), -sin(t), 0.0], [sin(t), cos(t), 0.0], [0.0, 0.0, 1.0]])
+fn _rx(t) = tensor([[1.0, 0.0, 0.0], [0.0, cos(t), -sin(t)], [0.0, sin(t), cos(t)]])
+
+fn orbit_state(a, e, i, raan, argp, nu, mu):
+    let A = _s(a)
+    let ee = _s(e)
+    let nv = _s(nu)
+    let m = _s(mu)
+    let p = A * (1 - ee * ee)
+    let r_pf = p / (1 + ee * cos(nv)) * tensor([cos(nv), sin(nv), 0.0])
+    let v_pf = sqrt(m / p) * tensor([-sin(nv), ee + cos(nv), 0.0])
+    let R = _rz(_s(raan)) @ _rx(_s(i)) @ _rz(_s(argp))
+    return record(r=R @ r_pf, v=R @ v_pf)
+
+fn orbital_period(a, mu) = 2 * pi * sqrt(_s(a) ** 3 / _s(mu))
+
+fn vis_viva(r, a, mu) = sqrt(_s(mu) * (2 / _s(r) - 1 / _s(a)))
+
+fn hohmann(r1, r2, mu):
+    let a1 = _s(r1)
+    let a2 = _s(r2)
+    let m = _s(mu)
+    let at = (a1 + a2) / 2
+    let dv1 = sqrt(m / a1) * (sqrt(2 * a2 / (a1 + a2)) - 1)
+    let dv2 = sqrt(m / a2) * (1 - sqrt(2 * a1 / (a1 + a2)))
+    return record(dv1=dv1, dv2=dv2, dv_total=abs(dv1) + abs(dv2), time=pi * sqrt(at ** 3 / m))
+
+# ------------------------------------------------------------------ rigid bodies
+fn inertia_tensor(masses, positions, about="com"):
+    let m = reshape(_v(masses), -1)
+    var x = reshape(_v(positions), -1, 3)
+    let N = shape(x)[0]
+    if about == "com":
+        x = x - sum(reshape(m, N, 1) * x, axis=0) / float(sum(m))
+    let r2 = sum(x * x, axis=1)
+    let outer = reshape(x, N, 3, 1) * reshape(x, N, 1, 3)
+    return sum(reshape(m, N, 1, 1) * (reshape(r2, N, 1, 1) * reshape(eye(3), 1, 3, 3) - outer), axis=0)
+
+fn principal_axes(I):
+    let r = eigh(_v(I))
+    return record(moments=r[0], axes=r[1])
+
+fn rotation_matrix(axis, angle):
+    var k = _v(axis)
+    k = k / _norm(k)
+    let t = _s(angle)
+    let K = tensor([[0.0, -float(k[2]), float(k[1])], [float(k[2]), 0.0, -float(k[0])], [-float(k[1]), float(k[0]), 0.0]])
+    return eye(3) + sin(t) * K + (1 - cos(t)) * (K @ K)
+
+fn quat(axis, angle):
+    var k = _v(axis)
+    k = k / _norm(k)
+    let t = _s(angle) / 2
+    return concat([tensor([cos(t)]), sin(t) * k])
+
+fn quat_mul(a, b):
+    let A = tolist(_v(a))
+    let B = tolist(_v(b))
+    let w1 = A[0]
+    let x1 = A[1]
+    let y1 = A[2]
+    let z1 = A[3]
+    let w2 = B[0]
+    let x2 = B[1]
+    let y2 = B[2]
+    let z2 = B[3]
+    return tensor([w1 * w2 - x1 * x2 - y1 * y2 - z1 * z2, w1 * x2 + x1 * w2 + y1 * z2 - z1 * y2,
+                   w1 * y2 - x1 * z2 + y1 * w2 + z1 * x2, w1 * z2 + x1 * y2 - y1 * x2 + z1 * w2])
+
+fn quat_conj(q):
+    let Q = _v(q)
+    return concat([Q[0:1], -Q[1:]])
+
+fn quat_rotate(q, v) = quat_mul(quat_mul(q, concat([tensor([0.0]), _v(v)])), quat_conj(q))[1:]
+
+fn quat_to_matrix(q):
+    let Q = tolist(_v(q) / _norm(_v(q)))
+    let w = Q[0]
+    let x = Q[1]
+    let y = Q[2]
+    let z = Q[3]
+    return tensor([[1 - 2 * (y * y + z * z), 2 * (x * y - w * z), 2 * (x * z + w * y)],
+                   [2 * (x * y + w * z), 1 - 2 * (x * x + z * z), 2 * (y * z - w * x)],
+                   [2 * (x * z - w * y), 2 * (y * z + w * x), 1 - 2 * (x * x + y * y)]])
+
+fn rigid_body(I, omega0, q0, dt, steps, torque=none, every=1):
+    let Iv = _v(I)
+    let Im = _diag(Iv) if ndim(Iv) == 1 else Iv
+    let Iinv = inv(Im)
+    var w = _v(omega0) * 1.0
+    var q = _v(q0 if q0 != none else [1.0, 0, 0, 0]) * 1.0
+    q = q / _norm(q)
+    let h = _s(dt)
+    let n = int(steps)
+    let ev = max(1, int(every))
+    fn tq(t, w, q) = _v(torque(t, w, q)) if torque != none else 0.0
+    fn f(t, w, q) = (Iinv @ (tq(t, w, q) - cross(w, Im @ w)), 0.5 * quat_mul(q, concat([tensor([0.0]), w])))
+    var ts = [0.0]
+    var wl = [w]
+    var ql = [q]
+    var t = 0.0
+    for i in range(n):
+        let s1 = f(t, w, q)
+        let s2 = f(t + h / 2, w + h / 2 * s1[0], q + h / 2 * s1[1])
+        let s3 = f(t + h / 2, w + h / 2 * s2[0], q + h / 2 * s2[1])
+        let s4 = f(t + h, w + h * s3[0], q + h * s3[1])
+        w = w + h / 6 * (s1[0] + 2 * s2[0] + 2 * s3[0] + s4[0])
+        q = q + h / 6 * (s1[1] + 2 * s2[1] + 2 * s3[1] + s4[1])
+        q = q / _norm(q)
+        t = t + h
+        if (i + 1) % ev == 0:
+            ts.append(t)
+            wl.append(w)
+            ql.append(q)
+    let Lw = stack([quat_to_matrix(ql[k]) @ (Im @ wl[k]) for k in range(len(wl))])
+    let E = tensor([0.5 * _dot3(wl[k], Im @ wl[k]) for k in range(len(wl))])
+    return record(t=tensor(ts), omega=stack(wl), q=stack(ql), L_world=Lw, energy=E)
+
+# ------------------------------------------------------------------ vibrations
+fn normal_modes(K, M):
+    let Kv = _v(K)
+    var Mv = _v(M)
+    if ndim(Mv) == 1:
+        Mv = _diag(Mv)
+    let Li = inv(cholesky(Mv))
+    let r = eigh(Li @ Kv @ transpose(Li))
+    let phi = transpose(Li) @ r[1]
+    let w = sqrt(where(r[0] > 0, r[0], zeros_like(r[0])))
+    return record(omega=w, freq=w / (2 * pi), modes=phi)
+
+# ------------------------------------------------------------------ structures
+fn _gradient(y, x):
+    # numpy.gradient on a non-uniform grid: second order inside, first order at the ends
+    let n = len(y)
+    var g = [0.0] * n
+    g[0] = (y[1] - y[0]) / (x[1] - x[0])
+    g[n - 1] = (y[n - 1] - y[n - 2]) / (x[n - 1] - x[n - 2])
+    for i in range(1, n - 1):
+        let hs = x[i] - x[i - 1]
+        let hd = x[i + 1] - x[i]
+        g[i] = (hs * hs * y[i + 1] + (hd * hd - hs * hs) * y[i] - hd * hd * y[i - 1]) / (hs * hd * (hd + hs))
+    return g
+
+fn _sub(K, rows, cols) = tensor([[K[i][j] for j in cols] for i in rows])
+
+fn beam(length, E, I, support="cantilever", loads=none, distributed=0.0, n=100):
+    let L = _s(length)
+    let EI = _s(E) * _s(I)
+    let ne = max(2, int(n))
+    let lds = loads if loads != none else []
+    var pset = {0.0, L}
+    for p in lds:
+        pset.add(min(max(_s(p[0]), 0.0), L))
+    let pts = sorted(list(pset))
+    var xset = set()
+    for k in range(len(pts) - 1):
+        let a = pts[k]
+        let b = pts[k + 1]
+        let cnt = max(2, int(round((b - a) / L * ne)) + 1)
+        for z in linspace(a, b, cnt):
+            xset.add(float(z))
+    let xs = sorted(list(xset))
+    let nn = len(xs)
+    let ndof = 2 * nn
+    var K = [[0.0] * ndof for i in range(ndof)]
+    var Fv = [0.0] * ndof
+    let q = _s(distributed)
+    for e in range(nn - 1):
+        let le = xs[e + 1] - xs[e]
+        let c = EI / le ** 3
+        let k = [[12.0, 6 * le, -12.0, 6 * le], [6 * le, 4 * le * le, -6 * le, 2 * le * le],
+                 [-12.0, -6 * le, 12.0, -6 * le], [6 * le, 2 * le * le, -6 * le, 4 * le * le]]
+        let fe = [le / 2, le * le / 12, le / 2, -le * le / 12]
+        for a in range(4):
+            for b in range(4):
+                K[2 * e + a][2 * e + b] = K[2 * e + a][2 * e + b] + c * k[a][b]
+            Fv[2 * e + a] = Fv[2 * e + a] + q * fe[a]
+    for p in lds:
+        let xp = min(max(_s(p[0]), 0.0), L)
+        var best = 0
+        for j in range(nn):
+            if abs(xs[j] - xp) < abs(xs[best] - xp):
+                best = j
+        Fv[2 * best] = Fv[2 * best] + _s(p[1])
+    var fixed = none
+    if support == "cantilever":
+        fixed = [0, 1]
+    elif support == "simply":
+        fixed = [0, ndof - 2]
+    elif support == "fixed":
+        fixed = [0, 1, ndof - 2, ndof - 1]
+    elif support == "propped":
+        fixed = [0, 1, ndof - 2]
+    else:
+        raise ValueError("support must be \"cantilever\", \"simply\", \"fixed\" or \"propped\"")
+    let free = [j for j in range(ndof) if j not in fixed]
+    let uf = tolist(solve(_sub(K, free, free), tensor([Fv[j] for j in free])))
+    var u = [0.0] * ndof
+    for k in range(len(free)):
+        u[free[k]] = uf[k]
+    var R = [0.0] * ndof
+    for i in range(ndof):
+        var acc = 0.0
+        for j in range(ndof):
+            acc = acc + K[i][j] * u[j]
+        R[i] = acc - Fv[i]
+    let w = [u[2 * j] for j in range(nn)]
+    let th = [u[2 * j + 1] for j in range(nn)]
+    var M = [0.0] * nn
+    var cnt = [0] * nn
+    for e in range(nn - 1):
+        let le = xs[e + 1] - xs[e]
+        let d = [u[2 * e], u[2 * e + 1], u[2 * e + 2], u[2 * e + 3]]
+        for sx in [(e, 0.0), (e + 1, 1.0)]:
+            let side = sx[0]
+            let xi = sx[1]
+            let B = [(-6 + 12 * xi) / le ** 2, (-4 + 6 * xi) * le / le ** 2, (6 - 12 * xi) / le ** 2, (-2 + 6 * xi) * le / le ** 2]
+            M[side] = M[side] + EI * (B[0] * d[0] + B[1] * d[1] + B[2] * d[2] + B[3] * d[3])
+            cnt[side] = cnt[side] + 1
+    for j in range(nn):
+        M[j] = M[j] / cnt[j]
+    let V = _gradient(M, xs)
+    var rd = {}
+    for j in fixed:
+        rd[f"at_{xs[j // 2]:g}_{'force' if j % 2 == 0 else 'moment'}"] = R[j]
+    var big = 0
+    for j in range(nn):
+        if abs(w[j]) > abs(w[big]):
+            big = j
+    return record(x=tensor(xs), deflection=tensor(w), slope=tensor(th), moment=tensor(M), shear=tensor(V),
+                  reactions=record(**rd), max_deflection=w[big])
+
+fn _per_member(x, m):
+    let p = _v(x)
+    if ndim(p) == 0:
+        return [float(p)] * m
+    return [float(e) for e in p]
+
+fn truss2d(nodes, members, E, A, supports, loads):
+    let X = tolist(reshape(_v(nodes), -1, 2))
+    let mem = [(int(e[0]), int(e[1])) for e in members]
+    let m = len(mem)
+    let Ev = _per_member(E, m)
+    let Av = _per_member(A, m)
+    let nn = len(X)
+    let ndof = 2 * nn
+    var K = [[0.0] * ndof for i in range(ndof)]
+    var geo = []
+    for k in range(m):
+        let i = mem[k][0]
+        let j = mem[k][1]
+        let dx = X[j][0] - X[i][0]
+        let dy = X[j][1] - X[i][1]
+        let Lk = hypot(dx, dy)
+        let c = dx / Lk
+        let s = dy / Lk
+        let T = [-c, -s, c, s]
+        let idx = [2 * i, 2 * i + 1, 2 * j, 2 * j + 1]
+        let st = Ev[k] * Av[k] / Lk
+        for a in range(4):
+            for b in range(4):
+                K[idx[a]][idx[b]] = K[idx[a]][idx[b]] + st * T[a] * T[b]
+        geo.append((idx, T, Lk))
+    var F = [0.0] * ndof
+    for ld in loads:
+        F[2 * int(ld[0])] = F[2 * int(ld[0])] + _s(ld[1])
+        F[2 * int(ld[0]) + 1] = F[2 * int(ld[0]) + 1] + _s(ld[2])
+    var fixed = []
+    for sd in supports:
+        let nd = int(sd[0])
+        if sd[1]:
+            fixed.append(2 * nd)
+        if sd[2]:
+            fixed.append(2 * nd + 1)
+    let free = [j for j in range(ndof) if j not in fixed]
+    let Kff = _sub(K, free, free)
+    if matrix_rank(Kff) < len(free):
+        raise ValueError("the truss is a mechanism (not enough members or supports)")
+    let uf = tolist(solve(Kff, tensor([F[j] for j in free])))
+    var u = [0.0] * ndof
+    for k in range(len(free)):
+        u[free[k]] = uf[k]
+    var R = [0.0] * ndof
+    for i in range(ndof):
+        var acc = 0.0
+        for j in range(ndof):
+            acc = acc + K[i][j] * u[j]
+        R[i] = acc - F[i]
+    var forces = []
+    for k in range(m):
+        let g = geo[k]
+        var ext = 0.0
+        for a in range(4):
+            ext = ext + g[1][a] * u[g[0][a]]
+        forces.append(Ev[k] * Av[k] / g[2] * ext)
+    let Ft = tensor(forces)
+    return record(displacements=reshape(tensor(u), -1, 2), forces=Ft, stresses=Ft / tensor(Av),
+                  reactions=reshape(tensor(R), -1, 2))

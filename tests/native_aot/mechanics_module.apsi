@@ -1,0 +1,76 @@
+use mechanics
+
+fn r6(x) = round(float(x), 6)
+fn rl(t) = [round(float(v), 6) for v in t]
+
+# integrators
+fn spring(x) = -x
+for m in ["verlet", "yoshida4", "rk4"]:
+    let s = simulate(spring, 1.0, 0.0, 0.01, 200, method=m, every=50)
+    print(m, rl(s.t), rl(s.x), r6(s.v[4]))
+fn damped(x, v) = -x - 0.1 * v
+let sd = simulate(damped, [1.0, 0.0], [0.0, 1.0], 0.01, 100, method="rk4", every=100)
+print(shape(sd.x), rl(sd.x[1]), rl(sd.v[1]))
+fn forced(x, v, t) = -x + cos(t)
+print(r6(simulate(forced, 0.0, 0.0, 0.05, 40, method="rk4").x[40]))
+
+# Hamiltonian / Lagrangian
+fn H(q, p) = sum(p * p) / 2 + sum(q * q) / 2
+let hf = hamiltonian_flow(H, 1.0, 0.0, 0.01, 100, every=50)
+print(rl(hf.q), rl(hf.p), rl(hf.energy))
+let hr = hamiltonian_flow(H, [1.0, 0.5], [0.0, 0.2], 0.01, 100, method="rk4", every=100)
+print(shape(hr.q), rl(hr.q[1]), rl(hr.energy))
+fn Lp(q, v) = 0.5 * v * v - 9.81 * (1 - cos(q))
+let lf = lagrangian_flow(Lp, 0.3, 0.0, 0.01, 100, every=50)
+print(rl(lf.q), rl(lf.qdot), rl(lf.energy))
+fn L2(q, v) = 0.5 * sum(v * v) - 0.5 * sum(q * q)
+let l2 = lagrangian_flow(L2, [1.0, 0.0], [0.0, 1.0], 0.01, 50, every=50)
+print(shape(l2.q), rl(l2.q[1]), rl(l2.energy))
+
+# N-body
+let nb = nbody([1.0, 1e-3], [[0.0, 0, 0], [1.0, 0, 0]], [[0.0, 0, 0], [0.0, 1.0, 0]], 0.01, 100, G=1.0, every=50)
+print(shape(nb.x), rl(nb.x[2, 1]), rl(nb.energy), rl(nb.momentum[2]), rl(nb.angular_momentum[2]), nb.energy_drift < 1e-6)
+let n2 = nbody([1.0, 1.0], [[-0.5, 0.0], [0.5, 0.0]], [[0.0, -0.5], [0.0, 0.5]], 0.01, 20, G=1.0, softening=0.01, method="verlet", every=10)
+print(rl(n2.x[2, 0]), rl(n2.angular_momentum))
+
+# orbits
+print(r6(kepler_solve(1.0, 0.3)), rl(kepler_solve([0.5, 2.0, 7.0], 0.9)))
+let el = orbit_elements([7000e3, 0.0, 0.0], [0.0, 7.5e3, 1.0e3], 3.986004418e14)
+print(r6(el.a / 1000), r6(el.e), r6(el.i), r6(el.raan), r6(el.argp), r6(el.nu), r6(el.period))
+let st = orbit_state(8000e3, 0.1, 0.5, 1.0, 2.0, 0.7, 3.986004418e14)
+print(rl(st.r / 1000), rl(st.v))
+let el2 = orbit_elements(st.r, st.v, 3.986004418e14)
+print(r6(el2.a / 1000), r6(el2.e), r6(el2.i), r6(el2.raan), r6(el2.argp), r6(el2.nu))
+print(r6(orbital_period(7000e3, 3.986004418e14)), r6(vis_viva(7000e3, 8000e3, 3.986004418e14)))
+let ho = hohmann(7000e3, 42164e3, 3.986004418e14)
+print(r6(ho.dv1), r6(ho.dv2), r6(ho.dv_total), r6(ho.time))
+
+# rigid bodies
+let It = inertia_tensor([1.0, 2.0, 1.5], [[1.0, 0, 0], [0, 1.0, 0.5], [0.3, -0.2, 1.0]])
+print(round(It, 6))
+let pa = principal_axes(It)
+print(rl(pa.moments))
+print(round(rotation_matrix([0.0, 0, 1], pi / 2), 6))
+let qq = quat([1.0, 1, 0], 0.7)
+print(rl(qq), rl(quat_rotate(qq, [0.0, 0, 1])), rl(quat_conj(qq)), rl(quat_mul(qq, qq)))
+print(round(quat_to_matrix(qq), 6))
+let rb = rigid_body([1.0, 2.0, 3.0], [0.1, 1.0, 0.1], none, 0.01, 100, every=50)
+print(shape(rb.omega), rl(rb.omega[2]), rl(rb.q[2]), rl(rb.energy), rl(rb.L_world[2]))
+fn tq(t, w, q) = [0.0, 0.0, 0.1]
+let rt = rigid_body([[1.0, 0, 0], [0, 1.0, 0], [0, 0, 2.0]], [0.0, 0.0, 0.5], [1.0, 0, 0, 0], 0.01, 50, torque=tq, every=50)
+print(rl(rt.omega[1]))
+
+# vibrations and structures
+let nm = normal_modes([[2.0, -1.0], [-1.0, 2.0]], [1.0, 1.0])
+print(rl(nm.omega), rl(nm.freq), rl(abs(nm.modes[:, 0])))
+let b1 = beam(2.0, 200e9, 1e-6, loads=[[2.0, -1000.0]], n=20)
+print(len(b1.x), r6(b1.max_deflection * 1000), r6(b1.slope[len(b1.x) - 1] * 1000), r6(b1.moment[0]), r6(b1.shear[5]), round(b1.reactions.at_0_force, 3), round(b1.reactions.at_0_moment, 3))
+let b2 = beam(4.0, 200e9, 2e-6, support="simply", distributed=-500.0, n=40)
+print(r6(b2.max_deflection * 1000), r6(b2.moment[20]), round(b2.reactions.at_0_force, 3), round(b2.reactions.at_4_force, 3))
+let b3 = beam(3.0, 70e9, 1e-6, support="fixed", loads=[[1.0, -200.0]], n=30)
+print(r6(b3.max_deflection * 1e6), round(b3.reactions.at_0_force, 3), round(b3.reactions.at_3_moment, 3))
+let b4 = beam(3.0, 70e9, 1e-6, support="propped", distributed=-100.0, n=30)
+print(r6(b4.max_deflection * 1e6), round(b4.reactions.at_0_moment, 3), round(b4.reactions.at_3_force, 3))
+let tr = truss2d([[0.0, 0], [1.0, 0], [0.5, 0.8]], [[0, 1], [1, 2], [0, 2]], 200e9, 1e-4,
+                 [[0, true, true], [1, false, true]], [[2, 0.0, -1000.0]])
+print(round(tr.displacements * 1e6, 6), rl(tr.forces), rl(tr.stresses / 1e6), round(tr.reactions, 6))

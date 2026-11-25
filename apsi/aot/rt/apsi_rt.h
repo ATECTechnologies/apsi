@@ -33,6 +33,7 @@ typedef struct AFunc {
     AObj h; const char *name; AFnCode code;
     int ncells; ACell **cells;            /* the closure's captured variables */
     int ndef; AV *defaults;               /* defaults of the last ndef parameters */
+    int nreq;                             /* positional parameters without a default (-1: unknown) */
 } AFunc;
 typedef struct AClass { AObj h; AStr *name; struct AClass *base; ADict *attrs; int nfields; AStr **fields; int is_struct; } AClass;
 typedef struct AInst { AObj h; AClass *cls; ADict *attrs; } AInst;

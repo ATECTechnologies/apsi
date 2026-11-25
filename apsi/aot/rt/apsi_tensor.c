@@ -27,7 +27,7 @@ static const char *dt_name[] = {"float64", "float32", "int64", "bool"};
 static const int dt_size[] = {8, 4, 8, 1};
 #define MAXD 8
 typedef struct ATensor { AObj h; uint8_t dt, nd, dev, pad; int64_t sh[MAXD]; int64_t n; void *p; AObj *base; } ATensor;   /* base: the tensor whose buffer this one shares (a reshape) */
-typedef struct ANode { AObj h; AV val; int op; AV a, b, x; AV grad; int64_t id; int seen; } ANode;
+typedef struct ANode { AObj h; AV val; int op; AV a, b, x; AV grad; int64_t id; int seen; int lvl; } ANode;   /* lvl: the grad() call that recorded it */
 #define TT(v) ((ATensor *)(v).o)
 #define ND(v) ((ANode *)(v).o)
 
@@ -1231,9 +1231,22 @@ static void conv_backward(AV g, AV a, AV b, AV opts); static void pool_backward(
 static int64_t node_ids = 0;
 static AV node_new(AV val, int op, AV a, AV b, AV x) {
     ANode *n = (ANode *)a_alloc(sizeof(ANode), O_NODE);
-    n->val = val; n->op = op; n->a = a; n->b = b; n->x = x; n->grad = A_NONE; n->id = ++node_ids;
+    n->val = val; n->op = op; n->a = a; n->b = b; n->x = x; n->grad = A_NONE; n->id = ++node_ids; n->lvl = 0;
+    if (a.t == T_OBJ && a.o->kind == O_NODE && ((ANode *)a.o)->lvl > n->lvl) n->lvl = ((ANode *)a.o)->lvl;
+    if (b.t == T_OBJ && b.o->kind == O_NODE && ((ANode *)b.o)->lvl > n->lvl) n->lvl = ((ANode *)b.o)->lvl;
+    if (a.t == T_OBJ && a.o->kind == O_LIST)
+        for (int64_t i = 0; i < ((AList *)a.o)->len; i++) { AV e = ((AList *)a.o)->v[i]; if (e.t == T_OBJ && e.o->kind == O_NODE && ((ANode *)e.o)->lvl > n->lvl) n->lvl = ((ANode *)e.o)->lvl; }
     return a_obj(n);
 }
+/* nested grad() calls: a value recorded by an outer call is a constant to an inner one. lift() wraps it in an
+   unregistered leaf of the inner level whose value is the outer node, so the inner result stays differentiable
+   by the outer call and the inner backward pass never reaches the outer leaves. */
+static int lvl_of(AV v) { return v.t == T_OBJ && v.o->kind == O_NODE ? ((ANode *)v.o)->lvl : -1; }
+static AV lift(AV v, int L) {
+    if (!(v.t == T_OBJ && v.o->kind == O_NODE) || ((ANode *)v.o)->lvl >= L) return v;
+    AV r = node_new(v, 0 /* N_LEAF */, A_NONE, A_NONE, A_NONE); ((ANode *)r.o)->lvl = L; return r;
+}
+static int grad_level = 0;
 static AV val_of(AV v) { return is_n(v) ? ND(v)->val : v; }
 
 /* every operation on values, whatever their kind */
@@ -1524,6 +1537,9 @@ static AV d_where(AV c, AV a, AV b);
 AV a_tensor_where(AV c, AV a, AV b) {
     int sp = a_ntmp;
     if (is_n(a) || is_n(b)) {
+        if (is_n(a) && is_n(b) && lvl_of(a) != lvl_of(b)) {
+            int L = lvl_of(a) > lvl_of(b) ? lvl_of(a) : lvl_of(b); a = lift(a, L); A_PUSH(a); b = lift(b, L); A_PUSH(b);
+        }
         AV v = a_tensor_where(c, val_of(a), val_of(b)); A_PUSH(v);
         AV n = node_new(v, N_WHERE, a, b, c); a_ntmp = sp; return n;
     }
@@ -1546,6 +1562,11 @@ AV a_tensor_where(AV c, AV a, AV b) {
 /* a_binop sends here every operation with a tensor or a node on either side */
 AV a_tensor_binop(int op, AV a, AV b) {
     if (is_n(a) || is_n(b)) {
+        int L = lvl_of(a) > lvl_of(b) ? lvl_of(a) : lvl_of(b);
+        if (lvl_of(a) != lvl_of(b) && is_n(a) && is_n(b)) {
+            int sp0 = a_ntmp; a = lift(a, L); A_PUSH(a); b = lift(b, L); A_PUSH(b);
+            AV r = a_tensor_binop(op, a, b); a_ntmp = sp0; return r;
+        }
         if (op == OP_MATMUL) { AV v = a_tensor_binop(OP_MATMUL, val_of(a), val_of(b)); int sp = a_ntmp; A_PUSH(v); AV r = node_new(v, N_MATMUL, a, b, A_NONE); a_ntmp = sp; return r; }
         AV v = a_binop(op, val_of(a), val_of(b));
         int nop = op == OP_ADD ? N_ADD : op == OP_SUB ? N_SUB : op == OP_MUL ? N_MUL : op == OP_DIV ? N_DIV : op == OP_POW ? N_POW : -1;
@@ -1790,6 +1811,13 @@ static AV join(int n, AV *a, ADict *kw, int stack) {
     for (int64_t i = 0; i < l->len; i++) if (is_n(l->v[i])) any_node = 1;
     if (!any_node) return t_concat(items, axi, stack);
     int sp = a_ntmp;
+    int L = -1, mixed = 0;
+    for (int64_t i = 0; i < l->len; i++) if (is_n(l->v[i])) { if (L >= 0 && lvl_of(l->v[i]) != L) mixed = 1; if (lvl_of(l->v[i]) > L) L = lvl_of(l->v[i]); }
+    if (mixed) {
+        AV lifted = a_list(l->len, l->v); A_PUSH(lifted);
+        for (int64_t i = 0; i < l->len; i++) ((AList *)lifted.o)->v[i] = lift(l->v[i], L);
+        items = lifted; l = (AList *)items.o;
+    }
     AV vals = a_list(l->len, l->v); A_PUSH(vals);
     for (int64_t i = 0; i < l->len; i++) ((AList *)vals.o)->v[i] = val_of(l->v[i]);
     AV v = join(2, (AV[]){vals, a_int(axi)}, NULL, stack); A_PUSH(v);
@@ -1984,7 +2012,9 @@ static AV run_grad(AV f, int n, AV *a, ADict *kw, int with_value) {
     int sp = a_ntmp;
     AV leaves = a_list(0, NULL); A_PUSH(leaves);
     AV args = a_list(n, a); A_PUSH(args);
+    int my_level = ++grad_level;
     AV x = wrap_tree(a[0], (AList *)leaves.o);
+    for (int64_t i = 0; i < ((AList *)leaves.o)->len; i++) ND(((AList *)leaves.o)->v[i])->lvl = my_level;
     ((AList *)args.o)->v[0] = x;
     AV out = a_call(f, n, ((AList *)args.o)->v, kw); A_PUSH(out);
     AV value = val_of(out);
@@ -1993,6 +2023,7 @@ static AV run_grad(AV f, int n, AV *a, ADict *kw, int with_value) {
         backward(out);
     }
     AV g = grads_tree(x); A_PUSH(g);
+    grad_level = my_level - 1;                       /* an exception leaves it higher: levels only need to grow inward */
     a_ntmp = sp;
     if (!with_value) return g;
     AV pair[2] = {is_t(value) && TT(value)->n == 1 ? t_scalar(TT(value), 0) : value, g};

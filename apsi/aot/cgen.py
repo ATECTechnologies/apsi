@@ -1009,6 +1009,13 @@ class CGen:
             self.function_body(cname, scope, name, params, body, expr_body)
         t = self.tmp()
         self.emit(f"{t} = a_func({cstr(name)}, {cname}, {len(scope.free)}, {len(defaults)});")
+        nreq = 0
+        for p in params:
+            if p.star:
+                break
+            if p.default is None:
+                nreq += 1
+        self.emit(f"((AFunc *){t}.o)->nreq = {nreq};")
         for i, nm in enumerate(scope.free):
             if nm in scope.snap:
                 self.emit(f"((AFunc *){t}.o)->cells[{i}] = a_cell({self.load(nm)});")

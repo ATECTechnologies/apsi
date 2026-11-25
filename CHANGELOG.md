@@ -23,7 +23,8 @@
   (pipelines), `layers` (MLPs, CNNs, recurrent layers, attention with grouped-query heads / RoPE / QK norm,
   transformer language models, `fit`), `models` (safetensors and `.apsim` checkpoints, interchangeable with
   `apsi run`), `web` (an HTTP/1.1 server on Apsi's own event loop), `crypto` (SHA-2, SHA-3, BLAKE2, HMAC, scrypt), `special`, `signal`, `config`, `env`, `log`,
-  `physics` (constants, formulas with units, fields) and `pde` (heat, waves, advection, Poisson, Navier–Stokes, CG).
+  `physics` (constants, formulas with units, fields) and `pde` (heat, waves, advection, Poisson, Navier–Stokes, CG), `mechanics`.
+- Native `grad` nests across variables (a gradient in one argument differentiated in another), as in `apsi run`.
 - Operators of a class (`__mul__`, `__radd__`, …) now win over tensors on either side; `round(tensor, n)` natively.
 - **`async fn` / `await`** in native programs, with `asyncio.run`, `gather`, `create_task`, `wait_for`, `sleep`,
   `Event`, `Lock`, `Queue`.

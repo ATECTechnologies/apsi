@@ -291,7 +291,7 @@ AV a_slice(AV lo, AV hi, AV step) {
 }
 AV a_func(const char *name, AFnCode code, int ncells, int ndef) {
     AFunc *f = (AFunc *)a_alloc(sizeof(AFunc), O_FUNC);
-    f->name = name; f->code = code; f->ncells = ncells; f->ndef = ndef;
+    f->name = name; f->code = code; f->ncells = ncells; f->ndef = ndef; f->nreq = -1;
     f->cells = ncells ? (ACell **)xmalloc(sizeof(ACell *) * (size_t)ncells) : NULL;
     for (int i = 0; i < ncells; i++) f->cells[i] = NULL;
     f->defaults = ndef ? (AV *)xmalloc(sizeof(AV) * (size_t)ndef) : NULL;
@@ -2117,6 +2117,8 @@ static AV b_min(int n, AV *a, ADict *kw, AV self) { if ((n == 1 || kw) && a_is_t
 static AV b_max(int n, AV *a, ADict *kw, AV self) { if ((n == 1 || kw) && a_is_tn(a[0])) return a_tensor_builtin("max", 1)(n, a, kw, self); (void)self; return minmax(n, a, kw, 1); }
 static AV b_sum(int n, AV *a, ADict *kw, AV self) { if (n && a_is_tn(a[0])) return a_tensor_builtin("sum", 1)(n, a, kw, self);
     (void)kw; (void)self;
+    if (n && (a[0].t == T_INT || a[0].t == T_FLOAT || a[0].t == T_BOOL || a_is(a[0], O_QTY)))   /* sum of one number, as numpy */
+        return n > 1 ? a_add(a[1], a[0]) : (a[0].t == T_BOOL ? a_int(a[0].i) : a[0]);
     int sp = a_ntmp; AV acc = n > 1 ? a[1] : a_int(0), it = a_iter(a[0]), x; A_PUSH(it); A_PUSH(acc);
     while (a_next(it, &x)) { acc = a_add(acc, x); a_tmp[sp + 1] = acc; }
     a_ntmp = sp; return acc;
