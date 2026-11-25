@@ -18,13 +18,15 @@ typedef struct AV {
 typedef enum {
     O_STR = 1, O_LIST, O_TUPLE, O_DICT, O_SET, O_FUNC, O_CLASS, O_INST, O_BOUND, O_RANGE, O_ITER, O_CELL, O_BUILTIN,
     O_SLICE, O_QTY, O_GEN, O_TENSOR, O_NODE, O_BYTES,    /* O_BYTES: an AStr whose characters are bytes */
-    O_COMPLEX, O_CTENSOR                                     /* a complex number, a complex128 tensor (apsi_cplx.c) */
+    O_COMPLEX, O_CTENSOR,                                    /* a complex number, a complex128 tensor (apsi_cplx.c) */
+    O_BYTEARRAY                                              /* mutable bytes: an O_BYTES buffer with spare room */
 } AKind;
 
 typedef struct AObj { struct AObj *gcnext; uint8_t kind, mark; } AObj;
 
 typedef struct AStr { AObj h; int64_t len; int64_t nchars; uint64_t hash; int ascii; char s[]; } AStr;
 typedef struct AList { AObj h; int64_t len, cap; AV *v; } AList;           /* list and tuple */
+typedef struct ABArr { AObj h; AV data; int64_t cap; } ABArr;              /* bytearray: an O_BYTES of cap bytes, len in use */
 typedef struct ADEnt { AV k, v; uint64_t hash; int used; } ADEnt;
 typedef struct ADict { AObj h; int64_t len, nent, cap; ADEnt *e; int64_t *idx; int64_t icap; } ADict;  /* dict, set */
 typedef struct ACell { AObj h; AV v; } ACell;
@@ -36,7 +38,7 @@ typedef struct AFunc {
     int ndef; AV *defaults;               /* defaults of the last ndef parameters */
     int nreq;                             /* positional parameters without a default (-1: unknown) */
 } AFunc;
-typedef struct AClass { AObj h; AStr *name; struct AClass *base; ADict *attrs; int nfields; AStr **fields; int is_struct; } AClass;
+typedef struct AClass { AObj h; AStr *name; struct AClass *base; ADict *attrs; int nfields; AStr **fields; int is_struct; int has_setattr; } AClass;
 typedef struct AInst { AObj h; AClass *cls; ADict *attrs; } AInst;
 typedef struct ABound { AObj h; AV self, fn; } ABound;
 typedef struct ARange { AObj h; int64_t start, stop, step; } ARange;

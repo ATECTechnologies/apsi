@@ -779,6 +779,35 @@ BI(lb_frombuffer) {
     }
     return a_obj(T);
 }
+/* __pk(code, little, value) -> bytes, __upk(bytes, offset, code, little) -> value: one value as struct.pack writes it
+   (codes B H I Q b h i q f d ? c) */
+static int pk_size(const char *c) { switch (*c) { case 'B': case 'b': case '?': case 'c': return 1; case 'H': case 'h': return 2; case 'I': case 'i': case 'f': return 4; case 'Q': case 'q': case 'd': return 8; } a_error("ValueError", "pack: unknown code '%s'", c); return 0; }
+BI(lb_pk) {
+    (void)self; (void)kw; (void)n; const char *c = lib_str(a[0], "pack")->s; int le = a_truthy(a[1]), sz = pk_size(c); AV v = a[2];
+    unsigned char raw[8]; uint64_t u = 0;
+    if (*c == 'f') { float f = (float)(v.t == T_FLOAT ? v.f : (double)v.i); uint32_t w; memcpy(&w, &f, 4); u = w; }
+    else if (*c == 'd') { double d = v.t == T_FLOAT ? v.f : (double)v.i; memcpy(&u, &d, 8); }
+    else if (*c == 'c') { AStr *t = lib_str(v, "pack"); u = (unsigned char)t->s[0]; }
+    else if (*c == '?') u = a_truthy(v) ? 1 : 0;
+    else u = (uint64_t)(v.t == T_FLOAT ? (int64_t)v.f : v.i);
+    for (int k = 0; k < sz; k++) raw[le ? k : sz - 1 - k] = (unsigned char)(u >> (8 * k));
+    return a_bytes((const char *)raw, sz);
+}
+BI(lb_upk) {
+    (void)self; (void)kw; (void)n; AStr *b = lib_str(a[0], "unpack"); int64_t off = a[1].i; const char *c = lib_str(a[2], "unpack")->s; int le = a_truthy(a[3]), sz = pk_size(c);
+    if (off < 0 || off + sz > b->len) a_error("ValueError", "unpack: %d bytes needed at %lld", sz, (long long)off);
+    const unsigned char *p = (const unsigned char *)b->s + off; uint64_t u = 0;
+    for (int k = 0; k < sz; k++) u |= (uint64_t)p[le ? k : sz - 1 - k] << (8 * k);
+    switch (*c) {
+    case 'f': { uint32_t w = (uint32_t)u; float f; memcpy(&f, &w, 4); return a_float((double)f); }
+    case 'd': { double d; memcpy(&d, &u, 8); return a_float(d); }
+    case '?': return a_bool(u != 0);
+    case 'c': { char ch = (char)u; unsigned char uc = (unsigned char)u; if (uc < 128) return a_strn(&ch, 1); char t2[2] = {(char)(0xC0 | (uc >> 6)), (char)(0x80 | (uc & 63))}; return a_strn(t2, 2); }
+    case 'b': return a_int((int8_t)u); case 'h': return a_int((int16_t)u); case 'i': return a_int((int32_t)u);
+    default: return a_int((int64_t)u);
+    }
+}
+BI(lb_setraw) { (void)self; (void)kw; (void)n; if (!a_is(a[0], O_INST)) a_error("TypeError", "__setraw: an object"); a_dict_set(((AInst *)a[0].o)->attrs, a[1], a[2]); return A_NONE; }
 #define APSI_VERSION "2.6.6"                                  /* kept equal to apsi.__version__ by the tests */
 BI(lb_apsi_version) { (void)n; (void)a; (void)kw; (void)self; return a_str(APSI_VERSION); }
 BI(lb_frame);
@@ -800,5 +829,5 @@ static const TEnt lib_builtins[] = {
     {"__password_hash", lb_password_hash}, {"__password_verify", lb_password_verify},
     {"__la", lb_la}, {"__fft", lb_fft}, {"__special", lb_special}, {"__conv2d", lb_conv2d}, {"__maxpool2d", lb_maxpool2d},
     {"__time", lb_time}, {"__sleep", lb_sleep}, {"__fs", lb_fs}, {"__st_load", lb_st_load}, {"__st_save", lb_st_save},
-    {"__npy_load", lb_npy_load}, {"__npy_save", lb_npy_save}, {"__http_serve", lb_http_serve}, {"__is_dev", lb_is_dev}, {"__frombuffer", lb_frombuffer}, {"__frame", lb_frame}, {"__sqlite", lb_sqlite}, {"__net", lb_net}, {"__ct", lb_ct}, {"__is_cplx", lb_is_cplx}, {"__ckron", lb_ckron}, {"__is_traced", lb_is_traced}, {"__qfmt", lb_qfmt}, {"__apsi_version", lb_apsi_version}, {"__arity", lb_arity}, {"__localtime", lb_localtime}, {"__isatty", lb_isatty}, {"__rec_dict", lb_rec_dict}, {"__is_rec", lb_is_rec}, {"__argv", lb_argv}, {"__environ_names", lb_environ_names}, {"__builtin", lb_builtin}, {"__setenv", lb_setenv}, {"__gen_step", lb_gen_step}, {"__is_coro", lb_is_coro},
+    {"__npy_load", lb_npy_load}, {"__npy_save", lb_npy_save}, {"__http_serve", lb_http_serve}, {"__is_dev", lb_is_dev}, {"__frombuffer", lb_frombuffer}, {"__pk", lb_pk}, {"__setraw", lb_setraw}, {"__upk", lb_upk}, {"__frame", lb_frame}, {"__sqlite", lb_sqlite}, {"__net", lb_net}, {"__ct", lb_ct}, {"__is_cplx", lb_is_cplx}, {"__ckron", lb_ckron}, {"__is_traced", lb_is_traced}, {"__qfmt", lb_qfmt}, {"__apsi_version", lb_apsi_version}, {"__arity", lb_arity}, {"__localtime", lb_localtime}, {"__isatty", lb_isatty}, {"__rec_dict", lb_rec_dict}, {"__is_rec", lb_is_rec}, {"__argv", lb_argv}, {"__environ_names", lb_environ_names}, {"__builtin", lb_builtin}, {"__setenv", lb_setenv}, {"__gen_step", lb_gen_step}, {"__is_coro", lb_is_coro},
     {NULL, NULL}};

@@ -411,7 +411,7 @@ static AV hex_of(const uint8_t *p, size_t n) { char o[260]; static const char *h
 #ifndef STR
 #define STR(v) ((AStr *)(v).o)
 #endif
-static AStr *lib_str(AV v, const char *what) { if (!a_is(v, O_STR) && !a_is(v, O_BYTES)) a_error("TypeError", "%s takes text (Str)", what); return (AStr *)v.o; }
+static AStr *lib_str(AV v, const char *what) { if (a_is(v, O_BYTEARRAY)) v = ((ABArr *)v.o)->data; if (!a_is(v, O_STR) && !a_is(v, O_BYTES)) a_error("TypeError", "%s takes text (Str)", what); return (AStr *)v.o; }
 static int lib_algo(AV v) {
     const char *name = lib_str(v, "the hash name")->s; int a = h_algo(name);
     if (a < 0) a_error("ValueError", "unknown hash '%s'; use one of blake2b, blake2s, md5, sha1, sha256, sha3_256, sha3_512, sha512", name);

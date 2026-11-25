@@ -1,0 +1,51 @@
+use layout
+
+let Flags = layout.bits(layout.u8, [["ready", 1], ["mode", 3], ["err", 1]])
+let Point = layout.c_struct("Point", [["x", layout.f32], ["y", layout.f32]])
+let Hdr = layout.c_struct("Hdr", [["magic", layout.u32], ["ver", layout.u8], ["flags", Flags], ["len", layout.u16],
+                                  ["pos", Point], ["name", layout.array(layout.char, 6)], ["vals", layout.array(layout.i16, 3)],
+                                  ["big", layout.i64], ["ok", layout.bool8], ["c", layout.char], ["scale", layout.f64]])
+print(Hdr.size, Hdr.align, Hdr.offset("pos"), Hdr.offset("big"), layout.offsetof(Hdr, "scale"))
+print(Hdr.describe())
+print(layout.sizeof(layout.u16), layout.alignof(Point), layout.sizeof(Hdr), layout.sizeof("f64"), layout.u8, Flags)
+let data = Hdr.pack({"magic": 0xCAFEBABE, "ver": 2, "flags": {"ready": 1, "mode": 5, "err": 0}, "len": 513,
+                     "pos": {"x": 1.5, "y": -2.25}, "name": "abc", "vals": [1, -2, 300], "big": -9000000000,
+                     "ok": true, "c": "Z", "scale": 3.125})
+print(len(data), data.hex())
+let r = Hdr.unpack(data)
+print(r.magic, r.ver, r.flags.ready, r.flags.mode, r.flags.err, r.len, r.pos.x, r.pos.y, r.name, r.big, r.ok, r.c, r.scale)
+print(r.vals.tolist(), r.vals[2])
+let P = layout.c_struct("P", [["a", layout.u8], ["b", layout.u32], ["c", layout.u16]], pack=1, endian="big")
+print(P.size, P.describe())
+let pb = P.pack(record(a=1, b=0x01020304, c=7))
+print(pb, P.unpack(pb))
+let P2 = layout.c_struct("P2", [["a", layout.u8], ["b", layout.u32]], pack=2)
+print(P2.size, P2.offset("b"))
+print(Hdr.c_header())
+let regs = layout.register_map("UART", 0x40001000, [["data", 0, layout.u32], ["status", 4, layout.u32, [["rx", 1], ["tx", 1], ["err", 2]]]])
+print(regs.c_header())
+let img = regs.write(bytearray(8), "status", {"rx": 1, "tx": 0, "err": 3})
+regs.write(img, "data", 65)
+let rr = regs.read(img)
+print(rr.data, rr.status.value, rr.status.rx, rr.status.err, bytes(img))
+var buf = bytearray(Point.size * 2)
+let v = Point.view(buf, 8)
+v.x = 3.5
+v.y = 4.0
+print(v.x, v.y, buf, v.to_record())
+try:
+    Hdr.pack({"ver": 300})
+except Exception as e:
+    print("error:", e)
+try:
+    layout.c_struct("Bad", [["a", "u9"]])
+except Exception as e:
+    print("error:", e)
+try:
+    Hdr.unpack(b"123")
+except Exception as e:
+    print("error:", e)
+let Arr = layout.c_struct("Arr", [["pts", layout.array(Point, 2)], ["fl", layout.array(layout.f64, 2)], ["bb", layout.array(layout.bool8, 2)]])
+let ab = Arr.pack({"pts": [{"x": 1, "y": 2}, {"x": 3, "y": 4}], "fl": [0.5, 0.25], "bb": [true, false]})
+let ar = Arr.unpack(ab)
+print(ar.pts[1].y, ar.fl, ar.bb, Arr.size)

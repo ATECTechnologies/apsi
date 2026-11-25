@@ -1,0 +1,457 @@
+# use layout: exact binary layouts (C structs, packets, file headers, device registers) for native programs, the same
+# bytes, offsets and C headers as apsi run.
+
+class LayoutError(RuntimeError):
+    pass
+
+fn _fail(msg):
+    raise LayoutError(msg)
+
+class _Scalar:
+    var name = ""
+    var code = ""
+    var size = 0
+    var align = 0
+    var ctype = ""
+    fn describe(self) = self.name
+    fn __str__(self) = self.name
+    fn __repr__(self) = self.name
+
+fn _scalar(name, code, size, ctype):
+    var s = _Scalar()
+    s.name = name
+    s.code = code
+    s.size = size
+    s.align = size
+    s.ctype = ctype
+    return s
+
+let u8 = _scalar("u8", "B", 1, "uint8_t")
+let u16 = _scalar("u16", "H", 2, "uint16_t")
+let u32 = _scalar("u32", "I", 4, "uint32_t")
+let u64 = _scalar("u64", "Q", 8, "uint64_t")
+let i8 = _scalar("i8", "b", 1, "int8_t")
+let i16 = _scalar("i16", "h", 2, "int16_t")
+let i32 = _scalar("i32", "i", 4, "int32_t")
+let i64 = _scalar("i64", "q", 8, "int64_t")
+let f32 = _scalar("f32", "f", 4, "float")
+let f64 = _scalar("f64", "d", 8, "double")
+let bool8 = _scalar("bool8", "?", 1, "bool")
+let char = _scalar("char", "c", 1, "char")
+let _SCALARS = {"u8": u8, "u16": u16, "u32": u32, "u64": u64, "i8": i8, "i16": i16, "i32": i32, "i64": i64, "f32": f32,
+                "f64": f64, "bool8": bool8, "char": char}
+
+class _Array:
+    var item = none
+    var n = 0
+    var size = 0
+    var align = 0
+    fn describe(self) = f"array({self.item.describe()}, {self.n})"
+    fn __str__(self) = self.describe()
+    fn __repr__(self) = self.describe()
+
+class _Bits:
+    var base = none
+    var fields = []
+    var size = 0
+    var align = 0
+    fn describe(self) = f"bits({self.base.name}, {', '.join([f'{f[0]}:{f[2]}' for f in self.fields])})"
+    fn __str__(self) = self.describe()
+    fn __repr__(self) = self.describe()
+
+fn _kind(t):
+    if isinstance(t, _Scalar):
+        return "scalar"
+    if isinstance(t, _Array):
+        return "array"
+    if isinstance(t, _Bits):
+        return "bits"
+    if isinstance(t, CStruct):
+        return "struct"
+    return ""
+
+fn _r(t) = f"'{t}'" if isinstance(t, str) else repr(t)
+
+fn _type(t):
+    if _kind(t) != "":
+        return t
+    if isinstance(t, str) and t in _SCALARS:
+        return _SCALARS[t]
+    _fail(f"not a layout type: {_r(t)} (u8 … i64, f32, f64, bool8, char, array(), bits(), c_struct())")
+
+fn _pairs(fields):
+    if isinstance(fields, dict):
+        return [[k, fields[k]] for k in fields]
+    if __is_rec(fields):
+        let d = __rec_dict(fields)
+        return [[k, d[k]] for k in d]
+    var out = []
+    for f in fields:
+        if not (isinstance(f, list) or isinstance(f, tuple)) or len(f) != 2:
+            _fail("fields are [(name, type), …]")
+        out.append([f[0], f[1]])
+    return out
+
+fn _field(values, name):
+    if values == none:
+        return none
+    if isinstance(values, dict):
+        return values.get(name)
+    if __is_rec(values):
+        let d = __rec_dict(values)
+        return d.get(name)
+    return getattr(values, name, none)
+
+fn _range(t):
+    let bits = 8 * t.size
+    if bits == 64:
+        return [-9223372036854775807 - 1, 9223372036854775807] if t.code.islower() else [0, 9223372036854775807]
+    if t.code.islower():
+        return [-(2 ** (bits - 1)), 2 ** (bits - 1) - 1]
+    return [0, 2 ** bits - 1]
+
+# ------------------------------------------------------------------------------- bytes
+fn _put(buf, off, t, v, little):
+    let k = _kind(t)
+    if k == "scalar":
+        if v == none:
+            return
+        var x = v
+        if t.name == "char":
+            let raw = v.encode() if isinstance(v, str) else bytes(v)
+            if len(raw) != 1:
+                _fail("char: one byte")
+            buf[off] = raw[0]
+            return
+        elif t.code == "f" or t.code == "d":
+            x = float(v)
+        elif t.name == "bool8":
+            x = bool(v)
+        else:
+            x = int(v)
+            let lr = _range(t)
+            if x < lr[0] or x > lr[1]:
+                _fail(f"{x} does not fit in {t.name} ({lr[0]} … {lr[1]})")
+        buf[off:off + t.size] = __pk(t.code, little, x)
+    elif k == "bits":
+        if v == none:
+            return
+        var word = 0
+        for f in t.fields:
+            let x = int(_field(v, f[0]) or 0)
+            if x < 0 or x >= 2 ** f[2]:
+                _fail(f"bit field {f[0]}: {x} does not fit in {f[2]} bits")
+            word = bor(word, x * 2 ** f[1])
+        buf[off:off + t.size] = __pk(t.base.code, little, word)
+    elif k == "struct":
+        if v != none:
+            t._write(buf, off, v)
+    elif k == "array":
+        if v == none:
+            return
+        if t.item.name == "char" and (isinstance(v, str) or isinstance(v, bytes)):
+            let raw = v.encode() if isinstance(v, str) else v
+            if len(raw) > t.n:
+                _fail(f"text of {len(raw)} bytes in array(char, {t.n})")
+            buf[off:off + len(raw)] = raw
+            return
+        let vals = list(v) if (isinstance(v, list) or isinstance(v, tuple)) else reshape(v, -1).tolist()
+        if len(vals) > t.n:
+            _fail(f"{len(vals)} values in array of {t.n}")
+        for i in range(len(vals)):
+            _put(buf, off + i * t.item.size, t.item, vals[i], little)
+    else:
+        _fail(f"not a layout type: {_r(t)}")
+
+fn _get(data, off, t, little):
+    let k = _kind(t)
+    if k == "scalar":
+        return __upk(data, off, t.code, little)
+    if k == "bits":
+        let word = __upk(data, off, t.base.code, little)
+        var d = {}
+        for f in t.fields:
+            d[f[0]] = band(word // 2 ** f[1], 2 ** f[2] - 1)
+        return record(**d)
+    if k == "struct":
+        return t._read(data, off)
+    if k == "array":
+        if t.item.name == "char":
+            let raw = bytes(data[off:off + t.n])
+            let z = raw.find(b"\x00")
+            return (raw if z < 0 else raw[0:z]).decode("utf-8", "replace")
+        let vals = [_get(data, off + i * t.item.size, t.item, little) for i in range(t.n)]
+        if _kind(t.item) == "scalar" and t.item.name != "bool8":
+            return tensor(vals, "float64") if (t.item.code == "f" or t.item.code == "d") else tensor(vals, "int64")
+        return vals
+    _fail(f"not a layout type: {_r(t)}")
+
+# ------------------------------------------------------------------------------- structs
+class CStruct:
+    var name = ""
+    var pack_n = 0
+    var endian = "little"
+    var little = true
+    var fields = []
+    var size = 0
+    var align = 1
+    var _by = {}
+    fn offset(self, field):
+        if not (field in self._by):
+            _fail(f"{self.name} has no field {field}")
+        return self._by[field][1]
+    fn describe(self):
+        var rows = [f"{self.name}: {self.size} bytes, align {self.align}, {self.endian}-endian" + (f", pack {self.pack_n}" if self.pack_n else "")]
+        for f in self.fields:
+            rows.append(f"  {f[2]:>5}  {f[1].size:>4}  {f[0]}: {f[1].describe()}")
+        return "\n".join(rows)
+    fn __str__(self) = self.describe()
+    fn __repr__(self) = self.describe()
+    fn pack(self, values=none):
+        var buf = bytearray(self.size)
+        self._write(buf, 0, values or {})
+        return bytes(buf)
+    fn unpack(self, data, offset=0):
+        let d = data if (isinstance(data, bytes) or isinstance(data, bytearray)) else bytes(data)
+        if len(d) - offset < self.size:
+            _fail(f"{self.name}: {self.size} bytes needed, {len(d) - offset} given")
+        return self._read(d, offset)
+    fn _write(self, buf, base, values):
+        for f in self.fields:
+            _put(buf, base + f[2], f[1], _field(values, f[0]), self.little)
+    fn _read(self, data, base):
+        var d = {}
+        for f in self.fields:
+            d[f[0]] = _get(data, base + f[2], f[1], self.little)
+        return record(**d)
+    fn view(self, buffer, offset=0) = _view(self, buffer, offset)
+    fn numpy_dtype(self):
+        _fail("numpy_dtype(): NumPy is not part of native programs (unpack records, or read arrays with unpack)")
+    fn c_header(self, guard=true):
+        var parts = []
+        var done = set()
+        _c_defs(self, parts, done)
+        let body = "\n\n".join(parts)
+        if not guard:
+            return body
+        let g = f"APSI_LAYOUT_{self.name.upper()}_H"
+        return f"/* {self.name}: made by Apsi (use layout). {self.endian}-endian, {self.size} bytes. */\n" + f"#ifndef {g}\n#define {g}\n\n#include <stdint.h>\n#include <stdbool.h>\n#include <stddef.h>\n\n" + f"{body}\n\n#endif\n"
+
+fn _ceil_to(x, a) = -((-x) // a) * a
+
+fn c_struct(name, fields, pack=0, endian="little"):
+    var s = CStruct()
+    s.name = str(name)
+    s.pack_n = int(pack or 0)
+    if not (s.pack_n in [0, 1, 2, 4, 8, 16]):
+        _fail("pack: 0 (natural), 1, 2, 4, 8 or 16")
+    if not (endian in ["little", "big", "native"]):
+        _fail("endian: \"little\", \"big\" or \"native\"")
+    s.endian = endian
+    s.little = endian != "big"
+    var fl = []
+    var off = 0
+    var align = 1
+    var seen = set()
+    var by = {}
+    for p in _pairs(fields):
+        let fname = str(p[0])
+        let t = _type(p[1])
+        if fname in seen:
+            _fail(f"{s.name}: the field {fname} twice")
+        seen.add(fname)
+        let a = min(t.align, s.pack_n) if s.pack_n else t.align
+        off = _ceil_to(off, a)
+        fl.append([fname, t, off])
+        by[fname] = [t, off]
+        off = off + t.size
+        align = max(align, a)
+    s.fields = fl
+    s._by = by
+    s.align = align
+    s.size = _ceil_to(off, align) if off else 0
+    return s
+
+fn array(item, n):
+    var a = _Array()
+    a.item = _type(item)
+    a.n = int(n)
+    if a.n < 0:
+        _fail("array(type, n): n is 0 or more")
+    a.size = a.item.size * a.n
+    a.align = a.item.align
+    return a
+
+fn bits(base, fields):
+    var b = _Bits()
+    b.base = _type(base)
+    if not (b.base.name in ["u8", "u16", "u32", "u64"]) or _kind(b.base) != "scalar":
+        _fail("bits(base, …): the base is u8, u16, u32 or u64")
+    var fl = []
+    var pos = 0
+    for p in _pairs(fields):
+        let w = int(p[1])
+        if w < 1:
+            _fail(f"bit field {p[0]}: a width of 1 or more")
+        fl.append([str(p[0]), pos, w])
+        pos = pos + w
+    if pos > 8 * b.base.size:
+        _fail(f"bit fields of {pos} bits do not fit in {b.base.name}")
+    b.fields = fl
+    b.size = b.base.size
+    b.align = b.base.align
+    return b
+
+fn sizeof(t) = _type(t).size
+fn alignof(t) = _type(t).align
+fn offsetof(layout_, field) = layout_.offset(field)
+
+fn _c_decl(t, n):
+    let k = _kind(t)
+    if k == "scalar":
+        return f"{t.ctype} {n}"
+    if k == "bits":
+        return f"{t.base.ctype} {n}"
+    if k == "struct":
+        return f"{t.name} {n}"
+    if k == "array":
+        return f"{_c_decl(t.item, n)}[{t.n}]"
+    _fail(f"no C form for {_r(t)}")
+
+fn _hexu(x) = format(x, "X")
+
+fn _c_defs(s, parts, done):
+    if s.name in done:
+        return
+    for f in s.fields:
+        let inner = f[1].item if _kind(f[1]) == "array" else f[1]
+        if _kind(inner) == "struct":
+            _c_defs(inner, parts, done)
+    let up = s.name.upper()
+    var lines = [f"#ifndef APSI_LAYOUT_DEF_{up}", f"#define APSI_LAYOUT_DEF_{up}"]
+    if s.pack_n:
+        lines.append(f"#pragma pack(push, {s.pack_n})")
+    lines.append(f"typedef struct {s.name} {{")
+    for f in s.fields:
+        lines.append(f"    {_c_decl(f[1], f[0])};")
+    lines.append(f"}} {s.name};")
+    if s.pack_n:
+        lines.append("#pragma pack(pop)")
+    lines.append("#endif")
+    lines.append(f"_Static_assert(sizeof({s.name}) == {s.size}, \"{s.name}: size\");")
+    for f in s.fields:
+        lines.append(f"_Static_assert(offsetof({s.name}, {f[0]}) == {f[2]}, \"{s.name}.{f[0]}: offset\");")
+    for f in s.fields:
+        if _kind(f[1]) == "bits":
+            for b in f[1].fields:
+                let mask = (2 ** b[2] - 1) * 2 ** b[1]
+                let pre = f"{up}_{f[0].upper()}_{b[0].upper()}"
+                lines.append(f"#ifndef {pre}_SHIFT\n#define {pre}_SHIFT {b[1]}u\n#define {pre}_MASK 0x{_hexu(mask)}u\n#endif")
+    parts.append("\n".join(lines))
+    done.add(s.name)
+
+# ------------------------------------------------------------------------------- views over a bytearray
+class View:
+    fn __getattr__(self, n):
+        let l_ = self._l
+        if not (n in l_._by):
+            raise AttributeError(n)
+        let to = l_._by[n]
+        if _kind(to[0]) == "struct":
+            return _view(to[0], self._m, self._o + to[1])
+        return _get(self._m, self._o + to[1], to[0], l_.little)
+    fn __setattr__(self, n, v):
+        let l_ = self._l
+        if not (n in l_._by):
+            _fail(f"{l_.name} has no field {n}")
+        let to = l_._by[n]
+        _put(self._m, self._o + to[1], to[0], v, l_.little)
+    fn to_record(self) = self._l._read(self._m, self._o)
+    fn __str__(self) = f"view({self._l.name} at {self._o})"
+    fn __repr__(self) = self.__str__()
+
+fn _view(l_, buffer, offset):
+    if not isinstance(buffer, bytearray):
+        _fail("view(): the buffer is read-only (use a bytearray or a NumPy array)" if isinstance(buffer, bytes) else "view(): a bytearray")
+    if len(buffer) - offset < l_.size:
+        _fail(f"{l_.name}: {l_.size} bytes needed at {offset}, {len(buffer) - offset} there")
+    var w = View()
+    __setraw(w, "_l", l_)
+    __setraw(w, "_m", buffer)
+    __setraw(w, "_o", int(offset))
+    return w
+
+# ------------------------------------------------------------------------------- device registers
+class RegisterMap:
+    var name = ""
+    var base = 0
+    var regs = []
+    var size = 0
+    fn c_header(self, guard=true):
+        let up = self.name.upper()
+        var lines = [f"#define {up}_BASE 0x{format(self.base, '08X')}u"]
+        for r in self.regs:
+            let rn = r[0].upper()
+            lines.append(f"#define {up}_{rn}_OFFSET 0x{_hexu(r[1])}u")
+            lines.append(f"#define {up}_{rn} (*(volatile {r[2].ctype} *)({up}_BASE + 0x{_hexu(r[1])}u))")
+            if r[3] != none:
+                for b in r[3].fields:
+                    lines.append(f"#define {up}_{rn}_{b[0].upper()}_SHIFT {b[1]}u")
+                    lines.append(f"#define {up}_{rn}_{b[0].upper()}_MASK 0x{_hexu((2 ** b[2] - 1) * 2 ** b[1])}u")
+        let body = "\n".join(lines)
+        if not guard:
+            return body
+        let g = f"APSI_REGS_{up}_H"
+        return f"/* {self.name} registers: made by Apsi (use layout). */\n#ifndef {g}\n#define {g}\n\n" + f"#include <stdint.h>\n\n{body}\n\n#endif\n"
+    fn read(self, image, endian="little"):
+        let le = endian != "big"
+        let data = bytes(image)
+        var out = {}
+        for r in self.regs:
+            let v = __upk(data, r[1], r[2].code, le)
+            if r[3] != none:
+                var d = {"value": v}
+                for b in r[3].fields:
+                    d[b[0]] = band(v // 2 ** b[1], 2 ** b[2] - 1)
+                out[r[0]] = record(**d)
+            else:
+                out[r[0]] = v
+        return record(**out)
+    fn write(self, image, register, value, endian="little"):
+        let le = endian != "big"
+        for r in self.regs:
+            if r[0] == register:
+                var v = value
+                if r[3] != none and not isinstance(value, int):
+                    var tmp = bytearray(r[2].size)
+                    _put(tmp, 0, r[3], value, le)
+                    v = __upk(bytes(tmp), 0, r[2].code, le)
+                image[r[1]:r[1] + r[2].size] = __pk(r[2].code, le, int(v))
+                return image
+        _fail(f"{self.name} has no register {register}")
+
+fn register_map(name, base, registers):
+    var m = RegisterMap()
+    m.name = str(name)
+    m.base = int(base)
+    var regs = []
+    var used = []
+    for r0 in registers:
+        let r = list(r0)
+        if not (len(r) in [3, 4]):
+            _fail("registers are [(name, offset, type), …] or with bit fields [(…, bits(…))]")
+        let rname = str(r[0])
+        let off = int(r[1])
+        let t = _type(r[2])
+        if not (_kind(t) == "scalar" and t.name in ["u8", "u16", "u32", "u64"]):
+            _fail(f"register {rname}: u8, u16, u32 or u64")
+        if off % t.size:
+            _fail(f"register {rname}: offset {off} is not aligned to {t.size}")
+        for u in used:
+            if off < u[1] + u[2] and u[1] < off + t.size:
+                _fail(f"register {rname} overlaps {u[0]}")
+        regs.append([rname, off, t, bits(t, r[3]) if len(r) == 4 else none])
+        used.append([rname, off, t.size])
+    m.regs = regs
+    m.size = max([r[1] + r[2].size for r in regs]) if len(regs) > 0 else 0
+    return m

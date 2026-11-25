@@ -98,6 +98,7 @@ static AV sq_query(AV hv, AV sqlv, AV params) {
         if (v.t == T_NONE) rc = sq.bind_null(st, i + 1);
         else if (v.t == T_INT || v.t == T_BOOL) rc = sq.bind_int64(st, i + 1, (long long)v.i);
         else if (v.t == T_FLOAT) rc = sq.bind_double(st, i + 1, v.f);
+        else if (a_is(v, O_BYTEARRAY) && sq.bind_blob) rc = sq.bind_blob(st, i + 1, ((AStr *)((ABArr *)v.o)->data.o)->s, (int)((AStr *)((ABArr *)v.o)->data.o)->len, (void (*)(void *))(intptr_t)-1);
         else if (a_is(v, O_BYTES) && sq.bind_blob) rc = sq.bind_blob(st, i + 1, ((AStr *)v.o)->s, (int)((AStr *)v.o)->len, (void (*)(void *))(intptr_t)-1);
         else if (a_is(v, O_STR)) rc = sq.bind_text(st, i + 1, ((AStr *)v.o)->s, (int)((AStr *)v.o)->len, (void (*)(void *))(intptr_t)-1);
         else { AV s = a_to_str(v); rc = sq.bind_text(st, i + 1, ((AStr *)s.o)->s, (int)((AStr *)s.o)->len, (void (*)(void *))(intptr_t)-1); }

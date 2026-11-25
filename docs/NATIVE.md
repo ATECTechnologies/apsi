@@ -114,6 +114,7 @@ backward pass walks its graph iteratively, so very deep graphs cannot overflow t
 | `net`, `http_get`, `http_post_json` | HTTP and HTTPS requests: WinHTTP on Windows; sockets and the system's OpenSSL on Linux and macOS (`HTTPS_PROXY` / `NO_PROXY`, `APSI_CA_FILE`); redirects, `HTTPError` |
 | `quantum` | grid Schrödinger solver, split-operator evolution, operators, `expm`, spins, qubits and gates, density matrices, entanglement, hydrogen (complex128 tensors; `measure` draws from the native generator) |
 | `rl` | CartPole, GridWorld and bandit environments, discounted returns, GAE, PPO, DQN, REINFORCE, evaluation, preference / DPO / IPO losses, KL-penalised rewards, GRPO advantages, PPO clip loss, sequence log-probabilities, MCTS, beam search, best-of-n |
+| `layout` | C structs with natural or packed alignment, little / big endian, bit fields, arrays, nested structs, `pack` / `unpack`, views over a `bytearray`, C headers with static assertions, device register maps |
 | `medical` | pharmacokinetics and NCA, SIR / SEIR, epidemiology, diagnostic accuracy, ROC with DeLong, Kaplan–Meier, log-rank, Cox regression, clinical formulas, ECG R-peaks and HRV, DICOM images and series |
 | `env`, `log` | `.env` files and secrets; leveled logging to the console and rotating text / JSON files, timers, reading logs back |
 
@@ -126,7 +127,7 @@ These programs keep running with `apsi run`. A native build that reaches one of 
 
 - graph networks, mixtures of experts and `fit_batches` in `layers`; GGUF, ONNX and PyTorch files in `models`;
   `text_dataset`, `train_tokenizer` and Parquet in `data`; websockets and TLS in `web` (serve HTTPS through a
-  reverse proxy); `tokens.focus` / `fit_chat` / `outline` (they read Python syntax trees); `db.mysql` / `mongo`, `db.pool`, PostgreSQL / Redis over TLS on Windows; the module `torch`
+  reverse proxy); `tokens.focus` / `fit_chat` / `outline` (they read Python syntax trees); `db.mysql` / `mongo`, `db.pool`, PostgreSQL / Redis over TLS on Windows; `layout`'s `numpy_dtype()`; the module `torch`
 - Python modules (`pyimport`, `import numpy`), except `asyncio`
 - random numbers: native programs use their own generator, so a seed gives different numbers than in `apsi run`
   (the same seed always gives the same numbers in native programs)

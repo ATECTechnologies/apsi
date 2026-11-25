@@ -99,6 +99,7 @@ static void mark_obj(AObj *o) {
         case O_SLICE: { ASlice *s = (ASlice *)o; mark(s->lo); mark(s->hi); mark(s->step); return; }
         case O_QTY: mark(((AQty *)o)->tv); o = (AObj *)((AQty *)o)->dtext; continue;
         case O_GEN: gen_mark((struct AGen *)o); return;
+        case O_BYTEARRAY: o = ((ABArr *)o)->data.o; continue;
         case O_NODE: case O_TENSOR: a_tensor_mark(o); return;
         default: return;
         }
@@ -176,6 +177,28 @@ AV a_bytes(const char *s, int64_t n) {
     return a_obj(o);
 }
 #define STR(v) ((AStr *)(v).o)
+#define BA(v) ((ABArr *)(v).o)
+static AV ba_new(const char *s, int64_t n) {
+    int64_t cap = n < 8 ? 8 : n;
+    int sp = a_ntmp;
+    AStr *o = (AStr *)a_alloc(sizeof(AStr) + (size_t)cap + 1, O_BYTES);
+    if (n) memcpy(o->s, s, (size_t)n);
+    o->s[n] = 0; o->len = n; o->nchars = n; o->ascii = 1;
+    A_PUSH(a_obj(o));
+    ABArr *b = (ABArr *)a_alloc(sizeof(ABArr), O_BYTEARRAY); b->data = a_obj(o); b->cap = cap;
+    a_ntmp = sp; return a_obj(b);
+}
+static void ba_reserve(AV v, int64_t need) {
+    ABArr *b = BA(v); if (need <= b->cap) return;
+    int64_t cap = b->cap * 2 > need ? b->cap * 2 : need;
+    AStr *old = STR(b->data);
+    AStr *o = (AStr *)a_alloc(sizeof(AStr) + (size_t)cap + 1, O_BYTES);
+    memcpy(o->s, old->s, (size_t)old->len); o->len = old->len; o->s[o->len] = 0; o->nchars = o->len; o->ascii = 1;
+    b->data = a_obj(o); b->cap = cap;
+}
+static AV ba_bytes(AV v) { return a_is(v, O_BYTEARRAY) ? BA(v)->data : v; }   /* the bytes in use (shared; read only) */
+static AV ba_from(AV bytes) { return ba_new(STR(bytes)->s, STR(bytes)->len); }
+static AV b_bytes_of(AV v);
 #define LIST(v) ((AList *)(v).o)
 #define DICT(v) ((ADict *)(v).o)
 
@@ -419,6 +442,7 @@ int a_isinstance(AV v, AV cls) {
         if (!strcmp(n, "bool")) return v.t == T_BOOL;
         if (!strcmp(n, "str")) return a_is(v, O_STR);
         if (!strcmp(n, "bytes")) return a_is(v, O_BYTES);
+        if (!strcmp(n, "bytearray")) return a_is(v, O_BYTEARRAY);
         if (!strcmp(n, "complex")) return a_is(v, O_COMPLEX);
         if (!strcmp(n, "list")) return a_is(v, O_LIST);
         if (!strcmp(n, "tuple")) return a_is(v, O_TUPLE);
@@ -451,7 +475,7 @@ uint64_t a_hash(AV v) {
         for (int64_t i = 0; i < LIST(v)->len; i++) h = (h ^ a_hash(LIST(v)->v[i])) * 1000003ull;
         return h;
     }
-    case O_LIST: case O_DICT: case O_SET: a_error("TypeError", "unhashable type");
+    case O_LIST: case O_DICT: case O_SET: case O_BYTEARRAY: a_error("TypeError", "unhashable type");
     default: return (uint64_t)(uintptr_t)v.o * 0x9e3779b97f4a7c15ull;
     }
 }
@@ -481,6 +505,10 @@ int a_eq(AV a, AV b) {
         }
     }
     if (a.t != b.t) return 0;
+    if (a_is(a, O_BYTEARRAY) || a_is(b, O_BYTEARRAY)) {
+        AV x = ba_bytes(a), y = ba_bytes(b);
+        return a_is(x, O_BYTES) && a_is(y, O_BYTES) && STR(x)->len == STR(y)->len && !memcmp(STR(x)->s, STR(y)->s, (size_t)STR(x)->len);
+    }
     if (a.t == T_NONE) return 1;
     if (a.o == b.o) return 1;
     if (a.o->kind != b.o->kind) return 0;
@@ -523,6 +551,7 @@ int a_truthy(AV v) {
     }
     switch (v.o->kind) {
     case O_STR: case O_BYTES: return STR(v)->len != 0;
+    case O_BYTEARRAY: return STR(BA(v)->data)->len != 0;
     case O_LIST: case O_TUPLE: return LIST(v)->len != 0;
     case O_DICT: case O_SET: return DICT(v)->len != 0;
     case O_RANGE: return a_len(v) != 0;
@@ -619,6 +648,7 @@ static void repr_into(SB *b, AV v, int repr) {
         }
         sb_put(b, &q, 1); return;
     }
+    case O_BYTEARRAY: sb_puts(b, "bytearray("); repr_into(b, BA(v)->data, 1); sb_puts(b, ")"); return;
     case O_LIST: case O_TUPLE: {
         int tup = v.o->kind == O_TUPLE;
         sb_puts(b, tup ? "(" : "[");
@@ -1025,7 +1055,7 @@ static const char *tname(AV v) {
     default: break;
     }
     switch (v.o->kind) {
-    case O_STR: return "str"; case O_BYTES: return "bytes"; case O_COMPLEX: return "complex"; case O_CTENSOR: return "tensor"; case O_LIST: return "list"; case O_TUPLE: return "tuple"; case O_DICT: return "dict";
+    case O_STR: return "str"; case O_BYTES: return "bytes"; case O_BYTEARRAY: return "bytearray"; case O_COMPLEX: return "complex"; case O_CTENSOR: return "tensor"; case O_LIST: return "list"; case O_TUPLE: return "tuple"; case O_DICT: return "dict";
     case O_SET: return "set"; case O_FUNC: case O_BUILTIN: case O_BOUND: return "function"; case O_CLASS: return "type";
     case O_INST: return ((AInst *)v.o)->cls->name->s; case O_RANGE: return "range";
     default: return "object";
@@ -1080,6 +1110,13 @@ AV a_binop(int op, AV a, AV b) {
         case OP_POW: return a_float(pow(x, y));
         default: break;
         }
+    }
+    if ((op == OP_ADD && (a_is(a, O_BYTEARRAY) || a_is(b, O_BYTEARRAY)) && (a_is(a, O_BYTES) || a_is(a, O_BYTEARRAY)) && (a_is(b, O_BYTES) || a_is(b, O_BYTEARRAY)))
+        || (op == OP_MUL && (a_is(a, O_BYTEARRAY) || a_is(b, O_BYTEARRAY)))) {
+        int ba = a_is(a, O_BYTEARRAY); int sp = a_ntmp;
+        AV r = a_binop(op, ba_bytes(a), ba_bytes(b)); A_PUSH(r);
+        if (ba || op == OP_MUL) r = ba_from(r);
+        a_ntmp = sp; return r;
     }
     if (op == OP_ADD && a.t == T_OBJ && b.t == T_OBJ && a.o->kind == b.o->kind) {
         if (a.o->kind == O_STR) {
@@ -1159,6 +1196,7 @@ AV a_unop(int op, AV a) {
     a_error("TypeError", "bad operand type for unary operator: '%s'", tname(a));
 }
 static int cmp_order(AV a, AV b) {   /* <0, 0, >0 */
+    a = ba_bytes(a); b = ba_bytes(b);
     if (a_is(a, O_QTY) || a_is(b, O_QTY)) {
         int ok; double x, y;
         if (a_is(a, O_QTY)) { x = QTY(a)->v; y = qty_same(a, b, "compare", &ok); } else { y = QTY(b)->v; x = qty_same(b, a, "compare", &ok); }
@@ -1249,6 +1287,7 @@ int a_compare(int op, AV a, AV b) {
 }
 int a_contains(AV c, AV x) {
     if (c.t != T_OBJ) a_error("TypeError", "argument of type '%s' is not iterable", tname(c));
+    c = ba_bytes(c); x = ba_bytes(x);
     switch (c.o->kind) {
     case O_BYTES: {
         if (x.t == T_INT) { for (int64_t i = 0; i < STR(c)->len; i++) if ((unsigned char)STR(c)->s[i] == x.i) return 1; return 0; }
@@ -1293,6 +1332,7 @@ int64_t a_len(AV o) {
     if (o.t == T_OBJ) switch (o.o->kind) {
     case O_STR: return STR(o)->nchars;
     case O_BYTES: return STR(o)->len;
+    case O_BYTEARRAY: return STR(BA(o)->data)->len;
     case O_LIST: case O_TUPLE: return LIST(o)->len;
     case O_DICT: case O_SET: return DICT(o)->len;
     case O_RANGE: {
@@ -1331,6 +1371,7 @@ AV a_getitem(AV o, AV i) {
     if (a_is(o, O_CTENSOR)) return a_cplx_getitem(o, i);
     if (qt(o)) return a_qty_make(a_tensor_getitem(QTY(o)->tv, i), QTY(o)->dim);
     if (o.t != T_OBJ) a_error("TypeError", "'%s' object is not subscriptable", tname(o));
+    if (o.o->kind == O_BYTEARRAY) { AV r = a_getitem(BA(o)->data, i); if (a_is(r, O_BYTES)) { int sp = a_ntmp; A_PUSH(r); r = ba_from(r); a_ntmp = sp; } return r; }
     switch (o.o->kind) {
     case O_LIST: case O_TUPLE: {
         AList *l = LIST(o);
@@ -1391,6 +1432,23 @@ void a_setitem(AV o, AV i, AV v) {
     if (a_is_tn(o)) { a_tensor_setitem(o, i, v); return; }
     if (a_is(o, O_CTENSOR)) { a_cplx_setitem(o, i, v); return; }
     if (qt(o)) { same_or_fail(o, v, "assign"); a_tensor_setitem(QTY(o)->tv, i, qval(v)); return; }
+    if (a_is(o, O_BYTEARRAY)) {
+        AStr *t = STR(BA(o)->data);
+        if (a_is(i, O_SLICE)) {
+            int64_t lo, hi, st; slice_bounds((ASlice *)i.o, t->len, &lo, &hi, &st);
+            if (st != 1) a_error("ValueError", "extended slice assignment is not supported");
+            if (hi < lo) hi = lo;
+            int sp = a_ntmp; AV src = a_is(v, O_BYTES) || a_is(v, O_BYTEARRAY) ? ba_bytes(v) : b_bytes_of(v); A_PUSH(src);
+            int64_t m = STR(src)->len, n = t->len - (hi - lo) + m;
+            char *tmp = (char *)malloc((size_t)n + 1);
+            memcpy(tmp, t->s, (size_t)lo); memcpy(tmp + lo, STR(src)->s, (size_t)m); memcpy(tmp + lo + m, t->s + hi, (size_t)(t->len - hi));
+            ba_reserve(o, n); t = STR(BA(o)->data); memcpy(t->s, tmp, (size_t)n); t->len = t->nchars = n; t->s[n] = 0; free(tmp);
+            a_ntmp = sp; return;
+        }
+        if (v.t != T_INT && v.t != T_BOOL) a_error("TypeError", "'%s' object cannot be interpreted as an integer", tname(v));
+        if (v.i < 0 || v.i > 255) a_error("ValueError", "byte must be in range(0, 256)");
+        t->s[norm_index(i, t->len)] = (char)v.i; return;
+    }
     if (a_is(o, O_LIST)) {
         AList *l = LIST(o);
         if (a_is(i, O_SLICE)) {
@@ -1416,6 +1474,11 @@ void a_delitem(AV o, AV i) {
         memmove(l->v + k, l->v + k + 1, sizeof(AV) * (size_t)(l->len - k - 1)); l->len--; return;
     }
     if (a_is(o, O_DICT)) { if (!a_dict_del(DICT(o), i)) a_key_error(i); return; }
+    if (a_is(o, O_BYTEARRAY)) {
+        if (a_is(i, O_SLICE)) { a_setitem(o, i, a_bytes("", 0)); return; }
+        AStr *t = STR(BA(o)->data); int64_t k = norm_index(i, t->len);
+        memmove(t->s + k, t->s + k + 1, (size_t)(t->len - k)); t->len--; t->nchars = t->len; return;
+    }
     a_error("TypeError", "'%s' object does not support item deletion", tname(o));
 }
 
@@ -1601,7 +1664,7 @@ AV a_iter(AV o) {
     switch (o.o->kind) {
     case O_LIST: case O_TUPLE: return new_iter(IT_SEQ, o);
     case O_STR: return new_iter(IT_STR, o);
-    case O_BYTES: return new_iter(IT_BYTES, o);
+    case O_BYTES: case O_BYTEARRAY: return new_iter(IT_BYTES, o);
     case O_DICT: case O_SET: return new_iter(IT_DICT, o);
     case O_RANGE: {
         ARange *r = (ARange *)o.o; AV it = new_iter(IT_RANGE, o);
@@ -1629,7 +1692,7 @@ int a_next(AV itv, AV *out) {
     switch (it->kind) {
     case IT_SEQ: { AList *l = LIST(it->src); if (it->pos >= l->len) return 0; *out = l->v[it->pos++]; return 1; }
     case IT_REV: { AList *l = LIST(it->src); if (it->pos < 0 || it->pos >= l->len) return 0; *out = l->v[it->pos--]; return 1; }
-    case IT_BYTES: { AStr *s = STR(it->src); if (it->pos >= s->len) return 0; *out = a_int((unsigned char)s->s[it->pos++]); return 1; }
+    case IT_BYTES: { AStr *s = STR(ba_bytes(it->src)); if (it->pos >= s->len) return 0; *out = a_int((unsigned char)s->s[it->pos++]); return 1; }
     case IT_STR: {
         AStr *s = STR(it->src); if (it->pos >= s->len) return 0;
         int64_t b = it->pos + 1; while (b < s->len && (((unsigned char)s->s[b]) & 0xC0) == 0x80) b++;
@@ -1775,7 +1838,11 @@ AV a_attr(AV o, const char *name) {
     return v;
 }
 void a_setattr(AV o, const char *name, AV v) {
-    if (a_is(o, O_INST)) { a_dict_set(((AInst *)o.o)->attrs, a_str(name), v); return; }
+    if (a_is(o, O_INST)) {
+        AV f = class_lookup(((AInst *)o.o)->cls, "__setattr__");      /* the class decides what x.name = v does */
+        if (f.t != 255 && a_is(f, O_FUNC)) { int sp = a_ntmp; AV args[3] = {o, a_str(name), v}; A_PUSH(args[1]); a_call(f, 3, args, NULL); a_ntmp = sp; return; }
+        a_dict_set(((AInst *)o.o)->attrs, a_str(name), v); return;
+    }
     if (a_is(o, O_CLASS)) { a_dict_set(((AClass *)o.o)->attrs, a_str(name), v); return; }
     a_error("AttributeError", "cannot set attribute '%s' on '%s'", name, tname(o));
 }
@@ -1867,7 +1934,7 @@ ADict *a_rest_kw(ADict *kw, int nnames, const char **names) {
 
 /* =================================================================== methods of built-in types */
 /* ---- bytes */
-static AStr *need_bytes(AV v, const char *what) { if (!a_is(v, O_BYTES)) a_error("TypeError", "%s needs bytes, not '%s'", what, tname(v)); return STR(v); }
+static AStr *need_bytes(AV v, const char *what) { v = ba_bytes(v); if (!a_is(v, O_BYTES)) a_error("TypeError", "%s needs bytes, not '%s'", what, tname(v)); return STR(v); }
 static AV m_str_encode(int n, AV *a, ADict *kw, AV s) {
     (void)kw; const char *enc = n > 0 ? STR(a_to_str(a[0]))->s : "utf-8";
     if (strcmp(enc, "utf-8") && strcmp(enc, "utf8") && strcmp(enc, "UTF-8") && strcmp(enc, "ascii") && strcmp(enc, "latin-1") && strcmp(enc, "latin1"))
@@ -1944,12 +2011,70 @@ static AV b_bytes(int n, AV *a, ADict *kw, AV self) {
     if (n == 0) return a_bytes("", 0);
     AV v = a[0];
     if (a_is(v, O_BYTES)) return v;
+    if (a_is(v, O_BYTEARRAY)) return a_bytes(STR(BA(v)->data)->s, STR(BA(v)->data)->len);
     if (a_is(v, O_STR)) { if (n < 2) a_error("TypeError", "string argument without an encoding"); return m_str_encode(n - 1, a + 1, NULL, v); }
     if (v.t == T_INT) { if (v.i < 0) a_error("ValueError", "negative count"); char *z = (char *)calloc((size_t)v.i + 1, 1); AV r = a_bytes(z, v.i); free(z); return r; }
     SB b = {0}; int sp = a_ntmp; AV it = a_iter(v), x; A_PUSH(it);
     while (a_next(it, &x)) { if (x.t != T_INT && x.t != T_BOOL) a_error("TypeError", "'%s' object cannot be interpreted as an integer", tname(x)); if (x.i < 0 || x.i > 255) a_error("ValueError", "bytes must be in range(0, 256)"); char c = (char)x.i; sb_put(&b, &c, 1); }
     a_ntmp = sp; AV r = a_bytes(b.p ? b.p : "", b.n); free(b.p); return r;
 }
+static AV b_bytes_of(AV v) { AV none; none.t = T_NONE; none.i = 0; return b_bytes(1, &v, NULL, none); }
+static AV b_bytearray(int n, AV *a, ADict *kw, AV self) {
+    if (n == 0) return ba_new("", 0);
+    AV r = b_bytes(n, a, kw, self); int sp = a_ntmp; A_PUSH(r); r = ba_from(r); a_ntmp = sp; return r;
+}
+#define BA_READ(f) static AV f##_ba(int n, AV *a, ADict *kw, AV s) { return f(n, a, kw, ba_bytes(s)); }
+#define BA_MAKE(f) static AV f##_ba(int n, AV *a, ADict *kw, AV s) { AV r = f(n, a, kw, ba_bytes(s)); int sp = a_ntmp; A_PUSH(r); r = ba_from(r); a_ntmp = sp; return r; }
+BA_READ(m_bytes_decode) BA_READ(m_bytes_hex) BA_READ(m_bytes_startswith) BA_READ(m_bytes_endswith) BA_READ(m_bytes_find)
+BA_READ(m_bytes_count) BA_READ(m_bytes_index) BA_MAKE(m_bytes_join) BA_MAKE(m_bytes_replace) BA_MAKE(m_bytes_strip)
+BA_MAKE(m_bytes_upper) BA_MAKE(m_bytes_lower)
+static AV m_bytes_split_ba(int n, AV *a, ADict *kw, AV s) {
+    AV r = m_bytes_split(n, a, kw, ba_bytes(s)); int sp = a_ntmp; A_PUSH(r);
+    for (int64_t i = 0; i < LIST(r)->len; i++) LIST(r)->v[i] = ba_from(LIST(r)->v[i]);
+    a_ntmp = sp; return r;
+}
+static int ba_byte(AV v) {
+    if (v.t != T_INT && v.t != T_BOOL) a_error("TypeError", "'%s' object cannot be interpreted as an integer", tname(v));
+    if (v.i < 0 || v.i > 255) a_error("ValueError", "byte must be in range(0, 256)");
+    return (int)v.i;
+}
+static AV m_ba_append(int n, AV *a, ADict *kw, AV s) {
+    (void)n; (void)kw; int c = ba_byte(a[0]); AStr *t = STR(BA(s)->data);
+    ba_reserve(s, t->len + 1); t = STR(BA(s)->data); t->s[t->len++] = (char)c; t->s[t->len] = 0; t->nchars = t->len;
+    AV none; none.t = T_NONE; none.i = 0; return none;
+}
+static AV m_ba_extend(int n, AV *a, ADict *kw, AV s) {
+    (void)n; (void)kw; int sp = a_ntmp; AV src = a_is(a[0], O_BYTES) || a_is(a[0], O_BYTEARRAY) ? ba_bytes(a[0]) : b_bytes_of(a[0]); A_PUSH(src);
+    int64_t m = STR(src)->len; AStr *t = STR(BA(s)->data);
+    char *tmp = (char *)malloc((size_t)m + 1); memcpy(tmp, STR(src)->s, (size_t)m);
+    ba_reserve(s, t->len + m); t = STR(BA(s)->data); memcpy(t->s + t->len, tmp, (size_t)m); free(tmp);
+    t->len += m; t->s[t->len] = 0; t->nchars = t->len;
+    a_ntmp = sp; AV none; none.t = T_NONE; none.i = 0; return none;
+}
+static AV m_ba_pop(int n, AV *a, ADict *kw, AV s) {
+    (void)kw; AStr *t = STR(BA(s)->data); if (!t->len) a_error("IndexError", "pop from empty bytearray");
+    int64_t k = n > 0 ? norm_index(a[0], t->len) : t->len - 1; int c = (unsigned char)t->s[k];
+    memmove(t->s + k, t->s + k + 1, (size_t)(t->len - k)); t->len--; t->nchars = t->len; return a_int(c);
+}
+static AV m_ba_insert(int n, AV *a, ADict *kw, AV s) {
+    (void)n; (void)kw; int c = ba_byte(a[1]); AStr *t = STR(BA(s)->data); int64_t k = a[0].i;
+    if (k < 0) k += t->len; if (k < 0) k = 0; if (k > t->len) k = t->len;
+    ba_reserve(s, t->len + 1); t = STR(BA(s)->data);
+    memmove(t->s + k + 1, t->s + k, (size_t)(t->len - k + 1)); t->s[k] = (char)c; t->len++; t->nchars = t->len;
+    AV none; none.t = T_NONE; none.i = 0; return none;
+}
+static AV m_ba_remove(int n, AV *a, ADict *kw, AV s) {
+    (void)n; (void)kw; int c = ba_byte(a[0]); AStr *t = STR(BA(s)->data);
+    for (int64_t k = 0; k < t->len; k++) if ((unsigned char)t->s[k] == c) { memmove(t->s + k, t->s + k + 1, (size_t)(t->len - k)); t->len--; t->nchars = t->len; AV none; none.t = T_NONE; none.i = 0; return none; }
+    a_error("ValueError", "value not found in bytearray"); AV none; none.t = T_NONE; none.i = 0; return none;
+}
+static AV m_ba_reverse(int n, AV *a, ADict *kw, AV s) {
+    (void)n; (void)a; (void)kw; AStr *t = STR(BA(s)->data);
+    for (int64_t i = 0, j = t->len - 1; i < j; i++, j--) { char c = t->s[i]; t->s[i] = t->s[j]; t->s[j] = c; }
+    AV none; none.t = T_NONE; none.i = 0; return none;
+}
+static AV m_ba_clear(int n, AV *a, ADict *kw, AV s) { (void)n; (void)a; (void)kw; AStr *t = STR(BA(s)->data); t->len = t->nchars = 0; t->s[0] = 0; AV none; none.t = T_NONE; none.i = 0; return none; }
+static AV m_ba_copy(int n, AV *a, ADict *kw, AV s) { (void)n; (void)a; (void)kw; return ba_from(BA(s)->data); }
 static AV b_bytes_fromhex(int n, AV *a, ADict *kw, AV self) {
     (void)n; (void)kw; (void)self; AStr *t = STR(a_to_str(a[0])); SB b = {0}; int hi = -1;
     for (int64_t i = 0; i < t->len; i++) {
@@ -2258,6 +2383,13 @@ static AV method_of(AV o, const char *name) {
         M("find", m_bytes_find); M("count", m_bytes_count); M("index", m_bytes_index); M("split", m_bytes_split); M("join", m_bytes_join);
         M("replace", m_bytes_replace); M("strip", m_bytes_strip); M("upper", m_bytes_upper); M("lower", m_bytes_lower);
         break;
+    case O_BYTEARRAY:
+        M("decode", m_bytes_decode_ba); M("hex", m_bytes_hex_ba); M("startswith", m_bytes_startswith_ba); M("endswith", m_bytes_endswith_ba);
+        M("find", m_bytes_find_ba); M("count", m_bytes_count_ba); M("index", m_bytes_index_ba); M("split", m_bytes_split_ba); M("join", m_bytes_join_ba);
+        M("replace", m_bytes_replace_ba); M("strip", m_bytes_strip_ba); M("upper", m_bytes_upper_ba); M("lower", m_bytes_lower_ba);
+        M("append", m_ba_append); M("extend", m_ba_extend); M("pop", m_ba_pop); M("insert", m_ba_insert); M("remove", m_ba_remove);
+        M("reverse", m_ba_reverse); M("clear", m_ba_clear); M("copy", m_ba_copy);
+        break;
     case O_STR:
         M("encode", m_str_encode);
         M("upper", m_str_upper); M("lower", m_str_lower); M("strip", m_str_strip); M("lstrip", m_str_lstrip);
@@ -2435,7 +2567,7 @@ static AV b_type(int n, AV *a, ADict *kw, AV self) {      /* the type's name, as
     AV v = a[0];
     switch (v.t) { case T_NONE: return a_str("None"); case T_BOOL: return a_str("Bool"); case T_INT: return a_str("Int"); case T_FLOAT: return a_str("Float"); default: break; }
     switch (v.o->kind) {
-    case O_STR: return a_str("Str"); case O_BYTES: return a_str("bytes"); case O_COMPLEX: case O_CTENSOR: return a_str(a_cplx_type(v)); case O_LIST: return a_str("List"); case O_TUPLE: return a_str("Tuple"); case O_DICT: return a_str("Dict");
+    case O_STR: return a_str("Str"); case O_BYTES: return a_str("bytes"); case O_BYTEARRAY: return a_str("bytearray"); case O_COMPLEX: case O_CTENSOR: return a_str(a_cplx_type(v)); case O_LIST: return a_str("List"); case O_TUPLE: return a_str("Tuple"); case O_DICT: return a_str("Dict");
     case O_SET: return a_str("set"); case O_RANGE: return a_str("range"); case O_FUNC: case O_BUILTIN: case O_BOUND: case O_CLASS: return a_str("Fn");
     case O_INST: return a_obj(((AInst *)v.o)->cls->name);
     case O_QTY: {
@@ -2780,7 +2912,7 @@ static AV b_exit(int n, AV *a, ADict *kw, AV self) { (void)kw; (void)self; fflus
 
 typedef struct { const char *name; ABuiltinFn fn; } BEnt;
 static const BEnt a_builtins[] = {
-    {"print", b_print}, {"len", b_len}, {"range", b_range}, {"str", b_str}, {"bytes", b_bytes}, {"complex", b_complex}, {"__bytes_fromhex", b_bytes_fromhex}, {"repr", b_repr}, {"int", b_int},
+    {"print", b_print}, {"len", b_len}, {"range", b_range}, {"str", b_str}, {"bytes", b_bytes}, {"bytearray", b_bytearray}, {"complex", b_complex}, {"__bytes_fromhex", b_bytes_fromhex}, {"repr", b_repr}, {"int", b_int},
     {"float", b_float}, {"bool", b_bool}, {"list", b_list}, {"tuple", b_tuple}, {"dict", b_dict}, {"set", b_set},
     {"abs", b_abs}, {"min", b_min}, {"max", b_max}, {"sum", b_sum}, {"sorted", b_sorted}, {"reversed", b_reversed},
     {"enumerate", b_enumerate}, {"zip", b_zip}, {"map", b_map}, {"filter", b_filter}, {"any", b_any}, {"all", b_all},
@@ -2860,7 +2992,12 @@ AV a_attrk(AV o, AV key) {
     return a_attr(o, STR(key)->s);
 }
 void a_setattrk(AV o, AV key, AV v) {
-    if (a_is(o, O_INST)) { a_dict_set(((AInst *)o.o)->attrs, key, v); return; }
+    if (a_is(o, O_INST)) {
+        AClass *c = ((AInst *)o.o)->cls;
+        if (c->has_setattr == 0) { AV f = class_lookup(c, "__setattr__"); c->has_setattr = f.t != 255 && a_is(f, O_FUNC) ? 1 : -1; }
+        if (c->has_setattr > 0) { AV f = class_lookup(c, "__setattr__"); int sp = a_ntmp; AV args[3] = {o, key, v}; a_call(f, 3, args, NULL); a_ntmp = sp; return; }
+        a_dict_set(((AInst *)o.o)->attrs, key, v); return;
+    }
     a_setattr(o, STR(key)->s, v);
 }
 AV a_call_spread(AV f, AV args, AV kw) {
