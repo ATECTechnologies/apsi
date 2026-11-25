@@ -102,6 +102,8 @@ backward pass walks its graph iteratively, so very deep graphs cannot overflow t
 | `special` | gamma, beta, incomplete gamma and beta with their inverses, erf / erfinv, Bessel J and I, elliptic K and E, Legendre, Hermite, Laguerre, Chebyshev, spherical harmonics, zeta, E1 |
 | `signal` | Butterworth filters as second-order sections, `filtfilt` (zero phase, as SciPy), notch, windows, convolution, peaks, Welch spectra, spectrograms, Savitzky–Golay, resampling, Hilbert envelope |
 | `config` | TOML (read by Apsi's own parser), JSON, INI and `.env` settings, the environment and `--set` arguments, defaults with types, `${...}` references |
+| `physics` | constants, the formulas with their units, `fields` (gradient, laplacian), `meshgrid` |
+| `pde` | tridiagonal solves, heat (Crank–Nicolson, ADI), waves, advection, fast Poisson solvers, pseudo-spectral Navier–Stokes, CG, BiCGSTAB |
 | `env`, `log` | `.env` files and secrets; leveled logging to the console and rotating text / JSON files, timers, reading logs back |
 
 Convolutions and max pooling run as C kernels (image columns and the packed matrix product) with their gradients,
@@ -113,7 +115,7 @@ These programs keep running with `apsi run`. A native build that reaches one of 
 
 - graph networks, mixtures of experts and `fit_batches` in `layers`; GGUF, ONNX and PyTorch files in `models`;
   `text_dataset`, `train_tokenizer` and Parquet in `data`; websockets and TLS in `web` (serve HTTPS through a
-  reverse proxy); the modules `db`, `rl`, `tokens`, `torch`, `dataframe`, `quantum`, `medical`, `physics` (beyond its constants)
+  reverse proxy); the modules `db`, `rl`, `tokens`, `torch`, `dataframe`, `quantum`, `medical`, `mechanics`
 - Python modules (`pyimport`, `import numpy`), except `asyncio`
 - random numbers: native programs use their own generator, so a seed gives different numbers than in `apsi run`
   (the same seed always gives the same numbers in native programs)

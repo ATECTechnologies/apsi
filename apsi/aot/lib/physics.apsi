@@ -1,0 +1,70 @@
+# use physics: the constants, formulas and field operators, for native programs.
+use physics.constants as _c
+use physics.formulas as _f
+use physics.fields as _d
+
+let c = _c.c
+let G = _c.G
+let h = _c.h
+let hbar = _c.hbar
+let k_B = _c.k_B
+let N_A = _c.N_A
+let R_gas = _c.R_gas
+let q_e = _c.q_e
+let m_e = _c.m_e
+let m_p = _c.m_p
+let m_n = _c.m_n
+let epsilon_0 = _c.epsilon_0
+let mu_0 = _c.mu_0
+let g0 = _c.g0
+let sigma_SB = _c.sigma_SB
+let a_0 = _c.a_0
+let alpha_fs = _c.alpha_fs
+let M_sun = _c.M_sun
+let M_earth = _c.M_earth
+let R_earth = _c.R_earth
+let AU = _c.AU
+let planck = _f.planck
+let wien_peak = _f.wien_peak
+let blackbody_power = _f.blackbody_power
+let lorentz_factor = _f.lorentz_factor
+let relativistic_energy = _f.relativistic_energy
+let relativistic_momentum = _f.relativistic_momentum
+let lorentz_boost = _f.lorentz_boost
+let time_dilation = _f.time_dilation
+let length_contraction = _f.length_contraction
+let velocity_add = _f.velocity_add
+let doppler = _f.doppler
+let relativistic_doppler = _f.relativistic_doppler
+let snell = _f.snell
+let critical_angle = _f.critical_angle
+let brewster_angle = _f.brewster_angle
+let fresnel = _f.fresnel
+let thin_lens = _f.thin_lens
+let single_slit = _f.single_slit
+let double_slit = _f.double_slit
+let photon_energy = _f.photon_energy
+let de_broglie = _f.de_broglie
+let coulomb_field = _f.coulomb_field
+let coulomb_potential = _f.coulomb_potential
+let biot_savart = _f.biot_savart
+let lorentz_force = _f.lorentz_force
+let cyclotron_frequency = _f.cyclotron_frequency
+let skin_depth = _f.skin_depth
+let ideal_gas_pressure = _f.ideal_gas_pressure
+let carnot_efficiency = _f.carnot_efficiency
+let maxwell_speed_pdf = _f.maxwell_speed_pdf
+let mean_speed = _f.mean_speed
+let rms_speed = _f.rms_speed
+let heat_conduction = _f.heat_conduction
+let decay = _f.decay
+let activity = _f.activity
+let half_life_from_rate = _f.half_life_from_rate
+let laplacian = _d.laplacian
+let gradient = _d.gradient
+fn meshgrid(x, y) = _meshgrid(x, y)
+
+fn _meshgrid(x, y):
+    let nx = len(x)
+    let ny = len(y)
+    return (reshape(x, nx, 1) + zeros(1, ny), reshape(y, 1, ny) + zeros(nx, 1))

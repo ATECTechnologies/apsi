@@ -962,7 +962,12 @@ static const char *tname(AV v) {
     default: return "object";
     }
 }
+static const char *const a_dn[] = {"", "__add__", "__sub__", "__mul__", "__truediv__", "__floordiv__", "__mod__", "__pow__", "__matmul__", "__and__", "__or__", "__xor__", "__lshift__", "__rshift__"};
+static const char *const a_rn[] = {"", "__radd__", "__rsub__", "__rmul__", "__rtruediv__", "__rfloordiv__", "__rmod__", "__rpow__", "__rmatmul__", "__rand__", "__ror__", "__rxor__", "__rlshift__", "__rrshift__"};
 AV a_binop(int op, AV a, AV b) {
+    if ((a_is(a, O_INST) || a_is(b, O_INST)) && op >= OP_ADD && op <= OP_SHR) {   /* a class's operators win over tensors */
+        int ok; AV r = inst_op(a, b, a_dn[op], a_rn[op], &ok); if (ok) return r;
+    }
     if (a_is(a, O_NODE) || a_is(b, O_NODE)) return a_tensor_binop(op, a, b);
     if (a_is(a, O_QTY) || a_is(b, O_QTY)) return qty_binop(op, a, b);
     if (a_is_tn(a) || a_is_tn(b)) return a_tensor_binop(op, a, b);
@@ -2124,8 +2129,17 @@ static AV b_map(int n, AV *a, ADict *kw, AV self) { (void)n; (void)kw; (void)sel
 static AV b_filter(int n, AV *a, ADict *kw, AV self) { (void)n; (void)kw; (void)self; AV src = a_iter(a[1]); AV it = new_iter(IT_FILTER, a[0]); ((AIter *)it.o)->aux = src; return it; }
 static AV b_any(int n, AV *a, ADict *kw, AV self) { (void)n; (void)kw; (void)self; int sp = a_ntmp; AV it = a_iter(a[0]), x; A_PUSH(it); while (a_next(it, &x)) if (a_truthy(x)) { a_ntmp = sp; return a_bool(1); } a_ntmp = sp; return a_bool(0); }
 static AV b_all(int n, AV *a, ADict *kw, AV self) { (void)n; (void)kw; (void)self; int sp = a_ntmp; AV it = a_iter(a[0]), x; A_PUSH(it); while (a_next(it, &x)) if (!a_truthy(x)) { a_ntmp = sp; return a_bool(0); } a_ntmp = sp; return a_bool(1); }
+#define U_ROUND_ID 15                                           /* U_ROUND in apsi_tensor.c */
 static AV b_round(int n, AV *a, ADict *kw, AV self) {
     (void)kw; (void)self;
+    if (a_is_tn(a[0])) {                                        /* elementwise, as numpy: rint(x * 10^d) / 10^d */
+        int d = (n < 2 || a[1].t == T_NONE) ? 0 : (int)a[1].i;
+        if (!d) return a_tensor_unary(U_ROUND_ID, a[0]);
+        int sp = a_ntmp; AV m = a_float(pow(10.0, (double)d));
+        AV t = a_binop(OP_MUL, a[0], m); A_PUSH(t);
+        AV r = a_tensor_unary(U_ROUND_ID, t); A_PUSH(r);
+        r = a_binop(OP_DIV, r, m); a_ntmp = sp; return r;
+    }
     if (a[0].t == T_INT || a[0].t == T_BOOL) return a_int(a[0].i);
     double x = fval(a[0]);
     if (n < 2 || a[1].t == T_NONE) { double r = nearbyint(x); return a_int((int64_t)r); }

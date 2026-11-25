@@ -1,4 +1,7 @@
 use log
+for name in ["app.log", "app.jsonl"]:         # start from empty files (apsi run writes next to the program)
+    with open(name, "w") as f:
+        f.write("")
 console(false)
 to_file("app.log")
 to_file("app.jsonl", format="json")

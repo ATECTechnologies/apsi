@@ -1,0 +1,74 @@
+use pde
+
+fn r6(x) = round(float(x), 6)
+fn rl(t) = [round(float(v), 6) for v in t]
+
+# tridiagonal
+print(rl(tridiag_solve([0.0, 1, 1, 1], [4.0, 4, 4, 4], [1.0, 1, 1, 0], [5.0, 6, 6, 5])))
+let D = tensor([[5.0, 1], [6, 2], [6, 3], [5, 4]])
+print(round(tridiag_solve([0.0, 1, 1, 1], [4.0, 4, 4, 4], [1.0, 1, 1, 0], D), 6))
+
+# heat 1d
+let x = linspace(0, 1, 21)
+let u0 = sin(pi * x)
+for bc in ["dirichlet", "neumann", "periodic"]:
+    let s = heat1d(u0, 0.05, 0.001, 50, 1.0, bc=bc, every=10)
+    print(bc, shape(s.u), rl(s.t), r6(s.u[len(s.t) - 1, 10]), r6(sum(s.u[len(s.t) - 1])))
+let sl = heat1d(u0, 0.05, 0.001, 20, 1.0, left=1.0, right=0.0)
+print(r6(sl.u[20, 1]), r6(sl.u[20, 0]))
+
+# heat 2d
+var g = zeros(9, 9)
+g[4, 4] = 1.0
+let h2 = heat2d(g, 0.1, 0.001, 10, 1.0, every=5)
+print(shape(h2.u), r6(h2.u[2, 4, 4]), r6(sum(h2.u[2])), r6(h2.u[2, 3, 4]))
+
+# waves
+let w = wave1d(sin(pi * x), 0.0, 1.0, 0.05, 0.025, 40, every=20)
+print(shape(w.u), r6(w.u[1, 10]), r6(w.u[2, 10]))
+let wf = wave1d(sin(pi * x), 0.0, 1.0, 0.05, 0.025, 10, bc="free")
+print(r6(wf.u[10, 0]), r6(wf.u[10, 10]))
+let wp = wave1d(sin(2 * pi * x), 0.0, 1.0, 0.05, 0.05, 10, bc="periodic")
+print(r6(wp.u[10, 3]))
+let a1 = advection1d(exp(-100 * (x - 0.3) ** 2), 1.0, 0.05, 0.025, 20, every=10)
+print(shape(a1.u), r6(a1.u[2, 10]), r6(sum(a1.u[2])))
+let a2 = advection1d(exp(-100 * (x - 0.3) ** 2), -1.0, 0.05, 0.025, 20, scheme="upwind")
+print(r6(a2.u[20, 4]))
+
+# Poisson
+let n = 15
+let xs = linspace(0, 1, n + 2)[1:n + 1]
+var F = zeros(n, n)
+for i in range(n):
+    for j in range(n):
+        F[i, j] = -2 * pi * pi * sin(pi * float(xs[i])) * sin(pi * float(xs[j]))
+let U = poisson2d(F, 1.0 / (n + 1))
+print(r6(U[7, 7]), r6(U[3, 10]))
+let m = 16
+let xp = arange(m) * (2 * pi / m)
+var Fp = zeros(m, m)
+for i in range(m):
+    for j in range(m):
+        Fp[i, j] = cos(float(xp[i])) + sin(2 * float(xp[j]))
+let Up = poisson2d(Fp, 2 * pi / m, bc="periodic")
+print(r6(Up[0, 0]), r6(Up[5, 3]), r6(mean(Up)))
+
+# Navier-Stokes
+let N = 16
+let xg = arange(N) * (2 * pi / N)
+var W = zeros(N, N)
+for i in range(N):
+    for j in range(N):
+        W[i, j] = 2 * cos(float(xg[i])) * cos(float(xg[j])) + 0.3 * sin(2 * float(xg[i]) + float(xg[j]))
+let ns = navier_stokes2d(W, 0.05, dt=0.01, steps=20, every=10)
+print(rl(ns.t), shape(ns.omega), rl(ns.energy), r6(ns.u[3, 5]), r6(ns.v[2, 7]), r6(ns.omega[2, 4, 4]))
+
+# Krylov
+let A = tensor([[4.0, 1, 0], [1, 3, 1], [0, 1, 2]])
+let b = tensor([1.0, 2, 3])
+let c1 = cg(A, b)
+print(rl(c1.x), c1.iterations, c1.converged)
+let c2 = bicgstab(tensor([[3.0, 1, 0], [-1, 4, 1], [0, 2, 5]]), b)
+print(rl(c2.x), c2.converged)
+let c3 = cg(fn(v) => A @ v, b, tol=1e-6)
+print(rl(c3.x), c3.converged)

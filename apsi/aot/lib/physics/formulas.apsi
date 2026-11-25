@@ -1,0 +1,154 @@
+# physics.formulas for native programs: numbers or quantities in (their SI values are used), quantities out.
+let _C = 299792458.0
+let _H = 6.62607015e-34
+let _KB = 1.380649e-23
+let _EPS0 = 8.8541878128e-12
+let _MU0 = 1.25663706212e-6
+let _SIGMA = 5.670374419e-8
+let _R = 8.314462618
+let _WIEN = 2.897771955e-3
+
+fn _v(x):
+    if isinstance(x, list):
+        return tensor([_v(t) for t in x], f64)
+    let p = to_plain(x)
+    return tensor(p, f64) if ndim(p) > 0 else float(p)
+
+fn _n(v) = float(v) if ndim(v) == 0 else v
+
+fn _beta(v):
+    let b = _v(v) / _C
+    if float(max(abs(tensor(b)))) >= 1:
+        raise ValueError("speed must be below the speed of light")
+    return b
+
+fn planck(wavelength, T):
+    let lam = _v(wavelength)
+    let t = _v(T)
+    return 2 * _H * _C * _C / lam ** 5 / expm1(_H * _C / (lam * _KB * t)) * 1.0[W/m^3]
+fn wien_peak(T) = _WIEN / _v(T) * 1.0[m]
+fn blackbody_power(T, area=1.0, emissivity=1.0) = float(_v(emissivity)) * _SIGMA * _v(area) * _v(T) ** 4 * 1.0[W]
+fn lorentz_factor(v) = _n(1 / sqrt(1 - _beta(v) ** 2))
+fn relativistic_energy(m, v) = lorentz_factor(v) * _v(m) * _C * _C * 1.0[J]
+fn relativistic_momentum(m, v) = lorentz_factor(v) * _v(m) * _v(v) * 1.0[kg*m/s]
+fn lorentz_boost(t, x, v):
+    let b = _beta(v)
+    let g = 1 / sqrt(1 - b * b)
+    let tt = _v(t)
+    let xx = _v(x)
+    return [g * (tt - b * xx / _C) * 1.0[s], g * (xx - b * _C * tt) * 1.0[m]]
+fn time_dilation(dt, v) = lorentz_factor(v) * _v(dt) * 1.0[s]
+fn length_contraction(L, v) = _v(L) / lorentz_factor(v) * 1.0[m]
+fn velocity_add(u, v):
+    let a = _v(u)
+    let b = _v(v)
+    return (a + b) / (1 + a * b / (_C * _C)) * 1.0[m/s]
+fn doppler(f, v_source=0.0, v_observer=0.0, c_wave=343.0) = _v(f) * (_v(c_wave) + _v(v_observer)) / (_v(c_wave) - _v(v_source)) * 1.0[Hz]
+fn relativistic_doppler(f, v):
+    let b = _beta(v)
+    return _v(f) * sqrt((1 - b) / (1 + b)) * 1.0[Hz]
+fn _asin_or_nan(s) = asin(s) if abs(s) <= 1 else nan
+fn snell(n1, n2, theta):
+    let s = _v(n1) * sin(_v(theta)) / _v(n2)
+    if ndim(s) > 0:
+        return reshape(tensor([_asin_or_nan(float(q)) for q in tolist(flatten(s))]), *shape(s))
+    return _asin_or_nan(s)
+fn critical_angle(n1, n2):
+    let r = _v(n2) / _v(n1)
+    if float(max(tensor(r))) >= 1:
+        raise ValueError("total internal reflection needs n1 > n2")
+    return _n(asin(r))
+fn brewster_angle(n1, n2) = _n(atan(_v(n2) / _v(n1)))
+fn fresnel(n1, n2, theta):
+    let a = _v(n1)
+    let b = _v(n2)
+    let th = _v(theta)
+    let ci = cos(th)
+    let st = a / b * sin(th)
+    let q = 1 - st * st
+    if q >= 0:
+        let ct = sqrt(q)
+        let rs = (a * ci - b * ct) / (a * ci + b * ct)
+        let rp = (b * ci - a * ct) / (b * ci + a * ct)
+        return [rs * rs, rp * rp, 1 - rs * rs, 1 - rp * rp]
+    return [1.0, 1.0, 0.0, 0.0]                        # total internal reflection
+fn thin_lens(f, d_o):
+    let fo = _v(f)
+    let dob = _v(d_o)
+    let di = 1 / (1 / fo - 1 / dob) if 1 / fo != 1 / dob else inf
+    return [di * 1.0[m], _n(-di / dob)]
+fn _sinc(x) = 1.0 if x == 0 else sin(pi * x) / (pi * x)
+fn single_slit(theta, width, wavelength):
+    let be = pi * _v(width) * sin(_v(theta)) / _v(wavelength)
+    return _sinc(be / pi) ** 2
+fn double_slit(theta, spacing, width, wavelength):
+    let s = sin(_v(theta))
+    let lam = _v(wavelength)
+    return cos(pi * _v(spacing) * s / lam) ** 2 * _sinc(_v(width) * s / lam) ** 2
+fn photon_energy(wavelength) = _H * _C / _v(wavelength) * 1.0[J]
+fn de_broglie(m, v) = _H / (_v(m) * _v(v)) * 1.0[m]
+fn _pts(x):
+    let a = _v(x)
+    if ndim(a) > 1:
+        return reshape(a, -1, shape(a)[ndim(a) - 1])
+    return reshape(a, 1, -1)
+fn coulomb_field(charges, positions, points, softening=0.0):
+    let q = reshape(tensor(_v(charges), f64), -1)
+    let P = _pts(positions)
+    let X = _pts(points)
+    let d = reshape(X, shape(X)[0], 1, shape(X)[1]) - reshape(P, 1, shape(P)[0], shape(P)[1])
+    let r2 = sum(d * d, axis=2) + float(_v(softening)) ** 2
+    let E = sum(reshape(q, 1, -1, 1) * d / reshape(r2, shape(r2)[0], shape(r2)[1], 1) ** 1.5, axis=1) / (4 * pi * _EPS0)
+    return E * 1.0[V/m]
+fn coulomb_potential(charges, positions, points, softening=0.0):
+    let q = reshape(tensor(_v(charges), f64), -1)
+    let P = _pts(positions)
+    let X = _pts(points)
+    let d = reshape(X, shape(X)[0], 1, shape(X)[1]) - reshape(P, 1, shape(P)[0], shape(P)[1])
+    let r = sqrt(sum(d * d, axis=2) + float(_v(softening)) ** 2)
+    return sum(reshape(q, 1, -1) / r, axis=1) / (4 * pi * _EPS0) * 1.0[V]
+fn _cross3(a, b) = tensor([a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2], a[0] * b[1] - a[1] * b[0]])
+fn biot_savart(path, current, points):
+    let Pth = tolist(_pts(path))
+    if len(Pth[0]) != 3:
+        raise ValueError("biot_savart needs 3-D points")
+    let I = float(_v(current))
+    let X = tolist(_pts(points))
+    var B = [[0.0, 0.0, 0.0] for i in range(len(X))]
+    for s in range(len(Pth) - 1):
+        let a = Pth[s]
+        let b = Pth[s + 1]
+        let seg = [b[0] - a[0], b[1] - a[1], b[2] - a[2]]
+        let L = sqrt(seg[0] ** 2 + seg[1] ** 2 + seg[2] ** 2)
+        if L == 0:
+            continue
+        let u = [seg[0] / L, seg[1] / L, seg[2] / L]
+        for i in range(len(X)):
+            let r1 = [X[i][0] - a[0], X[i][1] - a[1], X[i][2] - a[2]]
+            let p1 = r1[0] * u[0] + r1[1] * u[1] + r1[2] * u[2]
+            let p2 = p1 - L
+            let dv = [r1[0] - p1 * u[0], r1[1] - p1 * u[1], r1[2] - p1 * u[2]]
+            let dn = sqrt(dv[0] ** 2 + dv[1] ** 2 + dv[2] ** 2)
+            if dn <= 1e-300:
+                continue
+            let mag = _MU0 * I / (4 * pi * dn * dn) * (p1 / hypot(dn, p1) - p2 / hypot(dn, p2))
+            let c = [u[1] * dv[2] - u[2] * dv[1], u[2] * dv[0] - u[0] * dv[2], u[0] * dv[1] - u[1] * dv[0]]
+            B[i] = [B[i][0] + mag * c[0], B[i][1] + mag * c[1], B[i][2] + mag * c[2]]
+    return tensor(B) * 1.0[T]
+fn lorentz_force(q, E, B, v) = _v(q) * (_v(E) + _cross3(_v(v), _v(B))) * 1.0[N]
+fn cyclotron_frequency(q, B, m) = abs(_v(q)) * _v(B) / _v(m) * 1.0[s^-1]
+fn skin_depth(f, sigma, mu_r=1.0) = sqrt(2 / (2 * pi * _v(f) * _MU0 * _v(mu_r) * _v(sigma))) * 1.0[m]
+fn ideal_gas_pressure(n, T, V) = _v(n) * _R * _v(T) / _v(V) * 1.0[Pa]
+fn carnot_efficiency(T_hot, T_cold) = _n(1 - _v(T_cold) / _v(T_hot))
+fn maxwell_speed_pdf(v, m, T):
+    let vv = _v(v)
+    let a = _v(m) / (2 * _KB * _v(T))
+    return 4 * pi * (a / pi) ** 1.5 * vv * vv * exp(-a * vv * vv) * 1.0[s/m]
+fn mean_speed(m, T) = sqrt(8 * _KB * _v(T) / (pi * _v(m))) * 1.0[m/s]
+fn rms_speed(m, T) = sqrt(3 * _KB * _v(T) / _v(m)) * 1.0[m/s]
+fn heat_conduction(k, area, dT, thickness) = _v(k) * _v(area) * _v(dT) / _v(thickness) * 1.0[W]
+fn decay(N0, half_life, t):
+    let f = 2.0 ** (-_v(t) / _v(half_life))
+    return N0 * f
+fn activity(N, half_life) = log(2.0) / _v(half_life) * _v(N) * 1.0[s^-1]
+fn half_life_from_rate(lam) = log(2.0) / _v(lam) * 1.0[s]

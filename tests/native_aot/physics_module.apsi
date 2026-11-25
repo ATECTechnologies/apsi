@@ -1,0 +1,13 @@
+use physics
+print(wien_peak(5778.0), planck(500e-9, 5778.0), blackbody_power(300.0, 2.0))
+print(lorentz_factor(0.6 * 299792458.0), time_dilation(1.0, 2.0e8), velocity_add(2.0e8, 2.0e8))
+print(relativistic_energy(1.0, 1.0e8), lorentz_boost(1.0, 1.0, 1.0e8))
+print(doppler(440.0, 30.0), snell(1.0, 1.5, 0.5), critical_angle(1.5, 1.0), brewster_angle(1.0, 1.5), [round(v, 12) for v in fresnel(1.0, 1.5, 0.3)])
+print(thin_lens(0.1, 0.3), single_slit(0.01, 1e-5, 5e-7), double_slit(0.01, 5e-5, 1e-5, 5e-7), photon_energy(5e-7), de_broglie(9.1e-31, 1e6))
+print(coulomb_field([1e-9], [[0.0, 0.0, 0.0]], [[1.0, 0.0, 0.0], [0.0, 2.0, 0.0]]), coulomb_potential([1e-9, -1e-9], [[0.0, 0.0], [1.0, 0.0]], [[0.5, 1.0]]))
+print(biot_savart([[0.0, 0.0, -100.0], [0.0, 0.0, 100.0]], 1.0, [[0.1, 0.0, 0.0]]))
+print(lorentz_force(1.0, [0.0, 0.0, 0.0], [0.0, 0.0, 1.0], [1.0, 0.0, 0.0]), cyclotron_frequency(1.6e-19, 1.0, 9.1e-31), skin_depth(50.0, 5.8e7))
+print(ideal_gas_pressure(1.0, 300.0, 0.0224), carnot_efficiency(500.0, 300.0), maxwell_speed_pdf(500.0, 4.65e-26, 300.0), mean_speed(4.65e-26, 300.0), rms_speed(4.65e-26, 300.0))
+print(heat_conduction(200.0, 1.0, 10.0, 0.1), decay(1000.0, 5.0, 10.0), activity(1e20, 3600.0), half_life_from_rate(0.1))
+print(c, G, k_B, laplacian(tensor([0.0, 1.0, 4.0, 9.0, 16.0]), 1.0), gradient(tensor([0.0, 1.0, 4.0, 9.0]), 0.5))
+print(wien_peak(5778.0[K]), lorentz_factor(1.0e8[m/s]))

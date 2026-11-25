@@ -1,0 +1,379 @@
+# use pde: grid solvers and iterative linear solvers for native programs (the same schemes as apsi run:
+# Crank-Nicolson, ADI, leapfrog, upwind / Lax-Wendroff, fast sine / Fourier Poisson solvers, pseudo-spectral
+# Navier-Stokes, conjugate gradients, BiCGSTAB).
+use sci
+use _complex
+
+fn _v(x):
+    let p = si_magnitude(x)
+    return tensor(p, f64) if isinstance(p, list) or ndim(p) > 0 else float(p)
+fn _s(x) = float(si_magnitude(x))
+
+fn _tri_list(a, b, c, d):
+    let n = len(b)
+    var cp = [0.0] * n
+    var dp = [0.0] * n
+    cp[0] = c[0] / b[0]
+    dp[0] = d[0] / b[0]
+    for i in range(1, n):
+        let m = b[i] - a[i] * cp[i - 1]
+        cp[i] = c[i] / m if i < n - 1 else 0.0
+        dp[i] = (d[i] - a[i] * dp[i - 1]) / m
+    var x = [0.0] * n
+    x[n - 1] = dp[n - 1]
+    for i in range(n - 2, -1, -1):
+        x[i] = dp[i] - cp[i] * x[i + 1]
+    return x
+
+fn tridiag_solve(a, b, c, d):
+    let al = tolist(_v(a))
+    let bl = tolist(_v(b))
+    let cl = tolist(_v(c))
+    let D = _v(d)
+    if ndim(D) == 1:
+        return tensor(_tri_list(al, bl, cl, tolist(D)))
+    # several right-hand sides: each column of the trailing dimensions
+    let n = shape(D)[0]
+    let flat = reshape(D, n, -1)
+    let cols = shape(flat)[1]
+    var out = []
+    for j in range(cols):
+        out.append(tensor(_tri_list(al, bl, cl, tolist(flat[:, j]))))
+    return reshape(stack(out, axis=1), *shape(D))
+
+fn _periodic_tridiag(a, b, c, d):
+    let n = len(b)
+    let gamma = -b[0]
+    var bb = list(b)
+    bb[0] = bb[0] - gamma
+    bb[n - 1] = bb[n - 1] - c[n - 1] * a[0] / gamma
+    let x = _tri_list(a, bb, c, d)
+    var u = [0.0] * n
+    u[0] = gamma
+    u[n - 1] = c[n - 1]
+    let z = _tri_list(a, bb, c, u)
+    let fact = (x[0] + a[0] * x[n - 1] / gamma) / (1 + z[0] + a[0] * z[n - 1] / gamma)
+    return [x[i] - fact * z[i] for i in range(n)]
+
+fn heat1d(u0, dx, dt, steps, alpha, bc="dirichlet", left=none, right=none, every=1):
+    var u = tolist(_v(u0))
+    let h = _s(dx)
+    let k = _s(dt)
+    let al = _s(alpha)
+    let N = len(u)
+    let r = al * k / (h * h)
+    let ev = max(1, int(every))
+    if bc == "dirichlet":
+        u[0] = u[0] if left == none else _s(left)
+        u[N - 1] = u[N - 1] if right == none else _s(right)
+    var a = [-r / 2] * N
+    var b = [1 + r] * N
+    var c = [-r / 2] * N
+    if bc == "dirichlet":
+        b[0] = 1.0
+        b[N - 1] = 1.0
+        c[0] = 0.0
+        a[N - 1] = 0.0
+    elif bc == "neumann":
+        c[0] = -r
+        a[N - 1] = -r
+    elif bc != "periodic":
+        raise ValueError("bc must be \"dirichlet\", \"neumann\" or \"periodic\"")
+    var frames = [list(u)]
+    var ts = [0.0]
+    for i in range(int(steps)):
+        if bc == "periodic":
+            let rhs = [u[j] + r / 2 * (u[(j - 1) % N] - 2 * u[j] + u[(j + 1) % N]) for j in range(N)]
+            u = _periodic_tridiag(a, b, c, rhs)
+        else:
+            var rhs = list(u)
+            for j in range(1, N - 1):
+                rhs[j] = u[j] + r / 2 * (u[j - 1] - 2 * u[j] + u[j + 1])
+            if bc == "neumann":
+                rhs[0] = u[0] + r * (u[1] - u[0])
+                rhs[N - 1] = u[N - 1] + r * (u[N - 2] - u[N - 1])
+            u = _tri_list(a, b, c, rhs)
+        if (i + 1) % ev == 0:
+            frames.append(list(u))
+            ts.append((i + 1) * k)
+    return record(t=tensor(ts), x=arange(N) * h, u=tensor(frames))
+
+fn heat2d(u0, dx, dt, steps, alpha, every=1):
+    let U0 = _v(u0)
+    if ndim(U0) != 2:
+        raise ShapeError("heat2d needs a 2-D initial field")
+    var u = tolist(U0)
+    let ref = tolist(U0)
+    let h = _s(dx)
+    let k = _s(dt)
+    let r = _s(alpha) * k / (2 * h * h)
+    let ny = len(u)
+    let nx = len(u[0])
+    let ev = max(1, int(every))
+    fn implicit_line(vals):
+        let N = len(vals)
+        var a = [-r] * N
+        var b = [1 + 2 * r] * N
+        var c = [-r] * N
+        b[0] = 1.0
+        b[N - 1] = 1.0
+        c[0] = 0.0
+        a[N - 1] = 0.0
+        return _tri_list(a, b, c, vals)
+    fn fix(w):
+        for j in range(nx):
+            w[0][j] = ref[0][j]
+            w[ny - 1][j] = ref[ny - 1][j]
+        for i in range(ny):
+            w[i][0] = ref[i][0]
+            w[i][nx - 1] = ref[i][nx - 1]
+        return w
+    var frames = [tensor(u)]
+    var ts = [0.0]
+    for step in range(int(steps)):
+        var rhs = [list(row) for row in u]
+        for i in range(1, ny - 1):
+            for j in range(nx):
+                rhs[i][j] = u[i][j] + r * (u[i - 1][j] - 2 * u[i][j] + u[i + 1][j])
+        rhs = fix(rhs)
+        var half = [implicit_line(row) for row in rhs]     # implicit along x (each row)
+        half = fix(half)
+        var rhs2 = [list(row) for row in half]
+        for i in range(ny):
+            for j in range(1, nx - 1):
+                rhs2[i][j] = half[i][j] + r * (half[i][j - 1] - 2 * half[i][j] + half[i][j + 1])
+        rhs2 = fix(rhs2)
+        var nxt = [[0.0] * nx for i in range(ny)]
+        for j in range(nx):                                 # implicit along y (each column)
+            let col = implicit_line([rhs2[i][j] for i in range(ny)])
+            for i in range(ny):
+                nxt[i][j] = col[i]
+        u = fix(nxt)
+        if (step + 1) % ev == 0:
+            frames.append(tensor(u))
+            ts.append((step + 1) * k)
+    return record(t=tensor(ts), u=stack(frames))
+
+fn _lap1(w, bc):
+    let n = len(w)
+    if bc == "periodic":
+        return [w[(i - 1) % n] - 2 * w[i] + w[(i + 1) % n] for i in range(n)]
+    var L = [0.0] * n
+    for i in range(1, n - 1):
+        L[i] = w[i - 1] - 2 * w[i] + w[i + 1]
+    if bc == "free":
+        L[0] = 2 * (w[1] - w[0])
+        L[n - 1] = 2 * (w[n - 2] - w[n - 1])
+    return L
+
+fn wave1d(u0, v0, c, dx, dt, steps, bc="fixed", every=1):
+    let u = tolist(_v(u0))
+    let n0 = len(u)
+    let vv = _v(v0)
+    let v = tolist(vv) if ndim(vv) > 0 else [float(vv)] * n0
+    let cc = _s(c)
+    let h = _s(dx)
+    let k = _s(dt)
+    let C2 = (cc * k / h) ** 2
+    if C2 > 1 + 1e-12:
+        raise ValueError(f"unstable: c*dt/dx = {sqrt(C2):.3g} > 1 (use a smaller dt)")
+    if bc != "fixed" and bc != "free" and bc != "periodic":
+        raise ValueError("bc must be \"fixed\", \"free\" or \"periodic\"")
+    let ev = max(1, int(every))
+    var prev = list(u)
+    let L0 = _lap1(u, bc)
+    var cur = [u[i] + k * v[i] + 0.5 * C2 * L0[i] for i in range(n0)]
+    if bc == "fixed":
+        cur[0] = u[0]
+        cur[n0 - 1] = u[n0 - 1]
+    var frames = [list(u)]
+    var ts = [0.0]
+    for i in 1..int(steps) + 1:
+        if i % ev == 0:
+            frames.append(list(cur))
+            ts.append(i * k)
+        let L = _lap1(cur, bc)
+        var nxt = [2 * cur[j] - prev[j] + C2 * L[j] for j in range(n0)]
+        if bc == "fixed":
+            nxt[0] = u[0]
+            nxt[n0 - 1] = u[n0 - 1]
+        prev = cur
+        cur = nxt
+    return record(t=tensor(ts), x=arange(n0) * h, u=tensor(frames))
+
+fn advection1d(u0, c, dx, dt, steps, scheme="lax-wendroff", every=1):
+    var u = _v(u0)
+    let nu = _s(c) * _s(dt) / _s(dx)
+    if abs(nu) > 1 + 1e-12:
+        raise ValueError(f"unstable: |c|*dt/dx = {abs(nu):.3g} > 1")
+    let ev = max(1, int(every))
+    var frames = [u]
+    var ts = [0.0]
+    for i in range(int(steps)):
+        if scheme == "upwind":
+            u = u - nu * (u - roll(u, 1)) if nu >= 0 else u - nu * (roll(u, -1) - u)
+        elif scheme == "lax-wendroff":
+            let up = roll(u, -1)
+            let um = roll(u, 1)
+            u = u - nu / 2 * (up - um) + nu * nu / 2 * (up - 2 * u + um)
+        else:
+            raise ValueError("scheme must be \"upwind\" or \"lax-wendroff\"")
+        if (i + 1) % ev == 0:
+            frames.append(u)
+            ts.append((i + 1) * _s(dt))
+    return record(t=tensor(ts), x=arange(len(u)) * _s(dx), u=stack(frames))
+
+fn _dst1_rows(A):
+    # type-I sine transform of every row (the imaginary part of a real FFT of the odd extension)
+    let s = shape(A)
+    let n = s[1]
+    let ext = concat([zeros(s[0], 1), A, zeros(s[0], 1), -A[:, ::-1]], axis=1)
+    let Fh = rfft(ext)
+    return -Fh.im[:, 1:n + 1] / 2
+
+fn poisson2d(f, dx, bc="dirichlet"):
+    let F = _v(f)
+    let h = _s(dx)
+    if ndim(F) != 2:
+        raise ShapeError("poisson2d needs a 2-D right-hand side")
+    let ny = shape(F)[0]
+    let nx = shape(F)[1]
+    if bc == "dirichlet":
+        let lx = 2 * (cos(pi * arange(1, nx + 1) / (nx + 1)) - 1)
+        let ly = 2 * (cos(pi * arange(1, ny + 1) / (ny + 1)) - 1)
+        let Fh = transpose(_dst1_rows(transpose(_dst1_rows(F))))
+        let U = Fh * h * h / (reshape(ly, ny, 1) + reshape(lx, 1, nx))
+        return transpose(_dst1_rows(transpose(_dst1_rows(U)))) * (2.0 / (nx + 1)) * (2.0 / (ny + 1))
+    if bc == "periodic":
+        let Fh = fft(fft(F, axis=1), axis=0)
+        let kx = 2 * (cos(2 * pi * arange(nx) / nx) - 1)
+        let ky = 2 * (cos(2 * pi * arange(ny) / ny) - 1)
+        var den = reshape(ky, ny, 1) + reshape(kx, 1, nx)
+        den = where(den == 0, ones_like(den), den)
+        var U = Fh * (h * h / den)
+        var re = U.re
+        var im = U.im
+        re[0, 0] = 0.0
+        im[0, 0] = 0.0
+        return real(ifft(ifft(Complex(re, im), axis=1), axis=0))
+    raise ValueError("bc must be \"dirichlet\" or \"periodic\"")
+
+fn _fft2(w) = fft(fft(w, axis=1), axis=0)
+fn _ifft2r(wh) = real(ifft(ifft(wh, axis=1), axis=0))
+
+fn navier_stokes2d(omega0, nu, length=2 * pi, dt=1e-3, steps=1000, every=0):
+    let w = _v(omega0)
+    let n = shape(w)[0]
+    if ndim(w) != 2 or shape(w)[1] != n:
+        raise ShapeError("navier_stokes2d needs a square vorticity field")
+    let Lx = _s(length)
+    let nuv = _s(nu)
+    let h = _s(dt)
+    let N = int(steps)
+    let k = fftfreq(n, Lx / (2 * pi * n))
+    let KX = reshape(k, 1, n) + zeros(n, 1)
+    let KY = reshape(k, n, 1) + zeros(1, n)
+    let K2 = KX * KX + KY * KY
+    let K2i = where(K2 == 0, zeros_like(K2), 1.0 / where(K2 == 0, ones_like(K2), K2))
+    let kmax = float(max(abs(k)))
+    let mask = where(abs(KX) < 2.0 / 3.0 * kmax, ones_like(K2), zeros_like(K2)) * where(abs(KY) < 2.0 / 3.0 * kmax, ones_like(K2), zeros_like(K2))
+    let E = exp(-nuv * K2 * h / 2)
+    fn ik(K, z) = Complex(-K * z.im, K * z.re)
+    fn vel(wh):
+        let psi = wh * K2i
+        return (_ifft2r(ik(KY, psi)), _ifft2r(-ik(KX, psi)))
+    fn rhs(wh):
+        let uv = vel(wh)
+        let wx = _ifft2r(ik(KX, wh))
+        let wy = _ifft2r(ik(KY, wh))
+        return -_fft2(uv[0] * wx + uv[1] * wy) * mask
+    var wh = _fft2(w)
+    var out_t = [0.0]
+    var out_w = [_ifft2r(wh)]
+    for i in range(N):
+        let k1 = rhs(wh)
+        let k2 = rhs((wh + k1 * (h / 2)) * E)
+        let k3 = rhs(wh * E + k2 * (h / 2))
+        let k4 = rhs(wh * E * E + k3 * E * h)
+        wh = wh * E * E + (k1 * E * E + (k2 + k3) * E * 2.0 + k4) * (h / 6)
+        if every and (i + 1) % every == 0 and i + 1 < N:
+            out_t.append((i + 1) * h)
+            out_w.append(_ifft2r(wh))
+    out_t.append(N * h)
+    out_w.append(_ifft2r(wh))
+    let uv = vel(wh)
+    var en = []
+    for ww in out_w:
+        let q = vel(_fft2(ww))
+        en.append(0.5 * float(mean(q[0] * q[0] + q[1] * q[1])))
+    return record(t=tensor(out_t), omega=stack(out_w), u=uv[0], v=uv[1], energy=tensor(en))
+
+fn _op(A):
+    if callable(A):
+        return fn(x) => _v(A(x))
+    let M = _v(A)
+    return fn(x) => M @ x
+
+fn _dot(a, b) = float(sum(a * b))
+
+fn cg(A, b, tol=1e-10, max_iter=none, x0=none):
+    let Ax = _op(A)
+    let bb = _v(b)
+    var x = zeros_like(bb) if x0 == none else _v(x0) * 1.0
+    var r = bb - Ax(x)
+    var p = r * 1.0
+    var rs = _dot(r, r)
+    var nb = sqrt(_dot(bb, bb))
+    if nb == 0:
+        nb = 1.0
+    var it = 0
+    let mi = int(max_iter) if max_iter else 10 * len(tolist(bb))
+    while sqrt(rs) > tol * nb and it < mi:
+        let Ap = Ax(p)
+        let al = rs / _dot(p, Ap)
+        x = x + al * p
+        r = r - al * Ap
+        let rn = _dot(r, r)
+        p = r + rn / rs * p
+        rs = rn
+        it = it + 1
+    return record(x=x, iterations=it, residual=sqrt(rs) / nb, converged=sqrt(rs) <= tol * nb)
+
+fn bicgstab(A, b, tol=1e-10, max_iter=none, x0=none):
+    let Ax = _op(A)
+    let bb = _v(b)
+    var x = zeros_like(bb) if x0 == none else _v(x0) * 1.0
+    var r = bb - Ax(x)
+    let rh = r * 1.0
+    var rho = 1.0
+    var al = 1.0
+    var om = 1.0
+    var v = zeros_like(bb)
+    var p = zeros_like(bb)
+    var nb = sqrt(_dot(bb, bb))
+    if nb == 0:
+        nb = 1.0
+    let mi = int(max_iter) if max_iter else 10 * len(tolist(bb))
+    var it = 0
+    while sqrt(_dot(r, r)) > tol * nb and it < mi:
+        let rho1 = _dot(rh, r)
+        if rho1 == 0:
+            break
+        let beta = rho1 / rho * al / om
+        p = r + beta * (p - om * v)
+        v = Ax(p)
+        al = rho1 / _dot(rh, v)
+        let s = r - al * v
+        if sqrt(_dot(s, s)) <= tol * nb:
+            x = x + al * p
+            r = s
+            it = it + 1
+            break
+        let t = Ax(s)
+        om = _dot(t, s) / _dot(t, t)
+        x = x + al * p + om * s
+        r = s - om * t
+        rho = rho1
+        it = it + 1
+    let res = sqrt(_dot(r, r)) / nb
+    return record(x=x, iterations=it, residual=res, converged=res <= tol)

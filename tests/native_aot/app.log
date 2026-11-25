@@ -1,4 +1,0 @@
-2026-11-25 08:18:49.383  INFO   app  server started  port=8080
-2026-11-25 08:18:49.383  WARN   db  slow query  host=local  ms=120  sql="select 1"
-2026-11-25 08:18:49.383  DEBUG  app  details
-2026-11-25 08:18:49.383  INFO   app  work took 1.23e-06 s

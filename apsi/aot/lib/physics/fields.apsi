@@ -1,0 +1,22 @@
+# physics.fields for native programs: finite differences on regular grids.
+fn laplacian(u, dx, boundary="periodic"):
+    let n = ndim(u)
+    var total = u * 0
+    for ax in range(n):
+        total = total + (roll(u, 1, ax) + roll(u, -1, ax) - 2 * u)
+    var lap = total / (dx * dx)
+    if boundary == "fixed":
+        var mask = zeros(*shape(u))
+        let s = shape(u)
+        if n == 1:
+            mask = tensor([0.0 if i == 0 or i == s[0] - 1 else 1.0 for i in range(s[0])])
+        elif n == 2:
+            mask = tensor([[0.0 if i == 0 or i == s[0] - 1 or j == 0 or j == s[1] - 1 else 1.0 for j in range(s[1])] for i in range(s[0])])
+        else:
+            raise NotImplementedError("fixed boundaries natively: 1-D and 2-D grids")
+        lap = lap * mask
+    elif boundary != "periodic":
+        raise ValueError("boundary must be \"periodic\" or \"fixed\"")
+    return lap
+
+fn gradient(u, dx, axis=0) = (roll(u, -1, axis) - roll(u, 1, axis)) / (2 * dx)
