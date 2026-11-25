@@ -1,0 +1,278 @@
+# use log: leveled, structured logging for native programs: the console (stderr), files with rotation (text or
+# JSON lines), named loggers with fields, timers, and reading logs back. The same line format as apsi run.
+let LEVELS = {"debug": 10, "info": 20, "warn": 30, "warning": 30, "error": 40, "critical": 50, "crit": 50}
+let NAMES = {10: "DEBUG", 20: "INFO", 30: "WARN", 40: "ERROR", 50: "CRIT"}
+let COLORS = {10: "\u001b[2m", 20: "\u001b[36m", 30: "\u001b[33m", 40: "\u001b[31m", 50: "\u001b[1;31m"}
+let RESET = "\u001b[0m"
+
+class LogError(Exception):
+    pass
+
+var _level = LEVELS.get(str(getenv("APSI_LOG_LEVEL", "info")).lower(), 20)
+var _console = true
+var _color = none
+var _files = []
+
+fn _text(v):
+    var s = str(v)
+    if isinstance(v, Exception):
+        s = f"{type(v)}: {v}"
+    if s == "" or " " in s or "\t" in s or "\"" in s or "=" in s or "\n" in s:
+        s = json_str(s)
+    return s
+
+fn _jsonable(v):
+    if v == none or isinstance(v, str) or isinstance(v, int) or isinstance(v, float) or isinstance(v, bool):
+        return v
+    if isinstance(v, list) or isinstance(v, tuple):
+        return [_jsonable(x) for x in v]
+    if isinstance(v, dict):
+        var d = {}
+        for k in v:
+            d[str(k)] = _jsonable(v[k])
+        return d
+    return str(v)
+
+fn _size(text):
+    let t = str(text).lower().replace(" ", "")
+    var unit = 1
+    var num = t
+    for pair in [["gb", 1073741824], ["mb", 1048576], ["kb", 1024], ["b", 1]]:
+        if t.endswith(pair[0]):
+            unit = pair[1]
+            num = t[0:len(t) - len(pair[0])]
+            break
+    try:
+        return int(float(num) * unit)
+    except ValueError:
+        raise LogError(f"rotate: give a size such as \"10 MB\", or \"daily\" (not {repr(text)})")
+
+class _File:
+    fn __init__(self, path, fmt, rotate, keep, level):
+        self.path = path
+        self.fmt = fmt
+        self.keep = max(0, int(keep))
+        self.level = level
+        self.daily = str(rotate).lower() == "daily"
+        self.limit = none if self.daily or rotate == none or rotate == false or rotate == "none" else _size(rotate)
+        self.day = __localtime("date")
+        let d = path.replace("\\", "/").rsplit("/", 1)
+        if len(d) == 2 and d[0] != "":
+            __fs("mkdir", d[0], none)
+        self.size = __fs("size", path, none) if __fs("isfile", path, none) else 0
+    fn _rotate(self):
+        let dot = self.path.rfind(".")
+        let stem = self.path[0:dot] if dot > 0 else self.path
+        let ext = self.path[dot:] if dot > 0 else ""
+        if self.daily:
+            __fs("rename", self.path, f"{stem}.{self.day}{ext if ext != '' else '.log'}")
+        else:
+            for i in range(self.keep, 0, -1):
+                let src = self.path if i == 1 else f"{stem}.{i - 1}{ext}"
+                if __fs("isfile", src, none):
+                    let dst = f"{stem}.{i}{ext}"
+                    if __fs("isfile", dst, none):
+                        __fs("remove", dst, none)
+                    __fs("rename", src, dst)
+            if self.keep == 0 and __fs("isfile", self.path, none):
+                __fs("remove", self.path, none)
+        self.day = __localtime("date")
+        self.size = 0
+    fn write(self, line):
+        if self.daily and __localtime("date") != self.day and self.size > 0:
+            self._rotate()
+        elif self.limit != none and self.size + len(line) > self.limit and self.size > 0:
+            self._rotate()
+        __fs("append", self.path, line)
+        self.size = self.size + len(line)
+
+fn _emit(lvl, name, msg, fields):
+    var wanted = lvl >= _level
+    for f in _files:
+        if lvl >= f.level:
+            wanted = true
+    if not wanted:
+        return
+    let stamp = __localtime("stamp")
+    var tail = ""
+    for k in fields:
+        tail = tail + f"  {k}={_text(fields[k])}"
+    let lname = NAMES[lvl]
+    let text = f"{stamp}  {lname.ljust(5)}  {name}  {msg}{tail}"
+    if _console and lvl >= _level:
+        let color = _color if _color != none else __isatty()
+        if color:
+            write_err(f"\u001b[2m{stamp}\u001b[0m  {COLORS[lvl]}{lname.ljust(5)}{RESET}  \u001b[1m{name}\u001b[0m  {msg}\u001b[2m{tail}\u001b[0m\n")
+        else:
+            write_err(text + "\n")
+    for f in _files:
+        if lvl >= f.level:
+            if f.fmt == "json":
+                var rec = {"time": __localtime("iso"), "level": lname.lower(), "name": name, "message": msg}
+                for k in fields:
+                    rec[k] = _jsonable(fields[k])
+                f.write(json_str(rec) + "\n")
+            else:
+                f.write(text + "\n")
+
+class Timer:
+    fn __init__(self, logger, what, level):
+        self.logger = logger
+        self.what = what
+        self.level = level
+        self.t0 = 0.0
+    fn __enter__(self):
+        self.t0 = __time()
+        return self
+    fn __exit__(self, kind=none, err=none, tb=none):
+        let secs = __time() - self.t0
+        if err == none:
+            self.logger._log(self.level, [f"{self.what} took {secs:.3g} s"], {})
+        else:
+            self.logger._log(40, [f"{self.what} failed after {secs:.3g} s"], {"err": err})
+        return false
+
+class Logger:
+    fn __init__(self, name="app", fields=none):
+        self.name = name
+        self.fields = dict(fields) if fields != none else {}
+    fn _log(self, lvl, msg, fields):
+        var f = dict(self.fields)
+        for k in fields:
+            f[k] = fields[k]
+        _emit(lvl, self.name, " ".join([m if isinstance(m, str) else _text(m) for m in msg]), f)
+    fn debug(self, *msg, **fields):
+        self._log(10, msg, fields)
+    fn info(self, *msg, **fields):
+        self._log(20, msg, fields)
+    fn warn(self, *msg, **fields):
+        self._log(30, msg, fields)
+    fn warning(self, *msg, **fields):
+        self._log(30, msg, fields)
+    fn error(self, *msg, **fields):
+        self._log(40, msg, fields)
+    fn critical(self, *msg, **fields):
+        self._log(50, msg, fields)
+    fn named(self, name, **fields):
+        var f = dict(self.fields)
+        for k in fields:
+            f[k] = fields[k]
+        return Logger(f"{self.name}.{name}" if self.name != "app" else str(name), f)
+    fn timer(self, what, level="info") = Timer(self, what, LEVELS.get(str(level).lower(), 20))
+    fn __repr__(self) = f"<logger {self.name}>"
+
+let _root = Logger("app")
+
+fn debug(*msg, **fields):
+    _root._log(10, msg, fields)
+fn info(*msg, **fields):
+    _root._log(20, msg, fields)
+fn warn(*msg, **fields):
+    _root._log(30, msg, fields)
+fn warning(*msg, **fields):
+    _root._log(30, msg, fields)
+fn error(*msg, **fields):
+    _root._log(40, msg, fields)
+fn critical(*msg, **fields):
+    _root._log(50, msg, fields)
+fn named(name, **fields) = _root.named(name, **fields)
+fn timer(what, level="info") = _root.timer(what, level)
+
+fn to_file(path, format="text", rotate="10 MB", keep=5, level="debug"):
+    if format != "text" and format != "json":
+        raise LogError("log.to_file: format is \"text\" or \"json\"")
+    _files.append(_File(path, format, rotate, keep, LEVELS.get(str(level).lower(), 10)))
+    return path
+
+fn close():
+    _files = []
+
+fn level(name=none):
+    if name != none:
+        if str(name).lower() not in LEVELS:
+            raise LogError("log.level: one of debug, info, warn, error, critical")
+        _level = LEVELS[str(name).lower()]
+    return NAMES[_level].lower()
+
+fn console(on=true, color=none):
+    _console = on
+    _color = color
+    return _console
+
+fn _split_fields(text):
+    # "message  k=v  k2=\"v 2\"": the fields start at two spaces before a name=
+    var parts = []
+    var i = 0
+    var last = 0
+    let n = len(text)
+    while i < n - 2:
+        if text[i] == " " and text[i + 1] == " " and (text[i + 2].isalpha() or text[i + 2] == "_"):
+            var j = i + 2
+            while j < n and (text[j].isalnum() or text[j] == "_" or text[j] == "."):
+                j = j + 1
+            if j < n and text[j] == "=":
+                parts.append(text[last:i])
+                last = i + 2
+                i = j
+                continue
+        i = i + 1
+    parts.append(text[last:])
+    var fields = {}
+    for p in parts[1:]:
+        let kv = p.partition("=")
+        var v = kv[2]
+        if v.startswith("\""):
+            try:
+                v = json_parse(v)
+            except Exception:
+                pass
+        fields[kv[0]] = v
+    return (parts[0], fields)
+
+fn _lv(name) = {"DEBUG": 10, "INFO": 20, "WARN": 30, "WARNING": 30, "ERROR": 40, "CRIT": 50, "CRITICAL": 50}.get(name, 20)
+
+fn read(path, level=none, grep=none, last=none, name=none, older=false):
+    let want = LEVELS.get(str(level).lower(), 0) if level != none else 0
+    var out = []
+    for line in read_text(path).splitlines():
+        if line.strip() == "":
+            continue
+        var rec = none
+        if line.startswith("{"):
+            try:
+                var j = json_parse(line)
+                rec = {"time": j.pop("time", ""), "level": str(j.pop("level", "info")).upper(), "name": j.pop("name", ""), "message": j.pop("message", ""), "fields": j}
+            except Exception:
+                rec = none
+        if rec == none:
+            let w = line.split()
+            if len(w) >= 4 and len(w[0]) == 10 and w[0][4] == "-" and ":" in w[1] and w[2] in ["DEBUG", "INFO", "WARN", "ERROR", "CRIT"]:
+                var at = line.find(w[2], len(w[0]) + len(w[1]) + 1) + len(w[2])
+                at = line.find(w[3], at) + len(w[3])
+                while at < len(line) and line[at] == " ":
+                    at = at + 1
+                let mf = _split_fields(line[at:])
+                rec = {"time": w[0] + " " + w[1], "level": w[2], "name": w[3], "message": mf[0], "fields": mf[1]}
+            elif len(out) > 0:
+                out[len(out) - 1]["message"] = out[len(out) - 1]["message"] + "\n" + line
+                continue
+            else:
+                rec = {"time": "", "level": "INFO", "name": "", "message": line, "fields": {}}
+        if _lv(rec["level"]) < want or (name != none and not str(rec["name"]).startswith(name)):
+            continue
+        if grep != none and grep.lower() not in line.lower():
+            continue
+        out.append(rec)
+    return out[len(out) - int(last):] if last != none and len(out) > int(last) else out
+
+fn show(records, color=none, out=none):
+    let c = __isatty() if color == none else color
+    for r in records:
+        let lv = _lv(r["level"])
+        var tail = ""
+        for k in r["fields"]:
+            tail = tail + f"  {k}={_text(r['fields'][k])}"
+        if c:
+            print(f"\u001b[2m{r['time']}\u001b[0m  {COLORS[lv]}{r['level'].ljust(5)}{RESET}  \u001b[1m{r['name']}\u001b[0m  {r['message']}\u001b[2m{tail}\u001b[0m")
+        else:
+            print(f"{r['time']}  {r['level'].ljust(5)}  {r['name']}  {r['message']}{tail}")

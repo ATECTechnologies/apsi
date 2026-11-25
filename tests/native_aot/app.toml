@@ -1,0 +1,15 @@
+name = "demo"
+port = 8_080
+ratio = 2.5
+flags = [1, 2, 3]
+# comment
+[db]
+host = 'localhost' # here
+url = "postgres://${db.host}:5432"
+[db.pool]
+size = 4
+[[users]]
+name = "a"
+[[users]]
+name = "b"
+limits = { max = 10, soft = true }

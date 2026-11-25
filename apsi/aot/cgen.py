@@ -752,7 +752,8 @@ class CGen:
         from ..parser import parse, static_public
         with open(r[1], encoding="utf-8-sig") as fh:
             names = list(static_public(parse(fh.read())))
-        return names + ([s.path] if "." not in s.path and s.path not in names else [])
+        return names + ([s.path] if "." not in s.path and s.path not in names and s.path not in BUILTINS
+                        and s.path not in prelude_names() else [])
 
     def local_module(self, path):
         if path in self.local_mods:
@@ -807,8 +808,8 @@ class CGen:
             return
         for n, v in vals:
             self.store(n, v)
-        if "." not in s.path and s.path not in pub:
-            self.store(s.path, self.module_obj(s.path, vals))
+        if "." not in s.path and s.path not in pub and s.path not in BUILTINS and s.path not in prelude_names():
+            self.store(s.path, self.module_obj(s.path, vals))      # (`use log` keeps log() the logarithm, as apsi run)
 
     def module_obj(self, name, items):
         base = self.block_of([v for _, v in items]) if items else "S[0]"

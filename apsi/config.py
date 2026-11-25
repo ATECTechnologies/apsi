@@ -305,12 +305,20 @@ def _tv(v):
     return json.dumps(str(v), ensure_ascii=False)
 
 
+def _is_aot(v):
+    return isinstance(v, (list, tuple)) and v and all(isinstance(x, dict) for x in v)
+
+
 def to_toml(data, prefix=""):
-    plain = [(k, v) for k, v in data.items() if not isinstance(v, dict)]
-    tables = [(k, v) for k, v in data.items() if isinstance(v, dict)]
+    plain = [(k, v) for k, v in data.items() if not isinstance(v, dict) and not _is_aot(v)]
+    tables = [(k, v) for k, v in data.items() if isinstance(v, dict) or _is_aot(v)]
     out = "".join(f"{_key(k)} = {_tv(v)}\n" for k, v in plain)
     for k, v in tables:
         name = f"{prefix}{_key(k)}"
+        if _is_aot(v):                          # an array of tables: [[name]] once per entry
+            for x in v:
+                out += f"\n[[{name}]]\n" + to_toml(x, name + ".")
+            continue
         body = to_toml(v, name + ".")
         if any(not isinstance(x, dict) for x in v.values()):
             out += f"\n[{name}]\n"

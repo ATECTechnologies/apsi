@@ -1,0 +1,659 @@
+# use config: settings from TOML, JSON, INI and .env files, the environment and the command line, for native
+# programs (later sources win; defaults give the types). TOML is read by the parser below (TOML 1.0: tables, arrays
+# of tables, dotted keys, inline tables, all string forms, numbers with _ and 0x / 0o / 0b; dates stay text).
+use env as _envmod
+
+class ConfigError(ValueError):
+    pass
+
+var _where = []
+
+# ---- TOML
+class _Toml:
+    fn __init__(self, text, path):
+        self.s = text
+        self.i = 0
+        self.n = len(text)
+        self.path = path
+        self.line = 1
+
+    fn fail(self, msg):
+        raise ConfigError(f"{self.path}:{self.line}: {msg}")
+
+    fn peek(self) = self.s[self.i] if self.i < self.n else ""
+
+    fn ws(self):
+        while self.i < self.n and (self.s[self.i] == " " or self.s[self.i] == "\t"):
+            self.i = self.i + 1
+
+    fn ws_nl(self):
+        while self.i < self.n:
+            let c = self.s[self.i]
+            if c == " " or c == "\t" or c == "\r":
+                self.i = self.i + 1
+            elif c == "\n":
+                self.i = self.i + 1
+                self.line = self.line + 1
+            elif c == "#":
+                while self.i < self.n and self.s[self.i] != "\n":
+                    self.i = self.i + 1
+            else:
+                break
+
+    fn end_line(self):
+        self.ws()
+        if self.peek() == "#":
+            while self.i < self.n and self.s[self.i] != "\n":
+                self.i = self.i + 1
+        if self.peek() == "\r":
+            self.i = self.i + 1
+        if self.i < self.n and self.s[self.i] != "\n":
+            self.fail(f"unexpected '{self.s[self.i]}' after a value")
+
+    fn bare_key(self):
+        let st = self.i
+        while self.i < self.n and (self.s[self.i].isalnum() or self.s[self.i] == "_" or self.s[self.i] == "-"):
+            self.i = self.i + 1
+        if self.i == st:
+            self.fail("a key was expected")
+        return self.s[st:self.i]
+
+    fn key(self):
+        var parts = []
+        while true:
+            self.ws()
+            let c = self.peek()
+            if c == "\"":
+                parts.append(self.basic_string())
+            elif c == "'":
+                parts.append(self.literal_string())
+            else:
+                parts.append(self.bare_key())
+            self.ws()
+            if self.peek() == ".":
+                self.i = self.i + 1
+                continue
+            return parts
+
+    fn escape(self):
+        let c = self.peek()
+        self.i = self.i + 1
+        let m = {"n": "\n", "t": "\t", "r": "\r", "\\": "\\", "\"": "\"", "b": "\b", "f": "\f", "e": "\u001b"}
+        if c in m:
+            return m[c]
+        if c == "u" or c == "U":
+            let k = 4 if c == "u" else 8
+            let h = self.s[self.i:self.i + k]
+            self.i = self.i + k
+            return chr(int(h, 16))
+        self.fail(f"unknown escape \\{c}")
+
+    fn basic_string(self):
+        if self.s[self.i:self.i + 3] == "\"\"\"":
+            self.i = self.i + 3
+            if self.peek() == "\n":
+                self.i = self.i + 1
+                self.line = self.line + 1
+            var out = []
+            while self.i < self.n:
+                if self.s[self.i:self.i + 3] == "\"\"\"":
+                    self.i = self.i + 3
+                    while self.peek() == "\"":
+                        out.append("\"")
+                        self.i = self.i + 1
+                    return "".join(out)
+                let c = self.s[self.i]
+                if c == "\\":
+                    self.i = self.i + 1
+                    if self.peek() == "\n" or self.peek() == " " or self.peek() == "\r":
+                        while self.i < self.n and (self.s[self.i] == " " or self.s[self.i] == "\n" or self.s[self.i] == "\r" or self.s[self.i] == "\t"):
+                            if self.s[self.i] == "\n":
+                                self.line = self.line + 1
+                            self.i = self.i + 1
+                    else:
+                        out.append(self.escape())
+                    continue
+                if c == "\n":
+                    self.line = self.line + 1
+                out.append(c)
+                self.i = self.i + 1
+            self.fail("an unclosed \"\"\" string")
+        self.i = self.i + 1
+        var out = []
+        while self.i < self.n:
+            let c = self.s[self.i]
+            if c == "\"":
+                self.i = self.i + 1
+                return "".join(out)
+            if c == "\n":
+                self.fail("a string ends at the end of the line")
+            if c == "\\":
+                self.i = self.i + 1
+                out.append(self.escape())
+                continue
+            out.append(c)
+            self.i = self.i + 1
+        self.fail("an unclosed string")
+
+    fn literal_string(self):
+        if self.s[self.i:self.i + 3] == "'''":
+            self.i = self.i + 3
+            if self.peek() == "\n":
+                self.i = self.i + 1
+                self.line = self.line + 1
+            let end = self.s.find("'''", self.i)
+            if end < 0:
+                self.fail("an unclosed ''' string")
+            var e = end
+            while e + 3 < self.n and self.s[e + 3] == "'":
+                e = e + 1
+            let v = self.s[self.i:e]
+            self.line = self.line + v.count("\n")
+            self.i = e + 3
+            return v
+        self.i = self.i + 1
+        let end = self.s.find("'", self.i)
+        if end < 0 or "\n" in self.s[self.i:end]:
+            self.fail("an unclosed string")
+        let v = self.s[self.i:end]
+        self.i = end + 1
+        return v
+
+    fn value(self):
+        self.ws()
+        let c = self.peek()
+        if c == "\"":
+            return self.basic_string()
+        if c == "'":
+            return self.literal_string()
+        if c == "[":
+            self.i = self.i + 1
+            var arr = []
+            while true:
+                self.ws_nl()
+                if self.peek() == "]":
+                    self.i = self.i + 1
+                    return arr
+                arr.append(self.value())
+                self.ws_nl()
+                if self.peek() == ",":
+                    self.i = self.i + 1
+                    continue
+                self.ws_nl()
+                if self.peek() == "]":
+                    self.i = self.i + 1
+                    return arr
+                self.fail("',' or ']' was expected in an array")
+        if c == "{":
+            self.i = self.i + 1
+            var tbl = {}
+            self.ws()
+            if self.peek() == "}":
+                self.i = self.i + 1
+                return tbl
+            while true:
+                let k = self.key()
+                self.ws()
+                if self.peek() != "=":
+                    self.fail("'=' was expected")
+                self.i = self.i + 1
+                _put(tbl, k, self.value(), self)
+                self.ws()
+                if self.peek() == ",":
+                    self.i = self.i + 1
+                    continue
+                if self.peek() == "}":
+                    self.i = self.i + 1
+                    return tbl
+                self.fail("',' or '}' was expected in an inline table")
+        var st = self.i
+        while self.i < self.n and not (self.s[self.i] in ",]}#\n\r") :
+            self.i = self.i + 1
+        var tok = self.s[st:self.i].strip()
+        if tok == "true":
+            return true
+        if tok == "false":
+            return false
+        if tok == "inf" or tok == "+inf":
+            return inf
+        if tok == "-inf":
+            return -inf
+        if tok == "nan" or tok == "+nan" or tok == "-nan":
+            return nan
+        let t = tok.replace("_", "")
+        if t.startswith("0x"):
+            return int(t[2:], 16)
+        if t.startswith("0o"):
+            return int(t[2:], 8)
+        if t.startswith("0b"):
+            return int(t[2:], 2)
+        let body = t[1:] if t.startswith("+") or t.startswith("-") else t
+        if body != "" and body.isdigit():
+            return int(t)
+        if body != "" and (body[0].isdigit() or body[0] == "."):
+            if ":" in body or (body.count("-") >= 2 and not ("e" in body.lower())):
+                return tok                         # a date / time: kept as text
+            try:
+                return float(t)
+            except ValueError:
+                self.fail(f"'{tok}' is not a value")
+        self.fail(f"'{tok}' is not a value (strings need quotes)")
+
+    fn parse(self):
+        var root = {}
+        var cur = root
+        while true:
+            self.ws_nl()
+            if self.i >= self.n:
+                return root
+            if self.peek() == "[":
+                let arr = self.s[self.i:self.i + 2] == "[["
+                self.i = self.i + (2 if arr else 1)
+                let k = self.key()
+                self.ws()
+                if arr:
+                    if self.s[self.i:self.i + 2] != "]]":
+                        self.fail("']]' was expected")
+                    self.i = self.i + 2
+                    var node = root
+                    for p in k[0:len(k) - 1]:
+                        node = _child(node, p, self)
+                    let last = k[len(k) - 1]
+                    if last not in node:
+                        node[last] = []
+                    if not isinstance(node[last], list):
+                        self.fail(f"'{last}' is not an array of tables")
+                    var t = {}
+                    node[last].append(t)
+                    cur = t
+                else:
+                    if self.peek() != "]":
+                        self.fail("']' was expected")
+                    self.i = self.i + 1
+                    var node = root
+                    for p in k:
+                        node = _child(node, p, self)
+                    cur = node
+                self.end_line()
+                continue
+            let k = self.key()
+            self.ws()
+            if self.peek() != "=":
+                self.fail("'=' was expected after the key")
+            self.i = self.i + 1
+            _put(cur, k, self.value(), self)
+            self.end_line()
+
+fn _child(node, p, ps):
+    if p not in node:
+        node[p] = {}
+    var v = node[p]
+    if isinstance(v, list):
+        if len(v) == 0 or not isinstance(v[len(v) - 1], dict):
+            ps.fail(f"'{p}' is not a table")
+        return v[len(v) - 1]
+    if not isinstance(v, dict):
+        ps.fail(f"'{p}' is already a value")
+    return v
+
+fn _put(tbl, key, value, ps):
+    var node = tbl
+    for p in key[0:len(key) - 1]:
+        node = _child(node, p, ps)
+    let last = key[len(key) - 1]
+    if last in node:
+        ps.fail(f"'{'.'.join(key)}' is set twice")
+    node[last] = value
+
+fn read_toml(text, path="settings") = _Toml(text, path).parse()
+
+# ---- the other formats
+fn _guess(v):
+    if not isinstance(v, str):
+        return v
+    let t = v.strip()
+    let low = t.lower()
+    if low in ["true", "yes", "on"]:
+        return true
+    if low in ["false", "no", "off"]:
+        return false
+    if low in ["none", "null"]:
+        return none
+    let b = t[1:] if t.startswith("+") or t.startswith("-") else t
+    let bb = b.replace("_", "")
+    if bb != "" and bb.isdigit() and b[0].isdigit():
+        return int(t.replace("_", ""))
+    if b != "" and (b[0].isdigit() or b[0] == "."):
+        try:
+            return float(t)
+        except ValueError:
+            pass
+    if t.startswith("[") or t.startswith("{"):
+        try:
+            return json_parse(t)
+        except Exception:
+            pass
+    return v
+
+fn _set(d, dotted, value):
+    let parts = dotted.split(".")
+    var node = d
+    for p in parts[0:len(parts) - 1]:
+        if not isinstance(node.get(p), dict):
+            node[p] = {}
+        node = node[p]
+    node[parts[len(parts) - 1]] = value
+
+fn _read_ini(text, path):
+    var out = {}
+    var node = out
+    for raw in text.replace("\r\n", "\n").split("\n"):
+        let line = raw.strip()
+        if line == "" or line.startswith("#") or line.startswith(";"):
+            continue
+        if line.startswith("[") and line.endswith("]"):
+            node = out
+            for part in line[1:len(line) - 1].strip().split("."):
+                if not isinstance(node.get(part), dict):
+                    node[part] = {}
+                node = node[part]
+            continue
+        var sep = -1
+        for ch in ["=", ":"]:
+            let j = line.find(ch)
+            if j > 0 and (sep < 0 or j < sep):
+                sep = j
+        if sep < 0:
+            raise ConfigError(f"{path}: '{line}' is not key = value")
+        node[line[0:sep].strip()] = _guess(line[sep + 1:].strip())
+    return out
+
+fn read_file(path):
+    let low = path.lower()
+    var text = read_text(path)
+    if text.startswith("﻿"):
+        text = text[1:]
+    if low.endswith(".toml"):
+        return read_toml(text, path)
+    if low.endswith(".json"):
+        return json_parse(text)
+    if low.endswith(".ini") or low.endswith(".cfg") or low.endswith(".conf"):
+        return _read_ini(text, path)
+    let base = path.replace("\\", "/").rsplit("/", 1)[len(path.replace("\\", "/").rsplit("/", 1)) - 1]
+    if low.endswith(".env") or base.startswith(".env"):
+        var out = {}
+        let flat = _envmod.parse(text)
+        for k in flat:
+            _set(out, k.lower().replace("__", "."), _guess(flat[k]))
+        return out
+    if low.endswith(".yaml") or low.endswith(".yml"):
+        raise ConfigError(f"{path}: YAML is not read by native programs; use TOML or JSON (or apsi run)")
+    raise ConfigError(f"{path}: unknown settings format (use .toml, .json, .ini or .env)")
+
+fn _plain(v):
+    if __is_rec(v):
+        let d = __rec_dict(v)
+        var out = {}
+        for k in d:
+            out[str(k)] = _plain(d[k])
+        return out
+    if isinstance(v, dict):
+        var out = {}
+        for k in v:
+            out[str(k)] = _plain(v[k])
+        return out
+    if isinstance(v, list) or isinstance(v, tuple):
+        return [_plain(x) for x in v]
+    return v
+
+fn _mark(v, key, where, sources):
+    if isinstance(v, dict):
+        for k in v:
+            _mark(v[k], f"{key}.{k}", where, sources)
+    else:
+        sources[key] = where
+
+fn merge(base, over, where, sources, prefix=""):
+    for k in over:
+        let v = over[k]
+        let key = f"{prefix}{k}"
+        if isinstance(v, dict) and isinstance(base.get(k), dict):
+            merge(base[k], v, where, sources, key + ".")
+        else:
+            base[k] = v
+            for s in list(sources.keys()):
+                if s == key or s.startswith(key + "."):
+                    sources.pop(s)
+            _mark(v, key, where, sources)
+    return base
+
+fn _kind(d):
+    if isinstance(d, bool):
+        return "true/false"
+    if isinstance(d, int):
+        return "a whole number"
+    if isinstance(d, float):
+        return "a number"
+    if isinstance(d, str):
+        return "text"
+    return type(d)
+
+fn _check_types(data, defaults, where_of, prefix=""):
+    for k in defaults:
+        let d = defaults[k]
+        let key = f"{prefix}{k}"
+        if k not in data:
+            continue
+        let v = data[k]
+        if isinstance(d, dict):
+            if not isinstance(v, dict):
+                raise ConfigError(f"{where_of.get(key, 'settings')}: '{key}' should be a table of settings")
+            _check_types(v, d, where_of, key + ".")
+            continue
+        if d == none or v == none:
+            continue
+        var ok = isinstance(v, bool) == isinstance(d, bool) and (type(v) == type(d) or (isinstance(d, float) and isinstance(v, int) and not isinstance(v, bool)))
+        if isinstance(d, list) or isinstance(d, tuple):
+            ok = isinstance(v, list) or isinstance(v, tuple)
+        if not ok:
+            raise ConfigError(f"{where_of.get(key, 'settings')}: '{key}' should be {_kind(d)} (like the default {json_str(d)}), not {json_str(v)}")
+        if isinstance(d, float) and isinstance(v, int):
+            data[k] = float(v)
+
+fn _getd(d, dotted, default=none):
+    var node = d
+    for p in dotted.split("."):
+        if __is_rec(node):
+            node = __rec_dict(node)
+        if not isinstance(node, dict) or p not in node:
+            return default
+        node = node[p]
+    return node
+
+fn _expand(data, root):
+    for k in list(data.keys()):
+        let v = data[k]
+        if isinstance(v, dict):
+            _expand(v, root)
+        elif isinstance(v, str) and "${" in v:
+            var cur = v
+            for rnd in range(10):
+                var out = []
+                var i = 0
+                while i < len(cur):
+                    if cur[i:i + 2] == "${":
+                        let j = cur.find("}", i + 2)
+                        if j > 0:
+                            let name = cur[i + 2:j]
+                            if name.startswith("ENV:"):
+                                out.append(getenv(name[4:], ""))
+                            else:
+                                let got = _getd(root, name)
+                                if got == none:
+                                    raise ConfigError(f"'{k}' uses ${{{name}}}, which is not set")
+                                out.append(str(got))
+                            i = j + 1
+                            continue
+                    out.append(cur[i])
+                    i = i + 1
+                let nv = "".join(out)
+                if nv == cur:
+                    break
+                cur = nv
+            data[k] = cur
+
+fn _rec(v):
+    if isinstance(v, dict):
+        var f = {}
+        for k in v:
+            f[str(k)] = _rec(v[k])
+        return record(**f)
+    if isinstance(v, list):
+        return [_rec(x) for x in v]
+    return v
+
+fn load(*files, env=none, args=false, defaults=none, required=none):
+    var data = {}
+    var sources = {}
+    if defaults != none:
+        merge(data, _plain(defaults), "default", sources)
+    for f0 in files:
+        var f = str(f0)
+        let optional = f.endswith("?")
+        if optional:
+            f = f[0:len(f) - 1]
+        if not exists(f):
+            if optional:
+                continue
+            raise ConfigError(f"settings file '{f}' does not exist (end the name with ? if it is optional)")
+        let base = f.replace("\\", "/").rsplit("/", 1)
+        merge(data, read_file(f), base[len(base) - 1], sources)
+    if env != none and env != false:
+        let pre = str(env).upper().rstrip("_") + "_"
+        var over = {}
+        for name in sorted(__environ_names()):
+            if name.upper().startswith(pre) and len(name) > len(pre):
+                _set(over, name[len(pre):].lower().replace("__", "."), _guess(getenv(name)))
+        for k in over:
+            merge(data, {k: over[k]}, "environment", sources)
+    if args:
+        var over = {}
+        let av = __argv()
+        var i = 0
+        while i < len(av):
+            var a = av[i]
+            if a == "--set" and i + 1 < len(av):
+                a = av[i + 1]
+                i = i + 1
+            elif a.startswith("--set="):
+                a = a[6:]
+            if "=" in a and not a.startswith("-") and (a[0].isalpha() or a[0] == "_"):
+                let kv = a.partition("=")
+                _set(over, kv[0], _guess(kv[2]))
+            i = i + 1
+        merge(data, over, "command line", sources)
+    if defaults != none:
+        _check_types(data, _plain(defaults), sources)
+    _expand(data, data)
+    var missing = []
+    for k in (required if required != none else []):
+        if _getd(data, str(k)) == none:
+            missing.append(str(k))
+    if len(missing) > 0:
+        raise ConfigError("settings missing: " + ", ".join(missing) + (f" (looked in {', '.join([str(f) for f in files])})" if len(files) > 0 else ""))
+    let r = _rec(data)
+    _where.append([r, sources])
+    if len(_where) > 64:
+        _where = _where[1:]
+    return r
+
+fn sources(cfg):
+    for w in _where:
+        if w[0] is cfg:
+            return dict(w[1])
+    return {}
+
+fn get(cfg, key, default=none):
+    let v = _getd(cfg, str(key), none)
+    return default if v == none else v
+
+fn _tv(v):
+    if isinstance(v, bool):
+        return "true" if v else "false"
+    if isinstance(v, int) or isinstance(v, float):
+        return repr(v)
+    if isinstance(v, list) or isinstance(v, tuple):
+        return "[" + ", ".join([_tv(x) for x in v]) + "]"
+    if v == none:
+        return "\"\""
+    return json_str(str(v))
+
+fn _key(k):
+    var plain = len(k) > 0
+    for c in k:
+        if not (c.isalnum() or c == "_" or c == "-") or ord(c) > 127:
+            plain = false
+    return k if plain else json_str(k)
+
+fn _is_aot(v):
+    if not (isinstance(v, list) or isinstance(v, tuple)) or len(v) == 0:
+        return false
+    for x in v:
+        if not isinstance(x, dict):
+            return false
+    return true
+
+fn _to_toml(data, prefix):
+    var out = []
+    for k in data:
+        if not isinstance(data[k], dict) and not _is_aot(data[k]):
+            out.append(f"{_key(k)} = {_tv(data[k])}\n")
+    for k in data:
+        let v = data[k]
+        if _is_aot(v):
+            for x in v:
+                out.append(f"\n[[{prefix}{_key(k)}]]\n")
+                out.append(_to_toml(x, f"{prefix}{_key(k)}."))
+        elif isinstance(v, dict):
+            let name = f"{prefix}{_key(k)}"
+            var any_plain = false
+            for x in v:
+                if not isinstance(v[x], dict):
+                    any_plain = true
+            if any_plain:
+                out.append(f"\n[{name}]\n")
+            out.append(_to_toml(v, name + "."))
+    return "".join(out)
+
+fn to_toml(cfg) = _to_toml(_plain(cfg), "")
+
+fn save(path, cfg):
+    let data = _plain(cfg)
+    let low = str(path).lower()
+    var text = ""
+    if low.endswith(".json"):
+        text = json_str(data) + "\n"
+    elif low.endswith(".toml"):
+        text = to_toml(data)
+    else:
+        raise ConfigError(f"{path}: config.save writes .toml or .json in native programs")
+    write_text(str(path) + ".tmp", text)
+    if exists(str(path)):
+        __fs("remove", str(path), none)
+    __fs("rename", str(path) + ".tmp", str(path))
+    return str(path)
+
+fn parse(text, format="toml"):
+    if format == "toml":
+        return _rec(read_toml(text))
+    if format == "json":
+        return _rec(json_parse(text))
+    if format == "ini":
+        return _rec(_read_ini(text, "settings"))
+    if format == "env":
+        var out = {}
+        let flat = _envmod.parse(text)
+        for k in flat:
+            _set(out, k.lower().replace("__", "."), _guess(flat[k]))
+        return _rec(out)
+    raise ConfigError(f"unknown settings format '{format}'")

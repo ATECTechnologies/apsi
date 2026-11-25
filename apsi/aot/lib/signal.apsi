@@ -1,0 +1,537 @@
+# use signal: filters and spectra for native programs: Butterworth design as second-order sections, zero-phase
+# filtering padded and started in steady state (as SciPy), windows, convolution, peaks, Welch spectra, Savitzky-Golay,
+# resampling and the analytic signal. The same algorithms as apsi run.
+use sci
+use _complex
+use linalg
+
+# ---- complex numbers as pairs (re, im)
+fn _c(re, im=0.0) = [float(re), float(im)]
+fn _cadd(a, b) = [a[0] + b[0], a[1] + b[1]]
+fn _csub(a, b) = [a[0] - b[0], a[1] - b[1]]
+fn _cmul(a, b) = [a[0] * b[0] - a[1] * b[1], a[0] * b[1] + a[1] * b[0]]
+fn _cdiv(a, b):
+    let d = b[0] * b[0] + b[1] * b[1]
+    return [(a[0] * b[0] + a[1] * b[1]) / d, (a[1] * b[0] - a[0] * b[1]) / d]
+fn _cabs(a) = sqrt(a[0] * a[0] + a[1] * a[1])
+fn _cconj(a) = [a[0], -a[1]]
+fn _csqrt(a):
+    let r = _cabs(a)
+    let re = sqrt(max(0.0, (r + a[0]) / 2))
+    var im = sqrt(max(0.0, (r - a[0]) / 2))
+    if a[1] < 0:
+        im = -im
+    return [re, im]
+fn _cprod(xs):
+    var p = _c(1.0)
+    for x in xs:
+        p = _cmul(p, x)
+    return p
+
+fn _flt(x) = [float(v) for v in tolist(flatten(tensor(x, f64)))]
+
+fn _argmin(vals):
+    var k = 0
+    for i in range(1, len(vals)):
+        if vals[i] < vals[k]:
+            k = i
+    return k
+
+fn _poly(roots):
+    # coefficients of prod (x - r), real parts (conjugate pairs and real roots only)
+    if len(roots) == 0:
+        return [1.0]
+    if len(roots) == 1:
+        return [1.0, -roots[0][0]]
+    let s = _cadd(roots[0], roots[1])
+    let p = _cmul(roots[0], roots[1])
+    return [1.0, -s[0], p[0]]
+
+fn _zpk2sos(z0, p0, k):
+    var z = list(z0)
+    var p = list(p0)
+    var sections = []
+    while len(p) > 0:
+        let i = _argmin([abs(1 - _cabs(q)) for q in p])
+        let p1 = p[i]
+        p = p[0:i] + p[i + 1:]
+        var pp = [p1]
+        if abs(p1[1]) > 1e-12:
+            let j = _argmin([_cabs(_csub(q, _cconj(p1))) for q in p])
+            pp.append(p[j])
+            p = p[0:j] + p[j + 1:]
+        else:
+            var any_real = false
+            for q in p:
+                if abs(q[1]) <= 1e-12:
+                    any_real = true
+            if any_real:
+                let j = _argmin([_cabs(_csub(q, p1)) for q in p])
+                pp.append(p[j])
+                p = p[0:j] + p[j + 1:]
+        var zz = []
+        if len(z) > 0:
+            let j = _argmin([_cabs(_csub(q, pp[0])) for q in z])
+            let zr = z[j]
+            z = z[0:j] + z[j + 1:]
+            zz.append(zr)
+            if abs(zr[1]) > 1e-12:
+                let j2 = _argmin([_cabs(_csub(q, _cconj(zr))) for q in z])
+                zz.append(z[j2])
+                z = z[0:j2] + z[j2 + 1:]
+            elif len(pp) == 2 and len(z) > 0:
+                var best = -1
+                for t in range(len(z)):
+                    if abs(z[t][1]) <= 1e-12 and (best < 0 or _cabs(_csub(z[t], pp[0])) < _cabs(_csub(z[best], pp[0]))):
+                        best = t
+                if best >= 0:
+                    zz.append(z[best])
+                    z = z[0:best] + z[best + 1:]
+        var a = _poly(pp)
+        var b = _poly(zz)
+        while len(a) < 3:
+            a.append(0.0)
+        while len(b) < 3:
+            b.append(0.0)
+        sections.append(b + a)
+    var out = []
+    for i in range(len(sections) - 1, -1, -1):
+        out.append(sections[i])
+    out[0] = [out[0][0] * k, out[0][1] * k, out[0][2] * k] + out[0][3:]
+    return tensor(out)
+
+fn _bilinear(z, p, k, fs):
+    let fs2 = _c(2.0 * fs)
+    let zd = [_cdiv(_cadd(fs2, q), _csub(fs2, q)) for q in z] + [_c(-1.0) for i in range(len(p) - len(z))]
+    let pd = [_cdiv(_cadd(fs2, q), _csub(fs2, q)) for q in p]
+    let kd = k * _cdiv(_cprod([_csub(fs2, q) for q in z]), _cprod([_csub(fs2, q) for q in p]))[0]
+    return (zd, pd, kd)
+
+fn butter(order, cutoff, kind="lowpass", fs=2.0):
+    let N = int(order)
+    if N < 1:
+        raise ValueError("filter order must be >= 1")
+    let wn = [float(c) for c in cutoff] if isinstance(cutoff, list) or isinstance(cutoff, tuple) else [float(cutoff)]
+    for w in wn:
+        if w <= 0 or w >= fs / 2:
+            raise ValueError(f"cutoff must be between 0 and fs/2 = {fs / 2:g}")
+    var p = []
+    var m = -N + 1
+    while m < N:
+        let ang = pi * m / (2 * N)
+        p.append([-cos(ang), -sin(ang)])
+        m = m + 2
+    var z = []
+    var k = 1.0
+    let warped = [4.0 * tan(pi * (w / (fs / 2)) / 2.0) for w in wn]
+    if kind == "lowpass" or kind == "low":
+        p = [[q[0] * warped[0], q[1] * warped[0]] for q in p]
+        k = warped[0] ** N
+    elif kind == "highpass" or kind == "high":
+        k = _cdiv(_c(1.0), _cprod([[-q[0], -q[1]] for q in p]))[0]
+        z = [_c(0.0) for i in range(N)]
+        p = [_cdiv(_c(warped[0]), q) for q in p]
+    elif kind == "bandpass" or kind == "band" or kind == "bandstop" or kind == "stop":
+        if len(wn) != 2:
+            raise ValueError("band filters need cutoff = [low, high]")
+        let bw = warped[1] - warped[0]
+        let wo = sqrt(warped[0] * warped[1])
+        if kind == "bandpass" or kind == "band":
+            let pl = [[q[0] * bw / 2, q[1] * bw / 2] for q in p]
+            let rt = [_csqrt(_csub(_cmul(q, q), _c(wo * wo))) for q in pl]
+            p = [_cadd(pl[i], rt[i]) for i in range(N)] + [_csub(pl[i], rt[i]) for i in range(N)]
+            z = [_c(0.0) for i in range(N)]
+            k = bw ** N
+        else:
+            k = _cdiv(_c(1.0), _cprod([[-q[0], -q[1]] for q in p]))[0]
+            let ph = [_cdiv(_c(bw / 2), q) for q in p]
+            let rt = [_csqrt(_csub(_cmul(q, q), _c(wo * wo))) for q in ph]
+            p = [_cadd(ph[i], rt[i]) for i in range(N)] + [_csub(ph[i], rt[i]) for i in range(N)]
+            z = [_c(0.0, wo) for i in range(N)] + [_c(0.0, -wo) for i in range(N)]
+    else:
+        raise ValueError("kind must be \"lowpass\", \"highpass\", \"bandpass\" or \"bandstop\"")
+    let r = _bilinear(z, p, k, 2.0)
+    return _zpk2sos(r[0], r[1], r[2])
+
+fn _rows(sos):
+    let s = tensor(sos, f64)
+    let t = tolist(s)
+    return t if ndim(s) == 2 else [t]
+
+fn _sosfilt_list(rows, x, zi):
+    var y = list(x)
+    var zf = []
+    for s in range(len(rows)):
+        let r = rows[s]
+        let a0 = r[3]
+        let b0 = r[0] / a0
+        let b1 = r[1] / a0
+        let b2 = r[2] / a0
+        let a1 = r[4] / a0
+        let a2 = r[5] / a0
+        var z0 = 0.0
+        var z1 = 0.0
+        if zi != none:
+            z0 = zi[s][0]
+            z1 = zi[s][1]
+        for n in range(len(y)):
+            let v = y[n]
+            let o = b0 * v + z0
+            z0 = b1 * v - a1 * o + z1
+            z1 = b2 * v - a2 * o
+            y[n] = o
+        zf.append([z0, z1])
+    return (y, zf)
+
+fn sosfilt(sos, x):
+    let X = tensor(x, f64)
+    if ndim(X) != 1:
+        return stack([sosfilt(sos, X[i]) for i in range(shape(X)[0])])
+    return tensor(_sosfilt_list(_rows(sos), _flt(X), none)[0])
+
+fn _sos_zi(rows):
+    var zi = []
+    var scale = 1.0
+    for r in rows:
+        let b = [r[0] / r[3], r[1] / r[3], r[2] / r[3]]
+        let a = [1.0, r[4] / r[3], r[5] / r[3]]
+        let M = tensor([[1.0 + a[1], -1.0], [a[2], 1.0]])
+        let B = tensor([b[1] - a[1] * b[0], b[2] - a[2] * b[0]])
+        let zz = tolist(solve(M, B))
+        zi.append([scale * zz[0], scale * zz[1]])
+        scale = scale * (b[0] + b[1] + b[2]) / (a[0] + a[1] + a[2])
+    return zi
+
+fn filtfilt(sos, x, padlen=none):
+    let X = tensor(x, f64)
+    if ndim(X) != 1:
+        return stack([filtfilt(sos, X[i], padlen) for i in range(shape(X)[0])])
+    let rows = _rows(sos)
+    let a = _flt(X)
+    var pl = padlen
+    if pl == none:
+        var nb = 0
+        var na = 0
+        for r in rows:
+            if r[2] == 0:
+                nb = nb + 1
+            if r[5] == 0:
+                na = na + 1
+        pl = 3 * (2 * len(rows) + 1 - min(nb, na))
+    let P = int(pl)
+    let n = len(a)
+    if n <= P:
+        raise ValueError(f"the signal needs more than {P} samples for this filter")
+    var ext = a
+    if P > 0:
+        ext = [2 * a[0] - a[P - i] for i in range(P)] + a + [2 * a[n - 1] - a[n - 2 - i] for i in range(P)]
+    let zi = _sos_zi(rows)
+    var y = _sosfilt_list(rows, ext, [[z[0] * ext[0], z[1] * ext[0]] for z in zi])[0]
+    y = [y[len(y) - 1 - i] for i in range(len(y))]
+    y = _sosfilt_list(rows, y, [[z[0] * y[0], z[1] * y[0]] for z in zi])[0]
+    y = [y[len(y) - 1 - i] for i in range(len(y))]
+    return tensor(y[P:len(y) - P] if P > 0 else y)
+
+fn freqz(sos, n=512, fs=2 * pi):
+    let rows = _rows(sos)
+    var re = []
+    var im = []
+    var mag = []
+    var db = []
+    var ph = []
+    var prev = 0.0
+    var off = 0.0
+    for i in range(n):
+        let w = pi * i / n
+        let zm1 = [cos(w), -sin(w)]
+        let zm2 = _cmul(zm1, zm1)
+        var h = _c(1.0)
+        for r in rows:
+            let num = _cadd(_cadd(_c(r[0]), _cmul(_c(r[1]), zm1)), _cmul(_c(r[2]), zm2))
+            let den = _cadd(_cadd(_c(r[3]), _cmul(_c(r[4]), zm1)), _cmul(_c(r[5]), zm2))
+            h = _cmul(h, _cdiv(num, den))
+        re.append(h[0])
+        im.append(h[1])
+        let mg = _cabs(h)
+        mag.append(mg)
+        db.append(20 * log10(mg) if mg > 0 else -inf)
+        var ang = atan2(h[1], h[0]) + off
+        if i > 0:
+            while ang - prev > pi:
+                off = off - 2 * pi
+                ang = ang - 2 * pi
+            while ang - prev < -pi:
+                off = off + 2 * pi
+                ang = ang + 2 * pi
+        ph.append(ang)
+        prev = ang
+    return record(f=tensor([pi * i / n * fs / (2 * pi) for i in range(n)]), h=Complex(tensor(re), tensor(im)), magnitude=tensor(mag), magnitude_db=tensor(db), phase=tensor(ph))
+
+fn lowpass(x, cutoff, fs, order=4) = filtfilt(butter(order, cutoff, "lowpass", fs), x)
+fn highpass(x, cutoff, fs, order=4) = filtfilt(butter(order, cutoff, "highpass", fs), x)
+fn bandpass(x, low, high, fs, order=4) = filtfilt(butter(order, [low, high], "bandpass", fs), x)
+fn bandstop(x, low, high, fs, order=4) = filtfilt(butter(order, [low, high], "bandstop", fs), x)
+
+fn notch(x, freq, fs, q=30.0):
+    let w0 = 2 * pi * float(freq) / float(fs)
+    let bw = w0 / float(q)
+    let g = 1 / (1 + tan(bw / 2))
+    return filtfilt(tensor([[g, -2 * g * cos(w0), g, 1.0, -2 * g * cos(w0), 2 * g - 1]]), x)
+
+fn _win(n, sym, f):
+    let m = n if sym else n + 1
+    if m <= 1:
+        return ones(n)
+    return tensor([f(i, m) for i in range(n)])
+
+fn hann(n, sym=true) = _win(int(n), sym, fn(i, m) => 0.5 - 0.5 * cos(2 * pi * i / (m - 1)))
+fn hamming(n, sym=true) = _win(int(n), sym, fn(i, m) => 0.54 - 0.46 * cos(2 * pi * i / (m - 1)))
+fn blackman(n, sym=true) = _win(int(n), sym, fn(i, m) => 0.42 - 0.5 * cos(2 * pi * i / (m - 1)) + 0.08 * cos(4 * pi * i / (m - 1)))
+
+fn _i0(x):
+    var s = 1.0
+    var t = 1.0
+    for k in 1..200:
+        t = t * (x / (2 * k)) ** 2
+        s = s + t
+        if t < 1e-17 * s:
+            break
+    return s
+
+fn kaiser(n, beta=8.6):
+    let N = int(n)
+    if N == 1:
+        return ones(1)
+    let b = float(beta)
+    return tensor([_i0(b * sqrt(max(0.0, 1 - (2.0 * i / (N - 1) - 1) ** 2))) / _i0(b) for i in range(N)])
+
+fn convolve(a, b, mode="full"):
+    let x = _flt(a)
+    let y = _flt(b)
+    let n = len(x) + len(y) - 1
+    var r = [0.0] * n
+    for i in range(len(x)):
+        let xi = x[i]
+        for j in range(len(y)):
+            r[i + j] = r[i + j] + xi * y[j]
+    if mode == "full":
+        return tensor(r)
+    if mode == "same":
+        let st = (len(y) - 1) // 2
+        return tensor(r[st:st + len(x)])
+    if mode == "valid":
+        return tensor(r[min(len(x), len(y)) - 1:max(len(x), len(y))])
+    raise ValueError("mode must be \"full\", \"same\" or \"valid\"")
+
+fn correlate(a, b, mode="full"):
+    let y = _flt(b)
+    return convolve(a, [y[len(y) - 1 - i] for i in range(len(y))], mode)
+
+fn _prominence(x, peaks):
+    let n = len(x)
+    var proms = []
+    for p in peaks:
+        let h = x[p]
+        var i = p
+        var lmin = h
+        while i > 0 and x[i - 1] <= h:
+            i = i - 1
+            lmin = min(lmin, x[i])
+        var j = p
+        var rmin = h
+        while j < n - 1 and x[j + 1] <= h:
+            j = j + 1
+            rmin = min(rmin, x[j])
+        proms.append(h - max(lmin, rmin))
+    return proms
+
+fn find_peaks(x, height=none, distance=none, prominence=none):
+    let a = _flt(x)
+    let n = len(a)
+    var peaks = []
+    var i = 1
+    while i < n - 1:
+        if a[i - 1] < a[i]:
+            var j = i
+            while j + 1 < n and a[j + 1] == a[i]:
+                j = j + 1
+            if j + 1 < n and a[j + 1] < a[i]:
+                peaks.append((i + j) // 2)
+            i = j + 1
+        else:
+            i = i + 1
+    if height != none and len(peaks) > 0:
+        let hmin = height[0] if isinstance(height, list) or isinstance(height, tuple) else height
+        let hmax = height[1] if (isinstance(height, list) or isinstance(height, tuple)) and len(height) > 1 else none
+        peaks = [p for p in peaks if a[p] >= float(hmin) and (hmax == none or a[p] <= float(hmax))]
+    if distance != none and len(peaks) > 0:
+        let d = float(distance)
+        if d < 1:
+            raise ValueError("distance must be >= 1 sample")
+        var keep = [true] * len(peaks)
+        let order = sorted(range(len(peaks)), key=fn(t) => -a[peaks[t]])
+        for k in order:
+            if not keep[k]:
+                continue
+            var j = k - 1
+            while j >= 0 and peaks[k] - peaks[j] < d:
+                keep[j] = false
+                j = j - 1
+            j = k + 1
+            while j < len(peaks) and peaks[j] - peaks[k] < d:
+                keep[j] = false
+                j = j + 1
+        peaks = [peaks[t] for t in range(len(peaks)) if keep[t]]
+    var proms = _prominence(a, peaks)
+    if prominence != none and len(peaks) > 0:
+        var pk = []
+        var pr = []
+        for t in range(len(peaks)):
+            if proms[t] >= float(prominence):
+                pk.append(peaks[t])
+                pr.append(proms[t])
+        peaks = pk
+        proms = pr
+    return record(indices=tensor(peaks, i64), heights=tensor([a[p] for p in peaks], f64), prominences=tensor(proms, f64), count=len(peaks))
+
+fn _segments(a, nperseg, noverlap):
+    let step = nperseg - noverlap
+    let n = 1 + (len(a) - nperseg) // step
+    return [a[k * step:k * step + nperseg] for k in range(n)]
+
+fn _detrend_list(a, kind):
+    let m = _mean(a)
+    if kind == "constant":
+        return [v - m for v in a]
+    let n = len(a)
+    let tm = (n - 1) / 2.0
+    var stt = 0.0
+    var sty = 0.0
+    for i in range(n):
+        stt = stt + (i - tm) ** 2
+        sty = sty + (i - tm) * (a[i] - m)
+    let slope = sty / stt if stt > 0 else 0.0
+    return [a[i] - (m + slope * (i - tm)) for i in range(n)]
+
+fn _mean(a):
+    var s = 0.0
+    for v in a:
+        s = s + v
+    return s / len(a)
+
+fn _psd(segs, fs, nperseg, w, detrend):
+    let wl = tolist(w)
+    var ww = 0.0
+    for v in wl:
+        ww = ww + v * v
+    var rows = []
+    for s in segs:
+        let d = _detrend_list(s, detrend) if detrend != none and detrend != false else s
+        let X = rfft(tensor([d[i] * wl[i] for i in range(nperseg)]))
+        var P = (X.re * X.re + X.im * X.im) / (fs * ww)
+        var pl = tolist(P)
+        let last = len(pl) - (1 if nperseg % 2 == 0 else 0)
+        for i in range(1, last):
+            pl[i] = pl[i] * 2
+        rows.append(pl)
+    return rows
+
+fn welch(x, fs=1.0, nperseg=256, noverlap=none, detrend="constant"):
+    let a = _flt(x)
+    let ns = min(int(nperseg), len(a))
+    let no = ns // 2 if noverlap == none else int(noverlap)
+    let rows = _psd(_segments(a, ns, no), float(fs), ns, hann(ns, false), detrend)
+    return record(f=rfftfreq(ns, 1.0 / fs), psd=mean(tensor(rows), axis=0))
+
+fn spectrogram(x, fs=1.0, nperseg=256, noverlap=none):
+    let a = _flt(x)
+    let ns = min(int(nperseg), len(a))
+    let no = ns // 8 if noverlap == none else int(noverlap)
+    let segs = _segments(a, ns, no)
+    let rows = _psd(segs, float(fs), ns, hann(ns, false), "constant")
+    let step = ns - no
+    return record(f=rfftfreq(ns, 1.0 / fs), t=tensor([(k * step + ns / 2) / fs for k in range(len(segs))]), power=transpose(tensor(rows)))
+
+fn detrend(x, kind="linear"):
+    if kind != "linear" and kind != "constant":
+        raise ValueError("kind must be \"linear\" or \"constant\"")
+    return tensor(_detrend_list(_flt(x), kind))
+
+fn moving_average(x, n):
+    let a = _flt(x)
+    let N = len(a)
+    let k = int(n)
+    var c = [0.0]
+    for v in a:
+        c.append(c[len(c) - 1] + v)
+    let half = k // 2
+    var out = []
+    for i in range(N):
+        let lo = min(max(i - half, 0), N)
+        let hi = min(max(i - half + k, 0), N)
+        out.append((c[hi] - c[lo]) / (hi - lo))
+    return tensor(out)
+
+fn savgol(x, window, order):
+    let a = _flt(x)
+    let w = int(window)
+    let k = int(order)
+    if w % 2 == 0 or w <= k or w > len(a):
+        raise ValueError("window must be odd, larger than order and not longer than the signal")
+    let h = w // 2
+    let A = tensor([[float(t) ** j for j in range(k + 1)] for t in range(-h, h + 1)])
+    let coef = tolist(pinv(A)[0])
+    let y = tolist(convolve(a, [coef[len(coef) - 1 - i] for i in range(len(coef))], "same"))
+    let V = tensor([[float(t) ** j for j in range(k + 1)] for t in range(w)])
+    let pl = lstsq(V, tensor(a[0:w]))[0]
+    let pr = lstsq(V, tensor(a[len(a) - w:]))[0]
+    let left = tolist(V @ pl)
+    let right = tolist(V @ pr)
+    var out = y
+    for i in range(h):
+        out[i] = left[i]
+        out[len(a) - h + i] = right[w - h + i]
+    return tensor(out)
+
+fn resample(x, num):
+    let a = _flt(x)
+    let n = len(a)
+    let m = int(num)
+    let X = rfft(tensor(a))
+    let xr = tolist(X.re)
+    let xi = tolist(X.im)
+    var yr = [0.0] * (m // 2 + 1)
+    var yi = [0.0] * (m // 2 + 1)
+    let N = min(m, n)
+    let nyq = N // 2 + 1
+    for i in range(nyq):
+        yr[i] = xr[i]
+        yi[i] = xi[i]
+    if N % 2 == 0:
+        if m < n:
+            yr[N // 2] = yr[N // 2] * 2
+            yi[N // 2] = yi[N // 2] * 2
+        elif m > n:
+            yr[N // 2] = yr[N // 2] * 0.5
+            yi[N // 2] = yi[N // 2] * 0.5
+    return irfft(Complex(tensor(yr), tensor(yi)), m) * (m * 1.0 / n)
+
+fn hilbert(x):
+    let a = _flt(x)
+    let n = len(a)
+    let X = fft(tensor(a))
+    var h = [0.0] * n
+    h[0] = 1.0
+    if n % 2 == 0:
+        h[n // 2] = 1.0
+        for i in 1..n // 2:
+            h[i] = 2.0
+    else:
+        for i in 1..(n + 1) // 2:
+            h[i] = 2.0
+    let H = tensor(h)
+    return ifft(Complex(X.re * H, X.im * H))
+
+fn envelope(x):
+    let z = hilbert(x)
+    return sqrt(z.re * z.re + z.im * z.im)

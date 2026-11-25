@@ -1,0 +1,13 @@
+use config
+write_text("app.toml", "name = \"demo\"\nport = 8_080\nratio = 2.5\nflags = [1, 2, 3]\n# comment\n[db]\nhost = 'localhost' # here\nurl = \"postgres://${db.host}:5432\"\n[db.pool]\nsize = 4\n[[users]]\nname = \"a\"\n[[users]]\nname = \"b\"\nlimits = { max = 10, soft = true }\n")
+write_text("over.json", "{\"port\": 9090, \"db\": {\"pool\": {\"size\": 8}}}")
+let cfg = config.load("app.toml", "over.json", "missing.toml?", defaults={"port": 1, "ratio": 1.0, "debug": false}, required=["name"])
+print(cfg.name, cfg.port, cfg.ratio, cfg.flags, cfg.db.host, cfg.db.url, cfg.db.pool.size, cfg.users[1].name, cfg.users[1].limits.max, cfg.debug)
+print(config.get(cfg, "db.pool.size"), config.get(cfg, "nope", 5), config.sources(cfg)["port"], config.sources(cfg)["name"])
+print(config.to_toml(cfg))
+let p = config.parse("[a]\nb = 0x1F\nc = 1e3\nd = \"\"\"multi\nline\"\"\"\n")
+print(p.a.b, p.a.c, p.a.d)
+try:
+    config.load("app.toml", defaults={"port": "text"})
+except Exception as e:
+    print("error:", e)

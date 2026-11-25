@@ -10,8 +10,8 @@ fn _flatten(tree, prefix, out):
         for i in range(len(tree)):
             _flatten(tree[i], prefix + str(i) + ".", out)
         return out
-    if type(tree) == "Record":
-        let d = to_plain(tree)
+    if __is_rec(tree):
+        let d = __rec_dict(tree)
         for k in d:
             _flatten(d[k], prefix + str(k) + ".", out)
         return out
@@ -49,7 +49,7 @@ fn save_safetensors(path, params, metadata=none):
     var meta = none
     if metadata != none:
         meta = {}
-        let m = to_plain(metadata) if type(metadata) == "Record" else metadata
+        let m = __rec_dict(metadata) if __is_rec(metadata) else metadata
         for k in m:
             meta[str(k)] = str(m[k])
     __st_save(path, _flatten(params, "", {}), meta, false)
@@ -100,7 +100,7 @@ fn save_model(path, params, metadata=none, shard="4GB", sign=false):
     let p = _apsim(path)
     var user = {}
     if metadata != none:
-        let m = to_plain(metadata) if type(metadata) == "Record" else metadata
+        let m = __rec_dict(metadata) if __is_rec(metadata) else metadata
         for k in m:
             user[str(k)] = m[k]
     let base = {"format": "apsi-model", "version": "1", "apsi": "2.6.6", "units": "{}", "qtensors": "{}", "metadata": json_str(user)}
@@ -151,17 +151,17 @@ fn save_checkpoint(path, params, opt=none, step=none, config=none, files=none, m
     if step != none:
         extra["step"] = step
     if config != none:
-        extra["config"] = to_plain(config) if type(config) == "Record" else config
+        extra["config"] = __rec_dict(config) if __is_rec(config) else config
     if opt != none:
         raise NotImplementedError("optimizer state in checkpoints is not in native programs yet; save the parameters with save_model")
-    var m = {} if metadata == none else (to_plain(metadata) if type(metadata) == "Record" else dict(metadata))
+    var m = {} if metadata == none else (__rec_dict(metadata) if __is_rec(metadata) else dict(metadata))
     m["checkpoint"] = extra
     return save_model(path, tree, m)
 
 fn load_checkpoint(path, verify=true, key=none):
     let tree = load_model(path, verify, key)
     let info = model_info(path).metadata
-    let ck = to_plain(info).get("checkpoint", {}) if type(info) == "Record" else {}
+    let ck = __rec_dict(info).get("checkpoint", {}) if __is_rec(info) else {}
     let params = tree.params if hasattr(tree, "params") else tree
     return record(params=params, optimizer=none, step=ck.get("step", none), config=ck.get("config", none), files={}, metadata=info)
 

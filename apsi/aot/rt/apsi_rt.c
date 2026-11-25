@@ -434,12 +434,18 @@ int a_eq(AV a, AV b) {
         if (a.t == T_FLOAT || b.t == T_FLOAT) return fval(a) == fval(b);
         return a.i == b.i;
     }
+    if (!(a.t == T_OBJ && b.t == T_OBJ && a.o == b.o)) {   /* an instance's __eq__ decides against another kind of value */
+        int ia = a.t == T_OBJ && a.o->kind == O_INST, ib = b.t == T_OBJ && b.o->kind == O_INST;
+        if (ia != ib) {
+            AV x = ia ? a : b, y = ia ? b : a, eq = a_getattr(x, "__eq__");
+            if (eq.t != 255) return a_truthy(a_call(eq, 1, &y, NULL));
+            return 0;
+        }
+    }
     if (a.t != b.t) return 0;
     if (a.t == T_NONE) return 1;
     if (a.o == b.o) return 1;
-    if (a.o->kind != b.o->kind) {
-        return 0;
-    }
+    if (a.o->kind != b.o->kind) return 0;
     switch (a.o->kind) {
     case O_STR: return STR(a)->len == STR(b)->len && !memcmp(STR(a)->s, STR(b)->s, (size_t)STR(a)->len);
     case O_LIST: case O_TUPLE: {
@@ -1761,10 +1767,17 @@ static AV m_str_replace(int n, AV *a, ADict *kw, AV s) {
 }
 static AV m_str_startswith(int n, AV *a, ADict *kw, AV s) { (void)n; (void)kw; AStr *x = STR(a[0]); return a_bool(x->len <= STR(s)->len && !memcmp(STR(s)->s, x->s, (size_t)x->len)); }
 static AV m_str_endswith(int n, AV *a, ADict *kw, AV s) { (void)n; (void)kw; AStr *x = STR(a[0]); return a_bool(x->len <= STR(s)->len && !memcmp(STR(s)->s + STR(s)->len - x->len, x->s, (size_t)x->len)); }
+static int64_t byte_at(AV s, int64_t ch) {       /* the byte offset of character ch (negative: from the end) */
+    if (ch < 0) { ch += STR(s)->nchars; if (ch < 0) ch = 0; }
+    int64_t b = 0, c = 0, L = STR(s)->len;
+    while (b < L && c < ch) { b++; while (b < L && (((unsigned char)STR(s)->s[b]) & 0xC0) == 0x80) b++; c++; }
+    return b;
+}
 static AV m_str_find(int n, AV *a, ADict *kw, AV s) {
-    (void)n; (void)kw;
+    (void)kw;
     AStr *x = STR(a[0]);
-    for (int64_t i = 0; i + x->len <= STR(s)->len; i++) if (!memcmp(STR(s)->s + i, x->s, (size_t)x->len)) {
+    int64_t from = n > 1 && a[1].t == T_INT ? byte_at(s, a[1].i) : 0, to = n > 2 && a[2].t == T_INT ? byte_at(s, a[2].i) : STR(s)->len;
+    for (int64_t i = from; i + x->len <= to; i++) if (!memcmp(STR(s)->s + i, x->s, (size_t)x->len)) {
         int64_t c = 0; for (int64_t b = 0; b < i; b++) if ((((unsigned char)STR(s)->s[b]) & 0xC0) != 0x80) c++;
         return a_int(c);
     }
@@ -2516,8 +2529,9 @@ static AV exc_init_code(AFunc *f, int n, AV *args, ADict *kw) {
     a_ntmp = sp;
     return A_NONE;
 }
+int a_argc = 0; char **a_argv = NULL;
 void a_init(int argc, char **argv) {
-    (void)argc; (void)argv;
+    a_argc = argc; a_argv = argv;
     a_exc = A_NONE;
     for (int i = 0; i < A_NEXC; i++) {
         AV base = a_exc_base[i] >= 0 ? a_exc_classes[a_exc_base[i]] : A_NONE;

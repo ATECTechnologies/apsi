@@ -99,6 +99,10 @@ backward pass walks its graph iteratively, so very deep graphs cannot overflow t
 | `web` | `server()` with routes, hooks, CORS, rate limits, static files, JWT and API keys, on Apsi's own HTTP/1.1 event loop |
 | `crypto` | SHA-2, SHA-3, BLAKE2, SHA-1, MD5, HMAC, scrypt and PBKDF2 password hashes, Base64, secure random numbers |
 | `asyncio` | `import asyncio` / `pyimport("asyncio")`: `async fn`, `await`, run, sleep, gather, create_task, wait_for, Event, Lock, Queue |
+| `special` | gamma, beta, incomplete gamma and beta with their inverses, erf / erfinv, Bessel J and I, elliptic K and E, Legendre, Hermite, Laguerre, Chebyshev, spherical harmonics, zeta, E1 |
+| `signal` | Butterworth filters as second-order sections, `filtfilt` (zero phase, as SciPy), notch, windows, convolution, peaks, Welch spectra, spectrograms, Savitzky–Golay, resampling, Hilbert envelope |
+| `config` | TOML (read by Apsi's own parser), JSON, INI and `.env` settings, the environment and `--set` arguments, defaults with types, `${...}` references |
+| `env`, `log` | `.env` files and secrets; leveled logging to the console and rotating text / JSON files, timers, reading logs back |
 
 Convolutions and max pooling run as C kernels (image columns and the packed matrix product) with their gradients,
 about 1.7× faster than `apsi run` on a small CNN.
@@ -109,7 +113,7 @@ These programs keep running with `apsi run`. A native build that reaches one of 
 
 - graph networks, mixtures of experts and `fit_batches` in `layers`; GGUF, ONNX and PyTorch files in `models`;
   `text_dataset`, `train_tokenizer` and Parquet in `data`; websockets and TLS in `web` (serve HTTPS through a
-  reverse proxy); the modules `db`, `rl`, `tokens`, `torch`, `dataframe`, `quantum`, `medical`
+  reverse proxy); the modules `db`, `rl`, `tokens`, `torch`, `dataframe`, `quantum`, `medical`, `physics` (beyond its constants)
 - Python modules (`pyimport`, `import numpy`), except `asyncio`
 - random numbers: native programs use their own generator, so a seed gives different numbers than in `apsi run`
   (the same seed always gives the same numbers in native programs)

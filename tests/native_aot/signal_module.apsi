@@ -1,0 +1,23 @@
+use signal
+fn r(v) = round(float(v), 8)
+fn rl(t) = [round(float(v), 8) for v in list(t)]
+let sos = butter(4, 0.2)
+print([rl(row) for row in list(sos)])
+print([rl(row) for row in list(butter(2, 10.0, "highpass", 100.0))])
+print(len(list(butter(3, [5.0, 15.0], "bandpass", 100.0))), r(butter(2, [5.0, 15.0], "bandstop", 100.0)[0][0]))
+let t = arange(200) / 100.0
+let x = sin(2 * pi * 3 * t) + 0.5 * sin(2 * pi * 30 * t)
+print(rl(lowpass(x, 10.0, 100.0)[0:6]), rl(highpass(x, 10.0, 100.0)[100:104]), rl(bandpass(x, 20.0, 40.0, 100.0)[50:53]))
+print(rl(notch(x, 30.0, 100.0)[10:13]), rl(sosfilt(sos, x)[0:5]))
+print(rl(hann(5)), rl(hamming(4)), rl(blackman(5)), rl(kaiser(5, 6.0)), rl(hann(4, false)))
+print(rl(convolve([1.0, 2.0, 3.0], [0.0, 1.0, 0.5])), rl(convolve([1.0, 2.0, 3.0], [0.0, 1.0, 0.5], "same")), rl(correlate([1.0, 2.0, 3.0], [1.0, 1.0], "valid")))
+let pk = find_peaks(x, height=0.5, distance=5)
+print(list(pk.indices), pk.count, rl(pk.prominences[0:3]))
+let w = welch(x, fs=100.0, nperseg=64)
+print(rl(w.f[0:4]), rl(w.psd[0:4]))
+let sp = spectrogram(x, fs=100.0, nperseg=32)
+print(shape(sp.power), rl(sp.t[0:3]))
+print(rl(detrend(tensor([1.0, 2.5, 2.9, 4.2, 5.0]))), rl(moving_average(tensor([1.0, 2.0, 3.0, 4.0, 5.0]), 3)))
+print(rl(savgol(x, 11, 3)[0:4]), rl(resample(x, 50)[0:4]), rl(envelope(x)[90:93]))
+let fz = freqz(sos, 8)
+print(rl(fz.magnitude), rl(fz.phase))

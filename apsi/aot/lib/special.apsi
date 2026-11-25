@@ -1,0 +1,231 @@
+# use special: special functions for native programs, on numbers and elementwise on tensors (the same algorithms as
+# apsi run: incomplete gamma / beta by continued fractions, Bessel functions by series and periodic quadrature,
+# elliptic integrals by the AGM, orthogonal polynomials by their recurrences).
+use _complex
+
+fn _map(f, x):
+    if isinstance(x, list):
+        return tensor([f(float(v)) for v in x])
+    if ndim(x) > 0:
+        return reshape(tensor([f(float(v)) for v in tolist(flatten(tensor(x, f64)))]), *shape(x))
+    return f(float(x))
+
+fn _map2(f, a, x):
+    if ndim(a) == 0 and not isinstance(a, list):
+        return _map(fn(v) => f(float(a), v), x)
+    let av = tolist(flatten(tensor(a, f64)))
+    let xv = tolist(flatten(tensor(x, f64)))
+    return reshape(tensor([f(av[i], xv[i]) for i in range(len(av))]), *shape(tensor(a)))
+
+fn gamma(x) = _map(fn(v) => __gamma1(v), x)
+fn __gamma1(v) = exp(lgamma(v)) * (-1.0 if v < 0 and int(floor(v)) % 2 == 1 else 1.0) if v != floor(v) or v > 0 else nan
+fn lgamma(x) = _map(fn(v) => __special("gammaln", v), x)
+fn digamma(x) = __special("digamma", x)
+fn lbeta(a, b) = lgamma(a) + lgamma(b) - lgamma(a + b)
+fn beta(a, b) = exp(lbeta(a, b))
+fn factorial(n) = __fact(int(n))
+fn __fact(n):
+    if n < 0:
+        raise ValueError("factorial of a negative number")
+    var r = 1
+    for k in 2..n + 1:
+        r = r * k
+    return r
+fn comb(n, k):
+    let N = int(n)
+    let K = int(k)
+    if K < 0 or K > N:
+        return 0
+    var r = 1
+    for i in range(min(K, N - K)):
+        r = r * (N - i) // (i + 1)
+    return r
+fn perm(n, k):
+    let N = int(n)
+    let K = int(k)
+    if K < 0 or K > N:
+        return 0
+    var r = 1
+    for i in range(K):
+        r = r * (N - i)
+    return r
+fn erf(x) = _map(fn(v) => erf(v), x)
+fn erfc(x) = _map(fn(v) => erfc(v), x)
+fn erfinv(y) = __special("erfinv", y)
+fn erfcinv(y) = _map(fn(v) => __special("erfinv", 1.0 - v), y)
+fn gammainc(a, x) = _map2(fn(p, v) => __special("gammainc", v, p), a, x)
+fn gammaincc(a, x) = _map2(fn(p, v) => __special("gammaincc", v, p), a, x)
+fn gammaincinv(a, p) = _map2(fn(q, v) => __special("gammaincinv", v, q), a, p)
+fn betainc(a, b, x) = _map(fn(v) => __special("betainc", v, float(a), float(b)), x)
+fn betaincinv(a, b, p) = _map(fn(v) => __special("betaincinv", v, float(a), float(b)), p)
+
+fn __bessel_series(n, x, sign):
+    let m = abs(n)
+    let h = x / 2
+    var term = h ** m / __fact(m)
+    var tot = term
+    let q = sign * h * h
+    for k in 1..160:
+        term = term * q / (k * (k + m))
+        tot = tot + term
+    return tot
+
+fn __quad_periodic(g, x, n):
+    let N = int(2 * (abs(x) + abs(n)) + 64)
+    var s = 0.0
+    for i in range(N):
+        s = s + g(x, (i + 0.5) * (pi / N))
+    return s / N
+
+fn besselj(n, x):
+    let k = int(n)
+    fn one(v):
+        if abs(v) <= max(2.0, sqrt(abs(k) + 1)):
+            let r = __bessel_series(k, v, -1.0)
+            return -r if k < 0 and k % 2 != 0 else r
+        return __quad_periodic(fn(xx, t) => cos(k * t - xx * sin(t)), v, k)
+    return _map(one, x)
+
+fn besseli(n, x):
+    let k = abs(int(n))
+    fn one(v):
+        if abs(v) <= 50.0:
+            return __bessel_series(k, v, 1.0)
+        return __quad_periodic(fn(xx, t) => exp(xx * cos(t)) * cos(k * t), v, k)
+    return _map(one, x)
+
+fn ellipk(m):
+    fn one(v):
+        if v == 1:
+            return inf
+        if v > 1:
+            return nan
+        var a = 1.0
+        var b = sqrt(1 - v)
+        for i in range(40):
+            let a2 = (a + b) / 2
+            b = sqrt(a * b)
+            a = a2
+        return pi / (2 * a)
+    return _map(one, m)
+
+fn ellipe(m):
+    fn one(v):
+        if v == 1:
+            return 1.0
+        if v > 1:
+            return nan
+        var a = 1.0
+        var b = sqrt(1 - v)
+        var c2 = v / 2
+        var p = 0.5
+        for i in range(40):
+            let c = (a - b) / 2
+            let a2 = (a + b) / 2
+            b = sqrt(a * b)
+            a = a2
+            p = p * 2
+            c2 = c2 + p * c * c
+        return pi / (2 * a) * (1 - c2)
+    return _map(one, m)
+
+fn __rec(n, x, p0, p1, step):
+    if n < 0:
+        raise ValueError("polynomial degree must be >= 0")
+    var a = p0(x)
+    var b = p1(x)
+    if n == 0:
+        return a
+    for k in 1..n:
+        let c = step(k, x, a, b)
+        a = b
+        b = c
+    return b
+
+fn legendre(n, x) = __rec(int(n), x, fn(v) => ones_like(v) if ndim(v) > 0 else 1.0, fn(v) => v, fn(k, v, a, b) => ((2 * k + 1) * v * b - k * a) / (k + 1))
+fn hermite(n, x) = __rec(int(n), x, fn(v) => ones_like(v) if ndim(v) > 0 else 1.0, fn(v) => 2 * v, fn(k, v, a, b) => 2 * v * b - 2 * k * a)
+fn hermite_e(n, x) = __rec(int(n), x, fn(v) => ones_like(v) if ndim(v) > 0 else 1.0, fn(v) => v, fn(k, v, a, b) => v * b - k * a)
+fn laguerre(n, x, alpha=0.0) = __rec(int(n), x, fn(v) => ones_like(v) if ndim(v) > 0 else 1.0, fn(v) => 1 + alpha - v, fn(k, v, a, b) => ((2 * k + 1 + alpha - v) * b - (k + alpha) * a) / (k + 1))
+fn chebyshev(n, x) = __rec(int(n), x, fn(v) => ones_like(v) if ndim(v) > 0 else 1.0, fn(v) => v, fn(k, v, a, b) => 2 * v * b - a)
+
+fn assoc_legendre(l, m, x):
+    let L = int(l)
+    let M = int(m)
+    let am = abs(M)
+    fn one(v):
+        if am > L:
+            return 0.0
+        var pmm = 1.0
+        let s = sqrt(max(1 - v * v, 0.0))
+        var f = 1.0
+        for i in range(am):
+            pmm = -pmm * f * s
+            f = f + 2
+        var r = pmm
+        if L != am:
+            var pmm1 = v * (2 * am + 1) * pmm
+            if L != am + 1:
+                for ll in (am + 2)..(L + 1):
+                    let pll = (v * (2 * ll - 1) * pmm1 - (ll + am - 1) * pmm) / (ll - am)
+                    pmm = pmm1
+                    pmm1 = pll
+            r = pmm1
+        if M < 0:
+            r = (-1.0) ** am * __fact(L - am) / __fact(L + am) * r
+        return r
+    return _map(one, x)
+
+fn sph_harm(l, m, theta, phi):
+    let L = int(l)
+    let M = int(m)
+    let norm = sqrt((2 * L + 1) / (4 * pi) * __fact(L - M) / __fact(L + M)) if abs(M) <= L else 0.0
+    let plm = assoc_legendre(L, M, cos(theta))
+    return Complex(norm * plm * cos(M * phi), norm * plm * sin(M * phi))
+
+fn zeta(s):
+    fn one(v):
+        if v <= 1:
+            return inf if v == 1 else nan
+        let N = 20
+        var tot = 0.0
+        for k in 1..N:
+            tot = tot + k ** -v
+        tot = tot + N ** (1 - v) / (v - 1) + 0.5 * N ** -v
+        let B = [1 / 6, -1 / 30, 1 / 42, -1 / 30, 5 / 66, -691 / 2730, 7 / 6]
+        var term = v * N ** (-v - 1)
+        for j in range(len(B)):
+            tot = tot + B[j] / __fact(2 * j + 2) * term
+            term = term * (v + 2 * j + 1) * (v + 2 * j + 2) / (N * N)
+        return tot
+    return _map(one, s)
+
+fn expint(x):
+    fn one(v):
+        if v <= 0:
+            return inf if v == 0 else nan
+        if v < 1:
+            var s = 0.0
+            var term = 1.0
+            for k in 1..200:
+                term = term * -v / k
+                s = s + term / k
+                if abs(term / k) < 1e-17:
+                    break
+            return -0.5772156649015329 - log(v) - s
+        var b = v + 1
+        var c = 1e300
+        var d = 1 / b
+        var h = d
+        for i in 1..10000:
+            let an = -i * i
+            b = b + 2
+            d = 1 / (an * d + b)
+            c = b + an / c
+            let de = c * d
+            h = h * de
+            if abs(de - 1) < 1e-16:
+                break
+        return exp(-v) * h
+    return _map(one, x)
+
+fn sinc(x) = _map(fn(v) => 1.0 if v == 0 else sin(pi * v) / (pi * v), x)

@@ -1,0 +1,16 @@
+use log
+console(false)
+to_file("app.log")
+to_file("app.jsonl", format="json")
+info("server started", port=8080)
+let db = named("db", host="local")
+db.warn("slow query", ms=120, sql="select 1")
+debug("details")
+with timer("work"):
+    let x = 1 + 1
+for r in read("app.log"):
+    print(r["level"], r["name"], r["message"].split(" took")[0], r["fields"])
+let js = read("app.jsonl", level="warn")
+print(len(js), js[0]["name"], js[0]["fields"]["ms"])
+print(len(read("app.log", grep="slow")), level())
+close()

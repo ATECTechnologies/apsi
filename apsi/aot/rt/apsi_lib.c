@@ -603,6 +603,67 @@ static const TEnt lib_globals[] = {
 
 BI(lb_gen_step) { (void)self; (void)kw; return a_gen_step(a[0], n > 1 ? a[1] : A_NONE); }
 BI(lb_is_coro) { (void)self; (void)kw; (void)n; return a_bool(a_is_coro(a[0])); }
+BI(lb_builtin) { (void)self; (void)kw; (void)n; return a_global_builtin(lib_str(a[0], "builtin")->s); }
+BI(lb_setenv) {
+    (void)self; (void)kw; (void)n; const char *k = lib_str(a[0], "setenv")->s;
+#ifdef _WIN32
+    _putenv_s(k, a[1].t == T_NONE ? "" : lib_str(a[1], "setenv")->s);
+#else
+    if (a[1].t == T_NONE) unsetenv(k); else setenv(k, lib_str(a[1], "setenv")->s, 1);
+#endif
+    return A_NONE;
+}
+extern int a_argc; extern char **a_argv;
+#ifndef _WIN32
+extern char **environ;
+#endif
+BI(lb_argv) {                                /* the program's arguments after its own name */
+    (void)self; (void)kw; (void)n; (void)a; AV l = a_list(0, NULL); int sp = a_ntmp; A_PUSH(l);
+    for (int i = 1; i < a_argc; i++) a_list_append((AList *)l.o, a_str(a_argv[i]));
+    a_ntmp = sp; return l;
+}
+BI(lb_environ_names) {
+    (void)self; (void)kw; (void)n; (void)a; AV l = a_list(0, NULL); int sp = a_ntmp; A_PUSH(l);
+#ifdef _WIN32
+    char **env = _environ;
+#else
+    char **env = environ;
+#endif
+    for (char **e = env; e && *e; e++) { const char *q = strchr(*e, '='); if (q && q != *e) a_list_append((AList *)l.o, a_strn(*e, q - *e)); }
+    a_ntmp = sp; return l;
+}
+BI(lb_rec_dict) {                           /* a record's (or an instance's) fields as a new dict */
+    (void)self; (void)kw; (void)n; if (!a_is(a[0], O_INST)) return a[0];
+    ADict *d = ((AInst *)a[0].o)->attrs; AV out = a_dict(); int sp = a_ntmp; A_PUSH(out);
+    for (int64_t i = 0; i < d->nent; i++) if (d->e[i].used) a_dict_set((ADict *)out.o, d->e[i].k, d->e[i].v);
+    a_ntmp = sp; return out;
+}
+BI(lb_is_rec) { (void)self; (void)kw; (void)n; return a_bool(a_is(a[0], O_INST) && ((AInst *)a[0].o)->cls->name && !strcmp(((AInst *)a[0].o)->cls->name->s, "record")); }
+/* __localtime(form): "stamp" -> 2026-11-25 07:30:12.345, "iso" -> 2026-11-25T07:30:12.345+07:00, "date" */
+BI(lb_localtime) {
+    (void)self; (void)kw; const char *form = n ? lib_str(a[0], "localtime")->s : "stamp";
+    double t = now_s(); time_t sec = (time_t)t; int ms = (int)((t - (double)sec) * 1000); struct tm tmv;
+#ifdef _WIN32
+    localtime_s(&tmv, &sec);
+#else
+    localtime_r(&sec, &tmv);
+#endif
+    char b[64];
+    if (!strcmp(form, "date")) strftime(b, sizeof b, "%Y-%m-%d", &tmv);
+    else if (!strcmp(form, "iso")) {
+        char z[16]; strftime(z, sizeof z, "%z", &tmv); size_t k = strftime(b, sizeof b, "%Y-%m-%dT%H:%M:%S", &tmv);
+        snprintf(b + k, sizeof b - k, ".%03d%.3s:%.2s", ms, z, z[0] ? z + 3 : "00");
+    } else { size_t k = strftime(b, sizeof b, "%Y-%m-%d %H:%M:%S", &tmv); snprintf(b + k, sizeof b - k, ".%03d", ms); }
+    return a_str(b);
+}
+BI(lb_isatty) {
+    (void)self; (void)kw; (void)n; (void)a;
+#ifdef _WIN32
+    return a_bool(_isatty(2));
+#else
+    return a_bool(isatty(2));
+#endif
+}
 BI(lb_is_dev) { (void)self; (void)kw; (void)n; AV v = deepval(a[0]); return a_bool(is_t(v) && TT(v)->dev); }
 static const TEnt lib_builtins[] = {
     {"__hash", lb_hash}, {"__hmac", lb_hmac}, {"__b64enc", lb_b64enc}, {"__b64dec", lb_b64dec}, {"__crc32", lb_crc32},
@@ -610,5 +671,5 @@ static const TEnt lib_builtins[] = {
     {"__password_hash", lb_password_hash}, {"__password_verify", lb_password_verify},
     {"__la", lb_la}, {"__fft", lb_fft}, {"__special", lb_special}, {"__conv2d", lb_conv2d}, {"__maxpool2d", lb_maxpool2d},
     {"__time", lb_time}, {"__sleep", lb_sleep}, {"__fs", lb_fs}, {"__st_load", lb_st_load}, {"__st_save", lb_st_save},
-    {"__npy_load", lb_npy_load}, {"__npy_save", lb_npy_save}, {"__http_serve", lb_http_serve}, {"__is_dev", lb_is_dev}, {"__gen_step", lb_gen_step}, {"__is_coro", lb_is_coro},
+    {"__npy_load", lb_npy_load}, {"__npy_save", lb_npy_save}, {"__http_serve", lb_http_serve}, {"__is_dev", lb_is_dev}, {"__localtime", lb_localtime}, {"__isatty", lb_isatty}, {"__rec_dict", lb_rec_dict}, {"__is_rec", lb_is_rec}, {"__argv", lb_argv}, {"__environ_names", lb_environ_names}, {"__builtin", lb_builtin}, {"__setenv", lb_setenv}, {"__gen_step", lb_gen_step}, {"__is_coro", lb_is_coro},
     {NULL, NULL}};

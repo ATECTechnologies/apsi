@@ -1,0 +1,7 @@
+use env
+write_text("t.env", "A=1\nexport B = two # comment\nC=\"line\\nnext ${A}\"\nD='raw $A'\n# x\nE=$B-x\nLIST=a, b ,c\n")
+print(env.load("t.env"))
+print(env.get("A"), env.get("B"), env.get("C"), env.get("D"), env.get("E"))
+print(env.int("A") + 1, env.float("A"), env.bool("A"), env.list("LIST"), env.has("A"), env.has("NOPE_X"))
+print(env.get("NOPE_X", "dflt"), env.secret("B"), len(env.secret("B")), env.secret("B") == "two")
+print(env.parse("X=5\nY=${X}0"))

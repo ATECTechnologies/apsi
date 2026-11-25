@@ -1,0 +1,9 @@
+use special
+fn r(v) = round(v, 9)
+print(r(gamma(4.5)), r(gamma(-1.5)), r(lgamma(10.0)), r(digamma(3.0)), r(beta(2.0, 3.0)), factorial(10), comb(10, 3), perm(5, 2))
+print(r(erfinv(0.5)), r(erfcinv(0.3)), r(gammainc(2.0, 1.5)), r(gammaincc(2.0, 1.5)), r(gammaincinv(2.0, 0.4)))
+print(r(betainc(2.0, 3.0, 0.4)), r(betaincinv(2.0, 3.0, 0.5)))
+print(r(besselj(0, 2.5)), r(besselj(1, 10.0)), r(besselj(3, 30.0)), r(besseli(1, 2.0)), r(besseli(2, 60.0) / 1e24))
+print(r(ellipk(0.5)), r(ellipe(0.5)), r(legendre(3, 0.4)), r(hermite(4, 1.1)), r(hermite_e(3, 0.7)), r(laguerre(3, 0.5, 1.0)), r(chebyshev(5, 0.3)))
+print(r(assoc_legendre(3, 2, 0.4)), r(assoc_legendre(3, -1, 0.4)), r(zeta(2.0)), r(zeta(3.5)), r(expint(0.5)), r(expint(3.0)), r(sinc(0.25)))
+print([r(v) for v in list(legendre(2, tensor([0.1, 0.2])))], [r(v) for v in list(besselj(0, tensor([1.0, 5.0])))])
