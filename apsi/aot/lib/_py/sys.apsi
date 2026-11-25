@@ -9,3 +9,16 @@ fn getrecursionlimit() = 100000
 fn setrecursionlimit(n):
     pass
 let byteorder = "little"
+class _Stream:
+    fn __init__(self, err):
+        self.err = err
+    fn write(self, s):
+        if self.err:
+            write_err(s)
+        else:
+            write_out(s)
+        return len(s)
+    fn flush(self):
+        pass
+let stdout = _Stream(false)
+let stderr = _Stream(true)

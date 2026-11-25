@@ -30,7 +30,7 @@ typedef struct AStr { AObj h; int64_t len; int64_t nchars; uint64_t hash; int as
 typedef struct AList { AObj h; int64_t len, cap; AV *v; } AList;           /* list and tuple */
 typedef struct ABArr { AObj h; AV data; int64_t cap; } ABArr;              /* bytearray: an O_BYTES of cap bytes, len in use */
 typedef struct ADEnt { AV k, v; uint64_t hash; int used; } ADEnt;
-typedef struct ADict { AObj h; int64_t len, nent, cap; ADEnt *e; int64_t *idx; int64_t icap; } ADict;  /* dict, set */
+typedef struct ADict { AObj h; int64_t len, nent, cap; ADEnt *e; int64_t *idx; int64_t icap; ADEnt ie[4]; int64_t iidx[8]; } ADict;  /* dict, set: small ones inline */
 typedef struct ACell { AObj h; AV v; } ACell;
 struct AFunc;
 typedef AV (*AFnCode)(struct AFunc *self, int n, AV *args, ADict *kw);
@@ -40,7 +40,7 @@ typedef struct AFunc {
     int ndef; AV *defaults;               /* defaults of the last ndef parameters */
     int nreq;                             /* positional parameters without a default (-1: unknown) */
 } AFunc;
-typedef struct AClass { AObj h; AStr *name; struct AClass *base; ADict *attrs; int nfields; AStr **fields; int is_struct; int has_setattr; } AClass;
+typedef struct AClass { AObj h; AStr *name; struct AClass *base; ADict *attrs; int nfields; AStr **fields; int is_struct; int has_setattr; int has_descr; } AClass;
 typedef struct AInst { AObj h; AClass *cls; ADict *attrs; } AInst;
 typedef struct ABound { AObj h; AV self, fn; } ABound;
 typedef struct ARange { AObj h; int64_t start, stop, step; } ARange;

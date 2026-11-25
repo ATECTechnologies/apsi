@@ -112,7 +112,7 @@ void a_mark_value(AV v) { mark(v); }
 static void free_obj(AObj *o) {
     switch (o->kind) {
     case O_LIST: case O_TUPLE: free(((AList *)o)->v); break;
-    case O_DICT: case O_SET: free(((ADict *)o)->e); free(((ADict *)o)->idx); break;
+    case O_DICT: case O_SET: { ADict *d = (ADict *)o; if (d->e != d->ie) free(d->e); if (d->idx != d->iidx) free(d->idx); break; }
     case O_FUNC: free(((AFunc *)o)->cells); free(((AFunc *)o)->defaults); break;
     case O_CLASS: free(((AClass *)o)->fields); break;
     case O_GEN: gen_free((struct AGen *)o); break;
@@ -245,10 +245,10 @@ void a_list_append(AList *l, AV v) {
 }
 
 static ADict *new_dict(AKind kind) {
-    ADict *d = (ADict *)a_alloc(sizeof(ADict), kind);
-    d->cap = 8; d->e = (ADEnt *)xmalloc(sizeof(ADEnt) * 8); memset(d->e, 0, sizeof(ADEnt) * 8);
-    d->icap = 16; d->idx = (int64_t *)xmalloc(sizeof(int64_t) * 16);
-    for (int i = 0; i < 16; i++) d->idx[i] = -1;
+    ADict *d = (ADict *)a_alloc(sizeof(ADict), kind);     /* zeroed: the inline entries are empty */
+    d->cap = 4; d->e = d->ie;
+    d->icap = 8; d->idx = d->iidx;
+    for (int i = 0; i < 8; i++) d->idx[i] = -1;
     return d;
 }
 AV a_dict(void) { return a_obj(new_dict(O_DICT)); }
@@ -259,8 +259,10 @@ static void dict_rehash(ADict *d) {
     int64_t j = 0;
     for (int64_t i = 0; i < d->nent; i++) if (d->e[i].used) d->e[j++] = d->e[i];
     d->nent = j;
+    int64_t old = d->icap;
     while (d->icap < (d->len + 1) * 3) d->icap *= 2;
-    d->idx = (int64_t *)xrealloc(d->idx, sizeof(int64_t) * (size_t)d->icap);
+    if (d->idx == d->iidx) { if (d->icap > 8) d->idx = (int64_t *)xmalloc(sizeof(int64_t) * (size_t)d->icap); }
+    else if (d->icap != old) d->idx = (int64_t *)xrealloc(d->idx, sizeof(int64_t) * (size_t)d->icap);
     for (int64_t i = 0; i < d->icap; i++) d->idx[i] = -1;
     for (int64_t i = 0; i < d->nent; i++) {
         uint64_t p = d->e[i].hash & (uint64_t)(d->icap - 1);
@@ -273,7 +275,11 @@ static int64_t dict_find(ADict *d, AV k, uint64_t h, uint64_t *slot) {
     for (;;) {
         int64_t i = d->idx[p];
         if (i == -1) { if (slot) *slot = p; return -1; }
-        if (i >= 0 && d->e[i].used && d->e[i].hash == h && a_eq(d->e[i].k, k)) { if (slot) *slot = p; return i; }
+        if (i >= 0 && d->e[i].used && d->e[i].hash == h) {
+            AV ek = d->e[i].k;
+            if ((ek.t == k.t && ek.i == k.i) || (ek.t == T_OBJ && k.t == T_OBJ && ek.o->kind == O_STR && k.o->kind == O_STR
+                    ? (STR(ek)->len == STR(k)->len && !memcmp(STR(ek)->s, STR(k)->s, (size_t)STR(k)->len)) : a_eq(ek, k))) { if (slot) *slot = p; return i; }
+        }
         p = (p + 1) & (uint64_t)(d->icap - 1);
     }
 }
@@ -282,7 +288,11 @@ void a_dict_set(ADict *d, AV k, AV v) {
     int64_t i = dict_find(d, k, h, &slot);
     if (i >= 0) { d->e[i].v = v; return; }
     if ((d->nent + 1) * 3 > d->icap * 2 || d->nent + 1 > d->cap) {
-        if (d->nent + 1 > d->cap) { d->cap *= 2; d->e = (ADEnt *)xrealloc(d->e, sizeof(ADEnt) * (size_t)d->cap); }
+        if (d->nent + 1 > d->cap) {
+            d->cap *= 2;
+            if (d->e == d->ie) { ADEnt *ne = (ADEnt *)xmalloc(sizeof(ADEnt) * (size_t)d->cap); memcpy(ne, d->ie, sizeof d->ie); d->e = ne; }
+            else d->e = (ADEnt *)xrealloc(d->e, sizeof(ADEnt) * (size_t)d->cap);
+        }
         dict_rehash(d);
         dict_find(d, k, h, &slot);
     }
@@ -1875,8 +1885,21 @@ void a_unpack(AV v, int n, AV *out) {
 }
 
 /* =================================================================== attributes and calls */
+/* names looked up by C code (class_lookup, descriptors): one string object each, made once */
+static AV intern_tab[2048]; static int intern_n = 0, intern_rooted = 0;
+static AV a_intern(const char *name) {
+    size_t len = strlen(name); uint64_t h = 1469598103934665603ULL; for (size_t i = 0; i < len; i++) h = (h ^ (unsigned char)name[i]) * 1099511628211ULL;
+    if (!intern_rooted) { for (int i = 0; i < 2048; i++) intern_tab[i] = A_NONE; a_root(intern_tab, 2048); intern_rooted = 1; }
+    size_t p = h & 2047;
+    for (int tries = 0; tries < 2048; tries++, p = (p + 1) & 2047) {
+        AV v = intern_tab[p];
+        if (v.t == T_NONE) { if (intern_n > 1500) return a_str(name); AV s = a_strn(name, (int64_t)len); intern_tab[p] = s; intern_n++; return s; }
+        if ((size_t)STR(v)->len == len && !memcmp(STR(v)->s, name, len)) return v;
+    }
+    return a_str(name);
+}
 static AV class_lookup(AClass *c, const char *name) {
-    AV k = a_str(name), v;
+    AV k = a_intern(name), v;
     for (; c; c = c->base) if (a_dict_get(c->attrs, k, &v)) return v;
     v.t = 255; v.i = 0; return v;
 }
@@ -1892,7 +1915,13 @@ static int descr_kind(AV v) {
     const char *n = ((AInst *)v.o)->cls->name->s;
     return !strcmp(n, "property") ? 1 : !strcmp(n, "classmethod") ? 2 : !strcmp(n, "staticmethod") ? 3 : 0;
 }
-static AV descr_field(AV d, const char *f) { AV v; if (a_dict_get(((AInst *)d.o)->attrs, a_str(f), &v)) return v; return A_NONE; }
+static AV descr_field(AV d, const char *f) { AV v; if (a_dict_get(((AInst *)d.o)->attrs, a_intern(f), &v)) return v; return A_NONE; }
+static int class_has_descr(AClass *c) {                        /* any property / classmethod / staticmethod (cached) */
+    if (c->has_descr) return c->has_descr > 0;
+    int any = 0;
+    for (AClass *x = c; x && !any; x = x->base) for (int64_t i = 0; i < x->attrs->nent; i++) if (x->attrs->e[i].used && descr_kind(x->attrs->e[i].v)) { any = 1; break; }
+    c->has_descr = any ? 1 : -1; return any;
+}
 AV a_getattr(AV o, const char *name) {
     if (a_is(o, O_INST) && !strcmp(name, "__class__")) return a_obj(((AInst *)o.o)->cls);
     if (a_is(o, O_BUILTIN) && !strcmp(((ABuiltin *)o.o)->name, "bytes") && !strcmp(name, "fromhex")) return a_builtin("fromhex", b_bytes_fromhex, A_NONE);
@@ -2006,7 +2035,7 @@ AV a_attr(AV o, const char *name) {
 }
 void a_setattr(AV o, const char *name, AV v) {
     if (a_is(o, O_INST)) {
-        AV pd = class_lookup(((AInst *)o.o)->cls, name);
+        AV pd = class_has_descr(((AInst *)o.o)->cls) ? class_lookup(((AInst *)o.o)->cls, name) : A_NONE;
         if (descr_kind(pd) == 1) { AV st = descr_field(pd, "fset"); if (st.t == T_NONE) a_error("AttributeError", "property '%s' has no setter", name); AV args[2] = {o, v}; a_call(st, 2, args, NULL); return; }
         AV f = class_lookup(((AInst *)o.o)->cls, "__setattr__");      /* the class decides what x.name = v does */
         if (f.t != 255 && a_is(f, O_FUNC)) { int sp = a_ntmp; AV args[3] = {o, a_str(name), v}; A_PUSH(args[1]); a_call(f, 3, args, NULL); a_ntmp = sp; return; }
@@ -2652,7 +2681,13 @@ static AV method_of(AV o, const char *name) {
 /* =================================================================== built-in functions */
 static AV b_print(int n, AV *a, ADict *kw, AV self) {
     (void)self;
-    AV sep = kwarg(kw, "sep", A_NONE), end = kwarg(kw, "end", A_NONE);
+    AV sep = kwarg(kw, "sep", A_NONE), end = kwarg(kw, "end", A_NONE), file = a_pymode ? kwarg(kw, "file", A_NONE) : A_NONE;
+    if (file.t != T_NONE) {                                    /* print(…, file=f): f.write(text), as Python */
+        SB b = {0};
+        for (int i = 0; i < n; i++) { if (i) { if (a_is(sep, O_STR)) sb_put(&b, STR(sep)->s, STR(sep)->len); else sb_puts(&b, " "); } AV s = a_to_str(a[i]); sb_put(&b, STR(s)->s, STR(s)->len); }
+        if (a_is(end, O_STR)) sb_put(&b, STR(end)->s, STR(end)->len); else sb_puts(&b, "\n");
+        AV text = sb_done(&b); int sp = a_ntmp; A_PUSH(text); a_call(a_attr(file, "write"), 1, &text, NULL); a_ntmp = sp; return A_NONE;
+    }
     for (int i = 0; i < n; i++) {
         if (i) { if (a_is(sep, O_STR)) fwrite(STR(sep)->s, 1, (size_t)STR(sep)->len, stdout); else fputc(' ', stdout); }
         AV s = a_to_str(a[i]); fwrite(STR(s)->s, 1, (size_t)STR(s)->len, stdout);
@@ -3248,7 +3283,7 @@ AV a_attrk(AV o, AV key) {
     return a_attr(o, STR(key)->s);
 }
 void a_setattrk(AV o, AV key, AV v) {
-    if (a_is(o, O_INST) && a_is(key, O_STR)) {
+    if (a_is(o, O_INST) && a_is(key, O_STR) && class_has_descr(((AInst *)o.o)->cls)) {
         AV pd = class_lookup(((AInst *)o.o)->cls, STR(key)->s);
         if (descr_kind(pd) == 1) { AV st = descr_field(pd, "fset"); if (st.t == T_NONE) a_error("AttributeError", "property '%s' has no setter", STR(key)->s); AV args[2] = {o, v}; a_call(st, 2, args, NULL); return; }
     }
