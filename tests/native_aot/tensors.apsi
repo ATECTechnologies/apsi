@@ -13,3 +13,9 @@ print(sum(tensor([1.0, 2.0])), mean(tensor([1.0, 2.0])), tensor([3.0, 1.0])[0])
 print(0, linspace(0, 1, 5))
 print(f"{tensor([1.0,2.0])}")
 print(zeros(100, 100))
+
+# ... in indices
+var ell = zeros(2, 3, 4)
+ell[...] = 1.0
+ell[..., 1] = 5.0
+print(float(sum(ell)), shape(ell[..., 0]), shape(ell[0, ...]), shape(ell[0, ..., 1]))

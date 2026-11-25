@@ -3295,11 +3295,18 @@ static const BEnt a_builtins[] = {
     {"native", b_identity}, {"gpu", b_identity}, {"memo", b_identity},
     {NULL, NULL}};
 
+/* `...` in an index: one static slice object, outside the collected heap */
+static ASlice ellipsis_obj;
+AV a_ellipsis(void) {
+    if (ellipsis_obj.h.kind != O_SLICE) { ellipsis_obj.h.kind = O_SLICE; ellipsis_obj.h.mark = 1; ellipsis_obj.lo = A_NONE; ellipsis_obj.hi = A_NONE; ellipsis_obj.step = A_NONE; }
+    return a_obj(&ellipsis_obj);
+}
 AV a_global_builtin(const char *name) {
     for (int i = 0; i < A_NEXC; i++) if (!strcmp(a_exc_names[i], name)) return a_exc_classes[i];
     if (!strcmp(name, "Error")) return a_exc_classes[31];
     if (!strcmp(name, "IOError") || !strcmp(name, "EnvironmentError")) return a_exc_classes[17];
     if (!strcmp(name, "pi")) return a_float(3.141592653589793);
+    if (!strcmp(name, "Ellipsis")) return a_ellipsis();
     if (!strcmp(name, "tau")) return a_float(6.283185307179586);
     /* the storage formats are named as in apsi run (use precision reads the name); a tensor stores them as
        float32 / int64 */

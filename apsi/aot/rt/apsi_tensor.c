@@ -834,6 +834,15 @@ static int build_sels(ATensor *a, AV index, Sel *sels, int *newaxes) {
     AV items[MAXD + 1]; int ni = 0;
     if (a_is(index, O_TUPLE)) { AList *l = (AList *)index.o; if (l->len > MAXD) a_error("IndexError", "too many indices"); for (int64_t i = 0; i < l->len; i++) items[ni++] = l->v[i]; }
     else items[ni++] = index;
+    for (int i = 0; i < ni; i++) if (items[i].t == T_OBJ && items[i].o == a_ellipsis().o) {   /* `...`: as many whole axes as needed */
+        int fill = a->nd - (ni - 1); if (fill < 0) a_error("IndexError", "too many indices for a tensor of %d dimensions", a->nd);
+        AV rest[MAXD + 1]; int nr = 0;
+        for (int j = i + 1; j < ni; j++) rest[nr++] = items[j];
+        AV whole = a_obj(&((ASlice *)a_ellipsis().o)->h);
+        for (int k = 0; k < fill; k++) items[i + k] = whole;
+        for (int j = 0; j < nr; j++) items[i + fill + j] = rest[j];
+        ni = i + fill + nr; break;
+    }
     if (ni > a->nd) a_error("IndexError", "too many indices for a tensor of %d dimensions", a->nd);
     for (int d = 0; d < a->nd; d++) {
         if (d >= ni) { sels[d] = (Sel){1, 0, 1, a->sh[d], A_NONE}; continue; }

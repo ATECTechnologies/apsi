@@ -33,7 +33,7 @@ def _builtin_names():
     exc = re.search(r"a_exc_names\[A_NEXC\] = \{(.*?)\};", src, re.S).group(1)
     names |= set(re.findall(r'"([A-Za-z]+)"', exc))
     return names | {"cload", "ptr_f64", "ptr_f32", "ptr_i64", "ptr_i32", "ptr_u8", "ptr_void", "void", "cstr", "u8",
-                    "u16", "u32", "u64", "i8", "i16"} | {"pi", "e", "inf", "nan", "Error", "IOError", "EnvironmentError", "f64", "fp64", "f32", "fp32",
+                    "u16", "u32", "u64", "i8", "i16"} | {"pi", "e", "inf", "nan", "Ellipsis", "Error", "IOError", "EnvironmentError", "f64", "fp64", "f32", "fp32",
                     "f16", "fp16", "bf16", "i64", "i32", "int8", "uint8", "int4"}
 
 
