@@ -1,0 +1,15 @@
+class C:
+    var x = 0
+    fn __enter__(self):
+        print("enter")
+        return self
+    fn __exit__(self, kind, value, tb):
+        print("exit", kind, value)
+        return false
+try:
+    with C():
+        raise ValueError("boom")
+except ValueError as e:
+    print("caught", e)
+with C():
+    print("body")

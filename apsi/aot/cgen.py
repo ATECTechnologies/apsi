@@ -1603,7 +1603,14 @@ class CGen:
                 ks = kinds if isinstance(kinds, list) else [kinds]
                 parts = []
                 for k in ks:
-                    kv = self.load(k) if isinstance(k, str) else self.expr(k)
+                    if isinstance(k, str) and "." in k:          # except db.DatabaseError: a module's class
+                        obj, *attrs = k.split(".")
+                        node = A.Name(obj)
+                        for at in attrs:
+                            node = A.Attr(node, at)
+                        kv = self.hold(self.expr(node))
+                    else:
+                        kv = self.load(k) if isinstance(k, str) else self.expr(k)
                     parts.append(f"a_exc_matches({exc}, {kv})")
                 cond = " || ".join(parts)
             self.emit(f"{'if' if first else '} else if'} ({cond}) {{")
@@ -1621,19 +1628,42 @@ class CGen:
         self.emit("}")
 
     def s_With(self, s):
+        """with M as v: body  ==  v = M.__enter__(); body; M.__exit__(...), as Python: an exception reaches
+        __exit__(type, value, none) and is swallowed when it returns true; a normal end, return or break calls
+        __exit__(none, none, none)."""
         if len(s.items) != 1:
-            raise NativeError("with several items is not supported natively yet", s)
+            body = s.body
+            for item in reversed(s.items[1:]):
+                body = [A.With([item], body, s.is_async)]
+            return self.s_With(A.With([s.items[0]], body, s.is_async))
         e, target = s.items[0]
+        self.n_with = getattr(self, "n_with", 0) + 1
+        k = self.n_with
+        m, ok, ex = f"__with_mgr{k}", f"__with_ok{k}", f"__with_exc{k}"
+        for nm in (m, ok, ex):
+            self.fn.scope.bind(nm)
         mgr = self.hold(self.expr(e))
+        self.store(m, mgr)
         val = self.tmp()
         self.emit(f"{val} = a_call(a_attrk({mgr}, {self.k_str('__enter__')}), 0, NULL, NULL);")
         if target is not None:
             self.assign_pattern(target, val) if not isinstance(target, A.AST) else self.assign_target(target, val)
-        exit_call = A.ExprStmt(A.Call(A.Attr(A.Name("$mgr"), "__exit__"), [A.NoneLit(), A.NoneLit(), A.NoneLit()], []))
-        # the manager is reached through a hidden local
-        self.fn.scope.bind("$mgr")
-        self.store("$mgr", mgr)
-        self.s_Try(A.Try(s.body, [], None, [exit_call], None))
+        from ..parser import parse
+        tmpl = parse(f"""{ok} = true
+try:
+    pass
+except BaseException as {ex}:
+    {ok} = false
+    if not {m}.__exit__({ex}.__class__, {ex}, none):
+        raise
+finally:
+    if {ok}:
+        {m}.__exit__(none, none, none)
+""").body
+        tmpl = [t for t in tmpl if not isinstance(t, A.Declare)]
+        tmpl[1].body = s.body
+        for st in tmpl:
+            self.stmt(st)
 
     # ---- expressions: each returns a C expression; anything allocated is first put in a slot
     def expr(self, e):

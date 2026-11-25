@@ -2211,6 +2211,7 @@ static const TEnt tensor_overrides[] = {
 #include "apsi_linalg.c"
 #include "apsi_lib.c"
 #include "apsi_frame.c"
+#include "apsi_sqlite.c"
 ABuiltinFn a_tensor_builtin(const char *name, int override_only) {
     for (const TEnt *e = tensor_overrides; e->name; e++) if (!strcmp(e->name, name)) return e->fn;
     if (override_only) return NULL;

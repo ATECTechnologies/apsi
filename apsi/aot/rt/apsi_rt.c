@@ -426,6 +426,10 @@ static int num(AV v) { return v.t == T_INT || v.t == T_BOOL || v.t == T_FLOAT; }
 static double fval(AV v) { return v.t == T_FLOAT ? v.f : (double)v.i; }
 int a_eq(AV a, AV b) {
     if (a_is_tn(a) || a_is_tn(b)) return a_tensor_eq(a, b);
+    if ((a_is(a, O_STR) && a_is(b, O_CLASS)) || (a_is(a, O_CLASS) && a_is(b, O_STR))) {   /* type(x) == SomeClass */
+        AStr *n = a_is(a, O_STR) ? STR(a) : STR(b); AClass *c = (AClass *)(a_is(a, O_CLASS) ? a.o : b.o);
+        return c->name && !strcmp(c->name->s, n->s);
+    }
     if (a_is(a, O_QTY) != a_is(b, O_QTY)) {
         AV q = a_is(a, O_QTY) ? a : b, o = a_is(a, O_QTY) ? b : a;
         return is_zero_num(o) && ((AQty *)q.o)->v == 0.0;
@@ -599,6 +603,9 @@ static void repr_into(SB *b, AV v, int repr) {
     case O_BUILTIN: sb_puts(b, "<builtin "); sb_puts(b, ((ABuiltin *)v.o)->name); sb_puts(b, ">"); return;
     case O_CLASS:
         if (((AClass *)v.o)->is_struct) { sb_puts(b, "<struct "); sb_puts(b, ((AClass *)v.o)->name->s); sb_puts(b, ">"); return; }
+        for (int i = 0; i < A_NEXC; i++) if (a_exc_classes[i].t == T_OBJ && a_exc_classes[i].o == v.o) {   /* a built-in exception */
+            sb_puts(b, "<class '"); sb_puts(b, ((AClass *)v.o)->name->s); sb_puts(b, "'>"); return;
+        }
         sb_puts(b, "<class '__main__."); sb_puts(b, ((AClass *)v.o)->name->s); sb_puts(b, "'>"); return;
     case O_INST: {
         AInst *s = (AInst *)v.o;
@@ -1585,6 +1592,8 @@ static AV class_lookup(AClass *c, const char *name) {
 }
 static AV method_of(AV self, const char *name);
 AV a_getattr(AV o, const char *name) {
+    if (a_is(o, O_INST) && !strcmp(name, "__class__")) return a_obj(((AInst *)o.o)->cls);
+    if (a_is(o, O_STR) && !strcmp(name, "__name__")) return o;          /* type(x).__name__: type() gives the name */
     if (a_is(o, O_INST)) {
         AInst *s = (AInst *)o.o; AV v;
         if (a_dict_get(s->attrs, a_str(name), &v)) return v;

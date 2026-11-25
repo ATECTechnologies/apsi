@@ -1,0 +1,36 @@
+use db
+
+let lite = db.sqlite(":memory:")
+lite.execute("create table item (id integer primary key, name text, price real, qty integer, note text); create index ix on item(name)")
+let r = lite.query("insert into item (name, price, qty) values ($1, $2, $3)", "pen", 1.25, 10)
+print(r.rowcount, len(r), r.columns)
+print(lite.insert_many("item", [["cup", 3.5, 2], ["ink", 7.0, 0], ["pad", 2.25, 5]], ["name", "price", "qty"]))
+print(lite.insert_many("item", [{"name": "box", "price": 0.5, "qty": 100}], ["name", "price", "qty"]))
+let rows = lite.query("select id, name, price, qty, note from item where price < ? order by price", 5)
+print(rows)
+for row in rows:
+    print(row.id, row.name, row["price"], row[3], row.note, row.as_dict())
+print(rows.columns, rows.rowcount, rows.dicts()[0], rows.column("name"), rows.scalar())
+print(lite.query("select count(*) as n, sum(qty) as total from item").one())
+print(lite.query("update item set qty = qty + 1 where price > ?", 2).rowcount)
+print(lite.query("delete from item where name = ?", "ink").rowcount)
+with lite.transaction():
+    lite.query("insert into item (name, price, qty) values (?, ?, ?)", "tx1", 9.5, 1)
+try:
+    with lite.transaction():
+        lite.query("insert into item (name, price, qty) values (?, ?, ?)", "tx2", 9.5, 1)
+        raise ValueError("stop")
+except ValueError as e:
+    print("rolled back:", e)
+print(lite.query("select name from item where name like 'tx%'").column("name"))
+try:
+    lite.query("select * from nope")
+except db.DatabaseError as e:
+    print("error:", e)
+try:
+    lite.query("select ?", 1, 2)
+except db.DatabaseError as e:
+    print("error:", e)
+print(lite.query("select 1, 'a''b', null, 2.5").one())
+print(lite.query("select name, price * qty as value from item order by value desc").to_dataframe())
+lite.close()

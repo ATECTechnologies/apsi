@@ -1,0 +1,207 @@
+# use db: databases for native programs. SQLite runs on the SQLite library the system already has (Windows 10+,
+# Linux, macOS), with the same API and results as apsi run: query(sql, *params) with ? or $1 parameters (never
+# pasted into the SQL), execute(script), insert_many, transactions, rows that answer row.column and row["column"].
+
+use dataframe as _df
+
+class DatabaseError(RuntimeError):
+    var code = none
+    var detail = none
+
+class RedisError(DatabaseError):
+    pass
+
+fn _pyrepr(v):
+    if v == none:
+        return "None"
+    if isinstance(v, bool):
+        return "True" if v else "False"
+    if isinstance(v, float):
+        return repr(v)
+    if not isinstance(v, str):
+        return str(v)
+    let q = "\"" if "'" in v and "\"" not in v else "'"
+    var out = q
+    for ch in v:
+        if ch == "\\":
+            out = out + "\\\\"
+        elif ch == q:
+            out = out + "\\" + q
+        elif ch == "\n":
+            out = out + "\\n"
+        elif ch == "\t":
+            out = out + "\\t"
+        elif ch == "\r":
+            out = out + "\\r"
+        else:
+            out = out + ch
+    return out + q
+
+class Row:
+    var _cols = {}
+    var _names = []
+    var _vals = []
+    fn __getattr__(self, k):
+        if k in self._cols:
+            return self._vals[self._cols[k]]
+        raise AttributeError(f"no column '{k}' (columns: {', '.join(self._names)})")
+    fn __getitem__(self, k):
+        if isinstance(k, str):
+            if k not in self._cols:
+                raise KeyError(k)
+            return self._vals[self._cols[k]]
+        return self._vals[k]
+    fn __len__(self) = len(self._vals)
+    fn __iter__(self) = iter(self._vals)
+    fn __eq__(self, o):
+        if isinstance(o, Row):
+            return self._vals == o._vals
+        return isinstance(o, tuple) and list(o) == self._vals or isinstance(o, list) and o == self._vals
+    fn as_dict(self):
+        var d = {}
+        for i in range(len(self._names)):
+            d[self._names[i]] = self._vals[i]
+        return d
+    fn __str__(self) = str(tuple(self._vals))         # printed as apsi run prints it: a tuple
+
+class Result:
+    var rows = []
+    var columns = []
+    var status = ""
+    var rowcount = 0
+    fn __len__(self) = len(self.rows)
+    fn __getitem__(self, i) = self.rows[i]
+    fn __iter__(self) = iter(self.rows)
+    fn __str__(self) = "[" + ", ".join([str(r) for r in self.rows]) + "]"
+    fn one(self):
+        if len(self.rows) != 1:
+            raise DatabaseError(f"expected exactly one row, got {len(self.rows)}")
+        return self.rows[0]
+    fn scalar(self) = self.rows[0][0] if len(self.rows) > 0 else none
+    fn dicts(self) = [r.as_dict() for r in self.rows]
+    fn column(self, name):
+        let i = self.columns.index(name)
+        return [r[i] for r in self.rows]
+    fn to_dataframe(self):
+        var d = {}
+        for i in range(len(self.columns)):
+            d[self.columns[i]] = [r[i] for r in self.rows]
+        return _df.DataFrame(d)
+
+fn _result(cols, rows, status, rowcount):
+    var r = Result()
+    var idx = {}
+    for i in range(len(cols)):
+        idx[cols[i]] = i
+    var out = []
+    for vals in rows:
+        var row = Row()
+        row._cols = idx
+        row._names = cols
+        row._vals = vals
+        out.append(row)
+    r.rows = out
+    r.columns = list(cols)
+    r.status = status
+    r.rowcount = rowcount
+    return r
+
+fn _ident(name):
+    let s = str(name)
+    for part in s.split("."):
+        if part == "" or not all([c.isalnum() or c == "_" for c in part]) or ("0" <= part[0] and part[0] <= "9"):
+            raise DatabaseError("not a plain identifier: " + _pyrepr(s))
+    return s
+
+fn _dollars(sql):
+    # $1 -> ?1 (SQLite's numbered parameters), outside quotes as apsi run's regex does everywhere
+    var out = ""
+    var i = 0
+    let n = len(sql)
+    while i < n:
+        let c = sql[i]
+        if c == "$" and i + 1 < n and "0" <= sql[i + 1] and sql[i + 1] <= "9":
+            out = out + "?"
+            i = i + 1
+            continue
+        out = out + c
+        i = i + 1
+    return out
+
+fn _ok(r):
+    if isinstance(r, tuple) and len(r) == 2 and r[0] == "error":
+        raise DatabaseError(r[1])
+    return r
+
+class _Tx:
+    var conn = none
+    fn __enter__(self):
+        self.conn.execute("begin")
+        return self.conn
+    fn __exit__(self, kind, value, tb):
+        if kind != none:
+            self.conn.execute("rollback")
+        else:
+            self.conn.execute("commit")
+        return false
+
+class SQLite:
+    var h = 0
+    var path = ":memory:"
+    fn _run(self, sql, params):
+        let r = _ok(__sqlite("query", self.h, _dollars(str(sql)), list(params)))
+        let rc = r[2] if r[2] >= 0 else len(r[1])
+        return _result(r[0], r[1], "", rc)
+    fn query(self, sql, *params) = self._run(sql, params)
+    fn execute(self, sql):
+        _ok(__sqlite("exec", self.h, str(sql)))
+        return _result([], [], "", 0)
+    fn insert_many(self, table, rows, columns=none, chunk=1000):
+        var rs = []
+        for r in rows:
+            rs.append(list(r.values()) if isinstance(r, dict) else list(r))
+        if len(rs) == 0:
+            return 0
+        let cols = " (" + ", ".join([_ident(c) for c in columns]) + ")" if columns != none else ""
+        let sql = f"insert into {_ident(table)}{cols} values (" + ", ".join(["?"] * len(rs[0])) + ")"
+        _ok(__sqlite("exec", self.h, "begin"))
+        try:
+            for r in rs:
+                _ok(__sqlite("query", self.h, sql, r))
+        except DatabaseError as e:
+            __sqlite("exec", self.h, "rollback")
+            raise e
+        _ok(__sqlite("exec", self.h, "commit"))
+        return len(rs)
+    fn transaction(self):
+        var t = _Tx()
+        t.conn = self
+        return t
+    fn close(self):
+        __sqlite("close", self.h)
+        self.h = 0
+    fn __enter__(self) = self
+    fn __exit__(self, kind, value, tb):
+        self.close()
+        return false
+    fn __str__(self) = f"<sqlite {self.path}>"
+
+fn sqlite(path=":memory:"):
+    var c = SQLite()
+    c.path = str(path)
+    c.h = _ok(__sqlite("open", c.path))
+    return c
+
+fn _net_only(name) = DatabaseError(f"db.{name}() needs a network client that native programs do not have yet; run this program with apsi run")
+fn postgres(url=none, **kw):
+    raise _net_only("postgres")
+fn redis(url=none, **kw):
+    raise _net_only("redis")
+fn mysql(url=none, **kw):
+    raise _net_only("mysql")
+fn mariadb(url=none, **kw):
+    raise _net_only("mariadb")
+fn mongo(url=none, **kw):
+    raise _net_only("mongo")
+fn pool(url, size=8, **kw):
+    raise _net_only("pool")

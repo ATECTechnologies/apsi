@@ -781,9 +781,13 @@ class SQLite:
 
     def _run(self, sql, params):
         import re
+        import sqlite3
         sql = re.sub(r"\$(\d+)", r"?\1", sql)
         with self._lock:
-            cur = self.c.execute(sql, params)
+            try:
+                cur = self.c.execute(sql, params)
+            except sqlite3.Error as e:                    # one error type for every database
+                raise DatabaseError(str(e)) from None
             cols = [d[0] for d in cur.description] if cur.description else []
             rt = _row_type(cols)
             rows = [rt(r) for r in cur.fetchall()] if cols else []
@@ -793,8 +797,12 @@ class SQLite:
         return self._run(sql, params)
 
     def execute(self, sql):
+        import sqlite3
         with self._lock:
-            self.c.executescript(sql)
+            try:
+                self.c.executescript(sql)
+            except sqlite3.Error as e:
+                raise DatabaseError(str(e)) from None
         return Result()
 
     def insert_many(self, table, rows, columns=None, chunk=1000):
@@ -810,14 +818,18 @@ class SQLite:
 
     @contextmanager
     def transaction(self):
-        self.execute("begin")
+        # execute(), not executescript(): executescript commits first, which would end the transaction
+        with self._lock:
+            self.c.execute("begin")
         try:
             yield self
         except BaseException:
-            self.execute("rollback")
+            with self._lock:
+                self.c.execute("rollback")
             raise
         else:
-            self.execute("commit")
+            with self._lock:
+                self.c.execute("commit")
 
     def close(self):
         self.c.close()
