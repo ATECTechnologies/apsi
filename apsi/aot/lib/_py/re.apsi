@@ -1,0 +1,208 @@
+# Python's re for converted programs, on the runtime's regular-expression engine (Python's syntax and rules)
+let I = 2
+let IGNORECASE = 2
+let M = 8
+let MULTILINE = 8
+let S = 16
+let DOTALL = 16
+let X = 64
+let VERBOSE = 64
+let A = 256
+let ASCII = 256
+let U = 32
+let UNICODE = 32
+let NOFLAG = 0
+let error = ValueError
+
+fn _pat_of(p) = p.pattern if isinstance(p, Pattern) else p
+fn _flags_of(p, flags) = (p.flags | flags) if isinstance(p, Pattern) else flags
+
+class Match:
+    fn __init__(self, rx, string, spans, pos, endpos):
+        self.re = rx
+        self.string = string
+        self._spans = spans
+        self.pos = pos
+        self.endpos = endpos
+    fn _idx(self, g):
+        if isinstance(g, str):
+            if not (g in self.re.groupindex):
+                raise IndexError("no such group")
+            return self.re.groupindex[g]
+        if g < 0 or g > self.re.groups:
+            raise IndexError("no such group")
+        return g
+    fn _one(self, g, default=none):
+        let k = self._idx(g)
+        let s0 = self._spans[2 * k]
+        let e0 = self._spans[2 * k + 1]
+        if s0 < 0 or e0 < 0:
+            return default
+        return self.string[s0:e0]
+    fn group(self, *gs):
+        if len(gs) == 0:
+            return self._one(0)
+        if len(gs) == 1:
+            return self._one(gs[0])
+        return tuple([self._one(g) for g in gs])
+    fn __getitem__(self, g) = self._one(g)
+    fn groups(self, default=none) = tuple([self._one(k, default) for k in range(1, self.re.groups + 1)])
+    fn groupdict(self, default=none):
+        var d = {}
+        for name in self.re.groupindex:
+            d[name] = self._one(self.re.groupindex[name], default)
+        return d
+    fn start(self, g=0) = self._spans[2 * self._idx(g)]
+    fn end(self, g=0) = self._spans[2 * self._idx(g) + 1]
+    fn span(self, g=0) = (self.start(g), self.end(g))
+    fn expand(self, template) = _expand(template, self)
+    fn __bool__(self) = true
+    fn __getattr__(self, n):
+        if n == "lastindex":
+            var last = none
+            var best = -1
+            for k in range(1, self.re.groups + 1):
+                if self._spans[2 * k + 1] >= 0 and self._spans[2 * k + 1] > best:
+                    best = self._spans[2 * k + 1]
+                    last = k
+            return last
+        if n == "lastgroup":
+            let li = self.__getattr__("lastindex")
+            for name in self.re.groupindex:
+                if self.re.groupindex[name] == li:
+                    return name
+            return none
+        raise AttributeError(f"'re.Match' object has no attribute '{n}'")
+    fn __repr__(self) = f"<re.Match object; span=({self.start()}, {self.end()}), match={repr(self.group())}>"
+    fn __str__(self) = self.__repr__()
+
+class Pattern:
+    fn __init__(self, pattern, flags=0):
+        self.pattern = pattern
+        self.flags = flags
+        let info = __re("info", pattern, flags)
+        self.groups = info[0]
+        self.groupindex = info[1]
+    fn _run(self, op, string, pos=0, endpos=none, adv=false):
+        let r = __re(op, self.pattern, self.flags, string, pos, endpos, adv)
+        if r == none:
+            return none
+        return Match(self, string, r, pos, __re("len", self.pattern, self.flags, string) if endpos == none else endpos)
+    fn search(self, string, pos=0, endpos=none) = self._run("search", string, pos, endpos)
+    fn match(self, string, pos=0, endpos=none) = self._run("match", string, pos, endpos)
+    fn fullmatch(self, string, pos=0, endpos=none):
+        let n = __re("len", self.pattern, self.flags, string) if endpos == none else endpos
+        let p2 = Pattern("(?:" + self.pattern + ")\\Z", self.flags)
+        let m = p2._run("match", string, pos, n)
+        if m == none:
+            return none
+        return Match(self, string, m._spans, pos, n)
+    fn finditer(self, string, pos=0, endpos=none):
+        var out = []
+        let n = __re("len", self.pattern, self.flags, string) if endpos == none else endpos
+        var p = pos
+        var adv = false
+        while p <= n:
+            let m = self._run("search", string, p, n, adv)
+            if m == none:
+                break
+            out.append(m)
+            adv = m.end() == m.start()
+            p = m.end()
+        return iter(out)
+    fn findall(self, string, pos=0, endpos=none):
+        var out = []
+        for m in self.finditer(string, pos, endpos):
+            if self.groups == 0:
+                out.append(m.group())
+            elif self.groups == 1:
+                out.append(m._one(1, ""))
+            else:
+                out.append(tuple([m._one(k, "") for k in range(1, self.groups + 1)]))
+        return out
+    fn subn(self, repl, string, count=0):
+        var parts = []
+        var last = 0
+        var n = 0
+        for m in self.finditer(string):
+            if count and n >= count:
+                break
+            parts.append(string[last:m.start()])
+            parts.append(repl(m) if callable(repl) else _expand(repl, m))
+            last = m.end()
+            n = n + 1
+        parts.append(string[last:])
+        return ("".join(parts), n)
+    fn sub(self, repl, string, count=0) = self.subn(repl, string, count)[0]
+    fn split(self, string, maxsplit=0):
+        var out = []
+        var last = 0
+        var n = 0
+        for m in self.finditer(string):
+            if maxsplit and n >= maxsplit:
+                break
+            out.append(string[last:m.start()])
+            for k in range(1, self.groups + 1):
+                out.append(m._one(k))
+            last = m.end()
+            n = n + 1
+        out.append(string[last:])
+        return out
+    fn __repr__(self) = f"re.compile({repr(self.pattern)})" if self.flags == 0 else f"re.compile({repr(self.pattern)}, {_flag_text(self.flags)})"
+    fn __str__(self) = self.__repr__()
+    fn __eq__(self, o) = isinstance(o, Pattern) and o.pattern == self.pattern and o.flags == self.flags
+
+fn _flag_text(f):
+    var names = []
+    for nv in [["re.IGNORECASE", 2], ["re.MULTILINE", 8], ["re.DOTALL", 16], ["re.UNICODE", 32], ["re.VERBOSE", 64], ["re.ASCII", 256]]:
+        if f & nv[1]:
+            names.append(nv[0])
+    return "|".join(names)
+
+fn _expand(t, m):
+    var out = []
+    var i = 0
+    let n = len(t)
+    while i < n:
+        let c = t[i]
+        if c != "\\" or i + 1 >= n:
+            out.append(c)
+            i = i + 1
+            continue
+        let d = t[i + 1]
+        if d >= "0" and d <= "9":
+            var j = i + 1
+            var num = ""
+            while j < n and len(num) < 2 and t[j] >= "0" and t[j] <= "9":
+                num = num + t[j]
+                j = j + 1
+            out.append(m._one(int(num), ""))
+            i = j
+        elif d == "g":
+            let close = t.find(">", i)
+            let name = t[i + 3:close]
+            out.append(m._one(int(name) if name.isdigit() else name, ""))
+            i = close + 1
+        else:
+            let esc = {"n": "\n", "t": "\t", "r": "\r", "f": "\x0c", "v": "\x0b", "a": "\x07", "\\": "\\"}
+            if d in esc:
+                out.append(esc[d])
+            else:
+                out.append("\\" + d)
+            i = i + 2
+    return "".join(out)
+
+fn compile(pattern, flags=0) = pattern if isinstance(pattern, Pattern) else Pattern(pattern, flags)
+fn search(pattern, string, flags=0) = compile(_pat_of(pattern), _flags_of(pattern, flags)).search(string)
+fn match(pattern, string, flags=0) = compile(_pat_of(pattern), _flags_of(pattern, flags)).match(string)
+fn fullmatch(pattern, string, flags=0) = compile(_pat_of(pattern), _flags_of(pattern, flags)).fullmatch(string)
+fn findall(pattern, string, flags=0) = compile(_pat_of(pattern), _flags_of(pattern, flags)).findall(string)
+fn finditer(pattern, string, flags=0) = compile(_pat_of(pattern), _flags_of(pattern, flags)).finditer(string)
+fn sub(pattern, repl, string, count=0, flags=0) = compile(_pat_of(pattern), _flags_of(pattern, flags)).sub(repl, string, count)
+fn subn(pattern, repl, string, count=0, flags=0) = compile(_pat_of(pattern), _flags_of(pattern, flags)).subn(repl, string, count)
+fn split(pattern, string, maxsplit=0, flags=0) = compile(_pat_of(pattern), _flags_of(pattern, flags)).split(string, maxsplit)
+fn escape(s):
+    let special = "()[]{}?*+-|^$\\.&~# \t\n\r\x0b\x0c"
+    return "".join([("\\" + c) if c in special else c for c in s])
+fn purge():
+    pass

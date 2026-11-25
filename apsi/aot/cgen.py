@@ -119,7 +119,7 @@ PY_NATIVE = {"asyncio": "asyncio", "math": "_py/math", "collections": "_py/colle
              "itertools": "_py/itertools", "typing": "_py/typing", "dataclasses": "_py/dataclasses", "copy": "_py/copy",
              "sys": "_py/sys", "random": "_py/random", "heapq": "_py/heapq", "bisect": "_py/bisect", "string": "_py/string",
              "operator": "_py/operator", "json": "_py/json", "time": "_py/time", "abc": "_py/abc",
-             "statistics": "_py/statistics", "os": "_py/os", "os.path": "_py/os"}
+             "statistics": "_py/statistics", "os": "_py/os", "os.path": "_py/os", "re": "_py/re"}
 
 # C types in cload(...).fn(name, [types], result): C spelling, AV -> C, C -> AV
 FFI = {

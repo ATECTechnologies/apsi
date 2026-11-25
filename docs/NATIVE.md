@@ -83,7 +83,8 @@ prints: `None` / `True`, `'strings'` inside lists, CPython's order for sets of I
 `frozenset`, `issubclass`, and native stand-ins for `math`, `collections` (Counter, defaultdict, deque, namedtuple,
 OrderedDict), `functools`, `itertools`, `typing`, `dataclasses`, `copy`, `sys`, `random` (CPython's Mersenne Twister:
 the same numbers as Python for a seed), `heapq`, `bisect`, `string`, `operator`, `json`, `time`, `os` / `os.path`,
-`abc` and `statistics`.
+`abc`, `statistics` and `re` (the runtime's regular-expression engine with Python's syntax and rules: groups, named
+groups, back-references, lazy quantifiers, look-ahead and look-behind, flags I M S X A, Unicode `\w \d \s` as Python).
 
 ### Numbers
 
@@ -150,7 +151,7 @@ These programs keep running with `apsi run`. A native build that reaches one of 
   `text_dataset`, `train_tokenizer` and Parquet in `data`; websockets and TLS in `web` (serve HTTPS through a
   reverse proxy); `tokens.focus` / `fit_chat` / `outline` (they read Python syntax trees); `db.mysql` / `mongo`, `db.pool`, PostgreSQL / Redis over TLS on Windows; `layout`'s `numpy_dtype()`
 - the modules `hub`, `memory`, `rt` (camera and video), `python`; in programs converted from Python, Python modules
-  other than the stand-ins listed under "Programs converted from Python" (for example `re`)
+  other than the stand-ins listed under "Programs converted from Python" 
 - Python modules (`pyimport`, `import numpy`), except `asyncio`
 - random numbers: native programs use their own generator, so a seed gives different numbers than in `apsi run`
   (the same seed always gives the same numbers in native programs)
